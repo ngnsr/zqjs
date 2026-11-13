@@ -19,7 +19,8 @@ checked byte for byte against node. See [ROADMAP.md](ROADMAP.md).
 brew install zig && brew pin zig
 ```
 
-node (any recent version) is only needed for `zig build check-node`.
+node and Python 3 (standard library only) are needed only to regenerate or check test data
+(`zig build update-golden`, `zig build check-goldens`), not to build or test.
 
 ## Usage
 ```sh
@@ -32,8 +33,8 @@ zig-out/bin/zqjs --dump-ast -e "let x = 1; { let x = x + 2; }"
 # (block (let (x#1@1 (+ x#1 2))))           ← inner x refers to itself: a TDZ error if run
 zig build test                              # unit + integration tests (tests/all.zig)
 zig build test --fuzz=100K                  # also fuzz parsing and execution
-zig build check-node                        # verify syntax cases and goldens against node
-zig build update-golden                     # regenerate tests/ops and tests/diff/*.out with node
+zig build check-goldens                     # verify syntax cases against node; generated files up to date
+zig build update-golden                     # regenerate goldens (node) and pow references (Python)
 ```
 
 ## Documents
@@ -41,3 +42,4 @@ zig build update-golden                     # regenerate tests/ops and tests/dif
 - [ARCHITECTURE.md](ARCHITECTURE.md): components and ownership
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md): why things are the way they are
 - [ROADMAP.md](ROADMAP.md): milestones and required regression tests
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): licenses of ported code (musl/Arm `pow`)

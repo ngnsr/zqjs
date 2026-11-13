@@ -45,16 +45,38 @@ pub fn build(b: *std.Build) void {
     integration.setCwd(b.path(".")); // diff_test reads tests/diff at runtime
     test_step.dependOn(&integration.step);
 
-    const check_node = b.step("check-node", "Check syntax cases and goldens against node");
-    const node = b.addSystemCommand(&.{"node"});
-    node.addFileArg(b.path("tests/harness/check_syntax_cases.js"));
-    node.addFileArg(b.path("tests/syntax/cases.jsonl"));
-    check_node.dependOn(&node.step);
-    const goldens = b.addSystemCommand(&.{ "node", "tests/harness/golden.js", "--check" });
-    goldens.setCwd(b.path("."));
-    check_node.dependOn(&goldens.step);
+    // Portability check for pow (tools/pow_bits.zig): build with any -Dtarget/-Dcpu/-Doptimize.
+    const pow_bits = b.addRunArtifact(b.addExecutable(.{
+        .name = "pow-bits",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/pow_bits.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = imports,
+        }),
+    }));
+    pow_bits.addPassthruArgs();
+    b.step("pow-bits", "Hash pow results for a target (compare across targets)").dependOn(&pow_bits.step);
 
-    const update = b.addSystemCommand(&.{ "node", "tests/harness/golden.js" });
-    update.setCwd(b.path("."));
-    b.step("update-golden", "Regenerate tests/ops and tests/diff/*.out with node").dependOn(&update.step);
+    // Generated test data: node (goldens, syntax contract), Python stdlib (pow reference),
+    // and the pow tables generated from musl. Dev-time only; `zig build test` needs none.
+    const check = b.step("check-goldens", "Check syntax cases against node; generated files up to date");
+    const update = b.step("update-golden", "Regenerate goldens (node) and pow reference values (Python)");
+    for ([_][]const []const u8{
+        &.{ "node", "tests/harness/check_syntax_cases.js", "tests/syntax/cases.jsonl" },
+        &.{ "node", "tests/harness/golden.js", "--check" },
+        &.{ "node", "tools/gen_pow_data.js", "--check" },
+        &.{ "python3", "-I", "tools/pow_reference.py", "--check" },
+    }) |argv| {
+        const cmd = b.addSystemCommand(argv);
+        cmd.setCwd(b.path("."));
+        check.dependOn(&cmd.step);
+    }
+    // Order matters: pow_reference.py reads the inputs golden.js writes.
+    const regen_goldens = b.addSystemCommand(&.{ "node", "tests/harness/golden.js" });
+    regen_goldens.setCwd(b.path("."));
+    const regen_reference = b.addSystemCommand(&.{ "python3", "-I", "tools/pow_reference.py" });
+    regen_reference.setCwd(b.path("."));
+    regen_reference.step.dependOn(&regen_goldens.step);
+    update.dependOn(&regen_reference.step);
 }

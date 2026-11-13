@@ -27,6 +27,7 @@ the runtime.
 | `src/runtime/heap.zig` | `Heap`: list of all objects, `String`, byte accounting and limits |
 | `src/runtime/runtime.zig` | `Runtime`: heap, output, step budget, exception / stop reason |
 | `src/runtime/ops.zig` | all JS value semantics: ToNumber, ToString (number formatting), ToBoolean, operators |
+| `src/runtime/pow.zig` | `pow` ported from musl (Arm optimized-routines); `pow_data.zig`: its tables, generated |
 | `src/runtime/globals.zig` | `undefined`, `NaN`, `Infinity`, `print` |
 | `src/interp/treewalk.zig` | tree-walking interpreter over AST + Resolution, `?Value` slots |
 | `src/run.zig` | source → parse → resolve → run, with outcome reporting (CLI and tests share it) |
@@ -74,7 +75,13 @@ tests/syntax_test.zig     tests/syntax/cases.jsonl: outcome + resolved dump per 
 tests/ops_test.zig        tests/ops/*.jsonl: conversions/operators vs node, bit for bit
 tests/diff_test.zig       tests/diff/*.js: program output must equal node's tests/diff/*.out
 tests/harness/            node scripts: golden.js (regenerate/check goldens), check_syntax_cases.js
+tools/gen_pow_data.js     generates src/runtime/pow_data.zig from musl's C (hash-pinned)
+tools/pow_reference.py    correctly rounded x ** y reference values (Python stdlib `decimal`)
+tools/pow_bits.zig        hashes pow results, to compare targets and optimisation modes
 ```
 - `zig build test` runs the unit and integration test binaries; `zig build test --fuzz` fuzzes.
-- `zig build update-golden` regenerates `tests/ops` and `tests/diff/*.out` with node;
-  `zig build check-node` verifies the syntax contract and that every golden is up to date.
+- `zig build update-golden` regenerates `tests/ops`, `tests/diff/*.out` (node) and
+  `tests/ops/pow_reference.jsonl` (Python); `zig build check-goldens` verifies the syntax
+  contract against node and that every generated file is up to date.
+- Dev-time tools: node (goldens), Python 3 standard library (pow reference). Neither is needed
+  to build ZQJS or to run `zig build test`.

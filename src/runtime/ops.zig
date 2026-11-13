@@ -231,7 +231,7 @@ pub fn pow(base: f64, exponent: f64) f64 {
     if (exponent == 0) return 1;
     if (std.math.isNan(base)) return std.math.nan(f64);
     if (@abs(base) == 1 and std.math.isInf(exponent)) return std.math.nan(f64);
-    return std.math.pow(f64, base, exponent);
+    return @import("pow.zig").pow(base, exponent);
 }
 
 /// JS `%`: the result has the sign of the dividend; same as C fmod / Zig @rem.

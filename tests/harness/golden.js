@@ -3,7 +3,7 @@
 //   tests/diff/*.out    the output of each tests/diff/*.js program under node
 // Usage:
 //   node golden.js          regenerate everything
-//   node golden.js --check  fail if any golden is out of date (run by `zig build check-node`)
+//   node golden.js --check  fail if any golden is out of date (run by `zig build check-goldens`)
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -68,6 +68,40 @@ function* randomDoubles(n) {
   for (const [op, f] of Object.entries(ops)) for (const a of vals) for (const b of vals)
     lines.push(JSON.stringify([op, bits(a), bits(b), bits(f(a, b))]));
   emit('ops/arithmetic.jsonl', lines.join('\n') + '\n');
+}
+
+// ---- tests/ops/pow.jsonl: [base bits, exponent bits, result bits] for x ** y.
+// Special-value grid plus ~8,000 pseudo-random cases aimed at the hard regions.
+{
+  function* uniform(n, seed) { // doubles in [0, 1)
+    let s = BigInt(seed) | 1n;
+    const mask = (1n << 64n) - 1n;
+    for (let i = 0; i < n; i++) {
+      s ^= (s << 13n) & mask; s ^= s >> 7n; s ^= (s << 17n) & mask;
+      yield Number(s >> 11n) / 2 ** 53;
+    }
+  }
+  const pairs = [];
+  const specials = [0, -0, 1, -1, 2, -2, 0.5, -0.5, 3, -3, 1 / 3, 10, -8, 1e308, -1e308, 5e-324, -5e-324,
+    2.2250738585072014e-308, 1.0000000000000002, 0.9999999999999999, NaN, Infinity, -Infinity, 2 ** 53, -(2 ** 53) - 2, 1023.5, -1074, 1024];
+  for (const a of specials) for (const b of specials) pairs.push([a, b]);
+  const u = (n, seed) => [...uniform(n, seed)];
+  const A = u(3000, 1), B = u(3000, 2);
+  for (let i = 0; i < 3000; i++) pairs.push([A[i] * 10, B[i] * 60 - 30]);                    // everyday ranges
+  const C = u(1000, 3), D = u(1000, 4);
+  for (let i = 0; i < 1000; i++) pairs.push([2 ** (C[i] * 2000 - 1000), D[i] * 6 - 3]);       // any magnitude
+  const E = u(1000, 5), F = u(1000, 6);
+  for (let i = 0; i < 1000; i++) pairs.push([-(E[i] * 20), Math.round(F[i] * 120 - 60)]);    // negative base, integer exponent
+  const G = u(1000, 7), H = u(1000, 8);
+  for (let i = 0; i < 1000; i++) pairs.push([1 + (G[i] - 0.5) * 2 ** -(H[i] * 50), (H[i] - 0.5) * 2e12]); // near 1, huge exponent
+  const I = u(1000, 9), J = u(1000, 10);
+  for (let i = 0; i < 1000; i++) {                                                           // results near overflow / underflow
+    const base = 1.5 + I[i] * 100, edge = (J[i] < 0.5 ? 1024 : -1074) * Math.LN2 / Math.log(base);
+    pairs.push([base, edge * (1 + (J[i] - 0.5) * 1e-3)]);
+  }
+  const K = u(500, 11), M = u(500, 12);
+  for (let i = 0; i < 500; i++) pairs.push([K[i] * 2 ** -1022, M[i] * 2 - 1]);               // subnormal bases
+  emit('ops/pow.jsonl', pairs.map(([a, b]) => JSON.stringify([bits(a), bits(b), bits(a ** b)])).join('\n') + '\n');
 }
 
 // ---- tests/diff/*.out: the program's output under node with ZQJS's `print`.

@@ -27,4 +27,5 @@ test {
     _ = @import("frontend/resolver.zig");
     _ = @import("runtime/heap.zig");
     _ = @import("runtime/ops.zig");
+    _ = @import("runtime/pow.zig");
 }

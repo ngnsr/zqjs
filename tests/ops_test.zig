@@ -58,7 +58,6 @@ test "StringToNumber matches node" {
 
 test "arithmetic operators match node, including -0, NaN and Infinity" {
     var failures: usize = 0;
-    var pow_inexact: usize = 0;
     var it = lines("ops/arithmetic.jsonl");
     while (it.next()) |line| {
         if (line.len == 0) continue;
@@ -75,25 +74,90 @@ test "arithmetic operators match node, including -0, NaN and Infinity" {
         else if (std.mem.eql(u8, op, "%")) ops.remainder(a, b) //
             else ops.pow(a, b);
         if (!sameNumber(got, expected)) {
-            // Known deviation (DESIGN_DECISIONS D25): std.math.pow is less accurate than
-            // V8's pow. Exact and special cases must still match; the inexact ones are
-            // capped at today's count so any regression fails the test.
-            if (std.mem.eql(u8, op, "**") and !isExactCase(a, b, expected)) {
-                pow_inexact += 1;
-                continue;
-            }
+            // `**` is implementation-approximated: within 1 ulp of node unless exact (D25).
+            if (std.mem.eql(u8, op, "**") and !isExactCase(a, b, expected) and ulpDistance(got, expected) == 1) continue;
             if (failures < 20) std.debug.print("{d} {s} {d}: expected {d}, got {d}\n", .{ a, op, b, expected, got });
             failures += 1;
         }
     }
     try testing.expectEqual(@as(usize, 0), failures);
-    try testing.expect(pow_inexact <= 8);
 }
 
-/// Results that any correct pow must produce exactly: special values, and integral
-/// results representable exactly.
+/// Cases where the spec fixes the result or the true value is exactly representable,
+/// so any pow with < 1 ulp error must return it bit for bit: NaN/±Infinity/±0 operands,
+/// and integer ** non-negative integer with |result| < 2^53.
 fn isExactCase(a: f64, b: f64, expected: f64) bool {
     if (std.math.isNan(a) or std.math.isNan(b) or std.math.isInf(a) or std.math.isInf(b)) return true;
-    if (a == 0 or b == 0 or expected == 0 or std.math.isInf(expected)) return true;
-    return @abs(expected) < 0x1p53 and @floor(expected) == expected;
+    if (a == 0 or b == 0) return true;
+    return @floor(a) == a and @floor(b) == b and b >= 0 and @abs(expected) < 0x1p53;
+}
+
+/// Distance in units in the last place between two doubles of the same sign;
+/// maxInt for NaN vs number or for a sign difference (including -0 vs +0).
+fn ulpDistance(a: f64, b: f64) u64 {
+    if (std.math.isNan(a) or std.math.isNan(b)) return if (std.math.isNan(a) and std.math.isNan(b)) 0 else std.math.maxInt(u64);
+    if (std.math.signbit(a) != std.math.signbit(b)) return std.math.maxInt(u64);
+    const x: u64 = @as(u64, @bitCast(a)) & 0x7fffffffffffffff;
+    const y: u64 = @as(u64, @bitCast(b)) & 0x7fffffffffffffff;
+    return if (x > y) x - y else y - x;
+}
+
+test "pow: JS special cases exact, everything else within 1 ulp of node" {
+    var exact: usize = 0;
+    var one_ulp: usize = 0;
+    var failures: usize = 0;
+    var it = lines("ops/pow.jsonl");
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice([3][]const u8, testing.allocator, line, .{});
+        defer parsed.deinit();
+        const a = try fromBits(parsed.value[0]);
+        const b = try fromBits(parsed.value[1]);
+        const expected = try fromBits(parsed.value[2]);
+        const got = ops.pow(a, b);
+        const d = ulpDistance(got, expected);
+        const must_be_exact = isExactCase(a, b, expected);
+        if (d == 0) {
+            exact += 1;
+        } else if (d == 1 and !must_be_exact) {
+            one_ulp += 1;
+        } else {
+            if (failures < 20) std.debug.print("{e} ** {e}: node {e}, zqjs {e} ({d} ulp)\n", .{ a, b, expected, got, d });
+            failures += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), failures);
+    try testing.expect(exact + one_ulp > 8000);
+}
+
+// A different property from the node test above: distance from the *true* value.
+// tests/ops/pow_reference.jsonl holds correctly rounded results (tools/pow_reference.py,
+// Python `decimal` at 60 digits). Today 7,933 of 7,942 are correctly rounded and the rest
+// are 1 ulp off (musl documents a 0.54 ulp bound); the test fails if either gets worse.
+test "pow accuracy: never more than 1 ulp from the true value, almost always correctly rounded" {
+    var total: usize = 0;
+    var correctly_rounded: usize = 0;
+    var failures: usize = 0;
+    var it = lines("ops/pow_reference.jsonl");
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice([3][]const u8, testing.allocator, line, .{});
+        defer parsed.deinit();
+        const a = try fromBits(parsed.value[0]);
+        const b = try fromBits(parsed.value[1]);
+        const truth = try fromBits(parsed.value[2]);
+        const got = ops.pow(a, b);
+        total += 1;
+        switch (ulpDistance(got, truth)) {
+            0 => correctly_rounded += 1,
+            1 => {},
+            else => |d| {
+                if (failures < 20) std.debug.print("{e} ** {e}: true {e}, zqjs {e} ({d} ulp)\n", .{ a, b, truth, got, d });
+                failures += 1;
+            },
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), failures);
+    try testing.expectEqual(@as(usize, 7942), total);
+    try testing.expect(correctly_rounded >= 7933);
 }

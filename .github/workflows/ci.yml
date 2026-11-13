@@ -3,7 +3,13 @@ name: CI
 
 on:
   push:
+    branches: ["**"] # not tags: a tag points at a commit CI already checked
   pull_request:
+
+# A newer push to the same branch cancels the older run (saves CI minutes).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

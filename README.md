@@ -37,6 +37,11 @@ zig build check-goldens                     # verify syntax cases against node; 
 zig build update-golden                     # regenerate goldens (node) and pow references (Python)
 ```
 
+## Continuous integration
+`.github/workflows/ci.yml` runs on every push, on macOS arm64, Linux x86_64 and Linux arm64:
+`zig fmt --check .`, `zig build test`, `zig build check-goldens`, `zig build --release=fast`,
+and a check that `pow` produces the same bits as the reference hash (DESIGN_DECISIONS D25).
+
 ## Documents
 - [LANGUAGE.md](LANGUAGE.md): what ZQJS accepts and the compatibility contract with node
 - [ARCHITECTURE.md](ARCHITECTURE.md): components and ownership

@@ -1,0 +1,60 @@
+# Runs on every push and pull request. Same commands as a local check (see README).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false # one platform failing shouldn't hide the others' results
+      matrix:
+        include:
+          - { name: macOS arm64, os: macos-latest }
+          - { name: Linux x86_64, os: ubuntu-latest }
+          # GitHub's arm64 Linux runners are free for public repositories; for a private
+          # repository this job may need a paid runner (or remove it).
+          - { name: Linux arm64, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+
+      # Exact toolchain pin (DESIGN_DECISIONS D17); build.zig also refuses other versions.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      # Dev-time tools for check-goldens: node (goldens, syntax contract) and Python 3
+      # (pow reference values; standard library only, preinstalled on the runners).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Formatting
+        run: zig fmt --check .
+
+      - name: Tests (unit + integration)
+        run: zig build test --summary all
+
+      - name: Generated files and node contract
+        run: zig build check-goldens
+
+      - name: Release build
+        run: zig build --release=fast
+
+      # pow must give bit-identical results everywhere (DESIGN_DECISIONS D25). The expected
+      # hash was measured on aarch64-macos and x86_64 under Rosetta 2; these runners add
+      # real x86_64 and arm64 Linux hardware.
+      - name: pow portability hash
+        shell: bash
+        run: |
+          expected=b02251ea683f1d7d845373dba7eba1a0aa02f8253761095beb95de2a03ab2b19
+          out=$(zig build pow-bits -- tests/ops/pow.jsonl)
+          echo "$out"
+          grep -q "$expected" <<< "$out" || { echo "pow results differ from the reference hash"; exit 1; }

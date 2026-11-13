@@ -276,7 +276,7 @@ twice. Cost: each new syntax form needs a case in both back ends.
 
 ## D17. Exact toolchain pin: Zig 0.17.1
 `build.zig` refuses any other compiler (`builtin.zig_version_string`); `minimum_zig_version` alone
-only sets a floor. Locally: `brew pin zig`. CI (once a repository exists): `mlugg/setup-zig`
+only sets a floor. Locally: `brew pin zig`. CI (`.github/workflows/ci.yml`): `mlugg/setup-zig@v2`
 with `version: 0.17.1`. Upgrades are deliberate commits.
 
 ## D18. Number literals are validated by our lexer, not by `std.fmt.parseFloat`
@@ -380,8 +380,9 @@ and x86_64-macos under Rosetta 2 (`-Dcpu=baseline`, `x86_64_v2`, `haswell`). Has
 an identical hash also shows the compiler does not contract `a*b + c` into fused operations
 (Zig's default float mode is strict). We use musl's non-FMA code path so no result depends on
 FMA hardware.
-**Not verified, so not claimed:** real x86 hardware (Rosetta translates x86 code but isn't an
-x86 CPU), Linux/Windows, WebAssembly, 32-bit x86 (where x87 extended precision could cause
+CI repeats the hash check on every push on GitHub's Linux x86_64 and Linux arm64 runners (real
+hardware), once the repository is pushed there.
+**Not verified, so not claimed:** real x86 hardware until CI has run, Windows, WebAssembly, 32-bit x86 (where x87 extended precision could cause
 double rounding), or other compiler versions. Run `zig build pow-bits -Dtarget=…` there and
 compare with the hash above before relying on bit-identity.
 

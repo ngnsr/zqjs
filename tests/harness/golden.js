@@ -21,8 +21,10 @@ function emit(file, content, sameLine = (a, b) => a === b) {
   if (check) {
     const old = fs.existsSync(full) ? fs.readFileSync(full, 'utf8').split('\n') : null;
     const now = content.split('\n');
-    if (!old || old.length !== now.length || !old.every((l, i) => sameLine(l, now[i]))) {
+    const bad = !old || old.length !== now.length ? -1 : old.findIndex((l, i) => !sameLine(l, now[i]));
+    if (bad !== -1 || !old) {
       stale++; console.log(`out of date: ${file}`);
+      if (bad >= 0) console.log(`  line ${bad + 1}\n  committed: ${old[bad]}\n  node now:  ${now[bad]}`);
     }
   } else {
     fs.writeFileSync(full, content);

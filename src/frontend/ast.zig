@@ -85,6 +85,8 @@ pub const Expr = struct {
         binary: struct { op: BinaryOp, lhs: *const Expr, rhs: *const Expr },
         /// `target = value` (op null) or `target op= value`.
         assign: struct { op: ?BinaryOp, target: Ref, value: *const Expr },
+        /// `callee(args)`. In M3 only native functions (`print`) can be called.
+        call: struct { callee: *const Expr, args: []const *const Expr },
         /// `++x`, `--x`, `x++`, `x--`.
         update: struct { op: enum { inc, dec }, prefix: bool, target: Ref },
     };

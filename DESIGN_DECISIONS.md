@@ -247,18 +247,22 @@ that first enforces it; defaults are deliberately conservative.
 |---|---|---|---|
 | `max_source_bytes` | 16 MiB | parse entry / file read | M1 |
 | `max_nesting_depth` | 512 | parser recursion + AST depth | M1 |
-| `max_instructions` | unlimited (0) | counted at backward jumps and calls | M5 |
 | `max_call_depth` | 1 000 | frame push (JS and native re-entry) | M6 |
 | `max_stack_slots` | 1 Mi values | stack growth | M6 |
-| `max_heap_bytes` | 256 MiB | `heap.new` (after a collection), counting allocator | M8 |
+| `max_steps` | unlimited (CLI: 200 M, `--max-steps`) | every statement, every expression, every loop iteration | M3 |
+| `max_heap_bytes` | 256 MiB | every heap allocation (from M8: after a collection first) | M3 |
 | `max_string_length` | 2²⁸ code units | string creation / concat | M3 |
 | `max_array_length` | 2²⁶ | element growth | M7 |
 | `max_object_properties` | 2²⁰ | property insertion | M7 |
 | `max_temp_roots` | 1 024 | `pushTemp` | M8 |
 
-Checking instructions only at backward jumps and calls is enough to bound execution, since any
-unbounded run needs a loop or a call. Natives that loop (e.g. `join`) are bounded by the
-collection limits.
+*CLI default:* the library leaves `max_steps` unlimited because an embedder must choose its own
+budget, but the `zqjs` command defaults to 200 million steps (a few seconds), so an accidental
+infinite loop ends with `LimitExceeded(steps)` instead of hanging; `--max-steps 0` removes it.
+*Revised in M3:* the step budget charges every statement and expression evaluation as well as
+every loop iteration, so long straight-line programs and deep expressions consume it too, not
+only loops. Natives that loop internally (e.g. a future `join`) are bounded by the collection
+limits.
 *Shortcut accepted:* buffer growth through `heap.allocator()` cannot collect, so near the heap
 limit it may fail although collectible garbage exists. `heap.new` collects early (`next_gc` is
 capped at the limit), so this only bites in edge cases. Upgrade path: make buffer growth a safe
@@ -337,3 +341,57 @@ undecidable (`function f() { return x } f(); let x;`). M3 stores an internal `un
 in a binding's slot on scope entry, checks it on every read and write, and overwrites it when the
 declaration runs. A static "always initialised here" analysis may later remove checks as an
 optimisation.
+
+## D25. `**` uses `std.math.pow`; inexact results may differ from node *(known deviation)*
+The spec leaves `Math.pow`/`**` "implementation-approximated", and engines differ. node's
+results come from V8's own pow, and the M3 golden table found 8 of 324 cases where Zig's
+`std.math.pow` disagrees: mostly 1 ulp, but up to ~80 ulps for `1e308 ** (1/3)`. Special and
+exact cases (NaN, ±Infinity, ±0, ±1, integral results) all match, plus the two places where
+C `pow` and JS differ (`1 ** NaN`, `(±1) ** ±Infinity` are NaN), which `ops.pow` handles.
+`tests/ops_test.zig` caps the inexact mismatches at today's 8, so it can only get better.
+**Decision (after M3):** `pow` becomes its own milestone (ROADMAP "P"). Two separate goals:
+(1) JS *semantics*: every special case (NaN, ±Infinity, ±0, negative bases with integer and
+non-integer exponents, ±1) exactly as the spec says; (2) *accuracy*: within 1 ulp of the true
+result, using fdlibm's `e_pow.c` as the reference algorithm. The target is excellent accuracy
+and JS-compatible semantics, **not** reproducing V8's last bit, which no portable specification
+defines. Differential tests against node over thousands of edge cases and random finite doubles
+measure both; remaining last-bit differences stay documented here.
+
+## D26. TDZ marker: slots are `?Value`
+`null` means "not yet initialised". Zig's optional type makes it impossible for the marker to
+reach JS code: every read must unwrap it, and the unwrap is where the ReferenceError is thrown.
+**Alternative:** an internal `Value.uninitialized` tag, which every operation would have to remember
+to reject.
+
+## D27. Exceptions before objects exist
+Until M7 there are no Error objects. An exception is `Exception { name: ErrorName, message }`
+stored in `Runtime.exception`; the interpreter returns `error.Thrown`. **Ownership:** `name`
+is a static enum; `message` is a heap string owned by `Runtime.heap`, valid until
+`Runtime.deinit`, so it survives unwinding and the host can print it afterwards. If building
+the message fails (heap limit, OOM), that failure is reported instead. In M7 the thrown
+value becomes a real `Value`.
+
+## D28. Heap accounting
+Every runtime allocation is charged `header + payload + allocations × 16` *before* it happens,
+with overflow-checked arithmetic (`std.math.add/mul`), and refused if it would pass
+`max_heap_bytes`. The 16-byte per-allocation overhead stands in for allocator bookkeeping that
+`std.mem.Allocator` doesn't expose; it stops floods of tiny or empty strings from slipping
+under the limit. A refused or failed allocation leaves the counter unchanged (tested).
+`max_string_length` is checked on the summed length, also overflow-safe.
+
+## D29. Control flow is a value, not an error
+`exec` returns `Completion = .normal | .break | .continue`; loops consume break/continue.
+Zig errors are reserved for things that end the whole script (Thrown, LimitExceeded,
+Unsupported, OutOfMemory, WriteFailed). The parser guarantees break/continue never escape a loop.
+
+## D30. String literals allocate on every evaluation *(shortcut)*
+The tree-walker creates a new heap string each time a string literal is evaluated. Correct,
+but wasteful in loops; with no GC until M8 this memory isn't reclaimed during a run (the heap
+limit still bounds it). The M4 constant pool creates each literal once.
+
+## D31. Test layout
+Small unit tests stay in `src/` next to the code they test (Zig's convention: they can test
+private functions). Everything else lives in `tests/`, behind one root (`tests/all.zig`) and
+the public `zqjs` module: whole-pipeline allocation-failure and fuzz tests, syntax cases,
+node-generated golden tables (`tests/ops`) and whole-program differential tests (`tests/diff`).
+`zig build test` builds exactly two test binaries.

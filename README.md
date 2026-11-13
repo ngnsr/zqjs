@@ -7,9 +7,10 @@ Inspired by QuickJS and Crafting Interpreters; it does not reuse their code.
 Priorities: correctness, simplicity, inspectability. Speed comes last.
 
 ## Status
-Milestone 2 of 11: the frontend parses expressions, `let`/`const`, assignment, blocks,
-`if`/`while`/`for` and `break`/`continue`, and resolves every name to a scope slot or a global,
-with precise diagnostics. Nothing executes yet. See [ROADMAP.md](ROADMAP.md).
+Milestone 3 of 11: ZQJS runs programs. A tree-walking interpreter executes expressions,
+`let`/`const`, assignment, blocks, `if`/`while`/`for`, `break`/`continue` and `print(…)`, with
+JavaScript's semantics for numbers, strings, `-0`, the temporal dead zone and `const`. Output is
+checked byte for byte against node. See [ROADMAP.md](ROADMAP.md).
 
 ## Requirements
 **Zig 0.17.1 exactly** (the build refuses other versions; see DESIGN_DECISIONS D17).
@@ -23,12 +24,16 @@ node (any recent version) is only needed for `zig build check-node`.
 ## Usage
 ```sh
 zig build                                   # builds zig-out/bin/zqjs
-zig build run -- --dump-ast -e "let x = 1; { let x = x + 2; }"
+zig-out/bin/zqjs program.js                 # run a script (stops after 200M steps; --max-steps N, 0 = no limit)
+zig-out/bin/zqjs -e "let s = ''; for (let i = 0; i < 3; i++) { s += i; } print(s, 0.1 + 0.2);"
+# 012 0.30000000000000004
+zig-out/bin/zqjs --dump-ast -e "let x = 1; { let x = x + 2; }"
 # (let (x#0@0 1))
-# (block (let (x#1@1 (+ x#1 2))))   ← inner x refers to itself (TDZ in M3)
-zig build test                              # unit + syntax-case tests
-zig build test --fuzz=100K                  # also fuzz the parser
-zig build check-node                        # verify syntax cases against node
+# (block (let (x#1@1 (+ x#1 2))))           ← inner x refers to itself: a TDZ error if run
+zig build test                              # unit + integration tests (tests/all.zig)
+zig build test --fuzz=100K                  # also fuzz parsing and execution
+zig build check-node                        # verify syntax cases and goldens against node
+zig build update-golden                     # regenerate tests/ops and tests/diff/*.out with node
 ```
 
 ## Documents

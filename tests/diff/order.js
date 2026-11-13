@@ -1,0 +1,14 @@
+print('left') + print('right');
+print(print('arg 1'), print('arg 2'));
+let x = 1;
+x = x + (x = 10);
+print(x);
+let y = 1;
+y += (y = 10);
+print(y);
+let i = 0;
+print(i++ + i++, i);
+print(++i + ++i, i);
+let t = 'a';
+t += t += 'b';
+print(t);

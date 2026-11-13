@@ -133,6 +133,15 @@ const Dumper = struct {
                 try d.expr(a.value);
                 try w.writeByte(')');
             },
+            .call => |c| {
+                try w.writeAll("(call ");
+                try d.expr(c.callee);
+                for (c.args) |arg| {
+                    try w.writeByte(' ');
+                    try d.expr(arg);
+                }
+                try w.writeByte(')');
+            },
             .update => |u| {
                 const sym = if (u.op == .inc) "++" else "--";
                 try w.print("({s}{s} ", .{ if (u.prefix) "pre" else "post", sym });

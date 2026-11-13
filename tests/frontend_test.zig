@@ -1,14 +1,13 @@
 //! Tests over the whole frontend (parse → resolve → dump): allocation-failure paths
-//! and fuzzing. Kept out of parser.zig so the parser doesn't depend on later stages.
+//! and fuzzing. Lives here, not in src/, so no frontend file depends on a later stage.
 
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const Diagnostic = @import("diag.zig").Diagnostic;
-const Limits = @import("../limits.zig").Limits;
-const parse = @import("parser.zig").parse;
-const resolver = @import("resolver.zig");
-const dump = @import("dump.zig");
+const zqjs = @import("zqjs");
+const Diagnostic = zqjs.Diagnostic;
+const Limits = zqjs.Limits;
+const parse = zqjs.parse;
 
 /// The whole frontend: parse, resolve, dump. Used by the error-path and fuzz tests.
 fn frontendOnce(allocator: Allocator, source: []const u8, limits: Limits) !void {
@@ -16,9 +15,9 @@ fn frontendOnce(allocator: Allocator, source: []const u8, limits: Limits) !void 
     defer arena.deinit();
     var d: Diagnostic = .{};
     const script = parse(arena.allocator(), source, limits, &d) catch |err| return checkFailure(err, d, source);
-    const res = resolver.resolve(arena.allocator(), script, &d) catch |err| return checkFailure(err, d, source);
+    const res = zqjs.resolve(arena.allocator(), script, &d) catch |err| return checkFailure(err, d, source);
     var discard: std.Io.Writer.Discarding = .init(&.{});
-    try dump.script(script, res, &discard.writer);
+    try zqjs.dump.script(script, res, &discard.writer);
 }
 
 fn checkFailure(err: anyerror, d: Diagnostic, source: []const u8) !void {

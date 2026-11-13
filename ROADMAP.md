@@ -7,7 +7,8 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 |---|---|---|
 | 1 | Lexer, Pratt parser for expressions, AST, diagnostics, `--dump-ast` | **done** |
 | 2 | `let`/`const`, assignment, blocks, `if`/`while`/`for`, `break`/`continue`, resolver | **done** |
-| 3 | Tree-walking interpreter, `runtime/ops.zig`, UTF-16 strings, `print`, diff harness | – |
+| 3 | Tree-walking interpreter, `runtime/ops.zig`, UTF-16 strings, `print`, diff harness | **done** |
+| P | Accurate `pow`: JS special cases, fdlibm-based algorithm, ≤ 1 ulp, node differential tests (D25) | – |
 | 4 | Bytecode compiler, constant pool, `max_stack`, disassembler | – |
 | 5 | Stack VM with `step()` / `--trace`, instruction budget | – |
 | 6 | Functions, cells/closures, growable stack, call-depth limit | – |
@@ -38,13 +39,22 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 - assignment targets, `++`/`--` targets, `++x ** 2` vs `-x ** 2`
 - error paths and fuzzing over parse + resolve + dump; `check-node` now *runs* scripts
 
-**M3:** TDZ and const, from LANGUAGE.md §5: `x; let x`, `let x = x`, inner-block hoisting;
+**M3 (done)**: every item below is a program in `tests/diff` whose output equals node's.
+TDZ and const, from LANGUAGE.md §5: `x; let x`, `let x = x`, inner-block hoisting;
 `x = print('rhs'); let x` prints then throws, `x += print('rhs'); let x` throws first;
 re-entering a block resets its bindings (`while (n < 2) { n++; if (n === 2) print(z); let z = 1; }`
 throws on the second iteration); `const` TypeError for `=`, `+=`, `++` and in `for (const …; i++)`,
 none for `if (false) c = 2`.
-**M3:** surrogates at runtime: `length`, `charCodeAt`, concatenating two lone halves gives one
-pair, printing a lone surrogate gives U+FFFD (as node).
+Surrogates: concatenating two lone halves gives one pair, printing a lone surrogate gives U+FFFD.
+`-0` through arithmetic, comparison, compound assignment and string conversion. Evaluation order
+(left before right, arguments before the call check, short-circuit side effects). Golden tables
+from node for Number→String (3,183 values), String→Number and `+ - * / % **` on special values.
+Limits: step budget on loops, straight-line code and deep expressions; heap and string limits;
+allocation failure at every point; fuzzing of whole runs.
+**M7:** `length` and `charCodeAt` on strings with surrogates.
+**P (pow):** special-case table from the spec (all match node exactly); accuracy measured in ulps
+against node on thousands of random finite doubles; the `pow_inexact` cap in tests/ops_test.zig
+replaced by an ulp bound.
 **M6:** per-iteration `for (let …)` bindings: closures created in the body must each see their
 own iteration's value (`for (let i = 0; i < 3; i++) fs.push(() => i)` → 0, 1, 2), including when
 the body or the update changes `i`.

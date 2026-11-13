@@ -162,6 +162,10 @@ const Resolver = struct {
                 try r.target(a.target);
             },
             .update => |u| try r.target(u.target),
+            .call => |c| {
+                try r.expr(c.callee);
+                for (c.args) |arg| try r.expr(arg);
+            },
         }
     }
 

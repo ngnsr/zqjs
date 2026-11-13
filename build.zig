@@ -33,18 +33,28 @@ pub fn build(b: *std.Build) void {
     run.addPassthruArgs();
     b.step("run", "Run the zqjs CLI").dependOn(&run.step);
 
-    const test_step = b.step("test", "Run unit tests and syntax-case tests");
+    // Two test binaries: unit tests inside src/, and integration tests in tests/.
+    const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
-    const cases = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("tests/syntax_test.zig"),
+    const integration = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/all.zig"),
         .target = target,
         .optimize = optimize,
         .imports = imports,
-    }) });
-    test_step.dependOn(&b.addRunArtifact(cases).step);
+    }) }));
+    integration.setCwd(b.path(".")); // diff_test reads tests/diff at runtime
+    test_step.dependOn(&integration.step);
 
+    const check_node = b.step("check-node", "Check syntax cases and goldens against node");
     const node = b.addSystemCommand(&.{"node"});
     node.addFileArg(b.path("tests/harness/check_syntax_cases.js"));
     node.addFileArg(b.path("tests/syntax/cases.jsonl"));
-    b.step("check-node", "Check tests/syntax/cases.jsonl against node").dependOn(&node.step);
+    check_node.dependOn(&node.step);
+    const goldens = b.addSystemCommand(&.{ "node", "tests/harness/golden.js", "--check" });
+    goldens.setCwd(b.path("."));
+    check_node.dependOn(&goldens.step);
+
+    const update = b.addSystemCommand(&.{ "node", "tests/harness/golden.js" });
+    update.setCwd(b.path("."));
+    b.step("update-golden", "Regenerate tests/ops and tests/diff/*.out with node").dependOn(&update.step);
 }

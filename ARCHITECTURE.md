@@ -12,7 +12,7 @@ source ─▶ Lexer ─▶ Parser ─▶ AST ─▶ Resolver ─▶ Compiler ─
 Dependencies point one way: frontend → compiler → runtime/VM. The frontend knows nothing about
 the runtime.
 
-## Built so far (M2)
+## Built so far (M3)
 
 | file | role |
 |---|---|
@@ -23,9 +23,16 @@ the runtime.
 | `src/frontend/resolver.zig` | scopes and names → binding ids, slots, globals; redeclaration and global-write checks |
 | `src/frontend/dump.zig` | S-expression dump with resolved names (`x#binding@slot`, `x@global`) |
 | `src/frontend/diag.zig` | `Diagnostic` (kind, feature, span), line/column, rendering with caret |
+| `src/runtime/value.zig` | `Value` (tagged union) and `Native` |
+| `src/runtime/heap.zig` | `Heap`: list of all objects, `String`, byte accounting and limits |
+| `src/runtime/runtime.zig` | `Runtime`: heap, output, step budget, exception / stop reason |
+| `src/runtime/ops.zig` | all JS value semantics: ToNumber, ToString (number formatting), ToBoolean, operators |
+| `src/runtime/globals.zig` | `undefined`, `NaN`, `Infinity`, `print` |
+| `src/interp/treewalk.zig` | tree-walking interpreter over AST + Resolution, `?Value` slots |
+| `src/run.zig` | source → parse → resolve → run, with outcome reporting (CLI and tests share it) |
 | `src/limits.zig` | `Limits` (only the limits enforced so far, see DESIGN_DECISIONS D15) |
-| `src/root.zig` | library entry: `parse`, `resolve`, `dump` |
-| `src/main.zig` | CLI: `zqjs --dump-ast FILE` / `zqjs --dump-ast -e SOURCE` |
+| `src/root.zig` | library entry: `parse`, `resolve`, `dump`, `Runtime`, `interpret`, `runSource` |
+| `src/main.zig` | CLI: `zqjs FILE`, `zqjs -e SRC`, `--test` (harness output), `--dump-ast` |
 
 ### Ownership in the frontend
 - The lexer borrows the source and returns tokens by value; it allocates nothing.
@@ -49,9 +56,25 @@ parentheses, an identifier) is `Unsupported(syntax)`.
 See DESIGN_DECISIONS.md: heap and GC (D7–D11), stack (D12), objects (D13), limits (D15),
 oracle (D16).
 
+### Runtime ownership (M3)
+- Runtime values point into the `Heap`, never into the frontend arena; nothing created at
+  runtime depends on the AST.
+- Every heap object is on one linked list and is freed by `Runtime.deinit` (no GC until M8).
+- The interpreter's slot array is allocated per run and freed when the run ends.
+- A thrown exception's message is a heap string: it outlives unwinding, and the host reads
+  it before `Runtime.deinit` (DESIGN_DECISIONS D27).
+
 ## Tests
-- Unit tests live next to the code (`test "…"` blocks).
-- `tests/syntax/cases.jsonl`: one `[outcome, source, expected_dump?]` per line, checked by
-  `tests/syntax_test.zig` (ZQJS) and `tests/harness/check_syntax_cases.js` (node).
-- `src/frontend/frontend_test.zig`: allocation-failure paths and the fuzz target over the whole
-  frontend (parse → resolve → dump); `zig build test --fuzz` runs the fuzzer.
+```
+src/**                    unit tests next to the code (`test` blocks)
+tests/all.zig             root of all integration tests (through the public zqjs module)
+tests/frontend_test.zig   allocation-failure paths + fuzzing of parse → resolve → dump
+tests/interpreter_test.zig limits, allocation failures, exception ownership, fuzzing of runs
+tests/syntax_test.zig     tests/syntax/cases.jsonl: outcome + resolved dump per source
+tests/ops_test.zig        tests/ops/*.jsonl: conversions/operators vs node, bit for bit
+tests/diff_test.zig       tests/diff/*.js: program output must equal node's tests/diff/*.out
+tests/harness/            node scripts: golden.js (regenerate/check goldens), check_syntax_cases.js
+```
+- `zig build test` runs the unit and integration test binaries; `zig build test --fuzz` fuzzes.
+- `zig build update-golden` regenerates `tests/ops` and `tests/diff/*.out` with node;
+  `zig build check-node` verifies the syntax contract and that every golden is up to date.

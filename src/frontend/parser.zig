@@ -321,7 +321,7 @@ const Parser = struct {
         const lhs = try p.binary(0);
         const op = assignOp(p.tok.tag) orelse return lhs;
         // Parentheses are transparent, so `(x) = 1` arrives here as a plain identifier, as in JS.
-        if (lhs.data != .identifier) return p.failAt(.{ .syntax_error = "invalid assignment target" }, lhs.span.start, lhs.span.end);
+        if (lhs.data != .identifier) return p.invalidTarget(lhs, "invalid assignment target");
         try p.advance();
         const value = try p.expression();
         return p.node(
@@ -378,7 +378,7 @@ const Parser = struct {
                     0,
                 );
             },
-            else => return p.postfix(try p.primary()),
+            else => return p.postfix(try p.calls(try p.primary())),
         }
     }
 
@@ -397,8 +397,42 @@ const Parser = struct {
     }
 
     fn updateTarget(p: *Parser, operand: *const ast.Expr) Error!ast.Ref {
-        if (operand.data != .identifier) return p.failAt(.{ .syntax_error = "invalid update target" }, operand.span.start, operand.span.end);
+        if (operand.data != .identifier) return p.invalidTarget(operand, "invalid update target");
         return operand.data.identifier;
+    }
+
+    /// `f() = 1` and `f()++` are *runtime* ReferenceErrors in node (a web-compatibility
+    /// rule), not SyntaxErrors, so for calls we must not claim a SyntaxError.
+    fn invalidTarget(p: *Parser, e: *const ast.Expr, msg: []const u8) Error {
+        if (e.data == .call) return p.failAt(.{ .unsupported = .syntax }, e.span.start, e.span.end);
+        return p.failAt(.{ .syntax_error = msg }, e.span.start, e.span.end);
+    }
+
+    /// `callee(args)(args)…`. Unlike `++`, a call may continue on the next line:
+    /// `x\n(2)` calls x.
+    fn calls(p: *Parser, callee_in: *const ast.Expr) Error!*const ast.Expr {
+        var callee = callee_in;
+        while (p.tok.tag == .l_paren) {
+            try p.advance();
+            var args: std.ArrayList(*const ast.Expr) = .empty;
+            var depth = callee.depth;
+            while (p.tok.tag != .r_paren) {
+                if (p.tok.tag == .ellipsis) return p.fail(.{ .unsupported = .syntax }, p.tok); // spread
+                const arg = try p.expression();
+                try args.append(p.arena, arg);
+                depth = @max(depth, arg.depth);
+                if (p.tok.tag != .comma) break;
+                try p.advance(); // a trailing comma is allowed: `f(1,)`
+            }
+            const close = p.tok;
+            try p.expectAfterExpression(.r_paren);
+            callee = try p.node(
+                .{ .start = callee.span.start, .end = close.end },
+                .{ .call = .{ .callee = callee, .args = args.items } },
+                depth,
+            );
+        }
+        return callee;
     }
 
     fn primary(p: *Parser) Error!*const ast.Expr {

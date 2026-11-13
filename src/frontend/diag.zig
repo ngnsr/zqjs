@@ -16,10 +16,12 @@ pub const Feature = enum {
     bigint,
     labels,
     global_assignment,
+    function_to_string,
     syntax,
 
     pub fn description(f: Feature) []const u8 {
         return switch (f) {
+            .function_to_string => "converting a function to a string",
             .labels => "labels",
             .global_assignment => "assignment to an undeclared variable",
             .asi => "automatic semicolon insertion; end the statement with ';'",

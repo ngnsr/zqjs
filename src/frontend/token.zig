@@ -13,6 +13,15 @@ pub const Tag = enum {
     kw_true,
     kw_false,
     kw_null,
+    kw_const,
+    kw_if,
+    kw_else,
+    kw_while,
+    kw_for,
+    kw_break,
+    kw_continue,
+    // `let` is not a keyword: in sloppy scripts it is an ordinary identifier
+    // (`let = 1;` is valid JS), so the parser treats it contextually.
     /// Characters with no meaning to ZQJS: `#`, `@`, `` ` ``, `\`, `<!--`, ASCII control chars.
     unknown,
 
@@ -77,6 +86,24 @@ pub const Tag = enum {
     pipe_pipe_eq,
     question2_eq,
 };
+
+pub fn isKeyword(tag: Tag) bool {
+    return switch (tag) {
+        .kw_true, .kw_false, .kw_null, .kw_const, .kw_if, .kw_else, .kw_while, .kw_for, .kw_break, .kw_continue => true,
+        else => false,
+    };
+}
+
+/// Reserved words of sloppy-mode scripts that lex as plain identifiers in ZQJS
+/// (the ones with their own Tag are covered by `isKeyword`). None of them may name
+/// a variable; most of them start constructs ZQJS doesn't have yet.
+pub const reserved_identifiers = std.StaticStringMap(void).initComptime(.{
+    .{"case"},   .{"catch"}, .{"class"},      .{"debugger"}, .{"default"}, .{"delete"},
+    .{"do"},     .{"enum"},  .{"export"},     .{"extends"},  .{"finally"}, .{"function"},
+    .{"import"}, .{"in"},    .{"instanceof"}, .{"new"},      .{"return"},  .{"super"},
+    .{"switch"}, .{"this"},  .{"throw"},      .{"try"},      .{"typeof"},  .{"var"},
+    .{"void"},   .{"with"},
+});
 
 pub const Token = struct {
     tag: Tag,

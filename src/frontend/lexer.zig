@@ -162,6 +162,13 @@ fn keyword(s: []const u8) Tag {
         .{ "true", .kw_true },
         .{ "false", .kw_false },
         .{ "null", .kw_null },
+        .{ "const", .kw_const },
+        .{ "if", .kw_if },
+        .{ "else", .kw_else },
+        .{ "while", .kw_while },
+        .{ "for", .kw_for },
+        .{ "break", .kw_break },
+        .{ "continue", .kw_continue },
     });
     return map.get(s) orelse .identifier;
 }

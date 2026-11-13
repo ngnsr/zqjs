@@ -6,6 +6,12 @@
 const std = @import("std");
 const zqjs = @import("zqjs");
 
+fn frontend(arena: std.mem.Allocator, source: []const u8, diag: *zqjs.Diagnostic, w: *std.Io.Writer) !void {
+    const script = try zqjs.parse(arena, source, .{}, diag);
+    const resolution = try zqjs.resolve(arena, script, diag);
+    try zqjs.dump.script(script, resolution, w);
+}
+
 test "syntax cases" {
     const gpa = std.testing.allocator;
     var failures: usize = 0;
@@ -23,8 +29,7 @@ test "syntax cases" {
         defer arena.deinit();
         var diag: zqjs.Diagnostic = .{};
         var got: std.Io.Writer.Allocating = .init(arena.allocator());
-        if (zqjs.parse(arena.allocator(), source, .{}, &diag)) |script| {
-            try zqjs.ast.dump(script, &got.writer);
+        if (frontend(arena.allocator(), source, &diag, &got.writer)) {
             const dump = std.mem.trimEnd(u8, got.written(), "\n");
             if (!std.mem.eql(u8, outcome, "ok") or (case.len > 2 and !std.mem.eql(u8, dump, case[2]))) {
                 std.debug.print("cases.jsonl:{d}: expected {s}, got ok: {s}\n", .{ line_no, outcome, dump });

@@ -14,10 +14,14 @@ pub const Feature = enum {
     numeric_separator,
     non_decimal_literal,
     bigint,
+    labels,
+    global_assignment,
     syntax,
 
     pub fn description(f: Feature) []const u8 {
         return switch (f) {
+            .labels => "labels",
+            .global_assignment => "assignment to an undeclared variable",
             .asi => "automatic semicolon insertion; end the statement with ';'",
             .loose_equality => "loose equality; use '===' or '!=='",
             .legacy_octal => "legacy octal literal or escape",

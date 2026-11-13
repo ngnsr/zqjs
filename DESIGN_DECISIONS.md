@@ -234,8 +234,9 @@ Anything uncertain is `Unsupported`. Unsupported claims nothing, so it can't be 
 and keep running with behaviour node never produces: unsupported behaviour masquerading as
 JavaScript. The same holds for limits, which are also how a host sandboxes a script.
 *Change from v2:* sparse-array writes are now `Unsupported`, not a catchable `RangeError`.
-**Verification.** Syntax cases live in `tests/syntax/cases.jsonl`; `zig build check-node` asserts
-every `ok` case parses in node and every `syntax` case is a node SyntaxError. From M3, `tests/diff/`
+**Verification.** Syntax cases live in `tests/syntax/cases.jsonl`; `zig build check-node` *runs*
+each case in node (some SyntaxErrors, like top-level `let undefined`, only appear when a
+script starts) and asserts `ok` cases raise no SyntaxError and `syntax` cases do. From M3, `tests/diff/`
 compares runtime output, and a diff test that ends in `Unsupported`/`LimitExceeded` *fails*.
 
 ## D15. Resource limits
@@ -296,3 +297,43 @@ the use-after-free at the exact line. `zig build test --fuzz` works.
 | `-Dstack-stress` | pointers surviving stack moves | M6 |
 | `-Dsystem-alloc` + Guard Malloc | real UAF/overflow (page granularity) | M8 |
 | Valgrind (Linux CI) | UAF/uninitialised reads | M10 |
+
+## D20. Name resolution goes into side tables, not into the AST
+The parser numbers every variable use (`Ref.id`) and every declarator (`Declarator.binding`).
+The resolver fills `Resolution.refs[id]` and `Resolution.bindings[binding]`, sized exactly from
+the parser's counters. **Why:** the AST stays immutable (`*const`) after parsing, each pass owns
+exactly what it writes, and a later pass can add its own table without touching the tree.
+**Alternative:** a mutable `resolved` field in each identifier node. Simpler to read, but then
+"parsed" and "resolved" are states of the same object.
+**Algorithm:** see the header of `src/frontend/resolver.zig`. One `live` stack of visible bindings;
+`scope_start` marks the current scope, saved on the Zig call stack while a nested scope is walked.
+The *current* scope is `live[scope_start..]`, which is what the redeclaration check scans, so
+shadowing an outer name is never mistaken for a redeclaration. Slot = index in `live`.
+
+## D21. Assignment to an undeclared name is Unsupported
+Sloppy JS silently creates a global (`y = 1`) or silently ignores the write (`undefined = 1`).
+Until hosts can define globals (M9), ZQJS rejects such writes in the resolver
+(`Unsupported(global_assignment)`). Reads of undeclared names stay legal (they reach the global
+object at runtime: `undefined`, `NaN`, and later `print`).
+
+## D22. `for (let …)`: one slot now, per-iteration copies in M6
+The spec creates a fresh copy of the loop-head bindings for every iteration
+(CreatePerIterationEnvironment). Only closures can observe the difference. M3 and M4 use one
+slot per head binding. **This is a simplification, not an architectural limit:** the head
+declaration stays a distinct AST node (`for.init.declaration`) in its own resolver scope, so
+M6 knows exactly which bindings to copy. With heap cells (D10), copying means "at the end of each
+iteration, before the update, allocate a new cell holding the current value" for each *captured*
+head binding. Required regression test listed in ROADMAP (M6).
+
+## D23. Top-level `let`/`const` are script-local
+In node, top-level lexical bindings of one script are visible to later scripts in the same realm.
+ZQJS runs one script at a time, so top-level bindings are ordinary slots. Revisit with the
+embedding API (M9) if hosts need several scripts to share bindings. The restricted-global rule
+(`let undefined` at script level is a SyntaxError) is applied anyway, to match node.
+
+## D24. TDZ is enforced at runtime, not by static analysis
+Without functions (M2) every TDZ violation could be found statically, but closures (M6) make that
+undecidable (`function f() { return x } f(); let x;`). M3 stores an internal `uninitialized` value
+in a binding's slot on scope entry, checks it on every read and write, and overwrites it when the
+declaration runs. A static "always initialised here" analysis may later remove checks as an
+optimisation.

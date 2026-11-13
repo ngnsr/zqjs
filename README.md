@@ -7,8 +7,9 @@ Inspired by QuickJS and Crafting Interpreters; it does not reuse their code.
 Priorities: correctness, simplicity, inspectability. Speed comes last.
 
 ## Status
-Milestone 1 of 11: the frontend parses arithmetic, comparison and logical expressions into an
-AST, with precise diagnostics. Nothing executes yet. See [ROADMAP.md](ROADMAP.md).
+Milestone 2 of 11: the frontend parses expressions, `let`/`const`, assignment, blocks,
+`if`/`while`/`for` and `break`/`continue`, and resolves every name to a scope slot or a global,
+with precise diagnostics. Nothing executes yet. See [ROADMAP.md](ROADMAP.md).
 
 ## Requirements
 **Zig 0.17.1 exactly** (the build refuses other versions; see DESIGN_DECISIONS D17).
@@ -22,7 +23,9 @@ node (any recent version) is only needed for `zig build check-node`.
 ## Usage
 ```sh
 zig build                                   # builds zig-out/bin/zqjs
-zig build run -- --dump-ast -e "1 + 2 * 3;" # (+ 1 (* 2 3))
+zig build run -- --dump-ast -e "let x = 1; { let x = x + 2; }"
+# (let (x#0@0 1))
+# (block (let (x#1@1 (+ x#1 2))))   ← inner x refers to itself (TDZ in M3)
 zig build test                              # unit + syntax-case tests
 zig build test --fuzz=100K                  # also fuzz the parser
 zig build check-node                        # verify syntax cases against node

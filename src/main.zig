@@ -50,6 +50,13 @@ pub fn main(init: std.process.Init) !u8 {
             return 1;
         },
     };
-    try zqjs.ast.dump(script, out);
+    const resolution = zqjs.resolve(arena, script, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            try diag.render(source, name, err);
+            return 1;
+        },
+    };
+    try zqjs.dump.script(script, resolution, out);
     return 0;
 }

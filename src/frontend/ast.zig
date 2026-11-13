@@ -1,5 +1,9 @@
 //! Abstract syntax tree. All nodes live in the arena passed to the parser
-//! (DESIGN_DECISIONS D2) and point to each other directly (D3).
+//! (DESIGN_DECISIONS D2) and point to each other directly (D3). The tree is never
+//! modified after parsing: name resolution goes into side tables (D20).
+//!
+//! Names (`Ref.name`, `Declarator.name`) are slices of the source text, so the
+//! source must outlive the AST.
 
 const std = @import("std");
 
@@ -56,6 +60,13 @@ pub const BinaryOp = enum {
     }
 };
 
+/// A use of a variable name. `id` indexes `Resolution.refs` (resolver.zig).
+pub const Ref = struct {
+    name: []const u8,
+    span: Span,
+    id: u32,
+};
+
 pub const Expr = struct {
     span: Span,
     /// 1 + depth of the deepest child; bounded by Limits.max_nesting_depth, so every
@@ -69,55 +80,58 @@ pub const Expr = struct {
         string: []const u16,
         boolean: bool,
         null,
+        identifier: Ref,
         unary: struct { op: UnaryOp, operand: *const Expr },
         binary: struct { op: BinaryOp, lhs: *const Expr, rhs: *const Expr },
+        /// `target = value` (op null) or `target op= value`.
+        assign: struct { op: ?BinaryOp, target: Ref, value: *const Expr },
+        /// `++x`, `--x`, `x++`, `x--`.
+        update: struct { op: enum { inc, dec }, prefix: bool, target: Ref },
     };
 };
 
-pub const Stmt = union(enum) {
+pub const DeclKind = enum { let, @"const" };
+
+pub const Declarator = struct {
+    name: []const u8,
+    span: Span,
+    /// Index into `Resolution.bindings`.
+    binding: u32,
+    init: ?*const Expr,
+};
+
+pub const Declaration = struct {
+    kind: DeclKind,
+    declarators: []const Declarator,
+};
+
+pub const Stmt = struct {
+    span: Span,
+    data: Data,
+
+    pub const Data = union(enum) {
+        empty,
+        expression: *const Expr,
+        declaration: Declaration,
+        block: []const Stmt,
+        @"if": struct { cond: *const Expr, then: *const Stmt, @"else": ?*const Stmt },
+        @"while": struct { cond: *const Expr, body: *const Stmt },
+        /// The head declaration (if any) lives in its own scope around the body. Its
+        /// bindings are the ones the spec copies per iteration (DESIGN_DECISIONS D22).
+        @"for": struct { init: ?ForInit, cond: ?*const Expr, update: ?*const Expr, body: *const Stmt },
+        @"break",
+        @"continue",
+    };
+};
+
+pub const ForInit = union(enum) {
+    declaration: Declaration,
     expression: *const Expr,
 };
 
 pub const Script = struct {
     statements: []const Stmt,
+    /// Number of `Ref`s and `Declarator`s, so the resolver can size its tables exactly.
+    ref_count: u32,
+    binding_count: u32,
 };
-
-/// One S-expression per statement, e.g. `(+ 1 (* 2 3))`. A debugging format, not JS:
-/// strings print non-printable or non-ASCII code units as `\uXXXX`.
-pub fn dump(script: Script, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    for (script.statements) |s| switch (s) {
-        .expression => |e| {
-            try dumpExpr(e, w);
-            try w.writeByte('\n');
-        },
-    };
-}
-
-pub fn dumpExpr(e: *const Expr, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    switch (e.data) {
-        .number => |n| try w.print("{d}", .{n}),
-        .string => |units| {
-            try w.writeByte('"');
-            for (units) |u| switch (u) {
-                '"', '\\' => try w.print("\\{c}", .{@as(u8, @intCast(u))}),
-                0x20...0x21, 0x23...0x5B, 0x5D...0x7E => try w.writeByte(@intCast(u)),
-                else => try w.print("\\u{X:0>4}", .{u}),
-            };
-            try w.writeByte('"');
-        },
-        .boolean => |b| try w.writeAll(if (b) "true" else "false"),
-        .null => try w.writeAll("null"),
-        .unary => |u| {
-            try w.print("({s} ", .{u.op.symbol()});
-            try dumpExpr(u.operand, w);
-            try w.writeByte(')');
-        },
-        .binary => |b| {
-            try w.print("({s} ", .{b.op.symbol()});
-            try dumpExpr(b.lhs, w);
-            try w.writeByte(' ');
-            try dumpExpr(b.rhs, w);
-            try w.writeByte(')');
-        },
-    }
-}

@@ -28,7 +28,8 @@ When in doubt we report `Unsupported`, which makes no claim and therefore can't 
 
 How it is checked: `tests/syntax/cases.jsonl` lists inputs with their expected outcome.
 `zig build test` checks ZQJS against it; `zig build check-node` checks node against it
-(every `ok` must parse in node, every `syntax` must be a node SyntaxError).
+(every `ok` must run in node without a SyntaxError, every `syntax` must raise one; scripts
+are *run*, not just parsed, because some SyntaxErrors only appear when a script starts).
 
 ## 2. Unsupported features
 
@@ -45,7 +46,9 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `numeric_separator` | not yet | `1_000` | |
 | `non_decimal_literal` | not yet | `0x10`, `0o7`, `0b1` | |
 | `bigint` | not yet | `10n` | |
-| `syntax` | not yet | identifiers, `?:`, `,`, `~`, `=`, arrow functions, regexes … | any JS token or construct not yet in the grammar below |
+| `global_assignment` | restriction (revisit at M9) | `y = 1`, `undefined = 1`, `y++` with no declaration of `y` | sloppy JS silently creates (or ignores writes to) globals; ZQJS has no writable globals yet |
+| `labels` | not yet | `foo: while (…)`, `break foo;` | |
+| `syntax` | not yet | `?:`, `,`, `~`, `&&=`, `var`, `do`, destructuring, `for…of/in`, `let` used as a variable name, arrow functions, regexes … | any JS token or construct not yet in the grammar below |
 
 ## 3. Lexical grammar (M1)
 
@@ -72,38 +75,87 @@ Each `Unsupported` diagnostic names one of these stable ids.
   | `\` + any other character | that character (`'\q'` is `"q"`) |
 
   Non-ASCII characters in the literal are decoded from UTF-8; those above U+FFFF become a
-  surrogate pair, so `'😀'`, `'\u{1F600}'` and `'😀'` are the same string.
-- **Keywords** used so far: `true false null`. Other identifiers: `Unsupported(syntax)` (M2).
+  surrogate pair, so `'😀'`, `'\u{1F600}'` and `'\uD83D\uDE00'` are the same string.
+- **Identifiers**: `[A-Za-z_$][A-Za-z0-9_$]*`, ASCII only.
+- **Keywords**: `true false null const if else while for break continue`. `let` is *not* a
+  keyword (it isn't one in sloppy JS); it introduces a declaration only when followed by a
+  binding name (§4). Other JS reserved words (`this`, `new`, `var`, `function`, …) are
+  `Unsupported(syntax)` where an expression is expected, and a SyntaxError as variable names.
 
-## 4. Syntactic grammar (M1)
+## 4. Syntactic grammar (M2)
 
 ```
-Script     := Statement*
-Statement  := ';'                              (empty statement)
-            | Expression ';'
-Expression := Logical
-Logical    := Logical ('||' | '&&') Logical      (&& binds tighter than ||)
-            | Equality
-Equality   := Equality ('===' | '!==') Relational | Relational
-Relational := Relational ('<' | '<=' | '>' | '>=') Additive | Additive
-Additive   := Additive ('+' | '-') Mult | Mult
-Mult       := Mult ('*' | '/' | '%') Exp | Exp
-Exp        := Unary | Primary '**' Exp           (right-associative)
-Unary      := ('-' | '+' | '!') Unary | Primary
-Primary    := Number | String | 'true' | 'false' | 'null' | '(' Expression ')'
+Script            := StatementListItem*
+StatementListItem := Declaration | Statement
+Declaration       := ('let' | 'const') Declarator (',' Declarator)* ';'
+Declarator        := Identifier ('=' Expression)?          (const requires '=')
+Statement         := ';'                                   (empty statement)
+                   | '{' StatementListItem* '}'            (block)
+                   | 'if' '(' Expression ')' Statement ('else' Statement)?
+                   | 'while' '(' Expression ')' Statement
+                   | 'for' '(' ForInit? ';' Expression? ';' Expression? ')' Statement
+                   | 'break' ';' | 'continue' ';'          (only inside a loop)
+                   | Expression ';'
+ForInit           := ('let' | 'const') Declarator (',' Declarator)* | Expression
+Expression        := Identifier AssignOp Expression | Logical   (right-associative)
+AssignOp          := '=' | '+=' | '-=' | '*=' | '/=' | '%=' | '**='
+Logical           := Logical ('||' | '&&') Logical          (&& binds tighter than ||)
+                   | Equality
+Equality          := Equality ('===' | '!==') Relational | Relational
+Relational        := Relational ('<' | '<=' | '>' | '>=') Additive | Additive
+Additive          := Additive ('+' | '-') Mult | Mult
+Mult              := Mult ('*' | '/' | '%') Exp | Exp
+Exp               := Unary | Postfix '**' Exp               (right-associative)
+Unary             := ('-' | '+' | '!') Unary | ('++' | '--') Unary | Postfix
+Postfix           := Primary ('++' | '--')?                 (no line break before ++/--)
+Primary           := Number | String | 'true' | 'false' | 'null' | Identifier
+                   | '(' Expression ')'
 ```
 
 Notable rules, all matching JavaScript:
-- `2 ** 3 ** 2` is `2 ** (3 ** 2)` = 512.
-- A unary operator directly before `**` is a **SyntaxError**: `-2 ** 2`, `!x ** 2`,
-  `2 ** -2 ** 2`. Parenthesise instead: `(-2) ** 2`. A unary operand on the *right* is fine:
-  `2 ** -2`.
-- `1 < 2 < 3` is legal (left-associative).
+- `2 ** 3 ** 2` is `2 ** (3 ** 2)` = 512. `1 < 2 < 3` is legal (left-associative).
+- `-`, `+` or `!` directly before `**` is a **SyntaxError** (`-2 ** 2`, `2 ** -2 ** 2`);
+  `(-2) ** 2`, `2 ** -2`, `++x ** 2` and `x++ ** 2` are fine.
+- Assignment and `++`/`--` targets must be identifiers, possibly parenthesised (`(x) = 1`);
+  `1 = 2`, `x + 1 = 2`, `++1`, `(x + 1)++` are SyntaxErrors.
+- `let` + binding name starts a declaration, even across a line break (`let\nx = 1`).
+  A declaration where only a single statement is allowed (`if (c) let x = 1;`,
+  `while (c) const y = 1;`) is a SyntaxError.
+- **`break` / `continue`** (all three cases are distinct in JS):
 
-Nesting deeper than `Limits.max_nesting_depth` (default 512, counting both parentheses and
-operator chains) → `LimitExceeded(nesting_depth)`.
+  | input | meaning in JS | ZQJS |
+  |---|---|---|
+  | `break;` outside a loop | error | SyntaxError |
+  | `break foo;` | jump to label `foo` | `Unsupported(labels)`, even outside a loop: `foo: { break foo; }` is valid |
+  | `break\nfoo;` | ASI: `break; foo;` | `Unsupported(asi)` inside a loop; SyntaxError outside one |
+
+Nesting deeper than `Limits.max_nesting_depth` (default 512) → `LimitExceeded(nesting_depth)`.
+The limit bounds the parser's recursion (each parenthesis level costs two, each nested
+statement or `=` one) and the depth of expression trees (operator chains).
 
 ## 5. Semantics
 
-Nothing executes yet (M1 builds the AST only). Runtime semantics are added from M3; every
-addition goes here, with its differential tests.
+Nothing executes yet (M3 adds the tree-walking interpreter). What is decided:
+
+**Static (checked now, by the resolver):**
+- Each block, the script, and each `for` head is a scope. A `for` head scope encloses the
+  body, so `for (let i;;) { let i; }` is legal.
+- A `let`/`const` binding is visible from the *start* of its scope (hoisting), so
+  `let x = 1; { x; let x = 2; }` refers to the inner `x`.
+- Declaring the same name twice in one scope is a SyntaxError; shadowing an outer name is fine.
+- At script level, `let`/`const` named `undefined`, `NaN` or `Infinity` is a SyntaxError
+  (as in node). Inside a block or a `for` head they are ordinary names.
+- Top-level bindings belong to the script; they are not shared between scripts (revisit at M9).
+- A name with no declaration in scope is a *global*: reading it is allowed (M3: a
+  ReferenceError if it doesn't exist), assigning to it is `Unsupported(global_assignment)`.
+
+**Dynamic (enforced from M3; fixed now, checked against node):**
+- **Temporal dead zone:** from scope entry until its declaration runs, reading or writing a
+  binding throws a ReferenceError. `let x;` initialises to `undefined`. Each time a block is
+  entered (e.g. each loop iteration) its bindings start uninitialised again.
+- **`x = e`**: evaluate `e`, *then* the TDZ check, *then* the const check, then store.
+  **`x op= e`** and **`++x`/`x++`**: read `x` (TDZ check) first, then evaluate the right side.
+- **`const`**: writing to an initialised const binding throws a **TypeError**, only when the
+  write executes (`if (false) c = 2;` is fine). It is never an early error.
+- **`for (let …)`**: the spec gives each iteration a fresh copy of the head bindings. Without
+  closures this is unobservable; M6 must implement it for captured bindings (DESIGN_DECISIONS D22).

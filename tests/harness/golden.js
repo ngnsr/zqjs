@@ -34,6 +34,8 @@ function emit(file, content, sameLine = (a, b) => a === b) {
 
 // Exact float64 encoding: 16 hex digits of the IEEE-754 bits.
 function bits(x) { const b = Buffer.alloc(8); b.writeDoubleBE(x); return b.toString('hex'); }
+// Bits of a computed result. A NaN result's sign bit is platform noise (x86 makes inf + -inf = fff8…, arm 7ff8…).
+function resultBits(x) { return Number.isNaN(x) ? '7ff8000000000000' : bits(x); }
 function fromBits(h) { return Buffer.from(h, 'hex').readDoubleBE(); }
 
 // True if two bit strings are the same double or adjacent doubles (any two NaNs count as equal).
@@ -85,7 +87,7 @@ function* randomDoubles(n) {
     '%': (a, b) => a % b, '**': (a, b) => a ** b };
   const lines = [];
   for (const [op, f] of Object.entries(ops)) for (const a of vals) for (const b of vals)
-    lines.push(JSON.stringify([op, bits(a), bits(b), bits(f(a, b))]));
+    lines.push(JSON.stringify([op, bits(a), bits(b), resultBits(f(a, b))]));
   emit('ops/arithmetic.jsonl', lines.join('\n') + '\n', (o, n) => {
     if (o === n || !o.startsWith('["**"')) return o === n;
     const [x, y] = [JSON.parse(o), JSON.parse(n)];

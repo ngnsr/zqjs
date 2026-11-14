@@ -1,0 +1,33 @@
+slots 2, max_stack 5, code 104 bytes
+constants
+  k0  ""
+  k1  "d"
+names
+  n0  a
+  n1  print
+  n2  b
+code
+      0  clear_local    s0
+      5  clear_local    s1
+     10  push_const     k0            ; ""
+     15  dup
+     16  jump_if_true   @27
+     21  pop
+     22  push_const     k1            ; "d"
+     27  init_local     s0
+     32  get_local      s0 n0         ; a
+     41  dup
+     42  jump_if_false  @49
+     47  pop
+     48  push_null
+     49  init_local     s1
+     54  get_global     n1            ; print
+     59  get_local      s0 n0         ; a
+     68  get_local      s1 n2         ; b
+     77  get_local      s0 n0         ; a
+     86  not
+     87  get_local      s0 n0         ; a
+     96  neg
+     97  call           4
+    102  pop
+    103  halt

@@ -12,7 +12,7 @@ source ─▶ Lexer ─▶ Parser ─▶ AST ─▶ Resolver ─▶ Compiler ─
 Dependencies point one way: frontend → compiler → runtime/VM. The frontend knows nothing about
 the runtime.
 
-## Built so far (M3)
+## Built so far (M4)
 
 | file | role |
 |---|---|
@@ -29,11 +29,15 @@ the runtime.
 | `src/runtime/ops.zig` | all JS value semantics: ToNumber, ToString (number formatting), ToBoolean, operators |
 | `src/runtime/pow.zig` | `pow` ported from musl (Arm optimized-routines); `pow_data.zig`: its tables, generated |
 | `src/runtime/globals.zig` | `undefined`, `NaN`, `Infinity`, `print` |
-| `src/interp/treewalk.zig` | tree-walking interpreter over AST + Resolution, `?Value` slots |
+| `src/interp/treewalk.zig` | tree-walking interpreter over AST + Resolution, `?Value` slots (the oracle) |
+| `src/bytecode/bytecode.zig` | instruction set (`Op`, one table of operands and stack effects), `Proto` |
+| `src/bytecode/compiler.zig` | AST + Resolution → `Proto`: constant pool, name table, `max_stack`, no dead code |
+| `src/bytecode/verify.zig` | checks a `Proto` as untrusted input (D33); reports measured stack depth |
+| `src/bytecode/disasm.zig` | listing for `--dump-bytecode` |
 | `src/run.zig` | source → parse → resolve → run, with outcome reporting (CLI and tests share it) |
 | `src/limits.zig` | `Limits` (only the limits enforced so far, see DESIGN_DECISIONS D15) |
-| `src/root.zig` | library entry: `parse`, `resolve`, `dump`, `Runtime`, `interpret`, `runSource` |
-| `src/main.zig` | CLI: `zqjs FILE`, `zqjs -e SRC`, `--test` (harness output), `--dump-ast` |
+| `src/root.zig` | library entry: `parse`, `resolve`, `dump`, `Runtime`, `interpret`, `runSource`, `compile`, `verify`, `disassemble` |
+| `src/main.zig` | CLI: `zqjs FILE`, `zqjs -e SRC`, `--test` (harness output), `--dump-ast`, `--dump-bytecode` |
 
 ### Ownership in the frontend
 - The lexer borrows the source and returns tokens by value; it allocates nothing.

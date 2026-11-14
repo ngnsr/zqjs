@@ -17,6 +17,13 @@ pub const Limits = struct {
     max_heap_bytes: usize = 256 * 1024 * 1024,
     /// Longest string, in UTF-16 code units.
     max_string_length: usize = 1 << 28,
+    /// Largest bytecode of one compiled script, in bytes. Must stay below 4 GiB: jump
+    /// targets are u32 byte offsets. Code is several times larger than its source
+    /// (`a;` is 2 bytes of source, 10 of code), hence 4× the source limit.
+    max_code_bytes: u32 = 64 * 1024 * 1024,
+    /// Most entries in one compiled script's constant pool, and separately in its name
+    /// table. Operands are u32, so this is a resource bound, not an encoding one.
+    max_constants: u32 = 1 << 20,
 };
 
 pub const Limit = enum {
@@ -25,8 +32,11 @@ pub const Limit = enum {
     steps,
     heap_bytes,
     string_length,
+    code_bytes,
+    constants,
 };
 
 comptime {
     std.debug.assert((Limits{}).max_source_bytes < std.math.maxInt(u32));
+    std.debug.assert((Limits{}).max_code_bytes < std.math.maxInt(u32));
 }

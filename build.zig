@@ -34,9 +34,12 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run the zqjs CLI").dependOn(&run.step);
 
     // Two test binaries: unit tests inside src/, and integration tests in tests/.
+    // `--fuzz=N` fuzzes only one test per run, so pick fuzz targets with -Dtest-filter:
+    //   zig build test --fuzz=100K -Dtest-filter="fuzz: the verifier"
+    const filters: []const []const u8 = if (b.option([]const u8, "test-filter", "Run only tests whose name contains this")) |f| &.{f} else &.{};
     const test_step = b.step("test", "Run unit and integration tests");
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
-    const integration = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod, .filters = filters })).step);
+    const integration = b.addRunArtifact(b.addTest(.{ .filters = filters, .root_module = b.createModule(.{
         .root_source_file = b.path("tests/all.zig"),
         .target = target,
         .optimize = optimize,

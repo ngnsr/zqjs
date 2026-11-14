@@ -420,7 +420,8 @@ Unsupported, OutOfMemory, WriteFailed). The parser guarantees break/continue nev
 ## D30. String literals allocate on every evaluation *(shortcut)*
 The tree-walker creates a new heap string each time a string literal is evaluated. Correct,
 but wasteful in loops; with no GC until M8 this memory isn't reclaimed during a run (the heap
-limit still bounds it). The M4 constant pool creates each literal once.
+limit still bounds it). The M4 constant pool creates each literal once; the tree-walker keeps
+the shortcut because it stays untouched as the oracle.
 
 ## D31. Test layout
 Small unit tests stay in `src/` next to the code they test (Zig's convention: they can test
@@ -428,3 +429,53 @@ private functions). Everything else lives in `tests/`, behind one root (`tests/a
 the public `zqjs` module: whole-pipeline allocation-failure and fuzz tests, syntax cases,
 node-generated golden tables (`tests/ops`) and whole-program differential tests (`tests/diff`).
 `zig build test` builds exactly two test binaries.
+
+## D32. Bytecode format *(M4)*
+**Encoding.** A byte stream: 1-byte opcode, then little-endian u32 operands (slot, constant,
+name, absolute jump target, argc). One table, `Op.info()` in `src/bytecode/bytecode.zig`, gives
+every opcode's operands and stack effect; the compiler, verifier, disassembler and VM all read
+it, so the format is defined once. Alternatives: fixed-width instruction structs (easier
+patching, but two-operand instructions double the size of every instruction) and QuickJS-style
+u16 operands (smaller, but one block with 70k `let`s or a call with 70k arguments overflows
+them, which would need extra failure paths).
+**Limits.** u32 operands do not make limits unnecessary. `Limits.max_code_bytes` (default
+64 MiB, must stay below 4 GiB so u32 targets suffice) bounds one script's code;
+`Limits.max_constants` (default 2^20) bounds its constant pool and, separately, its name table.
+The compiler reports `LimitExceeded(code_bytes | constants)` with the statement's position; the
+verifier checks both again. Slots and argc need no limit of their own: they are bounded by the
+source size and, at run time, by the stack limit (D12).
+**Calls.** `call argc` pops `[callee, args…]` and pushes the result. In M4/M5 only natives
+exist: the callee is checked after the arguments are evaluated (TypeError if not callable,
+as in the tree-walker), and the native gets the arguments as a slice of the operand stack,
+valid during the call; natives cannot re-enter JS, so the stack cannot move. User functions
+(M6) will define frames, `this` and returns, and may change this instruction.
+**`const` writes** are known at compile time and compile to `assign_const` placed exactly where
+the write happens (after the right-hand side for `=`, after the read, right-hand side and
+operator for `op=`), which throws ReferenceError in the TDZ and TypeError otherwise. Order
+tests: `tests/diff/err_const_*` and the `tdz_and_const` bytecode snapshot.
+**No unreachable code.** The compiler tracks whether a statement can complete and skips code
+after `break`/`continue`, after an `if` whose branches both leave, and after `for (;;)` without
+`break`. This keeps listings honest and makes "verifier max_stack == compiler max_stack" an
+exact, testable invariant.
+
+## D33. The verifier is the M4 oracle *(M4)*
+Nothing executes bytecode until M5, so M4's correctness check is a verifier that treats a Proto
+as untrusted input (`src/bytecode/verify.zig`): sizes within limits; every byte part of a
+well-formed instruction; slot, constant and name indices in range; constants are numbers or
+strings; jump targets on instruction starts; over all reachable paths no stack underflow, no
+depth above `max_stack`, equal depth where paths meet, an empty stack at `halt`; and no path
+falls off the end. It is what lets the M5 VM push and pop without bounds checks (D12). Tests:
+every diff program and accepted syntax case must verify with `Info.max_stack == max_stack` and
+no unreachable instructions; a unit test per rule; fuzzing of the compiler (through the front
+end) and of the verifier on arbitrary bytes. The verifier says nothing about *meaning*; that is
+the differential tests' job once the VM runs the same bytecode (M5).
+
+## D34. Compile-time string constants: ownership *(M4)*
+String constants are heap `String`s created once by the compiler (deduplicated by content). The
+heap owns them; the Proto references them and must not outlive the heap. Until M8 they live to
+`Heap.deinit` like every heap object; with the GC, the Proto is what marks them (D9). If a
+compilation fails (limit, OOM), `Heap.rollback(mark)` frees every object created since the
+compile began, newest first, and returns their charge, so a failed compile leaves the heap
+exactly as it found it (tested under allocation failure and limits). Rollback is sound because
+nothing else allocates on that heap while the compiler runs and nothing outside the compiler
+can reference those strings yet.

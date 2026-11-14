@@ -64,15 +64,37 @@ pub const Heap = struct {
         var it = h.objects;
         while (it) |obj| {
             it = obj.next;
-            switch (obj.kind) {
-                .string => {
-                    const s: *String = @fieldParentPtr("obj", obj);
-                    h.gpa.free(s.units);
-                    h.gpa.destroy(s);
-                },
-            }
+            h.destroy(obj);
         }
         h.* = undefined;
+    }
+
+    /// The current newest object, for `rollback`.
+    pub fn mark(h: *const Heap) ?*Obj {
+        return h.objects;
+    }
+
+    /// Frees every object allocated since `m` (a value of `mark()`), newest first, and
+    /// gives their charge back to the accounting. Used when a compilation fails: the strings it created are
+    /// unreachable, so they are freed at once instead of lingering until `deinit`.
+    /// Only valid if nothing allocated since `m` is referenced anywhere.
+    pub fn rollback(h: *Heap, m: ?*Obj) void {
+        while (h.objects != m) {
+            const obj = h.objects.?; // `m` must be in the list
+            h.objects = obj.next;
+            h.destroy(obj);
+        }
+    }
+
+    fn destroy(h: *Heap, obj: *Obj) void {
+        switch (obj.kind) {
+            .string => {
+                const s: *String = @fieldParentPtr("obj", obj);
+                h.bytes -= @sizeOf(String) + s.units.len * @sizeOf(u16) + 2 * per_allocation_overhead;
+                h.gpa.free(s.units);
+                h.gpa.destroy(s);
+            },
+        }
     }
 
     /// A new string made of the concatenation of `pieces`.
@@ -157,6 +179,20 @@ test "string length limit and overflow-safe size arithmetic" {
     // Lengths whose sum overflows usize are reported as a limit, never wrap around.
     const huge: []const u8 = @as([*]const u8, @ptrFromInt(0x1000))[0 .. std.math.maxInt(usize) / 2 + 1];
     try testing.expectError(error.LimitExceeded, h.newString(&.{ .{ .ascii = huge }, .{ .ascii = huge } }));
+}
+
+test "rollback frees exactly the objects allocated since the mark" {
+    var h = Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    const keep = try h.ascii("keep");
+    const before = h.bytes;
+    const m = h.mark();
+    _ = try h.ascii("a");
+    _ = try h.ascii("bcd");
+    h.rollback(m);
+    try testing.expectEqual(before, h.bytes);
+    try testing.expectEqual(&keep.obj, h.objects.?);
+    try testing.expectEqual(@as(?*Obj, null), h.objects.?.next);
 }
 
 test "allocation failure leaves the accounting unchanged" {

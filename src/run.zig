@@ -1,6 +1,13 @@
 //! Source text → parse → resolve → run, with outcome reporting. Shared by the CLI and
 //! the differential tests so both print exactly the same thing.
 //!
+//! Engines:
+//!   .vm        compile → verify → VM (the default)
+//!   .treewalk  the tree-walking oracle (DESIGN_DECISIONS D16)
+//! Bytecode is always verified before it runs, in every build mode; a verifier
+//! rejection is a compiler bug, reported as an internal error (exit code 70), and the
+//! code is never executed.
+//!
 //! Modes:
 //!   .normal   program output to `out`; diagnostics and `Uncaught …` to `err`
 //!   .harness  everything to `out`, and an uncaught exception prints only
@@ -17,13 +24,26 @@ const resolve = @import("frontend/resolver.zig").resolve;
 const Runtime = @import("runtime/runtime.zig").Runtime;
 const ops = @import("runtime/ops.zig");
 const treewalk = @import("interp/treewalk.zig");
+const compile = @import("bytecode/compiler.zig").compile;
+const verify = @import("bytecode/verify.zig");
+const disasm = @import("bytecode/disasm.zig");
+const Vm = @import("vm/vm.zig").Vm;
 
 pub const Mode = enum { normal, harness };
+pub const Engine = enum { vm, treewalk };
+
+pub const Options = struct {
+    mode: Mode = .normal,
+    engine: Engine = .vm,
+    /// VM only: before each instruction, write its listing line and the operand stack.
+    trace: ?*Writer = null,
+};
 
 pub const Error = Allocator.Error || Writer.Error;
 
 /// Returns the process exit code: 0 on success, 1 if the script did not complete.
-pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: Limits, mode: Mode, out: *Writer, err: *Writer) Error!u8 {
+pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: Limits, options: Options, out: *Writer, err: *Writer) Error!u8 {
+    const mode = options.mode;
     const report = if (mode == .harness) out else err;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -36,7 +56,28 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
 
     var rt = Runtime.init(gpa, limits, out);
     defer rt.deinit();
-    treewalk.run(&rt, script, res) catch |e| {
+    const outcome = switch (options.engine) {
+        .treewalk => treewalk.run(&rt, script, res),
+        .vm => vm: {
+            var proto = compile(gpa, &rt.heap, script, res, limits, &diag) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.LimitExceeded => return frontendFailure(e, diag, source, name, report),
+            };
+            defer proto.deinit(gpa);
+            var failure: verify.Failure = .{};
+            _ = verify.verify(gpa, proto, limits, &failure) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidBytecode => {
+                    try report.print("{s}: internal error: invalid bytecode at {d}: {s}\n", .{ name, failure.pc, failure.reason });
+                    return 70;
+                },
+            };
+            var vm = try Vm.init(&rt, &proto);
+            defer vm.deinit();
+            break :vm if (options.trace) |t| runTraced(&vm, t) else vm.run();
+        },
+    };
+    outcome catch |e| {
         switch (e) {
             error.OutOfMemory, error.WriteFailed => |host| return host,
             error.Thrown => {
@@ -54,6 +95,27 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
         return 1;
     };
     return 0;
+}
+
+fn runTraced(vm: *Vm, t: *Writer) @import("runtime/runtime.zig").Error!void {
+    while (true) {
+        if (!vm.halted) {
+            // Pad the listing to a column, so the stacks line up; a line too long for the
+            // buffer (a long string constant) is written unpadded.
+            var buf: [128]u8 = undefined;
+            var line: Writer = .fixed(&buf);
+            if (disasm.instruction(vm.proto.*, vm.pc, &line)) {
+                try t.print("{s:<56}", .{line.buffered()});
+            } else |_| try disasm.instruction(vm.proto.*, vm.pc, t);
+            try t.writeAll(" |");
+            for (vm.operands(), 0..) |v, i| {
+                try t.writeAll(if (i > 0) ", " else " ");
+                try disasm.value(v, t);
+            }
+            try t.writeByte('\n');
+        }
+        if (try vm.step() == .halted) return;
+    }
 }
 
 fn frontendFailure(e: anyerror, diag: Diagnostic, source: []const u8, name: []const u8, report: *Writer) Error!u8 {

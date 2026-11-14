@@ -1,5 +1,5 @@
-//! Human-readable listing of a Proto (`zqjs --dump-bytecode`). Only for verified
-//! bytecode: it trusts operands to be in range.
+//! Human-readable listing of a Proto (`zqjs --dump-bytecode`, and each line of
+//! `--trace`). Only for verified bytecode: it trusts operands to be in range.
 //!
 //!   slots 1, max_stack 2, code 35 bytes
 //!   constants
@@ -28,7 +28,7 @@ pub fn disassemble(p: Proto, w: *Writer) Writer.Error!void {
     if (p.consts.len > 0) try w.writeAll("constants\n");
     for (p.consts, 0..) |k, i| {
         try w.print("  k{d}  ", .{i});
-        try constant(k, w);
+        try value(k, w);
         try w.writeByte('\n');
     }
     if (p.names.len > 0) try w.writeAll("names\n");
@@ -37,46 +37,52 @@ pub fn disassemble(p: Proto, w: *Writer) Writer.Error!void {
     try w.writeAll("code\n");
     var pc: usize = 0;
     while (pc < p.code.len) : (pc += @as(Op, @fromBackingInt(@intCast(p.code[pc]))).size()) {
-        const op: Op = @fromBackingInt(@intCast(p.code[pc]));
-        var buf: [96]u8 = undefined; // offset, opcode and at most two u32 operands
-        var line: Writer = .fixed(&buf);
-        line.print("  {d:>5}  {s:<14} ", .{ pc, @tagName(op) }) catch unreachable;
-        var comment: ?Value = null;
-        var comment_name: ?[]const u8 = null;
-        for (op.info().operands, 0..) |kind, i| {
-            const x = bc.readU32(p.code, pc + 1 + 4 * i);
-            if (i > 0) line.writeByte(' ') catch unreachable;
-            switch (kind) {
-                .slot => line.print("s{d}", .{x}) catch unreachable,
-                .@"const" => {
-                    line.print("k{d}", .{x}) catch unreachable;
-                    comment = p.consts[x];
-                },
-                .name => {
-                    line.print("n{d}", .{x}) catch unreachable;
-                    comment_name = p.names[x];
-                },
-                .target => line.print("@{d}", .{x}) catch unreachable,
-                .argc => line.print("{d}", .{x}) catch unreachable,
-            }
-        }
-        if (comment == null and comment_name == null) {
-            try w.print("{s}\n", .{std.mem.trimEnd(u8, line.buffered(), " ")});
-            continue;
-        }
-        try w.print("{s:<37} ; ", .{line.buffered()});
-        if (comment) |k| try constant(k, w) else try w.writeAll(comment_name.?);
+        try instruction(p, pc, w);
         try w.writeByte('\n');
     }
 }
 
-/// Numbers as JS prints them; strings quoted, with everything outside printable
-/// ASCII (including lone surrogates) as \uXXXX, so the listing is plain ASCII.
-fn constant(k: Value, w: *Writer) Writer.Error!void {
-    switch (k) {
+/// One line of the listing (no newline) for the instruction at `pc`. Also used by
+/// `--trace`, so traces and listings look the same.
+pub fn instruction(p: Proto, pc: usize, w: *Writer) Writer.Error!void {
+    const op: Op = @fromBackingInt(@intCast(p.code[pc]));
+    var buf: [96]u8 = undefined; // offset, opcode and at most two u32 operands
+    var line: Writer = .fixed(&buf);
+    line.print("  {d:>5}  {s:<14} ", .{ pc, @tagName(op) }) catch unreachable;
+    var comment: ?Value = null;
+    var comment_name: ?[]const u8 = null;
+    for (op.info().operands, 0..) |kind, i| {
+        const x = bc.readU32(p.code, pc + 1 + 4 * i);
+        if (i > 0) line.writeByte(' ') catch unreachable;
+        switch (kind) {
+            .slot => line.print("s{d}", .{x}) catch unreachable,
+            .@"const" => {
+                line.print("k{d}", .{x}) catch unreachable;
+                comment = p.consts[x];
+            },
+            .name => {
+                line.print("n{d}", .{x}) catch unreachable;
+                comment_name = p.names[x];
+            },
+            .target => line.print("@{d}", .{x}) catch unreachable,
+            .argc => line.print("{d}", .{x}) catch unreachable,
+        }
+    }
+    if (comment == null and comment_name == null) return w.writeAll(std.mem.trimEnd(u8, line.buffered(), " "));
+    try w.print("{s:<37} ; ", .{line.buffered()});
+    if (comment) |k| try value(k, w) else try w.writeAll(comment_name.?);
+}
+
+/// A value as the listing and the trace show it. Numbers as JS prints them (but -0 as
+/// "-0"); strings quoted, with everything outside printable ASCII (including lone
+/// surrogates) as \uXXXX, so output is plain ASCII.
+pub fn value(v: Value, w: *Writer) Writer.Error!void {
+    switch (v) {
+        .undefined, .null => try w.writeAll(@tagName(v)),
+        .boolean => |b| try w.writeAll(if (b) "true" else "false"),
+        .native => |n| try w.print("<native {s}>", .{n.name}),
         .number => |n| {
             var buf: ops.NumberBuf = undefined;
-            // -0 prints as "0" in JS; the listing must tell them apart.
             if (n == 0 and std.math.signbit(n)) try w.writeAll("-0") else try w.writeAll(ops.formatNumber(&buf, n));
         },
         .string => |s| {
@@ -88,6 +94,5 @@ fn constant(k: Value, w: *Writer) Writer.Error!void {
             };
             try w.writeByte('"');
         },
-        else => unreachable, // the verifier allows numbers and strings only
     }
 }

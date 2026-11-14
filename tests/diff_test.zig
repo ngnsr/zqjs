@@ -1,13 +1,14 @@
-//! Differential tests: every tests/diff/*.js runs under ZQJS in harness mode, and its
-//! output must equal tests/diff/*.out, which node produced (tests/harness/golden.js).
-//! A program that ZQJS rejects (SyntaxError, Unsupported, LimitExceeded) prints a
-//! diagnostic node never prints, so it fails here too.
+//! Differential tests: every tests/diff/*.js runs under ZQJS in harness mode, on *both*
+//! engines, and each output must equal tests/diff/*.out, which node produced
+//! (tests/harness/golden.js). A program that ZQJS rejects (SyntaxError, Unsupported,
+//! LimitExceeded) prints a diagnostic node never prints, so it fails here too.
 
 const std = @import("std");
 const testing = std.testing;
 const zqjs = @import("zqjs");
+const support = @import("support.zig");
 
-test "tests/diff programs produce node's output" {
+test "tests/diff programs produce node's output on both engines" {
     const io = testing.io;
     const gpa = testing.allocator;
     var dir = try std.Io.Dir.cwd().openDir(io, "tests/diff", .{ .iterate = true });
@@ -26,13 +27,15 @@ test "tests/diff programs produce node's output" {
         const expected = try dir.readFileAlloc(io, out_name, gpa, .limited(1 << 20));
         defer gpa.free(expected);
 
-        var got: std.Io.Writer.Allocating = .init(gpa);
-        defer got.deinit();
-        var discard: std.Io.Writer.Discarding = .init(&.{});
-        _ = try zqjs.runSource(gpa, entry.name, source, .{ .max_steps = 50_000_000 }, .harness, &got.writer, &discard.writer);
-        if (!std.mem.eql(u8, got.written(), expected)) {
-            std.debug.print("\n== {s}\n-- expected (node)\n{s}-- got (zqjs)\n{s}", .{ entry.name, expected, got.written() });
-            failures += 1;
+        for (support.engines) |engine| {
+            var got = try support.run(gpa, source, .{ .max_steps = 50_000_000 }, engine, .harness);
+            defer got.deinit(gpa);
+            if (!std.mem.eql(u8, got.out, expected)) {
+                std.debug.print("\n== {s} on {s}\n-- source\n{s}\n-- expected (node)\n{s}", .{ entry.name, @tagName(engine), source, expected });
+                support.printOutcome(@tagName(engine), got);
+                if (engine == .vm) support.printBytecode(gpa, source);
+                failures += 1;
+            }
         }
     }
     try testing.expect(count > 0);

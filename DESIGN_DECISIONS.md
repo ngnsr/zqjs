@@ -479,3 +479,37 @@ compile began, newest first, and returns their charge, so a failed compile leave
 exactly as it found it (tested under allocation failure and limits). Rollback is sound because
 nothing else allocates on that heap while the compiler runs and nothing outside the compiler
 can reference those strings yet.
+
+## D35. The VM and its `step()` contract *(M5)*
+`src/vm/vm.zig`. State: `pc`, `sp` (indices), `slots: []?Value` (`null` = TDZ), `stack: []Value`
+of exactly `max_stack` (no calls into JS yet, so it never grows; `max_stack` 0 is fine).
+`run()` is `while (step() == .running)`, so `--trace` and the M11 debugger drive the same code.
+**`step()`.** Executes exactly one instruction, charging one budget step *before* it.
+`.running`: completed, `pc` is the next instruction. `.halted`: `halt` executed; later calls
+return `.halted` and execute and charge nothing. An error is *precise*: `pc` still points at the
+failing instruction and the stack and slots are exactly as before it (every instruction fails
+before mutating, or mutates and then sets `pc`). Exception, limit and Unsupported details are on
+the Runtime. The VM is then faulted: later calls return the same error and do nothing. Side
+effects outside the VM (output already written by a native) are not undone.
+**Calls.** `[callee, arg0 … argN-1]`, arguments in source order. The native *borrows* the slice
+`stack[base+1 .. sp]`, valid only during the call (it cannot re-enter JS, so the stack cannot
+move). The callable check comes after argument evaluation, as in the tree-walker. If the native
+fails, nothing has been popped: the stack is a valid pre-call state. On success callee and
+arguments are replaced by the result. M6 replaces the slice with `NativeCtx` (D12).
+**Budget.** One step per executed instruction, charged before execution. `Runtime.step` checks
+before incrementing, so the counter never exceeds `max_steps` and cannot overflow even when it
+is `maxInt(u64)`. The unit is engine-defined, so thresholds differ between engines (LANGUAGE.md).
+**Trust.** The pipeline always verifies before running (D33), in every build mode. The VM still
+keeps cheap defensive checks (pc and instruction bounds, opcode validity, stack underflow and
+overflow, slot, constant and name indices, jump targets) because the verifier protects against
+malformed bytecode, not against bugs in the VM or the verifier. A failed check is a bug, so it
+panics with the pc instead of producing a JavaScript-visible result. They stay until a benchmark
+says otherwise.
+**Messages.** The VM writes the same exception messages as the tree-walker. The tree-walker is
+left untouched as the oracle, so the four message texts exist twice; the differential tests
+compare messages, which catches any drift.
+**Lesson (found by the differential tests on their first run).** `vm.top().* = .{ .number =
+f(vm.peek(0)) }` is wrong in Zig: the union literal is built in place (result location), so the
+slot's tag becomes `.number` *before* `f` reads the old value through `peek`, which then reads a
+pointer's bits as a float. Every in-place store in the VM computes into a local first.
+`tests/diff/unary_strings.js` is the regression test.

@@ -1,5 +1,5 @@
 //! zqjs library entry point. M3: frontend (parse → resolve → dump) and the
-//! tree-walking interpreter. M4: bytecode compiler, verifier and disassembler.
+//! tree-walking interpreter. M4: bytecode compiler, verifier and disassembler. M5: the VM.
 
 pub const ast = @import("frontend/ast.zig");
 pub const Diagnostic = @import("frontend/diag.zig").Diagnostic;
@@ -21,6 +21,10 @@ pub const disassemble = @import("bytecode/disasm.zig").disassemble;
 pub const Heap = @import("runtime/heap.zig").Heap;
 pub const runSource = @import("run.zig").runSource;
 pub const RunMode = @import("run.zig").Mode;
+pub const RunOptions = @import("run.zig").Options;
+pub const Engine = @import("run.zig").Engine;
+pub const Vm = @import("vm/vm.zig").Vm;
+pub const Value = @import("runtime/value.zig").Value;
 
 // Small unit tests live next to the code they test (`test` blocks in each file);
 // integration, golden and fuzz tests live in tests/ (root: tests/all.zig).

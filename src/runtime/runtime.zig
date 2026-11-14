@@ -49,13 +49,15 @@ pub const Runtime = struct {
         rt.* = undefined;
     }
 
-    /// Charges one step of the execution budget.
+    /// Charges one step of the execution budget, *before* the work it pays for. Checks
+    /// first, so `steps` never exceeds `max_steps` and cannot overflow (even with
+    /// `max_steps = maxInt(u64)`). What a step is depends on the engine (Limits.max_steps).
     pub fn step(rt: *Runtime) Error!void {
-        rt.steps += 1;
-        if (rt.steps > rt.max_steps) {
+        if (rt.steps >= rt.max_steps) {
             rt.limit_hit = .steps;
             return error.LimitExceeded;
         }
+        rt.steps += 1;
     }
 
     /// Records a JavaScript exception and returns error.Thrown. If building the message

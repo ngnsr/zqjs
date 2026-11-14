@@ -7,10 +7,31 @@ Inspired by QuickJS and Crafting Interpreters; it does not reuse their code.
 Priorities: correctness, simplicity, inspectability. Speed comes last.
 
 ## Status
-Milestone 3 of 11: ZQJS runs programs. A tree-walking interpreter executes expressions,
-`let`/`const`, assignment, blocks, `if`/`while`/`for`, `break`/`continue` and `print(…)`, with
-JavaScript's semantics for numbers, strings, `-0`, the temporal dead zone and `const`. Output is
-checked byte for byte against node. See [ROADMAP.md](ROADMAP.md).
+Milestone 7 of 11 done (tags `m1` … `m7`, and `p1` for accurate `**`). ZQJS has:
+
+- **the language so far:** `let`/`const`, blocks, `if`/`while`/`for`, `break`/`continue`;
+  functions, closures and recursion; objects, arrays, prototypes, methods with `this`; numbers,
+  UTF-16 strings, `-0`, the temporal dead zone, `const`; a few built-ins (`print`,
+  `Object.keys/create/getPrototypeOf`, `Array.isArray`, `push`/`pop`/`join`, `charCodeAt`).
+  Everything else node has is reported as `Unsupported(…)`, never silently wrong
+  ([LANGUAGE.md](LANGUAGE.md)).
+- **two engines that must agree:** a bytecode compiler, verifier and stack VM (the default),
+  and a tree-walking reference interpreter (`--engine=treewalk`). Their output is checked byte
+  for byte against node, and against each other under fuzzing.
+- **no garbage collector yet:** memory is freed when the run ends, bounded by the heap limit.
+  M8 adds one; the design is in [GC_DESIGN.md](GC_DESIGN.md).
+
+```js
+// node and ZQJS print the same: 6765 hi box:3 0,1,b,a
+function fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }
+const base = { describe() { return this.kind + ':' + this.size; } };
+const box = Object.create(base); box.kind = 'box'; box.size = 3;
+const greet = (function () { const word = 'hi'; return function () { return word; }; })();
+print(fib(20), greet(), box.describe(), Object.keys({ b: 1, a: 2, 1: 3, 0: 4 }));
+```
+
+Next: M8 (garbage collector), M9 (embedding API, with a small Raylib demo), M10 (fuzzing and
+benchmarks), M11 (bytecode debugger). See [ROADMAP.md](ROADMAP.md).
 
 ## Requirements
 **Zig 0.17.1 exactly** (the build refuses other versions; see DESIGN_DECISIONS D17).
@@ -19,8 +40,9 @@ checked byte for byte against node. See [ROADMAP.md](ROADMAP.md).
 brew install zig && brew pin zig
 ```
 
-node and Python 3 (standard library only) are needed only to regenerate or check test data
-(`zig build update-golden`, `zig build check-goldens`), not to build or test.
+node (22) and Python 3 (standard library only) are needed only to regenerate or check test data
+and the node-generated built-in inventory (`zig build update-golden`, `zig build check-goldens`),
+not to build or test.
 
 ## Usage
 ```sh
@@ -56,13 +78,16 @@ rerun and diff it before and after a change: a change in steps or heap means dif
 change in time alone means the same work got faster or slower.
 
 ## Continuous integration
-`.github/workflows/ci.yml` runs on every push, on macOS arm64, Linux x86_64 and Linux arm64:
-`zig fmt --check .`, `zig build test`, `zig build check-goldens`, `zig build --release=fast`,
-and a check that `pow` produces the same bits as the reference hash (DESIGN_DECISIONS D25).
+`.github/workflows/ci.yml` runs on every push that touches code, tests, tools or the build
+(documentation-only changes skip it), on macOS arm64, Linux x86_64 and Linux arm64:
+`zig fmt --check .`, `zig build test` (also with `-Dstack-stress`, and in ReleaseSafe),
+`zig build check-goldens`, `zig build --release=fast`, and a check that `pow` produces the same
+bits as the reference hash (DESIGN_DECISIONS D25).
 
 ## Documents
 - [LANGUAGE.md](LANGUAGE.md): what ZQJS accepts and the compatibility contract with node
 - [ARCHITECTURE.md](ARCHITECTURE.md): components and ownership
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md): why things are the way they are
-- [ROADMAP.md](ROADMAP.md): milestones and required regression tests
+- [ROADMAP.md](ROADMAP.md): milestones, required regression tests, technical debt
+- [GC_DESIGN.md](GC_DESIGN.md): the garbage collector's design (M8, proposal under review)
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): licenses of ported code (musl/Arm `pow`)

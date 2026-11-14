@@ -89,6 +89,19 @@ pub fn build(b: *std.Build) void {
     bench.setCwd(b.path("."));
     b.step("bench", "Run bench/*.js on both engines (ReleaseFast): steps, heap, median time").dependOn(&bench.step);
 
+    // GC report (tools/gc_report.zig): pauses, rates and per-collection series, ReleaseFast.
+    const gc_report = b.addRunArtifact(b.addExecutable(.{
+        .name = "gc-report",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gc_report.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "zqjs", .module = bench_mod }},
+        }),
+    }));
+    gc_report.setCwd(b.path("."));
+    b.step("gc-report", "GC pauses, allocation rate and GC share for bench/ and bench/gc/ (ReleaseFast)").dependOn(&gc_report.step);
+
     // Generated test data: node (goldens, syntax contract), Python stdlib (pow reference),
     // and the pow tables generated from musl. Dev-time only; `zig build test` needs none.
     const check = b.step("check-goldens", "Check syntax cases against node; generated files up to date");

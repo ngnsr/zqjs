@@ -189,6 +189,29 @@ pub const Heap = struct {
     gray: ?*Obj = null,
     stats: Stats = .{},
 
+    /// An optional observer of collections (the GC report tool). The runtime has no
+    /// clock: the observer brings one, and gets one sample per collection. Unset (the
+    /// default), collections don't call anything.
+    observer: ?Observer = null,
+
+    pub const Observer = struct {
+        ctx: *anyopaque,
+        /// Monotonic nanoseconds.
+        clock: *const fn (ctx: *anyopaque) u64,
+        record: *const fn (ctx: *anyopaque, sample: Sample) void,
+    };
+
+    /// One collection, as seen by an observer.
+    pub const Sample = struct {
+        start_ns: u64,
+        duration_ns: u64,
+        bytes_before: usize,
+        bytes_after: usize,
+        /// Objects that survived (were marked) and that were freed, in this collection.
+        marked: u64,
+        swept: u64,
+    };
+
     /// Deterministic collector statistics (D8): work units, not wall-clock time.
     pub const Stats = struct {
         collections: u64 = 0,
@@ -238,6 +261,18 @@ pub const Heap = struct {
     /// `markObj`/`markValue`); everything not reachable from them is freed. Allocates
     /// nothing and can't fail (I4).
     pub fn collect(h: *Heap, roots: anytype, comptime markRoots: fn (@TypeOf(roots), *Heap) void) void {
+        const start: u64 = if (h.observer) |o| o.clock(o.ctx) else 0;
+        const bytes_before = h.bytes;
+        const marked_before = h.stats.marked;
+        const swept_before = h.stats.swept;
+        defer if (h.observer) |o| o.record(o.ctx, .{
+            .start_ns = start,
+            .duration_ns = o.clock(o.ctx) - start,
+            .bytes_before = bytes_before,
+            .bytes_after = h.bytes,
+            .marked = h.stats.marked - marked_before,
+            .swept = h.stats.swept - swept_before,
+        });
         std.debug.assert(h.gray == null);
         markRoots(roots, h);
         // Drain: each gray object's children (D38's edges), iteratively, never recursively.

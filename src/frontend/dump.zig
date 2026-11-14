@@ -5,6 +5,7 @@
 //!   x#3^0     reference to binding 3 of an outer function, through capture 0
 //!   x@global  reference to an undeclared (global) name
 //!   (function f#1@0 (params…) (captures x#3…) body…)
+//!   (. o#0 name)  (. o#0 [key])  (object (name value) ("str" v) (1.5 v) ([k] v))  (array …)
 //! Strings print non-printable or non-ASCII code units as `\uXXXX`. Not JS syntax.
 
 const std = @import("std");
@@ -140,19 +141,50 @@ const Dumper = struct {
         }
     }
 
+    fn target(d: Dumper, t: ast.Target) Error!void {
+        switch (t) {
+            .ref => |r| try d.ref(r),
+            .member => |m| try d.member(m),
+        }
+    }
+
+    fn member(d: Dumper, m: ast.Member) Error!void {
+        try d.w.writeAll("(. ");
+        try d.expr(m.object);
+        try d.w.writeByte(' ');
+        try d.key(m.key);
+        try d.w.writeByte(')');
+    }
+
+    fn key(d: Dumper, k: ast.PropertyKey) Error!void {
+        switch (k) {
+            .name => |n| try d.w.writeAll(n),
+            .string => |units| try d.string(units),
+            .number => |n| try d.w.print("{d}", .{n}),
+            .computed => |e| {
+                try d.w.writeByte('[');
+                try d.expr(e);
+                try d.w.writeByte(']');
+            },
+        }
+    }
+
+    fn string(d: Dumper, units: []const u16) Error!void {
+        const w = d.w;
+        try w.writeByte('"');
+        for (units) |u| switch (u) {
+            '"', '\\' => try w.print("\\{c}", .{@as(u8, @intCast(u))}),
+            0x20...0x21, 0x23...0x5B, 0x5D...0x7E => try w.writeByte(@intCast(u)),
+            else => try w.print("\\u{X:0>4}", .{u}),
+        };
+        try w.writeByte('"');
+    }
+
     fn expr(d: Dumper, e: *const ast.Expr) Error!void {
         const w = d.w;
         switch (e.data) {
             .number => |n| try w.print("{d}", .{n}),
-            .string => |units| {
-                try w.writeByte('"');
-                for (units) |u| switch (u) {
-                    '"', '\\' => try w.print("\\{c}", .{@as(u8, @intCast(u))}),
-                    0x20...0x21, 0x23...0x5B, 0x5D...0x7E => try w.writeByte(@intCast(u)),
-                    else => try w.print("\\u{X:0>4}", .{u}),
-                };
-                try w.writeByte('"');
-            },
+            .string => |units| try d.string(units),
             .boolean => |b| try w.writeAll(if (b) "true" else "false"),
             .null => try w.writeAll("null"),
             .identifier => |r| try d.ref(r),
@@ -170,7 +202,7 @@ const Dumper = struct {
             },
             .assign => |a| {
                 if (a.op) |op| try w.print("({s}= ", .{op.symbol()}) else try w.writeAll("(= ");
-                try d.ref(a.target);
+                try d.target(a.target);
                 try w.writeByte(' ');
                 try d.expr(a.value);
                 try w.writeByte(')');
@@ -185,10 +217,36 @@ const Dumper = struct {
                 try w.writeByte(')');
             },
             .function => |f| try d.function(f),
+            .this => try w.writeAll("this"),
+            .member => |m| try d.member(m),
+            .delete => |m| {
+                try w.writeAll("(delete ");
+                try d.member(m);
+                try w.writeByte(')');
+            },
+            .array => |items| {
+                try w.writeAll("(array");
+                for (items) |item| {
+                    try w.writeByte(' ');
+                    try d.expr(item);
+                }
+                try w.writeByte(')');
+            },
+            .object => |props| {
+                try w.writeAll("(object");
+                for (props) |prop| {
+                    try w.writeAll(" (");
+                    try d.key(prop.key);
+                    try w.writeByte(' ');
+                    try d.expr(prop.value);
+                    try w.writeByte(')');
+                }
+                try w.writeByte(')');
+            },
             .update => |u| {
                 const sym = if (u.op == .inc) "++" else "--";
                 try w.print("({s}{s} ", .{ if (u.prefix) "pre" else "post", sym });
-                try d.ref(u.target);
+                try d.target(u.target);
                 try w.writeByte(')');
             },
         }

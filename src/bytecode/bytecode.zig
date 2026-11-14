@@ -94,6 +94,40 @@ pub const Op = enum(u8) {
     // ---- stack
     pop,
     dup,
+    /// [a, b] → [a, b, a, b] (a member's base and key, for `o[k] op= v`).
+    dup2,
+    /// [x, y, top] → [top, x, y]: move the top below the next two (postfix `o.p++`).
+    rot3,
+    /// [x, y, z, top] → [top, x, y, z]: below the next three (postfix `o[k]++`).
+    rot4,
+
+    // ---- objects (M7, runtime/object.zig). Keys on the stack are converted by the
+    // instruction that uses them (ToPropertyKey), which gives JS's order: for `o[k] = v`
+    // after v is evaluated, for `o[k] op= v` at the read before it.
+    /// Push a new ordinary object (prototype Object.prototype).
+    new_object,
+    /// [e0 … e(n-1)] → [array].
+    new_array,
+    /// [obj, value] → [obj]: define obj.name (an object literal's `name: value`).
+    define_prop,
+    /// [obj, key, value] → [obj]: the same with a computed or literal key.
+    define_elem,
+    /// [base] → [base.name].
+    get_prop,
+    /// [base, key] → [base[key]].
+    get_elem,
+    /// [base, value] → [value]: base.name = value.
+    set_prop,
+    /// [base, key, value] → [value].
+    set_elem,
+    /// [base] → [delete base.name].
+    delete_prop,
+    /// [base, key] → [delete base[key]].
+    delete_elem,
+    /// [key, object] → [key in object].
+    in,
+    /// Push the frame's `this`; Unsupported(sloppy_this) if the call had no receiver.
+    push_this,
 
     // ---- operators (runtime/ops.zig): pop operands, push the result
     add,
@@ -121,14 +155,15 @@ pub const Op = enum(u8) {
     /// Pop; jump if falsy / truthy (ToBoolean).
     jump_if_false,
     jump_if_true,
-    /// Stack: [callee, arg0 … arg(argc-1)] → [result].
-    /// M3/M5 calling convention, native functions only: the callee is evaluated first,
+    /// Stack: [callee, arg0 … arg(argc-1)] → [result]. The callee is evaluated first,
     /// then the arguments, and only then is it checked (TypeError if not callable,
-    /// matching the tree-walker). The native receives the argument values as a slice of
-    /// the operand stack, valid only during the call; it cannot call back into JS, so
-    /// the stack cannot move under it. User functions (M6) will define frames, `this`
-    /// and return, and may change this instruction; nothing here anticipates them.
+    /// matching the tree-walker). A closure gets a new frame (D36) with no receiver; a
+    /// native gets the arguments as a slice of the operand stack, valid only during the
+    /// call (it cannot call back into JS, so the stack cannot move under it).
     call,
+    /// Stack: [receiver, callee, arg0 … arg(argc-1)] → [result]: a method call `o.f(…)`;
+    /// `this` is the receiver (D41). Otherwise exactly like `call`.
+    call_method,
     /// Pop the return value, leave the frame, and push the value in place of the
     /// callee and arguments in the caller. Function protos only; the stack must hold
     /// exactly the return value.
@@ -163,6 +198,20 @@ pub const Op = enum(u8) {
             .@"return" => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
             .pop => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
             .dup => .{ .operands = &.{}, .pops = 1, .pushes = 2 },
+            .dup2 => .{ .operands = &.{}, .pops = 2, .pushes = 4 },
+            .rot3 => .{ .operands = &.{}, .pops = 3, .pushes = 3 },
+            .rot4 => .{ .operands = &.{}, .pops = 4, .pushes = 4 },
+            .new_object => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
+            .new_array => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
+            .define_prop => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
+            .define_elem => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
+            .get_prop, .delete_prop => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
+            .get_elem, .delete_elem => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
+            .set_prop => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
+            .set_elem => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
+            .in => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
+            .push_this => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
+            .call_method => .{ .operands = &.{.argc}, .pops = 2, .pushes = 1 },
             .add, .sub, .mul, .div, .mod, .pow, .lt, .le, .gt, .ge, .strict_eq, .strict_ne => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .neg, .to_number, .not, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .jump => .{ .operands = &.{.target}, .pops = 0, .pushes = 0 },
@@ -170,6 +219,16 @@ pub const Op = enum(u8) {
             .call => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
             .halt => .{ .operands = &.{}, .pops = 0, .pushes = 0 },
         };
+    }
+
+    /// Values popped, given the instruction's argc operand (if it has one): `call`,
+    /// `call_method` and `new_array` pop their arguments too.
+    pub fn popsWith(op: Op, argc: u32) u64 {
+        const extra: u64 = switch (op) {
+            .call, .call_method, .new_array => argc,
+            else => 0,
+        };
+        return op.info().pops + extra;
     }
 
     /// Encoded length in bytes.

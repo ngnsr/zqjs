@@ -40,6 +40,9 @@ pub const Limits = struct {
     /// LimitExceeded(interpreter_depth) instead of overflowing the OS stack. Sized
     /// (DESIGN_DECISIONS D37) to stay well inside an 8 MiB stack in Debug builds.
     max_interpreter_depth: u32 = 6_000,
+    /// Nesting of built-in conversions that recurse in Zig: converting an array to a
+    /// string converts its elements (`[[[…]]]`). LimitExceeded(conversion_depth).
+    max_conversion_depth: u32 = 1_000,
 };
 
 pub const Limit = enum {
@@ -53,6 +56,7 @@ pub const Limit = enum {
     call_depth,
     stack_slots,
     interpreter_depth,
+    conversion_depth,
 };
 
 comptime {

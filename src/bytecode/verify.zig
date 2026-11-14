@@ -154,7 +154,8 @@ const Verifier = struct {
             const op = opAt(p, at);
             const op_info = op.info();
             const d: u64 = depth[at];
-            const pops: u64 = @as(u64, op_info.pops) + if (op == .call) bc.readU32(p.code, at + 1) else 0;
+            const argc: u32 = if (op_info.operands.len > 0 and op_info.operands[0] == .argc) bc.readU32(p.code, at + 1) else 0;
+            const pops = op.popsWith(argc);
             if (d < pops) return v.fail(p, at, "stack underflow");
             const after = d - pops + op_info.pushes;
             // An instruction that pops and pushes (dup) peaks at its result depth.

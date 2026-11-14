@@ -86,6 +86,9 @@ const Parser = struct {
     loop_depth: u32 = 0,
     /// Number of enclosing functions; `return` is legal only when > 0.
     function_depth: u32 = 0,
+    /// Inside a `for (…;` head: `in` is not an operator there (`for (x in o)` is for-in).
+    /// Brackets, parentheses and literals turn it back on (`nested`), as in the grammar.
+    no_in: bool = false,
     ref_count: u32 = 0,
     binding_count: u32 = 0,
     function_count: u32 = 1, // function 0 is the script
@@ -268,6 +271,7 @@ const Parser = struct {
         try p.advance();
 
         var init: ?ast.ForInit = null;
+        p.no_in = true;
         if (p.tok.tag == .kw_const) {
             init = .{ .declaration = try p.declaration(.@"const") };
         } else if (p.isText(p.tok, "let") and try p.letStartsDeclaration()) {
@@ -275,6 +279,7 @@ const Parser = struct {
         } else if (p.tok.tag != .semicolon) {
             init = .{ .expression = try p.expression() };
         }
+        p.no_in = false;
         // `for (x of xs)` / `for (x in o)`
         if (p.isText(p.tok, "of") or p.isText(p.tok, "in")) return p.fail(.{ .unsupported = .syntax }, p.tok);
         try p.expectAfterExpression(.semicolon);
@@ -334,8 +339,6 @@ const Parser = struct {
         const start = p.tok.start;
         try p.advance(); // `function`
         if (p.tok.tag == .star) return p.fail(.{ .unsupported = .syntax }, p.tok); // generator
-        const id = p.function_count;
-        p.function_count += 1;
 
         var name: ?ast.Declarator = null;
         if (p.tok.tag != .l_paren) {
@@ -343,7 +346,14 @@ const Parser = struct {
         } else if (kind == .declaration) {
             return p.fail(.{ .syntax_error = "function declaration needs a name" }, p.tok);
         }
+        return p.functionRest(start, kind, name);
+    }
 
+    /// From the parameter list on: shared by `function` and object-literal methods
+    /// (`{ f(a) { … } }`, an anonymous function expression whose name is not bound).
+    fn functionRest(p: *Parser, start: u32, kind: @FieldType(ast.Function, "kind"), name: ?ast.Declarator) Error!*const ast.Function {
+        const id = p.function_count;
+        p.function_count += 1;
         if (p.tok.tag != .l_paren) return p.fail(.{ .syntax_error = "expected '('" }, p.tok);
         try p.advance();
         var params: std.ArrayList(ast.Declarator) = .empty;
@@ -423,14 +433,31 @@ const Parser = struct {
         const lhs = try p.binary(0);
         const op = assignOp(p.tok.tag) orelse return lhs;
         // Parentheses are transparent, so `(x) = 1` arrives here as a plain identifier, as in JS.
-        if (lhs.data != .identifier) return p.invalidTarget(lhs, "invalid assignment target");
+        const target = try p.assignTarget(lhs, "invalid assignment target");
         try p.advance();
         const value = try p.expression();
         return p.node(
             .{ .start = lhs.span.start, .end = value.span.end },
-            .{ .assign = .{ .op = op, .target = lhs.data.identifier, .value = value } },
-            value.depth,
+            .{ .assign = .{ .op = op, .target = target, .value = value } },
+            @max(lhs.depth, value.depth),
         );
+    }
+
+    /// Variables and members can be assigned to; anything else can't.
+    fn assignTarget(p: *Parser, e: *const ast.Expr, msg: []const u8) Error!ast.Target {
+        return switch (e.data) {
+            .identifier => |r| .{ .ref = r },
+            .member => |m| .{ .member = m },
+            else => p.invalidTarget(e, msg),
+        };
+    }
+
+    /// A nested expression in brackets, parentheses or a literal: `in` is an operator again.
+    fn nested(p: *Parser) Error!*const ast.Expr {
+        const saved = p.no_in;
+        p.no_in = false;
+        defer p.no_in = saved;
+        return p.expression();
     }
 
     fn binary(p: *Parser, min_bp: u8) Error!*const ast.Expr {
@@ -440,7 +467,7 @@ const Parser = struct {
         var lhs = try p.prefix();
         while (true) {
             if (p.tok.tag == .eq2 or p.tok.tag == .neq2) return p.fail(.{ .unsupported = .loose_equality }, p.tok);
-            const info = infix(p.tok.tag) orelse break;
+            const info: Infix = if (!p.no_in and p.isText(p.tok, "in")) .{ .op = .in, .bp = 4 } else infix(p.tok.tag) orelse break;
             if (info.bp < min_bp) break;
             try p.advance();
             const rhs = try p.binary(if (info.right_assoc) info.bp else info.bp + 1);
@@ -477,9 +504,19 @@ const Parser = struct {
                 return p.node(
                     .{ .start = t.start, .end = operand.span.end },
                     .{ .update = .{ .op = if (t.tag == .plus2) .inc else .dec, .prefix = true, .target = target } },
-                    0,
+                    operand.depth,
                 );
             },
+            .identifier => if (p.isText(t, "delete")) {
+                try p.advance();
+                const operand = try p.binary(unary_bp);
+                if (p.tok.tag == .star_star)
+                    return p.fail(.{ .syntax_error = "unary operator before '**' needs parentheses" }, t);
+                // `delete x` (a variable) and `delete 1` mean something in sloppy JS, but
+                // only member deletion is part of ZQJS.
+                if (operand.data != .member) return p.fail(.{ .unsupported = .syntax }, t);
+                return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .delete = operand.data.member }, operand.depth);
+            } else return p.postfix(try p.calls(try p.primary())),
             else => return p.postfix(try p.calls(try p.primary())),
         }
     }
@@ -494,13 +531,12 @@ const Parser = struct {
         return p.node(
             .{ .start = operand.span.start, .end = t.end },
             .{ .update = .{ .op = if (t.tag == .plus2) .inc else .dec, .prefix = false, .target = target } },
-            0,
+            operand.depth,
         );
     }
 
-    fn updateTarget(p: *Parser, operand: *const ast.Expr) Error!ast.Ref {
-        if (operand.data != .identifier) return p.invalidTarget(operand, "invalid update target");
-        return operand.data.identifier;
+    fn updateTarget(p: *Parser, operand: *const ast.Expr) Error!ast.Target {
+        return p.assignTarget(operand, "invalid update target");
     }
 
     /// `f() = 1` and `f()++` are *runtime* ReferenceErrors in node (a web-compatibility
@@ -510,17 +546,40 @@ const Parser = struct {
         return p.failAt(.{ .syntax_error = msg }, e.span.start, e.span.end);
     }
 
-    /// `callee(args)(args)…`. Unlike `++`, a call may continue on the next line:
-    /// `x\n(2)` calls x.
+    /// `callee(args)`, `object.name`, `object[key]`, chained. Unlike `++`, these may
+    /// continue on the next line: `x\n(2)` calls x, `x\n[0]` indexes it.
     fn calls(p: *Parser, callee_in: *const ast.Expr) Error!*const ast.Expr {
         var callee = callee_in;
-        while (p.tok.tag == .l_paren) {
+        while (true) switch (p.tok.tag) {
+            .l_paren => callee = try p.callArgs(callee),
+            .dot => {
+                try p.advance();
+                const name = p.tok;
+                // Any identifier or keyword names a property: `o.if`, `o.this`.
+                if (name.tag != .identifier and !token.isKeyword(name.tag)) return p.fail(.{ .unsupported = .syntax }, name);
+                try p.advance();
+                callee = try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = name.text(p.source()) } } }, callee.depth);
+            },
+            .l_bracket => {
+                try p.advance();
+                const k = try p.nested();
+                const close = p.tok;
+                try p.expectAfterExpression(.r_bracket);
+                callee = try p.node(.{ .start = callee.span.start, .end = close.end }, .{ .member = .{ .object = callee, .key = .{ .computed = k } } }, @max(callee.depth, k.depth));
+            },
+            .question_dot => return p.fail(.{ .unsupported = .syntax }, p.tok), // optional chaining
+            else => return callee,
+        };
+    }
+
+    fn callArgs(p: *Parser, callee: *const ast.Expr) Error!*const ast.Expr {
+        {
             try p.advance();
             var args: std.ArrayList(*const ast.Expr) = .empty;
             var depth = callee.depth;
             while (p.tok.tag != .r_paren) {
                 if (p.tok.tag == .ellipsis) return p.fail(.{ .unsupported = .syntax }, p.tok); // spread
-                const arg = try p.expression();
+                const arg = try p.nested();
                 try args.append(p.arena, arg);
                 depth = @max(depth, arg.depth);
                 if (p.tok.tag != .comma) break;
@@ -528,13 +587,118 @@ const Parser = struct {
             }
             const close = p.tok;
             try p.expectAfterExpression(.r_paren);
-            callee = try p.node(
+            return p.node(
                 .{ .start = callee.span.start, .end = close.end },
                 .{ .call = .{ .callee = callee, .args = args.items } },
                 depth,
             );
         }
-        return callee;
+    }
+
+    /// `[a, b, …]`. Holes (`[1,,2]`) are Unsupported: arrays are dense (D13).
+    fn arrayLiteral(p: *Parser) Error!*const ast.Expr {
+        const open = p.tok;
+        try p.advance();
+        var items: std.ArrayList(*const ast.Expr) = .empty;
+        var depth: u16 = 0;
+        while (p.tok.tag != .r_bracket) {
+            if (p.tok.tag == .comma) return p.fail(.{ .unsupported = .sparse_array }, p.tok);
+            if (p.tok.tag == .ellipsis) return p.fail(.{ .unsupported = .syntax }, p.tok); // spread
+            if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated array literal" }, open);
+            const e = try p.nested();
+            try items.append(p.arena, e);
+            depth = @max(depth, e.depth);
+            if (p.tok.tag != .comma) break;
+            try p.advance(); // a trailing comma adds no element
+        }
+        const close = p.tok;
+        try p.expectAfterExpression(.r_bracket);
+        return p.node(span(open, close), .{ .array = items.items }, depth);
+    }
+
+    /// `{ key: value, [expr]: value, name, method() {…}, … }`.
+    fn objectLiteral(p: *Parser) Error!*const ast.Expr {
+        const open = p.tok;
+        try p.advance();
+        var props: std.ArrayList(ast.PropertyDef) = .empty;
+        var depth: u16 = 0;
+        while (p.tok.tag != .r_brace) {
+            const t = p.tok;
+            const k: ast.PropertyKey = switch (t.tag) {
+                .l_bracket => blk: {
+                    try p.advance();
+                    const e = try p.nested();
+                    try p.expectAfterExpression(.r_bracket);
+                    break :blk .{ .computed = e };
+                },
+                .string => blk: {
+                    const units = try p.decodeString(t);
+                    try p.advance();
+                    break :blk .{ .string = units };
+                },
+                .number => blk: {
+                    const n = std.fmt.parseFloat(f64, t.text(p.source())) catch unreachable;
+                    try p.advance();
+                    break :blk .{ .number = n };
+                },
+                .eof => return p.fail(.{ .syntax_error = "unterminated object literal" }, open),
+                else => blk: {
+                    if (t.tag != .identifier and !token.isKeyword(t.tag)) return p.fail(.{ .unsupported = .syntax }, t); // `...`, `*`, …
+                    const name = t.text(p.source());
+                    // `get x() {}`, `set x(v) {}`, `async f() {}`: accessors and async methods.
+                    if (std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "set") or std.mem.eql(u8, name, "async")) {
+                        const next = try p.peek();
+                        switch (next.tag) {
+                            .colon, .l_paren, .comma, .r_brace => {},
+                            else => return p.fail(.{ .unsupported = .syntax }, t),
+                        }
+                    }
+                    try p.advance();
+                    break :blk .{ .name = name };
+                },
+            };
+            const value: *const ast.Expr = switch (p.tok.tag) {
+                .colon => blk: {
+                    if (isProtoKey(k)) return p.fail(.{ .unsupported = .builtin }, t); // sets the prototype
+                    try p.advance();
+                    break :blk try p.nested();
+                },
+                .l_paren => blk: {
+                    const f = try p.functionRest(t.start, .expression, null);
+                    break :blk try p.node(f.span, .{ .function = f }, 0);
+                },
+                .comma, .r_brace => blk: {
+                    // Shorthand `{ x }` is a reference to the variable x.
+                    if (k != .name or t.tag != .identifier) return p.fail(.{ .syntax_error = "unexpected token in object literal" }, p.tok);
+                    if (token.reserved_identifiers.has(k.name)) return p.fail(.{ .syntax_error = "reserved word as shorthand property" }, t);
+                    if (std.mem.eql(u8, k.name, "let")) return p.fail(.{ .unsupported = .syntax }, t);
+                    if (std.mem.eql(u8, k.name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
+                    const id = p.ref_count;
+                    p.ref_count += 1;
+                    break :blk try p.node(span(t, t), .{ .identifier = .{ .name = k.name, .span = span(t, t), .id = id } }, 0);
+                },
+                .eq => return p.fail(.{ .unsupported = .syntax }, p.tok), // `{ a = 1 }`: destructuring
+                .number, .string, .identifier => return p.fail(.{ .syntax_error = "unexpected token in object literal" }, p.tok),
+                else => return p.fail(.{ .unsupported = .syntax }, p.tok),
+            };
+            try props.append(p.arena, .{ .key = k, .value = value, .span = .{ .start = t.start, .end = value.span.end } });
+            depth = @max(depth, value.depth);
+            if (k == .computed) depth = @max(depth, k.computed.depth);
+            if (p.tok.tag != .comma) break;
+            try p.advance(); // a trailing comma is allowed
+        }
+        const close = p.tok;
+        try p.expectAfterExpression(.r_brace);
+        return p.node(span(open, close), .{ .object = props.items }, depth);
+    }
+
+    /// The literal key `__proto__:` (not computed, not shorthand) sets the prototype.
+    fn isProtoKey(k: ast.PropertyKey) bool {
+        return switch (k) {
+            .name => |n| std.mem.eql(u8, n, "__proto__"),
+            .string => |u| std.mem.eql(u16, u, std.unicode.utf8ToUtf16LeStringLiteral("__proto__")),
+            else => false,
+        };
     }
 
     fn primary(p: *Parser) Error!*const ast.Expr {
@@ -560,8 +724,16 @@ const Parser = struct {
                 try p.advance();
                 return p.node(s, .null, 0);
             },
+            .l_bracket => return p.arrayLiteral(),
+            .l_brace => return p.objectLiteral(),
             .identifier => {
                 const name = t.text(p.source());
+                if (std.mem.eql(u8, name, "this")) {
+                    // At script level `this` is the global object, which ZQJS doesn't have.
+                    if (p.function_depth == 0) return p.fail(.{ .unsupported = .sloppy_this }, t);
+                    try p.advance();
+                    return p.node(s, .this, 0);
+                }
                 if (std.mem.eql(u8, name, "function")) {
                     const f = try p.function(.expression);
                     return p.node(f.span, .{ .function = f }, 0);
@@ -581,7 +753,7 @@ const Parser = struct {
                 try p.advance();
                 // `()` is only valid as an arrow-function parameter list.
                 if (p.tok.tag == .r_paren) return p.fail(.{ .unsupported = .syntax }, p.tok);
-                const inner = try p.expression();
+                const inner = try p.nested();
                 try p.expectAfterExpression(.r_paren);
                 return inner;
             },

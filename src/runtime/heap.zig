@@ -9,6 +9,15 @@
 //! it would exceed `max_heap_bytes`. The overhead constant stands in for allocator
 //! bookkeeping we can't observe through `std.mem.Allocator`; charging it per
 //! allocation means many tiny allocations can't slip under the limit.
+//!
+//! Object-internal buffers (M7: property tables, array elements, the atom table) grow
+//! and shrink, so they go through `allocator()`, a counting std.mem.Allocator with the
+//! same charging rule (D7). It can only report OutOfMemory; when the refusal was the
+//! heap limit it sets `refused`, and `failed()` turns that back into LimitExceeded.
+//!
+//! GC traceability (M7 acceptance, DESIGN_DECISIONS D38): `forEachChild` enumerates
+//! every reference from a heap object to another, for every kind. M8's marking is that
+//! enumeration; a kind added without updating it fails the exhaustive switch.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,6 +25,7 @@ const limits_mod = @import("../limits.zig");
 const Limits = limits_mod.Limits;
 const Limit = limits_mod.Limit;
 const Value = @import("value.zig").Value;
+const Builtin = @import("builtin_names.zig").Builtin;
 
 pub const Error = error{ LimitExceeded, OutOfMemory };
 
@@ -25,7 +35,7 @@ pub const Obj = struct {
     kind: Kind,
     next: ?*Obj,
 
-    pub const Kind = enum { string, cell, closure, env };
+    pub const Kind = enum { string, cell, closure, env, object };
 };
 
 /// A captured variable (VM, DESIGN_DECISIONS D36). `null` = TDZ. Shared by every closure
@@ -60,6 +70,38 @@ pub const String = struct {
     obj: Obj,
     /// UTF-16 code units, possibly with lone surrogates. Immutable.
     units: []const u16,
+    /// Set for atoms (interned property keys, D11), which are compared by pointer.
+    atom: ?struct {
+        /// The canonical array index this key denotes ("0", "17"; not "01", "-1"), if any:
+        /// a canonical numeric string ≤ 2^32 − 2 (D13).
+        index: ?u32,
+    } = null,
+};
+
+/// An own property. Everything is a data property (no getters/setters in ZQJS); all are
+/// writable and configurable. Built-in methods are not enumerable, as in node.
+pub const Property = struct {
+    value: Value,
+    enumerable: bool = true,
+};
+
+/// An ordinary object or an array (DESIGN_DECISIONS D13).
+pub const Object = struct {
+    obj: Obj,
+    /// The prototype. Only Object.create and the built-ins set it, always to an existing
+    /// object or null, so a chain can never form a cycle.
+    proto: ?*Object,
+    /// Own properties in insertion order, keyed by atom. Index-like keys of ordinary
+    /// objects live here too; `ownKeys` puts them first, ascending.
+    props: std.AutoArrayHashMapUnmanaged(*String, Property) = .empty,
+    kind: union(enum) {
+        ordinary,
+        /// Dense elements 0 … len-1: no holes, ever (D13).
+        array: std.ArrayList(Value),
+    } = .ordinary,
+    /// Set on the built-in objects: which node object's names classify lookups that
+    /// miss here (builtin_names.zig, D39).
+    builtin: ?Builtin = null,
 };
 
 /// A part of a string being built: either UTF-16 units or ASCII bytes (numbers,
@@ -88,12 +130,17 @@ pub const Heap = struct {
     allocated: u64 = 0,
     /// Which limit was hit, when an operation returns error.LimitExceeded.
     limit_hit: ?Limit = null,
+    /// Interned property keys (D11). Strong until the M8 GC makes it weak.
+    atoms: std.HashMapUnmanaged(*String, void, AtomContext, 80) = .empty,
+    /// `allocator()` refused an allocation because of the heap limit (see `failed`).
+    refused: bool = false,
 
     pub fn init(gpa: Allocator, limits: Limits) Heap {
         return .{ .gpa = gpa, .max_bytes = limits.max_heap_bytes, .max_string_length = limits.max_string_length };
     }
 
     pub fn deinit(h: *Heap) void {
+        h.atoms.deinit(h.allocator());
         var it = h.objects;
         while (it) |obj| {
             it = obj.next;
@@ -114,9 +161,115 @@ pub const Heap = struct {
     pub fn rollback(h: *Heap, m: ?*Obj) void {
         while (h.objects != m) {
             const obj = h.objects.?; // `m` must be in the list
+            if (obj.kind == .string) std.debug.assert(@as(*String, @fieldParentPtr("obj", obj)).atom == null); // the table would dangle
             h.objects = obj.next;
             h.destroy(obj);
         }
+    }
+
+    // ---- objects (M7)
+
+    pub fn newObject(h: *Heap, proto: ?*Object) Error!*Object {
+        const charge = try h.reserve(@sizeOf(Object), 0, 1);
+        errdefer h.bytes -= charge;
+        const o = try h.gpa.create(Object);
+        o.* = .{ .obj = .{ .kind = .object, .next = h.objects }, .proto = proto };
+        h.objects = &o.obj;
+        return o;
+    }
+
+    pub fn newArray(h: *Heap, proto: ?*Object) Error!*Object {
+        const o = try h.newObject(proto);
+        o.kind = .{ .array = .empty };
+        return o;
+    }
+
+    /// The atom for `units` (interning it if new).
+    pub fn intern(h: *Heap, units: []const u16) Error!*String {
+        return h.internAdapted(units, Utf16Adapter{});
+    }
+
+    /// The atom for ASCII text (a property name from the source).
+    pub fn internAscii(h: *Heap, text: []const u8) Error!*String {
+        return h.internAdapted(text, AsciiAdapter{});
+    }
+
+    fn internAdapted(h: *Heap, key: anytype, adapter: anytype) Error!*String {
+        const gop = h.atoms.getOrPutContextAdapted(h.allocator(), key, adapter, .{}) catch |e| return h.failed(e);
+        if (gop.found_existing) return gop.key_ptr.*;
+        errdefer h.atoms.removeByPtr(gop.key_ptr);
+        const s = try h.newString(&.{if (@TypeOf(key) == []const u8) .{ .ascii = key } else .{ .utf16 = key }});
+        s.atom = .{ .index = arrayIndex(s.units) };
+        gop.key_ptr.* = s;
+        return s;
+    }
+
+    /// A counting allocator for object-internal buffers (see the file comment).
+    pub fn allocator(h: *Heap) Allocator {
+        return .{ .ptr = h, .vtable = &counting_vtable };
+    }
+
+    /// Translates an `allocator()` failure: LimitExceeded if the heap limit refused it.
+    pub fn failed(h: *Heap, e: Allocator.Error) Error {
+        switch (e) { // always OutOfMemory; `refused` says why
+            error.OutOfMemory => {},
+        }
+        if (h.refused) {
+            h.refused = false;
+            h.limit_hit = .heap_bytes;
+            return error.LimitExceeded;
+        }
+        return error.OutOfMemory;
+    }
+
+    const counting_vtable: Allocator.VTable = .{ .alloc = countAlloc, .resize = countResize, .remap = countRemap, .free = countFree };
+
+    /// Charges `len` bytes plus `allocations` overheads, or records the refusal.
+    fn chargeBytes(h: *Heap, len: usize, allocations: usize) bool {
+        _ = h.reserve(0, len, allocations) catch {
+            h.refused = true;
+            return false;
+        };
+        return true;
+    }
+
+    fn countAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const h: *Heap = @ptrCast(@alignCast(ctx));
+        if (!h.chargeBytes(len, 1)) return null;
+        const p = h.gpa.rawAlloc(len, alignment, ret) orelse {
+            h.bytes -= len + per_allocation_overhead;
+            return null;
+        };
+        return p;
+    }
+
+    fn countResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
+        const h: *Heap = @ptrCast(@alignCast(ctx));
+        // Growth is charged without an overhead: the allocation already exists.
+        if (new_len > memory.len and !h.chargeBytes(new_len - memory.len, 0)) return false;
+        if (!h.gpa.rawResize(memory, alignment, new_len, ret)) {
+            if (new_len > memory.len) h.bytes -= new_len - memory.len;
+            return false;
+        }
+        if (new_len < memory.len) h.bytes -= memory.len - new_len;
+        return true;
+    }
+
+    fn countRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+        const h: *Heap = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !h.chargeBytes(new_len - memory.len, 0)) return null;
+        const p = h.gpa.rawRemap(memory, alignment, new_len, ret) orelse {
+            if (new_len > memory.len) h.bytes -= new_len - memory.len;
+            return null;
+        };
+        if (new_len < memory.len) h.bytes -= memory.len - new_len;
+        return p;
+    }
+
+    fn countFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const h: *Heap = @ptrCast(@alignCast(ctx));
+        h.bytes -= memory.len + per_allocation_overhead;
+        h.gpa.rawFree(memory, alignment, ret);
     }
 
     pub fn newCell(h: *Heap, value: ?Value) Error!*Cell {
@@ -195,6 +348,16 @@ pub const Heap = struct {
                 h.gpa.free(e.values);
                 h.gpa.destroy(e);
             },
+            .object => {
+                const o: *Object = @fieldParentPtr("obj", obj);
+                o.props.deinit(h.allocator()); // refunds through the counting allocator
+                switch (o.kind) {
+                    .ordinary => {},
+                    .array => |*elements| elements.deinit(h.allocator()),
+                }
+                h.bytes -= @sizeOf(Object) + per_allocation_overhead;
+                h.gpa.destroy(o);
+            },
         }
     }
 
@@ -251,7 +414,179 @@ pub const Heap = struct {
     }
 };
 
+/// Calls `visit(ctx, child)` for every heap object `obj` references directly: the edges
+/// M8's marking follows (D38). Atoms used as property keys are edges too (D11).
+pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *Obj) void) void {
+    switch (obj.kind) {
+        .string => {},
+        .cell => {
+            const c: *Cell = @fieldParentPtr("obj", obj);
+            if (c.value) |v| visitValue(v, ctx, visit);
+        },
+        .closure => {
+            const c: *Closure = @fieldParentPtr("obj", obj);
+            switch (c.impl) {
+                // The Proto (and its string constants) is not a heap object yet; M8 roots it.
+                .vm => |v| for (v.captures) |cell| visit(ctx, &cell.obj),
+                .tree => |t| if (t.env) |e| visit(ctx, &e.obj),
+            }
+        },
+        .env => {
+            const e: *Env = @fieldParentPtr("obj", obj);
+            if (e.parent) |p| visit(ctx, &p.obj);
+            for (e.values) |slot| if (slot) |v| visitValue(v, ctx, visit);
+        },
+        .object => {
+            const o: *Object = @fieldParentPtr("obj", obj);
+            if (o.proto) |p| visit(ctx, &p.obj);
+            for (o.props.keys(), o.props.values()) |k, p| {
+                visit(ctx, &k.obj);
+                visitValue(p.value, ctx, visit);
+            }
+            switch (o.kind) {
+                .ordinary => {},
+                .array => |elements| for (elements.items) |v| visitValue(v, ctx, visit),
+            }
+        },
+    }
+}
+
+pub fn visitValue(v: Value, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *Obj) void) void {
+    switch (v) {
+        .undefined, .null, .boolean, .number, .native => {}, // natives are static
+        .string => |s| visit(ctx, @constCast(&s.obj)),
+        .closure => |c| visit(ctx, @constCast(&c.obj)),
+        .object => |o| visit(ctx, &o.obj),
+    }
+}
+
+/// The canonical array index a key denotes: "0" or [1-9][0-9]* with value ≤ 2^32 − 2.
+fn arrayIndex(units: []const u16) ?u32 {
+    if (units.len == 0 or units.len > 10) return null;
+    if (units[0] == '0') return if (units.len == 1) 0 else null;
+    var n: u64 = 0;
+    for (units) |u| {
+        if (u < '0' or u > '9') return null;
+        n = n * 10 + (u - '0');
+    }
+    return if (n <= std.math.maxInt(u32) - 1) @intCast(n) else null;
+}
+
+/// Atoms hash by content (FNV-1a over code units, so ASCII and UTF-16 lookups agree).
+fn hashUnits(comptime T: type, units: []const T) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (units) |u| {
+        h ^= @as(u16, u);
+        h *%= 0x100000001b3;
+    }
+    return h;
+}
+
+const AtomContext = struct {
+    pub fn hash(_: AtomContext, s: *String) u64 {
+        return hashUnits(u16, s.units);
+    }
+    pub fn eql(_: AtomContext, a: *String, b: *String) bool {
+        return a == b;
+    }
+};
+
+const Utf16Adapter = struct {
+    pub fn hash(_: Utf16Adapter, units: []const u16) u64 {
+        return hashUnits(u16, units);
+    }
+    pub fn eql(_: Utf16Adapter, units: []const u16, s: *String) bool {
+        return std.mem.eql(u16, units, s.units);
+    }
+};
+
+const AsciiAdapter = struct {
+    pub fn hash(_: AsciiAdapter, text: []const u8) u64 {
+        return hashUnits(u8, text);
+    }
+    pub fn eql(_: AsciiAdapter, text: []const u8, s: *String) bool {
+        if (text.len != s.units.len) return false;
+        for (text, s.units) |c, u| if (c != u) return false;
+        return true;
+    }
+};
+
 const testing = std.testing;
+
+test "atoms: interned once, by content, from ASCII or UTF-16; array indices classified" {
+    var h = Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    const a = try h.internAscii("length");
+    try testing.expectEqual(a, try h.intern(std.unicode.utf8ToUtf16LeStringLiteral("length")));
+    try testing.expectEqual(a, try h.internAscii("length"));
+    try testing.expect(a != try h.internAscii("lengths"));
+    try testing.expectEqual(@as(?u32, 4294967294), (try h.internAscii("4294967294")).atom.?.index);
+    for ([_][]const u8{ "4294967295", "01", "-1", "1.0", "", "1e3" }) |k| try testing.expectEqual(@as(?u32, null), (try h.internAscii(k)).atom.?.index);
+    try testing.expectEqual(@as(?u32, 0), (try h.internAscii("0")).atom.?.index);
+}
+
+test "object storage is charged to the heap limit and refunded exactly" {
+    var h = Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    const o = try h.newObject(null);
+    const arr = try h.newArray(o);
+    const k = try h.internAscii("k");
+    const before = h.bytes;
+    try o.props.put(h.allocator(), k, .{ .value = .null });
+    try arr.kind.array.append(h.allocator(), .{ .number = 1 });
+    try testing.expect(h.bytes > before);
+    _ = o.props.orderedRemove(k);
+    o.props.clearAndFree(h.allocator());
+    arr.kind.array.clearAndFree(h.allocator());
+    try testing.expectEqual(before, h.bytes);
+    // The limit refuses buffer growth too, reported as LimitExceeded, not OutOfMemory.
+    var small = Heap.init(testing.allocator, .{ .max_heap_bytes = 200 });
+    defer small.deinit();
+    const big = try small.newArray(null);
+    try testing.expectError(error.LimitExceeded, big.kind.array.appendNTimes(small.allocator(), .null, 100) catch |e| small.failed(e));
+    try testing.expectEqual(Limit.heap_bytes, small.limit_hit.?);
+}
+
+test "forEachChild enumerates every reference edge (what the M8 GC will mark)" {
+    var h = Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    const proto = try h.newObject(null);
+    const o = try h.newObject(proto);
+    const key = try h.internAscii("x");
+    const str = try h.ascii("value");
+    const arr = try h.newArray(proto);
+    try arr.kind.array.append(h.allocator(), .{ .string = str });
+    try o.props.put(h.allocator(), key, .{ .value = .{ .object = arr } });
+    const cell = try h.newCell(.{ .object = o });
+    const env = try h.newEnv(null, 0, 1);
+    env.values[0] = .{ .string = str };
+    const env2 = try h.newEnv(env, 1, 0);
+    const tree = try h.newTreeClosure(@ptrCast(&h), env2);
+    const vm = try h.newVmClosure(@ptrCast(&h), 1);
+    vm.impl.vm.captures[0] = cell;
+
+    const Collect = struct {
+        found: [8]*Obj = undefined,
+        n: usize = 0,
+        fn add(c: *@This(), child: *Obj) void {
+            c.found[c.n] = child;
+            c.n += 1;
+        }
+        fn expect(obj: *Obj, want: []const *Obj) !void {
+            var c: @This() = .{};
+            forEachChild(obj, &c, add);
+            try testing.expectEqualSlices(*Obj, want, c.found[0..c.n]);
+        }
+    };
+    try Collect.expect(&o.obj, &.{ &proto.obj, &key.obj, &arr.obj }); // prototype, key, value
+    try Collect.expect(&arr.obj, &.{ &proto.obj, &str.obj }); // prototype, elements
+    try Collect.expect(&cell.obj, &.{&o.obj});
+    try Collect.expect(&vm.obj, &.{&cell.obj}); // captured cells
+    try Collect.expect(&tree.obj, &.{&env2.obj});
+    try Collect.expect(&env2.obj, &.{&env.obj}); // parent
+    try Collect.expect(&env.obj, &.{&str.obj});
+    try Collect.expect(&str.obj, &.{});
+}
 
 test "strings are built from pieces and freed by deinit" {
     var h = Heap.init(testing.allocator, .{});

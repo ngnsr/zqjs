@@ -36,6 +36,8 @@ pub const BinaryOp = enum {
     ge,
     strict_eq,
     strict_ne,
+    /// `key in object` (M7).
+    in,
     /// `&&` and `||` short-circuit; the compiler treats them as control flow.
     logical_and,
     logical_or,
@@ -54,6 +56,7 @@ pub const BinaryOp = enum {
             .ge => ">=",
             .strict_eq => "===",
             .strict_ne => "!==",
+            .in => "in",
             .logical_and => "&&",
             .logical_or => "||",
         };
@@ -65,6 +68,33 @@ pub const Ref = struct {
     name: []const u8,
     span: Span,
     id: u32,
+};
+
+/// A property key as written (M7). `name`: an identifier or keyword after `.` or in a
+/// literal (ASCII); `string` / `number`: a literal key; `computed`: `[expr]`.
+pub const PropertyKey = union(enum) {
+    name: []const u8,
+    string: []const u16,
+    number: f64,
+    computed: *const Expr,
+};
+
+/// `object.name` or `object[expr]` (only `name` and `computed` keys occur here).
+pub const Member = struct {
+    object: *const Expr,
+    key: PropertyKey,
+};
+
+/// What an assignment or `++`/`--` writes to.
+pub const Target = union(enum) {
+    ref: Ref,
+    member: Member,
+};
+
+pub const PropertyDef = struct {
+    key: PropertyKey,
+    value: *const Expr,
+    span: Span,
 };
 
 pub const Expr = struct {
@@ -84,11 +114,20 @@ pub const Expr = struct {
         unary: struct { op: UnaryOp, operand: *const Expr },
         binary: struct { op: BinaryOp, lhs: *const Expr, rhs: *const Expr },
         /// `target = value` (op null) or `target op= value`.
-        assign: struct { op: ?BinaryOp, target: Ref, value: *const Expr },
-        /// `callee(args)`. In M3 only native functions (`print`) can be called.
+        assign: struct { op: ?BinaryOp, target: Target, value: *const Expr },
+        /// `callee(args)`. A member callee (`o.f(…)`) is a method call: `this` is `o`.
         call: struct { callee: *const Expr, args: []const *const Expr },
         /// `++x`, `--x`, `x++`, `x--`.
-        update: struct { op: enum { inc, dec }, prefix: bool, target: Ref },
+        update: struct { op: enum { inc, dec }, prefix: bool, target: Target },
+        member: Member,
+        /// `{ key: value, … }`, in source order.
+        object: []const PropertyDef,
+        /// `[a, b, …]` (no holes: the parser rejects them).
+        array: []const *const Expr,
+        /// `delete object.name` / `delete object[expr]`.
+        delete: Member,
+        /// `this`, only inside functions (at script level: Unsupported).
+        this,
         /// `function [name](params) { body }` as an expression.
         function: *const Function,
     };

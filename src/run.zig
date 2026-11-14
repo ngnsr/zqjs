@@ -93,7 +93,15 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
                 try report.writeByte('\n');
             },
             error.LimitExceeded => try report.print("{s}: LimitExceeded({s})\n", .{ name, @tagName(rt.limitHit().?) }),
-            error.Unsupported => try report.print("{s}: Unsupported({s}): {s}\n", .{ name, @tagName(rt.unsupported.?), rt.unsupported.?.description() }),
+            error.Unsupported => {
+                try report.print("{s}: Unsupported({s}): {s}", .{ name, @tagName(rt.unsupported.?), rt.unsupported.?.description() });
+                if (rt.unsupported_name) |n| {
+                    try report.writeAll(" ('");
+                    try ops.writeUtf16(report, n.units);
+                    try report.writeAll("')");
+                }
+                try report.writeByte('\n');
+            },
         }
         return 1;
     };

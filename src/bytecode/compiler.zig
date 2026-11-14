@@ -193,8 +193,8 @@ const Compiler = struct {
         for (operands) |x| c.code.appendSliceAssumeCapacity(&std.mem.toBytes(std.mem.nativeToLittle(u32, x)));
         c.s.code_bytes += op.size();
 
-        const pops = info.pops + if (op == .call) operands[0] else 0;
-        c.depth -= pops; // underflow here is a compiler bug (safety-checked)
+        const argc: u32 = if (info.operands.len > 0 and info.operands[0] == .argc) operands[0] else 0;
+        c.depth -= @intCast(op.popsWith(argc)); // underflow here is a compiler bug (safety-checked)
         c.depth += info.pushes;
         c.max_stack = @max(c.max_stack, c.depth);
     }
@@ -457,34 +457,153 @@ const Compiler = struct {
                     try c.emit(binaryOp(b.op), &.{});
                 },
             },
-            .assign => |a| {
-                if (a.op) |op| {
-                    // x op= e: read x (TDZ), evaluate e, apply op, then write (const check).
-                    try c.read(a.target);
-                    try c.expr(a.value);
-                    try c.emit(binaryOp(op), &.{});
-                } else {
-                    // x = e: evaluate e first; the TDZ and const checks happen on the write.
-                    try c.expr(a.value);
-                }
-                try c.write(a.target);
+            .assign => |a| switch (a.target) {
+                .ref => |ref| {
+                    if (a.op) |op| {
+                        // x op= e: read x (TDZ), evaluate e, apply op, then write (const check).
+                        try c.read(ref);
+                        try c.expr(a.value);
+                        try c.emit(binaryOp(op), &.{});
+                    } else {
+                        // x = e: evaluate e first; the TDZ and const checks happen on the write.
+                        try c.expr(a.value);
+                    }
+                    try c.write(ref);
+                },
+                // Base and key exactly once, before the right-hand side (dup/dup2 keep them
+                // for the write). `op=` reads before evaluating the right-hand side.
+                .member => |m| {
+                    try c.expr(m.object);
+                    switch (m.key) {
+                        .name => |n| {
+                            if (a.op) |op| {
+                                try c.emit(.dup, &.{});
+                                try c.emit(.get_prop, &.{try c.name(n)});
+                                try c.expr(a.value);
+                                try c.emit(binaryOp(op), &.{});
+                            } else try c.expr(a.value);
+                            try c.emit(.set_prop, &.{try c.name(n)});
+                        },
+                        .computed => |k| {
+                            try c.expr(k);
+                            if (a.op) |op| {
+                                try c.emit(.dup2, &.{});
+                                try c.emit(.get_elem, &.{});
+                                try c.expr(a.value);
+                                try c.emit(binaryOp(op), &.{});
+                            } else try c.expr(a.value);
+                            try c.emit(.set_elem, &.{});
+                        },
+                        .string, .number => unreachable, // only in literals
+                    }
+                },
             },
-            .update => |u| {
-                // Read, ToNumber, then write; the result is the new value (prefix) or the
-                // old one (postfix: keep a copy of it under the new value).
-                try c.read(u.target);
-                try c.emit(.to_number, &.{});
-                if (!u.prefix) try c.emit(.dup, &.{});
-                try c.emit(if (u.op == .inc) .inc else .dec, &.{});
-                try c.write(u.target);
-                if (!u.prefix) try c.emit(.pop, &.{});
+            .update => |u| switch (u.target) {
+                .ref => |ref| {
+                    // Read, ToNumber, then write; the result is the new value (prefix) or the
+                    // old one (postfix: keep a copy of it under the new value).
+                    try c.read(ref);
+                    try c.emit(.to_number, &.{});
+                    if (!u.prefix) try c.emit(.dup, &.{});
+                    try c.emit(if (u.op == .inc) .inc else .dec, &.{});
+                    try c.write(ref);
+                    if (!u.prefix) try c.emit(.pop, &.{});
+                },
+                // o.p++: o; dup; get_prop; to_number; [dup; rot3]; inc; set_prop; [pop]
+                // o[k]++: o; k; dup2; get_elem; to_number; [dup; rot4]; inc; set_elem; [pop]
+                // (rot moves a copy of the old value below base and key, for postfix).
+                .member => |m| {
+                    try c.expr(m.object);
+                    const named = switch (m.key) {
+                        .name => |n| n,
+                        .computed => |k| blk: {
+                            try c.expr(k);
+                            break :blk null;
+                        },
+                        .string, .number => unreachable,
+                    };
+                    if (named) |n| {
+                        try c.emit(.dup, &.{});
+                        try c.emit(.get_prop, &.{try c.name(n)});
+                    } else {
+                        try c.emit(.dup2, &.{});
+                        try c.emit(.get_elem, &.{});
+                    }
+                    try c.emit(.to_number, &.{});
+                    if (!u.prefix) {
+                        try c.emit(.dup, &.{});
+                        try c.emit(if (named == null) .rot4 else .rot3, &.{});
+                    }
+                    try c.emit(if (u.op == .inc) .inc else .dec, &.{});
+                    if (named) |n| try c.emit(.set_prop, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
+                    if (!u.prefix) try c.emit(.pop, &.{});
+                },
+            },
+            .member => |m| try c.member(m, .get),
+            .delete => |m| try c.member(m, .delete),
+            .this => try c.emit(.push_this, &.{}),
+            .array => |items| {
+                for (items) |item| try c.expr(item);
+                try c.emit(.new_array, &.{@intCast(items.len)});
+            },
+            .object => |props| {
+                // Each key (if computed), then its value, in source order.
+                try c.emit(.new_object, &.{});
+                for (props) |prop| switch (prop.key) {
+                    .name => |n| {
+                        try c.expr(prop.value);
+                        try c.emit(.define_prop, &.{try c.name(n)});
+                    },
+                    .string => |units| {
+                        try c.emit(.push_const, &.{try c.string(units)});
+                        try c.expr(prop.value);
+                        try c.emit(.define_elem, &.{});
+                    },
+                    .number => |n| {
+                        try c.emit(.push_const, &.{try c.number(n)});
+                        try c.expr(prop.value);
+                        try c.emit(.define_elem, &.{});
+                    },
+                    .computed => |k| {
+                        try c.expr(k);
+                        try c.expr(prop.value);
+                        try c.emit(.define_elem, &.{});
+                    },
+                };
             },
             .call => |call| {
-                // Callee, then arguments left to right, then the callable check.
-                try c.expr(call.callee);
+                // Callee, then arguments left to right, then the callable check. A member
+                // callee is a method call: [receiver, callee, args] (D41).
+                const method = call.callee.data == .member;
+                if (method) {
+                    const m = call.callee.data.member;
+                    try c.expr(m.object);
+                    try c.emit(.dup, &.{});
+                    switch (m.key) {
+                        .name => |n| try c.emit(.get_prop, &.{try c.name(n)}),
+                        .computed => |k| {
+                            try c.expr(k);
+                            try c.emit(.get_elem, &.{});
+                        },
+                        .string, .number => unreachable,
+                    }
+                } else try c.expr(call.callee);
                 for (call.args) |arg| try c.expr(arg);
-                try c.emit(.call, &.{@intCast(call.args.len)}); // args.len < source size
+                try c.emit(if (method) .call_method else .call, &.{@intCast(call.args.len)}); // args.len < source size
             },
+        }
+    }
+
+    /// `o.name` / `o[k]`, read or deleted.
+    fn member(c: *Compiler, m: ast.Member, comptime what: enum { get, delete }) Error!void {
+        try c.expr(m.object);
+        switch (m.key) {
+            .name => |n| try c.emit(if (what == .get) .get_prop else .delete_prop, &.{try c.name(n)}),
+            .computed => |k| {
+                try c.expr(k);
+                try c.emit(if (what == .get) .get_elem else .delete_elem, &.{});
+            },
+            .string, .number => unreachable, // only in literals
         }
     }
 
@@ -531,6 +650,7 @@ fn binaryOp(op: ast.BinaryOp) Op {
         .ge => .ge,
         .strict_eq => .strict_eq,
         .strict_ne => .strict_ne,
+        .in => .in,
         .logical_and, .logical_or => unreachable, // control flow, handled by the caller
     };
 }

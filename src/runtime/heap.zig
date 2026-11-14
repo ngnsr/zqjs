@@ -80,8 +80,12 @@ pub const Heap = struct {
     max_bytes: usize,
     max_string_length: usize,
     objects: ?*Obj = null,
-    /// Accounted bytes currently allocated.
+    /// Accounted bytes currently allocated (live, until M8: everything not rolled back).
     bytes: usize = 0,
+    /// Highest value `bytes` has had.
+    peak: usize = 0,
+    /// All bytes ever charged (never decreases; frees don't subtract).
+    allocated: u64 = 0,
     /// Which limit was hit, when an operation returns error.LimitExceeded.
     limit_hit: ?Limit = null,
 
@@ -236,6 +240,8 @@ pub const Heap = struct {
         const total = std.math.add(usize, h.bytes, charge) catch return h.exceeded(.heap_bytes);
         if (total > h.max_bytes) return h.exceeded(.heap_bytes);
         h.bytes = total;
+        h.peak = @max(h.peak, total);
+        h.allocated += charge;
         return charge;
     }
 

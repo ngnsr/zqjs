@@ -96,6 +96,24 @@ test "converting a native function to a string is Unsupported, not a mismatch" {
     }
 }
 
+test "comparing a function with a string is Unsupported; with a number it is false" {
+    // node: `print > 'a'` is true (it compares the function's source text).
+    for ([_][]const u8{ "print > 'a';", "'a' <= print;", "print < print;" }) |src| for (support.engines) |engine| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var discard: std.Io.Writer.Discarding = .init(&.{});
+        var rt = Runtime.init(testing.allocator, .{}, &discard.writer);
+        defer rt.deinit();
+        try testing.expectEqual(@as(?anyerror, error.Unsupported), try runScript(arena.allocator(), &rt, src, engine));
+        try testing.expectEqual(zqjs.Feature.function_to_string, rt.unsupported.?);
+    };
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, "print(print < 1, print >= 0, null < print);", .{}, engine, .harness);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("false false false\n", r.out);
+    }
+}
+
 fn runOnce(allocator: Allocator, source: []const u8, engine: zqjs.Engine) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();

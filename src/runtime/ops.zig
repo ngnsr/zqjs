@@ -243,8 +243,18 @@ pub fn remainder(a: f64, b: f64) f64 {
 
 /// IsLessThan for primitives: two strings compare by UTF-16 code unit; otherwise both
 /// sides become numbers. null means "undefined" in the spec (a NaN was involved).
-pub fn lessThan(gpa: Allocator, a: Value, b: Value) Allocator.Error!?bool {
+pub fn lessThan(rt: *Runtime, a: Value, b: Value) Error!?bool {
+    const gpa = rt.gpa;
     if (a == .string and b == .string) return std.mem.order(u16, a.string.units, b.string.units) == .lt;
+    // ToPrimitive turns a function into its source text, so against a string (or another
+    // function) JS compares that text as a string: `print > 'a'` is true. ZQJS has no
+    // source text to compare. Against anything else the text becomes NaN, as below.
+    const textual = struct {
+        fn f(v: Value) bool {
+            return v == .string or v == .native;
+        }
+    }.f;
+    if ((a == .native and textual(b)) or (b == .native and textual(a))) return rt.fail(.function_to_string);
     const x = try toNumber(gpa, a);
     const y = try toNumber(gpa, b);
     if (std.math.isNan(x) or std.math.isNan(y)) return null;
@@ -282,10 +292,10 @@ pub fn binary(rt: *Runtime, op: ast.BinaryOp, a: Value, b: Value) Error!Value {
         .div => .{ .number = try toNumber(gpa, a) / try toNumber(gpa, b) },
         .mod => .{ .number = remainder(try toNumber(gpa, a), try toNumber(gpa, b)) },
         .pow => .{ .number = pow(try toNumber(gpa, a), try toNumber(gpa, b)) },
-        .lt => .{ .boolean = (try lessThan(gpa, a, b)) orelse false },
-        .gt => .{ .boolean = (try lessThan(gpa, b, a)) orelse false },
-        .le => .{ .boolean = if (try lessThan(gpa, b, a)) |r| !r else false },
-        .ge => .{ .boolean = if (try lessThan(gpa, a, b)) |r| !r else false },
+        .lt => .{ .boolean = (try lessThan(rt, a, b)) orelse false },
+        .gt => .{ .boolean = (try lessThan(rt, b, a)) orelse false },
+        .le => .{ .boolean = if (try lessThan(rt, b, a)) |r| !r else false },
+        .ge => .{ .boolean = if (try lessThan(rt, a, b)) |r| !r else false },
         .strict_eq => .{ .boolean = strictEquals(a, b) },
         .strict_ne => .{ .boolean = !strictEquals(a, b) },
         .logical_and, .logical_or => unreachable,

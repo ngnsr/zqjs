@@ -192,6 +192,16 @@ Every item on both engines unless noted.
   column added
 - **kept permanently:** `-Dgc-stress` in CI (with `-Dstack-stress`, and in ReleaseSafe); the
   verifier as a development tool without stress (`zqjs --verify-heap`, `RunOptions.verify_heap`)
-- **next, before M8.1:** use the collector on realistic workloads and measure pause cost
-  (marked/swept per collection), allocation rate and peak memory; that decides whether M8.1 is
-  incremental marking or something else
+- **measured after M8** (ReleaseFast, Apple M4, a temporary timer around each collection, not
+  committed: the runtime has no clock): on the eight benchmarks pauses are 30-90 µs, never
+  above 1 ms, but collecting takes 15-37% of run time on garbage-heavy code (a collection every
+  ~256 KB allocated); with 100k live objects (~45 MB) pauses reach 36-41 ms, with 1M (~450 MB)
+  300-340 ms, and over half the run is spent re-marking long-lived objects. Pause time is
+  linear in the live heap (~0.3 µs per live object).
+- **direction from those numbers:** M8.1 generational (nursery, promotion, remembered sets: stop
+  re-marking survivors), M8.2 incremental marking (bounded work per safepoint: caps the pause,
+  including old-generation ones), M8.3 thresholds tuned on game workloads. First: a permanent
+  GC report (allocation rate, mean/max pause, collections per second, live after GC, time
+  collecting) with timing passed in by the tool, never in the runtime, and a game-like
+  workload (100k and 1M long-lived objects, thousands of temporaries per frame, minor and major
+  pauses measured separately). M9 (embedding) is not to wait for all of this.

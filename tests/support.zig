@@ -7,6 +7,32 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const zqjs = @import("zqjs");
 
+/// Leak-checking like `testing.allocator`, without its stack trace per allocation and
+/// free: a test that runs whole programs allocates millions of times, and unwinding each
+/// stack was ~95% of such a test's time (sampled, M8.1 P2: 116 s for one test). Tests of
+/// allocation failure and small unit tests keep `testing.allocator`.
+pub const ProgramAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+
+/// Each integration test binary's first test starts this: if the binary is still running
+/// after `limit_s`, it says which binary and aborts, so a hung test fails the build
+/// instead of hanging it (the build runner has no timeouts). The limits are ~10× the
+/// slowest measured run (M8.1: 12 s normal, ~2 min per binary under -Dgc-stress).
+pub fn watchdog(file: []const u8) void {
+    const limit_s: i64 = if (zqjs.heap.gc_stress) 20 * 60 else 5 * 60;
+    const t = std.Thread.spawn(.{}, struct {
+        fn run(name: []const u8, seconds: i64) void {
+            std.Io.sleep(std.testing.io, .fromSeconds(seconds), .awake) catch return;
+            std.debug.print("\n{s}: still running after {d} s, so a test is probably stuck. The last test the runner printed is the suspect; rerun it alone with -Dtest-filter.\n", .{ name, seconds });
+            std.process.abort();
+        }
+    }.run, .{ file, limit_s }) catch return; // no watchdog is better than a failed suite
+    t.detach();
+}
+
+pub fn endProgram(dbg: *ProgramAllocator) void {
+    if (dbg.deinit() == .leak) @panic("a program test leaked (addresses above)");
+}
+
 pub const engines = [_]zqjs.Engine{ .treewalk, .vm };
 
 pub const Outcome = struct {

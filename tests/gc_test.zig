@@ -60,6 +60,10 @@ fn rawStore(line_in: []const u8) ?[]const u8 {
     return null;
 }
 
+test "watchdog: this binary fails, instead of hanging, if a test gets stuck" {
+    support.watchdog(@src().file);
+}
+
 test "the scanner flags every raw-store form it claims to" {
     for ([_][]const u8{
         "o.props.put(a, k, v);",
@@ -118,6 +122,7 @@ test "every store into a heap object goes through the heap's store API (I3)" {
 // ---------------------------------------------------------------- P1: the collector
 
 const zqjs = @import("zqjs");
+const support = @import("support.zig");
 const heap = zqjs.heap;
 const Allocator = std.mem.Allocator;
 
@@ -310,15 +315,20 @@ test "no pathological collection loop: filling the heap with live data collects 
 
 // ---- the VM collecting
 
+const ProgramAllocator = support.ProgramAllocator;
+const endProgram = support.endProgram;
+
 const VmRun = struct { out: []u8, err: ?anyerror, collections: u64, bytes_after: usize };
 
 /// Runs `source` on the VM with a collection at every safepoint (`always`) or only when
 /// requested; returns its output, its error and the collector's statistics.
 fn runVm(source: []const u8, limits: zqjs.Limits, always: bool) !VmRun {
-    const gpa = testing.allocator;
+    var dbg: ProgramAllocator = .init;
+    defer endProgram(&dbg);
+    const gpa = dbg.allocator();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator); // returned: the caller frees it
     defer out.deinit();
     var rt = zqjs.Runtime.init(gpa, limits, &out.writer);
     defer rt.deinit();
@@ -448,7 +458,9 @@ fn runCollecting(source: []const u8, engine: zqjs.Engine, limits: zqjs.Limits) !
     var got: std.Io.Writer.Allocating = .init(testing.allocator);
     defer got.deinit();
     var discard: std.Io.Writer.Discarding = .init(&.{});
-    _ = try zqjs.runSource(testing.allocator, "t", source, limits, .{ .mode = .harness, .engine = engine, .collect_always = true }, &got.writer, &discard.writer);
+    var dbg: ProgramAllocator = .init;
+    defer endProgram(&dbg);
+    _ = try zqjs.runSource(dbg.allocator(), "t", source, limits, .{ .mode = .harness, .engine = engine, .collect_always = true }, &got.writer, &discard.writer);
     return got.toOwnedSlice();
 }
 
@@ -561,9 +573,11 @@ test "garbage under a small limit: the tree-walker runs to its step budget too" 
             \\}
         ;
         // The run allocates several times the 128 KiB limit, so reaching the step budget at
-        // all means garbage was reclaimed. Kept small: in Debug every allocation goes through
-        // std.testing.allocator, which records a stack trace for each one.
-        _ = try zqjs.runSource(testing.allocator, "t", source, .{ .max_heap_bytes = 128 << 10, .max_steps = 50_000 }, .{ .mode = .harness, .engine = engine }, &got.writer, &discard.writer);
+        // all means garbage was reclaimed. (On the non-tracing allocator: on
+        // std.testing.allocator, a stack trace per allocation made this the slowest test.)
+        var dbg: ProgramAllocator = .init;
+        defer endProgram(&dbg);
+        _ = try zqjs.runSource(dbg.allocator(), "t", source, .{ .max_heap_bytes = 128 << 10, .max_steps = 50_000 }, .{ .mode = .harness, .engine = engine }, &got.writer, &discard.writer);
         try testing.expectEqualStrings("t: LimitExceeded(steps)\n", got.written());
     }
 }
@@ -638,7 +652,9 @@ const EngineStats = struct { atoms: u32, collections: u64, peak: usize, live: us
 
 /// Runs `source` on `engine` (normal scheduling, unless stress) and returns the heap's state.
 fn runStats(source: []const u8, engine: zqjs.Engine, limits: zqjs.Limits) !EngineStats {
-    const gpa = testing.allocator;
+    var dbg: ProgramAllocator = .init;
+    defer endProgram(&dbg);
+    const gpa = dbg.allocator();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var discard: std.Io.Writer.Discarding = .init(&.{});
@@ -741,9 +757,20 @@ fn oldArray(h: *heap.Heap, n: usize) !*heap.Object {
     const arr = try h.newArray(null);
     const filler = try h.ascii("old");
     for (0..n) |_| try h.appendElement(arr, .{ .string = filler });
-    h.collect(TestRoots{ .objs = &.{&arr.obj} }, TestRoots.mark);
+    try collectMinor(h, &.{&arr.obj});
     try testing.expect(arr.obj.old);
     return arr;
+}
+
+/// A minor collection, whatever the schedule says (a card test that silently got a
+/// major one would pass without scanning any card). Asserts it was minor.
+fn collectMinor(h: *heap.Heap, roots: []const *heap.Obj) !void {
+    const saved = h.next_major;
+    const minors = h.stats.minor;
+    h.next_major = std.math.maxInt(usize);
+    h.collect(TestRoots{ .objs = roots }, TestRoots.mark);
+    h.next_major = saved;
+    try testing.expectEqual(minors + 1, h.stats.minor);
 }
 
 fn rememberedLength(h: *const heap.Heap) usize {
@@ -764,7 +791,7 @@ test "cards: a young store at a card boundary is found, and only its card is sca
         h.storeElement(arr, i, .{ .string = young });
         try h.verify();
         const before = h.stats.remembered_children;
-        h.collect(TestRoots{ .objs = &.{&arr.obj} }, TestRoots.mark); // minor: the root is old
+        try collectMinor(&h, &.{&arr.obj}); // minor: the root is old
         try testing.expectEqual(@as(u64, card), h.stats.remembered_children - before); // one card, no other
         try testing.expect(young.obj.old);
         try testing.expectEqualSlices(u16, utf16("young"), arr.kind.array.items[i].string.units);
@@ -776,7 +803,7 @@ test "cards: a young store at a card boundary is found, and only its card is sca
     const arr = try oldArray(&h, 4 * card);
     for (indices) |i| h.storeElement(arr, i, .{ .string = try h.ascii("young") });
     const before = h.stats.remembered_children;
-    h.collect(TestRoots{ .objs = &.{&arr.obj} }, TestRoots.mark);
+    try collectMinor(&h, &.{&arr.obj});
     try testing.expectEqual(@as(u64, 4 * card), h.stats.remembered_children - before);
     for (indices) |i| try testing.expectEqualSlices(u16, utf16("young"), arr.kind.array.items[i].string.units);
     try h.verifyCollected();
@@ -792,7 +819,7 @@ test "cards: an array remembered before its first bitmap gets an all-dirty one (
     for (0..200) |i| try h.appendElement(arr, .{ .number = @floatFromInt(i) }); // first bitmap
     try testing.expect(h.cards.get(arr) != null);
     try h.verify(); // I-gen2: index 3's card is dirty
-    h.collect(TestRoots{ .objs = &.{&arr.obj} }, TestRoots.mark);
+    try collectMinor(&h, &.{&arr.obj});
     try testing.expect(young.obj.old);
     try testing.expectEqualSlices(u16, utf16("young"), arr.kind.array.items[3].string.units);
     try h.verifyCollected();
@@ -811,7 +838,7 @@ test "cards: the bitmap grows with the array, keeping dirty bits and adding clea
     try testing.expectEqual(@as(u64, 1), words[0]);
     try testing.expectEqual(@as(u64, 0), words[1]);
     try h.verify();
-    h.collect(TestRoots{ .objs = &.{&arr.obj} }, TestRoots.mark);
+    try collectMinor(&h, &.{&arr.obj});
     try testing.expect(young.obj.old);
     try h.verifyCollected();
 }
@@ -825,7 +852,7 @@ test "cards: pop and shrink after a young store leave nothing stale" {
     _ = h.popElement(arr);
     h.shrinkElements(arr, 100); // the dirty cards are now past the length
     const swept = h.stats.swept;
-    h.collect(TestRoots{ .objs = &.{&arr.obj} }, TestRoots.mark);
+    try collectMinor(&h, &.{&arr.obj});
     try testing.expectEqual(swept + 2, h.stats.swept); // both strings are garbage now
     try h.verifyCollected(); // and every card is clean
 }
@@ -837,13 +864,13 @@ test "cards: a carded array's bitmap goes with it, in a minor and in a major col
     // measure from after a first carded array has come and gone.
     const first = try h.newArray(null);
     for (0..2000) |i| try h.appendElement(first, .{ .number = @floatFromInt(i) });
-    h.collect(TestRoots{ .objs = &.{} }, TestRoots.mark);
+    try collectMinor(&h, &.{});
     const base = h.bytes;
     // Young and carded, then garbage: freed by a minor collection.
     const young = try h.newArray(null);
     for (0..2000) |i| try h.appendElement(young, .{ .number = @floatFromInt(i) });
     try testing.expectEqual(@as(u32, 1), h.cards.count());
-    h.collect(TestRoots{ .objs = &.{} }, TestRoots.mark);
+    try collectMinor(&h, &.{});
     try testing.expectEqual(@as(u32, 0), h.cards.count());
     try testing.expectEqual(base, h.bytes); // the bitmap's bytes given back too
     try h.verifyCollected();
@@ -866,7 +893,7 @@ fn growRememberedArray(gpa: Allocator) !void {
     // Whatever allocation fails, the heap is left consistent: bitmap and elements agree.
     errdefer h.verify() catch |e| std.debug.panic("heap unsound after a failed append: {s}", .{@errorName(e)});
     for (0..300) |i| try h.appendElement(arr, .{ .number = @floatFromInt(i) });
-    h.collect(TestRoots{ .objs = &.{&arr.obj} }, TestRoots.mark);
+    try collectMinor(&h, &.{&arr.obj});
     try testing.expectEqualSlices(u16, utf16("young"), arr.kind.array.items[3].string.units);
     try h.verifyCollected();
 }
@@ -883,7 +910,7 @@ test "minor collections never free an atom; promotion keeps nothing else alive; 
     const key = try h.internAscii("dynamic key 1");
     try h.storeProperty(garbage, key, .{ .object = try h.newObject(null) });
     const swept = h.stats.swept;
-    h.collect(TestRoots{ .objs = &.{} }, TestRoots.mark); // minor
+    try collectMinor(&h, &.{}); // minor
     try testing.expectEqual(@as(u64, 1), h.stats.minor);
     try testing.expect(key.obj.old); // promoted: the table still holds it
     try testing.expectEqual(swept + 2, h.stats.swept); // the object and its value: freed
@@ -898,12 +925,12 @@ test "remembered set: an owner is listed once however often it stores, and clear
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
     const o = try h.newObject(null);
-    h.collect(TestRoots{ .objs = &.{&o.obj} }, TestRoots.mark);
+    try collectMinor(&h, &.{&o.obj});
     const key = try h.internAscii("k");
     for (0..3) |_| try h.storeProperty(o, key, .{ .string = try h.ascii("young") });
     try testing.expectEqual(@as(usize, 1), rememberedLength(&h));
     try h.verify();
-    h.collect(TestRoots{ .objs = &.{&o.obj} }, TestRoots.mark);
+    try collectMinor(&h, &.{&o.obj});
     try testing.expectEqual(@as(usize, 0), rememberedLength(&h));
     try testing.expect(!o.obj.remembered);
     try h.verifyCollected();
@@ -913,7 +940,7 @@ test "remembered set: an owner is listed once however often it stores, and clear
     try h.storeProperty(o, key, .{ .number = 1 });
     try testing.expect(o.obj.remembered);
     const swept = h.stats.swept;
-    h.collect(TestRoots{ .objs = &.{&o.obj} }, TestRoots.mark);
+    try collectMinor(&h, &.{&o.obj});
     try testing.expectEqual(swept + 1, h.stats.swept);
     try h.verifyCollected();
 }
@@ -923,7 +950,7 @@ test "major collection: remembered owners and dirty cards are reset, survivors a
     defer h.deinit();
     const arr = try oldArray(&h, 1024);
     const o = try h.newObject(null);
-    h.collect(TestRoots{ .objs = &.{ &arr.obj, &o.obj } }, TestRoots.mark);
+    try collectMinor(&h, &.{ &arr.obj, &o.obj });
     h.storeElement(arr, 700, .{ .string = try h.ascii("in a card") });
     try h.storeProperty(o, try h.internAscii("young key"), .{ .string = try h.ascii("young value") });
     _ = try h.internAscii("dead atom");
@@ -939,6 +966,12 @@ test "major collection: remembered owners and dirty cards are reset, survivors a
 
 /// `result` must be `caught` in the build with mutation `m`, and fine otherwise.
 /// (In another mutant's build the scenario may break differently: it is skipped there.)
+/// The first line of each mutation test: in another mutant's build its setup may already
+/// break (that mutant's own test is the one meant to catch it), so it doesn't run there.
+fn onlyIn(comptime m: heap.Mutation) !void {
+    if (heap.mutation != .none and heap.mutation != m) return error.SkipZigTest;
+}
+
 fn expectCaught(comptime m: heap.Mutation, caught: heap.Heap.VerifyError, result: heap.Heap.VerifyError!void) !void {
     if (heap.mutation == m) return testing.expectError(caught, result);
     if (heap.mutation != .none) return error.SkipZigTest;
@@ -946,6 +979,7 @@ fn expectCaught(comptime m: heap.Mutation, caught: heap.Heap.VerifyError, result
 }
 
 test "mutation: an element store without its barrier fails I-gen2" {
+    try onlyIn(.no_element_barrier);
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
     const arr = try oldArray(&h, 10);
@@ -954,6 +988,7 @@ test "mutation: an element store without its barrier fails I-gen2" {
 }
 
 test "mutation: a young element store that doesn't dirty its card fails I-gen2" {
+    try onlyIn(.no_card_set);
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
     const arr = try oldArray(&h, 1024);
@@ -962,17 +997,19 @@ test "mutation: a young element store that doesn't dirty its card fails I-gen2" 
 }
 
 test "mutation: a remembered bit left set after the scan fails I-gen4" {
+    try onlyIn(.keep_remembered_bit);
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
     h.verify_always = false; // the test verifies itself, instead of a panic in collect
     const o = try h.newObject(null);
-    h.collect(TestRoots{ .objs = &.{&o.obj} }, TestRoots.mark);
+    try collectMinor(&h, &.{&o.obj});
     try h.storeProperty(o, try h.internAscii("k"), .{ .string = try h.ascii("young") });
-    h.collect(TestRoots{ .objs = &.{&o.obj} }, TestRoots.mark);
+    try collectMinor(&h, &.{&o.obj});
     try expectCaught(.keep_remembered_bit, error.RememberedListCorrupt, h.verifyCollected());
 }
 
 test "mutation: a clean first bitmap for a remembered array fails I-gen2 (the hole)" {
+    try onlyIn(.clean_first_bitmap);
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
     const arr = try oldArray(&h, 390);
@@ -982,13 +1019,14 @@ test "mutation: a clean first bitmap for a remembered array fails I-gen2 (the ho
 }
 
 test "mutation: a minor collection that frees atoms leaves the table dangling" {
+    try onlyIn(.minor_frees_atoms);
     // Only tombstones make the dangling entry safe to look at.
     if (heap.mutation == .minor_frees_atoms and !heap.gc_stress) return error.SkipZigTest;
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
     h.verify_always = false;
     _ = try h.internAscii("dynamic key");
-    h.collect(TestRoots{ .objs = &.{} }, TestRoots.mark);
+    try collectMinor(&h, &.{});
     try expectCaught(.minor_frees_atoms, error.AtomTableHoldsCollectedObject, h.verifyCollected());
 }
 
@@ -1005,4 +1043,230 @@ test "dead dynamic keys drive major collections: atoms can't pile up past the he
         try testing.expect(r.peak <= 1 << 20);
         try testing.expect(r.atoms < 50); // and the final major one leaves only the realm's
     }
+}
+
+// ---------------------------------------------------------------- M8.1 P2b: property cards
+
+fn keyName(buf: []u8, i: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "k{d}", .{i}) catch unreachable;
+}
+
+/// An object with `n` properties k0…k(n-1), all holding one string, promoted.
+fn oldDict(h: *heap.Heap, n: usize) !*heap.Object {
+    const o = try h.newObject(null);
+    const filler = try h.ascii("old");
+    var buf: [16]u8 = undefined;
+    for (0..n) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .{ .string = filler });
+    try collectMinor(h, &.{&o.obj});
+    try testing.expect(o.obj.old);
+    return o;
+}
+
+/// Interns keys k`from`…k(`to`-1) and promotes them (a minor collection promotes every
+/// atom), so inserting them later stores nothing young: then only the rule under test can
+/// dirty a card. (New keys are young atoms, and the card one of them dirties can hide a
+/// missing rule: the hole tests passed without the hole fix until they used this.)
+fn oldKeys(h: *heap.Heap, root: *heap.Object, from: usize, to: usize) !void {
+    var buf: [16]u8 = undefined;
+    for (from..to) |i| _ = try h.internAscii(keyName(&buf, i));
+    try collectMinor(h, &.{&root.obj});
+}
+
+fn valueAt(o: *heap.Object, i: usize) []const u16 {
+    return o.props.values()[i].value.string.units;
+}
+
+test "property cards: a young value under an existing key at a card boundary dirties only its card" {
+    var dbg: ProgramAllocator = .init;
+    defer endProgram(&dbg);
+    const card = zqjs.limits.card_elements;
+    const indices = [_]usize{ 0, card - 1, card, 2 * card - 1, 2 * card, 4 * card - 1 };
+    var buf: [16]u8 = undefined;
+    for (indices) |i| {
+        var h = heap.Heap.init(dbg.allocator(), .{});
+        defer h.deinit();
+        const o = try oldDict(&h, 4 * card);
+        try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .{ .string = try h.ascii("young") }); // an update
+        try h.verify();
+        const before = h.stats.remembered_children;
+        try collectMinor(&h, &.{&o.obj});
+        try testing.expectEqual(@as(u64, 2 * card), h.stats.remembered_children - before); // one card: keys and values
+        try testing.expectEqualSlices(u16, utf16("young"), valueAt(o, i));
+        try h.verifyCollected();
+    }
+    var h = heap.Heap.init(dbg.allocator(), .{});
+    defer h.deinit();
+    const o = try oldDict(&h, 4 * card);
+    for (indices) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .{ .string = try h.ascii("young") });
+    const before = h.stats.remembered_children;
+    try collectMinor(&h, &.{&o.obj});
+    try testing.expectEqual(@as(u64, 4 * 2 * card), h.stats.remembered_children - before); // four distinct cards
+    for (indices) |i| try testing.expectEqualSlices(u16, utf16("young"), valueAt(o, i));
+    try h.verifyCollected();
+}
+
+test "property cards: a new young key with an old value dirties the card it is appended to" {
+    const card = zqjs.limits.card_elements;
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    const o = try oldDict(&h, 4 * card - 1);
+    const old_value = o.props.values()[0].value;
+    try h.storeProperty(o, try h.internAscii("a fresh key"), old_value); // entry 4·card − 1
+    try testing.expect(o.obj.remembered);
+    try h.verify();
+    const before = h.stats.remembered_children;
+    try collectMinor(&h, &.{&o.obj});
+    try testing.expectEqual(@as(u64, 2 * card), h.stats.remembered_children - before); // the last card only
+    try h.verifyCollected();
+}
+
+test "property cards: deletes at the start, middle and end shift young entries across cards safely" {
+    const card = zqjs.limits.card_elements;
+    var buf: [16]u8 = undefined;
+    for ([_]usize{ 0, card + card / 2, 4 * card - 1 }) |removed| {
+        var h = heap.Heap.init(testing.allocator, .{});
+        defer h.deinit();
+        const o = try oldDict(&h, 4 * card);
+        // Young values at the first two entries of card 2 and in card 3: a delete before
+        // them moves 2·card down into card 1, and the others down one place.
+        const young = [_]usize{ 2 * card, 2 * card + 1, 3 * card };
+        for (young) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .{ .string = try h.ascii("young") });
+        h.removeProperty(o, try h.internAscii(keyName(&buf, removed)));
+        try h.verify(); // PC8: every young entry, wherever it moved, is under a dirty card
+        try collectMinor(&h, &.{&o.obj});
+        for (young) |i| {
+            const k = try h.internAscii(keyName(&buf, i));
+            try testing.expectEqualSlices(u16, utf16("young"), o.props.get(k).?.value.string.units);
+        }
+        try h.verifyCollected();
+    }
+}
+
+test "property cards: a table remembered before its first bitmap gets an all-dirty one (the hole)" {
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    const o = try oldDict(&h, 400);
+    try testing.expect(h.prop_cards.get(o) == null);
+    var buf: [16]u8 = undefined;
+    try oldKeys(&h, o, 400, 600);
+    try h.storeProperty(o, try h.internAscii(keyName(&buf, 3)), .{ .string = try h.ascii("young") }); // remembered whole
+    for (400..600) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .null); // first bitmap at 512
+    try testing.expect(h.prop_cards.get(o) != null);
+    try h.verify();
+    try collectMinor(&h, &.{&o.obj});
+    try testing.expectEqualSlices(u16, utf16("young"), valueAt(o, 3));
+    try h.verifyCollected();
+}
+
+test "property cards: the bitmap grows over many reallocations; indices stay valid" {
+    var dbg: ProgramAllocator = .init;
+    defer endProgram(&dbg);
+    var h = heap.Heap.init(dbg.allocator(), .{});
+    defer h.deinit();
+    const o = try oldDict(&h, 1000);
+    var buf: [16]u8 = undefined;
+    // Old keys for the entries to come (a minor collection promotes every atom), so only
+    // the young value below dirties anything.
+    for (1000..40_000) |i| _ = try h.internAscii(keyName(&buf, i));
+    try collectMinor(&h, &.{&o.obj});
+    try h.storeProperty(o, try h.internAscii(keyName(&buf, 0)), .{ .string = try h.ascii("young") });
+    for (1000..40_000) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .null); // buffer moves many times
+    const words = h.prop_cards.get(o).?;
+    try testing.expectEqual(@as(usize, 2), words.len);
+    try testing.expectEqual(@as(u64, 1), words[0]);
+    try testing.expectEqual(@as(u64, 0), words[1]);
+    try h.verify();
+    try collectMinor(&h, &.{&o.obj});
+    try testing.expectEqualSlices(u16, utf16("young"), valueAt(o, 0));
+    try h.verifyCollected();
+}
+
+test "property cards: allocation failing at every point of a bitmap's creation" {
+    // The table is built on a working allocator; then each allocation of the inserts that
+    // take it past 512 entries (the bitmap, the table's growth, new atoms) fails in turn,
+    // and the heap must stay sound, the young value reachable. (checkAllAllocationFailures
+    // would rebuild the whole table once per allocation: ~1000 reruns, 89 s.)
+    var dbg: ProgramAllocator = .init;
+    defer endProgram(&dbg);
+    var buf: [16]u8 = undefined;
+    var nth: usize = 0;
+    while (true) : (nth += 1) {
+        var failing = testing.FailingAllocator.init(dbg.allocator(), .{});
+        var h = heap.Heap.init(failing.allocator(), .{});
+        defer h.deinit();
+        const o = try oldDict(&h, 500);
+        try h.storeProperty(o, try h.internAscii(keyName(&buf, 3)), .{ .string = try h.ascii("young") });
+        failing.fail_index = failing.alloc_index + nth;
+        const inserted: anyerror!void = for (500..530) |i| {
+            const k = h.internAscii(keyName(&buf, i)) catch |e| break e;
+            h.storeProperty(o, k, .null) catch |e| break e;
+        };
+        inserted catch |e| try testing.expectEqual(error.OutOfMemory, e);
+        try h.verify(); // bitmap and table consistent whatever failed
+        failing.fail_index = std.math.maxInt(usize);
+        try collectMinor(&h, &.{&o.obj});
+        try testing.expectEqualSlices(u16, utf16("young"), valueAt(o, 3));
+        try h.verifyCollected();
+        if (!failing.has_induced_failure) break; // every allocation of the inserts has failed once
+    }
+    try testing.expect(nth > 3);
+}
+
+test "property cards: a table's bitmap goes with it, in a minor and in a major collection" {
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    var buf: [16]u8 = undefined;
+    // Warm the side table (its buckets stay), and the atoms k0…k599 (minors promote them).
+    const first = try h.newObject(null);
+    for (0..600) |i| try h.storeProperty(first, try h.internAscii(keyName(&buf, i)), .null);
+    try collectMinor(&h, &.{});
+    const base = h.bytes;
+    const young = try h.newObject(null);
+    for (0..600) |i| try h.storeProperty(young, try h.internAscii(keyName(&buf, i)), .null);
+    try testing.expectEqual(@as(u32, 1), h.prop_cards.count());
+    try collectMinor(&h, &.{});
+    try testing.expectEqual(@as(u32, 0), h.prop_cards.count());
+    try testing.expectEqual(base, h.bytes);
+    try h.verifyCollected();
+    const old = try h.newObject(null);
+    for (0..600) |i| try h.storeProperty(old, try h.internAscii(keyName(&buf, i)), .null);
+    try collectMinor(&h, &.{&old.obj});
+    try h.storeProperty(old, try h.internAscii(keyName(&buf, 550)), .{ .string = try h.ascii("young") });
+    collectMajor(&h, &.{});
+    try testing.expectEqual(@as(u32, 0), h.prop_cards.count());
+    try h.verifyCollected();
+}
+
+test "mutation: a young property store that doesn't dirty its card fails PC1" {
+    try onlyIn(.no_prop_card_set);
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    const o = try oldDict(&h, 1024);
+    var buf: [16]u8 = undefined;
+    try h.storeProperty(o, try h.internAscii(keyName(&buf, 700)), .{ .string = try h.ascii("young") });
+    try expectCaught(.no_prop_card_set, error.CleanCardOverYoungProperty, h.verify());
+}
+
+test "mutation: a delete that doesn't dirty the shifted cards fails PC1" {
+    try onlyIn(.no_dirty_on_remove);
+    const card = zqjs.limits.card_elements;
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    const o = try oldDict(&h, 4 * card);
+    var buf: [16]u8 = undefined;
+    try h.storeProperty(o, try h.internAscii(keyName(&buf, 2 * card)), .{ .string = try h.ascii("young") });
+    h.removeProperty(o, try h.internAscii(keyName(&buf, 0))); // moves it to 2·card − 1: card 1
+    try expectCaught(.no_dirty_on_remove, error.CleanCardOverYoungProperty, h.verify());
+}
+
+test "mutation: a clean first property bitmap for a remembered table fails PC1 (the hole)" {
+    try onlyIn(.clean_first_prop_bitmap);
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    const o = try oldDict(&h, 400);
+    var buf: [16]u8 = undefined;
+    try oldKeys(&h, o, 400, 600);
+    try h.storeProperty(o, try h.internAscii(keyName(&buf, 3)), .{ .string = try h.ascii("young") });
+    for (400..600) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .null);
+    try expectCaught(.clean_first_prop_bitmap, error.CleanCardOverYoungProperty, h.verify());
 }

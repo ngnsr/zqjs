@@ -46,25 +46,40 @@ pub fn build(b: *std.Build) void {
     run.addPassthruArgs();
     b.step("run", "Run the zqjs CLI").dependOn(&run.step);
 
-    // Two test binaries: unit tests inside src/, and integration tests in tests/.
-    // `--fuzz=N` fuzzes only one test per run, so pick fuzz targets with -Dtest-filter:
+    // Unit tests inside src/, and one binary per integration test file in tests/: a test
+    // binary runs its tests one at a time, so separate binaries are what lets the build
+    // run them in parallel. `--fuzz=N` fuzzes only one test per run, so pick fuzz targets
+    // with -Dtest-filter:
     //   zig build test --fuzz=100K -Dtest-filter="fuzz: the verifier"
     const filters: []const []const u8 = if (b.option([]const u8, "test-filter", "Run only tests whose name contains this")) |f| &.{f} else &.{};
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod, .filters = filters })).step);
-    const integration = b.addRunArtifact(b.addTest(.{ .filters = filters, .root_module = b.createModule(.{
-        .root_source_file = b.path("tests/all.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = imports,
-    }) }));
-    integration.setCwd(b.path(".")); // diff_test reads tests/diff at runtime
-    test_step.dependOn(&integration.step);
+    // Everything in tests/ goes through the public `zqjs` module. Data files are generated
+    // or checked with node by the scripts in tests/harness/.
+    for ([_][]const u8{
+        "gc_test", // the garbage collector: store-API scan, generations, cards, mutants
+        "interpreter_test", // both engines: limits, allocation failures, exceptions, fuzzing
+        "bytecode_test", // compiler + verifier over all programs, snapshots, limits, fuzzing
+        "diff_test", // diff/*.js on both engines: output must equal node's (diff/*.out)
+        "vm_test", // the VM's step() contract, cleanup, --trace
+        "syntax_test", // syntax/cases.jsonl: outcome + resolved dump for each source
+        "ops_test", // ops/*.jsonl: conversions and operators vs node, bit for bit
+        "frontend_test", // allocation-failure paths and fuzzing of parse, resolve, dump
+    }) |name| {
+        const integration = b.addRunArtifact(b.addTest(.{ .name = name, .filters = filters, .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("tests/{s}.zig", .{name})),
+            .target = target,
+            .optimize = optimize,
+            .imports = imports,
+        }) }));
+        integration.setCwd(b.path(".")); // diff_test reads tests/diff at runtime
+        test_step.dependOn(&integration.step);
+    }
 
     // The broken builds (M8.1): for each heap.Mutation, the `mutation:` tests under
     // -Dgc-stress, which pass only if the verifier catches that mutant.
     const mutants = b.step("gc-mutants", "Prove the heap verifier catches each deliberately broken GC piece");
-    for ([_][]const u8{ "none", "no_element_barrier", "no_card_set", "keep_remembered_bit", "clean_first_bitmap", "minor_frees_atoms" }) |name| {
+    for ([_][]const u8{ "none", "no_element_barrier", "no_card_set", "keep_remembered_bit", "clean_first_bitmap", "minor_frees_atoms", "no_prop_card_set", "no_dirty_on_remove", "clean_first_prop_bitmap" }) |name| {
         const mutant_options = b.addOptions();
         mutant_options.addOption(bool, "stack_stress", false);
         mutant_options.addOption(bool, "gc_stress", true);
@@ -72,7 +87,7 @@ pub fn build(b: *std.Build) void {
         const mutant_mod = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
         mutant_mod.addOptions("build_options", mutant_options);
         const mutant = b.addRunArtifact(b.addTest(.{ .name = b.fmt("mutant-{s}", .{name}), .filters = &.{"mutation:"}, .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/all.zig"),
+            .root_source_file = b.path("tests/gc_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "zqjs", .module = mutant_mod }},

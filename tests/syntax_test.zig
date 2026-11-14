@@ -5,11 +5,16 @@
 
 const std = @import("std");
 const zqjs = @import("zqjs");
+const support = @import("support.zig");
 
 fn frontend(arena: std.mem.Allocator, source: []const u8, diag: *zqjs.Diagnostic, w: *std.Io.Writer) !void {
     const script = try zqjs.parse(arena, source, .{}, diag);
     const resolution = try zqjs.resolve(arena, script, diag);
     try zqjs.dump.script(script, resolution, w);
+}
+
+test "watchdog: this binary fails, instead of hanging, if a test gets stuck" {
+    support.watchdog(@src().file);
 }
 
 test "syntax cases" {

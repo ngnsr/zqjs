@@ -3,6 +3,7 @@
 //! last digit matter. Any NaN matches any NaN.
 
 const std = @import("std");
+const support = @import("support.zig");
 const testing = std.testing;
 const ops = @import("zqjs").ops;
 
@@ -17,6 +18,10 @@ fn sameNumber(a: f64, b: f64) bool {
 
 fn lines(comptime file: []const u8) std.mem.SplitIterator(u8, .scalar) {
     return std.mem.splitScalar(u8, @embedFile(file), '\n');
+}
+
+test "watchdog: this binary fails, instead of hanging, if a test gets stuck" {
+    support.watchdog(@src().file);
 }
 
 test "Number::toString matches node" {

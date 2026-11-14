@@ -35,7 +35,7 @@ pub const gc_stress = @import("build_options").gc_stress;
 /// `-Dgc-mutation` (tests only: `zig build gc-mutants`): one deliberately broken piece of
 /// the generational collector. Each `mutation:` test in tests/gc_test.zig must see the
 /// verifier catch its mutant; `.none` everywhere else.
-pub const Mutation = enum { none, no_element_barrier, no_card_set, keep_remembered_bit, clean_first_bitmap, minor_frees_atoms };
+pub const Mutation = enum { none, no_element_barrier, no_card_set, keep_remembered_bit, clean_first_bitmap, minor_frees_atoms, no_prop_card_set, no_dirty_on_remove, clean_first_prop_bitmap };
 pub const mutation: Mutation = std.meta.stringToEnum(Mutation, @import("build_options").gc_mutation) orelse @compileError("unknown -Dgc-mutation");
 const limits_mod = @import("../limits.zig");
 const Limits = limits_mod.Limits;
@@ -206,6 +206,10 @@ pub const Heap = struct {
     /// touched only when such an array's capacity grows, on a young store into an old
     /// one, and when a minor collection scans it.
     cards: std.AutoHashMapUnmanaged(*Object, []u64) = .empty,
+    /// The same for property tables with ≥ `card_elements` entries (M8.1 P2b): bit i
+    /// covers entries [i·card_elements, (i+1)·card_elements), key and value alike. Entry
+    /// indices are insertion order; only `removeProperty` shifts them (and dirties).
+    prop_cards: std.AutoHashMapUnmanaged(*Object, []u64) = .empty,
     /// Collect at every safepoint, not only when requested (tests; always under -Dgc-stress).
     collect_always: bool = gc_stress,
     /// Run the heap verifier after every collection (always under -Dgc-stress; a
@@ -426,42 +430,60 @@ pub const Heap = struct {
     }
 
     /// Minor collection, first step: mark the young children of every remembered owner,
-    /// emptying the list. An array with cards has only its dirty cards' elements scanned
-    /// (each card scanned, then cleared); its prototype and properties always.
+    /// emptying the list. An object with cards has only its dirty cards scanned (each card
+    /// scanned, then cleared): property cards over its entries, element cards over an
+    /// array's elements. Without a bitmap, that part is scanned whole.
     fn scanRemembered(h: *Heap) void {
-        const Scan = struct {
-            h: *Heap,
-            fn child(c: *@This(), obj: *Obj) void {
-                c.h.stats.remembered_children += 1;
-                c.h.markObj(obj);
-            }
-        };
-        var scan: Scan = .{ .h = h };
+        var scan: RememberedScan = .{ .h = h };
         while (h.remembered) |owner| {
             h.remembered = owner.gray_next;
             owner.gray_next = null;
             if (mutation != .keep_remembered_bit) owner.remembered = false;
-            const bits = if (owner.kind == .object) h.cards.get(@fieldParentPtr("obj", owner)) else null;
-            const words = bits orelse {
-                forEachChild(owner, &scan, Scan.child);
+            if (owner.kind != .object) {
+                forEachChild(owner, &scan, RememberedScan.child);
                 continue;
-            };
+            }
             const o: *Object = @fieldParentPtr("obj", owner);
             if (o.proto) |p| scan.child(&p.obj);
-            for (o.props.keys(), o.props.values()) |k, p| {
-                scan.child(&k.obj);
-                visitValue(p.value, &scan, Scan.child);
+            if (h.prop_cards.get(o)) |words| {
+                scanDirty(words, o.props.count(), &scan, o, RememberedScan.entries);
+            } else scan.entries(o, 0, o.props.count());
+            switch (o.kind) {
+                .ordinary => {},
+                .array => |elements| if (h.cards.get(o)) |words| {
+                    scanDirty(words, elements.items.len, &scan, o, RememberedScan.elements);
+                } else scan.elements(o, 0, elements.items.len),
             }
-            const items = elementsOf(o).items;
-            for (words, 0..) |*w, wi| {
-                var word = w.*;
-                while (word != 0) : (word &= word - 1) {
-                    const lo = (wi * 64 + @ctz(word)) * card_elements;
-                    if (lo >= items.len) continue; // past a pop or shrink
-                    for (items[lo..@min(lo + card_elements, items.len)]) |v| visitValue(v, &scan, Scan.child);
-                }
-                w.* = 0;
+        }
+    }
+
+    const RememberedScan = struct {
+        h: *Heap,
+        fn child(c: *RememberedScan, obj: *Obj) void {
+            c.h.stats.remembered_children += 1;
+            c.h.markObj(obj);
+        }
+        fn entries(c: *RememberedScan, o: *Object, lo: usize, hi: usize) void {
+            for (o.props.keys()[lo..hi], o.props.values()[lo..hi]) |k, p| {
+                c.child(&k.obj);
+                visitValue(p.value, c, child);
             }
+        }
+        fn elements(c: *RememberedScan, o: *Object, lo: usize, hi: usize) void {
+            for (elementsOf(o).items[lo..hi]) |v| visitValue(v, c, child);
+        }
+    };
+
+    /// Calls `visit(scan, o, lo, hi)` for each dirty card's range, clamped to `len` (cards
+    /// past a pop, shrink or delete cover nothing), then clears each word it scanned.
+    fn scanDirty(words: []u64, len: usize, scan: *RememberedScan, o: *Object, comptime visit: fn (*RememberedScan, *Object, usize, usize) void) void {
+        for (words, 0..) |*w, wi| {
+            var word = w.*;
+            while (word != 0) : (word &= word - 1) {
+                const lo = (wi * 64 + @ctz(word)) * card_elements;
+                if (lo < len) visit(scan, o, lo, @min(lo + card_elements, len));
+            }
+            w.* = 0;
         }
     }
 
@@ -472,7 +494,10 @@ pub const Heap = struct {
             h.remembered = owner.gray_next;
             owner.gray_next = null;
             owner.remembered = false;
-            if (owner.kind == .object) if (h.cards.get(@fieldParentPtr("obj", owner))) |words| @memset(words, 0);
+            if (owner.kind != .object) continue;
+            const o: *Object = @fieldParentPtr("obj", owner);
+            if (h.cards.get(o)) |words| @memset(words, 0);
+            if (h.prop_cards.get(o)) |words| @memset(words, 0);
         }
     }
 
@@ -489,6 +514,7 @@ pub const Heap = struct {
         /// carded array) the card covering that element is clean: a missing barrier.
         UnrememberedOldToYoungEdge,
         CleanCardOverYoungElement,
+        CleanCardOverYoungProperty,
         /// I-gen4: the remembered list isn't exactly the objects with `remembered` set,
         /// each old and live, each once.
         RememberedListCorrupt,
@@ -548,14 +574,29 @@ pub const Heap = struct {
         if (sum != h.bytes) return error.AccountingMismatch;
     }
 
-    /// I-gen2 for a carded array: every young element sits under a dirty card.
+    /// I-gen2 for carded objects (PC8): walks every edge itself, and each young element,
+    /// key or value must sit under a dirty card. The bitmap is only ever the thing checked.
     fn checkCards(h: *const Heap, o: *Object) VerifyError!void {
-        const words = h.cards.get(o) orelse return;
-        for (elementsOf(o).items, 0..) |v, i| {
-            if (!isYoung(v)) continue;
-            const card = i / card_elements;
-            if (words[card / 64] & (@as(u64, 1) << @intCast(card % 64)) == 0) return error.CleanCardOverYoungElement;
+        if (h.prop_cards.get(o)) |words| {
+            for (o.props.keys(), o.props.values(), 0..) |k, p, i| {
+                if ((!k.obj.old or isYoung(p.value)) and !cardSet(words, i)) return error.CleanCardOverYoungProperty;
+            }
         }
+        if (o.kind == .array) if (h.cards.get(o)) |words| {
+            for (elementsOf(o).items, 0..) |v, i| {
+                if (isYoung(v) and !cardSet(words, i)) return error.CleanCardOverYoungElement;
+            }
+        };
+    }
+
+    fn cardSet(words: []const u64, i: usize) bool {
+        const card = i / card_elements;
+        return words[card / 64] & (@as(u64, 1) << @intCast(card % 64)) != 0;
+    }
+
+    fn setCard(words: []u64, i: usize) void {
+        const card = i / card_elements;
+        words[card / 64] |= @as(u64, 1) << @intCast(card % 64);
     }
 
     /// `verify`, plus what must hold right after a collection (I-gen3): nothing young,
@@ -564,8 +605,10 @@ pub const Heap = struct {
         try h.verify();
         if (h.young != null) return error.NurseryNotEmpty;
         if (h.remembered != null) return error.RememberedSetNotEmpty;
-        var it = h.cards.valueIterator();
-        while (it.next()) |words| for (words.*) |w| if (w != 0) return error.DirtyCardAfterCollection;
+        for ([_]*const std.AutoHashMapUnmanaged(*Object, []u64){ &h.cards, &h.prop_cards }) |table| {
+            var it = table.valueIterator();
+            while (it.next()) |words| for (words.*) |w| if (w != 0) return error.DirtyCardAfterCollection;
+        }
     }
 
     pub fn deinit(h: *Heap) void {
@@ -577,8 +620,9 @@ pub const Heap = struct {
                 h.destroy(obj);
             }
         }
-        std.debug.assert(h.cards.count() == 0); // each array's entry went with it (release)
+        std.debug.assert(h.cards.count() == 0 and h.prop_cards.count() == 0); // gone with their objects (release)
         h.cards.deinit(h.allocator());
+        h.prop_cards.deinit(h.allocator());
         var t = h.tombstones;
         while (t) |obj| {
             t = obj.next;
@@ -634,28 +678,78 @@ pub const Heap = struct {
     /// enumerability) or adds an enumerable one at the end (D13).
     pub fn storeProperty(h: *Heap, o: *Object, key: *String, value: Value) Error!void {
         o.obj.checkLive();
+        try h.growPropCards(o);
         const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
         const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
         if (gop.found_existing) gop.value_ptr.value = value else gop.value_ptr.* = .{ .value = value };
         if (!gop.found_existing) h.barrier(&o.obj, null, .{ .string = key }); // the key is a child too
         h.barrier(&o.obj, old, value);
+        h.propertyBarrier(o, gop.index, key, value);
     }
 
     /// Adds or replaces a property with explicit attributes (built-in method tables).
     pub fn defineProperty(h: *Heap, o: *Object, key: *String, p: Property) Error!void {
         o.obj.checkLive();
+        try h.growPropCards(o);
         const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
         const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
         gop.value_ptr.* = p;
         if (!gop.found_existing) h.barrier(&o.obj, null, .{ .string = key }); // the key is a child too
         h.barrier(&o.obj, old, p.value);
+        h.propertyBarrier(o, gop.index, key, p.value);
     }
 
-    /// `delete o[key]` for an own property; keeps the others' order (O(n), D13).
+    /// `delete o[key]` for an own property; keeps the others' order (O(n), D13). Every
+    /// later entry moves down one index, so on a remembered carded table every card from
+    /// the removed entry's on is dirtied (PC2): a young entry may have moved under a clean
+    /// one. An owner that isn't remembered has nothing young to move.
     pub fn removeProperty(h: *Heap, o: *Object, key: *String) void {
-        const old = o.props.get(key) orelse return;
-        _ = o.props.orderedRemove(key);
+        const index = o.props.getIndex(key) orelse return;
+        const old = o.props.values()[index];
+        o.props.orderedRemoveAt(index);
         h.barrier(&o.obj, old.value, null);
+        if (!o.obj.remembered or mutation == .no_dirty_on_remove) return;
+        const words = h.prop_cards.get(o) orelse return;
+        const first = index / card_elements;
+        words[first / 64] |= ~@as(u64, 0) << @intCast(first % 64);
+        for (words[first / 64 + 1 ..]) |*w| w.* = ~@as(u64, 0);
+    }
+
+    /// Before an insertion: a table about to reach `card_elements` entries gets its
+    /// bitmap, and one about to outgrow its bitmap gets a bigger one (PC3). Entry counts
+    /// grow one at a time, so checking at exactly those counts sees every crossing. Grown
+    /// before the table: if this fails nothing has changed, and if the table then can't
+    /// grow, a bigger bitmap is harmless. A first bitmap for a remembered owner is all
+    /// dirty (the hole rule, as for arrays).
+    fn growPropCards(h: *Heap, o: *Object) Error!void {
+        const per_word = 64 * card_elements;
+        const n = o.props.count() + 1;
+        if (n < card_elements or (n != card_elements and (n - 1) % per_word != 0)) return;
+        const needed = (n + per_word - 1) / per_word;
+        const gop = h.prop_cards.getOrPut(h.allocator(), o) catch |e| return h.failed(e);
+        const fresh = !gop.found_existing;
+        if (fresh) gop.value_ptr.* = &.{};
+        const old = gop.value_ptr.*;
+        if (old.len >= needed) return;
+        const new = h.allocator().alloc(u64, @max(needed, 2 * old.len)) catch |e| {
+            if (fresh) h.prop_cards.removeByPtr(gop.key_ptr);
+            return h.failed(e);
+        };
+        @memcpy(new[0..old.len], old);
+        @memset(new[old.len..], if (fresh and o.obj.remembered and mutation != .clean_first_prop_bitmap) std.math.maxInt(u64) else 0);
+        h.allocator().free(old);
+        gop.value_ptr.* = new;
+    }
+
+    /// A property store's card (PC6): after `barrier`, a young key or value in an old
+    /// carded table dirties the card of entry `index`, new entry or updated one alike.
+    /// Looked up whenever an old owner stores something young: a table can keep its
+    /// bitmap after deletes take it below `card_elements` entries.
+    inline fn propertyBarrier(h: *Heap, o: *Object, index: usize, key: *String, value: Value) void {
+        if (!o.obj.old or (key.obj.old and !isYoung(value))) return;
+        if (mutation == .no_prop_card_set) return;
+        const words = h.prop_cards.get(o) orelse return; // no bitmap: scanned whole
+        setCard(words, index);
     }
 
     pub fn appendElement(h: *Heap, arr: *Object, value: Value) Error!void {
@@ -725,8 +819,7 @@ pub const Heap = struct {
         h.remember(&arr.obj);
         if (mutation == .no_card_set) return;
         const words = h.cards.get(arr) orelse return; // no bitmap: scanned whole
-        const card = i / card_elements;
-        words[card / 64] |= @as(u64, 1) << @intCast(card % 64);
+        setCard(words, i);
     }
 
     /// Truncates to `len` (≤ length): `arr.length = len`.
@@ -999,6 +1092,7 @@ pub const Heap = struct {
                 const o: *Object = @fieldParentPtr("obj", obj);
                 o.props.deinit(h.allocator()); // refunds through the counting allocator
                 o.props = .empty;
+                if (h.prop_cards.fetchRemove(o)) |kv| h.allocator().free(kv.value);
                 switch (o.kind) {
                     .ordinary => {},
                     .array => |*elements| {

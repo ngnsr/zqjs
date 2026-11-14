@@ -30,7 +30,7 @@ pub const Vm = @import("vm/vm.zig").Vm;
 pub const Value = @import("runtime/value.zig").Value;
 
 // Small unit tests live next to the code they test (`test` blocks in each file);
-// integration, golden and fuzz tests live in tests/ (root: tests/all.zig).
+// integration, golden and fuzz tests live in tests/ (one test binary per file, build.zig).
 test {
     _ = @import("frontend/token.zig");
     _ = @import("frontend/lexer.zig");

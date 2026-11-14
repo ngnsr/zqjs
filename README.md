@@ -61,7 +61,7 @@ zig-out/bin/zqjs --dump-ast -e "let x = 1; { let x = x + 2; }"
 zig-out/bin/zqjs --dump-bytecode -e "let x = 1; x += 2;"   # compiled, verified, listed (M4)
 zig-out/bin/zqjs --trace -e "print(1 + 2);"                # each VM instruction and the stack, on stderr
 zig-out/bin/zqjs --engine=treewalk program.js               # the reference interpreter instead of the VM
-zig build test                              # unit + integration tests (tests/all.zig)
+zig build test                              # unit + integration tests (tests/*_test.zig, in parallel)
 zig build test -Dstack-stress               # same, with the VM moving its stacks on every call
 zig build test -Dgc-stress                  # same, collecting at every safepoint, with tombstones and a heap verifier
 zig build test --fuzz=100K -Dtest-filter="fuzz: frontend"   # fuzz one target (only one runs per call):

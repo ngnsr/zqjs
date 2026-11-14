@@ -11,6 +11,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const zqjs = @import("zqjs");
+const support = @import("support.zig");
 const Limits = zqjs.Limits;
 
 const Compiled = struct {
@@ -55,6 +56,10 @@ fn expectCompiles(source: []const u8) !void {
     var diag: zqjs.Diagnostic = .{};
     var c = try compileChecked(testing.allocator, source, .{}, &diag);
     c.deinit(testing.allocator);
+}
+
+test "watchdog: this binary fails, instead of hanging, if a test gets stuck" {
+    support.watchdog(@src().file);
 }
 
 test "every diff program and every accepted syntax case compiles to verified bytecode" {

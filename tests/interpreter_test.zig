@@ -34,15 +34,21 @@ fn runScript(arena: Allocator, rt: *Runtime, source: []const u8, engine: zqjs.En
 }
 
 fn expectLimit(source: []const u8, limits: Limits, which: Limit) !void {
+    var dbg: support.ProgramAllocator = .init; // these programs run to a limit: many allocations
+    defer support.endProgram(&dbg);
     for (support.engines) |engine| {
-        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        var arena = std.heap.ArenaAllocator.init(dbg.allocator());
         defer arena.deinit();
         var discard: std.Io.Writer.Discarding = .init(&.{});
-        var rt = Runtime.init(testing.allocator, limits, &discard.writer);
+        var rt = Runtime.init(dbg.allocator(), limits, &discard.writer);
         defer rt.deinit();
         try testing.expectEqual(@as(?anyerror, error.LimitExceeded), try runScript(arena.allocator(), &rt, source, engine));
         try testing.expectEqual(which, rt.limitHit().?);
     }
+}
+
+test "watchdog: this binary fails, instead of hanging, if a test gets stuck" {
+    support.watchdog(@src().file);
 }
 
 test "step budget covers loops, straight-line code and deep expressions" {
@@ -191,7 +197,9 @@ const corpus = [_][]const u8{
 };
 
 test "the engines agree on every syntax case and corpus program" {
-    const gpa = testing.allocator;
+    var dbg: support.ProgramAllocator = .init;
+    defer support.endProgram(&dbg);
+    const gpa = dbg.allocator();
     var failures: usize = 0;
     for (corpus) |src| {
         if (!try support.enginesAgree(gpa, src, .{ .max_steps = 100_000 })) failures += 1;

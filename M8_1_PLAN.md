@@ -438,7 +438,8 @@ them and the run fits. With the growth trigger disabled it fails with `LimitExce
 
 ## P2b design: property-table cards and adaptive major scheduling (for review)
 
-Approved in principle after P2. Nothing below is implemented yet.
+- **Property-table cards:** approved with the additions below (PC6–PC8).
+- **Adaptive scheduling:** revised for review, with `f_max = 4` (the reviewer's choice).
 
 ### Property-table cards
 
@@ -474,6 +475,24 @@ insertion and can shift on delete.
 - **PC4 (I-gen3 extended).** After any collection, every property card is clean.
 - **PC5: lifetime.** A table's bitmap is freed with its object, in `release`. `deinit`
   asserts that `prop_cards` is empty.
+- **PC6: every store dirties its own card.** Every store of a young reference into an old
+  carded table dirties the card of that entry's index:
+  - a new key appended at index `count` (the key, the value, or both may be young);
+  - a value updated under an existing key, at that key's unchanged index.
+
+  All of it goes through `storeProperty` and `defineProperty`, which know the index.
+- **PC7: reallocation.** When the entries buffer grows and moves, the indices stay valid,
+  because a card names an entry index, never an address. A test grows a dirty table through
+  many reallocations, to 40k entries.
+- **PC8: the verifier checks the edges, not the bitmap.** For every old object with a bitmap,
+  it walks every entry. For each young key or value it finds, the covering card must be
+  dirty. It never takes the bitmap's word for which entries matter. Clamped dirty cards past
+  the count are allowed. Clean cards over young entries are not.
+
+  The delete rule (PC2) dirties cards only for an owner that is already remembered. An owner
+  that isn't remembered has no young children (I-gen2), so nothing can shift into a clean
+  card. Leaving its cards untouched also keeps I-gen3 (no dirty card after a collection),
+  because collections only clear the cards of remembered owners.
 
 **Scanning a remembered owner:**
 
@@ -490,6 +509,8 @@ missing bitmap falls back to a whole scan, which is always safe.
 - the delete shift across a card boundary;
 - the hole: remembered at 400 entries, grown to 600;
 - growth to 40k entries;
+- deletes at the beginning, middle and end, with several young entries shifting across card
+  boundaries at once;
 - `checkAllAllocationFailures` on inserts that grow the bitmap;
 - the bitmap dying in a minor collection and in a major one.
 
@@ -499,63 +520,89 @@ missing bitmap falls back to a whole scan, which is always safe.
 **Acceptance:** game_big_dictionary's minor p95 under 1 ms, and its remembered-set p95 under
 0.1 ms (1.9 and 1.85 ms today).
 
-### Adaptive major scheduling
+### Adaptive major scheduling (revision 2, for review)
 
 Today `next_major = live + min(max(live, 256 KiB), (max − live)/2)`, which is D8's formula. It
 grows the heap by 1× live, whatever the last major collection found.
 
-**Proposal:** a growth factor `f ∈ {1, 2, 4, 8}`, updated at each major collection from that
-collection's own reclamation `r = freed / bytes_before`.
+**Definitions.** At each major collection:
 
-- `r < 10%` → `f = min(2f, 8)`: the heap is growing for real, so don't collect again at the
-  next doubling.
-- `r ≥ 50%` → `f = 1`: there's real old garbage, so go back to conservative.
-- otherwise `f` is unchanged.
-- `next_major = live + min(max(f · live, 256 KiB), (max − live)/2)`.
+- `before` = `h.bytes` when the major collection starts. That's the whole heap, old and young
+  (the young part is at most one nursery).
+- `after` = `h.bytes` when it ends. Every survivor is old by then, so this is `live`.
+- `r = (before − after) / before`: the fraction of the heap that collection freed. It's
+  computed in integers as `freed · 10 < before` and `freed · 2 ≥ before`, so no division or
+  float is involved and it's deterministic.
 
-**Invariants:**
+**The rule.** A growth factor `f ∈ {1, 2, 4}`, so `f_max = 4`. It starts at 1 and changes only
+at a major collection:
 
-- **AS1: the hard limit.** For every `f`, `next_major ≤ live + (max − live)/2 < max`.
-  Scheduling can never push the heap past its limit. Near the limit, major collections still
-  come at halving distances, so M8's O(log limit) guarantee holds. The existing
-  "no pathological collection loop" test must keep passing.
-- **AS2: deterministic.** `f` changes only at a major collection, and only from that
-  collection's byte counts. It never depends on time.
-- **AS3: bounded overhead.** At the next major collection, old bytes are at most
-  `(1 + f_max) · live`, and never more than the limit.
-- **AS4: fast reset.** One major collection that reclaims at least half returns `f` to 1. So
-  after a phase change from growth to churn, there's at most one long gap.
+| that major freed | new `f` |
+|---|---|
+| under 10% (`freed · 10 < before`) | `min(2f, 4)` |
+| at least 50% (`freed · 2 ≥ before`) | 1 |
+| anything in between | unchanged |
 
-**What it buys, and what it doesn't** (simulated on game_1m's growth curve):
+`next_major = live + min(max(f · live, 256 KiB), (max − live)/2)`, with `f · live` saturating.
 
-- Major collections happen at about 0.5, 1.5, 7.5 and 67.5 MB, instead of nine doublings up to
-  240 MB.
-- So about half as many majors during growth: the count goes from log₂ to log₉ of the final
-  size.
-- The longest pause *here* falls from about 59 ms to about 15 ms, but only because the
-  thresholds happen to land there. A heap that ends just past a threshold still pays a full
-  pause at that size. Making major pauses shorter in general is M8.2.
+**The hard limit (AS1), argued from the code as it stands.** Write `L` for `max_heap_bytes`.
 
-**`f_max` is for review:** 8, or 4 to be more conservative.
+1. **No allocation ever goes past `L`.** `reserve` refuses any charge that would take `bytes`
+   over `L`, so `bytes ≤ L` holds at every moment, under any schedule. Scheduling decides
+   only *when* collections happen.
+2. **The major threshold stays below `L`.** For any `f`, `next_major ≤ live + (L − live)/2`,
+   which is strictly less than `L` while `live < L`.
+3. **A collection is requested at least every half of the remaining room.** After every
+   collection, `next_gc = bytes + min(nursery, (L − bytes)/2)`. Once `bytes` passes
+   `next_gc`, the next safepoint collects. So while the heap fills, collections come at
+   distances that halve.
+4. **A major collection comes before the heap is full.** The old size after a collection
+   increases only through promotion, and by (3) collections keep happening as `bytes`
+   approaches `L`. So the old size reaches `next_major`, which is below `L` by (2), before
+   `bytes` can reach `L`. The next collection after that is a major one.
 
-| `f_max` | majors on game_1m | last major at | worst-case old-garbage overhead |
-|---|---|---|---|
-| 8 | ~4 | 67.5 MB | 9× live |
-| 4 | ~5 | 187 MB | 5× live |
+   Between "major due" and that next collection, the heap grows by at most half the room, so
+   the major collection runs while the heap is still within the limit and can free the old
+   garbage.
+5. **What it does not prevent:** a single allocation bigger than the room left fails at once,
+   because allocation never collects (D7). That's M8's behaviour too, and `f` doesn't change
+   it.
+
+`f` appears only inside the `min(…)` that (2) bounds, so all of the above holds at
+`f = 1, 2, 4` alike.
+
+**Overhead bound (AS3).** At the next major collection, old bytes are at most `(1 + 4) · live`,
+and never more than `L`.
+
+**Determinism and reset (AS2, AS4)** are as before: `f` comes from byte counts only, and one
+major collection that frees at least half resets it to 1.
+
+**What it buys** (simulated on game_1m's growth curve, `f_max = 4`):
+- major collections at about 0.5, 1.5, 7.5, 37.5 and 187 MB: five instead of nine;
+- the last one at 187 MB instead of 240 MB.
+
+That gain is in collection count. Pause length is M8.2's job.
 
 **Tests:**
-- a unit test of the `f` sequence: repeated non-reclaiming majors go 1→2→4→8→8, and one
-  reclaiming major resets to 1;
-- the extremes loop over `schedule(live, f)`: never above `max`, never below `live`;
-- the existing O(log limit) fill test;
-- new: growth followed by churn of objects that die *old*, under a small limit. It must
-  finish without `LimitExceeded`, with `peak ≤ limit`.
+
+- **The adaptation cycle** (unit, `h.growth` exposed for the test):
+  1. live data that survives;
+  2. three major collections that each free under 10%: `f` goes 1 → 2 → 4 → 4 (the cap);
+  3. drop most of it, run a major collection that frees over 50%: `f` = 1;
+  4. one that frees 30%: `f` unchanged.
+- **The extremes:** `schedule(live)` for every `f`, `live ∈ {0, 1, L/2, L−1, L}` and
+  `L ∈ {0, 1, 100, 1 MiB, maxInt}`: never above `L` (and never below `live`), no overflow.
+- **A nearly full heap with continuous allocation:** a 1 MiB heap. Live data grows to about
+  70%. Then a churn loop runs for a long time, allocating objects that survive a minor
+  collection and then die *old* (a ring buffer that keeps replacing its oldest entries).
+  - It must finish without `LimitExceeded`, with major collections > 0 and `peak ≤ 1 MiB`.
+  - It runs on both engines, after the growth phase has pushed `f` to 4.
+- **The existing O(log limit) fill test** keeps passing unchanged.
 
 These are scheduling properties, so they're unit tests, not verifier mutants: the heap stays
 sound under any `f`, only its timing changes.
 
-**Decisions:** this changes D8's scheduling formula, so D8 gets a revision entry in
-P3's docs.
+**Decisions:** this replaces D8's formula, so D8 gets a revision entry in P3's docs.
 
 ## Out of scope
 

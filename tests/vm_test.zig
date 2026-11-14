@@ -6,6 +6,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const zqjs = @import("zqjs");
+const support = @import("support.zig");
 const Op = zqjs.bytecode.Op;
 
 /// A compiled, verified script plus the runtime it runs in.
@@ -45,6 +46,10 @@ const Setup = struct {
         return @fromBackingInt(s.proto.code[pc]);
     }
 };
+
+test "watchdog: this binary fails, instead of hanging, if a test gets stuck" {
+    support.watchdog(@src().file);
+}
 
 test "step executes one instruction at a time; after halt nothing runs" {
     const s = try Setup.create("let x = 1;", .{});

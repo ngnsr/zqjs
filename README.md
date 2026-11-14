@@ -7,7 +7,7 @@ Inspired by QuickJS and Crafting Interpreters; it does not reuse their code.
 Priorities: correctness, simplicity, inspectability. Speed comes last.
 
 ## Status
-Milestone 7 of 11 done (tags `m1` … `m7`, and `p1` for accurate `**`). ZQJS has:
+Milestone 8 of 11 done (tags `m1` … `m8`, and `p1` for accurate `**`). ZQJS has:
 
 - **the language so far:** `let`/`const`, blocks, `if`/`while`/`for`, `break`/`continue`;
   functions, closures and recursion; objects, arrays, prototypes, methods with `this`; numbers,
@@ -18,8 +18,10 @@ Milestone 7 of 11 done (tags `m1` … `m7`, and `p1` for accurate `**`). ZQJS ha
 - **two engines that must agree:** a bytecode compiler, verifier and stack VM (the default),
   and a tree-walking reference interpreter (`--engine=treewalk`). Their output is checked byte
   for byte against node, and against each other under fuzzing.
-- **no garbage collector yet:** memory is freed when the run ends, bounded by the heap limit.
-  M8 adds one; the design is in [GC_DESIGN.md](GC_DESIGN.md).
+- **a garbage collector:** stop-the-world, non-moving, precise mark-and-sweep, running at
+  safepoints in both engines, with weak atoms, a stress mode (`-Dgc-stress`) and a heap verifier
+  ([GC_DESIGN.md](GC_DESIGN.md)). A program whose live data fits the heap limit runs as long as
+  its step budget allows, however much garbage it makes.
 
 ```js
 // ZQJS prints 6765 hi box:3 0,1,b,a. `print` is ZQJS's own built-in, so node needs one defined
@@ -31,8 +33,8 @@ const greet = (function () { const word = 'hi'; return function () { return word
 print(fib(20), greet(), box.describe(), Object.keys({ b: 1, a: 2, 1: 3, 0: 4 }));
 ```
 
-Next: M8 (garbage collector), M9 (embedding API, with a small Raylib demo), M10 (fuzzing and
-benchmarks), M11 (bytecode debugger). See [ROADMAP.md](ROADMAP.md).
+Next: M9 (embedding API, with a small Raylib demo), M10 (fuzzing and benchmarks), M11
+(bytecode debugger). The collector's next step is decided by measuring it first (ROADMAP). See [ROADMAP.md](ROADMAP.md).
 
 ## Requirements
 **Zig 0.17.1 exactly** (the build refuses other versions; see DESIGN_DECISIONS D17).
@@ -75,11 +77,12 @@ zig build update-golden                     # regenerate goldens (node) and pow 
 engines, each run with a fresh runtime and heap. `steps` and the heap columns are
 deterministic (identical on every machine, and checked identical across runs): `allocated` is
 the cumulative volume charged, `peak` the highest live total, `end` what is live at the end
-(equal until the M8 GC frees memory during a run). `median ms` only compares on the same
-machine. `bench/baseline.txt` is the current baseline (Apple M4; the six M6 workloads plus
-`objects.js` and `arrays.js` from M7); the M6 reference point is commit abbf773;
-rerun and diff it before and after a change: a change in steps or heap means different work, a
-change in time alone means the same work got faster or slower.
+(they differ as soon as garbage is collected during a run). `median ms` only compares on the same
+machine. `collections` counts garbage collections during the run. `bench/baseline.txt` is the
+current baseline (end of M8, Apple M4); `bench/baseline-m7.txt` is the end of M7, kept to compare
+against (the M6 reference point is commit abbf773). Rerun and diff before and after a change: a
+change in steps or heap means different work, a change in time alone means the same work got
+faster or slower.
 
 ## Continuous integration
 `.github/workflows/ci.yml` runs on every push that touches code, tests, tools or the build

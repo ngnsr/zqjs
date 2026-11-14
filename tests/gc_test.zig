@@ -616,3 +616,96 @@ test "under -Dgc-stress every run collects at every safepoint, whatever the opti
     defer testing.allocator.free(r.out);
     try testing.expect(r.collections >= 8); // one per instruction, at least
 }
+
+// ---------------------------------------------------------------- P4: acceptance
+
+const EngineStats = struct { atoms: u32, collections: u64, peak: usize, live: usize, err: ?anyerror };
+
+/// Runs `source` on `engine` (normal scheduling, unless stress) and returns the heap's state.
+fn runStats(source: []const u8, engine: zqjs.Engine, limits: zqjs.Limits) !EngineStats {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var rt = zqjs.Runtime.init(gpa, limits, &discard.writer);
+    defer rt.deinit();
+    var d: zqjs.Diagnostic = .{};
+    const script = try zqjs.parse(arena.allocator(), source, limits, &d);
+    const res = try zqjs.resolve(arena.allocator(), script, &d);
+    var err: ?anyerror = null;
+    switch (engine) {
+        .treewalk => zqjs.interpret(&rt, script, res) catch |e| {
+            err = e;
+        },
+        .vm => {
+            var proto = try zqjs.compile(gpa, &rt.heap, script, res, limits, &d);
+            defer proto.deinit(gpa);
+            var vm = try zqjs.Vm.init(&rt, &proto);
+            defer vm.deinit();
+            vm.run() catch |e| {
+                err = e;
+            };
+        },
+    }
+    rt.collect(); // the run is over: only the runtime's own roots remain
+    return .{ .atoms = rt.heap.atoms.count(), .collections = rt.heap.stats.collections, .peak = rt.heap.peak, .live = rt.heap.bytes, .err = err };
+}
+
+test "weak atoms are reclaimed in real programs, on both engines" {
+    // 20 000 distinct keys, each on an object dropped at once: without weak atoms the table
+    // would end with 20 000 entries; with them, only the realm's names survive.
+    const source = "for (let i = 0; i < 20000; i++) { let o = {}; o['key' + i] = i; o.fixed = o['key' + i]; }";
+    for ([_]zqjs.Engine{ .treewalk, .vm }) |engine| {
+        const r = try runStats(source, engine, .{});
+        try testing.expectEqual(@as(?anyerror, null), r.err);
+        try testing.expect(r.collections > 0);
+        testing.expect(r.atoms < 50) catch |e| {
+            std.debug.print("{s}: {d} atoms left\n", .{ @tagName(engine), r.atoms });
+            return e;
+        };
+    }
+}
+
+test "both engines reclaim garbage and keep reachable objects in one program" {
+    // Garbage of every kind next to a growing live structure that is checked at the end.
+    const source =
+        \\let live = [];
+        \\for (let i = 0; i < 3000; i++) {
+        \\  let tmp = { s: 'garbage ' + i, f: function () { return tmp; }, l: [i, i] };
+        \\  if (i % 100 === 0) live.push({ i, s: 'kept ' + i, f: function () { return i; } });
+        \\}
+        \\let sum = 0;
+        \\for (let j = 0; j < live.length; j++) sum = sum + live[j].f() + live[j].s.length;
+        \\if (sum !== 43758) undefinedCheck; // node: 43758
+    ;
+    for ([_]zqjs.Engine{ .treewalk, .vm }) |engine| {
+        const r = try runStats(source, engine, .{ .max_heap_bytes = 256 << 10 });
+        try testing.expectEqual(@as(?anyerror, null), r.err); // the check at the end passed
+        try testing.expect(r.collections > 0);
+        try testing.expect(r.peak <= 256 << 10);
+    }
+}
+
+test "statistics are exact: collections, bytes freed, peak and live" {
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    const keep = try h.newObject(null);
+    var freed: u64 = 0;
+    var highest: usize = h.bytes;
+    for (0..3) |round| {
+        for (0..40 * (round + 1)) |_| {
+            _ = try h.ascii("garbage string");
+            highest = @max(highest, h.bytes);
+        }
+        const before = h.bytes;
+        h.collect(TestRoots{ .objs = &.{&keep.obj} }, TestRoots.mark);
+        freed += before - h.bytes;
+        try testing.expectEqual(@as(u64, round + 1), h.stats.collections);
+        try testing.expectEqual(freed, h.stats.bytes_freed);
+        try testing.expectEqual(h.bytes, h.stats.live_after_last);
+        try h.verify();
+    }
+    try testing.expectEqual(highest, h.peak);
+    try testing.expectEqual(@as(u64, 3), h.stats.marked); // `keep`, once per collection
+    try testing.expectEqual(@as(u64, 40 + 80 + 120), h.stats.swept); // every garbage string
+}

@@ -1,7 +1,7 @@
 # Garbage collection: design (M8 and after)
 
-Status: **approved** (§14, with the additions recorded in [M8_PLAN.md](M8_PLAN.md); the
-decisions are in DESIGN_DECISIONS.md D7–D11, revised where noted). This file stays as the
+Status: **built in M8** (approved design; the decisions are in DESIGN_DECISIONS.md D7–D11,
+revised where noted, and M8's tests and findings in ROADMAP.md). This file stays as the
 GC's reference. It covers the collector M8 builds (stop-the-world, non-moving, precise
 mark-and-sweep) and the interfaces that let incremental marking (M8.1) and generations (M8.2)
 be added later without changing the object model.

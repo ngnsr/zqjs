@@ -176,6 +176,9 @@ pub const Heap = struct {
     collect_requested: bool = false,
     /// Collect at every safepoint, not only when requested (tests; always under -Dgc-stress).
     collect_always: bool = gc_stress,
+    /// Run the heap verifier after every collection (always under -Dgc-stress; a
+    /// development option otherwise: RunOptions.verify_heap, `zqjs --verify-heap`).
+    verify_always: bool = gc_stress,
     /// Bytes charged through `allocator()` (object-internal buffers), for the verifier's
     /// accounting check: `bytes` = Σ live objects' fixed charges + `buffer_bytes`.
     buffer_bytes: usize = 0,
@@ -272,7 +275,7 @@ pub const Heap = struct {
         h.stats.live_after_last = h.bytes;
         h.next_gc = h.schedule(h.bytes);
         h.collect_requested = false;
-        if (gc_stress) h.verify() catch |e| std.debug.panic("zqjs GC bug: heap verification failed after a collection: {s}", .{@errorName(e)});
+        if (h.verify_always) h.verify() catch |e| std.debug.panic("zqjs GC bug: heap verification failed after a collection: {s}", .{@errorName(e)});
     }
 
     pub const VerifyError = error{ GrayListNotEmpty, EdgeToCollectedObject, CollectedObjectInList, AtomTableHoldsCollectedObject, AtomTableHoldsNonAtom, AccountingMismatch };

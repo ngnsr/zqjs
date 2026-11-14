@@ -41,6 +41,8 @@ pub const Options = struct {
     trace: ?*Writer = null,
     /// Collect at every safepoint, not only when the heap asks (tests; GC_DESIGN §11).
     collect_always: bool = false,
+    /// Run the heap verifier after every collection, without the rest of -Dgc-stress.
+    verify_heap: bool = false,
 };
 
 pub const Error = Allocator.Error || Writer.Error;
@@ -62,6 +64,7 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
     defer rt.deinit();
     // An option can only add collections: under -Dgc-stress every safepoint collects anyway.
     rt.heap.collect_always = options.collect_always or rt.heap.collect_always;
+    rt.heap.verify_always = options.verify_heap or rt.heap.verify_always;
     const outcome = switch (options.engine) {
         .treewalk => treewalk.run(&rt, script, res),
         .vm => vm: {

@@ -1,0 +1,18 @@
+# zqjs benchmark baseline: zig 0.17.1, aarch64-macos (apple_m4), fast, median of 5 runs
+program                engine           steps    allocated         peak          end  median ms
+arrays.js              vm             5455249      2379800      2379688      2379688       53.2
+arrays.js              treewalk       3803441     23191776     23191664     23191664       76.3
+closures.js            vm             4500028     29600304     29600304     29600304       57.1
+closures.js            treewalk       3700021     57600728     57600728     57600728       89.3
+fib.js                 vm             2670640          144          144          144       28.8
+fib.js                 treewalk       2670637     25249824     25249824     25249824       66.6
+loop.js                vm            25666675            0            0            0      311.9
+loop.js                treewalk      18333340    104000312    104000312    104000312      416.1
+objects.js             vm             3025022     16004400     16004104     16004104       44.3
+objects.js             treewalk       2425016     33754572     33754276     33754276       61.3
+per_iteration.js       vm             2400016     14400112     14400112     14400112       27.3
+per_iteration.js       treewalk       1600012     28800312     28800312     28800312       37.4
+scopes.js              vm             6400015            0            0            0       56.8
+scopes.js              treewalk       5000012     83200312     83200312     83200312      112.5
+strings.js             vm              540236      3613144      3613144      3613144        8.5
+strings.js             treewalk        400158     11014878     11014878     11014878       13.7

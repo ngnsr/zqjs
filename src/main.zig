@@ -7,6 +7,7 @@
 //!   --max-steps N    execution budget; 0 = unlimited (default: cli_default_steps)
 //!   --engine=E       vm (default) or treewalk (the reference interpreter)
 //!   --trace          VM: print each instruction and the operand stack to stderr
+//!   --verify-heap    verify the heap after every collection (a GC debugging aid)
 
 const std = @import("std");
 const zqjs = @import("zqjs");
@@ -19,6 +20,7 @@ const usage =
     \\  --engine=vm        run on the bytecode VM (default)
     \\  --engine=treewalk  run on the tree-walking reference interpreter
     \\  --trace            VM: print each instruction and the operand stack to stderr
+    \\  --verify-heap      verify the heap after every garbage collection
     \\
 ;
 
@@ -62,6 +64,8 @@ pub fn main(init: std.process.Init) !u8 {
             };
         } else if (std.mem.eql(u8, rest[0], "--trace")) {
             options.trace = err;
+        } else if (std.mem.eql(u8, rest[0], "--verify-heap")) {
+            options.verify_heap = true;
         } else if (std.mem.eql(u8, rest[0], "--max-steps") and rest.len > 1) {
             const n = std.fmt.parseInt(u64, rest[1], 10) catch {
                 try err.print("--max-steps: not a number: {s}\n", .{rest[1]});

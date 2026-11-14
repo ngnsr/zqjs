@@ -829,6 +829,34 @@ test "cards: pop and shrink after a young store leave nothing stale" {
     try h.verifyCollected(); // and every card is clean
 }
 
+test "cards: a carded array's bitmap goes with it, in a minor and in a major collection" {
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    // The side table keeps its bucket storage once it has any (as the atom table does), so
+    // measure from after a first carded array has come and gone.
+    const first = try h.newArray(null);
+    for (0..2000) |i| try h.appendElement(first, .{ .number = @floatFromInt(i) });
+    h.collect(TestRoots{ .objs = &.{} }, TestRoots.mark);
+    const base = h.bytes;
+    // Young and carded, then garbage: freed by a minor collection.
+    const young = try h.newArray(null);
+    for (0..2000) |i| try h.appendElement(young, .{ .number = @floatFromInt(i) });
+    try testing.expectEqual(@as(u32, 1), h.cards.count());
+    h.collect(TestRoots{ .objs = &.{} }, TestRoots.mark);
+    try testing.expectEqual(@as(u32, 0), h.cards.count());
+    try testing.expectEqual(base, h.bytes); // the bitmap's bytes given back too
+    try h.verifyCollected();
+    // Old, carded, dirty and remembered, then garbage: freed by a major collection.
+    const old = try oldArray(&h, 2000);
+    h.storeElement(old, 1500, .{ .string = try h.ascii("young") });
+    try testing.expectEqual(@as(u32, 1), h.cards.count());
+    collectMajor(&h, &.{});
+    try testing.expectEqual(@as(u32, 0), h.cards.count());
+    try testing.expectEqual(@as(?*heap.Obj, null), h.remembered);
+    try testing.expectEqual(base, h.bytes);
+    try h.verifyCollected();
+}
+
 fn growRememberedArray(gpa: Allocator) !void {
     var h = heap.Heap.init(gpa, .{});
     defer h.deinit();

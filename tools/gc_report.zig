@@ -20,7 +20,12 @@
 //! The clock lives here, not in the runtime: the heap only calls the observer it is given.
 //! Timings are machine-dependent; compare only on the same machine and build mode.
 //!
+//! Each row is followed by its slowest minor collection over all runs (which run, which
+//! collection, its work): a slow collection that is the same one in every run is work, a
+//! different one each time is the machine.
+//!
 //!   zig build gc-report              (always ReleaseFast)
+//!   zig build gc-report -- game_1m   (only programs whose name contains the text)
 //!   zig build gc-report > bench/gc/baseline-m8.txt
 
 const std = @import("std");
@@ -71,6 +76,8 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const gpa = init.gpa;
     const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
+    const only: ?[]const u8 = if (args.len > 1) args[1] else null;
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
@@ -93,6 +100,7 @@ pub fn main(init: std.process.Init) !u8 {
         var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
         defer dir.close(io);
         for (try sortedScripts(arena, io, dir)) |name| {
+            if (only) |o| if (std.mem.indexOf(u8, name, o) == null) continue;
             const source = try dir.readFileAlloc(io, name, arena, .limited(1 << 20));
             for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
                 var results: [runs]Result = undefined;
@@ -106,6 +114,7 @@ pub fn main(init: std.process.Init) !u8 {
                     if (r.allocated != results[0].allocated or ss.len != samples[0].len) return error.NonDeterministic;
                 }
                 try summary(out, gpa, name, engine, &results, &samples);
+                try slowestMinor(out, &samples);
                 if (game) {
                     try collections(&series.writer, name, engine, samples[0]);
                     try series.writer.print("largest array: {d} elements, one child scan {d:.3} ms\n", .{ results[0].scan.elements, ns_f(results[0].scan.ns) / 1e6 });
@@ -199,6 +208,26 @@ fn perRun(gpa: std.mem.Allocator, samples: []const Heap.Sample, kind: Kind, buck
     p.max = pauses.items[p.count - 1];
     p.rem_p95 = rems.items[(p.count * 95 - 1) / 100];
     return p;
+}
+
+fn slowestMinor(out: *std.Io.Writer, samples: *const [runs][]Heap.Sample) !void {
+    var worst: ?Heap.Sample = null;
+    var where: [2]usize = .{ 0, 0 };
+    for (samples, 0..) |ss, run| {
+        var nth: usize = 0;
+        for (ss) |x| {
+            if (x.kind != .minor) continue;
+            nth += 1;
+            if (worst == null or x.duration_ns > worst.?.duration_ns) {
+                worst = x;
+                where = .{ run + 1, nth };
+            }
+        }
+    }
+    const w = worst orelse return;
+    try out.print("{s:<22}   slowest minor: run {d}, minor #{d}: {d:.3} ms (rem {d:.3}, sweep {d:.3}), marked {d}, swept {d}, {d:.1} -> {d:.1} MB\n", .{
+        "", where[0], where[1], ns_f(w.duration_ns) / 1e6, ns_f(w.remembered_ns) / 1e6, ns_f(w.sweep_ns) / 1e6, w.marked, w.swept, mb(w.bytes_before), mb(w.bytes_after),
+    });
 }
 
 fn median(xs: []u64) u64 {

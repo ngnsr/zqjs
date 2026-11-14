@@ -245,6 +245,8 @@ pub const Heap = struct {
         swept: u64,
         /// Minor collections: the part of the pause spent scanning the remembered set.
         remembered_ns: u64 = 0,
+        /// The part of the pause spent sweeping (freeing, promoting).
+        sweep_ns: u64 = 0,
     };
 
     /// Deterministic collector statistics (D8): work units, not wall-clock time.
@@ -327,6 +329,7 @@ pub const Heap = struct {
         const marked_before = h.stats.marked;
         const swept_before = h.stats.swept;
         var remembered_ns: u64 = 0;
+        var sweep_start: u64 = 0;
         defer if (h.observer) |o| o.record(o.ctx, .{
             .kind = if (major) .major else .minor,
             .start_ns = start,
@@ -336,6 +339,7 @@ pub const Heap = struct {
             .marked = h.stats.marked - marked_before,
             .swept = h.stats.swept - swept_before,
             .remembered_ns = remembered_ns,
+            .sweep_ns = o.clock(o.ctx) - sweep_start,
         });
         std.debug.assert(h.gray == null);
         if (major) {
@@ -370,6 +374,7 @@ pub const Heap = struct {
             }
         }
         const before = h.bytes;
+        if (h.observer) |o| sweep_start = o.clock(o.ctx);
         // A major collection sweeps the old list first: survivors promoted below arrive
         // there unmarked.
         if (major) {
@@ -572,7 +577,8 @@ pub const Heap = struct {
                 h.destroy(obj);
             }
         }
-        h.cards.deinit(h.allocator()); // empty by now: each array's entry goes with it
+        std.debug.assert(h.cards.count() == 0); // each array's entry went with it (release)
+        h.cards.deinit(h.allocator());
         var t = h.tombstones;
         while (t) |obj| {
             t = obj.next;

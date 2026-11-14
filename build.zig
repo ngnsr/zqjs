@@ -124,6 +124,7 @@ pub fn build(b: *std.Build) void {
         }),
     }));
     gc_report.setCwd(b.path("."));
+    gc_report.addPassthruArgs();
     b.step("gc-report", "GC pauses, allocation rate and GC share for bench/ and bench/gc/ (ReleaseFast)").dependOn(&gc_report.step);
 
     // Generated test data: node (goldens, syntax contract), Python stdlib (pow reference),

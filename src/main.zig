@@ -27,10 +27,12 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator(); // process lifetime
     const args = try init.minimal.args.toSlice(arena);
 
+    // Streaming, not positional, writers: with `> file 2>&1` both descriptors share one
+    // file offset, and positional writers would each start at 0 and overwrite each other.
     var out_buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &out_buf);
     var err_buf: [1024]u8 = undefined;
-    var stderr = std.Io.File.stderr().writer(io, &err_buf);
+    var stderr = std.Io.File.stderr().writerStreaming(io, &err_buf);
     const out = &stdout.interface;
     const err = &stderr.interface;
     defer err.flush() catch {};

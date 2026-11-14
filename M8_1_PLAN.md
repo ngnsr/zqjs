@@ -571,6 +571,72 @@ at a major collection:
 `f` appears only inside the `min(…)` that (2) bounds, so all of the above holds at
 `f = 1, 2, 4` alike.
 
+**Bursts (AS5, added for the second review).**
+
+A *burst* is allocation inside one step: `a.join()`, a long concatenation, a native that
+builds a big result. There's no safepoint inside it, so no collection can run mid-burst (D7).
+Its only room is what's free at the safepoint before it.
+
+Notation: `L` is the limit, `live` the heap after the last major collection, `B` the heap after
+the last collection of any kind (all of it old), and `N = nursery_bytes`.
+
+1. **Exact, for every `f`.** After any collection, `next_gc = B + min(N, (L − B)/2)`. So at
+   every safepoint with no collection pending, `bytes ≤ B + (L − B)/2`: **a burst always has
+   at least `(L − B)/2` of room.** `f` doesn't appear in this at all.
+2. **`B` is live data plus old garbage.** `f` decides only how much old garbage can build up
+   before a major collection clears it:
+   - that's at most `next_major − live`, plus what the one collection that crosses
+     `next_major` promotes;
+   - it's bounded by `(L − live)/2` for every `f` (F3), and by `(L − live)/4` with the
+     mitigation below.
+3. **What this doesn't bound:** a burst that *overshoots* a trigger by its whole size, with a
+   result that stays live. Then `B` rises by that much, but that's live data genuinely filling
+   the heap, the same as in M8 at any `f`.
+
+(A first draft claimed a fixed `(L − live)/8` of room for every `f`. It's wrong: the overshoot
+in point 3 breaks it.)
+
+**What `f` does change is the typical headroom away from the limit.**
+
+Example: `L` = 100 MB, `live` = 10 MB.
+
+| `f` | `next_major` | room just before that major |
+|---|---|---|
+| 1 | 20 MB | about 80 MB |
+| 4 | 50 MB | about 50 MB |
+
+So a 60 MB burst that always fits at `f = 1` can fail at `f = 4` if it arrives just before a
+major collection. That's the real cost of adaptive scheduling: fewer major collections in
+exchange for less headroom against bursts.
+
+**Proposed mitigation (for review):** when `f > 1`, the growth is also capped at a *quarter* of
+the room, not half: `growth = min(max(f · live, 256 KiB), (L − live)/(f > 1 ? 4 : 2))`. Then
+`f > 1` never leaves less than three quarters of the room free (minus a nursery) at its major
+trigger.
+
+In the example that's `next_major` = 32.5 MB, so the 60 MB burst fits. The costs:
+- point 1's guarantee is unchanged;
+- growth phases far from the limit keep most of their benefit;
+- near the limit, `f` effectively falls back to 1.
+
+**Tests for AS5:**
+
+- **A grid of the bound itself** (unit, no programs):
+  - inputs: `L ∈ {256K, 1M, 64M, maxInt}`, `live` and `B` across `[0, L]`, `f ∈ {1, 2, 4}`;
+  - checks: `next_major ≤ live + (L − live)/2`, or `/4` when `f > 1`; `next_gc ≤ B +
+    (L − B)/2`;
+  - with overflow-checked arithmetic throughout.
+- **Bursts at every phase** (both engines, 1 MiB limit):
+  1. grow live data to push `f` to 4;
+  2. churn objects that die old;
+  3. every *k* iterations, run one burst: a `join` of a prepared array into a short-lived
+     string of about 90% of the smallest `(L − B)/2` the run can reach. Because *k* is coprime with the collection period, bursts
+     land at every point between collections.
+
+  It must finish without `LimitExceeded`. A control run with a burst of about 110% of the
+  *typical* room (not the guaranteed one) must hit `LimitExceeded`, so the test can't pass
+  by accident.
+
 **Overhead bound (AS3).** At the next major collection, old bytes are at most `(1 + 4) · live`,
 and never more than `L`.
 

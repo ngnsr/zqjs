@@ -24,6 +24,10 @@ pub fn build(b: *std.Build) void {
     // -Dgc-stress: collect at every safepoint, keep collected objects as tombstones, and
     // verify the heap after every collection (GC_DESIGN §11): zig build test -Dgc-stress
     options.addOption(bool, "gc_stress", b.option(bool, "gc-stress", "GC: collect at every safepoint, tombstones, heap verifier") orelse false);
+    // -Dgc-mutation=<name>: one deliberately broken piece of the generational collector
+    // (heap.Mutation), so the `mutation:` tests can prove the verifier catches it. Only
+    // `zig build gc-mutants` uses it; never set it for a real build.
+    options.addOption([]const u8, "gc_mutation", b.option([]const u8, "gc-mutation", "GC: break one barrier piece on purpose (tests)") orelse "none");
     mod.addOptions("build_options", options);
     const imports: []const std.Build.Module.Import = &.{.{ .name = "zqjs", .module = mod }};
 
@@ -56,6 +60,26 @@ pub fn build(b: *std.Build) void {
     }) }));
     integration.setCwd(b.path(".")); // diff_test reads tests/diff at runtime
     test_step.dependOn(&integration.step);
+
+    // The broken builds (M8.1): for each heap.Mutation, the `mutation:` tests under
+    // -Dgc-stress, which pass only if the verifier catches that mutant.
+    const mutants = b.step("gc-mutants", "Prove the heap verifier catches each deliberately broken GC piece");
+    for ([_][]const u8{ "none", "no_element_barrier", "no_card_set", "keep_remembered_bit", "clean_first_bitmap", "minor_frees_atoms" }) |name| {
+        const mutant_options = b.addOptions();
+        mutant_options.addOption(bool, "stack_stress", false);
+        mutant_options.addOption(bool, "gc_stress", true);
+        mutant_options.addOption([]const u8, "gc_mutation", name);
+        const mutant_mod = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+        mutant_mod.addOptions("build_options", mutant_options);
+        const mutant = b.addRunArtifact(b.addTest(.{ .name = b.fmt("mutant-{s}", .{name}), .filters = &.{"mutation:"}, .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/all.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zqjs", .module = mutant_mod }},
+        }) }));
+        mutant.setCwd(b.path("."));
+        mutants.dependOn(&mutant.step);
+    }
 
     // Portability check for pow (tools/pow_bits.zig): build with any -Dtarget/-Dcpu/-Doptimize.
     const pow_bits = b.addRunArtifact(b.addExecutable(.{

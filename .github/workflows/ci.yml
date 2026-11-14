@@ -82,6 +82,10 @@ jobs:
       - name: Tests under -Dgc-stress in ReleaseSafe
         run: zig build test -Dgc-stress -Doptimize=ReleaseSafe --summary all
 
+      # M8.1: each deliberately broken GC piece must be caught by the heap verifier.
+      - name: GC mutants
+        run: zig build gc-mutants --summary all
+
       - name: Generated files and node contract
         run: zig build check-goldens
 

@@ -34,7 +34,7 @@ fn compileChecked(gpa: Allocator, source: []const u8, limits: Limits, diag: *zqj
     errdefer heap.deinit();
     var proto = zqjs.compile(gpa, &heap, script, res, limits, diag) catch |e| {
         // A failed compile leaves no trace on the heap (Heap.rollback).
-        try testing.expect(heap.objects == null);
+        try testing.expect(heap.young == null and heap.old == null);
         try testing.expectEqual(@as(usize, 0), heap.bytes);
         return e;
     };

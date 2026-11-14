@@ -275,33 +275,36 @@ const Interpreter = struct {
                     .@"return" => return .@"return",
                 }
             },
-            .@"for" => |f| {
-                const saved = it.env;
-                defer it.env = saved;
-                var per_iteration = false;
-                if (f.init) |init| switch (init) {
-                    .declaration => |decl| {
-                        try it.pushScope(it.res.bindings[decl.declarators[0].binding].scope);
-                        try it.declare(decl);
-                        per_iteration = decl.kind == .let; // the spec copies only `let` bindings
-                    },
-                    .expression => |e| _ = try it.eval(e),
-                };
-                if (per_iteration) try it.copyScope();
-                while (true) {
-                    try it.rt.step();
-                    if (f.cond) |c| if (!ops.toBoolean(try it.eval(c))) break;
-                    switch (try it.exec(f.body.*)) {
-                        .normal, .@"continue" => {}, // `continue` lands here: the update still runs
-                        .@"break" => break,
-                        .@"return" => return .@"return",
-                    }
-                    if (per_iteration) try it.copyScope();
-                    if (f.update) |u| _ = try it.eval(u);
-                }
-            },
+            .@"for" => |f| return it.execFor(f),
             .@"break" => return .@"break",
             .@"continue" => return .@"continue",
+        }
+        return .normal;
+    }
+
+    fn execFor(it: *Interpreter, f: @FieldType(ast.Stmt.Data, "for")) Error!Completion {
+        const saved = it.env;
+        defer it.env = saved;
+        var per_iteration = false;
+        if (f.init) |init| switch (init) {
+            .declaration => |decl| {
+                try it.pushScope(it.res.bindings[decl.declarators[0].binding].scope);
+                try it.declare(decl);
+                per_iteration = decl.kind == .let; // the spec copies only `let` bindings
+            },
+            .expression => |e| _ = try it.eval(e),
+        };
+        if (per_iteration) try it.copyScope();
+        while (true) {
+            try it.rt.step();
+            if (f.cond) |c| if (!ops.toBoolean(try it.eval(c))) break;
+            switch (try it.exec(f.body.*)) {
+                .normal, .@"continue" => {}, // `continue` lands here: the update still runs
+                .@"break" => break,
+                .@"return" => return .@"return",
+            }
+            if (per_iteration) try it.copyScope();
+            if (f.update) |u| _ = try it.eval(u);
         }
         return .normal;
     }
@@ -332,76 +335,9 @@ const Interpreter = struct {
                     .not => .{ .boolean = !ops.toBoolean(v) },
                 };
             },
-            .binary => |b| {
-                const lhs = try it.eval(b.lhs);
-                switch (b.op) {
-                    // Short-circuit, and return an operand, not a boolean: '' || 'd' is 'd'.
-                    // (`lhs` isn't needed once the right side runs.)
-                    .logical_and => return if (ops.toBoolean(lhs)) it.eval(b.rhs) else lhs,
-                    .logical_or => return if (ops.toBoolean(lhs)) lhs else it.eval(b.rhs),
-                    else => {
-                        try it.hold(lhs);
-                        return ops.binary(rt, b.op, lhs, try it.eval(b.rhs));
-                    },
-                }
-            },
-            .assign => |a| switch (a.target) {
-                .ref => |ref| {
-                    if (a.op) |op| {
-                        // x op= e: read x first (TDZ), then evaluate e, then write (const check).
-                        const old = try it.read(ref);
-                        try it.hold(old);
-                        const v = try ops.binary(rt, op, old, try it.eval(a.value));
-                        try it.write(ref, v);
-                        return v;
-                    }
-                    // x = e: evaluate e first; the TDZ and const checks happen on the write.
-                    const v = try it.eval(a.value);
-                    try it.write(ref, v);
-                    return v;
-                },
-                .member => |m| {
-                    // Base and key expression are evaluated exactly once, before the right-hand
-                    // side. The key is *converted* (ToPropertyKey) when the reference is first
-                    // used: for `=` after the right-hand side, for `op=` at the read before it.
-                    const base = try it.eval(m.object);
-                    try it.hold(base);
-                    const kv = try it.keyValue(m);
-                    if (kv == .value) try it.hold(kv.value);
-                    if (a.op) |op| {
-                        const k = try it.toKey(kv);
-                        try it.holdKey(k);
-                        const old = try object.get(rt, base, k);
-                        try it.hold(old);
-                        const v = try ops.binary(rt, op, old, try it.eval(a.value));
-                        try object.set(rt, base, k, v);
-                        return v;
-                    }
-                    const v = try it.eval(a.value);
-                    try object.set(rt, base, try it.toKey(kv), v);
-                    return v;
-                },
-            },
-            .update => |u| {
-                const old, const new = switch (u.target) {
-                    .ref => |ref| blk: {
-                        const old = try ops.toNumber(rt, try it.read(ref));
-                        const new = if (u.op == .inc) old + 1 else old - 1;
-                        try it.write(ref, .{ .number = new });
-                        break :blk .{ old, new };
-                    },
-                    .member => |m| blk: {
-                        const base = try it.eval(m.object);
-                        try it.hold(base);
-                        const k = try it.toKey(try it.keyValue(m));
-                        const old = try ops.toNumber(rt, try object.get(rt, base, k));
-                        const new = if (u.op == .inc) old + 1 else old - 1;
-                        try object.set(rt, base, k, .{ .number = new });
-                        break :blk .{ old, new };
-                    },
-                };
-                return .{ .number = if (u.prefix) new else old };
-            },
+            .binary => |b| return it.evalBinary(b),
+            .assign => |a| return it.evalAssign(a),
+            .update => |u| return it.evalUpdate(u),
             .member => |m| {
                 const base = try it.eval(m.object);
                 try it.hold(base);
@@ -413,67 +349,160 @@ const Interpreter = struct {
                 return .{ .boolean = try object.delete(rt, base, try it.toKey(try it.keyValue(m))) };
             },
             .this => return it.this orelse rt.fail(.sloppy_this),
-            .array => |items| {
-                const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
-                try it.hold(.{ .object = arr });
-                for (items) |item| {
-                    const v = try it.eval(item);
-                    try rt.heap.appendElement(arr, v);
-                }
-                return .{ .object = arr };
-            },
-            .object => |props| {
-                const o = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
-                try it.hold(.{ .object = o });
-                // Each key, then its value, in source order.
-                for (props) |prop| {
-                    const m = it.mark();
-                    defer it.release(m);
-                    const k = try it.literalKey(prop.key);
-                    try it.holdKey(k);
-                    try object.define(rt, o, k, try it.eval(prop.value));
-                }
-                return .{ .object = o };
-            },
-            .function => |f| {
-                // A named expression's name lives in its own record around the function.
-                if (f.name) |n| {
-                    const own = try rt.heap.newEnv(it.env, it.res.bindings[n.binding].scope, 1);
-                    const c = try rt.heap.newTreeClosure(f, own);
-                    rt.heap.storeEnv(own, 0, .{ .closure = c });
-                    return .{ .closure = c };
-                }
-                return .{ .closure = try rt.heap.newTreeClosure(f, it.env) };
-            },
-            .call => |c| {
-                // A member callee is a method call: its base is the receiver (D41). The
-                // callee is found before the arguments are evaluated.
-                var receiver: ?Value = null;
-                const callee = switch (c.callee.data) {
-                    .member => |m| blk: {
-                        const base = try it.eval(m.object);
-                        try it.hold(base);
-                        receiver = base;
-                        break :blk try object.get(rt, base, try it.toKey(try it.keyValue(m)));
-                    },
-                    else => try it.eval(c.callee),
-                };
-                try it.hold(callee);
-                const args = try rt.gpa.alloc(Value, c.args.len);
-                defer rt.gpa.free(args);
-                // `args` is not traced: each value is on the shadow stack too.
-                for (c.args, args) |arg, *slot| {
-                    slot.* = try it.eval(arg);
-                    try it.hold(slot.*);
-                }
-                return switch (callee) {
-                    .native => |n| n.call(rt, receiver orelse .undefined, args),
-                    // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
-                    .closure => |cl| it.call(cl, if (receiver) |r| (if (r == .object) r else null) else null, args),
-                    else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
-                };
+            .array => |items| return it.evalArray(items),
+            .object => |props| return it.evalObject(props),
+            .function => |f| return it.evalFunction(f),
+            .call => |c| return it.evalCall(c),
+        }
+    }
+
+    // The big `eval` arms live in their own functions: in Debug, a function's frame holds
+    // the locals of *every* arm of its switch, so with them inline each level of recursion
+    // paid for the largest one (measured: ~2x the stack per level, D37).
+    fn evalBinary(it: *Interpreter, b: @FieldType(ast.Expr.Data, "binary")) Error!Value {
+        const rt = it.rt;
+        const lhs = try it.eval(b.lhs);
+        switch (b.op) {
+            // Short-circuit, and return an operand, not a boolean: '' || 'd' is 'd'.
+            // (`lhs` isn't needed once the right side runs.)
+            .logical_and => return if (ops.toBoolean(lhs)) it.eval(b.rhs) else lhs,
+            .logical_or => return if (ops.toBoolean(lhs)) lhs else it.eval(b.rhs),
+            else => {
+                try it.hold(lhs);
+                return ops.binary(rt, b.op, lhs, try it.eval(b.rhs));
             },
         }
+    }
+
+    fn evalAssign(it: *Interpreter, a: @FieldType(ast.Expr.Data, "assign")) Error!Value {
+        const rt = it.rt;
+        switch (a.target) {
+            .ref => |ref| {
+                if (a.op) |op| {
+                    // x op= e: read x first (TDZ), then evaluate e, then write (const check).
+                    const old = try it.read(ref);
+                    try it.hold(old);
+                    const v = try ops.binary(rt, op, old, try it.eval(a.value));
+                    try it.write(ref, v);
+                    return v;
+                }
+                // x = e: evaluate e first; the TDZ and const checks happen on the write.
+                const v = try it.eval(a.value);
+                try it.write(ref, v);
+                return v;
+            },
+            .member => |m| {
+                // Base and key expression are evaluated exactly once, before the right-hand
+                // side. The key is *converted* (ToPropertyKey) when the reference is first
+                // used: for `=` after the right-hand side, for `op=` at the read before it.
+                const base = try it.eval(m.object);
+                try it.hold(base);
+                const kv = try it.keyValue(m);
+                if (kv == .value) try it.hold(kv.value);
+                if (a.op) |op| {
+                    const k = try it.toKey(kv);
+                    try it.holdKey(k);
+                    const old = try object.get(rt, base, k);
+                    try it.hold(old);
+                    const v = try ops.binary(rt, op, old, try it.eval(a.value));
+                    try object.set(rt, base, k, v);
+                    return v;
+                }
+                const v = try it.eval(a.value);
+                try object.set(rt, base, try it.toKey(kv), v);
+                return v;
+            },
+        }
+    }
+
+    fn evalUpdate(it: *Interpreter, u: @FieldType(ast.Expr.Data, "update")) Error!Value {
+        const rt = it.rt;
+        const old, const new = switch (u.target) {
+            .ref => |ref| blk: {
+                const old = try ops.toNumber(rt, try it.read(ref));
+                const new = if (u.op == .inc) old + 1 else old - 1;
+                try it.write(ref, .{ .number = new });
+                break :blk .{ old, new };
+            },
+            .member => |m| blk: {
+                const base = try it.eval(m.object);
+                try it.hold(base);
+                const k = try it.toKey(try it.keyValue(m));
+                const old = try ops.toNumber(rt, try object.get(rt, base, k));
+                const new = if (u.op == .inc) old + 1 else old - 1;
+                try object.set(rt, base, k, .{ .number = new });
+                break :blk .{ old, new };
+            },
+        };
+        return .{ .number = if (u.prefix) new else old };
+    }
+
+    fn evalArray(it: *Interpreter, items: @FieldType(ast.Expr.Data, "array")) Error!Value {
+        const rt = it.rt;
+        const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
+        try it.hold(.{ .object = arr });
+        for (items) |item| {
+            const v = try it.eval(item);
+            try rt.heap.appendElement(arr, v);
+        }
+        return .{ .object = arr };
+    }
+
+    fn evalObject(it: *Interpreter, props: @FieldType(ast.Expr.Data, "object")) Error!Value {
+        const rt = it.rt;
+        const o = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
+        try it.hold(.{ .object = o });
+        // Each key, then its value, in source order.
+        for (props) |prop| {
+            const m = it.mark();
+            defer it.release(m);
+            const k = try it.literalKey(prop.key);
+            try it.holdKey(k);
+            try object.define(rt, o, k, try it.eval(prop.value));
+        }
+        return .{ .object = o };
+    }
+
+    fn evalFunction(it: *Interpreter, f: @FieldType(ast.Expr.Data, "function")) Error!Value {
+        const rt = it.rt;
+        // A named expression's name lives in its own record around the function.
+        if (f.name) |n| {
+            const own = try rt.heap.newEnv(it.env, it.res.bindings[n.binding].scope, 1);
+            const c = try rt.heap.newTreeClosure(f, own);
+            rt.heap.storeEnv(own, 0, .{ .closure = c });
+            return .{ .closure = c };
+        }
+        return .{ .closure = try rt.heap.newTreeClosure(f, it.env) };
+    }
+
+    fn evalCall(it: *Interpreter, c: @FieldType(ast.Expr.Data, "call")) Error!Value {
+        const rt = it.rt;
+        // A member callee is a method call: its base is the receiver (D41). The
+        // callee is found before the arguments are evaluated.
+        var receiver: ?Value = null;
+        const callee = switch (c.callee.data) {
+            .member => |m| blk: {
+                const base = try it.eval(m.object);
+                try it.hold(base);
+                receiver = base;
+                break :blk try object.get(rt, base, try it.toKey(try it.keyValue(m)));
+            },
+            else => try it.eval(c.callee),
+        };
+        try it.hold(callee);
+        const args = try rt.gpa.alloc(Value, c.args.len);
+        defer rt.gpa.free(args);
+        // `args` is not traced: each value is on the shadow stack too.
+        for (c.args, args) |arg, *slot| {
+            slot.* = try it.eval(arg);
+            try it.hold(slot.*);
+        }
+        return switch (callee) {
+            .native => |n| n.call(rt, receiver orelse .undefined, args),
+            // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
+            .closure => |cl| it.call(cl, if (receiver) |r| (if (r == .object) r else null) else null, args),
+            else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
+        };
     }
 
     /// A member's key as evaluated but not yet converted.

@@ -556,7 +556,11 @@ allocation per scope entry (garbage until M8), so long loops use far more heap h
 VM; limits are engine-specific (LANGUAGE.md).
 **Native recursion.** The tree-walker recurses in Zig for every statement, expression and call,
 across JS calls, so it counts that depth and stops at `max_interpreter_depth` (default 6000)
-with `LimitExceeded(interpreter_depth)`. *Measured* worst case at 6000 (plain recursion, and
+with `LimitExceeded(interpreter_depth)`. *(M8 P2: M7 and the shadow stack had grown `eval`'s
+Debug frame, which holds the locals of every switch arm, to ~5-6 KB per level, 37 MB at the
+limit on Linux x86_64, and the guard test failed in CI; the large arms are now separate
+functions and the cost is back to ~2.3 KB per level, ~14 MB, on arm64 and x86_64.)* *Measured*
+worst case at 6000 (plain recursion, and
 recursion through a 200-deep nested expression): **~14.5 MB of stack in Debug** (2.4 KB per
 level), ~4 MB in ReleaseSafe. That is more than an 8 MiB thread has (it only passed at first
 because Zig gives executables a 16 MiB main stack), so the tree-walker runs on **its own thread

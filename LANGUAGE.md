@@ -26,6 +26,14 @@ When in doubt we report `Unsupported`, which makes no claim and therefore can't 
 **Not compared with node, ever:** error *messages*, stack traces, `console.log` formatting
 (ZQJS has `print`, which uses `String(x)`), resource-limit thresholds, timing.
 
+**Engines.** ZQJS has two engines that must behave identically: the bytecode VM (the default)
+and the tree-walking reference interpreter (`--engine=treewalk`). Between them, outputs,
+exception names *and* messages, and Unsupported features must match (checked by differential
+tests and fuzzing). Limit thresholds are not a cross-engine guarantee: `max_steps` counts VM
+instructions on the VM and statements/expressions/iterations on the tree-walker, and the VM
+allocates fewer strings, so the same script can hit a limit at a different point, or only on
+one engine (DESIGN_DECISIONS D35).
+
 **Known deviation:** `**` is "implementation-approximated" in the spec. ZQJS's result is
 correctly rounded in 99.9% of cases and always within 1 ulp; node's (V8's) is correctly rounded
 in about 92%. So where node is 1 ulp off, ZQJS prints a different last digit

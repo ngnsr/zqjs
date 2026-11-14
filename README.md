@@ -32,9 +32,11 @@ zig-out/bin/zqjs --dump-ast -e "let x = 1; { let x = x + 2; }"
 # (let (x#0@0 1))
 # (block (let (x#1@1 (+ x#1 2))))           ← inner x refers to itself: a TDZ error if run
 zig-out/bin/zqjs --dump-bytecode -e "let x = 1; x += 2;"   # compiled, verified, listed (M4)
+zig-out/bin/zqjs --trace -e "print(1 + 2);"                # each VM instruction and the stack, on stderr
+zig-out/bin/zqjs --engine=treewalk program.js               # the reference interpreter instead of the VM
 zig build test                              # unit + integration tests (tests/all.zig)
 zig build test --fuzz=100K -Dtest-filter="fuzz: frontend"   # fuzz one target (only one runs per call):
-                                            #   "fuzz: frontend", "fuzz: any input runs",
+                                            #   "fuzz: frontend", "fuzz: both engines agree",
                                             #   "fuzz: anything the front end", "fuzz: the verifier"
 zig build check-goldens                     # verify syntax cases against node; generated files up to date
 zig build update-golden                     # regenerate goldens (node) and pow references (Python)

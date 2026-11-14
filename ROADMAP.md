@@ -10,7 +10,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | 3 | Tree-walking interpreter, `runtime/ops.zig`, UTF-16 strings, `print`, diff harness | **done** |
 | P1 | Accurate exponentiation: JS special cases, musl/Arm `pow`, accuracy and portability checks (D25) | **done** |
 | 4 | Bytecode compiler, constant pool, `max_stack`, verifier, disassembler | **done** |
-| 5 | Stack VM with `step()` / `--trace`, instruction budget | – |
+| 5 | Stack VM with `step()` / `--trace`, instruction budget | **done** |
 | 6 | Functions, cells/closures, growable stack, call-depth limit | – |
 | 7 | Objects, arrays, atoms, ordered properties, prototypes | – |
 | 8 | Mark-and-sweep GC, temp roots, stress modes, heap limit | – |
@@ -52,6 +52,18 @@ from node for Number→String (3,183 values), String→Number and `+ - * / % **`
 Limits: step budget on loops, straight-line code and deep expressions; heap and string limits;
 allocation failure at every point; fuzzing of whole runs.
 **M7:** `length` and `charCodeAt` on strings with surrogates.
+**M5 (done):** the tree-walker is the oracle for the VM.
+- every `tests/diff` program on both engines equals node's output (incl. the const/TDZ order
+  programs and `unary_strings.js`, a regression test for a result-location aliasing bug)
+- the engines agree (stdout, stderr incl. exception messages, exit code) on every syntax case
+  and a corpus; differential fuzzing on arbitrary input; a mismatch report shows the source,
+  both results and the VM's bytecode
+- `step()` contract (D35): one instruction per call, budget charged first and never above the
+  limit (no counter overflow at `maxInt(u64)`), precise faults (pc and stack as before the
+  failing instruction: TDZ read, global miss, operator limit, native failure), nothing runs
+  after halt or a fault, empty script (`max_stack` 0)
+- limits on both engines (steps, heap, string length); allocation failure at every point on
+  both engines, including the partial states of `Vm.init`; `--trace` format
 **M4 (done):** the verifier (D33) is the oracle until the VM runs.
 - every `tests/diff` program and every `ok` syntax case compiles to bytecode the verifier
   accepts, with the verifier's measured `max_stack` equal to the compiler's and no unreachable

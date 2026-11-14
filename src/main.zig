@@ -5,15 +5,20 @@
 //!   --dump-ast       print the resolved AST instead of running
 //!   --dump-bytecode  compile, verify and print the bytecode instead of running
 //!   --max-steps N    execution budget; 0 = unlimited (default: cli_default_steps)
+//!   --engine=E       vm (default) or treewalk (the reference interpreter)
+//!   --trace          VM: print each instruction and the operand stack to stderr
 
 const std = @import("std");
 const zqjs = @import("zqjs");
 
 const usage =
-    \\usage: zqjs [--test | --dump-ast | --dump-bytecode] [--max-steps N] FILE
-    \\       zqjs [--test | --dump-ast | --dump-bytecode] [--max-steps N] -e SOURCE
+    \\usage: zqjs [--test | --dump-ast | --dump-bytecode] [options] FILE
+    \\       zqjs [--test | --dump-ast | --dump-bytecode] [options] -e SOURCE
     \\
-    \\  --max-steps N   stop after N execution steps (0 = unlimited, default 200000000)
+    \\  --max-steps N      stop after N execution steps (0 = unlimited, default 200000000)
+    \\  --engine=vm        run on the bytecode VM (default)
+    \\  --engine=treewalk  run on the tree-walking reference interpreter
+    \\  --trace            VM: print each instruction and the operand stack to stderr
     \\
 ;
 
@@ -42,6 +47,7 @@ pub fn main(init: std.process.Init) !u8 {
     const Command = enum { run, @"test", dump, dump_bytecode };
     var command: Command = .run;
     var limits: zqjs.Limits = .{ .max_steps = cli_default_steps };
+    var options: zqjs.RunOptions = .{};
     while (rest.len > 0 and std.mem.startsWith(u8, rest[0], "--")) {
         if (std.mem.eql(u8, rest[0], "--test")) {
             command = .@"test";
@@ -49,6 +55,13 @@ pub fn main(init: std.process.Init) !u8 {
             command = .dump;
         } else if (std.mem.eql(u8, rest[0], "--dump-bytecode")) {
             command = .dump_bytecode;
+        } else if (std.mem.startsWith(u8, rest[0], "--engine=")) {
+            options.engine = std.meta.stringToEnum(zqjs.Engine, rest[0]["--engine=".len..]) orelse {
+                try err.writeAll(usage);
+                return 2;
+            };
+        } else if (std.mem.eql(u8, rest[0], "--trace")) {
+            options.trace = err;
         } else if (std.mem.eql(u8, rest[0], "--max-steps") and rest.len > 1) {
             const n = std.fmt.parseInt(u64, rest[1], 10) catch {
                 try err.print("--max-steps: not a number: {s}\n", .{rest[1]});
@@ -80,8 +93,11 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     switch (command) {
-        .run => return zqjs.runSource(init.gpa, name, source, limits, .normal, out, err),
-        .@"test" => return zqjs.runSource(init.gpa, name, source, limits, .harness, out, err),
+        .run => return zqjs.runSource(init.gpa, name, source, limits, options, out, err),
+        .@"test" => {
+            options.mode = .harness;
+            return zqjs.runSource(init.gpa, name, source, limits, options, out, err);
+        },
         .dump => return dump(arena, name, source, limits, out, err),
         .dump_bytecode => return dumpBytecode(init.gpa, arena, name, source, limits, out, err),
     }

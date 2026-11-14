@@ -12,7 +12,7 @@ source ─▶ Lexer ─▶ Parser ─▶ AST ─▶ Resolver ─▶ Compiler ─
 Dependencies point one way: frontend → compiler → runtime/VM. The frontend knows nothing about
 the runtime.
 
-## Built so far (M4)
+## Built so far (M5)
 
 | file | role |
 |---|---|
@@ -34,10 +34,11 @@ the runtime.
 | `src/bytecode/compiler.zig` | AST + Resolution → `Proto`: constant pool, name table, `max_stack`, no dead code |
 | `src/bytecode/verify.zig` | checks a `Proto` as untrusted input (D33); reports measured stack depth |
 | `src/bytecode/disasm.zig` | listing for `--dump-bytecode` |
-| `src/run.zig` | source → parse → resolve → run, with outcome reporting (CLI and tests share it) |
+| `src/vm/vm.zig` | the stack VM: `Vm.step()` / `run()`, defensive checks, precise faults (D35) |
+| `src/run.zig` | source → parse → resolve → engine (VM: compile → verify → run; or tree-walker), with outcome reporting and `--trace` (CLI and tests share it) |
 | `src/limits.zig` | `Limits` (only the limits enforced so far, see DESIGN_DECISIONS D15) |
 | `src/root.zig` | library entry: `parse`, `resolve`, `dump`, `Runtime`, `interpret`, `runSource`, `compile`, `verify`, `disassemble` |
-| `src/main.zig` | CLI: `zqjs FILE`, `zqjs -e SRC`, `--test` (harness output), `--dump-ast`, `--dump-bytecode` |
+| `src/main.zig` | CLI: `zqjs FILE`, `zqjs -e SRC`, `--test` (harness output), `--dump-ast`, `--dump-bytecode`, `--engine=vm\|treewalk`, `--trace` |
 
 ### Ownership in the frontend
 - The lexer borrows the source and returns tokens by value; it allocates nothing.

@@ -9,9 +9,11 @@ pub const Limits = struct {
     /// Bounds both parser recursion (e.g. nested parentheses) and AST depth (e.g. a long
     /// `1+1+…` chain, which the parser builds in a loop but later passes walk recursively).
     max_nesting_depth: u16 = 512,
-    /// Execution budget. One step is charged for every statement executed, every
-    /// expression evaluated and every loop iteration, so straight-line code, deep
-    /// expressions and loops all consume it. Default: unlimited.
+    /// Execution budget, charged before the work it pays for. The unit is engine-defined:
+    /// the VM charges one step per executed instruction; the tree-walker one per statement
+    /// executed, expression evaluated and loop iteration. So straight-line code, deep
+    /// expressions and loops all consume it, but the same script uses different amounts
+    /// in each engine: thresholds are not a cross-engine guarantee. Default: unlimited.
     max_steps: u64 = std.math.maxInt(u64),
     /// Runtime heap budget, in accounted bytes (see Heap.accountedSize).
     max_heap_bytes: usize = 256 * 1024 * 1024,

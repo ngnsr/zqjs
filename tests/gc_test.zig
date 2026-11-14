@@ -238,6 +238,26 @@ test "weak atoms (D11): kept by their objects, dropped with them, reusable after
     try testing.expectEqual(@as(?*heap.Obj, null), h.objects);
 }
 
+test "after a collection the atom table holds only live atoms (no stale pointers)" {
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    const o = try h.newObject(null);
+    var buf: [16]u8 = undefined;
+    for (0..300) |i| {
+        const k = try h.internAscii(std.fmt.bufPrint(&buf, "a{d}", .{i}) catch unreachable);
+        if (i % 3 == 0) try h.storeProperty(o, k, .null);
+    }
+    h.collect(TestRoots{ .objs = &.{&o.obj} }, TestRoots.mark);
+    var it = h.atoms.keyIterator();
+    while (it.next()) |k| {
+        var live = h.objects;
+        while (live) |obj| : (live = obj.next) {
+            if (obj == &k.*.obj) break;
+        } else return error.TestUnexpectedResult; // an entry that isn't a live object
+    }
+    try testing.expectEqual(@as(u32, 100), h.atoms.count());
+}
+
 test "scheduling: a collection is requested past next_gc, with headroom under the limit" {
     var h = heap.Heap.init(testing.allocator, .{ .max_heap_bytes = 1 << 20 });
     defer h.deinit();
@@ -247,10 +267,28 @@ test "scheduling: a collection is requested past next_gc, with headroom under th
     h.collect(TestRoots{ .objs = &.{} }, TestRoots.mark);
     try testing.expect(!h.collect_requested);
     try testing.expectEqual(@as(usize, 0), h.bytes);
-    // A small limit: the trigger is capped an eighth below it.
+    // A small limit: never closer than halfway to it.
     var small = heap.Heap.init(testing.allocator, .{ .max_heap_bytes = 80_000 });
     defer small.deinit();
-    try testing.expectEqual(@as(usize, 70_000), small.next_gc);
+    try testing.expectEqual(@as(usize, 40_000), small.next_gc);
+    // Extremes: no overflow, never beyond the limit, never below the live size.
+    for ([_]usize{ 0, 1, 100, 1 << 20, std.math.maxInt(usize) }) |max| {
+        var e = heap.Heap.init(testing.allocator, .{ .max_heap_bytes = max });
+        defer e.deinit();
+        for ([_]usize{ 0, 1, max / 2, max -| 1, max }) |live| {
+            const next = e.schedule(live);
+            try testing.expect(next >= live and next <= @max(max, live));
+        }
+    }
+}
+
+test "no pathological collection loop: filling the heap with live data collects O(log limit) times" {
+    // Live data grows to the limit (every string is kept): each collection frees nothing,
+    // and must not be followed by another one at the very next safepoint.
+    const r = try runVm("let keep = []; let n = 0; while (true) { keep.push('item number ' + n++); }", .{ .max_heap_bytes = 4 << 20 }, false);
+    defer testing.allocator.free(r.out);
+    try testing.expectEqual(@as(?anyerror, error.LimitExceeded), r.err);
+    try testing.expect(r.collections > 0 and r.collections <= 30); // log2(4 MiB / 256 KiB) + the halvings
 }
 
 // ---- the VM collecting
@@ -330,6 +368,9 @@ test "the exception message and the unsupported name are roots" {
         var vm = try zqjs.Vm.init(&rt, &proto);
         _ = vm.run() catch {};
         vm.deinit();
+        // The VM failed, then was torn down: its registration must be gone, or the
+        // collections below would scan freed stacks.
+        try testing.expectEqual(@as(?zqjs.runtime.EngineRoots, null), rt.engine_roots);
         for (0..3) |_| rt.collect(); // no engine left: only the runtime's own roots
         const text = if (rt.exception) |e| e.message.units else rt.unsupported_name.?.units;
         var want: [64]u16 = undefined;

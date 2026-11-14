@@ -156,13 +156,15 @@ safepoint collects.
 
 **The heap limit with a collector.** `max_heap_bytes` keeps meaning "accounted bytes", live plus
 garbage not collected yet. So that a program with a small live set never hits it, a collection is
-requested well before it: `next_gc ≤ limit − headroom` (headroom: an eighth of the limit). A
+requested well before it: `next_gc = live + min(max(live, 256 KiB), (limit − live) / 2)`, so the trigger is never past halfway between
+the live size and the limit. (Revised in P1 from `limit − limit/8`, which made every safepoint
+collect once live data passed that cap: see D8.) A
 program can then fail with LimitExceeded(heap_bytes) only if its *live* data, plus at most one
 step's garbage, exceeds the limit (with the caveat below). Acceptance test: a loop making
 garbage forever under a 1 MiB limit runs until its step budget, on both engines.
 
 **Acknowledged limitation.** Because allocation never collects, uncollected garbage can reach
-one headroom (an eighth of the limit) before a collection is requested, so a single instruction
+the trigger (at most half the room left under the limit) before a collection is requested, so a single instruction
 that allocates more than the remaining headroom can fail with LimitExceeded(heap_bytes) although
 collectable garbage exists (200 MiB of garbage below the trigger, then a 60 MiB join, on a
 256 MiB limit). The real guarantee is therefore "live data + headroom + one step's allocation",
@@ -356,7 +358,7 @@ What each later step needs from M8, so that none of them changes the object mode
 4. **Protos stay outside the heap**, registered as roots while running; bytecode names stay ASCII,
    so bytecode keeps no atoms alive (revises D11's expectation and its test).
 5. **Heap-limit semantics:** accounted bytes include uncollected garbage; collections are
-   scheduled with an eighth of the limit as headroom.
+   scheduled at most halfway between the live size and the limit (revised in P1, D8).
 6. **No finalizers, one thread per runtime**, no global GC state.
 7. **Observability:** deterministic counters (`collections`, bytes, `marked`/`swept`), wall-clock
    only in the benchmark tool.

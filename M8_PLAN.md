@@ -72,7 +72,7 @@ safepoint.
   `next_gc`; `collect(roots)` runs mark → drain → atom cleanup → sweep → schedule → stats.
   Marking is the existing `forEachChild`, iterative through the intrusive gray list; nothing
   in the collector allocates (I4).
-- Scheduling: `next_gc = clamp(live × 2, 256 KiB, max_bytes − max_bytes/8)`, recomputed after
+- Scheduling: `next_gc = live + min(max(live, 256 KiB), (limit − live) / 2)` (revised from `clamp(live × 2, 256 KiB, limit − limit/8)`, see D8), recomputed after
   each collection; `requestCollect` at every allocation that pushes `bytes` over `next_gc`.
 - Atom table cleanup: after marking, clear retaining capacity and re-insert the marked atom
   strings found in the object list (`putAssumeCapacity`), so no allocation and no dangling
@@ -152,9 +152,10 @@ The risky phase: the tree-walker holds values in Zig locals across sub-evaluatio
 
 ## Scheduler and limits: known consequences
 
-- `max_heap_bytes` counts live plus not-yet-collected garbage. Collections trigger at
-  `limit − limit/8`, so uncollected garbage at a safepoint is at most an eighth of the limit
-  plus one step's garbage.
+- `max_heap_bytes` counts live plus not-yet-collected garbage. Collections trigger at most
+  halfway between the live size and the limit, so uncollected garbage at a safepoint is at
+  most half the remaining room plus one step's garbage, and filling the heap with live data
+  costs O(log limit) collections.
 - Because allocation never collects (I1), one instruction that allocates more than the
   remaining headroom can fail with `LimitExceeded(heap_bytes)` while enough garbage exists to
   make room. The guarantee is "live + headroom + one step's allocation", not "live". Tests

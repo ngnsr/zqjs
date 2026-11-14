@@ -87,7 +87,7 @@ object fully traceable before returning.
 **Phases.** At a safepoint with `collect_requested` (or forced: tests, `-Dgc-stress`): mark the
 roots; drain the gray list through `heap.forEachChild` (D38); remove unmarked atoms from the
 atom table (D11); sweep the object list, destroying unmarked objects and clearing survivors'
-marks; schedule `next_gc = clamp(live × 2, 256 KiB, limit − limit/8)`; update the statistics
+marks; schedule `next_gc = live + min(max(live, 256 KiB), (limit − live) / 2)`; update the statistics
 (`collections`, bytes freed, live after, `marked`, `swept`: deterministic work units, no clock).
 **Roots** (GC_DESIGN §4): `Runtime.realm`, `exception.message`, `unsupported_name`; the registered
 Proto tree being run (its string constants; Protos are not heap objects); the VM's operand stack,
@@ -95,8 +95,13 @@ locals (values and cells) and frames (closure, `this`); the tree-walker's shadow
 environment, `this` and pending return value; host handles (M9). The atom table is not a root.
 **Compiler.** It runs before execution, with no safepoint inside, so its constants need no GC
 pause and no rooting; `runSource` registers the finished Proto tree before running it.
-**Heap limit.** `max_heap_bytes` counts live data plus garbage not yet collected; collections are
-requested an eighth of the limit early. *Acknowledged limitation:* because allocation never
+**Heap limit and scheduling.** `max_heap_bytes` counts live data plus garbage not yet
+collected. The trigger grows by the live size (at least 256 KiB), but never beyond half the
+room left under the limit. *Revised in P1:* the approved design capped it at `limit − limit/8`,
+which, once live data passed that cap, set the trigger below the heap size, so every following
+safepoint collected again (quadratic slowdown near the limit; a test with the old formula
+shows it). With the half-the-room rule, a program filling its heap with live data collects
+O(log limit) times. *Acknowledged limitation:* because allocation never
 collects, one step that allocates more than the remaining headroom can fail with
 LimitExceeded(heap_bytes) although collectable garbage exists; the guarantee is "live +
 headroom + one step's allocation". Accepted for M8 (GC_DESIGN §5); an instruction-level

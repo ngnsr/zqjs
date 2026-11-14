@@ -174,11 +174,16 @@ pub const Heap = struct {
 
     // ---- the collector (D8; GC_DESIGN §6). Runs only at safepoints, by the engine.
 
-    /// Collect when `bytes` passes this (set by `schedule`).
+    /// The next collection trigger after `live` bytes survived (D8): grow by the live size
+    /// (at least 256 KiB), but never beyond half the room left under the limit. So small
+    /// heaps collect after doubling, and near the limit each collection needs half the
+    /// remaining room allocated first: a program filling its heap with live data collects
+    /// O(log limit) times, never at every safepoint. Overflow-free: the result is at most
+    /// `live + (max − live) / 2 ≤ max`.
     pub fn schedule(h: *const Heap, live: usize) usize {
-        const min_gc = 256 * 1024;
-        const cap = h.max_bytes - h.max_bytes / 8; // an eighth of the limit as headroom (D8)
-        return @min(@max(live *| 2, min_gc), cap);
+        const min_growth = 256 * 1024;
+        const room = (h.max_bytes -| live) / 2;
+        return live + @min(@max(live, min_growth), room);
     }
 
     /// Marks `obj` and queues it for scanning, once.

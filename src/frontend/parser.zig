@@ -555,8 +555,12 @@ const Parser = struct {
             .dot => {
                 try p.advance();
                 const name = p.tok;
-                // Any identifier or keyword names a property: `o.if`, `o.this`.
-                if (name.tag != .identifier and !token.isKeyword(name.tag)) return p.fail(.{ .unsupported = .syntax }, name);
+                // Any identifier or keyword names a property: `o.if`, `o.this`. A literal,
+                // `=` or a closing token can't follow `.` in any JS; others (`o.#x`) might.
+                if (name.tag != .identifier and !token.isKeyword(name.tag)) return switch (name.tag) {
+                    .eof, .semicolon, .comma, .eq, .r_paren, .r_bracket, .r_brace, .number, .string => p.fail(.{ .syntax_error = "expected a property name after '.'" }, name),
+                    else => p.fail(.{ .unsupported = .syntax }, name),
+                };
                 try p.advance();
                 callee = try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = name.text(p.source()) } } }, callee.depth);
             },

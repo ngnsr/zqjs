@@ -152,7 +152,7 @@ pub const Vm = struct {
         const code = p.code;
         const pc = vm.pc;
         if (pc >= code.len) vm.bug("pc outside the code");
-        const op = std.enums.fromInt(Op, code[pc]) orelse vm.bug("invalid opcode");
+        const op = Op.decode(code[pc]) orelse vm.bug("invalid opcode");
         if (op.size() > code.len - pc) vm.bug("instruction runs past the end of the code");
         try vm.rt.step();
         const rt = vm.rt;

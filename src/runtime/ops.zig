@@ -288,8 +288,9 @@ pub fn binary(rt: *Runtime, op: ast.BinaryOp, a_in: Value, b_in: Value) Error!Va
         .add, .lt, .gt, .le, .ge => true,
         else => false,
     };
-    const a = if (converts) try object.toPrimitive(rt, a_in, .number) else a_in;
-    const b = if (converts) try object.toPrimitive(rt, b_in, .number) else b_in;
+    // (Tested here rather than inside toPrimitive: the common case stays call-free.)
+    const a = if (converts and a_in == .object) try object.toPrimitive(rt, a_in, .number) else a_in;
+    const b = if (converts and b_in == .object) try object.toPrimitive(rt, b_in, .number) else b_in;
     return switch (op) {
         .add => {
             if (a == .string or b == .string) {

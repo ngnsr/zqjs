@@ -97,7 +97,7 @@ const Verifier = struct {
         var pc: usize = 0;
         while (pc < p.code.len) {
             const at: u32 = @intCast(pc);
-            const op = std.enums.fromInt(Op, p.code[pc]) orelse return v.fail(p, at, "invalid opcode");
+            const op = Op.decode(p.code[pc]) orelse return v.fail(p, at, "invalid opcode");
             if (op.size() > p.code.len - pc) return v.fail(p, at, "instruction runs past the end of the code");
             switch (op) {
                 .halt => if (p.kind != .script) return v.fail(p, at, "halt in a function"),
@@ -257,6 +257,13 @@ test "every rule rejects malformed code" {
     try expectInvalid(enc(.{ .push_null, .dup, .pop, .pop, .halt }), 1, "stack deeper than max_stack");
     try expectInvalid(enc(.{ .push_null, .halt }), 1, "stack not empty at halt");
     try expectInvalid(enc(.{.push_null}), 1, "execution falls off the end of the code");
+    // M7: instructions whose pops depend on their operand, and the stack shuffles.
+    try expectInvalid(enc(.{ .push_null, .new_array, 2, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .push_null, .push_null, .call_method, 1, .pop, .halt }), 2, "stack underflow");
+    try expectInvalid(enc(.{ .push_null, .push_null, .rot3, .halt }), 2, "stack underflow");
+    try expectInvalid(enc(.{ .push_null, .dup2, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .push_null, .push_null, .dup2, .pop, .pop, .pop, .pop, .halt }), 3, "stack deeper than max_stack");
+    try expectInvalid(enc(.{ .new_object, .get_prop, 1, .pop, .halt }), 1, "name index out of range");
     // Two paths reach offset 7 (`halt`), one with an extra value on the stack.
     try expectInvalid(enc(.{ .push_true, .jump_if_false, 7, .push_null, .halt }), 1, "inconsistent stack depth where paths meet");
 }

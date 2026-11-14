@@ -178,7 +178,25 @@ pub const Op = enum(u8) {
         pushes: u32,
     };
 
+    /// Operands and stack effect. A table lookup: computed once, at compile time, from
+    /// `infoOf` (the profile showed the switch itself on every instruction).
     pub fn info(op: Op) Info {
+        return info_table[@backingInt(op)];
+    }
+
+    const info_table = blk: {
+        var t: [count]Info = undefined;
+        for (0..count) |i| t[i] = infoOf(@fromBackingInt(i));
+        break :blk t;
+    };
+
+    const size_table = blk: {
+        var t: [count]u8 = undefined;
+        for (0..count) |i| t[i] = 1 + 4 * infoOf(@fromBackingInt(i)).operands.len;
+        break :blk t;
+    };
+
+    fn infoOf(op: Op) Info {
         return switch (op) {
             .push_undefined, .push_null, .push_true, .push_false => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
             .push_const => .{ .operands = &.{.@"const"}, .pops = 0, .pushes = 1 },
@@ -231,9 +249,22 @@ pub const Op = enum(u8) {
         return op.info().pops + extra;
     }
 
+    /// The opcode a byte encodes, or null. Opcodes are 0 … count-1 with no gaps
+    /// (checked below), so this is one compare. (std.enums.fromInt searches every value:
+    /// measured 3× slower in the VM's loop once M7 grew the instruction set.)
+    pub fn decode(byte: u8) ?Op {
+        return if (byte < count) @fromBackingInt(byte) else null;
+    }
+
+    pub const count = @typeInfo(Op).@"enum".field_names.len;
+
+    comptime {
+        for (@typeInfo(Op).@"enum".field_values, 0..) |v, i| std.debug.assert(v == i);
+    }
+
     /// Encoded length in bytes.
     pub fn size(op: Op) u32 {
-        return 1 + 4 * @as(u32, @intCast(op.info().operands.len));
+        return size_table[@backingInt(op)];
     }
 };
 

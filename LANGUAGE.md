@@ -69,6 +69,12 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `duplicate_function` | restriction | `function f() {} function f() {}`, `function f(a) { function a() {} }`, `function NaN() {}` | legal in sloppy JS (the later declaration wins, or a global is redefined) |
 | `function_name_assignment` | restriction | `let g = function n() { n = 1; };` | sloppy JS silently ignores the write |
 | `arguments` | not yet | `arguments`, `function f(arguments) {}` | the arguments object |
+| `builtin` | not yet | `Math.PI`, `[].map`, `'x'.toUpperCase`, `Object.assign`, `({}).constructor`, `o.__proto__`, `{ __proto__: p }`, `Object()` | a global or built-in member node has but ZQJS doesn't implement (the diagnostic names it; DESIGN_DECISIONS D39) |
+| `sparse_array` | restriction (revisit) | `[1,,2]`, `delete a[0]`, `a[a.length + 1] = x`, `a.length = 10` | arrays have no holes |
+| `user_conversion` | not yet | `print({ toString() { return 'x'; } })`, `o.valueOf = …; o + 1` | converting an object through a user-defined toString/valueOf/join (D40) |
+| `sloppy_this` | restriction | `this` at script level, `const f = o.m; f()` where `m` reads `this` | sloppy JS uses the global object (or boxes a primitive receiver) |
+| `function_properties` | not yet | `f.x`, `f.length`, `print.name` | functions aren't objects yet |
+| `primitive_write` | restriction | `'s'.x = 1`, `delete 'ab'.length` | sloppy JS silently ignores these |
 | `labels` | not yet | `foo: while (…)`, `break foo;` | |
 | `syntax` | not yet | `?:`, `,`, `~`, `&&=`, `var`, `do`, destructuring, `for…of/in`, `let` used as a variable name, arrow functions, default/rest parameters, generators, `async`, `this`, `new`, regexes … | any JS token or construct not yet in the grammar below |
 
@@ -133,12 +139,18 @@ Relational        := Relational ('<' | '<=' | '>' | '>=') Additive | Additive
 Additive          := Additive ('+' | '-') Mult | Mult
 Mult              := Mult ('*' | '/' | '%') Exp | Exp
 Exp               := Unary | Postfix '**' Exp               (right-associative)
-Unary             := ('-' | '+' | '!') Unary | ('++' | '--') Unary | Postfix
+Unary             := ('-' | '+' | '!') Unary | ('++' | '--') Unary | 'delete' Member | Postfix
 Postfix           := Primary ('++' | '--')?                 (no line break before ++/--)
 Primary           := Number | String | 'true' | 'false' | 'null' | Identifier
+                   | '[' (Expression (',' Expression)* ','?)? ']'      (array, no holes)
+                   | '{' (PropDef (',' PropDef)* ','?)? '}'            (object)
+                   | 'this'                                (only inside functions)
                    | 'function' Identifier? Params Body    (function expression)
                    | '(' Expression ')'
                    | Primary '(' (Expression (',' Expression)* ','?)? ')'   (call)
+                   | Primary '.' IdentifierName | Primary '[' Expression ']'   (member)
+PropDef           := (IdentifierName | String | Number | '[' Expression ']') ':' Expression
+                   | Identifier                            (shorthand) | IdentifierName Params Body (method)
 ```
 
 Notable rules, all matching JavaScript:
@@ -205,6 +217,32 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
 - `<` `<=` `>` `>=` compare two strings by UTF-16 code unit, anything else as numbers.
 - `===`/`!==`: same type and value; `NaN !== NaN`, `0 === -0`.
 - `-0` is kept through arithmetic and prints as `0`.
+
+### Objects and arrays (M7), as in JavaScript
+- **Literals:** `{ a: 1, 'b c': 2, 3: x, [k]: v, short, method() {…} }`: each (computed) key,
+  then its value, left to right; a repeated key keeps its first position and its last value.
+  `[a, b, ]` (no holes).
+- **Members:** `o.name`, `o[expr]`; the base, then the key expression, are evaluated exactly once
+  for reads, writes, `op=` and `++`/`--`. The key is *converted* (ToPropertyKey) when first used:
+  for `o[k] = v` after `v` is evaluated, for `o[k] op= v` at the read, before `v`. Reading a
+  property of `undefined`/`null` is a TypeError; so is writing one (after the right-hand side).
+- **Keys:** strings; numbers become strings (`-0` → `"0"`, `1e21` → `"1e+21"`). `Object.keys`
+  lists array indices (canonical numbers up to 2^32 − 2) ascending, then other keys in insertion
+  order; deleting and re-adding a key moves it to the end.
+- **Arrays:** dense (`sparse_array`). `length` reads the element count; setting it smaller
+  truncates, an invalid length is a RangeError. `push`, `pop`, `join`.
+- **Prototypes:** reads, `in` and method lookups follow the chain; writes create own properties.
+  `Object.create(proto | null)`, `Object.getPrototypeOf`. Chains can't contain cycles (the only
+  way to change a prototype, `__proto__`, is Unsupported).
+- **Conversions:** `String(o)` is `[object Object]`, arrays join with `,` (nested arrays flatten;
+  `null`/`undefined` elements are empty; a cycle is empty), `+[5]` is 5, `[] + {}` is
+  `[object Object]`, `===` compares identity.
+- **Strings:** `s.length` and `s[i]` count UTF-16 code units (a surrogate pair is 2);
+  `s.charCodeAt(i)` returns a code unit (NaN out of range).
+- **`this`:** the receiver of a method call; see `sloppy_this` and DESIGN_DECISIONS D41.
+- **`delete o.k`** and **`k in o`** (`in` on a non-object is a TypeError).
+- **Built-ins:** only those listed in DESIGN_DECISIONS D39; every other name node has is
+  `Unsupported(builtin)`, every name node doesn't have is `undefined` / a ReferenceError.
 
 ### Bindings
 

@@ -1,0 +1,72 @@
+slots 1, max_stack 5, code 201 bytes
+constants
+  k0  1
+  k1  "b"
+  k2  2
+  k3  3
+  k4  "a"
+names
+  n0  a
+  n1  o
+  n2  m
+  n3  print
+  n4  b
+code
+      0  clear_local    s0
+      5  new_object
+      6  push_const     k0            ; 1
+     11  define_prop    n0            ; a
+     16  push_const     k1            ; "b"
+     21  push_const     k2            ; 2
+     26  define_elem
+     27  get_local      s0 n1         ; o
+     36  push_const     k3            ; 3
+     41  define_elem
+     42  make_closure   #1
+     47  define_prop    n2            ; m
+     52  init_local     s0
+     57  get_local      s0 n1         ; o
+     66  dup
+     67  get_prop       n0            ; a
+     72  push_const     k0            ; 1
+     77  add
+     78  set_prop       n0            ; a
+     83  pop
+     84  get_local      s0 n1         ; o
+     93  push_const     k1            ; "b"
+     98  dup2
+     99  get_elem
+    100  to_number
+    101  dup
+    102  rot4
+    103  inc
+    104  set_elem
+    105  pop
+    106  pop
+    107  get_global     n3            ; print
+    112  get_local      s0 n1         ; o
+    121  dup
+    122  get_prop       n2            ; m
+    127  call_method    0
+    132  get_local      s0 n1         ; o
+    141  get_prop       n0            ; a
+    146  get_local      s0 n1         ; o
+    155  get_prop       n4            ; b
+    160  new_array      2
+    165  push_const     k4            ; "a"
+    170  get_local      s0 n1         ; o
+    179  in
+    180  get_local      s0 n1         ; o
+    189  delete_prop    n0            ; a
+    194  call           4
+    199  pop
+    200  halt
+
+function #1 (anonymous): params 0
+slots 0, max_stack 1, code 7 bytes
+names
+  n0  a
+code
+      0  push_this
+      1  get_prop       n0            ; a
+      6  return

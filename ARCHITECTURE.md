@@ -12,7 +12,7 @@ source ─▶ Lexer ─▶ Parser ─▶ AST ─▶ Resolver ─▶ Compiler ─
 Dependencies point one way: frontend → compiler → runtime/VM. The frontend knows nothing about
 the runtime.
 
-## Built so far (M7)
+## Built so far (M8)
 
 | file | role |
 |---|---|
@@ -24,7 +24,7 @@ the runtime.
 | `src/frontend/dump.zig` | S-expression dump with resolved names (`x#binding@slot`, `x@global`) |
 | `src/frontend/diag.zig` | `Diagnostic` (kind, feature, span), line/column, rendering with caret |
 | `src/runtime/value.zig` | `Value` (tagged union) and `Native` |
-| `src/runtime/heap.zig` | `Heap`: list of all objects (`String`, `Cell`, `Closure`, `Env`, `Object`), atoms, counting allocator, byte accounting and limits, `forEachChild` (GC edges) |
+| `src/runtime/heap.zig` | `Heap`: all objects (`String`, `Cell`, `Closure`, `Env`, `Object`), atoms (weak table), counting allocator, byte accounting and limits, the store API (barrier hook), the collector (mark through `forEachChild`, weak-atom cleanup, sweep, scheduling, stats), tombstones and the heap verifier (D8-D11, GC_DESIGN) |
 | `src/runtime/runtime.zig` | `Runtime`: heap, output, step budget, exception / stop reason |
 | `src/runtime/ops.zig` | all JS value semantics: ToNumber, ToString (number formatting), ToBoolean, operators |
 | `src/runtime/object.zig` | property get/set/define/delete/`in`, keys, prototype chains, ToPrimitive, join (D38, D40) |

@@ -30,6 +30,12 @@ pub const Exception = struct {
     message: *const heap_mod.String,
 };
 
+/// How an engine lets the collector mark the values only it holds.
+pub const EngineRoots = struct {
+    ctx: *anyopaque,
+    mark: *const fn (ctx: *anyopaque, h: *Heap) void,
+};
+
 pub const Runtime = struct {
     gpa: Allocator,
     heap: Heap,
@@ -46,6 +52,8 @@ pub const Runtime = struct {
     realm: ?@import("builtins.zig").Realm = null,
     /// Arrays being converted to strings right now (cycle detection, object.join).
     joining: std.ArrayList(*heap_mod.Object) = .empty,
+    /// The running engine's roots (its stacks and frames), marked by `collect` (D8).
+    engine_roots: ?EngineRoots = null,
     limit_hit: ?Limit = null,
 
     pub fn init(gpa: Allocator, limits: Limits, out: *std.Io.Writer) Runtime {
@@ -85,6 +93,22 @@ pub const Runtime = struct {
     pub fn limit(rt: *Runtime, which: Limit) Error {
         rt.limit_hit = which;
         return error.LimitExceeded;
+    }
+
+    /// A full collection. Engines call it only at safepoints (D8); tests may call it when
+    /// no engine holds values outside the roots.
+    pub fn collect(rt: *Runtime) void {
+        rt.heap.collect(rt, markRoots);
+    }
+
+    /// The runtime's own roots (GC_DESIGN §4), then the running engine's.
+    fn markRoots(rt: *Runtime, h: *Heap) void {
+        if (rt.realm) |*r| for (r.objects()) |o| h.markObj(&o.obj);
+        if (rt.exception) |e| h.markObj(@constCast(&e.message.obj));
+        if (rt.unsupported_name) |n| h.markObj(@constCast(&n.obj));
+        // Only non-empty inside an instruction, never at a safepoint.
+        std.debug.assert(rt.joining.items.len == 0);
+        if (rt.engine_roots) |e| e.mark(e.ctx, h);
     }
 
     pub fn limitHit(rt: *const Runtime) ?Limit {

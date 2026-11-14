@@ -34,6 +34,12 @@ instructions on the VM and statements/expressions/iterations on the tree-walker,
 allocates fewer strings, so the same script can hit a limit at a different point, or only on
 one engine (DESIGN_DECISIONS D35).
 
+**Memory.** Unreachable values are reclaimed by a garbage collector (M8), so `max_heap_bytes`
+bounds live data plus garbage not yet collected: a program whose live data fits runs as long as
+its step budget allows. Collections happen between instructions (between evaluation steps in
+the tree-walker), so one step that allocates more than the room left can still stop with
+`LimitExceeded(heap_bytes)` although garbage could be reclaimed (DESIGN_DECISIONS D8).
+
 **Known deviation:** `**` is "implementation-approximated" in the spec. ZQJS's result is
 correctly rounded in 99.9% of cases and always within 1 ulp; node's (V8's) is correctly rounded
 in about 92%. So where node is 1 ulp off, ZQJS prints a different last digit

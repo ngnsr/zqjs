@@ -111,6 +111,9 @@ pub const Vm = struct {
     }
 
     pub fn deinit(vm: *Vm) void {
+        if (vm.rt.engine_roots) |e| if (e.ctx == @as(*anyopaque, vm)) {
+            vm.rt.engine_roots = null; // no collection may scan a VM that is gone
+        };
         const gpa = vm.rt.gpa;
         vm.frames.deinit(gpa);
         gpa.free(vm.locals);
@@ -121,6 +124,33 @@ pub const Vm = struct {
     /// Runs to `halt` or the first error.
     pub fn run(vm: *Vm) Error!void {
         while (try vm.step() == .running) {}
+    }
+
+    /// The VM's roots (GC_DESIGN §4): the operand stack, the locals (values and cells), each
+    /// frame's closure and `this`, and the script's Proto tree (its string constants; the
+    /// Protos aren't heap objects, so the tree being run is what keeps them).
+    fn markRoots(ctx: *anyopaque, h: *heap.Heap) void {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        for (vm.stack[0..vm.sp]) |v| h.markValue(v);
+        for (vm.locals[0..vm.locals_len]) |s| switch (s) {
+            .value => |v| if (v) |x| h.markValue(x),
+            .cell => |c| h.markObj(&c.obj),
+        };
+        for (vm.frames.items) |f| {
+            if (f.closure) |c| h.markObj(@constCast(&c.obj));
+            if (f.this) |t| h.markValue(t);
+        }
+        markProto(h, vm.frames.items[0].proto);
+    }
+
+    fn markProto(h: *heap.Heap, p: *const Proto) void {
+        for (p.consts) |k| h.markValue(k);
+        for (p.functions) |*f| markProto(h, f); // nesting depth is bounded by the AST's
+    }
+
+    /// The Proto this VM runs (the one `init` was given), for tests.
+    pub fn scriptProto(vm: *const Vm) *const Proto {
+        return vm.frames.items[0].proto;
     }
 
     /// The operand stack of all frames, bottom first (for traces and tests).
@@ -139,6 +169,15 @@ pub const Vm = struct {
     pub fn step(vm: *Vm) Error!State {
         if (vm.fault) |e| return e;
         if (vm.halted) return .halted;
+        // The safepoint (D8): every live value is in the stacks and frames now, so a
+        // collection can run. Before the budget charge, so collecting never costs a step.
+        // Registered here rather than in init, which returns the VM by value (a pointer
+        // taken there would point at a copy).
+        const h = &vm.rt.heap;
+        if (h.collect_requested or h.collect_always) {
+            vm.rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
+            vm.rt.collect();
+        }
         return vm.execute() catch |e| {
             vm.fault = e;
             return e;
@@ -216,10 +255,10 @@ pub const Vm = struct {
             .set_cell => {
                 const c = vm.cellAt(vm.operand(0));
                 if (c.value == null) return vm.tdz(vm.operand(1));
-                c.value = vm.peek(0);
+                rt.heap.storeCell(c, vm.peek(0));
             },
             .init_cell => {
-                vm.cellAt(vm.operand(0)).value = vm.peek(0);
+                rt.heap.storeCell(vm.cellAt(vm.operand(0)), vm.peek(0));
                 vm.drop(1);
             },
             .assign_const_cell => {
@@ -233,7 +272,7 @@ pub const Vm = struct {
             .set_capture => {
                 const c = vm.capture(vm.operand(0));
                 if (c.value == null) return vm.tdz(vm.operand(1));
-                c.value = vm.peek(0);
+                rt.heap.storeCell(c, vm.peek(0));
             },
             .assign_const_capture => {
                 if (vm.capture(vm.operand(0)).value == null) return vm.tdz(vm.operand(1));
@@ -283,7 +322,7 @@ pub const Vm = struct {
                 const n = vm.operand(0);
                 if (n > vm.sp - vm.frame().stack_base) vm.bug("stack underflow");
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
-                arr.kind.array.appendSlice(rt.heap.allocator(), vm.stack[vm.sp - n .. vm.sp]) catch |e| return rt.heap.failed(e);
+                try rt.heap.appendElements(arr, vm.stack[vm.sp - n .. vm.sp]);
                 vm.sp -= n;
                 vm.push(.{ .object = arr });
             },
@@ -424,6 +463,7 @@ pub const Vm = struct {
     /// replace everything from `stack[base]`. Transactional: everything that can fail
     /// happens before anything is committed.
     fn enter(vm: *Vm, c: *const Closure, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value) Error!void {
+        c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
             .tree => vm.bug("a tree-walker closure in the VM"),
@@ -523,7 +563,10 @@ pub const Vm = struct {
 
     fn cellIn(vm: *const Vm, s: *Slot) *Cell {
         return switch (s.*) {
-            .cell => |c| c,
+            .cell => |c| blk: {
+                c.obj.checkLive(); // stress builds: a collected cell
+                break :blk c;
+            },
             .value => vm.bug("cell access to a value slot"),
         };
     }
@@ -536,6 +579,7 @@ pub const Vm = struct {
         const c = vm.frame().closure orelse vm.bug("capture access in the script");
         const caps = c.impl.vm.captures;
         if (i >= caps.len) vm.bug("capture index out of range");
+        caps[i].obj.checkLive();
         return caps[i];
     }
 

@@ -6,8 +6,8 @@
 //!     allocated  cumulative bytes charged over the run (frees don't subtract)
 //!     peak       the highest live total during the run
 //!     end        bytes still live when the script ends
-//!   (Until the M8 GC nothing is freed during a run, so the three are equal; with a GC,
-//!   `allocated` measures allocation volume and `peak` the memory a run really needs.)
+//!     collections  garbage collections during the run (M8)
+//!   `allocated` measures allocation volume, `peak` the memory a run really needs.
 //!   median  wall time of `runs` in-process runs (parse → resolve → [compile → verify] →
 //!           run), in milliseconds. Machine-dependent; compare only on the same machine.
 //!           Every run gets a fresh arena, Runtime and heap, so runs can't influence each
@@ -30,7 +30,7 @@ const limits: zqjs.Limits = .{
     .max_heap_bytes = 4 << 30, // the tree-walker allocates per scope entry (D37)
 };
 
-const Result = struct { steps: u64, allocated: u64, peak: usize, end: usize, ns: u64 };
+const Result = struct { steps: u64, allocated: u64, peak: usize, end: usize, collections: u64, ns: u64 };
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !u8 {
     try out.print("# zqjs benchmark baseline: zig {s}, {s}-{s} ({s}), {s}, median of {d} runs\n", .{
         builtin.zig_version_string, @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), builtin.cpu.model.name, @tagName(builtin.mode), runs,
     });
-    try out.print("{s:<22} {s:<9} {s:>12} {s:>12} {s:>12} {s:>12} {s:>10}\n", .{ "program", "engine", "steps", "allocated", "peak", "end", "median ms" });
+    try out.print("{s:<22} {s:<9} {s:>12} {s:>12} {s:>12} {s:>12} {s:>11} {s:>10}\n", .{ "program", "engine", "steps", "allocated", "peak", "end", "collections", "median ms" });
     for (names.items) |name| {
         const source = try dir.readFileAlloc(io, name, arena, .limited(1 << 20));
         for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
@@ -68,14 +68,14 @@ pub fn main(init: std.process.Init) !u8 {
                 const r = try runOnce(gpa, io, source, engine);
                 // Steps and heap must not vary between runs; if they do, something is
                 // nondeterministic and the baseline would be meaningless.
-                if (first) |f| if (f.steps != r.steps or f.allocated != r.allocated or f.peak != r.peak or f.end != r.end) return error.NonDeterministic;
+                if (first) |f| if (f.steps != r.steps or f.allocated != r.allocated or f.peak != r.peak or f.end != r.end or f.collections != r.collections) return error.NonDeterministic;
                 first = r;
                 t.* = r.ns;
             }
             std.mem.sort(u64, &times, {}, std.sort.asc(u64));
             const median = times[runs / 2];
             const f = first.?;
-            try out.print("{s:<22} {s:<9} {d:>12} {d:>12} {d:>12} {d:>12} {d:>10.1}\n", .{ name, @tagName(engine), f.steps, f.allocated, f.peak, f.end, @as(f64, @floatFromInt(median)) / 1e6 });
+            try out.print("{s:<22} {s:<9} {d:>12} {d:>12} {d:>12} {d:>12} {d:>11} {d:>10.1}\n", .{ name, @tagName(engine), f.steps, f.allocated, f.peak, f.end, f.collections, @as(f64, @floatFromInt(median)) / 1e6 });
         }
     }
     return 0;
@@ -104,5 +104,5 @@ fn runOnce(gpa: std.mem.Allocator, io: std.Io, source: []const u8, engine: zqjs.
         },
     }
     const ns = start.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds();
-    return .{ .steps = rt.steps, .allocated = rt.heap.allocated, .peak = rt.heap.peak, .end = rt.heap.bytes, .ns = @intCast(ns) };
+    return .{ .steps = rt.steps, .allocated = rt.heap.allocated, .peak = rt.heap.peak, .end = rt.heap.bytes, .collections = rt.heap.stats.collections, .ns = @intCast(ns) };
 }

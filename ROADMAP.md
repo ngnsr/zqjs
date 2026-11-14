@@ -13,7 +13,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | 5 | Stack VM with `step()` / `--trace`, instruction budget | **done** |
 | 6 | Functions, cells/closures, growable stack, call-depth limit | **done** |
 | 7 | Objects, arrays, atoms, ordered properties, prototypes | **done** |
-| 8 | Mark-and-sweep GC, temp roots, stress modes, heap limit | – |
+| 8 | Mark-and-sweep GC: safepoints, precise roots, weak atoms, stress modes, heap verifier | **done** |
 | 9 | Embedding API (handles, `NativeCtx`), then C ABI | – |
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | – |
 | 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
@@ -27,6 +27,7 @@ Known shortcuts, each with the decision that explains it and what would replace 
 | tree-walker allocates every string literal on every evaluation | D30 | the VM's constant pool already fixes it; the oracle stays simple | not planned |
 | VM panics on a failed defensive check instead of returning an internal error | D35 | an internal-error result, if an embedder needs to survive a VM bug | M9 (embedding API) |
 | VM ~10-19% slower than at M6 on the M6 workloads (same steps), cause outside the VM loop | bench/baseline.txt, M7 notes below | profile the shared paths (ops, runtime layout) | before M10's benchmarks |
+| one step allocating more than the room left can hit LimitExceeded(heap_bytes) while collectable garbage exists | D8 "Acknowledged limitation" | collect and retry at the safepoint (instruction-level) | M8.1, if a real program hits it |
 | property names interned (hashed) on every access by name | `object.named` | atoms in the constant pool, then inline caches if benchmarks justify | M10 |
 
 ## Required regression tests by milestone
@@ -160,5 +161,37 @@ hashes results per target for portability checks.
   (a big switch) ran on every instruction; both became table lookups, recovering most of it.
   ~10-19% remains vs M6, measured with both builds back to back; it is outside the VM loop
   (removing the new VM instructions doesn't change it). Listed under Technical debt.
-**M8:** GC rooting and atom lifetime: the targeted stress tests in DESIGN_DECISIONS D10 and
-D11. Whole suite under `-Dgc-stress`. OOM injection over script runs.
+**M8 (done):** stop-the-world, non-moving, precise mark-and-sweep (GC_DESIGN.md, D7-D11).
+Every item on both engines unless noted.
+- store API: every reference store goes through `heap.store*` (owner, old, new value; the future
+  barrier hook); a source scan fails on any raw store and checks its own patterns
+- collector: accounting exact after a sweep; a value reachable only through a chain of every
+  object kind survives a collection that frees garbage of every kind around it; collection
+  allocates nothing (run with the allocator failing every request); scheduling bounded
+  (`next_gc = live + min(max(live, 256 KiB), (limit − live)/2)`; filling the heap with live
+  data costs O(log limit) collections; the first formula made every safepoint collect near
+  the limit, and fails this test)
+- weak atoms: 10 000 keys kept by their object, dropped with it, a key reused after `delete`;
+  only live atoms in the table after a collection; 20 000 dynamic keys on dropped objects leave
+  the table small in a real run
+- roots: one test per VM root kind (operand stack, locals, cells, frames' closures and `this`,
+  Proto constants, the realm), the runtime's exception message and unsupported name, and one
+  node-checked program per tree-walker shadow-stack site (calls, recursion, receivers,
+  literals, returns, closures, per-iteration bindings), each collecting at every safepoint
+- every `tests/diff` program matches node on each engine with a collection at every safepoint
+- failures mid-evaluation and allocation failure at every point with collection forced; a
+  failed, torn-down engine leaves no registration
+- garbage under a small limit runs to the step budget (fails if an engine stops collecting);
+  a program mixing garbage with a growing live structure checks the structure at the end
+- `-Dgc-stress` (collect at every safepoint, tombstones naming kind and allocation number, the
+  heap verifier after every collection): the whole suite passes in Debug and ReleaseSafe; a
+  removed root gives the same `use of a collected <kind> (allocation #N)` panic on every run;
+  the verifier catches each kind of corruption in a unit test
+- benchmarks (`bench/baseline.txt`, against `bench/baseline-m7.txt`): steps identical on every
+  row; peak heap down by up to 400× (tree-walker `loop.js` 104 MB → 262 KB); `collections`
+  column added
+- **kept permanently:** `-Dgc-stress` in CI (with `-Dstack-stress`, and in ReleaseSafe); the
+  verifier as a development tool without stress (`zqjs --verify-heap`, `RunOptions.verify_heap`)
+- **next, before M8.1:** use the collector on realistic workloads and measure pause cost
+  (marked/swept per collection), allocation rate and peak memory; that decides whether M8.1 is
+  incremental marking or something else

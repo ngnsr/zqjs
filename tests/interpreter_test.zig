@@ -87,9 +87,10 @@ test "the VM's stack-slot limit counts every active frame's reservation" {
 test "heap and string limits stop runaway strings" {
     try expectLimit("let s = 'ab'; while (true) { s += s; }", .{ .max_heap_bytes = 1 << 20 }, .heap_bytes);
     try expectLimit("let s = 'ab'; while (true) { s += s; }", .{ .max_string_length = 1000 }, .string_length);
-    // Many small strings: per-allocation overhead is charged, so this can't evade the limit.
-    // (The VM creates the literal once, so the loop must build new strings to hit it.)
-    try expectLimit("let n = 0; while (true) { '' + n++; }", .{ .max_heap_bytes = 1 << 16 }, .heap_bytes);
+    // Many small *live* strings: per-allocation overhead is charged, so they can't evade the
+    // limit. (They are kept in an array: since M8 the VM collects unreferenced ones, see the
+    // garbage test below.)
+    try expectLimit("let keep = []; let n = 0; while (true) { keep.push('' + n++); }", .{ .max_heap_bytes = 1 << 16 }, .heap_bytes);
 }
 
 test "an exception outlives unwinding and is freed by Runtime.deinit" {

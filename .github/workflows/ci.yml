@@ -68,13 +68,19 @@ jobs:
       - name: Tests (unit + integration)
         run: zig build test --summary all
 
-      # The VM moves its stacks on every call (stale indices fail at once, DESIGN_DECISIONS
-      # D36); ReleaseSafe checks the tree-walker's measured stack use in another mode (D37).
-      - name: Tests under -Dstack-stress
-        run: zig build test -Dstack-stress --summary all
+      # Both stress modes at once: the VM moves its stacks on every call (D36), and both
+      # engines collect at every safepoint, keep collected objects as tombstones and verify
+      # the heap after every collection (D8, GC_DESIGN §11). ReleaseSafe checks the
+      # tree-walker's measured stack use in another mode (D37), and that the stress checks
+      # don't exist only in Debug.
+      - name: Tests under -Dgc-stress -Dstack-stress
+        run: zig build test -Dgc-stress -Dstack-stress --summary all
 
       - name: Tests in ReleaseSafe
         run: zig build test -Doptimize=ReleaseSafe --summary all
+
+      - name: Tests under -Dgc-stress in ReleaseSafe
+        run: zig build test -Dgc-stress -Doptimize=ReleaseSafe --summary all
 
       - name: Generated files and node contract
         run: zig build check-goldens

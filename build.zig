@@ -21,6 +21,9 @@ pub fn build(b: *std.Build) void {
     // suite with it: zig build test -Dstack-stress
     const options = b.addOptions();
     options.addOption(bool, "stack_stress", b.option(bool, "stack-stress", "VM: move the stacks on every call") orelse false);
+    // -Dgc-stress: collect at every safepoint, keep collected objects as tombstones, and
+    // verify the heap after every collection (GC_DESIGN §11): zig build test -Dgc-stress
+    options.addOption(bool, "gc_stress", b.option(bool, "gc-stress", "GC: collect at every safepoint, tombstones, heap verifier") orelse false);
     mod.addOptions("build_options", options);
     const imports: []const std.Build.Module.Import = &.{.{ .name = "zqjs", .module = mod }};
 

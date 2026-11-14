@@ -1,7 +1,7 @@
 # Garbage collection: design (M8 and after)
 
-Status: **proposal for review**, before any M8 code. Once approved, the decisions here move
-into DESIGN_DECISIONS.md (revising D7, D8, D10 and D11 where noted) and this file stays as the
+Status: **built in M8** (approved design; the decisions are in DESIGN_DECISIONS.md D7–D11,
+revised where noted, and M8's tests and findings in ROADMAP.md). This file stays as the
 GC's reference. It covers the collector M8 builds (stop-the-world, non-moving, precise
 mark-and-sweep) and the interfaces that let incremental marking (M8.1) and generations (M8.2)
 be added later without changing the object model.
@@ -143,6 +143,12 @@ next safepoint. That is bounded: the biggest single steps are a `join` (bounded 
 `max_string_length`), `new_array` / a literal (bounded by the operand count) and `Object.keys`
 (bounded by the object's size, which is live data anyway).
 
+**The safepoint contract.** No collection can occur during instruction execution (or during a
+tree-walker evaluation step): every GC-managed reference an instruction needs is either
+reachable from the root set at the safepoint that started it, or was allocated after that
+safepoint. This is what makes temporary values cheap to reason about: an instruction may hold
+heap pointers in Zig locals freely, because nothing can collect under it.
+
 **Allocation** stays as it is: `heap.zig` is the only code that allocates heap objects (D7); each
 allocation is charged before it is made and refused past `max_heap_bytes`. It also adds to the
 *allocation debt*: when `bytes` passes `next_gc`, the heap sets `collect_requested`, and the next
@@ -150,10 +156,20 @@ safepoint collects.
 
 **The heap limit with a collector.** `max_heap_bytes` keeps meaning "accounted bytes", live plus
 garbage not collected yet. So that a program with a small live set never hits it, a collection is
-requested well before it: `next_gc ≤ limit − headroom` (headroom: an eighth of the limit). A
+requested well before it: `next_gc = live + min(max(live, 256 KiB), (limit − live) / 2)`, so the trigger is never past halfway between
+the live size and the limit. (Revised in P1 from `limit − limit/8`, which made every safepoint
+collect once live data passed that cap: see D8.) A
 program can then fail with LimitExceeded(heap_bytes) only if its *live* data, plus at most one
-step's garbage, exceeds the limit. Acceptance test: a loop making garbage forever under a 1 MiB
-limit runs until its step budget, on both engines.
+step's garbage, exceeds the limit (with the caveat below). Acceptance test: a loop making
+garbage forever under a 1 MiB limit runs until its step budget, on both engines.
+
+**Acknowledged limitation.** Because allocation never collects, uncollected garbage can reach
+the trigger (at most half the room left under the limit) before a collection is requested, so a single instruction
+that allocates more than the remaining headroom can fail with LimitExceeded(heap_bytes) although
+collectable garbage exists (200 MiB of garbage below the trigger, then a 60 MiB join, on a
+256 MiB limit). The real guarantee is therefore "live data + headroom + one step's allocation",
+not "live data". Accepted for M8 and stated here rather than hidden; the natural fix — an
+instruction-level collect-and-retry — belongs to M8.1, not to collecting inside allocation.
 
 ---
 
@@ -187,7 +203,8 @@ heap functions (I3):
 - `heap.storeProperty(object, key, value)` and `storeElement(array, index, value)`, plus `appendElements`
 - `heap.storeCell(cell, value)`
 - `heap.storeEnv(env, index, value)` (tree-walker)
-- closures' captures and an object's prototype are set only at construction
+- closures' captures and an object's prototype are set only at construction, inside
+  `heap.zig`; the source scan (I3) keeps any write to them out of every other file
 
 Each receives the owner, the slot's old value and the new value, which is everything an
 insertion barrier (Dijkstra: shade the new value if the owner is black) or a deletion barrier
@@ -261,6 +278,16 @@ of magnitude.
   collections; the same keys with the object dropped shrink the atom table to its baseline;
   `delete o[k]`, collect, reuse `k`; a property name used only in bytecode works across
   collections that freed its atom; the atom table is cleaned before the sweep.
+- **Proto and atom lifetime** (the collector-enable boundary, one test each): a string
+  constant survives collections while its Proto executes; nested function Protos keep their
+  constants; an atom referenced by a live object survives; a dead atom is gone after the
+  collection; the atom table's capacity is reused without allocation during cleanup; Proto
+  registration is removed when the VM is destroyed, and registration never outlives the
+  `Proto` it points at (the VM registers the same script Proto `runSource` owns, not a copy).
+- **Shadow-stack symmetry** (stress builds): the tree-walker's shadow stack has the same depth
+  after every `exec`/`eval` as before it, on every exit path — normal return, Thrown,
+  Unsupported, LimitExceeded and allocation failure. `defer` makes it hold by construction;
+  the verifier asserts it.
 - **Garbage under a small limit**: loops making strings, closures, environments and objects
   forever under a 1 MiB heap run until the step budget, on both engines.
 - **Every root kind** (section 4) gets a test that collects while that root is the *only*
@@ -295,6 +322,13 @@ result inside one native, so its intermediate array needs no root (no safepoint 
 
 ## 13. The road after M8
 
+| milestone | collector |
+|---|---|
+| M8 | stop-the-world, non-moving mark-and-sweep |
+| M8.1 | incremental marking |
+| M8.2 | generational collection |
+| later | concurrent marking, if benchmarks justify it |
+
 What each later step needs from M8, so that none of them changes the object model:
 
 - **M8.1 incremental marking:** a marking state machine stepped at safepoints with a work budget
@@ -313,7 +347,7 @@ What each later step needs from M8, so that none of them changes the object mode
 
 ---
 
-## 14. Decisions to approve
+## 14. Decisions (approved)
 
 1. **Collect only at safepoints** (VM instruction starts, tree-walker evaluation starts), never
    inside allocation (revises D7). The tree-walker gets a shadow stack; nothing else needs rooting.
@@ -324,8 +358,11 @@ What each later step needs from M8, so that none of them changes the object mode
 4. **Protos stay outside the heap**, registered as roots while running; bytecode names stay ASCII,
    so bytecode keeps no atoms alive (revises D11's expectation and its test).
 5. **Heap-limit semantics:** accounted bytes include uncollected garbage; collections are
-   scheduled with an eighth of the limit as headroom.
+   scheduled at most halfway between the live size and the limit (revised in P1, D8).
 6. **No finalizers, one thread per runtime**, no global GC state.
 7. **Observability:** deterministic counters (`collections`, bytes, `marked`/`swept`), wall-clock
    only in the benchmark tool.
-8. **Stress:** `-Dgc-stress` with zombie mode and the heap verifier, in CI.
+8. **Stress:** `-Dgc-stress` with zombie mode and the heap verifier, in CI — collecting at
+   *every* safepoint. If the full suite is too slow, the stress tests move to a dedicated CI
+   job; the mode itself is never weakened (a lower collection frequency would hide exactly
+   the bugs it exists to find).

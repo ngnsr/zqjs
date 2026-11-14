@@ -75,6 +75,13 @@ fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUs
     defer if (use) |u| {
         u.* = .{ .depth = it.max_depth, .bytes = it.stack_top - it.lowest_frame };
     };
+    defer {
+        // No collection may scan this interpreter once it returns (D8).
+        if (rt.engine_roots) |e| if (e.ctx == @as(*anyopaque, &it)) {
+            rt.engine_roots = null;
+        };
+        it.roots.deinit(rt.gpa);
+    }
     // The parser guarantees break/continue only occur in loops and return in functions.
     std.debug.assert(try it.block(script.statements) == .normal);
 }
@@ -91,6 +98,10 @@ const Interpreter = struct {
     ret: Value = .undefined,
     /// The running call's `this`: its receiver, or null for a call without one (D41).
     this: ?Value = null,
+    /// The shadow stack (D10, GC_DESIGN §4): heap objects held in Zig locals across a
+    /// sub-evaluation, which may contain a safepoint. Pushed with `hold`, released with
+    /// `release` in a `defer`, so it is balanced on every exit path; `exec`/`eval` assert it.
+    roots: std.ArrayList(*heap.Obj) = .empty,
     // Stack measurement, test builds only (see the test at the end).
     stack_top: usize = 0,
     lowest_frame: usize = 0,
@@ -107,16 +118,78 @@ const Interpreter = struct {
         }
     }
 
+    // ---- the collector (D8, D10)
+
+    /// A safepoint: at the start of every statement and expression evaluation. Every heap
+    /// value the interpreter still needs is reachable from `env`, `this`, `ret` or the
+    /// shadow stack here, so a collection can run.
+    fn safepoint(it: *Interpreter) void {
+        const h = &it.rt.heap;
+        if (!h.collect_requested and !h.collect_always) return;
+        it.rt.engine_roots = .{ .ctx = it, .mark = markRoots };
+        it.rt.collect();
+    }
+
+    fn markRoots(ctx: *anyopaque, h: *heap.Heap) void {
+        const it: *Interpreter = @ptrCast(@alignCast(ctx));
+        for (it.roots.items) |o| h.markObj(o);
+        if (it.env) |e| h.markObj(&e.obj);
+        if (it.this) |t| h.markValue(t);
+        h.markValue(it.ret);
+    }
+
+    /// The shadow stack's depth, to `release` back to.
+    fn mark(it: *const Interpreter) usize {
+        return it.roots.items.len;
+    }
+
+    fn release(it: *Interpreter, m: usize) void {
+        it.roots.shrinkRetainingCapacity(m);
+    }
+
+    /// Roots `v` until the matching `release` (non-heap values need nothing).
+    fn hold(it: *Interpreter, v: Value) Error!void {
+        const o: *heap.Obj = switch (v) {
+            .undefined, .null, .boolean, .number, .native => return,
+            .string => |x| @constCast(&x.obj),
+            .closure => |x| @constCast(&x.obj),
+            .object => |x| &x.obj,
+        };
+        try it.roots.append(it.rt.gpa, o);
+    }
+
+    fn holdKey(it: *Interpreter, k: object.Key) Error!void {
+        switch (k) {
+            .atom => |a| try it.roots.append(it.rt.gpa, &a.obj),
+            .index => {},
+        }
+    }
+
+    fn holdEnv(it: *Interpreter, e: ?*Env) Error!void {
+        if (e) |x| try it.roots.append(it.rt.gpa, &x.obj);
+    }
+
     // ---- environments
 
     /// The record holding binding `b`: walk outward to the record of its scope.
-    fn slotOf(it: *const Interpreter, b: u32) *?Value {
-        const binding = it.res.bindings[b];
+    fn envOf(it: *const Interpreter, b: u32) *Env {
+        const scope = it.res.bindings[b].scope;
         var e = it.env;
         while (e) |rec| : (e = rec.parent) {
-            if (rec.scope == binding.scope) return &rec.values[binding.index];
+            rec.obj.checkLive(); // stress builds: a collected environment record
+            if (rec.scope == scope) return rec;
         }
         unreachable; // the resolver only resolves names to bindings in enclosing scopes
+    }
+
+    /// Binding `b`'s value (null: in the TDZ).
+    fn load(it: *const Interpreter, b: u32) ?Value {
+        return it.envOf(b).values[it.res.bindings[b].index];
+    }
+
+    /// Writes binding `b` through the heap's store API (GC_DESIGN §7): no checks here.
+    fn store(it: *Interpreter, b: u32, v: Value) void {
+        it.rt.heap.storeEnv(it.envOf(b), it.res.bindings[b].index, v);
     }
 
     /// A new record for `scope` (if it declares anything) inside the current one.
@@ -149,7 +222,7 @@ const Interpreter = struct {
     fn body(it: *Interpreter, stmts: []const ast.Stmt) Error!Completion {
         for (stmts) |s| if (s.data == .function) {
             const f = s.data.function;
-            it.slotOf(f.name.?.binding).* = .{ .closure = try it.rt.heap.newTreeClosure(f, it.env) };
+            it.store(f.name.?.binding, .{ .closure = try it.rt.heap.newTreeClosure(f, it.env) });
         };
         for (stmts) |s| {
             const c = try it.exec(s);
@@ -161,7 +234,7 @@ const Interpreter = struct {
     fn declare(it: *Interpreter, decl: ast.Declaration) Error!void {
         for (decl.declarators) |d| {
             const v: Value = if (d.init) |init| try it.eval(init) else .undefined;
-            it.slotOf(d.binding).* = v; // initialisation: no TDZ or const check
+            it.store(d.binding, v); // initialisation: no TDZ or const check
         }
     }
 
@@ -177,6 +250,9 @@ const Interpreter = struct {
     fn exec(it: *Interpreter, s: ast.Stmt) Error!Completion {
         try it.enter();
         defer it.depth -= 1;
+        const balanced = it.mark();
+        defer std.debug.assert(it.mark() == balanced); // shadow-stack symmetry, every exit
+        it.safepoint();
         try it.rt.step();
         switch (s.data) {
             .empty, .function => {}, // functions were created on entry to the body
@@ -200,33 +276,36 @@ const Interpreter = struct {
                     .@"return" => return .@"return",
                 }
             },
-            .@"for" => |f| {
-                const saved = it.env;
-                defer it.env = saved;
-                var per_iteration = false;
-                if (f.init) |init| switch (init) {
-                    .declaration => |decl| {
-                        try it.pushScope(it.res.bindings[decl.declarators[0].binding].scope);
-                        try it.declare(decl);
-                        per_iteration = decl.kind == .let; // the spec copies only `let` bindings
-                    },
-                    .expression => |e| _ = try it.eval(e),
-                };
-                if (per_iteration) try it.copyScope();
-                while (true) {
-                    try it.rt.step();
-                    if (f.cond) |c| if (!ops.toBoolean(try it.eval(c))) break;
-                    switch (try it.exec(f.body.*)) {
-                        .normal, .@"continue" => {}, // `continue` lands here: the update still runs
-                        .@"break" => break,
-                        .@"return" => return .@"return",
-                    }
-                    if (per_iteration) try it.copyScope();
-                    if (f.update) |u| _ = try it.eval(u);
-                }
-            },
+            .@"for" => |f| return it.execFor(f),
             .@"break" => return .@"break",
             .@"continue" => return .@"continue",
+        }
+        return .normal;
+    }
+
+    fn execFor(it: *Interpreter, f: @FieldType(ast.Stmt.Data, "for")) Error!Completion {
+        const saved = it.env;
+        defer it.env = saved;
+        var per_iteration = false;
+        if (f.init) |init| switch (init) {
+            .declaration => |decl| {
+                try it.pushScope(it.res.bindings[decl.declarators[0].binding].scope);
+                try it.declare(decl);
+                per_iteration = decl.kind == .let; // the spec copies only `let` bindings
+            },
+            .expression => |e| _ = try it.eval(e),
+        };
+        if (per_iteration) try it.copyScope();
+        while (true) {
+            try it.rt.step();
+            if (f.cond) |c| if (!ops.toBoolean(try it.eval(c))) break;
+            switch (try it.exec(f.body.*)) {
+                .normal, .@"continue" => {}, // `continue` lands here: the update still runs
+                .@"break" => break,
+                .@"return" => return .@"return",
+            }
+            if (per_iteration) try it.copyScope();
+            if (f.update) |u| _ = try it.eval(u);
         }
         return .normal;
     }
@@ -235,6 +314,11 @@ const Interpreter = struct {
         const rt = it.rt;
         try it.enter();
         defer it.depth -= 1;
+        it.safepoint();
+        // Every value held across a sub-evaluation below is on the shadow stack until the
+        // end of this evaluation (`hold`); this release balances it on every exit path.
+        const balanced = it.mark();
+        defer it.release(balanced);
         try rt.step();
         switch (e.data) {
             .number => |n| return .{ .number = n },
@@ -252,125 +336,174 @@ const Interpreter = struct {
                     .not => .{ .boolean = !ops.toBoolean(v) },
                 };
             },
-            .binary => |b| {
-                const lhs = try it.eval(b.lhs);
-                switch (b.op) {
-                    // Short-circuit, and return an operand, not a boolean: '' || 'd' is 'd'.
-                    .logical_and => return if (ops.toBoolean(lhs)) it.eval(b.rhs) else lhs,
-                    .logical_or => return if (ops.toBoolean(lhs)) lhs else it.eval(b.rhs),
-                    else => return ops.binary(rt, b.op, lhs, try it.eval(b.rhs)),
-                }
-            },
-            .assign => |a| switch (a.target) {
-                .ref => |ref| {
-                    if (a.op) |op| {
-                        // x op= e: read x first (TDZ), then evaluate e, then write (const check).
-                        const old = try it.read(ref);
-                        const v = try ops.binary(rt, op, old, try it.eval(a.value));
-                        try it.write(ref, v);
-                        return v;
-                    }
-                    // x = e: evaluate e first; the TDZ and const checks happen on the write.
-                    const v = try it.eval(a.value);
-                    try it.write(ref, v);
-                    return v;
-                },
-                .member => |m| {
-                    // Base and key expression are evaluated exactly once, before the right-hand
-                    // side. The key is *converted* (ToPropertyKey) when the reference is first
-                    // used: for `=` after the right-hand side, for `op=` at the read before it.
-                    const base = try it.eval(m.object);
-                    const kv = try it.keyValue(m);
-                    if (a.op) |op| {
-                        const k = try it.toKey(kv);
-                        const old = try object.get(rt, base, k);
-                        const v = try ops.binary(rt, op, old, try it.eval(a.value));
-                        try object.set(rt, base, k, v);
-                        return v;
-                    }
-                    const v = try it.eval(a.value);
-                    try object.set(rt, base, try it.toKey(kv), v);
-                    return v;
-                },
-            },
-            .update => |u| {
-                const old, const new = switch (u.target) {
-                    .ref => |ref| blk: {
-                        const old = try ops.toNumber(rt, try it.read(ref));
-                        const new = if (u.op == .inc) old + 1 else old - 1;
-                        try it.write(ref, .{ .number = new });
-                        break :blk .{ old, new };
-                    },
-                    .member => |m| blk: {
-                        const base = try it.eval(m.object);
-                        const k = try it.toKey(try it.keyValue(m));
-                        const old = try ops.toNumber(rt, try object.get(rt, base, k));
-                        const new = if (u.op == .inc) old + 1 else old - 1;
-                        try object.set(rt, base, k, .{ .number = new });
-                        break :blk .{ old, new };
-                    },
-                };
-                return .{ .number = if (u.prefix) new else old };
-            },
+            .binary => |b| return it.evalBinary(b),
+            .assign => |a| return it.evalAssign(a),
+            .update => |u| return it.evalUpdate(u),
             .member => |m| {
                 const base = try it.eval(m.object);
+                try it.hold(base);
                 return object.get(rt, base, try it.toKey(try it.keyValue(m)));
             },
             .delete => |m| {
                 const base = try it.eval(m.object);
+                try it.hold(base);
                 return .{ .boolean = try object.delete(rt, base, try it.toKey(try it.keyValue(m))) };
             },
             .this => return it.this orelse rt.fail(.sloppy_this),
-            .array => |items| {
-                const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
-                for (items) |item| {
-                    const v = try it.eval(item);
-                    arr.kind.array.append(rt.heap.allocator(), v) catch |err| return rt.heap.failed(err);
-                }
-                return .{ .object = arr };
-            },
-            .object => |props| {
-                const o = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
-                // Each key, then its value, in source order.
-                for (props) |prop| {
-                    const k = try it.literalKey(prop.key);
-                    try object.define(rt, o, k, try it.eval(prop.value));
-                }
-                return .{ .object = o };
-            },
-            .function => |f| {
-                // A named expression's name lives in its own record around the function.
-                if (f.name) |n| {
-                    const own = try rt.heap.newEnv(it.env, it.res.bindings[n.binding].scope, 1);
-                    const c = try rt.heap.newTreeClosure(f, own);
-                    own.values[0] = .{ .closure = c };
-                    return .{ .closure = c };
-                }
-                return .{ .closure = try rt.heap.newTreeClosure(f, it.env) };
-            },
-            .call => |c| {
-                // A member callee is a method call: its base is the receiver (D41). The
-                // callee is found before the arguments are evaluated.
-                var receiver: ?Value = null;
-                const callee = switch (c.callee.data) {
-                    .member => |m| blk: {
-                        const base = try it.eval(m.object);
-                        receiver = base;
-                        break :blk try object.get(rt, base, try it.toKey(try it.keyValue(m)));
-                    },
-                    else => try it.eval(c.callee),
-                };
-                const args = try rt.gpa.alloc(Value, c.args.len);
-                defer rt.gpa.free(args);
-                for (c.args, args) |arg, *slot| slot.* = try it.eval(arg);
-                return switch (callee) {
-                    .native => |n| n.call(rt, receiver orelse .undefined, args),
-                    // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
-                    .closure => |cl| it.call(cl, if (receiver) |r| (if (r == .object) r else null) else null, args),
-                    else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
-                };
+            .array => |items| return it.evalArray(items),
+            .object => |props| return it.evalObject(props),
+            .function => |f| return it.evalFunction(f),
+            .call => |c| return it.evalCall(c),
+        }
+    }
+
+    // The big `eval` arms live in their own functions: in Debug, a function's frame holds
+    // the locals of *every* arm of its switch, so with them inline each level of recursion
+    // paid for the largest one (measured: ~2x the stack per level, D37).
+    fn evalBinary(it: *Interpreter, b: @FieldType(ast.Expr.Data, "binary")) Error!Value {
+        const rt = it.rt;
+        const lhs = try it.eval(b.lhs);
+        switch (b.op) {
+            // Short-circuit, and return an operand, not a boolean: '' || 'd' is 'd'.
+            // (`lhs` isn't needed once the right side runs.)
+            .logical_and => return if (ops.toBoolean(lhs)) it.eval(b.rhs) else lhs,
+            .logical_or => return if (ops.toBoolean(lhs)) lhs else it.eval(b.rhs),
+            else => {
+                try it.hold(lhs);
+                return ops.binary(rt, b.op, lhs, try it.eval(b.rhs));
             },
         }
+    }
+
+    fn evalAssign(it: *Interpreter, a: @FieldType(ast.Expr.Data, "assign")) Error!Value {
+        const rt = it.rt;
+        switch (a.target) {
+            .ref => |ref| {
+                if (a.op) |op| {
+                    // x op= e: read x first (TDZ), then evaluate e, then write (const check).
+                    const old = try it.read(ref);
+                    try it.hold(old);
+                    const v = try ops.binary(rt, op, old, try it.eval(a.value));
+                    try it.write(ref, v);
+                    return v;
+                }
+                // x = e: evaluate e first; the TDZ and const checks happen on the write.
+                const v = try it.eval(a.value);
+                try it.write(ref, v);
+                return v;
+            },
+            .member => |m| {
+                // Base and key expression are evaluated exactly once, before the right-hand
+                // side. The key is *converted* (ToPropertyKey) when the reference is first
+                // used: for `=` after the right-hand side, for `op=` at the read before it.
+                const base = try it.eval(m.object);
+                try it.hold(base);
+                const kv = try it.keyValue(m);
+                if (kv == .value) try it.hold(kv.value);
+                if (a.op) |op| {
+                    const k = try it.toKey(kv);
+                    try it.holdKey(k);
+                    const old = try object.get(rt, base, k);
+                    try it.hold(old);
+                    const v = try ops.binary(rt, op, old, try it.eval(a.value));
+                    try object.set(rt, base, k, v);
+                    return v;
+                }
+                const v = try it.eval(a.value);
+                try object.set(rt, base, try it.toKey(kv), v);
+                return v;
+            },
+        }
+    }
+
+    fn evalUpdate(it: *Interpreter, u: @FieldType(ast.Expr.Data, "update")) Error!Value {
+        const rt = it.rt;
+        const old, const new = switch (u.target) {
+            .ref => |ref| blk: {
+                const old = try ops.toNumber(rt, try it.read(ref));
+                const new = if (u.op == .inc) old + 1 else old - 1;
+                try it.write(ref, .{ .number = new });
+                break :blk .{ old, new };
+            },
+            .member => |m| blk: {
+                const base = try it.eval(m.object);
+                try it.hold(base);
+                const k = try it.toKey(try it.keyValue(m));
+                const old = try ops.toNumber(rt, try object.get(rt, base, k));
+                const new = if (u.op == .inc) old + 1 else old - 1;
+                try object.set(rt, base, k, .{ .number = new });
+                break :blk .{ old, new };
+            },
+        };
+        return .{ .number = if (u.prefix) new else old };
+    }
+
+    fn evalArray(it: *Interpreter, items: @FieldType(ast.Expr.Data, "array")) Error!Value {
+        const rt = it.rt;
+        const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
+        try it.hold(.{ .object = arr });
+        for (items) |item| {
+            const v = try it.eval(item);
+            try rt.heap.appendElement(arr, v);
+        }
+        return .{ .object = arr };
+    }
+
+    fn evalObject(it: *Interpreter, props: @FieldType(ast.Expr.Data, "object")) Error!Value {
+        const rt = it.rt;
+        const o = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
+        try it.hold(.{ .object = o });
+        // Each key, then its value, in source order.
+        for (props) |prop| {
+            const m = it.mark();
+            defer it.release(m);
+            const k = try it.literalKey(prop.key);
+            try it.holdKey(k);
+            try object.define(rt, o, k, try it.eval(prop.value));
+        }
+        return .{ .object = o };
+    }
+
+    fn evalFunction(it: *Interpreter, f: @FieldType(ast.Expr.Data, "function")) Error!Value {
+        const rt = it.rt;
+        // A named expression's name lives in its own record around the function.
+        if (f.name) |n| {
+            const own = try rt.heap.newEnv(it.env, it.res.bindings[n.binding].scope, 1);
+            const c = try rt.heap.newTreeClosure(f, own);
+            rt.heap.storeEnv(own, 0, .{ .closure = c });
+            return .{ .closure = c };
+        }
+        return .{ .closure = try rt.heap.newTreeClosure(f, it.env) };
+    }
+
+    fn evalCall(it: *Interpreter, c: @FieldType(ast.Expr.Data, "call")) Error!Value {
+        const rt = it.rt;
+        // A member callee is a method call: its base is the receiver (D41). The
+        // callee is found before the arguments are evaluated.
+        var receiver: ?Value = null;
+        const callee = switch (c.callee.data) {
+            .member => |m| blk: {
+                const base = try it.eval(m.object);
+                try it.hold(base);
+                receiver = base;
+                break :blk try object.get(rt, base, try it.toKey(try it.keyValue(m)));
+            },
+            else => try it.eval(c.callee),
+        };
+        try it.hold(callee);
+        const args = try rt.gpa.alloc(Value, c.args.len);
+        defer rt.gpa.free(args);
+        // `args` is not traced: each value is on the shadow stack too.
+        for (c.args, args) |arg, *slot| {
+            slot.* = try it.eval(arg);
+            try it.hold(slot.*);
+        }
+        return switch (callee) {
+            .native => |n| n.call(rt, receiver orelse .undefined, args),
+            // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
+            .closure => |cl| it.call(cl, if (receiver) |r| (if (r == .object) r else null) else null, args),
+            else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
+        };
     }
 
     /// A member's key as evaluated but not yet converted.
@@ -402,6 +535,7 @@ const Interpreter = struct {
     }
 
     fn call(it: *Interpreter, closure: *const heap.Closure, this: ?Value, args: []const Value) Error!Value {
+        closure.obj.checkLive();
         const t = switch (closure.impl) {
             .tree => |t| t,
             .vm => unreachable, // each engine only ever sees its own closures
@@ -419,12 +553,18 @@ const Interpreter = struct {
             it.env = saved;
             it.this = saved_this;
         }
+        // The caller's environment and `this` are held only here while the body runs (the
+        // callee's record descends from where the closure was made, not from the caller).
+        const m = it.mark();
+        defer it.release(m);
+        try it.holdEnv(saved);
+        if (saved_this) |v| try it.hold(v);
         it.env = t.env;
         it.this = this; // decided by the call, not by where the function was defined
         // Parameters and the body's declarations share one scope.
         const scope = if (f.params.len > 0) it.res.bindings[f.params[0].binding].scope else it.scopeOf(f.body);
         try it.pushScope(scope);
-        for (f.params, 0..) |p, i| it.slotOf(p.binding).* = if (i < args.len) args[i] else .undefined;
+        for (f.params, 0..) |p, i| it.store(p.binding, if (i < args.len) args[i] else .undefined);
         return switch (try it.body(f.body)) {
             .@"return" => it.ret,
             else => .undefined,
@@ -441,17 +581,16 @@ const Interpreter = struct {
 
     fn read(it: *Interpreter, ref: ast.Ref) Error!Value {
         const b = it.bindingOf(ref) orelse return builtins.global(it.rt, ref.name);
-        return it.slotOf(b).* orelse it.tdz(ref);
+        return it.load(b) orelse it.tdz(ref);
     }
 
     /// The resolver rejects writes to globals and to function-expression names.
     fn write(it: *Interpreter, ref: ast.Ref, v: Value) Error!void {
         const b = it.bindingOf(ref).?;
-        const slot = it.slotOf(b);
-        if (slot.* == null) return it.tdz(ref);
+        if (it.load(b) == null) return it.tdz(ref);
         if (it.res.bindings[b].kind == .@"const")
             return it.rt.throw(.TypeError, &.{.{ .ascii = "Assignment to constant variable." }});
-        slot.* = v;
+        it.store(b, v);
     }
 
     fn tdz(it: *Interpreter, ref: ast.Ref) Error {

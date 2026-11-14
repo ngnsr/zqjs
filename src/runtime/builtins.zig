@@ -86,7 +86,7 @@ fn builtin(h: *heap_mod.Heap, proto: ?*Object, b: names.Builtin) Error!*Object {
 
 fn method(rt: *Runtime, o: *Object, name: []const u8, n: *const Native) Error!void {
     const k = try rt.heap.internAscii(name);
-    o.props.put(rt.heap.allocator(), k, .{ .value = .{ .native = n }, .enumerable = false }) catch |e| return rt.heap.failed(e);
+    try rt.heap.defineProperty(o, k, .{ .value = .{ .native = n }, .enumerable = false });
 }
 
 /// The natives ToPrimitive may call (D40); anything else found there is user code.
@@ -187,13 +187,13 @@ fn thisArray(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
 
 fn arrayPush(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const a = try thisArray(rt, this, "push");
-    a.kind.array.appendSlice(rt.heap.allocator(), args) catch |e| return rt.heap.failed(e);
+    try rt.heap.appendElements(a, args);
     return .{ .number = @floatFromInt(a.kind.array.items.len) };
 }
 
 fn arrayPop(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     const a = try thisArray(rt, this, "pop");
-    return a.kind.array.pop() orelse .undefined;
+    return rt.heap.popElement(a) orelse .undefined;
 }
 
 fn arrayJoin(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -264,7 +264,7 @@ fn pushKey(rt: *Runtime, out: *Object, k: object.Key) Error!void {
             break :blk try rt.heap.ascii(std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
         },
     };
-    out.kind.array.append(rt.heap.allocator(), .{ .string = s }) catch |e| return rt.heap.failed(e);
+    try rt.heap.appendElement(out, .{ .string = s });
 }
 
 fn objectCreate(rt: *Runtime, _: Value, args: []const Value) Error!Value {

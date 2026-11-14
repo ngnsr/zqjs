@@ -18,9 +18,18 @@
 //! GC traceability (M7 acceptance, DESIGN_DECISIONS D38): `forEachChild` enumerates
 //! every reference from a heap object to another, for every kind. M8's marking is that
 //! enumeration; a kind added without updating it fails the exhaustive switch.
+//!
+//! Reference stores (M8, DESIGN_DECISIONS D8/I3): after construction, every reference
+//! written into a heap object goes through the `store*`/`append*` functions below, so a
+//! later write barrier (incremental marking, generations) has one place to hook into. In
+//! M8 the barrier is a no-op: collection is stop-the-world and only at safepoints, so no
+//! store can happen during a collection. `tests/gc_test.zig` greps for raw stores.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+/// `-Dgc-stress` (GC_DESIGN §11): collect at every safepoint, turn freed objects into
+/// tombstones, verify the heap after every collection. In any build mode, ReleaseSafe too.
+pub const gc_stress = @import("build_options").gc_stress;
 const limits_mod = @import("../limits.zig");
 const Limits = limits_mod.Limits;
 const Limit = limits_mod.Limit;
@@ -33,10 +42,38 @@ pub const per_allocation_overhead = 16;
 
 pub const Obj = struct {
     kind: Kind,
+    /// The list of every object (the sweep list).
     next: ?*Obj,
+    /// Set during a collection's mark phase; cleared by the sweep (D8).
+    marked: bool = false,
+    /// The gray list while marking: intrusive, so marking never allocates (D9).
+    gray_next: ?*Obj = null,
+    /// Stress builds only: an allocation number, and the kind a tombstone used to be.
+    debug: Debug = if (gc_stress) .{} else {},
 
-    pub const Kind = enum { string, cell, closure, env, object };
+    pub const Kind = enum {
+        string,
+        cell,
+        closure,
+        env,
+        object,
+        /// A tombstone (stress builds): a collected object kept so any later use of it is a
+        /// deterministic panic naming what it was, instead of a read of freed memory.
+        dead,
+    };
+
+    pub const Debug = if (gc_stress) struct { id: u64 = 0, was: Kind = .dead } else void;
+
+    /// Panics if `obj` was collected (only tombstones can fail this, so only in stress
+    /// builds; the check itself is one compare).
+    pub inline fn checkLive(obj: *const Obj) void {
+        if (gc_stress and obj.kind == .dead)
+            std.debug.panic("zqjs GC bug: use of a collected {s} (allocation #{d})", .{ @tagName(obj.debug.was), obj.debug.id });
+    }
 };
+
+/// What a tombstoned string's units become: visible in any output that reads it anyway.
+const poison_units = [_]u16{ '<', 'c', 'o', 'l', 'l', 'e', 'c', 't', 'e', 'd', '>' };
 
 /// A captured variable (VM, DESIGN_DECISIONS D36). `null` = TDZ. Shared by every closure
 /// that captured it, so writes through any of them are seen by all.
@@ -134,9 +171,143 @@ pub const Heap = struct {
     atoms: std.HashMapUnmanaged(*String, void, AtomContext, 80) = .empty,
     /// `allocator()` refused an allocation because of the heap limit (see `failed`).
     refused: bool = false,
+    /// When `bytes` passes this, a collection is requested for the next safepoint.
+    next_gc: usize = 0,
+    collect_requested: bool = false,
+    /// Collect at every safepoint, not only when requested (tests; always under -Dgc-stress).
+    collect_always: bool = gc_stress,
+    /// Run the heap verifier after every collection (always under -Dgc-stress; a
+    /// development option otherwise: RunOptions.verify_heap, `zqjs --verify-heap`).
+    verify_always: bool = gc_stress,
+    /// Bytes charged through `allocator()` (object-internal buffers), for the verifier's
+    /// accounting check: `bytes` = Σ live objects' fixed charges + `buffer_bytes`.
+    buffer_bytes: usize = 0,
+    /// Stress builds: allocation numbers, and collected objects kept as tombstones.
+    next_id: u64 = 0,
+    tombstones: ?*Obj = null,
+    /// The gray list while marking (empty otherwise).
+    gray: ?*Obj = null,
+    stats: Stats = .{},
+
+    /// Deterministic collector statistics (D8): work units, not wall-clock time.
+    pub const Stats = struct {
+        collections: u64 = 0,
+        /// Cumulative bytes freed by collections.
+        bytes_freed: u64 = 0,
+        /// Accounted bytes surviving the last collection.
+        live_after_last: usize = 0,
+        /// Cumulative objects surviving collections, and freed by them.
+        marked: u64 = 0,
+        swept: u64 = 0,
+    };
 
     pub fn init(gpa: Allocator, limits: Limits) Heap {
-        return .{ .gpa = gpa, .max_bytes = limits.max_heap_bytes, .max_string_length = limits.max_string_length };
+        var h: Heap = .{ .gpa = gpa, .max_bytes = limits.max_heap_bytes, .max_string_length = limits.max_string_length };
+        h.next_gc = h.schedule(0);
+        return h;
+    }
+
+    // ---- the collector (D8; GC_DESIGN §6). Runs only at safepoints, by the engine.
+
+    /// The next collection trigger after `live` bytes survived (D8): grow by the live size
+    /// (at least 256 KiB), but never beyond half the room left under the limit. So small
+    /// heaps collect after doubling, and near the limit each collection needs half the
+    /// remaining room allocated first: a program filling its heap with live data collects
+    /// O(log limit) times, never at every safepoint. Overflow-free: the result is at most
+    /// `live + (max − live) / 2 ≤ max`.
+    pub fn schedule(h: *const Heap, live: usize) usize {
+        const min_growth = 256 * 1024;
+        const room = (h.max_bytes -| live) / 2;
+        return live + @min(@max(live, min_growth), room);
+    }
+
+    /// Marks `obj` and queues it for scanning, once.
+    pub fn markObj(h: *Heap, obj: *Obj) void {
+        obj.checkLive(); // a root or an edge to a collected object (stress builds)
+        if (obj.marked) return;
+        obj.marked = true;
+        obj.gray_next = h.gray;
+        h.gray = obj;
+    }
+
+    pub fn markValue(h: *Heap, v: Value) void {
+        visitValue(v, h, markObj);
+    }
+
+    /// A full stop-the-world collection. `markRoots(roots, h)` marks every root (with
+    /// `markObj`/`markValue`); everything not reachable from them is freed. Allocates
+    /// nothing and can't fail (I4).
+    pub fn collect(h: *Heap, roots: anytype, comptime markRoots: fn (@TypeOf(roots), *Heap) void) void {
+        std.debug.assert(h.gray == null);
+        markRoots(roots, h);
+        // Drain: each gray object's children (D38's edges), iteratively, never recursively.
+        while (h.gray) |obj| {
+            h.gray = obj.gray_next;
+            obj.gray_next = null;
+            forEachChild(obj, h, markObj);
+        }
+        // Weak atoms (D11, I6): rebuild the table from the marked atoms, before any atom is
+        // freed. Walking the object list (not the table) keeps the rebuild deterministic,
+        // and reinserting at most as many entries as were there needs no allocation.
+        h.atoms.clearRetainingCapacity();
+        var it = h.objects;
+        while (it) |obj| : (it = obj.next) {
+            if (obj.kind != .string or !obj.marked) continue;
+            const str: *String = @fieldParentPtr("obj", obj);
+            if (str.atom != null) h.atoms.putAssumeCapacityNoClobber(str, {});
+        }
+        // Sweep: free the unmarked, unmark the survivors.
+        const before = h.bytes;
+        var link: *?*Obj = &h.objects;
+        while (link.*) |obj| {
+            if (obj.marked) {
+                obj.marked = false;
+                h.stats.marked += 1;
+                link = &obj.next;
+            } else {
+                link.* = obj.next;
+                if (gc_stress) h.entomb(obj) else h.destroy(obj);
+                h.stats.swept += 1;
+            }
+        }
+        h.stats.collections += 1;
+        h.stats.bytes_freed += before - h.bytes;
+        h.stats.live_after_last = h.bytes;
+        h.next_gc = h.schedule(h.bytes);
+        h.collect_requested = false;
+        if (h.verify_always) h.verify() catch |e| std.debug.panic("zqjs GC bug: heap verification failed after a collection: {s}", .{@errorName(e)});
+    }
+
+    pub const VerifyError = error{ GrayListNotEmpty, EdgeToCollectedObject, CollectedObjectInList, AtomTableHoldsCollectedObject, AtomTableHoldsNonAtom, AccountingMismatch };
+
+    /// The heap verifier (GC_DESIGN §11; after every collection in stress builds, and
+    /// callable from tests): the gray list is empty; no live object references a collected
+    /// one (roots are checked as they are marked, `markObj`); the atom table holds only live
+    /// atoms; and the accounting is exact: `bytes` = Σ every live object's fixed charge +
+    /// every buffer byte charged through `allocator()`. Allocates nothing.
+    pub fn verify(h: *const Heap) VerifyError!void {
+        if (h.gray != null) return error.GrayListNotEmpty;
+        var sum: usize = h.buffer_bytes;
+        const Check = struct {
+            bad: bool = false,
+            fn edge(c: *@This(), child: *Obj) void {
+                if (child.kind == .dead) c.bad = true;
+            }
+        };
+        var it = h.objects;
+        while (it) |obj| : (it = obj.next) {
+            if (obj.kind == .dead) return error.CollectedObjectInList;
+            sum += fixedCharge(obj);
+            var c: Check = .{};
+            forEachChild(obj, &c, Check.edge);
+            if (c.bad) return error.EdgeToCollectedObject;
+        }
+        var atoms = h.atoms.keyIterator();
+        while (atoms.next()) |k| {
+            if (k.*.obj.kind == .dead) return error.AtomTableHoldsCollectedObject;
+            if (k.*.atom == null) return error.AtomTableHoldsNonAtom;
+        }
+        if (sum != h.bytes) return error.AccountingMismatch;
     }
 
     pub fn deinit(h: *Heap) void {
@@ -145,6 +316,11 @@ pub const Heap = struct {
         while (it) |obj| {
             it = obj.next;
             h.destroy(obj);
+        }
+        var t = h.tombstones;
+        while (t) |obj| {
+            t = obj.next;
+            h.freeStruct(obj, if (gc_stress) obj.debug.was else unreachable);
         }
         h.* = undefined;
     }
@@ -173,7 +349,7 @@ pub const Heap = struct {
         const charge = try h.reserve(@sizeOf(Object), 0, 1);
         errdefer h.bytes -= charge;
         const o = try h.gpa.create(Object);
-        o.* = .{ .obj = .{ .kind = .object, .next = h.objects }, .proto = proto };
+        o.* = .{ .obj = h.newHeader(.object), .proto = proto };
         h.objects = &o.obj;
         return o;
     }
@@ -182,6 +358,103 @@ pub const Heap = struct {
         const o = try h.newObject(proto);
         o.kind = .{ .array = .empty };
         return o;
+    }
+
+    // ---- the store API (GC_DESIGN §7, I3)
+    //
+    // After construction, every reference written into a heap object goes through one of
+    // these. Each knows the owner, the old value and the new one: what an insertion barrier
+    // (Dijkstra), a deletion barrier (Yuasa) or a generational remembered set needs. In M8
+    // `barrier` does nothing; tests/gc_test.zig scans the sources for raw stores.
+
+    /// `o[key] = value`: updates an own property in place (keeping its position and
+    /// enumerability) or adds an enumerable one at the end (D13).
+    pub fn storeProperty(h: *Heap, o: *Object, key: *String, value: Value) Error!void {
+        o.obj.checkLive();
+        const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
+        const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
+        if (gop.found_existing) gop.value_ptr.value = value else gop.value_ptr.* = .{ .value = value };
+        h.barrier(&o.obj, old, value);
+    }
+
+    /// Adds or replaces a property with explicit attributes (built-in method tables).
+    pub fn defineProperty(h: *Heap, o: *Object, key: *String, p: Property) Error!void {
+        o.obj.checkLive();
+        const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
+        const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
+        gop.value_ptr.* = p;
+        h.barrier(&o.obj, old, p.value);
+    }
+
+    /// `delete o[key]` for an own property; keeps the others' order (O(n), D13).
+    pub fn removeProperty(h: *Heap, o: *Object, key: *String) void {
+        const old = o.props.get(key) orelse return;
+        _ = o.props.orderedRemove(key);
+        h.barrier(&o.obj, old.value, null);
+    }
+
+    pub fn appendElement(h: *Heap, arr: *Object, value: Value) Error!void {
+        elementsOf(arr).append(h.allocator(), value) catch |e| return h.failed(e);
+        h.barrier(&arr.obj, null, value);
+    }
+
+    pub fn appendElements(h: *Heap, arr: *Object, values: []const Value) Error!void {
+        elementsOf(arr).appendSlice(h.allocator(), values) catch |e| return h.failed(e);
+        for (values) |v| h.barrier(&arr.obj, null, v);
+    }
+
+    /// `arr[i] = value` for an existing element (i < length).
+    pub fn storeElement(h: *Heap, arr: *Object, i: usize, value: Value) void {
+        const slot = &elementsOf(arr).items[i];
+        const old = slot.*;
+        slot.* = value;
+        h.barrier(&arr.obj, old, value);
+    }
+
+    /// Truncates to `len` (≤ length): `arr.length = len`.
+    pub fn shrinkElements(h: *Heap, arr: *Object, len: usize) void {
+        const elements = elementsOf(arr);
+        for (elements.items[len..]) |old| h.barrier(&arr.obj, old, null);
+        elements.shrinkRetainingCapacity(len);
+    }
+
+    pub fn popElement(h: *Heap, arr: *Object) ?Value {
+        const old = elementsOf(arr).pop() orelse return null;
+        h.barrier(&arr.obj, old, null);
+        return old;
+    }
+
+    /// A captured binding's new value (null: back in the TDZ).
+    pub fn storeCell(h: *Heap, c: *Cell, value: ?Value) void {
+        const old = c.value;
+        c.value = value;
+        h.barrier(&c.obj, old, value);
+    }
+
+    /// A tree-walker binding's new value (null: back in the TDZ).
+    pub fn storeEnv(h: *Heap, e: *Env, index: usize, value: ?Value) void {
+        const old = e.values[index];
+        e.values[index] = value;
+        h.barrier(&e.obj, old, value);
+    }
+
+    /// The write barrier: `owner` now holds `new` where it held `old`. A no-op in M8:
+    /// collection is stop-the-world and only at safepoints, so no store can happen during
+    /// one (GC_DESIGN §7). M8.1 (incremental) and M8.2 (generations) change only this.
+    inline fn barrier(h: *Heap, owner: *Obj, old: ?Value, new: ?Value) void {
+        _ = h;
+        _ = old;
+        // Not the barrier's job, but every store passes here: in stress builds, a store
+        // into or of a collected object is caught at the store.
+        owner.checkLive();
+        if (new) |v| checkValue(v);
+    }
+
+    fn elementsOf(arr: *Object) *std.ArrayList(Value) {
+        return switch (arr.kind) {
+            .array => |*elements| elements,
+            .ordinary => unreachable, // only arrays have elements
+        };
     }
 
     /// The atom for `units` (interning it if new).
@@ -240,6 +513,7 @@ pub const Heap = struct {
             h.bytes -= len + per_allocation_overhead;
             return null;
         };
+        h.buffer_bytes += len + per_allocation_overhead;
         return p;
     }
 
@@ -252,6 +526,7 @@ pub const Heap = struct {
             return false;
         }
         if (new_len < memory.len) h.bytes -= memory.len - new_len;
+        h.buffer_bytes = h.buffer_bytes + new_len - memory.len;
         return true;
     }
 
@@ -263,12 +538,14 @@ pub const Heap = struct {
             return null;
         };
         if (new_len < memory.len) h.bytes -= memory.len - new_len;
+        h.buffer_bytes = h.buffer_bytes + new_len - memory.len;
         return p;
     }
 
     fn countFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
         const h: *Heap = @ptrCast(@alignCast(ctx));
         h.bytes -= memory.len + per_allocation_overhead;
+        h.buffer_bytes -= memory.len + per_allocation_overhead;
         h.gpa.rawFree(memory, alignment, ret);
     }
 
@@ -276,7 +553,7 @@ pub const Heap = struct {
         const charge = try h.reserve(@sizeOf(Cell), 0, 1);
         errdefer h.bytes -= charge;
         const c = try h.gpa.create(Cell);
-        c.* = .{ .obj = .{ .kind = .cell, .next = h.objects }, .value = value };
+        c.* = .{ .obj = h.newHeader(.cell), .value = value };
         h.objects = &c.obj;
         return c;
     }
@@ -289,7 +566,7 @@ pub const Heap = struct {
         const captures = try h.gpa.alloc(*Cell, n);
         errdefer h.gpa.free(captures);
         const c = try h.gpa.create(Closure);
-        c.* = .{ .obj = .{ .kind = .closure, .next = h.objects }, .impl = .{ .vm = .{ .proto = proto, .captures = captures } } };
+        c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .vm = .{ .proto = proto, .captures = captures } } };
         h.objects = &c.obj;
         return c;
     }
@@ -298,7 +575,7 @@ pub const Heap = struct {
         const charge = try h.reserve(@sizeOf(Closure), 0, 2); // same charge as a VM closure
         errdefer h.bytes -= charge;
         const c = try h.gpa.create(Closure);
-        c.* = .{ .obj = .{ .kind = .closure, .next = h.objects }, .impl = .{ .tree = .{ .func = func, .env = env } } };
+        c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .tree = .{ .func = func, .env = env } } };
         h.objects = &c.obj;
         return c;
     }
@@ -312,53 +589,111 @@ pub const Heap = struct {
         errdefer h.gpa.free(values);
         @memset(values, null);
         const e = try h.gpa.create(Env);
-        e.* = .{ .obj = .{ .kind = .env, .next = h.objects }, .parent = parent, .scope = scope, .values = values };
+        e.* = .{ .obj = h.newHeader(.env), .parent = parent, .scope = scope, .values = values };
         h.objects = &e.obj;
         return e;
     }
 
-    /// Frees one object and gives its charge back (the same formula as when it was made).
+    /// Frees one object and gives its charge back.
     fn destroy(h: *Heap, obj: *Obj) void {
+        const kind = obj.kind;
+        h.release(obj);
+        h.freeStruct(obj, kind);
+    }
+
+    /// Stress builds: free what a collected object owns and give its charge back, but keep
+    /// its struct as a tombstone, with every payload emptied or poisoned, so a later use is
+    /// a deterministic panic (`checkLive`) or at worst a visibly wrong value, never a read
+    /// of freed memory.
+    fn entomb(h: *Heap, obj: *Obj) void {
+        const kind = obj.kind;
+        h.release(obj);
+        obj.kind = .dead;
+        if (gc_stress) obj.debug.was = kind;
+        obj.marked = false;
+        obj.next = h.tombstones;
+        h.tombstones = obj;
+    }
+
+    /// The charge an object's constructor made for the object itself (its struct and
+    /// fixed-size payload). Buffers that grow are charged separately (`buffer_bytes`).
+    fn fixedCharge(obj: *const Obj) usize {
+        return switch (obj.kind) {
+            .string => @sizeOf(String) + @as(*const String, @alignCast(@fieldParentPtr("obj", obj))).units.len * @sizeOf(u16) + 2 * per_allocation_overhead,
+            .cell => @sizeOf(Cell) + per_allocation_overhead,
+            .closure => switch (@as(*const Closure, @alignCast(@fieldParentPtr("obj", obj))).impl) {
+                .vm => |v| @sizeOf(Closure) + v.captures.len * @sizeOf(*Cell) + 2 * per_allocation_overhead,
+                .tree => @sizeOf(Closure) + 2 * per_allocation_overhead,
+            },
+            .env => @sizeOf(Env) + @as(*const Env, @alignCast(@fieldParentPtr("obj", obj))).values.len * @sizeOf(?Value) + 2 * per_allocation_overhead,
+            .object => @sizeOf(Object) + per_allocation_overhead,
+            .dead => 0,
+        };
+    }
+
+    /// Gives back the charge and frees everything `obj` owns except its struct, leaving
+    /// empty (or poisoned) payloads behind.
+    fn release(h: *Heap, obj: *Obj) void {
+        h.bytes -= fixedCharge(obj);
         switch (obj.kind) {
             .string => {
                 const s: *String = @fieldParentPtr("obj", obj);
-                h.bytes -= @sizeOf(String) + s.units.len * @sizeOf(u16) + 2 * per_allocation_overhead;
                 h.gpa.free(s.units);
-                h.gpa.destroy(s);
+                s.units = &poison_units;
+                s.atom = null;
             },
-            .cell => {
-                const c: *Cell = @fieldParentPtr("obj", obj);
-                h.bytes -= @sizeOf(Cell) + per_allocation_overhead;
-                h.gpa.destroy(c);
-            },
+            .cell => @as(*Cell, @fieldParentPtr("obj", obj)).value = null,
             .closure => {
                 const c: *Closure = @fieldParentPtr("obj", obj);
                 switch (c.impl) {
-                    .vm => |v| {
-                        h.bytes -= @sizeOf(Closure) + v.captures.len * @sizeOf(*Cell) + 2 * per_allocation_overhead;
+                    .vm => |*v| {
                         h.gpa.free(v.captures);
+                        v.captures = &.{};
                     },
-                    .tree => h.bytes -= @sizeOf(Closure) + 2 * per_allocation_overhead,
+                    .tree => |*t| t.env = null,
                 }
-                h.gpa.destroy(c);
             },
             .env => {
                 const e: *Env = @fieldParentPtr("obj", obj);
-                h.bytes -= @sizeOf(Env) + e.values.len * @sizeOf(?Value) + 2 * per_allocation_overhead;
                 h.gpa.free(e.values);
-                h.gpa.destroy(e);
+                e.values = &.{};
+                e.parent = null;
             },
             .object => {
                 const o: *Object = @fieldParentPtr("obj", obj);
                 o.props.deinit(h.allocator()); // refunds through the counting allocator
+                o.props = .empty;
                 switch (o.kind) {
                     .ordinary => {},
                     .array => |*elements| elements.deinit(h.allocator()),
                 }
-                h.bytes -= @sizeOf(Object) + per_allocation_overhead;
-                h.gpa.destroy(o);
+                o.kind = .ordinary;
+                o.proto = null;
             },
+            .dead => unreachable, // tombstones are never released twice
         }
+    }
+
+    fn freeStruct(h: *Heap, obj: *Obj, kind: Obj.Kind) void {
+        switch (kind) {
+            .string => h.gpa.destroy(@as(*String, @fieldParentPtr("obj", obj))),
+            .cell => h.gpa.destroy(@as(*Cell, @fieldParentPtr("obj", obj))),
+            .closure => h.gpa.destroy(@as(*Closure, @fieldParentPtr("obj", obj))),
+            .env => h.gpa.destroy(@as(*Env, @fieldParentPtr("obj", obj))),
+            .object => h.gpa.destroy(@as(*Object, @fieldParentPtr("obj", obj))),
+            .dead => unreachable,
+        }
+    }
+
+    /// A new object's header, linked into the object list (with an allocation number in
+    /// stress builds).
+    fn newHeader(h: *Heap, kind: Obj.Kind) Obj {
+        var o: Obj = .{ .kind = kind, .next = h.objects };
+        if (gc_stress) {
+            h.next_id += 1;
+            o.debug.id = h.next_id;
+        }
+        return o;
     }
 
     /// A new string made of the concatenation of `pieces`.
@@ -386,7 +721,7 @@ pub const Heap = struct {
         };
 
         const s = try h.gpa.create(String);
-        s.* = .{ .obj = .{ .kind = .string, .next = h.objects }, .units = units };
+        s.* = .{ .obj = h.newHeader(.string), .units = units };
         h.objects = &s.obj;
         return s;
     }
@@ -403,6 +738,7 @@ pub const Heap = struct {
         const total = std.math.add(usize, h.bytes, charge) catch return h.exceeded(.heap_bytes);
         if (total > h.max_bytes) return h.exceeded(.heap_bytes);
         h.bytes = total;
+        if (total > h.next_gc) h.collect_requested = true; // collected at the next safepoint
         h.peak = @max(h.peak, total);
         h.allocated += charge;
         return charge;
@@ -419,6 +755,7 @@ pub const Heap = struct {
 pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *Obj) void) void {
     switch (obj.kind) {
         .string => {},
+        .dead => unreachable, // markObj rejects tombstones before they are scanned
         .cell => {
             const c: *Cell = @fieldParentPtr("obj", obj);
             if (c.value) |v| visitValue(v, ctx, visit);
@@ -457,6 +794,16 @@ pub fn visitValue(v: Value, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *Obj
         .string => |s| visit(ctx, @constCast(&s.obj)),
         .closure => |c| visit(ctx, @constCast(&c.obj)),
         .object => |o| visit(ctx, &o.obj),
+    }
+}
+
+/// Panics if `v` is a collected heap object (stress builds; one compare otherwise skipped).
+pub inline fn checkValue(v: Value) void {
+    switch (v) {
+        .string => |x| x.obj.checkLive(),
+        .closure => |x| x.obj.checkLive(),
+        .object => |x| x.obj.checkLive(),
+        .undefined, .null, .boolean, .number, .native => {},
     }
 }
 

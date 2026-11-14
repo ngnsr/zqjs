@@ -12,6 +12,7 @@ const Value = @import("value.zig").Value;
 const rt_mod = @import("runtime.zig");
 const Runtime = rt_mod.Runtime;
 const Error = rt_mod.Error;
+const object = @import("object.zig");
 
 // ------------------------------------------------------------ ToBoolean
 
@@ -21,13 +22,14 @@ pub fn toBoolean(v: Value) bool {
         .boolean => |b| b,
         .number => |n| !(n == 0 or std.math.isNan(n)), // 0, -0 and NaN are falsy
         .string => |s| s.units.len != 0,
-        .native, .closure => true,
+        .native, .closure, .object => true,
     };
 }
 
 // ------------------------------------------------------------ ToNumber
 
-pub fn toNumber(gpa: Allocator, v: Value) Allocator.Error!f64 {
+pub fn toNumber(rt: *Runtime, v: Value) Error!f64 {
+    const gpa = rt.gpa;
     return switch (v) {
         .undefined => std.math.nan(f64),
         .null => 0,
@@ -36,6 +38,7 @@ pub fn toNumber(gpa: Allocator, v: Value) Allocator.Error!f64 {
         .string => |s| stringToNumber(gpa, s.units),
         // ToPrimitive gives the source text, which is never a numeric string.
         .native, .closure => std.math.nan(f64),
+        .object => toNumber(rt, try object.toPrimitive(rt, v, .number)),
     };
 }
 
@@ -202,6 +205,7 @@ pub fn toPiece(rt: *Runtime, v: Value, buf: *NumberBuf) Error!Piece {
         .string => |s| .{ .utf16 = s.units },
         // Node prints the function's source text; ZQJS has none to show (yet).
         .native, .closure => rt.fail(.function_to_string),
+        .object => toPiece(rt, try object.toPrimitive(rt, v, .string), buf),
     };
 }
 
@@ -242,10 +246,10 @@ pub fn remainder(a: f64, b: f64) f64 {
     return @rem(a, b);
 }
 
-/// IsLessThan for primitives: two strings compare by UTF-16 code unit; otherwise both
-/// sides become numbers. null means "undefined" in the spec (a NaN was involved).
+/// IsLessThan for primitives (`binary` converts objects first, in source order): two
+/// strings compare by UTF-16 code unit; otherwise both sides become numbers. null
+/// means "undefined" in the spec (a NaN was involved).
 pub fn lessThan(rt: *Runtime, a: Value, b: Value) Error!?bool {
-    const gpa = rt.gpa;
     if (a == .string and b == .string) return std.mem.order(u16, a.string.units, b.string.units) == .lt;
     // ToPrimitive turns a function into its source text, so against a string (or another
     // function) JS compares that text as a string: `print > 'a'` is true. ZQJS has no
@@ -256,8 +260,8 @@ pub fn lessThan(rt: *Runtime, a: Value, b: Value) Error!?bool {
         }
     }.f;
     if ((a.isFunction() and textual(b)) or (b.isFunction() and textual(a))) return rt.fail(.function_to_string);
-    const x = try toNumber(gpa, a);
-    const y = try toNumber(gpa, b);
+    const x = try toNumber(rt, a);
+    const y = try toNumber(rt, b);
     if (std.math.isNan(x) or std.math.isNan(y)) return null;
     return x < y;
 }
@@ -271,13 +275,22 @@ pub fn strictEquals(a: Value, b: Value) bool {
         .string => |x| std.mem.eql(u16, x.units, b.string.units),
         .native => |x| x == b.native,
         .closure => |x| x == b.closure, // identity
+        .object => |x| x == b.object,
     };
 }
 
 /// All binary operators except `&&`/`||` (which short-circuit, so they are control
 /// flow in the evaluator). Both operands have already been evaluated, left first.
-pub fn binary(rt: *Runtime, op: ast.BinaryOp, a: Value, b: Value) Error!Value {
-    const gpa = rt.gpa;
+pub fn binary(rt: *Runtime, op: ast.BinaryOp, a_in: Value, b_in: Value) Error!Value {
+    // `+` and the relational operators convert objects first, left then right (ToPrimitive
+    // with the default/number hint); the arithmetic ones convert through toNumber.
+    const converts = switch (op) {
+        .add, .lt, .gt, .le, .ge => true,
+        else => false,
+    };
+    // (Tested here rather than inside toPrimitive: the common case stays call-free.)
+    const a = if (converts and a_in == .object) try object.toPrimitive(rt, a_in, .number) else a_in;
+    const b = if (converts and b_in == .object) try object.toPrimitive(rt, b_in, .number) else b_in;
     return switch (op) {
         .add => {
             if (a == .string or b == .string) {
@@ -287,13 +300,14 @@ pub fn binary(rt: *Runtime, op: ast.BinaryOp, a: Value, b: Value) Error!Value {
                 const pb = try toPiece(rt, b, &buf_b);
                 return .{ .string = try rt.heap.newString(&.{ pa, pb }) };
             }
-            return .{ .number = try toNumber(gpa, a) + try toNumber(gpa, b) };
+            return .{ .number = try toNumber(rt, a) + try toNumber(rt, b) };
         },
-        .sub => .{ .number = try toNumber(gpa, a) - try toNumber(gpa, b) },
-        .mul => .{ .number = try toNumber(gpa, a) * try toNumber(gpa, b) },
-        .div => .{ .number = try toNumber(gpa, a) / try toNumber(gpa, b) },
-        .mod => .{ .number = remainder(try toNumber(gpa, a), try toNumber(gpa, b)) },
-        .pow => .{ .number = pow(try toNumber(gpa, a), try toNumber(gpa, b)) },
+        .sub => .{ .number = try toNumber(rt, a) - try toNumber(rt, b) },
+        .mul => .{ .number = try toNumber(rt, a) * try toNumber(rt, b) },
+        .div => .{ .number = try toNumber(rt, a) / try toNumber(rt, b) },
+        .mod => .{ .number = remainder(try toNumber(rt, a), try toNumber(rt, b)) },
+        .pow => .{ .number = pow(try toNumber(rt, a), try toNumber(rt, b)) },
+        .in => .{ .boolean = try object.has(rt, try object.key(rt, a), b) },
         .lt => .{ .boolean = (try lessThan(rt, a, b)) orelse false },
         .gt => .{ .boolean = (try lessThan(rt, b, a)) orelse false },
         .le => .{ .boolean = if (try lessThan(rt, b, a)) |r| !r else false },

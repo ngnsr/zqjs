@@ -19,7 +19,7 @@ const Feature = @import("../frontend/diag.zig").Feature;
 
 pub const Error = error{ Thrown, LimitExceeded, Unsupported, OutOfMemory, WriteFailed };
 
-pub const ErrorName = enum { ReferenceError, TypeError };
+pub const ErrorName = enum { ReferenceError, TypeError, RangeError };
 
 /// A JavaScript exception, until M7 gives us Error objects.
 /// Ownership: `name` is static; `message` is a heap string owned by `Runtime.heap`,
@@ -40,6 +40,12 @@ pub const Runtime = struct {
     steps: u64 = 0,
     exception: ?Exception = null,
     unsupported: ?Feature = null,
+    /// For Unsupported(builtin): which global or member (an atom on the heap).
+    unsupported_name: ?*const heap_mod.String = null,
+    /// The built-in objects, created on first use (builtins.zig).
+    realm: ?@import("builtins.zig").Realm = null,
+    /// Arrays being converted to strings right now (cycle detection, object.join).
+    joining: std.ArrayList(*heap_mod.Object) = .empty,
     limit_hit: ?Limit = null,
 
     pub fn init(gpa: Allocator, limits: Limits, out: *std.Io.Writer) Runtime {
@@ -47,6 +53,7 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(rt: *Runtime) void {
+        rt.joining.deinit(rt.gpa);
         rt.heap.deinit();
         rt.* = undefined;
     }

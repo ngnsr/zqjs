@@ -61,7 +61,7 @@ everywhere else), so NaN-boxing remains a local change. *(planned, M3)*
 the host API convert at the boundary (lone surrogates → U+FFFD on output, as node does).
 A Latin-1 representation can be added later behind the `String` API if memory matters.
 
-## D7. Heap: one allocation interface *(planned, M3/M8; binding from the start)*
+## D7. Heap: one allocation interface *(M3; the counting `allocator()` since M7, D38)*
 **Decision.** `runtime/heap.zig` is the only code that touches the runtime's backing allocator.
 - `heap.new(T) !*T` creates GC objects. **It is the only safe point**: a collection can start
   only inside `heap.new`.
@@ -181,7 +181,7 @@ every pointer use. Rejected for now in favour of: `-Dgc-stress` (collect on *eve
 - every allocation failing once (`checkAllAllocationFailures` over a script run): no leak, no
   crash, temp stack balanced
 
-## D11. Atoms (interned property names) and the weak atom table *(planned, M7/M8)*
+## D11. Atoms (interned property names) and the weak atom table *(atoms M7; the table is strong until M8 makes it weak)*
 **Decision.** Property keys are atoms: interned `String` objects, compared by pointer. The
 intern table is **weak**, so it does not keep atoms alive.
 **How keys stay alive.** Liveness of an atom comes only from strong references: an object's
@@ -209,11 +209,14 @@ intern table, so the table never holds a dangling pointer.
 **Regression tests (M6).** deep recursion that forces several moves; native→JS callback that
 grows the stack, then reads its args; closure created before a move and called after it.
 
-## D13. Object properties: insertion-ordered map + spec key order *(planned, M7)*
+## D13. Object properties: insertion-ordered map + spec key order *(M7)*
 `std.ArrayHashMapUnmanaged(*Atom, Property)` keeps insertion order. `delete` uses
 `orderedRemove` (O(n), acceptable). `ownKeys()` yields array-index keys (canonical numeric
 strings ≤ 2³²−2) ascending, then other string keys in insertion order. No hidden classes.
-Arrays are dense; creating a hole is `Unsupported` (D14).
+Arrays are dense; creating a hole is `Unsupported(sparse_array)` (D14). *M7:* that covers
+`[1,,2]`, a write more than one past the end, `delete a[i]` for an existing element (JS leaves a
+hole, it doesn't shift), and growing `length`; shrinking `length`, `push`/`pop`, appending at
+`a[a.length]` and deleting past the end are fine.
 **Regression tests (M7).** the `{b, a, 1, 0}` example → `0,1,b,a`; `"4294967295"` sorts as a
 string, `"4294967294"` as an index; `"01"` and `"-1"` are strings; delete + re-add moves a key to
 the end.
@@ -581,3 +584,73 @@ every build mode CI tests (Debug and ReleaseSafe).
 native stack in Debug is a lot, and its size depends on the compiler's frame layout. The proper
 fix is an explicit interpreter stack (the walk keeps its own continuation records on the heap),
 which makes memory use predictable and removes the thread. Listed in ROADMAP, Technical debt.
+
+## D38. Objects on the heap, and what the GC will trace *(M7)*
+**Representation.** `Object { proto, props, kind, builtin }`: `props` is an insertion-ordered
+`AutoArrayHashMapUnmanaged(*atom, Property { value, enumerable })` (D13; no hidden classes, no
+shapes, no inline caches); `kind` is ordinary or array (dense `ArrayList(Value)`); `builtin`
+marks the built-in objects for lookup classification (D39). Atoms (D11) are interned Strings
+that cache whether they are a canonical array index; the intern table hashes by content (FNV-1a
+over code units, so ASCII source names and UTF-16 strings find the same atom). Keys are an
+`.index` (0 … 2^32 − 2) or an atom. All semantics live in `runtime/object.zig`, called by both
+engines (D16). Property tables, element lists and the atom table grow through
+`Heap.allocator()`, a counting `std.mem.Allocator` that charges the same `max_heap_bytes` as
+every other allocation (refusal → LimitExceeded via `Heap.failed`).
+**Traceability (M7 acceptance).** Every reference edge is enumerated by `heap.forEachChild`, one
+exhaustive switch over the object kinds, tested per kind; that function is M8's marking.
+
+| from | edges |
+|---|---|
+| Object | prototype; each property's key (atom) and value; array elements |
+| Closure (VM) | captured cells (the Proto is not a heap object yet: a root, below) |
+| Closure (tree-walker) | its environment record |
+| Env | parent record; binding values |
+| Cell | its value |
+| String | none |
+| Value | strings, closures, objects (natives are static, never collected) |
+
+**Roots** (M8 will collect from these): `Runtime.realm` (the eight built-in objects), the atom
+table (weak in M8: D11), `Runtime.exception.message`, `Runtime.unsupported_name`, every Proto's
+string constants (D9), the VM's operand stack, locals (values and cells) and frames (closures,
+`this`), and the tree-walker's current environment, `this` and its Zig locals (the reason
+D10's rooting discipline exists). Built-in objects are created on first use (`builtins.realm`),
+so `Runtime.init` stays infallible.
+
+## D39. Built-ins: implemented, known, nonexistent *(M7)*
+A name can be three things, for globals and for properties of the built-in objects:
+**implemented** (`runtime/builtins.zig`, with behaviour; the only ones that produce values),
+**known** (node has it, ZQJS doesn't implement it: `Unsupported(builtin)`, naming it), or
+**nonexistent** (a ReferenceError for a global, `undefined` for a property). The *known* names
+come from node itself: `tools/gen_builtins.js` lists the own property names of the global object
+and of each modelled built-in (Object/Array/String/Number/Boolean/Function prototypes, the
+`Object` and `Array` constructors), taken from a fresh `vm` context (the environment the goldens
+run in, so no `process`/`require`), into `src/runtime/builtin_names.zig`; `check-goldens`
+verifies it against the node in use. Names alone never provide behaviour. A lookup is classified
+where node would find the name: walking the prototype chain, at each built-in object that lacks
+the key while node has it there, the lookup is Unsupported, even if a later object in the chain
+has something by that name. `in` answers `true` for a known name (node has the property; no
+value is needed). This also closes an M3 hole: `Math.PI` used to be a ReferenceError.
+Implemented in M7: `Object.keys/create/getPrototypeOf`, `Array.isArray`,
+`Object.prototype.toString/valueOf`, `Array.prototype.push/pop/join/toString`,
+`String.prototype.charCodeAt`; calling `Object`/`Array` themselves is Unsupported.
+
+## D40. Conversions use only the built-in methods; no native calls JS *(M7)*
+ToPrimitive looks up `valueOf`/`toString` (string hint: the other way round) as the spec does,
+but only *calls* them if they are the built-in natives (`isConversion`); a user function there,
+or a different native, is `Unsupported(user_conversion)`. `Array.prototype.toString` likewise
+looks up `join` and accepts only the built-in one. So no native ever calls back into JS in M7:
+the VM never re-enters itself, natives' borrowed argument slices stay valid (D12), and
+`NativeCtx` is still not needed. Joining arrays recurses in Zig, bounded by
+`max_conversion_depth`; a cycle prints as empty, as in node. *Alternative:* re-entrant calls
+from natives into JS now, which would make M7 much larger and change the VM's core invariants.
+
+## D41. `this` *(M7)*
+`this` is decided by the call expression, never by where a function is defined: a member call
+`o.f(…)` / `o[k](…)` passes `o`, every other call passes no receiver; reading `this` without
+one is `Unsupported(sloppy_this)` (sloppy JS gives the global object, which ZQJS doesn't have).
+A primitive receiver of a user function is treated the same way (sloppy JS would box it into
+a wrapper object); natives get the primitive as is (`'ab'.charCodeAt(0)`). `this` at script
+level is Unsupported at parse time. So `const f = o.m; f()` and a function nested in a method
+and called plainly both have no receiver; tests cover both on both engines. The receiver is
+evaluated once (the callee is read from it, then the arguments are evaluated): the VM's
+`call_method` takes `[receiver, callee, args…]`.

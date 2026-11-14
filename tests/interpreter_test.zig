@@ -159,6 +159,8 @@ test "error paths: every allocation failing once leaks nothing" {
         "function counter() { let n = 0; return function() { n++; return n; }; } const c = counter(); c(); print(c());",
         "let fs = ''; for (let i = 0; i < 3; i++) { const f = function self(k) { if (k) return self(k - 1); return i; }; fs += f(2); } print(fs);",
         "function f(a, b) { return a + b; } print(f(1), f(1, 2, 3), f('x', print('arg')));",
+        // Objects: literals, keys, prototype chains, methods, arrays, conversions.
+        "let o = { a: 1, [ 'b' + 1 ]: [1, 2], m() { return this.a; } }; o.c = Object.create(o); o.b1.push(o.m()); delete o.a; print(o.b1, Object.keys(o), o.c.m(), [o.b1] + '', 'a' in o.c);",
     };
     for (support.engines) |engine| for (sources) |src|
         try testing.checkAllAllocationFailures(testing.allocator, runOnce, .{ src, engine });
@@ -181,6 +183,10 @@ const corpus = [_][]const u8{
     "const k = 1; function w() { k = 2; } w();",
     "function t() { return later; } t(); let later;",
     "const f = function g(x) { return x ? g(x - 1) + 1 : 0; };",
+    "let o = { a: 1, b: [1, 2, { c: 3 }], m(x) { return this.a + x; } }; o.b.push(o.m(2)); o['a'] += o.b.length; print(o.b, o.a, 'm' in o, delete o.a, Object.keys(o));",
+    "let p = { v: 1 }; let q = Object.create(p); q.w = 2; print(q.v + q.w, [q.v, q.w].join('-'), [] + {}, [3] * [4]);",
+    "let s = 'h\\uD83D\\uDE00'; print(s.length, s.charCodeAt(1), s[2], Object.keys(s));",
+    "let a = [1, 2, 3]; a.length = 1; a[a.length] = 9; print(a, a.pop(), a[0]++, ++a[0], a);",
 };
 
 test "the engines agree on every syntax case and corpus program" {
@@ -242,4 +248,87 @@ test "deep recursion stops cleanly even when the host thread has a tiny stack" {
         };
         try testing.expectEqualStrings(expected, r.err);
     }
+}
+
+/// Runs `source` on both engines and expects the given Unsupported diagnostic (the
+/// feature id, and for `builtin` the member) after `output`.
+fn expectUnsupported(source: []const u8, output: []const u8, diagnostic: []const u8) !void {
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, source, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        testing.expectEqualStrings(output, r.out) catch |e| {
+            std.debug.print("source: {s}\nengine: {s}\n", .{ source, @tagName(engine) });
+            return e;
+        };
+        if (std.mem.indexOf(u8, r.err, diagnostic) == null) {
+            std.debug.print("source: {s}\nengine: {s}\nexpected {s} in: {s}\n", .{ source, @tagName(engine), diagnostic, r.err });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "this: decided by the call; an unbound call or a primitive receiver is Unsupported" {
+    const obj = "const obj = { value: 42, getValue() { return this.value; } }; ";
+    try expectUnsupported(obj ++ "print(obj.getValue()); const fn = obj.getValue; fn();", "42\n", "Unsupported(sloppy_this)");
+    try expectUnsupported("function outer() { function inner() { return this; } return inner(); } print(1); outer();", "1\n", "Unsupported(sloppy_this)");
+    // Not lexical: a nested function called plainly gets no receiver, even inside a method.
+    try expectUnsupported("const o = { m() { const f = function () { return this; }; return f(); } }; o.m();", "", "Unsupported(sloppy_this)");
+    try expectUnsupported("const s = { f() { return this; } }; let g = s.f; g.call;", "", "Unsupported(function_properties)");
+    try expectUnsupported("let o = { f() { return this; } }; let p = 'str'; p.f = o.f;", "", "Unsupported(primitive_write)");
+}
+
+test "holes are Unsupported: arrays stay dense" {
+    try expectUnsupported("let a = [10, 20, 30]; print(delete a[3]); delete a[1];", "true\n", "Unsupported(sparse_array)");
+    try expectUnsupported("let a = [1]; a[1] = 2; print(a); a[5] = 6;", "1,2\n", "Unsupported(sparse_array)");
+    try expectUnsupported("let a = [1, 2]; a.length = 1; print(a); a.length = 3;", "1\n", "Unsupported(sparse_array)");
+}
+
+test "built-ins: known to node but not implemented is Unsupported, naming the member" {
+    try expectUnsupported("print(Math === undefined);", "", "Unsupported(builtin): a built-in node has that ZQJS doesn't implement yet ('Math')");
+    try expectUnsupported("print([1].length); [1].map;", "1\n", "Unsupported(builtin)");
+    try expectUnsupported("[1].map;", "", "('map')");
+    try expectUnsupported("'abc'.toUpperCase;", "", "('toUpperCase')");
+    try expectUnsupported("(1).toFixed;", "", "('toFixed')");
+    try expectUnsupported("Object.assign;", "", "('assign')");
+    try expectUnsupported("Object.name;", "", "('name')");
+    try expectUnsupported("({}).hasOwnProperty;", "", "('hasOwnProperty')");
+    try expectUnsupported("({}).constructor;", "", "('constructor')");
+    try expectUnsupported("console;", "", "('console')");
+    try expectUnsupported("Object({});", "", "Unsupported(builtin)");
+    // Names node doesn't have are plain misses (undefined / ReferenceError), not Unsupported.
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, "print([].nope, ({}).nope, 'x'.nope, Object.nope); nope;", .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("undefined undefined undefined undefined\n", r.out);
+        try testing.expect(std.mem.startsWith(u8, r.err, "Uncaught ReferenceError"));
+    }
+}
+
+test "prototypes can't form a cycle: __proto__ is the only way, and it is Unsupported" {
+    try expectUnsupported("let o = {}; o.__proto__ = o;", "", "('__proto__')");
+    try expectUnsupported("let o = {}; o['__proto__'] = {};", "", "('__proto__')");
+    try expectUnsupported("let o = {}; o.__proto__;", "", "('__proto__')");
+    try expectUnsupported("let o = { __proto__: null };", "", "Unsupported(builtin)");
+    // A computed `['__proto__']` key in a literal is an ordinary own property, as in JS.
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, "let o = { ['__proto__']: 1 }; print(Object.keys(o));", .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("__proto__\n", r.out);
+    }
+}
+
+test "conversions call only the built-in methods" {
+    try expectUnsupported("let o = { toString() { return 'mine'; } }; print('ok'); print(o);", "ok\n", "Unsupported(user_conversion)");
+    try expectUnsupported("let o = { valueOf() { return 1; } }; o + 1;", "", "Unsupported(user_conversion)");
+    try expectUnsupported("let a = [1]; a.join = function () { return 'j'; }; '' + a;", "", "Unsupported(user_conversion)");
+    try expectUnsupported("let o = { toString: print }; '' + o;", "", "Unsupported(user_conversion)");
+    try expectUnsupported("let f = function () {}; f.x = 1;", "", "Unsupported(function_properties)");
+    try expectUnsupported("print.name;", "", "Unsupported(function_properties)");
+}
+
+test "object limits: heap, string length of a join, conversion depth" {
+    try expectLimit("let a = []; while (true) { a.push({ x: a.length }); }", .{ .max_heap_bytes = 1 << 20 }, .heap_bytes);
+    try expectLimit("let o = {}; let i = 0; while (true) { o['k' + i] = i; i++; }", .{ .max_heap_bytes = 1 << 20 }, .heap_bytes);
+    try expectLimit("let a = ['abcdefgh']; while (true) { a.push(a.join()); }", .{ .max_string_length = 1000 }, .string_length);
+    try expectLimit("let d = [1]; for (let i = 0; i < 2000; i++) { d = [d]; } '' + d;", .{}, .conversion_depth);
 }

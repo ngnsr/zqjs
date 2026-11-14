@@ -46,7 +46,8 @@ const rt_mod = @import("../runtime/runtime.zig");
 const Runtime = rt_mod.Runtime;
 const Error = rt_mod.Error;
 const ops = @import("../runtime/ops.zig");
-const globals = @import("../runtime/globals.zig");
+const object = @import("../runtime/object.zig");
+const builtins = @import("../runtime/builtins.zig");
 const BinaryOp = @import("../frontend/ast.zig").BinaryOp;
 const bc = @import("../bytecode/bytecode.zig");
 const Op = bc.Op;
@@ -68,8 +69,11 @@ pub const Frame = struct {
     locals_base: u32,
     /// First of this frame's operands.
     stack_base: u32,
-    /// Index of the callee in the caller's operands: `return` cuts the stack back to it.
-    callee_index: u32,
+    /// Where the result goes in the caller's operands (the callee's slot, or the receiver's
+    /// for a method call): `return` cuts the stack back to it.
+    result_index: u32,
+    /// `this`: the method call's receiver, or null for a call without one (D41).
+    this: ?Value,
     /// The end of the operand region reserved by this frame *or any frame below it*: a
     /// callee's region can end below its caller's, and the stack must keep both.
     stack_end: u32,
@@ -100,7 +104,7 @@ pub const Vm = struct {
         try vm.reserve(script);
         try vm.frames.ensureTotalCapacity(rt.gpa, 1);
         vm.initLocals(script, 0, 0);
-        vm.frames.appendAssumeCapacity(.{ .proto = script, .closure = null, .return_pc = 0, .locals_base = 0, .stack_base = 0, .callee_index = 0, .stack_end = script.max_stack });
+        vm.frames.appendAssumeCapacity(.{ .proto = script, .closure = null, .return_pc = 0, .locals_base = 0, .stack_base = 0, .result_index = 0, .this = null, .stack_end = script.max_stack });
         vm.locals_len = script.slot_count;
         vm.reserved = script.slot_count + script.max_stack;
         return vm;
@@ -148,7 +152,7 @@ pub const Vm = struct {
         const code = p.code;
         const pc = vm.pc;
         if (pc >= code.len) vm.bug("pc outside the code");
-        const op = std.enums.fromInt(Op, code[pc]) orelse vm.bug("invalid opcode");
+        const op = Op.decode(code[pc]) orelse vm.bug("invalid opcode");
         if (op.size() > code.len - pc) vm.bug("instruction runs past the end of the code");
         try vm.rt.step();
         const rt = vm.rt;
@@ -184,9 +188,8 @@ pub const Vm = struct {
                 return vm.constAssignment();
             },
             .get_global => {
-                const n = vm.name(vm.operand(0));
-                const v = globals.lookup(n) orelse return rt.throw(.ReferenceError, &.{ .{ .ascii = n }, .{ .ascii = " is not defined" } });
-                vm.push(v);
+                vm.ensurePush();
+                vm.push(try builtins.global(rt, vm.name(vm.operand(0))));
             },
 
             .new_cell => {
@@ -254,8 +257,87 @@ pub const Vm = struct {
 
             .pop => vm.drop(1),
             .dup => vm.push(vm.peek(0)),
+            .dup2 => {
+                const a = vm.peek(1);
+                const b = vm.peek(0);
+                vm.ensurePush2();
+                vm.push(a);
+                vm.push(b);
+            },
+            .rot3, .rot4 => {
+                const n: u32 = if (op == .rot3) 3 else 4;
+                const t = vm.peek(0);
+                _ = vm.peek(n - 1); // underflow check
+                const at = vm.sp - n;
+                std.mem.copyBackwards(Value, vm.stack[at + 1 .. vm.sp], vm.stack[at .. vm.sp - 1]);
+                vm.stack[at] = t;
+            },
 
-            .add, .sub, .mul, .div, .mod, .pow, .lt, .le, .gt, .ge, .strict_eq, .strict_ne => {
+            // ---- objects: compute first (any of these can fail), then commit
+            .new_object => {
+                vm.ensurePush();
+                const o = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
+                vm.push(.{ .object = o });
+            },
+            .new_array => {
+                const n = vm.operand(0);
+                if (n > vm.sp - vm.frame().stack_base) vm.bug("stack underflow");
+                const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
+                arr.kind.array.appendSlice(rt.heap.allocator(), vm.stack[vm.sp - n .. vm.sp]) catch |e| return rt.heap.failed(e);
+                vm.sp -= n;
+                vm.push(.{ .object = arr });
+            },
+            .define_prop => {
+                const o = vm.peek(1);
+                if (o != .object) vm.bug("define on a non-object");
+                try object.define(rt, o.object, try object.named(rt, vm.name(vm.operand(0))), vm.peek(0));
+                vm.drop(1);
+            },
+            .define_elem => {
+                const o = vm.peek(2);
+                if (o != .object) vm.bug("define on a non-object");
+                try object.define(rt, o.object, try object.key(rt, vm.peek(1)), vm.peek(0));
+                vm.drop(2);
+            },
+            .get_prop => {
+                const r = try object.get(rt, vm.peek(0), try object.named(rt, vm.name(vm.operand(0))));
+                vm.top().* = r;
+            },
+            .get_elem => {
+                const k = try object.key(rt, vm.peek(0));
+                const r = try object.get(rt, vm.peek(1), k);
+                vm.drop(1);
+                vm.top().* = r;
+            },
+            .set_prop => {
+                const v = vm.peek(0);
+                try object.set(rt, vm.peek(1), try object.named(rt, vm.name(vm.operand(0))), v);
+                vm.drop(1);
+                vm.top().* = v;
+            },
+            .set_elem => {
+                const v = vm.peek(0);
+                const k = try object.key(rt, vm.peek(1)); // after the value: JS's order for `=`
+                try object.set(rt, vm.peek(2), k, v);
+                vm.drop(2);
+                vm.top().* = v;
+            },
+            .delete_prop => {
+                const r = try object.delete(rt, vm.peek(0), try object.named(rt, vm.name(vm.operand(0))));
+                vm.top().* = .{ .boolean = r };
+            },
+            .delete_elem => {
+                const k = try object.key(rt, vm.peek(0));
+                const r = try object.delete(rt, vm.peek(1), k);
+                vm.drop(1);
+                vm.top().* = .{ .boolean = r };
+            },
+            .push_this => {
+                vm.ensurePush();
+                vm.push(vm.frame().this orelse return rt.fail(.sloppy_this));
+            },
+
+            .add, .sub, .mul, .div, .mod, .pow, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in => {
                 const r = try ops.binary(rt, binaryOp(op), vm.peek(1), vm.peek(0)); // into a local (see .neg)
                 vm.drop(1);
                 vm.top().* = r;
@@ -266,8 +348,8 @@ pub const Vm = struct {
             .neg, .to_number, .not => {
                 const v = vm.peek(0);
                 const r: Value = switch (op) {
-                    .neg => .{ .number = -(try ops.toNumber(rt.gpa, v)) },
-                    .to_number => .{ .number = try ops.toNumber(rt.gpa, v) },
+                    .neg => .{ .number = -(try ops.toNumber(rt, v)) },
+                    .to_number => .{ .number = try ops.toNumber(rt, v) },
                     .not => .{ .boolean = !ops.toBoolean(v) },
                     else => unreachable,
                 };
@@ -285,22 +367,28 @@ pub const Vm = struct {
                 vm.drop(1);
                 if (truthy == (op == .jump_if_true)) next = vm.target();
             },
-            .call => {
-                // Stack: [callee, arg0 … arg(argc-1)], arguments in source order.
+            .call, .call_method => {
+                // Stack: [callee, args…] or [receiver, callee, args…], arguments in source
+                // order. The result replaces the whole group, from `base`.
                 const argc = vm.operand(0);
-                if (argc >= vm.sp - vm.frame().stack_base) vm.bug("stack underflow");
-                const base = vm.sp - argc - 1;
-                switch (vm.stack[base]) {
+                const group = argc + @as(u32, if (op == .call_method) 2 else 1);
+                if (group > vm.sp - vm.frame().stack_base) vm.bug("stack underflow");
+                const base = vm.sp - group;
+                const args = vm.sp - argc;
+                const receiver: ?Value = if (op == .call_method) vm.stack[base] else null;
+                switch (vm.stack[args - 1]) {
                     // The native *borrows* the argument slice: valid only during the call; it
                     // cannot call back into JS, so the stack cannot move under it. If it fails,
                     // nothing has been popped: the stack is still a valid pre-call state.
                     .native => |n| {
-                        const result = try n.call(rt, vm.stack[base + 1 .. vm.sp]);
+                        const result = try n.call(rt, receiver orelse .undefined, vm.stack[args..vm.sp]);
                         vm.stack[base] = result;
                         vm.sp = base + 1;
                     },
                     .closure => |c| {
-                        try vm.enter(c, base, argc, next);
+                        // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
+                        const this: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
+                        try vm.enter(c, base, args, argc, next, this);
                         return .running; // pc is the callee's 0
                     },
                     else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
@@ -312,8 +400,8 @@ pub const Vm = struct {
                 const f = vm.frames.pop().?;
                 vm.locals_len = f.locals_base;
                 vm.reserved -= f.proto.slot_count + f.proto.max_stack;
-                vm.sp = f.callee_index;
-                vm.stack[vm.sp] = v; // replaces the callee; arguments and callee operands are gone
+                vm.sp = f.result_index;
+                vm.stack[vm.sp] = v; // replaces the callee (and receiver); arguments and callee operands are gone
                 vm.sp += 1;
                 vm.pc = f.return_pc;
                 return .running;
@@ -332,9 +420,10 @@ pub const Vm = struct {
 
     // ---- calls
 
-    /// Enters closure `c`, whose callee slot is `stack[base]` with `argc` arguments above
-    /// it. Transactional: everything that can fail happens before anything is committed.
-    fn enter(vm: *Vm, c: *const Closure, base: u32, argc: u32, return_pc: u32) Error!void {
+    /// Enters closure `c`: its `argc` arguments start at `stack[args]`, and the result will
+    /// replace everything from `stack[base]`. Transactional: everything that can fail
+    /// happens before anything is committed.
+    fn enter(vm: *Vm, c: *const Closure, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value) Error!void {
         const v = switch (c.impl) {
             .vm => |v| v,
             .tree => vm.bug("a tree-walker closure in the VM"),
@@ -348,7 +437,7 @@ pub const Vm = struct {
         try vm.frames.ensureUnusedCapacity(vm.rt.gpa, 1);
         try vm.reserve(callee);
         // 3. the callee's locals, above locals_len (not live yet, so nothing visible changes)
-        vm.initLocals(callee, base + 1, argc);
+        vm.initLocals(callee, args, argc);
         // 4. commit
         vm.frames.appendAssumeCapacity(.{
             .proto = callee,
@@ -356,7 +445,8 @@ pub const Vm = struct {
             .return_pc = return_pc,
             .locals_base = vm.locals_len,
             .stack_base = vm.sp,
-            .callee_index = base,
+            .result_index = base,
+            .this = this,
             .stack_end = vm.stackEnd(callee),
         });
         vm.locals_len += callee.slot_count;
@@ -459,6 +549,10 @@ pub const Vm = struct {
         if (vm.sp >= vm.frame().stack_base + vm.proto().max_stack or vm.sp >= vm.stack.len) vm.bug("stack overflow");
     }
 
+    fn ensurePush2(vm: *const Vm) void {
+        if (vm.sp + 1 >= vm.frame().stack_base + vm.proto().max_stack or vm.sp + 1 >= vm.stack.len) vm.bug("stack overflow");
+    }
+
     fn push(vm: *Vm, v: Value) void {
         vm.ensurePush();
         vm.stack[vm.sp] = v;
@@ -508,6 +602,7 @@ fn binaryOp(op: Op) BinaryOp {
         .ge => .ge,
         .strict_eq => .strict_eq,
         .strict_ne => .strict_ne,
+        .in => .in,
         else => unreachable,
     };
 }

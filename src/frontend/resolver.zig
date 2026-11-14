@@ -281,14 +281,33 @@ const Resolver = struct {
             },
             .assign => |a| {
                 try r.expr(a.value);
-                try r.target(a.target);
+                try r.assignTarget(a.target);
             },
-            .update => |u| try r.target(u.target),
+            .update => |u| try r.assignTarget(u.target),
+            .member, .delete => |m| try r.member(m),
+            .object => |props| for (props) |prop| {
+                if (prop.key == .computed) try r.expr(prop.key.computed);
+                try r.expr(prop.value);
+            },
+            .array => |items| for (items) |item| try r.expr(item),
+            .this => {},
             .call => |c| {
                 try r.expr(c.callee);
                 for (c.args) |arg| try r.expr(arg);
             },
             .function => |f| try r.function(f),
+        }
+    }
+
+    fn member(r: *Resolver, m: ast.Member) Error!void {
+        try r.expr(m.object);
+        if (m.key == .computed) try r.expr(m.key.computed);
+    }
+
+    fn assignTarget(r: *Resolver, t: ast.Target) Error!void {
+        switch (t) {
+            .ref => |ref| try r.target(ref),
+            .member => |m| try r.member(m),
         }
     }
 

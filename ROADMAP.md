@@ -12,7 +12,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | 4 | Bytecode compiler, constant pool, `max_stack`, verifier, disassembler | **done** |
 | 5 | Stack VM with `step()` / `--trace`, instruction budget | **done** |
 | 6 | Functions, cells/closures, growable stack, call-depth limit | **done** |
-| 7 | Objects, arrays, atoms, ordered properties, prototypes | – |
+| 7 | Objects, arrays, atoms, ordered properties, prototypes | **done** |
 | 8 | Mark-and-sweep GC, temp roots, stress modes, heap limit | – |
 | 9 | Embedding API (handles, `NativeCtx`), then C ABI | – |
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | – |
@@ -26,6 +26,8 @@ Known shortcuts, each with the decision that explains it and what would replace 
 | tree-walker on its own 64 MiB thread (~14.5 MB of native stack in Debug at the depth limit) | D37, `src/interp/treewalk.zig` | an explicit interpreter stack: continuation records on the heap, no native recursion | when the tree-walker's memory or thread matters (embedding it), or before M10's benchmarks |
 | tree-walker allocates every string literal on every evaluation | D30 | the VM's constant pool already fixes it; the oracle stays simple | not planned |
 | VM panics on a failed defensive check instead of returning an internal error | D35 | an internal-error result, if an embedder needs to survive a VM bug | M9 (embedding API) |
+| VM ~10-19% slower than at M6 on the M6 workloads (same steps), cause outside the VM loop | bench/baseline.txt, M7 notes below | profile the shared paths (ops, runtime layout) | before M10's benchmarks |
+| property names interned (hashed) on every access by name | `object.named` | atoms in the constant pool, then inline caches if benchmarks justify | M10 |
 
 ## Required regression tests by milestone
 
@@ -60,7 +62,6 @@ Surrogates: concatenating two lone halves gives one pair, printing a lone surrog
 from node for Number→String (3,183 values), String→Number and `+ - * / % **` on special values.
 Limits: step budget on loops, straight-line code and deep expressions; heap and string limits;
 allocation failure at every point; fuzzing of whole runs.
-**M7:** `length` and `charCodeAt` on strings with surrogates.
 **M5 (done):** the tree-walker is the oracle for the VM.
 - every `tests/diff` program on both engines equals node's output (incl. the const/TDZ order
   programs and `unary_strings.js`, a regression test for a result-location aliasing bug)
@@ -123,7 +124,41 @@ hashes results per target for portability checks.
 - allocation failure at every point with closures, cells, calls and per-iteration copies
 - moved to the milestone that adds the first native able to call JS (with `NativeCtx`, D12): a
   native→JS callback that grows the stack, then reads its arguments
-**M7:** property order: `0,1,b,a` example, `"4294967295"` vs `"4294967294"`, `"01"`, `"-1"`,
-delete + re-add.
+**M7 (done):** every item on both engines; (node) = a `tests/diff` program.
+- evaluation order (node): base and computed key exactly once for `op=`, prefix/postfix `++`/`--`
+  on named and computed members, plain assignment (base, key, right-hand side), computed
+  literal keys (key then value), method calls keeping their receiver; key conversion after the
+  right-hand side for `=` (a throwing key converts after `rhs` printed)
+- objects (node): key order `0,1,2,b,a`; `"4294967294"` an index, `"4294967295"`, `"01"`, `"-1"`,
+  `"1.5"` strings; delete + re-add moves to the end; number keys (`-0`, `1e21`); keywords as
+  names; shorthand, methods, duplicate keys; `in`, `delete`
+- arrays (node): index, length, append at the end, push/pop/join, truncation, nested arrays,
+  named properties on arrays, cycles; RangeError for an invalid length; Unsupported for holes
+  (`[1,,2]`, `delete a[1]`, writes past the end, growing length)
+- prototypes (node): inherited reads, own writes, `in` along the chain, `Object.keys` own only,
+  null prototypes, built-in methods not enumerable; no cycles (`__proto__` Unsupported)
+- `this` (node + Unsupported cases): receiver of the call, not of the definition; a method
+  borrowed by another object; a function nested in a method; native methods with a receiver;
+  `const f = o.m; f()` and a plain inner call are `Unsupported(sloppy_this)`
+- primitives (node): string `length`, `s[i]`, `charCodeAt` in UTF-16 code units with a surrogate
+  pair; properties of numbers/booleans/strings via their prototypes
+- conversions (node): `String`, `+`, `<` and keys of objects and arrays; user toString/valueOf/
+  join are `Unsupported(user_conversion)`
+- built-ins: implemented ones work; known ones are `Unsupported(builtin)` naming the member
+  (`Math`, `[].map`, `'x'.toUpperCase`, `Object.assign`, `Object.name`, `constructor`,
+  `hasOwnProperty`, `console`); unknown names stay `undefined` / ReferenceError; the inventory is
+  node-generated and checked by `check-goldens`
+- limits: heap (objects, properties, elements), string length of a join, conversion depth
+- GC traceability: `forEachChild` enumerates every edge of every kind (unit test per kind)
+- grammar: 38 node-checked syntax cases (literals, members, accessors and spread Unsupported,
+  `?.`, `delete x`, `for…in` still Unsupported while `in` works elsewhere)
+- verifier rules for the new instructions; bytecode snapshot `objects.js`; allocation failure
+  with objects; differential fuzzing corpus with objects
+- benchmarks: `objects.js`, `arrays.js` added; the six M6 workloads unchanged (steps identical;
+  only `strings.js` allocates more: string headers now carry atom data). The VM *time* had
+  regressed ~3×: `std.enums.fromInt` (a linear search) decoded every opcode, and `Op.info`
+  (a big switch) ran on every instruction; both became table lookups, recovering most of it.
+  ~10-19% remains vs M6, measured with both builds back to back; it is outside the VM loop
+  (removing the new VM instructions doesn't change it). Listed under Technical debt.
 **M8:** GC rooting and atom lifetime: the targeted stress tests in DESIGN_DECISIONS D10 and
 D11. Whole suite under `-Dgc-stress`. OOM injection over script runs.

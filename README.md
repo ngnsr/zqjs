@@ -50,7 +50,8 @@ engines, each run with a fresh runtime and heap. `steps` and the heap columns ar
 deterministic (identical on every machine, and checked identical across runs): `allocated` is
 the cumulative volume charged, `peak` the highest live total, `end` what is live at the end
 (equal until the M8 GC frees memory during a run). `median ms` only compares on the same
-machine. `bench/baseline.txt` is the baseline at the end of M6 (commit abbf773, Apple M4);
+machine. `bench/baseline.txt` is the current baseline (Apple M4; the six M6 workloads plus
+`objects.js` and `arrays.js` from M7); the M6 reference point is commit abbf773;
 rerun and diff it before and after a change: a change in steps or heap means different work, a
 change in time alone means the same work got faster or slower.
 

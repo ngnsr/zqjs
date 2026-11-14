@@ -94,6 +94,7 @@ pub fn build(b: *std.Build) void {
         &.{ "node", "tests/harness/check_syntax_cases.js", "tests/syntax/cases.jsonl" },
         &.{ "node", "tests/harness/golden.js", "--check" },
         &.{ "node", "tools/gen_pow_data.js", "--check" },
+        &.{ "node", "tools/gen_builtins.js", "--check" },
         &.{ "python3", "-I", "tools/pow_reference.py", "--check" },
     }) |argv| {
         const cmd = b.addSystemCommand(argv);

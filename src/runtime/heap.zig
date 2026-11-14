@@ -18,6 +18,12 @@
 //! GC traceability (M7 acceptance, DESIGN_DECISIONS D38): `forEachChild` enumerates
 //! every reference from a heap object to another, for every kind. M8's marking is that
 //! enumeration; a kind added without updating it fails the exhaustive switch.
+//!
+//! Reference stores (M8, DESIGN_DECISIONS D8/I3): after construction, every reference
+//! written into a heap object goes through the `store*`/`append*` functions below, so a
+//! later write barrier (incremental marking, generations) has one place to hook into. In
+//! M8 the barrier is a no-op: collection is stop-the-world and only at safepoints, so no
+//! store can happen during a collection. `tests/gc_test.zig` greps for raw stores.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -182,6 +188,99 @@ pub const Heap = struct {
         const o = try h.newObject(proto);
         o.kind = .{ .array = .empty };
         return o;
+    }
+
+    // ---- the store API (GC_DESIGN §7, I3)
+    //
+    // After construction, every reference written into a heap object goes through one of
+    // these. Each knows the owner, the old value and the new one: what an insertion barrier
+    // (Dijkstra), a deletion barrier (Yuasa) or a generational remembered set needs. In M8
+    // `barrier` does nothing; tests/gc_test.zig scans the sources for raw stores.
+
+    /// `o[key] = value`: updates an own property in place (keeping its position and
+    /// enumerability) or adds an enumerable one at the end (D13).
+    pub fn storeProperty(h: *Heap, o: *Object, key: *String, value: Value) Error!void {
+        const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
+        const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
+        if (gop.found_existing) gop.value_ptr.value = value else gop.value_ptr.* = .{ .value = value };
+        h.barrier(&o.obj, old, value);
+    }
+
+    /// Adds or replaces a property with explicit attributes (built-in method tables).
+    pub fn defineProperty(h: *Heap, o: *Object, key: *String, p: Property) Error!void {
+        const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
+        const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
+        gop.value_ptr.* = p;
+        h.barrier(&o.obj, old, p.value);
+    }
+
+    /// `delete o[key]` for an own property; keeps the others' order (O(n), D13).
+    pub fn removeProperty(h: *Heap, o: *Object, key: *String) void {
+        const old = o.props.get(key) orelse return;
+        _ = o.props.orderedRemove(key);
+        h.barrier(&o.obj, old.value, null);
+    }
+
+    pub fn appendElement(h: *Heap, arr: *Object, value: Value) Error!void {
+        elementsOf(arr).append(h.allocator(), value) catch |e| return h.failed(e);
+        h.barrier(&arr.obj, null, value);
+    }
+
+    pub fn appendElements(h: *Heap, arr: *Object, values: []const Value) Error!void {
+        elementsOf(arr).appendSlice(h.allocator(), values) catch |e| return h.failed(e);
+        for (values) |v| h.barrier(&arr.obj, null, v);
+    }
+
+    /// `arr[i] = value` for an existing element (i < length).
+    pub fn storeElement(h: *Heap, arr: *Object, i: usize, value: Value) void {
+        const slot = &elementsOf(arr).items[i];
+        const old = slot.*;
+        slot.* = value;
+        h.barrier(&arr.obj, old, value);
+    }
+
+    /// Truncates to `len` (≤ length): `arr.length = len`.
+    pub fn shrinkElements(h: *Heap, arr: *Object, len: usize) void {
+        const elements = elementsOf(arr);
+        for (elements.items[len..]) |old| h.barrier(&arr.obj, old, null);
+        elements.shrinkRetainingCapacity(len);
+    }
+
+    pub fn popElement(h: *Heap, arr: *Object) ?Value {
+        const old = elementsOf(arr).pop() orelse return null;
+        h.barrier(&arr.obj, old, null);
+        return old;
+    }
+
+    /// A captured binding's new value (null: back in the TDZ).
+    pub fn storeCell(h: *Heap, c: *Cell, value: ?Value) void {
+        const old = c.value;
+        c.value = value;
+        h.barrier(&c.obj, old, value);
+    }
+
+    /// A tree-walker binding's new value (null: back in the TDZ).
+    pub fn storeEnv(h: *Heap, e: *Env, index: usize, value: ?Value) void {
+        const old = e.values[index];
+        e.values[index] = value;
+        h.barrier(&e.obj, old, value);
+    }
+
+    /// The write barrier: `owner` now holds `new` where it held `old`. A no-op in M8:
+    /// collection is stop-the-world and only at safepoints, so no store can happen during
+    /// one (GC_DESIGN §7). M8.1 (incremental) and M8.2 (generations) change only this.
+    inline fn barrier(h: *Heap, owner: *Obj, old: ?Value, new: ?Value) void {
+        _ = h;
+        _ = owner;
+        _ = old;
+        _ = new;
+    }
+
+    fn elementsOf(arr: *Object) *std.ArrayList(Value) {
+        return switch (arr.kind) {
+            .array => |*elements| elements,
+            .ordinary => unreachable, // only arrays have elements
+        };
     }
 
     /// The atom for `units` (interning it if new).

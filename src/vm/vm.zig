@@ -216,10 +216,10 @@ pub const Vm = struct {
             .set_cell => {
                 const c = vm.cellAt(vm.operand(0));
                 if (c.value == null) return vm.tdz(vm.operand(1));
-                c.value = vm.peek(0);
+                rt.heap.storeCell(c, vm.peek(0));
             },
             .init_cell => {
-                vm.cellAt(vm.operand(0)).value = vm.peek(0);
+                rt.heap.storeCell(vm.cellAt(vm.operand(0)), vm.peek(0));
                 vm.drop(1);
             },
             .assign_const_cell => {
@@ -233,7 +233,7 @@ pub const Vm = struct {
             .set_capture => {
                 const c = vm.capture(vm.operand(0));
                 if (c.value == null) return vm.tdz(vm.operand(1));
-                c.value = vm.peek(0);
+                rt.heap.storeCell(c, vm.peek(0));
             },
             .assign_const_capture => {
                 if (vm.capture(vm.operand(0)).value == null) return vm.tdz(vm.operand(1));
@@ -283,7 +283,7 @@ pub const Vm = struct {
                 const n = vm.operand(0);
                 if (n > vm.sp - vm.frame().stack_base) vm.bug("stack underflow");
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
-                arr.kind.array.appendSlice(rt.heap.allocator(), vm.stack[vm.sp - n .. vm.sp]) catch |e| return rt.heap.failed(e);
+                try rt.heap.appendElements(arr, vm.stack[vm.sp - n .. vm.sp]);
                 vm.sp -= n;
                 vm.push(.{ .object = arr });
             },

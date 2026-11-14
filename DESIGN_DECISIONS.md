@@ -61,65 +61,60 @@ everywhere else), so NaN-boxing remains a local change. *(planned, M3)*
 the host API convert at the boundary (lone surrogates → U+FFFD on output, as node does).
 A Latin-1 representation can be added later behind the `String` API if memory matters.
 
-## D7. Heap: one allocation interface *(M3; the counting `allocator()` since M7, D38)*
-**Decision.** `runtime/heap.zig` is the only code that touches the runtime's backing allocator.
-- `heap.new(T) !*T` creates GC objects. **It is the only safe point**: a collection can start
-  only inside `heap.new`.
-- `heap.allocator()` is a counting `std.mem.Allocator` for object-internal buffers (property
-  tables, string data, array elements). It counts bytes and enforces the heap limit but
-  **never collects**.
+## D7. Heap: one allocation interface *(M3; counting `allocator()` M7; revised for M8, GC_DESIGN §5)*
+**Decision.** `runtime/heap.zig` is the only code that allocates runtime objects or touches the
+runtime's backing allocator for them: the `new*` constructors for heap objects, and
+`heap.allocator()`, a counting `std.mem.Allocator` for object-internal buffers (property tables,
+element lists, the atom table), which charges the same `max_heap_bytes` (D28, D38).
+**Revised for M8: allocation never collects.** The original plan made `heap.new` the only
+safepoint, so any allocation could run a collection. M8 instead collects only at *safepoints*
+(the start of a VM instruction, the start of a tree-walker evaluation; D8). An allocation only
+adds to the allocation debt: past `next_gc` it sets `collect_requested`, and the next safepoint
+collects. *Why:* with collection inside allocation, every heap pointer held in a Zig local across
+any allocation needs a temporary root: dozens of sites in `object.zig`, `join`, every native,
+both engines and the compiler, each a use-after-free when missed. Safepoint-only collection
+leaves exactly one place that holds values across a safepoint: the tree-walker (D10).
+*Cost:* garbage made within one step can't be collected before the step ends (bounded; D8).
 
-`Runtime` exposes no raw allocator. `zig build check` greps for raw allocator use outside
-`heap.zig`.
-**Why.** When the GC arrives, every allocation is already accounted for, and "can a GC happen
-here?" has a one-line answer: *only if `heap.new` can be reached.*
+## D8. GC: non-moving, precise, stop-the-world mark-and-sweep, at safepoints *(M8; GC_DESIGN)*
+**The safepoint contract.** No collection can occur during instruction execution (or during a
+tree-walker evaluation step): every GC-managed reference an instruction needs is either
+reachable from the root set at the safepoint that started it, or was allocated after that
+safepoint. An instruction may therefore hold heap pointers in Zig locals freely.
+**Object header.** `Obj { kind, next, marked, gray_next }` (+8 bytes per object): `next` links
+every object (the sweep list), `gray_next` the gray worklist (D9). Every constructor leaves the
+object fully traceable before returning.
+**Phases.** At a safepoint with `collect_requested` (or forced: tests, `-Dgc-stress`): mark the
+roots; drain the gray list through `heap.forEachChild` (D38); remove unmarked atoms from the
+atom table (D11); sweep the object list, destroying unmarked objects and clearing survivors'
+marks; schedule `next_gc = clamp(live × 2, 256 KiB, limit − limit/8)`; update the statistics
+(`collections`, bytes freed, live after, `marked`, `swept`: deterministic work units, no clock).
+**Roots** (GC_DESIGN §4): `Runtime.realm`, `exception.message`, `unsupported_name`; the registered
+Proto tree being run (its string constants; Protos are not heap objects); the VM's operand stack,
+locals (values and cells) and frames (closure, `this`); the tree-walker's shadow stack, current
+environment, `this` and pending return value; host handles (M9). The atom table is not a root.
+**Compiler.** It runs before execution, with no safepoint inside, so its constants need no GC
+pause and no rooting; `runSource` registers the finished Proto tree before running it.
+**Heap limit.** `max_heap_bytes` counts live data plus garbage not yet collected; collections are
+requested an eighth of the limit early. *Acknowledged limitation:* because allocation never
+collects, one step that allocates more than the remaining headroom can fail with
+LimitExceeded(heap_bytes) although collectable garbage exists; the guarantee is "live +
+headroom + one step's allocation". Accepted for M8 (GC_DESIGN §5); an instruction-level
+collect-and-retry belongs to M8.1, not collection inside allocation.
+**Barriers.** Every reference store into an existing heap object goes through the heap's store
+API (`storeProperty`, `defineProperty`, `removeProperty`, `appendElement(s)`, `storeElement`,
+`shrinkElements`, `popElement`, `storeCell`, `storeEnv`), each knowing owner, old and new value;
+`tests/gc_test.zig` scans the sources for raw stores. The barrier is a no-op in M8 (no store can
+happen during a stop-the-world collection); M8.1 (incremental) and M8.2 (generations) change only
+what it does (GC_DESIGN §7, §13).
+**Debug and stress.** `-Dgc-stress` collects at *every* safepoint (never less often: a lower
+frequency hides exactly the missing roots it exists to find). Zombie mode keeps freed objects
+as poisoned tombstones (`kind = .dead`) that every accessor rejects; a heap verifier runs after
+each collection. Both in CI.
+*Not planned:* moving or compacting (M8.3 research), finalizers, concurrent marking (later, if
+benchmarks justify it).
 
-## D8. GC: non-moving, precise, stop-the-world mark-and-sweep *(planned, M8)*
-**Object header.** `Obj { kind, marked, next: ?*Obj, gray_next: ?*Obj }`. `next` links every
-live object (the sweep list). `gray_next` links the gray worklist (D9).
-
-**`heap.new(T)`:**
-1. If `bytes_allocated + size > next_gc` (or `-Dgc-stress`), collect.
-2. If still over `Limits.max_heap_bytes` → `error.LimitExceeded`.
-3. Allocate, **initialise every field to a traceable state** (empty maps, `undefined` values,
-   null pointers), link into `next`.
-
-*Invariant:* every object in the list is traceable at all times, so a failed allocation halfway
-through a larger construction never leaves a half-initialised object for the GC to trip over.
-
-**Roots.** VM value stack `[0..sp]`; frames (closure of each frame); `vm.exception`; global
-object; the *permanent atom set* (`rt.atoms.common`, e.g. `"length"`, `"prototype"`); the
-temporary-root stack (D10a); host handles (`rt.persist`). The weak atom table is **not** a
-root (D11).
-
-**Compiler-created values.** GC is paused (`heap.pause()`/`defer heap.unpause()`) for the
-whole compilation. Constants and nested protos therefore can't be collected while they are only
-referenced from compiler state. The finished proto is returned to the caller, who must root it
-before the next `heap.new`. *Trade-off:* compile-time garbage lives until compilation ends, which
-is acceptable; the alternative (registering compiler state as roots, as clox does) adds rooting
-obligations to the most complex code.
-
-**Tracing rules.**
-
-| type | marks |
-|---|---|
-| String | nothing |
-| Object | prototype; for each property: **key atom and value** |
-| Array | elements; plus Object rules for named properties |
-| FunctionProto | every constant (strings, numbers, nested protos), property-name atoms used by bytecode, name |
-| Closure | proto, every cell |
-| Cell | value |
-| NativeFunction | name atom, optional `data: Value` |
-
-**Sweep.** (1) remove unmarked strings from the weak atom table, (2) walk `next`, `deinit` +
-free unmarked objects, clear marks on survivors, (3) `next_gc = max(live * 2, min_gc)`, capped
-at the heap limit.
-
-**Debug-only checks.** Freed objects are poisoned (`kind = .freed`, body `0xAA`) and every
-`obj.as(T)` asserts the kind. `heap.verify()` (runs after each collection in stress mode)
-re-walks the roots and asserts every reachable pointer is in the `next` list and not freed.
-
-## D9. GC worklist: intrusive gray list, no allocation during GC
+## D9. GC worklist: intrusive gray list, no allocation during GC *(M8, unchanged by the M8 review)*
 The collector must never fail halfway through marking.
 
 | option | extra memory | can fail during GC? | complexity |
@@ -137,65 +132,49 @@ no recursion, so neither OOM nor deep structures can break marking.
 **Cost.** 8 bytes per object (header 24 B instead of 16 B). We accept it for a guarantee that is
 obvious by construction.
 
-## D10. Rooting discipline *(planned, M3–M8; applies to all runtime code)*
-**Invariant.** *A GC pointer held in a Zig local (or any non-root location) across a call that
-may reach `heap.new` must be reachable from a root at the time of that call.*
-A function "may collect" if it takes `*Heap`, `*Runtime` or `*VM` and allocates directly or
-transitively. Functions that cannot collect take no heap parameter.
+## D10. Rooting discipline *(revised for M8: GC_DESIGN §4, §5)*
+**Invariant.** At a safepoint, every value the program can still use is reachable from a root.
+Because collection happens only at safepoints (D7, D8), this has to be arranged in exactly two
+places:
+- **The VM:** by construction. Every live value sits in its operand stack, locals or frames,
+  which are roots, at each instruction start. Natives, `object.zig`, the compiler and the
+  verifier contain no safepoint, so they need no rooting at all; whatever they allocate is
+  returned into the VM's stacks or is garbage.
+- **The tree-walker:** it holds values in Zig locals while it recurses into sub-evaluations,
+  which contain safepoints. Each such value (or environment record) is pushed on its shadow
+  stack before the sub-evaluation and popped with `defer`, so the stack is balanced on every
+  exit path: normal return, Thrown, Unsupported, LimitExceeded and allocation failure. The ~15
+  sites are listed in GC_DESIGN §4; a stress-build assertion checks the balance after every
+  `exec`/`eval`, and per-site tests collect while the shadow stack holds the only reference.
+**Replaced.** The original plan (temporary roots via `tempMark`/`pushTemp` in all runtime code,
+rooting partially constructed objects and nested constructors, `errdefer` restrictions after a
+collecting allocation) existed only because any allocation could collect. With safepoint-only
+collection none of it is needed outside the tree-walker. Exceptions keep their rule: the message
+is stored in `Runtime.exception` (a root) before `error.Thrown` is returned.
+**Stress tests (M8, under `-Dgc-stress`):** array literals of fresh objects, nested object
+literals, string concatenation in a loop, closures capturing cells in a loop, an exception thrown
+mid-evaluation (shadow stack balanced afterwards), every allocation failing once.
 
-**(a) Temporary roots.**
-```zig
-const m = heap.tempMark();
-defer heap.tempRestore(m);      // also runs on every error path
-try heap.pushTemp(obj.value()); // capacity reserved up front; see Limits
-```
-**(b) Partially constructed objects.** `heap.new` returns an object that is traceable but **not
-rooted**. If construction continues with another `heap.new` (e.g. an array of fresh objects),
-push the parent first. Internal buffers allocated through `heap.allocator()` never collect, so
-`try obj.props.put(heap.allocator(), k, v)` is safe without rooting `obj`, provided `k` and `v`
-are already reachable.
-**(c) Nested constructors.** A constructor that calls another constructor roots its own
-result before the inner call. Example: `newError(msg)` = `new(Object)` → **push** →
-`newString(msg)` → set property → pop.
-**(d) Native functions.** `this` and arguments live on the VM stack (rooted) and are read via
-`ctx.arg(i)`, never through a slice (D12). A native that creates more than one object pushes
-temporaries. Its return value is pushed by the VM before any other allocation.
-**(e) Error paths.** `heap.new` may run a collection *and then* fail with `OutOfMemory` or
-`LimitExceeded`. So an `errdefer` that touches an unrooted GC pointer after a failed `heap.new`
-is a use-after-free. Rule: `errdefer` blocks only touch rooted objects or non-GC memory; the
-temp stack is restored by `defer`, not by hand.
-**(f) Exceptions.** A thrown value is stored in `vm.exception` (a root) *before* returning
-`error.Thrown`.
-
-**Enforcement.** We considered a debug-mode "GC epoch" wrapper type that asserts no collection
-happened since a pointer was loaded. It catches bugs at the access site but adds a wrapper to
-every pointer use. Rejected for now in favour of: `-Dgc-stress` (collect on *every*
-`heap.new`) + poisoning + `heap.verify()` + Guard Malloc. Revisit if stress mode misses bugs.
-
-**Targeted stress tests (M8, all under `-Dgc-stress`).**
-- native function creating two objects and linking them (forgotten temp root ⇒ poisoned read)
-- array literal `[{}, {}, …]` and nested object literals `{a:{b:{c:{}}}}`
-- string concatenation in a loop; closures capturing cells in a loop
-- `newError` path (nested constructor)
-- exception thrown while temporaries are pushed: assert temp-stack depth restored
-- every allocation failing once (`checkAllAllocationFailures` over a script run): no leak, no
-  crash, temp stack balanced
-
-## D11. Atoms (interned property names) and the weak atom table *(atoms M7; the table is strong until M8 makes it weak)*
+## D11. Atoms (interned property names) and the weak atom table *(atoms M7; weak table M8)*
 **Decision.** Property keys are atoms: interned `String` objects, compared by pointer. The
-intern table is **weak**, so it does not keep atoms alive.
-**How keys stay alive.** Liveness of an atom comes only from strong references: an object's
-property map marks its *keys* as well as its values; a proto marks the atoms its bytecode uses;
-`rt.atoms.common` is a root. After marking, before sweeping, unmarked atoms are removed from the
-intern table, so the table never holds a dangling pointer.
+intern table is **weak**: it never keeps an atom alive.
+**How keys stay alive.** Only through strong references: an object's property table marks its
+*keys* as well as its values (`forEachChild`, D38), and `Runtime.unsupported_name` is a root.
+After marking and before sweeping, unmarked atoms are removed from the table in place, so it
+never holds a dangling pointer and cleanup needs no allocation.
+**Revised for M8: bytecode keeps no atoms alive.** The original plan had a proto mark the atoms
+its bytecode uses. It doesn't need to: bytecode stores property names as plain ASCII
+(`Proto.names`) and interns them on use, and an atom freed in between is simply interned again
+(atoms are looked up by content).
 **Why weak.** A strong table leaks every dynamically generated key (`o["k" + i]`).
-**Cached data.** Each atom caches `hash` and `array_index: ?u32` (D13).
+**Cached data.** Each atom caches whether it is a canonical array index (D13); hashing is by
+content (FNV-1a over code units, D38).
 **Regression tests (M8).**
 - 10 000 keys `"k"+i` set on one object, collect 5×, read all back (keys kept alive by the object)
-- same keys, object dropped, collect: intern table shrinks to baseline
-- `delete o[k]`, collect, re-intern `k`: a fresh atom works as the key again
-- key used only as a bytecode constant (`o.someName`) survives collection with no object holding it
-- atom table cleanup runs before sweep (verify: no table entry points to a poisoned object)
+- same keys, object dropped, collect: the intern table shrinks to its baseline
+- `delete o[k]`, collect, reuse `k`: a fresh atom works as the key again
+- a property name used only by bytecode (`o.someName`) works across collections that freed its atom
+- atom-table cleanup runs before the sweep (verifier: no table entry points at a tombstone)
 
 ## D12. VM stack: growable, addressed by index *(M5/M6; two stacks since M6, see D36)*
 - `stack: []Value`, `sp: u32`; frames store `base: u32`, never pointers.

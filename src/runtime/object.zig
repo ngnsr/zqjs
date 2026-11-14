@@ -200,16 +200,16 @@ pub fn set(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
     };
     if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
     switch (o.kind) {
-        .array => |*elements| switch (k) {
+        .array => |elements| switch (k) {
             .index => |i| {
                 if (i < elements.items.len) {
-                    elements.items[i] = v;
+                    rt.heap.storeElement(o, i, v);
                 } else if (i == elements.items.len) {
-                    elements.append(rt.heap.allocator(), v) catch |e| return rt.heap.failed(e);
+                    try rt.heap.appendElement(o, v);
                 } else return rt.fail(.sparse_array);
                 return;
             },
-            .atom => if (isNamed(k, "length")) return setLength(rt, elements, v),
+            .atom => if (isNamed(k, "length")) return setLength(rt, o, v),
         },
         .ordinary => {},
     }
@@ -224,21 +224,15 @@ pub fn define(rt: *Runtime, o: *Object, k: Key, v: Value) Error!void {
 }
 
 fn putOwn(rt: *Runtime, o: *Object, k: Key, v: Value) Error!void {
-    const a = try atomOf(rt, k);
-    const gop = o.props.getOrPut(rt.heap.allocator(), a) catch |e| return rt.heap.failed(e);
-    if (gop.found_existing) {
-        gop.value_ptr.value = v; // keeps its position and enumerability
-    } else {
-        gop.value_ptr.* = .{ .value = v };
-    }
+    try rt.heap.storeProperty(o, try atomOf(rt, k), v);
 }
 
-fn setLength(rt: *Runtime, elements: *std.ArrayList(Value), v: Value) Error!void {
+fn setLength(rt: *Runtime, arr: *Object, v: Value) Error!void {
     const n = try ops.toNumber(rt, v);
     if (!(n >= 0 and n <= max_index + 1 and @floor(n) == n)) return rt.throw(.RangeError, &.{.{ .ascii = "Invalid array length" }});
     const len: usize = @intFromFloat(n);
-    if (len > elements.items.len) return rt.fail(.sparse_array);
-    elements.shrinkRetainingCapacity(len);
+    if (len > arr.kind.array.items.len) return rt.fail(.sparse_array);
+    rt.heap.shrinkElements(arr, len);
 }
 
 /// `delete base[k]`.
@@ -258,7 +252,7 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
         .ordinary => {},
     }
     if (o.props.count() == 0) return true;
-    _ = o.props.orderedRemove(try atomOf(rt, k)); // O(n), keeps the others' order (D13)
+    rt.heap.removeProperty(o, try atomOf(rt, k));
     return true;
 }
 

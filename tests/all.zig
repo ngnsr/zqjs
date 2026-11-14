@@ -4,6 +4,7 @@
 //!   frontend_test.zig     allocation-failure paths and fuzzing of parse → resolve → dump
 //!   interpreter_test.zig  both engines: limits, allocation failures, exceptions, differential fuzzing
 //!   vm_test.zig           the VM's step() contract, cleanup, --trace
+//!   gc_test.zig           the garbage collector (M8): store-API source scan, …
 //!   syntax_test.zig       syntax/cases.jsonl: outcome + resolved dump for each source
 //!   ops_test.zig          ops/*.jsonl: conversions and operators vs node, bit for bit
 //!   diff_test.zig         diff/*.js on both engines: output must equal node's (diff/*.out)
@@ -19,4 +20,5 @@ test {
     _ = @import("diff_test.zig");
     _ = @import("bytecode_test.zig");
     _ = @import("vm_test.zig");
+    _ = @import("gc_test.zig");
 }

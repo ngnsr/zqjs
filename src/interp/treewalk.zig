@@ -110,13 +110,23 @@ const Interpreter = struct {
     // ---- environments
 
     /// The record holding binding `b`: walk outward to the record of its scope.
-    fn slotOf(it: *const Interpreter, b: u32) *?Value {
-        const binding = it.res.bindings[b];
+    fn envOf(it: *const Interpreter, b: u32) *Env {
+        const scope = it.res.bindings[b].scope;
         var e = it.env;
         while (e) |rec| : (e = rec.parent) {
-            if (rec.scope == binding.scope) return &rec.values[binding.index];
+            if (rec.scope == scope) return rec;
         }
         unreachable; // the resolver only resolves names to bindings in enclosing scopes
+    }
+
+    /// Binding `b`'s value (null: in the TDZ).
+    fn load(it: *const Interpreter, b: u32) ?Value {
+        return it.envOf(b).values[it.res.bindings[b].index];
+    }
+
+    /// Writes binding `b` through the heap's store API (GC_DESIGN §7): no checks here.
+    fn store(it: *Interpreter, b: u32, v: Value) void {
+        it.rt.heap.storeEnv(it.envOf(b), it.res.bindings[b].index, v);
     }
 
     /// A new record for `scope` (if it declares anything) inside the current one.
@@ -149,7 +159,7 @@ const Interpreter = struct {
     fn body(it: *Interpreter, stmts: []const ast.Stmt) Error!Completion {
         for (stmts) |s| if (s.data == .function) {
             const f = s.data.function;
-            it.slotOf(f.name.?.binding).* = .{ .closure = try it.rt.heap.newTreeClosure(f, it.env) };
+            it.store(f.name.?.binding, .{ .closure = try it.rt.heap.newTreeClosure(f, it.env) });
         };
         for (stmts) |s| {
             const c = try it.exec(s);
@@ -161,7 +171,7 @@ const Interpreter = struct {
     fn declare(it: *Interpreter, decl: ast.Declaration) Error!void {
         for (decl.declarators) |d| {
             const v: Value = if (d.init) |init| try it.eval(init) else .undefined;
-            it.slotOf(d.binding).* = v; // initialisation: no TDZ or const check
+            it.store(d.binding, v); // initialisation: no TDZ or const check
         }
     }
 
@@ -325,7 +335,7 @@ const Interpreter = struct {
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
                 for (items) |item| {
                     const v = try it.eval(item);
-                    arr.kind.array.append(rt.heap.allocator(), v) catch |err| return rt.heap.failed(err);
+                    try rt.heap.appendElement(arr, v);
                 }
                 return .{ .object = arr };
             },
@@ -343,7 +353,7 @@ const Interpreter = struct {
                 if (f.name) |n| {
                     const own = try rt.heap.newEnv(it.env, it.res.bindings[n.binding].scope, 1);
                     const c = try rt.heap.newTreeClosure(f, own);
-                    own.values[0] = .{ .closure = c };
+                    rt.heap.storeEnv(own, 0, .{ .closure = c });
                     return .{ .closure = c };
                 }
                 return .{ .closure = try rt.heap.newTreeClosure(f, it.env) };
@@ -424,7 +434,7 @@ const Interpreter = struct {
         // Parameters and the body's declarations share one scope.
         const scope = if (f.params.len > 0) it.res.bindings[f.params[0].binding].scope else it.scopeOf(f.body);
         try it.pushScope(scope);
-        for (f.params, 0..) |p, i| it.slotOf(p.binding).* = if (i < args.len) args[i] else .undefined;
+        for (f.params, 0..) |p, i| it.store(p.binding, if (i < args.len) args[i] else .undefined);
         return switch (try it.body(f.body)) {
             .@"return" => it.ret,
             else => .undefined,
@@ -441,17 +451,16 @@ const Interpreter = struct {
 
     fn read(it: *Interpreter, ref: ast.Ref) Error!Value {
         const b = it.bindingOf(ref) orelse return builtins.global(it.rt, ref.name);
-        return it.slotOf(b).* orelse it.tdz(ref);
+        return it.load(b) orelse it.tdz(ref);
     }
 
     /// The resolver rejects writes to globals and to function-expression names.
     fn write(it: *Interpreter, ref: ast.Ref, v: Value) Error!void {
         const b = it.bindingOf(ref).?;
-        const slot = it.slotOf(b);
-        if (slot.* == null) return it.tdz(ref);
+        if (it.load(b) == null) return it.tdz(ref);
         if (it.res.bindings[b].kind == .@"const")
             return it.rt.throw(.TypeError, &.{.{ .ascii = "Assignment to constant variable." }});
-        slot.* = v;
+        it.store(b, v);
     }
 
     fn tdz(it: *Interpreter, ref: ast.Ref) Error {

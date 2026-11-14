@@ -67,6 +67,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
+          # One Zig cache per test configuration (the OS is already in the key): with a
+          # shared key each job restored whichever configuration saved last, and recompiled.
+          cache-key: ${{ matrix.suite.name }}
 
       - name: Tests (${{ matrix.suite.name }})
         run: zig build test ${{ matrix.suite.flags }} --summary all

@@ -46,6 +46,8 @@ pub fn run(rt: *Runtime, script: ast.Script, res: Resolution) Error!void {
 /// The tree-walker's own stack (DESIGN_DECISIONS D37). Measured worst case at
 /// Limits.max_interpreter_depth = 6000: ~14.5 MB in Debug, ~4 MB in ReleaseSafe; the
 /// test at the end of this file keeps it under half of this.
+// shortcut: a big native stack instead of an explicit interpreter stack (D37 "Debt");
+// replace it when the tree-walker's memory use or thread matters (e.g. embedding it).
 pub const stack_bytes = 64 * 1024 * 1024;
 
 /// Runs the interpreter on a thread with `stack_bytes` of stack, so its recursion

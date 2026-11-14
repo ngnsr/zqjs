@@ -577,3 +577,7 @@ with a 64 MiB stack**; the caller waits, so the Runtime is never shared. The gua
 whatever stack the host thread has: a test runs worst-case recursion from a 256 KiB host thread
 on both engines, and a unit test asserts the measured use stays under half of the 64 MiB, in
 every build mode CI tests (Debug and ReleaseSafe).
+**Debt.** A dedicated 64 MiB thread is acceptable for a reference implementation, but ~14.5 MB of
+native stack in Debug is a lot, and its size depends on the compiler's frame layout. The proper
+fix is an explicit interpreter stack (the walk keeps its own continuation records on the heap),
+which makes memory use predictable and removes the thread. Listed in ROADMAP, Technical debt.

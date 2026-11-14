@@ -18,6 +18,15 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | – |
 | 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
 
+## Technical debt
+Known shortcuts, each with the decision that explains it and what would replace it.
+
+| shortcut | where | replace with | when |
+|---|---|---|---|
+| tree-walker on its own 64 MiB thread (~14.5 MB of native stack in Debug at the depth limit) | D37, `src/interp/treewalk.zig` | an explicit interpreter stack: continuation records on the heap, no native recursion | when the tree-walker's memory or thread matters (embedding it), or before M10's benchmarks |
+| tree-walker allocates every string literal on every evaluation | D30 | the VM's constant pool already fixes it; the oracle stays simple | not planned |
+| VM panics on a failed defensive check instead of returning an internal error | D35 | an internal-error result, if an embedder needs to survive a VM bug | M9 (embedding API) |
+
 ## Required regression tests by milestone
 
 **M1 (done)**

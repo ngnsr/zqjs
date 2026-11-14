@@ -40,7 +40,7 @@ fn compileChecked(gpa: Allocator, source: []const u8, limits: Limits, diag: *zqj
     };
     errdefer proto.deinit(gpa);
     var failure: zqjs.verify.Failure = .{};
-    const info = zqjs.verify.verify(gpa, proto, limits, &failure) catch |e| {
+    const info = zqjs.verify.verify(gpa, &proto, limits, &failure) catch |e| {
         if (e == error.InvalidBytecode) std.debug.print("invalid bytecode at {d}: {s}\nsource: {s}\n", .{ failure.pc, failure.reason, source });
         return e;
     };
@@ -208,7 +208,7 @@ fn fuzzVerify(_: void, smith: *testing.Smith) anyerror!void {
         .slot_count = 3,
         .max_stack = 4,
     };
-    const info = zqjs.verify.verify(testing.allocator, p, .{}, &failure) catch |e| switch (e) {
+    const info = zqjs.verify.verify(testing.allocator, &p, .{}, &failure) catch |e| switch (e) {
         error.InvalidBytecode => return,
         else => return e,
     };

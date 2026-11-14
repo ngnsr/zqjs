@@ -2,9 +2,12 @@
 //! before anything runs.
 //!
 //! Output (all in side tables; the AST stays immutable, DESIGN_DECISIONS D20):
-//!   refs[ref.id]               → .local(binding id) or .global
-//!   bindings[declarator.binding] → { kind, slot }
-//!   max_slots                  → how many local slots a frame needs
+//!   refs[ref.id]                 → .local(binding), .capture{binding, index} or .global
+//!   bindings[declarator.binding] → kind, slot, scope, index in scope, owning function,
+//!                                  and whether an inner function captures it
+//!   scopes[id]                   → how many bindings the scope declares (the tree-walker
+//!                                  allocates one environment record per scope)
+//!   functions[f.id]              → slot count, parameter count, capture list (0 = script)
 //!
 //! How it works
 //! ------------
@@ -18,14 +21,25 @@
 //!     binding, so shadowing works with no extra bookkeeping.
 //!   * Redeclaration check = scan only `live[scope_start..]`, the *current* scope,
 //!     so `let x; { let x; }` (shadowing) is fine and `let x; let x;` is not.
-//!   * A binding's slot = its index in `live` when it was declared. Bindings of a
-//!     finished block are truncated away, so a later sibling block reuses the same
-//!     slots, and the largest `live.len` ever seen is the frame size.
+//!   * A binding's slot = its index in `live` minus where its function's bindings
+//!     start. Bindings of a finished block are truncated away, so a later sibling
+//!     block reuses the same slots; each function numbers its slots from 0.
 //!
-//! Hoisting: on entering a block we declare *all* of its `let`/`const` bindings
-//! before resolving any statement. So in `let x = 1; { x; let x = 2; }` the inner
-//! `x` reference finds the inner binding, which at runtime is still in its
-//! temporal dead zone (ReferenceError), exactly as in JS.
+//! Hoisting: on entering a block we declare *all* of its `let`/`const` bindings (and,
+//! in a script or function body, its function declarations) before resolving any
+//! statement. So in `let x = 1; { x; let x = 2; }` the inner `x` reference finds the
+//! inner binding, which at runtime is still in its temporal dead zone.
+//!
+//! Functions and captures (M6, DESIGN_DECISIONS D36)
+//! ------------------------------------------------
+//! A reference that finds a binding of an *outer* function is a capture. The binding
+//! is marked `captured` (the VM then keeps it in a heap cell), and every function
+//! between the binding's function and the referencing one gets a capture entry for
+//! it: the innermost one reads it from its parent's capture list, and so on outward,
+//! until the function directly inside the binding's own function reads it from that
+//! function's slot. This is the information `make_closure` needs to build a closure.
+//! A binding's `captured` flag can be set after some of its references were already
+//! resolved, so consumers read it only once resolution has finished.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -37,19 +51,66 @@ pub const Error = error{ SyntaxError, Unsupported, OutOfMemory };
 pub const Resolution = struct {
     refs: []const Ref,
     bindings: []const Binding,
-    max_slots: u32,
+    scopes: []const Scope,
+    functions: []const Function,
 
     pub const Ref = union(enum) {
-        /// Binding id (index into `bindings`).
+        /// A binding of the function containing the reference (binding id).
         local: u32,
+        /// A binding of an outer function, reached through entry `index` of the current
+        /// function's capture list.
+        capture: struct { binding: u32, index: u32 },
         /// Not declared anywhere in the script; looked up by name at runtime.
         global,
     };
 
-    pub const Binding = struct {
-        kind: ast.DeclKind,
-        slot: u32,
+    pub const BindingKind = enum {
+        let,
+        @"const",
+        param,
+        /// A function declaration's name: initialised on scope entry, mutable.
+        function,
+        /// A named function expression's own name, visible only inside it; writes are
+        /// Unsupported (sloppy JS silently ignores them).
+        function_name,
     };
+
+    pub const Binding = struct {
+        kind: BindingKind,
+        /// Frame slot in the owning function. A captured binding's slot holds its cell.
+        slot: u32,
+        scope: u32,
+        /// Position among the bindings of `scope`.
+        index: u32,
+        function: u32,
+        captured: bool = false,
+    };
+
+    pub const Scope = struct { len: u32 = 0 };
+
+    pub const Function = struct {
+        slot_count: u32 = 0,
+        param_count: u32 = 0,
+        /// Slot of the first parameter (1 in a named function expression, whose own
+        /// name comes first; else 0). Parameters occupy consecutive slots.
+        param_slot: u32 = 0,
+        captures: []const Capture = &.{},
+    };
+
+    pub const Capture = struct {
+        binding: u32,
+        from: union(enum) {
+            /// The parent function's frame slot (which holds the binding's cell).
+            parent_slot: u32,
+            /// Entry of the parent function's own capture list.
+            parent_capture: u32,
+        },
+    };
+
+    /// Script slots (function 0).
+    pub fn scriptSlots(r: Resolution) u32 {
+        return r.functions[0].slot_count;
+    }
 };
 
 /// `arena` also owns the returned tables; they live exactly as long as the AST.
@@ -59,58 +120,100 @@ pub fn resolve(arena: Allocator, script: ast.Script, diag: *Diagnostic) Error!Re
         .diag = diag,
         .refs = try arena.alloc(Resolution.Ref, script.ref_count),
         .bindings = try arena.alloc(Resolution.Binding, script.binding_count),
+        .functions = try arena.alloc(Resolution.Function, script.function_count),
     };
+    @memset(r.functions, .{});
+    try r.fns.append(arena, .{ .id = 0, .live_start = 0 });
     try r.block(script.statements, .script);
-    return .{ .refs = r.refs, .bindings = r.bindings, .max_slots = r.max_slots };
+    r.finishFunction();
+    return .{ .refs = r.refs, .bindings = r.bindings, .scopes = r.scopes.items, .functions = r.functions };
 }
 
 const Live = struct { name: []const u8, binding: u32 };
+
+/// A function being resolved (innermost last in `Resolver.fns`).
+const FnState = struct {
+    id: u32,
+    /// Index in `live` where this function's bindings start (its slot 0).
+    live_start: usize,
+    max_slots: u32 = 0,
+    captures: std.ArrayList(Resolution.Capture) = .empty,
+};
 
 const Resolver = struct {
     arena: Allocator,
     diag: *Diagnostic,
     refs: []Resolution.Ref,
     bindings: []Resolution.Binding,
+    functions: []Resolution.Function,
+    scopes: std.ArrayList(Resolution.Scope) = .empty,
+    fns: std.ArrayList(FnState) = .empty,
     live: std.ArrayList(Live) = .empty,
     scope_start: usize = 0,
-    max_slots: u32 = 0,
+    scope: u32 = 0,
 
-    const Saved = struct { scope_start: usize, live_len: usize };
+    const Saved = struct { scope_start: usize, live_len: usize, scope: u32 };
 
-    fn enterScope(r: *Resolver) Saved {
-        const saved: Saved = .{ .scope_start = r.scope_start, .live_len = r.live.items.len };
+    fn enterScope(r: *Resolver) Error!Saved {
+        const saved: Saved = .{ .scope_start = r.scope_start, .live_len = r.live.items.len, .scope = r.scope };
         r.scope_start = r.live.items.len;
+        r.scope = @intCast(r.scopes.items.len);
+        try r.scopes.append(r.arena, .{});
         return saved;
     }
 
     fn exitScope(r: *Resolver, saved: Saved) void {
         r.live.shrinkRetainingCapacity(saved.live_len);
         r.scope_start = saved.scope_start;
+        r.scope = saved.scope;
     }
 
-    /// The script body or a `{ … }` block: declare everything first, then resolve.
-    fn block(r: *Resolver, stmts: []const ast.Stmt, comptime kind: enum { script, block }) Error!void {
-        const saved = r.enterScope();
-        defer r.exitScope(saved);
-        for (stmts) |s| if (s.data == .declaration) try r.declare(s.data.declaration, kind == .script);
+    fn current(r: *Resolver) *FnState {
+        return &r.fns.items[r.fns.items.len - 1];
+    }
+
+    fn finishFunction(r: *Resolver) void {
+        const f = r.fns.pop().?;
+        r.functions[f.id].slot_count = f.max_slots;
+        r.functions[f.id].captures = f.captures.items;
+    }
+
+    /// The script body, a function body or a `{ … }` block: declare everything first,
+    /// then resolve.
+    fn block(r: *Resolver, stmts: []const ast.Stmt, comptime kind: enum { script, body, block }) Error!void {
+        const saved: ?Saved = if (kind == .body) null else try r.enterScope(); // a body shares the parameters' scope
+        defer if (saved) |sv| r.exitScope(sv);
+        for (stmts) |s| switch (s.data) {
+            .declaration => |decl| for (decl.declarators) |d| try r.declare(d, if (decl.kind == .let) .let else .@"const", kind == .script),
+            .function => |f| try r.declare(f.name.?, .function, kind == .script),
+            else => {},
+        };
         for (stmts) |s| try r.stmt(s);
     }
 
-    fn declare(r: *Resolver, decl: ast.Declaration, script_scope: bool) Error!void {
-        for (decl.declarators) |d| {
-            for (r.live.items[r.scope_start..]) |l| {
-                if (std.mem.eql(u8, l.name, d.name)) return r.fail(.{ .syntax_error = "identifier has already been declared" }, d.span);
-            }
-            // At script level these would collide with non-configurable properties of
-            // the global object; node throws a SyntaxError before running anything.
-            // Inside a block (or a `for` head) they are ordinary local names.
-            if (script_scope and isRestrictedGlobal(d.name))
-                return r.fail(.{ .syntax_error = "cannot redeclare a non-configurable global at script level" }, d.span);
-            const slot: u32 = @intCast(r.live.items.len);
-            r.bindings[d.binding] = .{ .kind = decl.kind, .slot = slot };
-            try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
-            r.max_slots = @max(r.max_slots, slot + 1);
+    fn declare(r: *Resolver, d: ast.Declarator, kind: Resolution.BindingKind, script_scope: bool) Error!void {
+        for (r.live.items[r.scope_start..]) |l| {
+            if (!std.mem.eql(u8, l.name, d.name)) continue;
+            const old = r.bindings[l.binding].kind;
+            // Sloppy JS allows these (the later declaration wins); not certain errors.
+            if (kind == .param and old == .param) return r.fail(.{ .unsupported = .duplicate_parameter }, d.span);
+            if (kind == .function and (old == .function or old == .param)) return r.fail(.{ .unsupported = .duplicate_function }, d.span);
+            return r.fail(.{ .syntax_error = "identifier has already been declared" }, d.span);
         }
+        // At script level these would collide with non-configurable properties of the
+        // global object: node rejects `let NaN` before running anything (SyntaxError);
+        // for a function declaration it is less clear-cut, so Unsupported.
+        if (script_scope and isRestrictedGlobal(d.name)) {
+            if (kind == .function) return r.fail(.{ .unsupported = .duplicate_function }, d.span);
+            return r.fail(.{ .syntax_error = "cannot redeclare a non-configurable global at script level" }, d.span);
+        }
+        const f = r.current();
+        const slot: u32 = @intCast(r.live.items.len - f.live_start);
+        const scope = &r.scopes.items[r.scope];
+        r.bindings[d.binding] = .{ .kind = kind, .slot = slot, .scope = r.scope, .index = scope.len, .function = f.id };
+        scope.len += 1;
+        try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
+        f.max_slots = @max(f.max_slots, slot + 1);
     }
 
     fn stmt(r: *Resolver, s: ast.Stmt) Error!void {
@@ -119,6 +222,8 @@ const Resolver = struct {
             .expression => |e| try r.expr(e),
             // Already declared by the enclosing block; only the initialisers remain.
             .declaration => |decl| for (decl.declarators) |d| if (d.init) |init| try r.expr(init),
+            .function => |f| try r.function(f),
+            .@"return" => |v| if (v) |e| try r.expr(e),
             .block => |stmts| try r.block(stmts, .block),
             .@"if" => |i| {
                 try r.expr(i.cond);
@@ -132,11 +237,11 @@ const Resolver = struct {
             .@"for" => |f| {
                 // The head declaration gets its own scope, enclosing the body (whose
                 // block, if any, is one more scope), so `for (let i;;) { let i; }` is legal.
-                const saved = r.enterScope();
+                const saved = try r.enterScope();
                 defer r.exitScope(saved);
                 if (f.init) |init| switch (init) {
                     .declaration => |decl| {
-                        try r.declare(decl, false);
+                        for (decl.declarators) |d| try r.declare(d, if (decl.kind == .let) .let else .@"const", false);
                         for (decl.declarators) |d| if (d.init) |e| try r.expr(e);
                     },
                     .expression => |e| try r.expr(e),
@@ -148,10 +253,27 @@ const Resolver = struct {
         }
     }
 
+    /// A function's own scopes: for a named expression, one holding just its name, then
+    /// one for the parameters and the body's declarations (a body `let` may not reuse a
+    /// parameter's name, so they share a scope).
+    fn function(r: *Resolver, f: *const ast.Function) Error!void {
+        try r.fns.append(r.arena, .{ .id = f.id, .live_start = r.live.items.len });
+        const name_scope: ?Saved = if (f.kind == .expression and f.name != null) try r.enterScope() else null;
+        if (name_scope != null) try r.declare(f.name.?, .function_name, false);
+        const saved = try r.enterScope();
+        r.functions[f.id].param_slot = @intCast(r.live.items.len - r.current().live_start);
+        for (f.params) |p| try r.declare(p, .param, false);
+        r.functions[f.id].param_count = @intCast(f.params.len);
+        try r.block(f.body, .body);
+        r.exitScope(saved);
+        if (name_scope) |sv| r.exitScope(sv);
+        r.finishFunction();
+    }
+
     fn expr(r: *Resolver, e: *const ast.Expr) Error!void {
         switch (e.data) {
             .number, .string, .boolean, .null => {},
-            .identifier => |ref| r.refs[ref.id] = r.lookup(ref.name),
+            .identifier => |ref| r.refs[ref.id] = try r.lookup(ref.name),
             .unary => |u| try r.expr(u.operand),
             .binary => |b| {
                 try r.expr(b.lhs);
@@ -166,6 +288,7 @@ const Resolver = struct {
                 try r.expr(c.callee);
                 for (c.args) |arg| try r.expr(arg);
             },
+            .function => |f| try r.function(f),
         }
     }
 
@@ -174,18 +297,44 @@ const Resolver = struct {
     /// belongs to the runtime (M3). Assignment to an undeclared name is rejected:
     /// sloppy JS would silently create a global, which ZQJS doesn't do (decision B).
     fn target(r: *Resolver, ref: ast.Ref) Error!void {
-        const res = r.lookup(ref.name);
-        if (res == .global) return r.fail(.{ .unsupported = .global_assignment }, ref.span);
+        const res = try r.lookup(ref.name);
+        const b = switch (res) {
+            .global => return r.fail(.{ .unsupported = .global_assignment }, ref.span),
+            .local => |b| b,
+            .capture => |c| c.binding,
+        };
+        if (r.bindings[b].kind == .function_name) return r.fail(.{ .unsupported = .function_name_assignment }, ref.span);
         r.refs[ref.id] = res;
     }
 
-    fn lookup(r: *Resolver, name: []const u8) Resolution.Ref {
+    fn lookup(r: *Resolver, name: []const u8) Error!Resolution.Ref {
         var i = r.live.items.len;
         while (i > 0) {
             i -= 1;
-            if (std.mem.eql(u8, r.live.items[i].name, name)) return .{ .local = r.live.items[i].binding };
+            if (!std.mem.eql(u8, r.live.items[i].name, name)) continue;
+            const b = r.live.items[i].binding;
+            if (r.bindings[b].function == r.current().id) return .{ .local = b };
+            r.bindings[b].captured = true;
+            return .{ .capture = .{ .binding = b, .index = try r.captureIndex(r.fns.items.len - 1, b) } };
         }
         return .global;
+    }
+
+    /// Index of binding `b` in the capture list of function `fns[level]`, adding it
+    /// (and, recursively, to the enclosing functions) if needed.
+    fn captureIndex(r: *Resolver, level: usize, b: u32) Error!u32 {
+        const f = &r.fns.items[level];
+        for (f.captures.items, 0..) |c, i| if (c.binding == b) return @intCast(i);
+        // `b` belongs to an enclosing function, so level > its function's level ≥ 0.
+        const parent = r.fns.items[level - 1];
+        const capture: Resolution.Capture = if (r.bindings[b].function == parent.id)
+            .{ .binding = b, .from = .{ .parent_slot = r.bindings[b].slot } }
+        else
+            .{ .binding = b, .from = .{ .parent_capture = try r.captureIndex(level - 1, b) } };
+        // `f` is still valid: the recursion appends to other functions' capture lists,
+        // never to `fns` itself.
+        try f.captures.append(r.arena, capture);
+        return @intCast(f.captures.items.len - 1);
     }
 
     fn fail(r: *Resolver, detail: Diagnostic.Detail, s: ast.Span) Error {
@@ -218,6 +367,7 @@ fn resolveSource(arena: Allocator, source: []const u8, diag: *Diagnostic) !Resol
 fn refBinding(r: Resolved, n: u32) ?u32 {
     return switch (r.res.refs[n]) {
         .local => |b| b,
+        .capture => |c| c.binding,
         .global => null,
     };
 }
@@ -239,7 +389,7 @@ test "shadowing is allowed; each declaration gets its own binding and slot" {
     try testing.expectEqual(@as(u32, 1), r.res.bindings[1].slot);
     try testing.expectEqual(@as(?u32, 1), refBinding(r, 0)); // inside the block: inner x
     try testing.expectEqual(@as(?u32, 0), refBinding(r, 1)); // after the block: outer x
-    try testing.expectEqual(@as(u32, 2), r.res.max_slots);
+    try testing.expectEqual(@as(u32, 2), r.res.scriptSlots());
 }
 
 test "redeclaration in the same scope is a SyntaxError" {
@@ -286,7 +436,7 @@ test "sibling blocks reuse slots" {
     try testing.expectEqual(@as(u32, 1), r.res.bindings[1].slot); // b
     try testing.expectEqual(@as(u32, 2), r.res.bindings[2].slot); // c
     try testing.expectEqual(@as(u32, 1), r.res.bindings[3].slot); // e reuses b's slot
-    try testing.expectEqual(@as(u32, 3), r.res.max_slots);
+    try testing.expectEqual(@as(u32, 3), r.res.scriptSlots());
 }
 
 test "nested scopes never reuse a slot that is still live" {
@@ -319,7 +469,7 @@ test "nested scopes never reuse a slot that is still live" {
     // Only a is live next to g.
     try testing.expect(g != a);
     try testing.expectEqual(b, g);
-    try testing.expectEqual(@as(u32, 4), r.res.max_slots); // a, b, e, f at the deepest point
+    try testing.expectEqual(@as(u32, 4), r.res.scriptSlots()); // a, b, e, f at the deepest point
     // References inside the nested blocks still find the outer bindings.
     const expected = [_]u32{ 0, 1, 2, 0, 1, 3, 4, 0 }; // a b c | a b e f | a
     for (expected, 0..) |binding, n| try testing.expectEqual(@as(?u32, binding), refBinding(r, @intCast(n)));
@@ -391,6 +541,65 @@ test "assigning to a const resolves normally (the error is a runtime TypeError)"
     defer arena.deinit();
     var d: Diagnostic = .{};
     const r = try resolveSource(arena.allocator(), "const c = 1; if (false) c = 2; c++;", &d);
-    try testing.expectEqual(ast.DeclKind.@"const", r.res.bindings[0].kind);
+    try testing.expectEqual(Resolution.BindingKind.@"const", r.res.bindings[0].kind);
     try testing.expectEqual(@as(?u32, 0), refBinding(r, 0));
+}
+
+test "functions number their own slots; parameters come first, after a named expression's name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: Diagnostic = .{};
+    const r = try resolveSource(arena.allocator(), "let a; function f(p, q) { let b; } let g = function self(x) { let y; };", &d);
+    // Binding ids (parse order): a 0, f 1, p 2, q 3, b 4, self 5, x 6, y 7, g 8; `g`'s
+    // declarator is created after its initialiser has been parsed.
+    const slot = struct {
+        fn of(res: Resolution, binding: u32) u32 {
+            return res.bindings[binding].slot;
+        }
+    }.of;
+    try testing.expectEqual(@as(u32, 0), slot(r.res, 2)); // p: f's slot 0
+    try testing.expectEqual(@as(u32, 1), slot(r.res, 3)); // q
+    try testing.expectEqual(@as(u32, 2), slot(r.res, 4)); // b
+    try testing.expectEqual(@as(u32, 0), slot(r.res, 5)); // self: the named expression's own name
+    try testing.expectEqual(@as(u32, 1), slot(r.res, 6)); // x
+    try testing.expectEqual(@as(u32, 1), r.res.functions[2].param_slot);
+    try testing.expectEqual(@as(u32, 0), r.res.functions[1].param_slot);
+    try testing.expectEqual(@as(u32, 3), r.res.functions[0].slot_count); // a, f, g
+}
+
+test "captures: marked bindings and capture chains through intermediate functions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: Diagnostic = .{};
+    // Bindings: v(0) f(1) w(2) g(3) h(4). h reads v and w, two levels and one level out.
+    const r = try resolveSource(arena.allocator(), "let v = 1; function f() { let w; function g() { function h() { return v + w; } } } v;", &d);
+    try testing.expect(r.res.bindings[0].captured); // v: captured (by h)
+    try testing.expect(r.res.bindings[2].captured); // w
+    try testing.expect(!r.res.bindings[1].captured); // f: only declared
+    const f = r.res.functions[1];
+    const g = r.res.functions[2];
+    const h = r.res.functions[3];
+    // f gets v from the script's slot; g gets v from f's captures and w from f's slot;
+    // h gets both from g's captures.
+    try testing.expectEqual(@as(usize, 1), f.captures.len);
+    try testing.expectEqual(Resolution.Capture{ .binding = 0, .from = .{ .parent_slot = 0 } }, f.captures[0]);
+    try testing.expectEqual(@as(usize, 2), g.captures.len);
+    try testing.expectEqual(Resolution.Capture{ .binding = 0, .from = .{ .parent_capture = 0 } }, g.captures[0]);
+    try testing.expectEqual(Resolution.Capture{ .binding = 2, .from = .{ .parent_slot = 0 } }, g.captures[1]);
+    try testing.expectEqual(@as(usize, 2), h.captures.len);
+    try testing.expectEqual(Resolution.Capture{ .binding = 0, .from = .{ .parent_capture = 0 } }, h.captures[0]);
+    try testing.expectEqual(Resolution.Capture{ .binding = 2, .from = .{ .parent_capture = 1 } }, h.captures[1]);
+    // References: inside h through captures; at script level a plain local.
+    try testing.expectEqual(Resolution.Ref{ .capture = .{ .binding = 0, .index = 0 } }, r.res.refs[0]);
+    try testing.expectEqual(Resolution.Ref{ .capture = .{ .binding = 2, .index = 1 } }, r.res.refs[1]);
+    try testing.expectEqual(Resolution.Ref{ .local = 0 }, r.res.refs[2]);
+}
+
+test "duplicate and conflicting declarations around functions" {
+    try expectFailure("function f(a, a) {}", error.Unsupported, .{ .unsupported = .duplicate_parameter });
+    try expectFailure("function f() {} function f() {}", error.Unsupported, .{ .unsupported = .duplicate_function });
+    try expectFailure("function f(a) { function a() {} }", error.Unsupported, .{ .unsupported = .duplicate_function });
+    try expectFailure("function f(a) { let a; }", error.SyntaxError, .{ .syntax_error = "identifier has already been declared" });
+    try expectFailure("let f; function f() {}", error.SyntaxError, .{ .syntax_error = "identifier has already been declared" });
+    try expectFailure("let g = function n() { n = 1; };", error.Unsupported, .{ .unsupported = .function_name_assignment });
 }

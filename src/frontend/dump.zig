@@ -1,7 +1,10 @@
 //! Debug output: one S-expression per top-level statement, with resolved names.
 //!   x#3@1     declaration of x as binding 3 in slot 1
+//!   x#3@c1    same, but captured by an inner function (slot 1 holds its cell)
 //!   x#3       reference to binding 3
+//!   x#3^0     reference to binding 3 of an outer function, through capture 0
 //!   x@global  reference to an undeclared (global) name
+//!   (function f#1@0 (params…) (captures x#3…) body…)
 //! Strings print non-printable or non-ASCII code units as `\uXXXX`. Not JS syntax.
 
 const std = @import("std");
@@ -29,6 +32,15 @@ const Dumper = struct {
             .empty => try w.writeAll("(empty)"),
             .@"break" => try w.writeAll("(break)"),
             .@"continue" => try w.writeAll("(continue)"),
+            .function => |f| try d.function(f),
+            .@"return" => |v| {
+                try w.writeAll("(return");
+                if (v) |e| {
+                    try w.writeByte(' ');
+                    try d.expr(e);
+                }
+                try w.writeByte(')');
+            },
             .expression => |e| try d.expr(e),
             .declaration => |decl| try d.declaration(decl),
             .block => |stmts| {
@@ -74,10 +86,39 @@ const Dumper = struct {
         }
     }
 
+    fn binding(d: Dumper, dc: ast.Declarator) Error!void {
+        const b = d.res.bindings[dc.binding];
+        try d.w.print("{s}#{d}@{s}{d}", .{ dc.name, dc.binding, if (b.captured) "c" else "", b.slot });
+    }
+
+    fn function(d: Dumper, f: *const ast.Function) Error!void {
+        const w = d.w;
+        try w.writeAll("(function ");
+        if (f.name) |n| try d.binding(n) else try w.writeByte('_');
+        try w.writeAll(" (");
+        for (f.params, 0..) |p, i| {
+            if (i > 0) try w.writeByte(' ');
+            try d.binding(p);
+        }
+        try w.writeByte(')');
+        const captures = d.res.functions[f.id].captures;
+        if (captures.len > 0) {
+            try w.writeAll(" (captures");
+            for (captures) |c| try w.print(" #{d}", .{c.binding});
+            try w.writeByte(')');
+        }
+        for (f.body) |st| {
+            try w.writeByte(' ');
+            try d.stmt(st);
+        }
+        try w.writeByte(')');
+    }
+
     fn declaration(d: Dumper, decl: ast.Declaration) Error!void {
         try d.w.print("({s}", .{@tagName(decl.kind)});
         for (decl.declarators) |dc| {
-            try d.w.print(" ({s}#{d}@{d}", .{ dc.name, dc.binding, d.res.bindings[dc.binding].slot });
+            try d.w.writeAll(" (");
+            try d.binding(dc);
             if (dc.init) |init| {
                 try d.w.writeByte(' ');
                 try d.expr(init);
@@ -94,6 +135,7 @@ const Dumper = struct {
     fn ref(d: Dumper, r: ast.Ref) Error!void {
         switch (d.res.refs[r.id]) {
             .local => |b| try d.w.print("{s}#{d}", .{ r.name, b }),
+            .capture => |c| try d.w.print("{s}#{d}^{d}", .{ r.name, c.binding, c.index }),
             .global => try d.w.print("{s}@global", .{r.name}),
         }
     }
@@ -142,6 +184,7 @@ const Dumper = struct {
                 }
                 try w.writeByte(')');
             },
+            .function => |f| try d.function(f),
             .update => |u| {
                 const sym = if (u.op == .inc) "++" else "--";
                 try w.print("({s}{s} ", .{ if (u.prefix) "pre" else "post", sym });

@@ -29,6 +29,8 @@ const verify = @import("bytecode/verify.zig");
 const disasm = @import("bytecode/disasm.zig");
 const Vm = @import("vm/vm.zig").Vm;
 
+const RuntimeError = @import("runtime/runtime.zig").Error;
+
 pub const Mode = enum { normal, harness };
 pub const Engine = enum { vm, treewalk };
 
@@ -65,14 +67,15 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
             };
             defer proto.deinit(gpa);
             var failure: verify.Failure = .{};
-            _ = verify.verify(gpa, proto, limits, &failure) catch |e| switch (e) {
+            _ = verify.verify(gpa, &proto, limits, &failure) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidBytecode => {
                     try report.print("{s}: internal error: invalid bytecode at {d}: {s}\n", .{ name, failure.pc, failure.reason });
                     return 70;
                 },
             };
-            var vm = try Vm.init(&rt, &proto);
+            // The script's own frame can already exceed max_stack_slots.
+            var vm = Vm.init(&rt, &proto) catch |e| break :vm @as(RuntimeError!void, e);
             defer vm.deinit();
             break :vm if (options.trace) |t| runTraced(&vm, t) else vm.run();
         },
@@ -97,16 +100,17 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
     return 0;
 }
 
-fn runTraced(vm: *Vm, t: *Writer) @import("runtime/runtime.zig").Error!void {
+fn runTraced(vm: *Vm, t: *Writer) RuntimeError!void {
     while (true) {
         if (!vm.halted) {
-            // Pad the listing to a column, so the stacks line up; a line too long for the
-            // buffer (a long string constant) is written unpadded.
+            // Indented by call depth. Padded to a column, so the stacks line up; a line too
+            // long for the buffer (a long string constant) is written unpadded.
+            try t.splatByteAll(' ', 2 * (vm.frames.items.len - 1));
             var buf: [128]u8 = undefined;
             var line: Writer = .fixed(&buf);
-            if (disasm.instruction(vm.proto.*, vm.pc, &line)) {
+            if (disasm.instruction(vm.proto().*, vm.pc, &line)) {
                 try t.print("{s:<56}", .{line.buffered()});
-            } else |_| try disasm.instruction(vm.proto.*, vm.pc, t);
+            } else |_| try disasm.instruction(vm.proto().*, vm.pc, t);
             try t.writeAll(" |");
             for (vm.operands(), 0..) |v, i| {
                 try t.writeAll(if (i > 0) ", " else " ");

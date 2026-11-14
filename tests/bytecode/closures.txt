@@ -1,0 +1,102 @@
+slots 3, max_stack 2, code 140 bytes
+constants
+  k0  1
+  k1  0
+  k2  2
+names
+  n0  a
+  n1  i
+code
+      0  clear_local    s0
+      5  make_closure   #1
+     10  init_local     s1
+     15  push_undefined
+     16  init_local     s0
+     21  new_cell       s2
+     26  push_const     k0            ; 1
+     31  init_cell      s2
+     36  make_closure   #2
+     41  set_local      s0 n0         ; a
+     50  pop
+     51  new_cell       s2
+     56  push_const     k1            ; 0
+     61  init_cell      s2
+     66  fresh_cell     s2
+     71  get_cell       s2 n1         ; i
+     80  push_const     k2            ; 2
+     85  lt
+     86  jump_if_false  @139
+     91  make_closure   #3
+     96  set_local      s0 n0         ; a
+    105  pop
+    106  fresh_cell     s2
+    111  get_cell       s2 n1         ; i
+    120  to_number
+    121  dup
+    122  inc
+    123  set_cell       s2 n1         ; i
+    132  pop
+    133  pop
+    134  jump           @71
+    139  halt
+
+function #1 outer: params 1
+slots 3, max_stack 1, code 40 bytes
+constants
+  k0  0
+names
+  n0  middle
+code
+      0  box_local      s0
+      5  new_cell       s1
+     10  make_closure   #1
+     15  init_local     s2
+     20  push_const     k0            ; 0
+     25  init_cell      s1
+     30  get_local      s2 n0         ; middle
+     39  return
+
+function #1.1 middle: params 0, captures s1 s0
+slots 0, max_stack 1, code 6 bytes
+code
+      0  make_closure   #1
+      5  return
+
+function #1.1.1 inner: params 0, captures ^0 ^1
+slots 1, max_stack 2, code 59 bytes
+names
+  n0  depth
+  n1  p
+  n2  inner
+code
+      0  push_callee
+      1  init_local     s0
+      6  get_capture    ^0 n0         ; depth
+     15  to_number
+     16  dup
+     17  inc
+     18  set_capture    ^0 n0         ; depth
+     27  pop
+     28  pop
+     29  get_capture    ^1 n1         ; p
+     38  get_capture    ^0 n0         ; depth
+     47  add
+     48  get_local      s0 n2         ; inner
+     57  add
+     58  return
+
+function #2 (anonymous): params 0, captures s2
+slots 0, max_stack 1, code 10 bytes
+names
+  n0  x
+code
+      0  get_capture    ^0 n0         ; x
+      9  return
+
+function #3 (anonymous): params 0, captures s2
+slots 0, max_stack 1, code 10 bytes
+names
+  n0  i
+code
+      0  get_capture    ^0 n0         ; i
+      9  return

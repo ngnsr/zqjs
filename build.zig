@@ -16,6 +16,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // -Dstack-stress: the VM moves its stacks to fresh allocations on every call, so a
+    // stale index or slice into them fails at once (DESIGN_DECISIONS D12). Run the whole
+    // suite with it: zig build test -Dstack-stress
+    const options = b.addOptions();
+    options.addOption(bool, "stack_stress", b.option(bool, "stack-stress", "VM: move the stacks on every call") orelse false);
+    mod.addOptions("build_options", options);
     const imports: []const std.Build.Module.Import = &.{.{ .name = "zqjs", .module = mod }};
 
     const exe = b.addExecutable(.{

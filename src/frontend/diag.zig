@@ -17,11 +17,21 @@ pub const Feature = enum {
     labels,
     global_assignment,
     function_to_string,
+    block_function,
+    duplicate_parameter,
+    duplicate_function,
+    function_name_assignment,
+    arguments,
     syntax,
 
     pub fn description(f: Feature) []const u8 {
         return switch (f) {
             .function_to_string => "converting a function to a string",
+            .block_function => "function declarations inside blocks or single-statement positions (Annex B)",
+            .duplicate_parameter => "duplicate parameter names",
+            .duplicate_function => "redeclaring a function, or a parameter, with a function declaration",
+            .function_name_assignment => "assigning to a function expression's own name",
+            .arguments => "the arguments object",
             .labels => "labels",
             .global_assignment => "assignment to an undeclared variable",
             .asi => "automatic semicolon insertion; end the statement with ';'",

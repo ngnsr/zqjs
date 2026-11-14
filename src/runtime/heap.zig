@@ -15,6 +15,7 @@ const Allocator = std.mem.Allocator;
 const limits_mod = @import("../limits.zig");
 const Limits = limits_mod.Limits;
 const Limit = limits_mod.Limit;
+const Value = @import("value.zig").Value;
 
 pub const Error = error{ LimitExceeded, OutOfMemory };
 
@@ -24,7 +25,35 @@ pub const Obj = struct {
     kind: Kind,
     next: ?*Obj,
 
-    pub const Kind = enum { string };
+    pub const Kind = enum { string, cell, closure, env };
+};
+
+/// A captured variable (VM, DESIGN_DECISIONS D36). `null` = TDZ. Shared by every closure
+/// that captured it, so writes through any of them are seen by all.
+pub const Cell = struct {
+    obj: Obj,
+    value: ?Value,
+};
+
+/// A function value. Each engine creates and reads only its own variant; the payload
+/// pointers are opaque here so the heap does not depend on the AST or the bytecode.
+pub const Closure = struct {
+    obj: Obj,
+    impl: union(enum) {
+        /// `proto: *const bytecode.Proto`; `captures` filled by `make_closure`.
+        vm: struct { proto: *const anyopaque, captures: []*Cell },
+        /// `func: *const ast.Function`; `env` is the environment it was created in.
+        tree: struct { func: *const anyopaque, env: ?*Env },
+    },
+};
+
+/// An environment record of the tree-walker (DESIGN_DECISIONS D37): the bindings of one
+/// scope (`null` = TDZ) and the enclosing record.
+pub const Env = struct {
+    obj: Obj,
+    parent: ?*Env,
+    scope: u32,
+    values: []?Value,
 };
 
 pub const String = struct {
@@ -86,6 +115,52 @@ pub const Heap = struct {
         }
     }
 
+    pub fn newCell(h: *Heap, value: ?Value) Error!*Cell {
+        const charge = try h.reserve(@sizeOf(Cell), 0, 1);
+        errdefer h.bytes -= charge;
+        const c = try h.gpa.create(Cell);
+        c.* = .{ .obj = .{ .kind = .cell, .next = h.objects }, .value = value };
+        h.objects = &c.obj;
+        return c;
+    }
+
+    /// A VM closure with `n` captures, all `undefined` until the caller fills them.
+    pub fn newVmClosure(h: *Heap, proto: *const anyopaque, n: usize) Error!*Closure {
+        const payload = std.math.mul(usize, n, @sizeOf(*Cell)) catch return h.exceeded(.heap_bytes);
+        const charge = try h.reserve(@sizeOf(Closure), payload, 2);
+        errdefer h.bytes -= charge;
+        const captures = try h.gpa.alloc(*Cell, n);
+        errdefer h.gpa.free(captures);
+        const c = try h.gpa.create(Closure);
+        c.* = .{ .obj = .{ .kind = .closure, .next = h.objects }, .impl = .{ .vm = .{ .proto = proto, .captures = captures } } };
+        h.objects = &c.obj;
+        return c;
+    }
+
+    pub fn newTreeClosure(h: *Heap, func: *const anyopaque, env: ?*Env) Error!*Closure {
+        const charge = try h.reserve(@sizeOf(Closure), 0, 2); // same charge as a VM closure
+        errdefer h.bytes -= charge;
+        const c = try h.gpa.create(Closure);
+        c.* = .{ .obj = .{ .kind = .closure, .next = h.objects }, .impl = .{ .tree = .{ .func = func, .env = env } } };
+        h.objects = &c.obj;
+        return c;
+    }
+
+    /// An environment record with `len` bindings, all in the TDZ.
+    pub fn newEnv(h: *Heap, parent: ?*Env, scope: u32, len: usize) Error!*Env {
+        const payload = std.math.mul(usize, len, @sizeOf(?Value)) catch return h.exceeded(.heap_bytes);
+        const charge = try h.reserve(@sizeOf(Env), payload, 2);
+        errdefer h.bytes -= charge;
+        const values = try h.gpa.alloc(?Value, len);
+        errdefer h.gpa.free(values);
+        @memset(values, null);
+        const e = try h.gpa.create(Env);
+        e.* = .{ .obj = .{ .kind = .env, .next = h.objects }, .parent = parent, .scope = scope, .values = values };
+        h.objects = &e.obj;
+        return e;
+    }
+
+    /// Frees one object and gives its charge back (the same formula as when it was made).
     fn destroy(h: *Heap, obj: *Obj) void {
         switch (obj.kind) {
             .string => {
@@ -93,6 +168,28 @@ pub const Heap = struct {
                 h.bytes -= @sizeOf(String) + s.units.len * @sizeOf(u16) + 2 * per_allocation_overhead;
                 h.gpa.free(s.units);
                 h.gpa.destroy(s);
+            },
+            .cell => {
+                const c: *Cell = @fieldParentPtr("obj", obj);
+                h.bytes -= @sizeOf(Cell) + per_allocation_overhead;
+                h.gpa.destroy(c);
+            },
+            .closure => {
+                const c: *Closure = @fieldParentPtr("obj", obj);
+                switch (c.impl) {
+                    .vm => |v| {
+                        h.bytes -= @sizeOf(Closure) + v.captures.len * @sizeOf(*Cell) + 2 * per_allocation_overhead;
+                        h.gpa.free(v.captures);
+                    },
+                    .tree => h.bytes -= @sizeOf(Closure) + 2 * per_allocation_overhead,
+                }
+                h.gpa.destroy(c);
+            },
+            .env => {
+                const e: *Env = @fieldParentPtr("obj", obj);
+                h.bytes -= @sizeOf(Env) + e.values.len * @sizeOf(?Value) + 2 * per_allocation_overhead;
+                h.gpa.free(e.values);
+                h.gpa.destroy(e);
             },
         }
     }
@@ -193,6 +290,23 @@ test "rollback frees exactly the objects allocated since the mark" {
     try testing.expectEqual(before, h.bytes);
     try testing.expectEqual(&keep.obj, h.objects.?);
     try testing.expectEqual(@as(?*Obj, null), h.objects.?.next);
+}
+
+test "cells, closures and environments are accounted and freed" {
+    var h = Heap.init(testing.allocator, .{});
+    defer h.deinit(); // testing.allocator reports leaks
+    const c = try h.newCell(null);
+    const vm = try h.newVmClosure(@ptrCast(&h), 2);
+    vm.impl.vm.captures[0] = c;
+    vm.impl.vm.captures[1] = c;
+    const e = try h.newEnv(null, 0, 3);
+    _ = try h.newTreeClosure(@ptrCast(&h), e);
+    const m = h.mark();
+    const before = h.bytes;
+    _ = try h.newEnv(e, 1, 5);
+    _ = try h.newCell(.{ .number = 1 });
+    h.rollback(m);
+    try testing.expectEqual(before, h.bytes); // charges given back exactly
 }
 
 test "allocation failure leaves the accounting unchanged" {

@@ -12,7 +12,7 @@ source ─▶ Lexer ─▶ Parser ─▶ AST ─▶ Resolver ─▶ Compiler ─
 Dependencies point one way: frontend → compiler → runtime/VM. The frontend knows nothing about
 the runtime.
 
-## Built so far (M5)
+## Built so far (M6)
 
 | file | role |
 |---|---|
@@ -20,21 +20,21 @@ the runtime.
 | `src/frontend/lexer.zig` | pull-based, allocation-free tokenizer. Validates numbers; finds string ends |
 | `src/frontend/ast.zig` | `Expr` and `Stmt` nodes, `Ref` (variable use), `Declarator`, `Script` |
 | `src/frontend/parser.zig` | statements + Pratt expression parser; decodes string literals to UTF-16; classifies errors |
-| `src/frontend/resolver.zig` | scopes and names → binding ids, slots, globals; redeclaration and global-write checks |
+| `src/frontend/resolver.zig` | scopes and names → binding ids, slots, globals; function slots, captured bindings and capture lists; redeclaration and global-write checks |
 | `src/frontend/dump.zig` | S-expression dump with resolved names (`x#binding@slot`, `x@global`) |
 | `src/frontend/diag.zig` | `Diagnostic` (kind, feature, span), line/column, rendering with caret |
 | `src/runtime/value.zig` | `Value` (tagged union) and `Native` |
-| `src/runtime/heap.zig` | `Heap`: list of all objects, `String`, byte accounting and limits |
+| `src/runtime/heap.zig` | `Heap`: list of all objects (`String`, `Cell`, `Closure`, `Env`), byte accounting and limits |
 | `src/runtime/runtime.zig` | `Runtime`: heap, output, step budget, exception / stop reason |
 | `src/runtime/ops.zig` | all JS value semantics: ToNumber, ToString (number formatting), ToBoolean, operators |
 | `src/runtime/pow.zig` | `pow` ported from musl (Arm optimized-routines); `pow_data.zig`: its tables, generated |
 | `src/runtime/globals.zig` | `undefined`, `NaN`, `Infinity`, `print` |
-| `src/interp/treewalk.zig` | tree-walking interpreter over AST + Resolution, `?Value` slots (the oracle) |
+| `src/interp/treewalk.zig` | tree-walking interpreter (the oracle): spec-style environment records, on its own 64 MiB stack (D37) |
 | `src/bytecode/bytecode.zig` | instruction set (`Op`, one table of operands and stack effects), `Proto` |
 | `src/bytecode/compiler.zig` | AST + Resolution → `Proto`: constant pool, name table, `max_stack`, no dead code |
 | `src/bytecode/verify.zig` | checks a `Proto` as untrusted input (D33); reports measured stack depth |
 | `src/bytecode/disasm.zig` | listing for `--dump-bytecode` |
-| `src/vm/vm.zig` | the stack VM: `Vm.step()` / `run()`, defensive checks, precise faults (D35) |
+| `src/vm/vm.zig` | the stack VM: frames, locals and operand stacks, transactional calls, cells and captures, `Vm.step()` / `run()`, defensive checks, precise faults (D35, D36) |
 | `src/run.zig` | source → parse → resolve → engine (VM: compile → verify → run; or tree-walker), with outcome reporting and `--trace` (CLI and tests share it) |
 | `src/limits.zig` | `Limits` (only the limits enforced so far, see DESIGN_DECISIONS D15) |
 | `src/root.zig` | library entry: `parse`, `resolve`, `dump`, `Runtime`, `interpret`, `runSource`, `compile`, `verify`, `disassemble` |

@@ -63,9 +63,14 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `non_decimal_literal` | not yet | `0x10`, `0o7`, `0b1` | |
 | `bigint` | not yet | `10n` | |
 | `global_assignment` | restriction (revisit at M9) | `y = 1`, `undefined = 1`, `y++` with no declaration of `y` | sloppy JS silently creates (or ignores writes to) globals; ZQJS has no writable globals yet |
-| `function_to_string` | not yet | `print(print)`, `'' + print` | node prints the function's source text; ZQJS's native functions have none |
+| `function_to_string` | not yet | `print(print)`, `'' + f`, `f < 'a'`, `f < g` | JS converts a function to its source text; ZQJS has none to show or compare |
+| `block_function` | restriction | `{ function f() {} }`, `if (c) function f() {}` | sloppy-mode Annex B gives block-level function declarations two bindings; declare functions at the top of a script or function body, or use `let f = function () {}` |
+| `duplicate_parameter` | restriction | `function f(a, a) {}` | legal in sloppy JS (the last one wins) |
+| `duplicate_function` | restriction | `function f() {} function f() {}`, `function f(a) { function a() {} }`, `function NaN() {}` | legal in sloppy JS (the later declaration wins, or a global is redefined) |
+| `function_name_assignment` | restriction | `let g = function n() { n = 1; };` | sloppy JS silently ignores the write |
+| `arguments` | not yet | `arguments`, `function f(arguments) {}` | the arguments object |
 | `labels` | not yet | `foo: while (…)`, `break foo;` | |
-| `syntax` | not yet | `?:`, `,`, `~`, `&&=`, `var`, `do`, destructuring, `for…of/in`, `let` used as a variable name, arrow functions, regexes … | any JS token or construct not yet in the grammar below |
+| `syntax` | not yet | `?:`, `,`, `~`, `&&=`, `var`, `do`, destructuring, `for…of/in`, `let` used as a variable name, arrow functions, default/rest parameters, generators, `async`, `this`, `new`, regexes … | any JS token or construct not yet in the grammar below |
 
 ## 3. Lexical grammar (M1)
 
@@ -99,10 +104,14 @@ Each `Unsupported` diagnostic names one of these stable ids.
   binding name (§4). Other JS reserved words (`this`, `new`, `var`, `function`, …) are
   `Unsupported(syntax)` where an expression is expected, and a SyntaxError as variable names.
 
-## 4. Syntactic grammar (M2)
+## 4. Syntactic grammar (M2, functions M6)
 
 ```
-Script            := StatementListItem*
+Script            := BodyItem*
+BodyItem          := FunctionDeclaration | StatementListItem   (script and function bodies)
+FunctionDeclaration := 'function' Identifier Params Body   (hoisted; not inside blocks)
+Params            := '(' (Identifier (',' Identifier)* ','?)? ')'
+Body              := '{' BodyItem* '}'
 StatementListItem := Declaration | Statement
 Declaration       := ('let' | 'const') Declarator (',' Declarator)* ';'
 Declarator        := Identifier ('=' Expression)?          (const requires '=')
@@ -111,7 +120,8 @@ Statement         := ';'                                   (empty statement)
                    | 'if' '(' Expression ')' Statement ('else' Statement)?
                    | 'while' '(' Expression ')' Statement
                    | 'for' '(' ForInit? ';' Expression? ';' Expression? ')' Statement
-                   | 'break' ';' | 'continue' ';'          (only inside a loop)
+                   | 'break' ';' | 'continue' ';'          (only inside a loop of the same function)
+                   | 'return' Expression? ';'              (only inside a function)
                    | Expression ';'
 ForInit           := ('let' | 'const') Declarator (',' Declarator)* | Expression
 Expression        := Identifier AssignOp Expression | Logical   (right-associative)
@@ -126,6 +136,7 @@ Exp               := Unary | Postfix '**' Exp               (right-associative)
 Unary             := ('-' | '+' | '!') Unary | ('++' | '--') Unary | Postfix
 Postfix           := Primary ('++' | '--')?                 (no line break before ++/--)
 Primary           := Number | String | 'true' | 'false' | 'null' | Identifier
+                   | 'function' Identifier? Params Body    (function expression)
                    | '(' Expression ')'
                    | Primary '(' (Expression (',' Expression)* ','?)? ')'   (call)
 ```
@@ -159,11 +170,33 @@ script runs (DESIGN_DECISIONS D32).
 ## 5. Semantics
 
 ### Values and globals (M3)
-Values: `undefined`, `null`, booleans, numbers (IEEE-754 doubles), strings (UTF-16 code units)
-and native functions. Globals: `undefined`, `NaN`, `Infinity`, and `print(a, b, …)`, which
+Values: `undefined`, `null`, booleans, numbers (IEEE-754 doubles), strings (UTF-16 code units),
+native functions and (M6) closures. Globals: `undefined`, `NaN`, `Infinity`, and `print(a, b, …)`, which
 writes `String(a) + ' ' + String(b) + … + '\n'` (lone surrogates are written as U+FFFD).
-Calling anything other than a native function throws a **TypeError** (after the arguments are
+Calling anything other than a function throws a **TypeError** (after the arguments are
 evaluated); reading an undeclared global throws a **ReferenceError**.
+
+### Functions (M6), as in JavaScript
+- **Calls:** the callee, then the arguments left to right, then the callable check. Missing
+  arguments are `undefined`; extra ones are evaluated and dropped. `return;`, `return e;`, and
+  falling off the end (`undefined`).
+- **Declarations** at the top of a script or function body are hoisted *and initialised* on
+  entry, so `f(); function f() {}` and mutual recursion work. Their names are mutable bindings.
+- **Named function expressions:** the name is bound only inside the function, to the function;
+  parameters and locals may shadow it.
+- **Closures** capture *bindings*, not values: writes through one closure are seen by every
+  other closure of the same binding, and a binding lives as long as any closure using it.
+  Every execution of a block creates new bindings (`{ let x = …; f = function () { return x; }; }`
+  run twice gives two independent `x`s).
+- **`for (let …)`** gives each iteration its own copy of the head bindings: a closure created in
+  an iteration keeps that iteration's value, even after later iterations or the update run.
+- **Values:** functions compare by identity (`===`), are truthy, and convert to NaN. Converting
+  one to a string, or comparing it with a string or another function, needs its source text:
+  `Unsupported(function_to_string)`.
+- **Limits:** more than `Limits.max_call_depth` (default 10,000) active calls →
+  `LimitExceeded(call_depth)` (node: RangeError at about 11,000). The VM also limits the stack
+  slots reserved by all active frames (`max_stack_slots`), the tree-walker its native recursion
+  (`max_interpreter_depth`); which limit a runaway recursion hits first is engine-specific.
 
 ### Operators (M3), as in JavaScript
 - Operands are evaluated left to right; `&&`/`||` short-circuit and return an operand value.
@@ -195,5 +228,4 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
   **`x op= e`** and **`++x`/`x++`**: read `x` (TDZ check) first, then evaluate the right side.
 - **`const`**: writing to an initialised const binding throws a **TypeError**, only when the
   write executes (`if (false) c = 2;` is fine). It is never an early error.
-- **`for (let …)`**: the spec gives each iteration a fresh copy of the head bindings. Without
-  closures this is unobservable; M6 must implement it for captured bindings (DESIGN_DECISIONS D22).
+- **`for (let …)`**: each iteration gets a fresh copy of the head bindings (see Functions).

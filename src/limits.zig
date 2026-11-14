@@ -26,6 +26,20 @@ pub const Limits = struct {
     /// Most entries in one compiled script's constant pool, and separately in its name
     /// table. Operands are u32, so this is a resource bound, not an encoding one.
     max_constants: u32 = 1 << 20,
+    /// Most active JavaScript calls (frames) at once, on both engines. Node allows about
+    /// 11k before its RangeError; we stop a little earlier with LimitExceeded(call_depth).
+    max_call_depth: u32 = 10_000,
+    /// VM: the most stack slots reserved at once, summed over *all active frames*: each
+    /// frame reserves its `slot_count` locals plus its `max_stack` operands on entry,
+    /// whether or not it uses them, so a deep recursion of small frames and a shallow one
+    /// of huge frames are both bounded. LimitExceeded(stack_slots) (DESIGN_DECISIONS D36).
+    max_stack_slots: u32 = 1 << 22,
+    /// Tree-walker: the deepest native recursion of the interpreter, counting every
+    /// statement, expression and call it is nested in, across function calls. Bounds
+    /// its use of the Zig stack, so deep recursion stops cleanly with
+    /// LimitExceeded(interpreter_depth) instead of overflowing the OS stack. Sized
+    /// (DESIGN_DECISIONS D37) to stay well inside an 8 MiB stack in Debug builds.
+    max_interpreter_depth: u32 = 6_000,
 };
 
 pub const Limit = enum {
@@ -36,6 +50,9 @@ pub const Limit = enum {
     string_length,
     code_bytes,
     constants,
+    call_depth,
+    stack_slots,
+    interpreter_depth,
 };
 
 comptime {

@@ -35,13 +35,15 @@ pub const Runtime = struct {
     heap: Heap,
     out: *std.Io.Writer,
     max_steps: u64,
+    /// All limits, for the engines (call depth, stack slots, interpreter depth).
+    limits: Limits,
     steps: u64 = 0,
     exception: ?Exception = null,
     unsupported: ?Feature = null,
     limit_hit: ?Limit = null,
 
     pub fn init(gpa: Allocator, limits: Limits, out: *std.Io.Writer) Runtime {
-        return .{ .gpa = gpa, .heap = .init(gpa, limits), .out = out, .max_steps = limits.max_steps };
+        return .{ .gpa = gpa, .heap = .init(gpa, limits), .out = out, .max_steps = limits.max_steps, .limits = limits };
     }
 
     pub fn deinit(rt: *Runtime) void {
@@ -71,6 +73,11 @@ pub const Runtime = struct {
     pub fn fail(rt: *Runtime, feature: Feature) Error {
         rt.unsupported = feature;
         return error.Unsupported;
+    }
+
+    pub fn limit(rt: *Runtime, which: Limit) Error {
+        rt.limit_hit = which;
+        return error.LimitExceeded;
     }
 
     pub fn limitHit(rt: *const Runtime) ?Limit {

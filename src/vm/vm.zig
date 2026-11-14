@@ -1,32 +1,47 @@
-//! The stack VM: executes a verified Proto (bytecode/bytecode.zig).
+//! The stack VM: executes a verified Proto tree (bytecode/bytecode.zig).
 //!
-//! State: `pc` and `sp` are indices (never pointers, DESIGN_DECISIONS D12); `slots` are
-//! the script's locals (`null` = TDZ, as in the tree-walker); `stack` is the operand
-//! stack, sized `max_stack` once (M5 has no calls into JS, so it never grows).
+//! State (DESIGN_DECISIONS D12, D36), all addressed by index, never by pointer, so the
+//! stacks can move when they grow:
+//!   frames   one per active call (the script is frames[0]): its Proto and closure,
+//!            the caller's pc to return to, where its locals and operands start
+//!   locals   every frame's slots, contiguous; a slot holds a value (`null` = TDZ) or,
+//!            for a captured binding, a Cell (`Slot`)
+//!   stack    every frame's operands, contiguous; a callee's operands start above the
+//!            caller's arguments
 //!
 //! Semantics live in runtime/ops.zig, shared with the tree-walker (D16). This file only
-//! moves values between the stack, the slots and those functions.
+//! moves values between the stacks, the cells and those functions.
 //!
 //! `step()` contract (DESIGN_DECISIONS D35)
-//!   * Executes exactly one instruction, charging one budget step *before* it.
-//!   * `.running`: the instruction completed; `pc` is the next instruction.
+//!   * Executes exactly one instruction (a call or return included), charging one budget
+//!     step *before* it.
+//!   * `.running`: the instruction completed; `pc` is the next instruction (the callee's
+//!     first after a call, the caller's next after a return).
 //!   * `.halted`: `halt` executed. Further calls return `.halted` and do nothing.
-//!   * An error (Thrown, LimitExceeded, Unsupported, OutOfMemory, WriteFailed) is
-//!     *precise*: `pc` still points at the failing instruction and the operand stack and
-//!     slots are exactly as before it. Details are on the Runtime (`exception`,
-//!     `limitHit()`, `unsupported`). The VM is then faulted: further calls return the
-//!     same error and execute nothing. (Side effects outside the VM, such as output a
-//!     native already wrote, are not undone.)
+//!   * An error is *precise*: `pc`, the frames, both stacks and every slot and cell are
+//!     exactly as before the failing instruction. Details are on the Runtime. The VM is
+//!     then faulted: further calls return the same error and execute nothing. (Side
+//!     effects outside the VM, such as output a native already wrote, are not undone.)
+//!
+//! Calls (D36) are transactional: limits are checked and every stack's capacity is
+//! reserved (growing may move a stack, which is fine: everything is an index) before
+//! anything is committed, so a failed call leaves the caller exactly as it was: its
+//! operands, including callee and arguments, untouched, and `pc` on the `call`.
 //!
 //! Defensive checks. The verifier rejects malformed bytecode; these checks catch bugs in
-//! the VM or the verifier themselves: pc and instruction bounds, opcode validity, stack
-//! underflow/overflow, slot, constant and name indices. They are cheap compares, kept in
-//! every build mode, and a failure is a bug, so it panics (`bug`) rather than producing
-//! a JavaScript-visible result. Remove them only if benchmarks justify it.
+//! the VM, the compiler or the verifier themselves: pc and instruction bounds, opcode
+//! validity, a frame's stack underflow/overflow, slot, constant, name, function and
+//! capture indices, and the kind of a slot (value or cell). They are cheap compares,
+//! kept in every build mode, and a failure is a bug, so it panics (`bug`) rather than
+//! producing a JavaScript-visible result.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const build_options = @import("build_options");
 const Value = @import("../runtime/value.zig").Value;
+const heap = @import("../runtime/heap.zig");
+const Cell = heap.Cell;
+const Closure = heap.Closure;
 const rt_mod = @import("../runtime/runtime.zig");
 const Runtime = rt_mod.Runtime;
 const Error = rt_mod.Error;
@@ -37,31 +52,65 @@ const bc = @import("../bytecode/bytecode.zig");
 const Op = bc.Op;
 const Proto = bc.Proto;
 
+/// A local slot: a plain binding's value (`null` = TDZ), or a captured binding's cell.
+pub const Slot = union(enum) {
+    value: ?Value,
+    cell: *Cell,
+};
+
+pub const Frame = struct {
+    proto: *const Proto,
+    /// The running closure (null for the script).
+    closure: ?*const Closure,
+    /// Where the caller continues (unused for the script).
+    return_pc: u32,
+    /// First of this frame's `slot_count` locals.
+    locals_base: u32,
+    /// First of this frame's operands.
+    stack_base: u32,
+    /// Index of the callee in the caller's operands: `return` cuts the stack back to it.
+    callee_index: u32,
+    /// The end of the operand region reserved by this frame *or any frame below it*: a
+    /// callee's region can end below its caller's, and the stack must keep both.
+    stack_end: u32,
+};
+
 pub const Vm = struct {
     pub const State = enum { running, halted };
 
     rt: *Runtime,
-    proto: *const Proto,
-    pc: u32 = 0,
+    frames: std.ArrayList(Frame) = .empty,
+    locals: []Slot = &.{},
+    locals_len: u32 = 0,
+    stack: []Value = &.{},
     sp: u32 = 0,
-    slots: []?Value,
-    stack: []Value,
+    /// Σ (slot_count + max_stack) over active frames (Limits.max_stack_slots).
+    reserved: u64 = 0,
+    /// The current frame's pc.
+    pc: u32 = 0,
     halted: bool = false,
     fault: ?Error = null,
 
-    /// `proto` must have passed `verify` and must outlive the VM. Allocates with `rt.gpa`;
-    /// on failure nothing is left allocated.
-    pub fn init(rt: *Runtime, proto: *const Proto) Allocator.Error!Vm {
-        const slots = try rt.gpa.alloc(?Value, proto.slot_count);
-        errdefer rt.gpa.free(slots);
-        @memset(slots, null);
-        const stack = try rt.gpa.alloc(Value, proto.max_stack);
-        return .{ .rt = rt, .proto = proto, .slots = slots, .stack = stack };
+    /// `script` must have passed `verify` and must outlive the VM (and every use of its
+    /// closures). Allocates with `rt.gpa`; on failure nothing is left allocated.
+    pub fn init(rt: *Runtime, script: *const Proto) Error!Vm {
+        if (@as(u64, script.slot_count) + script.max_stack > rt.limits.max_stack_slots) return rt.limit(.stack_slots);
+        var vm: Vm = .{ .rt = rt };
+        errdefer vm.deinit();
+        try vm.reserve(script);
+        try vm.frames.ensureTotalCapacity(rt.gpa, 1);
+        vm.initLocals(script, 0, 0);
+        vm.frames.appendAssumeCapacity(.{ .proto = script, .closure = null, .return_pc = 0, .locals_base = 0, .stack_base = 0, .callee_index = 0, .stack_end = script.max_stack });
+        vm.locals_len = script.slot_count;
+        vm.reserved = script.slot_count + script.max_stack;
+        return vm;
     }
 
     pub fn deinit(vm: *Vm) void {
-        vm.rt.gpa.free(vm.stack);
-        vm.rt.gpa.free(vm.slots);
+        const gpa = vm.rt.gpa;
+        vm.frames.deinit(gpa);
+        gpa.free(vm.locals);
+        gpa.free(vm.stack);
         vm.* = undefined;
     }
 
@@ -70,9 +119,17 @@ pub const Vm = struct {
         while (try vm.step() == .running) {}
     }
 
-    /// The operand stack, bottom first (for traces and tests).
+    /// The operand stack of all frames, bottom first (for traces and tests).
     pub fn operands(vm: *const Vm) []const Value {
         return vm.stack[0..vm.sp];
+    }
+
+    pub fn frame(vm: *const Vm) *const Frame {
+        return &vm.frames.items[vm.frames.items.len - 1];
+    }
+
+    pub fn proto(vm: *const Vm) *const Proto {
+        return vm.frame().proto;
     }
 
     pub fn step(vm: *Vm) Error!State {
@@ -85,9 +142,10 @@ pub const Vm = struct {
     }
 
     /// One instruction. Every path either fails before changing VM state, or commits
-    /// its stack/slot changes and then sets `pc` (see the contract above).
+    /// its changes and then sets `pc` (see the contract above).
     fn execute(vm: *Vm) Error!State {
-        const code = vm.proto.code;
+        const p = vm.proto();
+        const code = p.code;
         const pc = vm.pc;
         if (pc >= code.len) vm.bug("pc outside the code");
         const op = std.enums.fromInt(Op, code[pc]) orelse vm.bug("invalid opcode");
@@ -103,33 +161,96 @@ pub const Vm = struct {
             .push_false => vm.push(.{ .boolean = false }),
             .push_const => {
                 const k = vm.operand(0);
-                if (k >= vm.proto.consts.len) vm.bug("constant index out of range");
-                vm.push(vm.proto.consts[k]);
+                if (k >= p.consts.len) vm.bug("constant index out of range");
+                vm.push(p.consts[k]);
             },
 
             .get_local => {
-                const v = vm.slot(vm.operand(0)).* orelse return vm.tdz(vm.operand(1));
+                const v = vm.value(vm.operand(0)).* orelse return vm.tdz(vm.operand(1));
                 vm.push(v);
             },
             .set_local => {
-                const s = vm.slot(vm.operand(0));
+                const s = vm.value(vm.operand(0));
                 if (s.* == null) return vm.tdz(vm.operand(1));
                 s.* = vm.peek(0); // the assignment's value stays on the stack
             },
             .init_local => {
-                vm.slot(vm.operand(0)).* = vm.peek(0);
+                vm.slot(vm.operand(0)).* = .{ .value = vm.peek(0) };
                 vm.drop(1);
             },
-            .clear_local => vm.slot(vm.operand(0)).* = null,
+            .clear_local => vm.slot(vm.operand(0)).* = .{ .value = null },
             .assign_const => {
-                if (vm.slot(vm.operand(0)).* == null) return vm.tdz(vm.operand(1));
-                return rt.throw(.TypeError, &.{.{ .ascii = "Assignment to constant variable." }});
+                if (vm.value(vm.operand(0)).* == null) return vm.tdz(vm.operand(1));
+                return vm.constAssignment();
             },
             .get_global => {
                 const n = vm.name(vm.operand(0));
                 const v = globals.lookup(n) orelse return rt.throw(.ReferenceError, &.{ .{ .ascii = n }, .{ .ascii = " is not defined" } });
                 vm.push(v);
             },
+
+            .new_cell => {
+                const s = vm.slot(vm.operand(0));
+                s.* = .{ .cell = try rt.heap.newCell(null) };
+            },
+            .box_local => {
+                const s = vm.slot(vm.operand(0));
+                const v = switch (s.*) {
+                    .value => |v| v orelse vm.bug("boxing a slot in the TDZ"),
+                    .cell => vm.bug("boxing a cell"),
+                };
+                s.* = .{ .cell = try rt.heap.newCell(v) };
+            },
+            .fresh_cell => {
+                const s = vm.slot(vm.operand(0));
+                const old = vm.cellIn(s);
+                s.* = .{ .cell = try rt.heap.newCell(old.value) };
+            },
+            .get_cell => {
+                const v = vm.cellAt(vm.operand(0)).value orelse return vm.tdz(vm.operand(1));
+                vm.push(v);
+            },
+            .set_cell => {
+                const c = vm.cellAt(vm.operand(0));
+                if (c.value == null) return vm.tdz(vm.operand(1));
+                c.value = vm.peek(0);
+            },
+            .init_cell => {
+                vm.cellAt(vm.operand(0)).value = vm.peek(0);
+                vm.drop(1);
+            },
+            .assign_const_cell => {
+                if (vm.cellAt(vm.operand(0)).value == null) return vm.tdz(vm.operand(1));
+                return vm.constAssignment();
+            },
+            .get_capture => {
+                const v = vm.capture(vm.operand(0)).value orelse return vm.tdz(vm.operand(1));
+                vm.push(v);
+            },
+            .set_capture => {
+                const c = vm.capture(vm.operand(0));
+                if (c.value == null) return vm.tdz(vm.operand(1));
+                c.value = vm.peek(0);
+            },
+            .assign_const_capture => {
+                if (vm.capture(vm.operand(0)).value == null) return vm.tdz(vm.operand(1));
+                return vm.constAssignment();
+            },
+
+            .make_closure => {
+                const f = vm.operand(0);
+                if (f >= p.functions.len) vm.bug("function index out of range");
+                const child = &p.functions[f];
+                vm.ensurePush();
+                const c = try rt.heap.newVmClosure(child, child.captures.len);
+                // Nothing below can fail: the closure is complete before it is pushed.
+                for (child.captures, c.impl.vm.captures) |desc, *dst| dst.* = switch (desc.from) {
+                    .parent_slot => vm.cellAt(desc.index),
+                    .parent_capture => vm.capture(desc.index),
+                };
+                vm.push(.{ .closure = c });
+            },
+            .push_callee => vm.push(.{ .closure = vm.frame().closure orelse vm.bug("push_callee in the script") }),
 
             .pop => vm.drop(1),
             .dup => vm.push(vm.peek(0)),
@@ -165,21 +286,40 @@ pub const Vm = struct {
                 if (truthy == (op == .jump_if_true)) next = vm.target();
             },
             .call => {
-                // Stack: [callee, arg0 … arg(argc-1)], arguments in source order. The native
-                // *borrows* the argument slice: it is valid only during the call and must not
-                // be kept (M6's NativeCtx replaces it). If the native throws, nothing has been
-                // popped, so the stack is still a valid pre-call state. On success, callee and
-                // arguments are replaced by the result.
+                // Stack: [callee, arg0 … arg(argc-1)], arguments in source order.
                 const argc = vm.operand(0);
-                if (argc >= vm.sp) vm.bug("stack underflow");
+                if (argc >= vm.sp - vm.frame().stack_base) vm.bug("stack underflow");
                 const base = vm.sp - argc - 1;
-                const callee = vm.stack[base];
-                if (callee != .native) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
-                const result = try callee.native.call(rt, vm.stack[base + 1 .. vm.sp]);
-                vm.stack[base] = result;
-                vm.sp = base + 1;
+                switch (vm.stack[base]) {
+                    // The native *borrows* the argument slice: valid only during the call; it
+                    // cannot call back into JS, so the stack cannot move under it. If it fails,
+                    // nothing has been popped: the stack is still a valid pre-call state.
+                    .native => |n| {
+                        const result = try n.call(rt, vm.stack[base + 1 .. vm.sp]);
+                        vm.stack[base] = result;
+                        vm.sp = base + 1;
+                    },
+                    .closure => |c| {
+                        try vm.enter(c, base, argc, next);
+                        return .running; // pc is the callee's 0
+                    },
+                    else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
+                }
+            },
+            .@"return" => {
+                if (vm.frames.items.len < 2) vm.bug("return in the script");
+                const v = vm.peek(0);
+                const f = vm.frames.pop().?;
+                vm.locals_len = f.locals_base;
+                vm.reserved -= f.proto.slot_count + f.proto.max_stack;
+                vm.sp = f.callee_index;
+                vm.stack[vm.sp] = v; // replaces the callee; arguments and callee operands are gone
+                vm.sp += 1;
+                vm.pc = f.return_pc;
+                return .running;
             },
             .halt => {
+                if (vm.frames.items.len != 1) vm.bug("halt in a function");
                 if (vm.sp != 0) vm.bug("stack not empty at halt");
                 vm.halted = true;
                 return .halted; // pc stays on `halt`
@@ -190,52 +330,163 @@ pub const Vm = struct {
         return .running;
     }
 
+    // ---- calls
+
+    /// Enters closure `c`, whose callee slot is `stack[base]` with `argc` arguments above
+    /// it. Transactional: everything that can fail happens before anything is committed.
+    fn enter(vm: *Vm, c: *const Closure, base: u32, argc: u32, return_pc: u32) Error!void {
+        const v = switch (c.impl) {
+            .vm => |v| v,
+            .tree => vm.bug("a tree-walker closure in the VM"),
+        };
+        const callee: *const Proto = @ptrCast(@alignCast(v.proto));
+        const limits = vm.rt.limits;
+        // 1. limits
+        if (vm.frames.items.len >= limits.max_call_depth) return vm.rt.limit(.call_depth);
+        if (vm.reserved + callee.slot_count + callee.max_stack > limits.max_stack_slots) return vm.rt.limit(.stack_slots);
+        // 2. capacity (may move the stacks: fine, everything is an index)
+        try vm.frames.ensureUnusedCapacity(vm.rt.gpa, 1);
+        try vm.reserve(callee);
+        // 3. the callee's locals, above locals_len (not live yet, so nothing visible changes)
+        vm.initLocals(callee, base + 1, argc);
+        // 4. commit
+        vm.frames.appendAssumeCapacity(.{
+            .proto = callee,
+            .closure = c,
+            .return_pc = return_pc,
+            .locals_base = vm.locals_len,
+            .stack_base = vm.sp,
+            .callee_index = base,
+            .stack_end = vm.stackEnd(callee),
+        });
+        vm.locals_len += callee.slot_count;
+        vm.reserved += callee.slot_count + callee.max_stack;
+        vm.pc = 0;
+    }
+
+    /// Makes room for a frame of `p` above the current locals and operands. Grows
+    /// geometrically; on failure the old stacks are untouched. With -Dstack-stress, moves
+    /// both stacks to fresh allocations every time, so stale indices or slices would
+    /// show up at once.
+    fn reserve(vm: *Vm, p: *const Proto) Error!void {
+        const gpa = vm.rt.gpa;
+        const need_locals = @as(usize, vm.locals_len) + p.slot_count;
+        const need_stack: usize = vm.stackEnd(p);
+        if (build_options.stack_stress) {
+            const locals = try gpa.alloc(Slot, need_locals);
+            errdefer gpa.free(locals);
+            const stack = try gpa.alloc(Value, need_stack);
+            @memcpy(locals[0..vm.locals_len], vm.locals[0..vm.locals_len]);
+            @memcpy(stack[0..vm.sp], vm.stack[0..vm.sp]);
+            gpa.free(vm.locals);
+            gpa.free(vm.stack);
+            vm.locals = locals;
+            vm.stack = stack;
+            return;
+        }
+        if (need_locals > vm.locals.len) vm.locals = try gpa.realloc(vm.locals, @max(need_locals, vm.locals.len * 2));
+        if (need_stack > vm.stack.len) vm.stack = try gpa.realloc(vm.stack, @max(need_stack, vm.stack.len * 2));
+    }
+
+    /// Operand stack size needed with a frame of `p` on top: its region, and the regions
+    /// of every frame below it (found by the stress mode, whose exact-size copies would
+    /// otherwise drop the caller's unused reservation).
+    fn stackEnd(vm: *const Vm, p: *const Proto) u32 {
+        const below: u32 = if (vm.frames.items.len > 0) vm.frame().stack_end else 0;
+        return @max(below, vm.sp + p.max_stack);
+    }
+
+    /// Initialises the `p.slot_count` locals above locals_len: the parameters (slots
+    /// param_slot…) from the `argc` values at stack[args…] (missing ones are undefined,
+    /// extra ones ignored), everything else in the TDZ.
+    fn initLocals(vm: *Vm, p: *const Proto, args: u32, argc: u32) void {
+        for (vm.locals[vm.locals_len..][0..p.slot_count], 0..) |*s, n| {
+            const i = @as(i64, @intCast(n)) - p.param_slot; // parameter number
+            s.* = .{ .value = if (i >= 0 and i < p.param_count) (if (i < argc) vm.stack[args + @as(u32, @intCast(i))] else .undefined) else null };
+        }
+    }
+
     // ---- checked accessors (see "Defensive checks")
 
     fn operand(vm: *const Vm, i: usize) u32 {
-        return bc.readU32(vm.proto.code, vm.pc + 1 + 4 * i); // instruction bounds checked in execute
+        return bc.readU32(vm.proto().code, vm.pc + 1 + 4 * i); // instruction bounds checked in execute
     }
 
     fn target(vm: *const Vm) u32 {
         const t = vm.operand(0);
-        if (t >= vm.proto.code.len) vm.bug("jump target outside the code");
+        if (t >= vm.proto().code.len) vm.bug("jump target outside the code");
         return t;
     }
 
-    fn slot(vm: *Vm, i: u32) *?Value {
-        if (i >= vm.slots.len) vm.bug("slot index out of range");
-        return &vm.slots[i];
+    fn slot(vm: *Vm, i: u32) *Slot {
+        if (i >= vm.proto().slot_count) vm.bug("slot index out of range");
+        return &vm.locals[vm.frame().locals_base + i];
+    }
+
+    /// A plain (uncaptured) slot's value.
+    fn value(vm: *Vm, i: u32) *?Value {
+        return switch (vm.slot(i).*) {
+            .value => |*v| v,
+            .cell => vm.bug("value access to a cell slot"),
+        };
+    }
+
+    fn cellIn(vm: *const Vm, s: *Slot) *Cell {
+        return switch (s.*) {
+            .cell => |c| c,
+            .value => vm.bug("cell access to a value slot"),
+        };
+    }
+
+    fn cellAt(vm: *Vm, i: u32) *Cell {
+        return vm.cellIn(vm.slot(i));
+    }
+
+    fn capture(vm: *const Vm, i: u32) *Cell {
+        const c = vm.frame().closure orelse vm.bug("capture access in the script");
+        const caps = c.impl.vm.captures;
+        if (i >= caps.len) vm.bug("capture index out of range");
+        return caps[i];
     }
 
     fn name(vm: *const Vm, i: u32) []const u8 {
-        if (i >= vm.proto.names.len) vm.bug("name index out of range");
-        return vm.proto.names[i];
+        if (i >= vm.proto().names.len) vm.bug("name index out of range");
+        return vm.proto().names[i];
+    }
+
+    /// Stack room for one more operand in the current frame.
+    fn ensurePush(vm: *const Vm) void {
+        if (vm.sp >= vm.frame().stack_base + vm.proto().max_stack or vm.sp >= vm.stack.len) vm.bug("stack overflow");
     }
 
     fn push(vm: *Vm, v: Value) void {
-        if (vm.sp >= vm.stack.len) vm.bug("stack overflow");
+        vm.ensurePush();
         vm.stack[vm.sp] = v;
         vm.sp += 1;
     }
 
-    /// The value `depth` places below the top (0 = top).
+    /// The value `depth` places below the top (0 = top), within the current frame.
     fn peek(vm: *const Vm, depth: u32) Value {
-        if (depth >= vm.sp) vm.bug("stack underflow");
+        if (depth >= vm.sp - vm.frame().stack_base) vm.bug("stack underflow");
         return vm.stack[vm.sp - 1 - depth];
     }
 
     fn top(vm: *Vm) *Value {
-        if (vm.sp == 0) vm.bug("stack underflow");
+        if (vm.sp == vm.frame().stack_base) vm.bug("stack underflow");
         return &vm.stack[vm.sp - 1];
     }
 
     fn drop(vm: *Vm, n: u32) void {
-        if (n > vm.sp) vm.bug("stack underflow");
+        if (n > vm.sp - vm.frame().stack_base) vm.bug("stack underflow");
         vm.sp -= n;
     }
 
     fn tdz(vm: *Vm, name_index: u32) Error {
         return vm.rt.throw(.ReferenceError, &.{ .{ .ascii = "Cannot access '" }, .{ .ascii = vm.name(name_index) }, .{ .ascii = "' before initialization" } });
+    }
+
+    fn constAssignment(vm: *Vm) Error {
+        return vm.rt.throw(.TypeError, &.{.{ .ascii = "Assignment to constant variable." }});
     }
 
     fn bug(vm: *const Vm, comptime what: []const u8) noreturn {

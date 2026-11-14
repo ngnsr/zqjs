@@ -150,7 +150,7 @@ fn dumpBytecode(gpa: std.mem.Allocator, arena: std.mem.Allocator, name: []const 
     };
     defer proto.deinit(gpa);
     var failure: zqjs.verify.Failure = .{};
-    _ = zqjs.verify.verify(gpa, proto, limits, &failure) catch |e| switch (e) {
+    _ = zqjs.verify.verify(gpa, &proto, limits, &failure) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.InvalidBytecode => {
             // No listing: the disassembler trusts operands, which is exactly what failed.

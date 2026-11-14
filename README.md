@@ -22,7 +22,8 @@ Milestone 7 of 11 done (tags `m1` … `m7`, and `p1` for accurate `**`). ZQJS ha
   M8 adds one; the design is in [GC_DESIGN.md](GC_DESIGN.md).
 
 ```js
-// node and ZQJS print the same: 6765 hi box:3 0,1,b,a
+// ZQJS prints 6765 hi box:3 0,1,b,a. `print` is ZQJS's own built-in, so node needs one defined
+// first to print the same (tests/harness/golden.js uses `console.log(a.map(String).join(' '))`).
 function fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }
 const base = { describe() { return this.kind + ':' + this.size; } };
 const box = Object.create(base); box.kind = 'box'; box.size = 3;
@@ -40,9 +41,11 @@ benchmarks), M11 (bytecode debugger). See [ROADMAP.md](ROADMAP.md).
 brew install zig && brew pin zig
 ```
 
-node (22) and Python 3 (standard library only) are needed only to regenerate or check test data
-and the node-generated built-in inventory (`zig build update-golden`, `zig build check-goldens`),
-not to build or test.
+node **22.x exactly** and Python 3 (standard library only) are needed only to regenerate or check
+test data and the node-generated built-in inventory (`zig build update-golden`,
+`zig build check-goldens`), not to build or test. The goldens record node 22's answers and a newer
+node gives different ones (26 prints `1e-29` where 22 prints `1.0000000000000001e-29`), so
+`check-goldens` fails under it.
 
 ## Usage
 ```sh

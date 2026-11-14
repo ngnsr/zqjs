@@ -67,6 +67,25 @@ pub fn build(b: *std.Build) void {
     pow_bits.addPassthruArgs();
     b.step("pow-bits", "Hash pow results for a target (compare across targets)").dependOn(&pow_bits.step);
 
+    // Benchmark baseline (tools/bench.zig): bench/*.js on both engines, always ReleaseFast.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mod.addOptions("build_options", options);
+    const bench = b.addRunArtifact(b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "zqjs", .module = bench_mod }},
+        }),
+    }));
+    bench.setCwd(b.path("."));
+    b.step("bench", "Run bench/*.js on both engines (ReleaseFast): steps, heap, median time").dependOn(&bench.step);
+
     // Generated test data: node (goldens, syntax contract), Python stdlib (pow reference),
     // and the pow tables generated from musl. Dev-time only; `zig build test` needs none.
     const check = b.step("check-goldens", "Check syntax cases against node; generated files up to date");

@@ -39,9 +39,18 @@ zig build test -Dstack-stress               # same, with the VM moving its stack
 zig build test --fuzz=100K -Dtest-filter="fuzz: frontend"   # fuzz one target (only one runs per call):
                                             #   "fuzz: frontend", "fuzz: both engines agree",
                                             #   "fuzz: anything the front end", "fuzz: the verifier"
+zig build bench                             # bench/*.js on both engines: steps, heap bytes, median ms
 zig build check-goldens                     # verify syntax cases against node; generated files up to date
 zig build update-golden                     # regenerate goldens (node) and pow references (Python)
 ```
+
+## Benchmarks
+`zig build bench` (always ReleaseFast) runs every `bench/*.js` five times in-process on both
+engines. `steps` and `heap` are deterministic (identical on every machine, and checked to be
+identical across runs); `median ms` only compares on the same machine. `bench/baseline.txt` is
+the baseline recorded at the end of M6 (Apple M4); rerun and diff it before and after a change:
+a change in steps or heap means different work, a change in time alone means the same work got
+faster or slower.
 
 ## Continuous integration
 `.github/workflows/ci.yml` runs on every push, on macOS arm64, Linux x86_64 and Linux arm64:

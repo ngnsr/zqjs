@@ -9,7 +9,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | 2 | `let`/`const`, assignment, blocks, `if`/`while`/`for`, `break`/`continue`, resolver | **done** |
 | 3 | Tree-walking interpreter, `runtime/ops.zig`, UTF-16 strings, `print`, diff harness | **done** |
 | P1 | Accurate exponentiation: JS special cases, musl/Arm `pow`, accuracy and portability checks (D25) | **done** |
-| 4 | Bytecode compiler, constant pool, `max_stack`, disassembler | – |
+| 4 | Bytecode compiler, constant pool, `max_stack`, verifier, disassembler | **done** |
 | 5 | Stack VM with `step()` / `--trace`, instruction budget | – |
 | 6 | Functions, cells/closures, growable stack, call-depth limit | – |
 | 7 | Objects, arrays, atoms, ordered properties, prototypes | – |
@@ -52,6 +52,22 @@ from node for Number→String (3,183 values), String→Number and `+ - * / % **`
 Limits: step budget on loops, straight-line code and deep expressions; heap and string limits;
 allocation failure at every point; fuzzing of whole runs.
 **M7:** `length` and `charCodeAt` on strings with surrogates.
+**M4 (done):** the verifier (D33) is the oracle until the VM runs.
+- every `tests/diff` program and every `ok` syntax case compiles to bytecode the verifier
+  accepts, with the verifier's measured `max_stack` equal to the compiler's and no unreachable
+  instructions (including code after `break`/`continue`, after `if` with both branches leaving,
+  after `for (;;)` with and without `break`)
+- verifier: one rejected example per rule (opcode, truncation, each operand kind, misaligned
+  target, underflow, overflow of `max_stack`, non-empty stack at `halt`, falling off the end,
+  inconsistent depth at a join, limits, non-number/string constants)
+- `const`/TDZ evaluation order with observable right-hand sides, as programs whose node output is
+  checked now (tree-walker) and again in M5 (VM): `c = rhs`, `c += rhs`, `c++`, TDZ `c = rhs` /
+  `c += rhs`, a right-hand side that throws its own error first; plus the `tdz_and_const` snapshot
+- constant pool dedup (`1`/`1.0`, `'a'`/`'\u0061'`), names dedup
+- limits: `code_bytes`, `constants` (literals and names), heap and string limits on string
+  constants; after any failed compile the heap is empty again (`Heap.rollback`)
+- allocation failure at every point of compilation; fuzzing of compiler and verifier
+- snapshots in `tests/bytecode` (`--dump-bytecode` listings)
 **P1 (done):** two separate metrics, both permanent tests:
 - *agreement with node*: 8,284 node cases; forced results bit-exact, all others within 1 ulp;
 - *accuracy*: 7,942 correctly rounded reference values (`tools/pow_reference.py`); never more

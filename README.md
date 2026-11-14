@@ -31,8 +31,11 @@ zig-out/bin/zqjs -e "let s = ''; for (let i = 0; i < 3; i++) { s += i; } print(s
 zig-out/bin/zqjs --dump-ast -e "let x = 1; { let x = x + 2; }"
 # (let (x#0@0 1))
 # (block (let (x#1@1 (+ x#1 2))))           ← inner x refers to itself: a TDZ error if run
+zig-out/bin/zqjs --dump-bytecode -e "let x = 1; x += 2;"   # compiled, verified, listed (M4)
 zig build test                              # unit + integration tests (tests/all.zig)
-zig build test --fuzz=100K                  # also fuzz parsing and execution
+zig build test --fuzz=100K -Dtest-filter="fuzz: frontend"   # fuzz one target (only one runs per call):
+                                            #   "fuzz: frontend", "fuzz: any input runs",
+                                            #   "fuzz: anything the front end", "fuzz: the verifier"
 zig build check-goldens                     # verify syntax cases against node; generated files up to date
 zig build update-golden                     # regenerate goldens (node) and pow references (Python)
 ```

@@ -1,5 +1,5 @@
 //! zqjs library entry point. M3: frontend (parse → resolve → dump) and the
-//! tree-walking interpreter.
+//! tree-walking interpreter. M4: bytecode compiler, verifier and disassembler.
 
 pub const ast = @import("frontend/ast.zig");
 pub const Diagnostic = @import("frontend/diag.zig").Diagnostic;
@@ -14,6 +14,11 @@ pub const ops = @import("runtime/ops.zig");
 pub const Runtime = @import("runtime/runtime.zig").Runtime;
 pub const ErrorName = @import("runtime/runtime.zig").ErrorName;
 pub const interpret = @import("interp/treewalk.zig").run;
+pub const bytecode = @import("bytecode/bytecode.zig");
+pub const compile = @import("bytecode/compiler.zig").compile;
+pub const verify = @import("bytecode/verify.zig");
+pub const disassemble = @import("bytecode/disasm.zig").disassemble;
+pub const Heap = @import("runtime/heap.zig").Heap;
 pub const runSource = @import("run.zig").runSource;
 pub const RunMode = @import("run.zig").Mode;
 
@@ -28,4 +33,6 @@ test {
     _ = @import("runtime/heap.zig");
     _ = @import("runtime/ops.zig");
     _ = @import("runtime/pow.zig");
+    _ = @import("bytecode/bytecode.zig");
+    _ = @import("bytecode/verify.zig");
 }

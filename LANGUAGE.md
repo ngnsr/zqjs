@@ -143,6 +143,11 @@ Nesting deeper than `Limits.max_nesting_depth` (default 512) → `LimitExceeded(
 The limit bounds the parser's recursion (each parenthesis level costs two, each nested
 statement or `=` one) and the depth of expression trees (operator chains).
 
+A script whose bytecode exceeds `Limits.max_code_bytes` (default 64 MiB) →
+`LimitExceeded(code_bytes)`; more than `Limits.max_constants` (default 2^20) distinct literals,
+or as many distinct variable names → `LimitExceeded(constants)`. Both are reported before the
+script runs (DESIGN_DECISIONS D32).
+
 ## 5. Semantics
 
 ### Values and globals (M3)

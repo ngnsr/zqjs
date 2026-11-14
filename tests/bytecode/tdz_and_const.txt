@@ -1,0 +1,50 @@
+slots 2, max_stack 3, code 174 bytes
+constants
+  k0  "rhs first"
+  k1  "never"
+  k2  1
+  k3  2
+  k4  "rhs, then op"
+names
+  n0  print
+  n1  x
+  n2  c
+code
+      0  clear_local    s0
+      5  clear_local    s1
+     10  get_global     n0            ; print
+     15  push_const     k0            ; "rhs first"
+     20  call           1
+     25  set_local      s0 n1         ; x
+     34  pop
+     35  get_local      s0 n1         ; x
+     44  get_global     n0            ; print
+     49  push_const     k1            ; "never"
+     54  call           1
+     59  add
+     60  set_local      s0 n1         ; x
+     69  pop
+     70  push_const     k2            ; 1
+     75  init_local     s0
+     80  push_const     k3            ; 2
+     85  init_local     s1
+     90  get_global     n0            ; print
+     95  push_const     k0            ; "rhs first"
+    100  call           1
+    105  assign_const   s1 n2         ; c
+    114  pop
+    115  get_local      s1 n2         ; c
+    124  get_global     n0            ; print
+    129  push_const     k4            ; "rhs, then op"
+    134  call           1
+    139  add
+    140  assign_const   s1 n2         ; c
+    149  pop
+    150  get_local      s1 n2         ; c
+    159  to_number
+    160  dup
+    161  inc
+    162  assign_const   s1 n2         ; c
+    171  pop
+    172  pop
+    173  halt

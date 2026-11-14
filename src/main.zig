@@ -3,14 +3,15 @@
 //! options:
 //!   --test           harness output mode (used to compare with node)
 //!   --dump-ast       print the resolved AST instead of running
+//!   --dump-bytecode  compile, verify and print the bytecode instead of running
 //!   --max-steps N    execution budget; 0 = unlimited (default: cli_default_steps)
 
 const std = @import("std");
 const zqjs = @import("zqjs");
 
 const usage =
-    \\usage: zqjs [--test | --dump-ast] [--max-steps N] FILE
-    \\       zqjs [--test | --dump-ast] [--max-steps N] -e SOURCE
+    \\usage: zqjs [--test | --dump-ast | --dump-bytecode] [--max-steps N] FILE
+    \\       zqjs [--test | --dump-ast | --dump-bytecode] [--max-steps N] -e SOURCE
     \\
     \\  --max-steps N   stop after N execution steps (0 = unlimited, default 200000000)
     \\
@@ -36,7 +37,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer out.flush() catch {}; // runs first: program output before the error report
 
     var rest = args[1..];
-    const Command = enum { run, @"test", dump };
+    const Command = enum { run, @"test", dump, dump_bytecode };
     var command: Command = .run;
     var limits: zqjs.Limits = .{ .max_steps = cli_default_steps };
     while (rest.len > 0 and std.mem.startsWith(u8, rest[0], "--")) {
@@ -44,6 +45,8 @@ pub fn main(init: std.process.Init) !u8 {
             command = .@"test";
         } else if (std.mem.eql(u8, rest[0], "--dump-ast")) {
             command = .dump;
+        } else if (std.mem.eql(u8, rest[0], "--dump-bytecode")) {
+            command = .dump_bytecode;
         } else if (std.mem.eql(u8, rest[0], "--max-steps") and rest.len > 1) {
             const n = std.fmt.parseInt(u64, rest[1], 10) catch {
                 try err.print("--max-steps: not a number: {s}\n", .{rest[1]});
@@ -78,6 +81,7 @@ pub fn main(init: std.process.Init) !u8 {
         .run => return zqjs.runSource(init.gpa, name, source, limits, .normal, out, err),
         .@"test" => return zqjs.runSource(init.gpa, name, source, limits, .harness, out, err),
         .dump => return dump(arena, name, source, limits, out, err),
+        .dump_bytecode => return dumpBytecode(init.gpa, arena, name, source, limits, out, err),
     }
 }
 
@@ -98,5 +102,44 @@ fn dump(arena: std.mem.Allocator, name: []const u8, source: []const u8, limits: 
         },
     };
     try zqjs.dump.script(script, resolution, out);
+    return 0;
+}
+
+fn dumpBytecode(gpa: std.mem.Allocator, arena: std.mem.Allocator, name: []const u8, source: []const u8, limits: zqjs.Limits, out: *std.Io.Writer, err: *std.Io.Writer) !u8 {
+    var diag: zqjs.Diagnostic = .{};
+    const script = zqjs.parse(arena, source, limits, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            try diag.render(source, name, err);
+            return 1;
+        },
+    };
+    const resolution = zqjs.resolve(arena, script, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            try diag.render(source, name, err);
+            return 1;
+        },
+    };
+    var heap = zqjs.Heap.init(gpa, limits);
+    defer heap.deinit();
+    var proto = zqjs.compile(gpa, &heap, script, resolution, limits, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.LimitExceeded => {
+            try diag.render(source, name, err);
+            return 1;
+        },
+    };
+    defer proto.deinit(gpa);
+    var failure: zqjs.verify.Failure = .{};
+    _ = zqjs.verify.verify(gpa, proto, limits, &failure) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.InvalidBytecode => {
+            // No listing: the disassembler trusts operands, which is exactly what failed.
+            try err.print("{s}: internal error: invalid bytecode at {d}: {s}\n", .{ name, failure.pc, failure.reason });
+            return 70;
+        },
+    };
+    try zqjs.disassemble(proto, out);
     return 0;
 }

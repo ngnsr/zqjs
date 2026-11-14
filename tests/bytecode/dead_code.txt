@@ -1,0 +1,14 @@
+slots 0, max_stack 2, code 40 bytes
+constants
+  k0  "once"
+names
+  n0  print
+code
+      0  get_global     n0            ; print
+      5  push_const     k0            ; "once"
+     10  call           1
+     15  jump_if_false  @25
+     20  jump           @30
+     25  jump           @35
+     30  jump           @0
+     35  jump           @35

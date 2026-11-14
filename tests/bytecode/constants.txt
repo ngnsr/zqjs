@@ -1,0 +1,29 @@
+slots 0, max_stack 12, code 73 bytes
+constants
+  k0  1
+  k1  "a"
+  k2  "\uD800"
+  k3  "\"\\"
+  k4  0.1
+  k5  0.2
+  k6  1e+21
+names
+  n0  print
+code
+      0  get_global     n0            ; print
+      5  push_const     k0            ; 1
+     10  push_const     k0            ; 1
+     15  push_const     k0            ; 1
+     20  push_const     k0            ; 1
+     25  push_const     k1            ; "a"
+     30  push_const     k1            ; "a"
+     35  push_const     k1            ; "a"
+     40  push_const     k2            ; "\uD800"
+     45  push_const     k3            ; "\"\\"
+     50  push_const     k4            ; 0.1
+     55  push_const     k5            ; 0.2
+     60  add
+     61  push_const     k6            ; 1e+21
+     66  call           11
+     71  pop
+     72  halt

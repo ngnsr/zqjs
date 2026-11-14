@@ -176,6 +176,7 @@ const Interpreter = struct {
         const scope = it.res.bindings[b].scope;
         var e = it.env;
         while (e) |rec| : (e = rec.parent) {
+            rec.obj.checkLive(); // stress builds: a collected environment record
             if (rec.scope == scope) return rec;
         }
         unreachable; // the resolver only resolves names to bindings in enclosing scopes
@@ -534,6 +535,7 @@ const Interpreter = struct {
     }
 
     fn call(it: *Interpreter, closure: *const heap.Closure, this: ?Value, args: []const Value) Error!Value {
+        closure.obj.checkLive();
         const t = switch (closure.impl) {
             .tree => |t| t,
             .vm => unreachable, // each engine only ever sees its own closures

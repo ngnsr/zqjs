@@ -133,7 +133,23 @@ The risky phase: the tree-walker holds values in Zig locals across sub-evaluatio
   and nested object literals, concatenation in a loop, closures capturing cells in a loop),
   garbage-under-a-small-limit on the tree-walker, engine agreement with collection forced.
 
-### P3. Stress modes, zombie, verifier, CI
+### P3. Stress modes, zombie, verifier, CI *(done)*
+
+Done as planned. Tombstones carry an allocation number and their former kind; their payloads
+are released and replaced by empty or poisoned stand-ins (strings read `<collected>`), so even
+an unchecked read never touches freed memory; `checkLive` at the store API, `markObj`,
+property access, string conversion, closure entry, cells, captures and environment lookup
+turns a use into `zqjs GC bug: use of a collected <kind> (allocation #N)`. The verifier
+(after every stress collection, and callable from tests) checks the gray list, every edge,
+the atom table, and exact accounting (a new `buffer_bytes` counter covers the counting
+allocator). Findings: (1) `runSource` assigned `collect_always` from an option whose default
+is false, which silently turned the stress mode off for most tests; options can now only add
+collections, and a test fails if stress builds don't collect at every safepoint; (2) a
+mutation (one shadow-stack hold removed) gives the same panic, naming kind and allocation
+number, on every run. Whole suite under -Dgc-stress: 127 s Debug, 29 s ReleaseSafe. CI runs
+`-Dgc-stress -Dstack-stress` (one step instead of a separate stack-stress step) and
+`-Dgc-stress` in ReleaseSafe. Before P3, the stack guard caught P2 doubling the tree-walker's
+Debug frames (37 MB on Linux x86_64); fixed by splitting `eval`'s large arms (ac88818).
 
 - `-Dgc-stress` (build option, like `-Dstack-stress`): collect at every safepoint.
 - Zombie mode (with gc-stress): freed objects become `kind = .dead` tombstones with poisoned

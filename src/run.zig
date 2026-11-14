@@ -60,7 +60,8 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
 
     var rt = Runtime.init(gpa, limits, out);
     defer rt.deinit();
-    rt.heap.collect_always = options.collect_always;
+    // An option can only add collections: under -Dgc-stress every safepoint collects anyway.
+    rt.heap.collect_always = options.collect_always or rt.heap.collect_always;
     const outcome = switch (options.engine) {
         .treewalk => treewalk.run(&rt, script, res),
         .vm => vm: {

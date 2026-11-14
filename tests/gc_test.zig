@@ -283,6 +283,8 @@ test "scheduling: a collection is requested past next_gc, with headroom under th
 }
 
 test "no pathological collection loop: filling the heap with live data collects O(log limit) times" {
+    // A test of the *scheduler*; -Dgc-stress bypasses it and collects at every safepoint.
+    if (heap.gc_stress) return error.SkipZigTest;
     // Live data grows to the limit (every string is kept): each collection frees nothing,
     // and must not be followed by another one at the very next safepoint.
     const r = try runVm("let keep = []; let n = 0; while (true) { keep.push('item number ' + n++); }", .{ .max_heap_bytes = 1 << 20 }, false);
@@ -305,7 +307,7 @@ fn runVm(source: []const u8, limits: zqjs.Limits, always: bool) !VmRun {
     defer out.deinit();
     var rt = zqjs.Runtime.init(gpa, limits, &out.writer);
     defer rt.deinit();
-    rt.heap.collect_always = always;
+    rt.heap.collect_always = always or heap.gc_stress; // never fewer collections under -Dgc-stress
     var d: zqjs.Diagnostic = .{};
     const script = try zqjs.parse(arena.allocator(), source, limits, &d);
     const res = try zqjs.resolve(arena.allocator(), script, &d);
@@ -549,4 +551,68 @@ test "garbage under a small limit: the tree-walker runs to its step budget too" 
         _ = try zqjs.runSource(testing.allocator, "t", source, .{ .max_heap_bytes = 128 << 10, .max_steps = 50_000 }, .{ .mode = .harness, .engine = engine }, &got.writer, &discard.writer);
         try testing.expectEqualStrings("t: LimitExceeded(steps)\n", got.written());
     }
+}
+
+// ---------------------------------------------------------------- P3: stress infrastructure
+
+test "the heap verifier passes after real collections and catches each kind of corruption" {
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+    const keep = try h.newObject(null);
+    try h.storeProperty(keep, try h.internAscii("s"), .{ .string = try h.ascii("live") });
+    const arr = try h.newArray(keep);
+    try h.appendElement(arr, .{ .object = keep });
+    try h.storeProperty(keep, try h.internAscii("a"), .{ .object = arr });
+    for (0..50) |_| _ = try h.newObject(keep); // garbage
+    h.collect(TestRoots{ .objs = &.{&keep.obj} }, TestRoots.mark);
+    try h.verify(); // exact accounting, no dangling edge, clean atom table, empty gray list
+
+    // Accounting: one byte off is caught.
+    h.bytes += 1;
+    try testing.expectError(error.AccountingMismatch, h.verify());
+    h.bytes -= 1;
+    // A gray list left non-empty.
+    h.gray = &keep.obj;
+    try testing.expectError(error.GrayListNotEmpty, h.verify());
+    h.gray = null;
+    // An edge from a live object to a collected one (a hand-made tombstone).
+    var dead: heap.Object = .{ .obj = .{ .kind = .dead, .next = null }, .proto = null };
+    keep.props.getPtr(try h.internAscii("a")).?.value = .{ .object = &dead };
+    try testing.expectError(error.EdgeToCollectedObject, h.verify());
+    keep.props.getPtr(try h.internAscii("a")).?.value = .{ .object = arr };
+    // A non-atom in the atom table.
+    const plain = try h.ascii("not an atom");
+    try h.atoms.putNoClobber(h.allocator(), plain, {});
+    try testing.expectError(error.AtomTableHoldsNonAtom, h.verify());
+    _ = h.atoms.remove(plain);
+    try h.verify();
+}
+
+test "stress builds: collected objects become tombstones that say what and which they were" {
+    if (!heap.gc_stress) return error.SkipZigTest; // tombstones exist only under -Dgc-stress
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit(); // frees the tombstones too (testing.allocator checks for leaks)
+    const a = try h.newObject(null);
+    const s = try h.ascii("doomed");
+    const b = try h.newArray(null);
+    try testing.expect(a.obj.debug.id < s.obj.debug.id and s.obj.debug.id < b.obj.debug.id);
+    const id = s.obj.debug.id;
+    h.collect(TestRoots{ .objs = &.{&a.obj} }, TestRoots.mark);
+    try testing.expectEqual(heap.Obj.Kind.object, a.obj.kind); // kept
+    try testing.expectEqual(heap.Obj.Kind.dead, s.obj.kind); // collected: a tombstone
+    try testing.expectEqual(heap.Obj.Kind.string, s.obj.debug.was);
+    try testing.expectEqual(id, s.obj.debug.id);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("<collected>"), s.units); // poisoned, not freed memory
+    try testing.expectEqual(heap.Obj.Kind.object, b.obj.debug.was); // an array is an object
+    try testing.expect(b.kind == .ordinary and b.props.count() == 0); // storage released, nothing left to read
+    try h.verify();
+}
+
+test "under -Dgc-stress every run collects at every safepoint, whatever the options say" {
+    // Guards the mode against being weakened by accident: an option default of `false`
+    // once silently turned it off for everything going through runSource.
+    if (!heap.gc_stress) return error.SkipZigTest;
+    const r = try runVm("let a = 1; let b = 2; print(a + b);", .{}, false);
+    defer testing.allocator.free(r.out);
+    try testing.expect(r.collections >= 8); // one per instruction, at least
 }

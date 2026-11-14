@@ -197,6 +197,7 @@ pub fn formatNumber(buf: *NumberBuf, x: f64) []const u8 {
 /// ToString for building strings: the value as a piece of text. `buf` backs number
 /// text and must outlive the returned piece.
 pub fn toPiece(rt: *Runtime, v: Value, buf: *NumberBuf) Error!Piece {
+    heap.checkValue(v); // stress builds: printing or converting a collected value
     return switch (v) {
         .undefined => .{ .ascii = "undefined" },
         .null => .{ .ascii = "null" },

@@ -122,6 +122,7 @@ fn keyPiece(k: Key, buf: *[10]u8) Piece {
 
 /// `base[k]` / `base.k`.
 pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
+    heap_mod.checkValue(base);
     const r = try builtins.realm(rt);
     switch (base) {
         .undefined, .null => {
@@ -155,6 +156,7 @@ pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
 fn getFrom(rt: *Runtime, start: *Object, k: Key) Error!Value {
     var o: ?*Object = start;
     while (o) |cur| : (o = cur.proto) {
+        cur.obj.checkLive(); // stress builds: a collected object or prototype
         if (try ownGet(rt, cur, k)) |v| return v;
         if (cur.builtin) |b| if (nodeHas(b, k)) return unsupportedBuiltin(rt, k);
     }
@@ -237,6 +239,7 @@ fn setLength(rt: *Runtime, arr: *Object, v: Value) Error!void {
 
 /// `delete base[k]`.
 pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
+    heap_mod.checkValue(base);
     const o = switch (base) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
         .string, .number, .boolean => return rt.fail(.primitive_write),
@@ -258,6 +261,7 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
 
 /// `k in base`.
 pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
+    heap_mod.checkValue(base);
     const start = switch (base) {
         .object => |o| o,
         .native, .closure => return rt.fail(.function_properties),

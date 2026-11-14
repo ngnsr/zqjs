@@ -463,6 +463,7 @@ pub const Vm = struct {
     /// replace everything from `stack[base]`. Transactional: everything that can fail
     /// happens before anything is committed.
     fn enter(vm: *Vm, c: *const Closure, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value) Error!void {
+        c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
             .tree => vm.bug("a tree-walker closure in the VM"),
@@ -562,7 +563,10 @@ pub const Vm = struct {
 
     fn cellIn(vm: *const Vm, s: *Slot) *Cell {
         return switch (s.*) {
-            .cell => |c| c,
+            .cell => |c| blk: {
+                c.obj.checkLive(); // stress builds: a collected cell
+                break :blk c;
+            },
             .value => vm.bug("cell access to a value slot"),
         };
     }
@@ -575,6 +579,7 @@ pub const Vm = struct {
         const c = vm.frame().closure orelse vm.bug("capture access in the script");
         const caps = c.impl.vm.captures;
         if (i >= caps.len) vm.bug("capture index out of range");
+        caps[i].obj.checkLive();
         return caps[i];
     }
 

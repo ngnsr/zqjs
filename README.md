@@ -61,6 +61,7 @@ zig-out/bin/zqjs --trace -e "print(1 + 2);"                # each VM instruction
 zig-out/bin/zqjs --engine=treewalk program.js               # the reference interpreter instead of the VM
 zig build test                              # unit + integration tests (tests/all.zig)
 zig build test -Dstack-stress               # same, with the VM moving its stacks on every call
+zig build test -Dgc-stress                  # same, collecting at every safepoint, with tombstones and a heap verifier
 zig build test --fuzz=100K -Dtest-filter="fuzz: frontend"   # fuzz one target (only one runs per call):
                                             #   "fuzz: frontend", "fuzz: both engines agree",
                                             #   "fuzz: anything the front end", "fuzz: the verifier"
@@ -83,7 +84,8 @@ change in time alone means the same work got faster or slower.
 ## Continuous integration
 `.github/workflows/ci.yml` runs on every push that touches code, tests, tools or the build
 (documentation-only changes skip it), on macOS arm64, Linux x86_64 and Linux arm64:
-`zig fmt --check .`, `zig build test` (also with `-Dstack-stress`, and in ReleaseSafe),
+`zig fmt --check .`, `zig build test` (also with `-Dgc-stress -Dstack-stress`, in ReleaseSafe,
+and with `-Dgc-stress` in ReleaseSafe),
 `zig build check-goldens`, `zig build --release=fast`, and a check that `pow` produces the same
 bits as the reference hash (DESIGN_DECISIONS D25).
 

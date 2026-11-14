@@ -203,6 +203,8 @@ pub const Heap = struct {
 
     /// One collection, as seen by an observer.
     pub const Sample = struct {
+        /// M8 has one kind of collection, a full one: it reports `.major`.
+        kind: enum { minor, major } = .major,
         start_ns: u64,
         duration_ns: u64,
         bytes_before: usize,
@@ -210,6 +212,8 @@ pub const Heap = struct {
         /// Objects that survived (were marked) and that were freed, in this collection.
         marked: u64,
         swept: u64,
+        /// Minor collections: the part of the pause spent scanning the remembered set.
+        remembered_ns: u64 = 0,
     };
 
     /// Deterministic collector statistics (D8): work units, not wall-clock time.

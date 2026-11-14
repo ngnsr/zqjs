@@ -304,6 +304,23 @@ only makes major collections rare. The report states this rather than hiding it.
 M8 GC test. Collection counts change, so the exact-stats tests get updated explicitly for minor
 and major collections, not weakened.
 
+## Implementation review checks (from the plan's approval)
+
+1. **Promotion is not reachability.** An unmarked young atom is relinked and gets its `old` bit,
+   but it is never marked or scanned. Strings have no children (`forEachChild` returns at once),
+   so promoting one can't retain anything else. A test checks it: a dead object keyed by a dead
+   dynamic atom is still freed by the same minor collection.
+2. **Card allocation failure.** The bitmap grows first, then the elements buffer. If the
+   elements allocation then fails, the array has its old elements and a larger, valid bitmap
+   whose extra bits are clean. `checkAllAllocationFailures` covers it, followed by the verifier
+   on every failed run.
+3. **Major collection.**
+   - The atom table is rebuilt *before* any atom is freed.
+   - Remembered bits and cards are cleared before marking, so nothing stale survives.
+   - Both lists are swept, and every survivor ends up old.
+   - A test runs a major collection with dirty cards and remembered owners present, then checks
+     I-gen3 and the atom invariant.
+
 ## Benchmark methodology
 
 `gc-report` changes *before* P1 starts, and the M8 baseline is taken again with it. That way M8

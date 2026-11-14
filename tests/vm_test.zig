@@ -30,7 +30,7 @@ const Setup = struct {
         const res = try zqjs.resolve(s.arena.allocator(), script, &d);
         s.proto = try zqjs.compile(gpa, &s.rt.heap, script, res, limits, &d);
         var f: zqjs.verify.Failure = .{};
-        _ = try zqjs.verify.verify(gpa, s.proto, limits, &f);
+        _ = try zqjs.verify.verify(gpa, &s.proto, limits, &f);
         return s;
     }
 
@@ -60,7 +60,7 @@ test "step executes one instruction at a time; after halt nothing runs" {
     try testing.expectEqual(@as(u64, 4), s.rt.steps);
     try testing.expectEqual(zqjs.Vm.State.halted, try vm.step());
     try testing.expectEqual(@as(u64, 4), s.rt.steps); // nothing executed, nothing charged
-    try testing.expectEqual(@as(?zqjs.Value, .{ .number = 1 }), vm.slots[0]);
+    try testing.expectEqual(zqjs.Value{ .number = 1 }, vm.locals[0].value.?);
 }
 
 test "an empty script has max_stack 0 and halts" {
@@ -171,4 +171,67 @@ test "--trace prints each instruction and the operand stack before it runs" {
         \\     46  halt                                            |
         \\
     , trace.written());
+}
+
+test "a fault inside a callee is precise and leaves the frames intact" {
+    const s = try Setup.create("function f() { return nope; } print(1, f());", .{});
+    defer s.destroy();
+    var vm = try zqjs.Vm.init(&s.rt, &s.proto);
+    defer vm.deinit();
+    try testing.expectEqual(error.Thrown, runToFault(&vm));
+    try testing.expectEqual(@as(usize, 2), vm.frames.items.len); // still inside f
+    try testing.expectEqual(Op.get_global, @as(Op, @fromBackingInt(vm.proto().code[vm.pc])));
+    // The caller's operands sit below the callee's: [print, 1, f], untouched.
+    try testing.expectEqual(@as(usize, 3), vm.operands().len);
+    try testing.expectEqual(zqjs.Value{ .number = 1 }, vm.operands()[1]);
+    try testing.expect(vm.operands()[2] == .closure);
+}
+
+test "a call that fails during setup leaves the caller unchanged: limit" {
+    const s = try Setup.create("function f(n) { return f(n + 1); } f(0);", .{ .max_call_depth = 3 });
+    defer s.destroy();
+    var vm = try zqjs.Vm.init(&s.rt, &s.proto);
+    defer vm.deinit();
+    try testing.expectEqual(error.LimitExceeded, runToFault(&vm));
+    try testing.expectEqual(zqjs.Limit.call_depth, s.rt.limitHit().?);
+    try testing.expectEqual(@as(usize, 3), vm.frames.items.len); // the 4th frame was never pushed
+    try testing.expectEqual(Op.call, @as(Op, @fromBackingInt(vm.proto().code[vm.pc])));
+    const top = vm.frames.items[2];
+    try testing.expectEqual(top.stack_base + 2, @as(u32, @intCast(vm.operands().len))); // [f, n + 1] still there
+    try testing.expectEqual(top.locals_base + top.proto.slot_count, vm.locals_len);
+}
+
+test "a call that fails during setup leaves the caller unchanged: out of memory" {
+    const s = try Setup.create("function f(a) { let b = a; return b; } print(f(1));", .{});
+    defer s.destroy();
+    var vm = try zqjs.Vm.init(&s.rt, &s.proto);
+    defer vm.deinit();
+    // Run up to the call of f; the script's stacks are exactly its own size, so entering
+    // f must grow them, and that allocation fails.
+    while (@as(Op, @fromBackingInt(vm.proto().code[vm.pc])) != .call or vm.operands().len != 3) _ = try vm.step();
+    const before = .{ vm.pc, vm.sp, vm.locals_len, vm.frames.items.len, vm.reserved };
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const gpa = s.rt.gpa;
+    s.rt.gpa = failing.allocator();
+    try testing.expectError(error.OutOfMemory, vm.step());
+    s.rt.gpa = gpa;
+    try testing.expectEqual(before, .{ vm.pc, vm.sp, vm.locals_len, vm.frames.items.len, vm.reserved });
+    try testing.expect(vm.operands()[1] == .closure); // [print, f, 1]
+}
+
+test "return restores the caller's pc, frame and operand depth" {
+    const s = try Setup.create("function f(a, b) { let c = a + b; return c; } print(10, f(1, 2));", .{});
+    defer s.destroy();
+    var vm = try zqjs.Vm.init(&s.rt, &s.proto);
+    defer vm.deinit();
+    while (@as(Op, @fromBackingInt(vm.proto().code[vm.pc])) != .call or vm.frames.items.len != 1 or vm.operands().len != 5) _ = try vm.step();
+    const pc = vm.pc;
+    _ = try vm.step(); // enter f
+    try testing.expectEqual(@as(usize, 2), vm.frames.items.len);
+    try testing.expectEqual(@as(u32, 0), vm.pc);
+    while (vm.frames.items.len == 2) _ = try vm.step(); // until f returns
+    try testing.expectEqual(pc + zqjs.bytecode.Op.call.size(), vm.pc);
+    try testing.expectEqual(@as(usize, 3), vm.operands().len); // [print, 10, 3]
+    try testing.expectEqual(zqjs.Value{ .number = 3 }, vm.operands()[2]);
+    try testing.expectEqual(s.proto.slot_count, vm.locals_len);
 }

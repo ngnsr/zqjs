@@ -39,4 +39,5 @@ test {
     _ = @import("runtime/pow.zig");
     _ = @import("bytecode/bytecode.zig");
     _ = @import("bytecode/verify.zig");
+    _ = @import("interp/treewalk.zig");
 }

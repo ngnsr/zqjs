@@ -12,7 +12,8 @@
 //!       10  init_local     s0
 //!       15  get_local      s0 n0         ; x
 //!   …
-//! Operands: sN slot, kN constant, nN name, @N jump target (byte offset), plain N argc.
+//! Operands: sN slot, kN constant, nN name, @N jump target (byte offset), plain N argc,
+//! #N nested function, ^N capture. Nested functions follow, as `function #1.2 name`.
 //! The comment shows the constant's value or the name.
 
 const std = @import("std");
@@ -24,6 +25,21 @@ const Op = bc.Op;
 const Proto = bc.Proto;
 
 pub fn disassemble(p: Proto, w: *Writer) Writer.Error!void {
+    var path: [64]u32 = undefined; // nesting is bounded by the AST depth limit; deeper is elided
+    try listing(p, &path, 0, w);
+}
+
+/// One Proto, then its functions depth-first, numbered by path (#1, #1.2, …).
+fn listing(p: Proto, path: []u32, depth: usize, w: *Writer) Writer.Error!void {
+    if (depth > 0) {
+        try w.writeAll("\nfunction #");
+        for (path[0..depth], 0..) |n, i| try w.print("{s}{d}", .{ if (i > 0) "." else "", n });
+        try w.print(" {s}: params {d}", .{ if (p.name.len > 0) p.name else "(anonymous)", p.param_count });
+        if (p.param_count > 0 and p.param_slot > 0) try w.print(" from s{d}", .{p.param_slot});
+        if (p.captures.len > 0) try w.writeAll(", captures");
+        for (p.captures) |c| try w.print(" {s}{d}", .{ if (c.from == .parent_slot) "s" else "^", c.index });
+        try w.writeByte('\n');
+    }
     try w.print("slots {d}, max_stack {d}, code {d} bytes\n", .{ p.slot_count, p.max_stack, p.code.len });
     if (p.consts.len > 0) try w.writeAll("constants\n");
     for (p.consts, 0..) |k, i| {
@@ -39,6 +55,11 @@ pub fn disassemble(p: Proto, w: *Writer) Writer.Error!void {
     while (pc < p.code.len) : (pc += @as(Op, @fromBackingInt(@intCast(p.code[pc]))).size()) {
         try instruction(p, pc, w);
         try w.writeByte('\n');
+    }
+    for (p.functions, 1..) |f, i| {
+        if (depth >= path.len) return w.writeAll("\n(deeper functions elided)\n");
+        path[depth] = @intCast(i);
+        try listing(f, path, depth + 1, w);
     }
 }
 
@@ -66,6 +87,8 @@ pub fn instruction(p: Proto, pc: usize, w: *Writer) Writer.Error!void {
             },
             .target => line.print("@{d}", .{x}) catch unreachable,
             .argc => line.print("{d}", .{x}) catch unreachable,
+            .function => line.print("#{d}", .{x + 1}) catch unreachable, // the listing numbers from 1
+            .capture => line.print("^{d}", .{x}) catch unreachable,
         }
     }
     if (comment == null and comment_name == null) return w.writeAll(std.mem.trimEnd(u8, line.buffered(), " "));
@@ -81,6 +104,7 @@ pub fn value(v: Value, w: *Writer) Writer.Error!void {
         .undefined, .null => try w.writeAll(@tagName(v)),
         .boolean => |b| try w.writeAll(if (b) "true" else "false"),
         .native => |n| try w.print("<native {s}>", .{n.name}),
+        .closure => try w.writeAll("<function>"),
         .number => |n| {
             var buf: ops.NumberBuf = undefined;
             if (n == 0 and std.math.signbit(n)) try w.writeAll("-0") else try w.writeAll(ops.formatNumber(&buf, n));

@@ -21,7 +21,7 @@ pub fn toBoolean(v: Value) bool {
         .boolean => |b| b,
         .number => |n| !(n == 0 or std.math.isNan(n)), // 0, -0 and NaN are falsy
         .string => |s| s.units.len != 0,
-        .native => true,
+        .native, .closure => true,
     };
 }
 
@@ -34,7 +34,8 @@ pub fn toNumber(gpa: Allocator, v: Value) Allocator.Error!f64 {
         .boolean => |b| if (b) 1 else 0,
         .number => |n| n,
         .string => |s| stringToNumber(gpa, s.units),
-        .native => std.math.nan(f64),
+        // ToPrimitive gives the source text, which is never a numeric string.
+        .native, .closure => std.math.nan(f64),
     };
 }
 
@@ -200,7 +201,7 @@ pub fn toPiece(rt: *Runtime, v: Value, buf: *NumberBuf) Error!Piece {
         .number => |n| .{ .ascii = formatNumber(buf, n) },
         .string => |s| .{ .utf16 = s.units },
         // Node prints the function's source text; ZQJS has none to show (yet).
-        .native => rt.fail(.function_to_string),
+        .native, .closure => rt.fail(.function_to_string),
     };
 }
 
@@ -251,10 +252,10 @@ pub fn lessThan(rt: *Runtime, a: Value, b: Value) Error!?bool {
     // source text to compare. Against anything else the text becomes NaN, as below.
     const textual = struct {
         fn f(v: Value) bool {
-            return v == .string or v == .native;
+            return v == .string or v.isFunction();
         }
     }.f;
-    if ((a == .native and textual(b)) or (b == .native and textual(a))) return rt.fail(.function_to_string);
+    if ((a.isFunction() and textual(b)) or (b.isFunction() and textual(a))) return rt.fail(.function_to_string);
     const x = try toNumber(gpa, a);
     const y = try toNumber(gpa, b);
     if (std.math.isNan(x) or std.math.isNan(y)) return null;
@@ -269,6 +270,7 @@ pub fn strictEquals(a: Value, b: Value) bool {
         .number => |x| x == b.number, // NaN !== NaN, 0 === -0
         .string => |x| std.mem.eql(u16, x.units, b.string.units),
         .native => |x| x == b.native,
+        .closure => |x| x == b.closure, // identity
     };
 }
 

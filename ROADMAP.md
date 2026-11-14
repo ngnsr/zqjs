@@ -11,7 +11,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | P1 | Accurate exponentiation: JS special cases, musl/Arm `pow`, accuracy and portability checks (D25) | **done** |
 | 4 | Bytecode compiler, constant pool, `max_stack`, verifier, disassembler | **done** |
 | 5 | Stack VM with `step()` / `--trace`, instruction budget | **done** |
-| 6 | Functions, cells/closures, growable stack, call-depth limit | – |
+| 6 | Functions, cells/closures, growable stack, call-depth limit | **done** |
 | 7 | Objects, arrays, atoms, ordered properties, prototypes | – |
 | 8 | Mark-and-sweep GC, temp roots, stress modes, heap limit | – |
 | 9 | Embedding API (handles, `NativeCtx`), then C ABI | – |
@@ -87,12 +87,33 @@ allocation failure at every point; fuzzing of whole runs.
 Reproducibility: `pow_data.zig` is generated (`tools/gen_pow_data.js`, pinned source hashes);
 `zig build check-goldens` verifies tables and references are up to date; `zig build pow-bits`
 hashes results per target for portability checks.
-**M6:** per-iteration `for (let …)` bindings: closures created in the body must each see their
-own iteration's value (`for (let i = 0; i < 3; i++) fs.push(() => i)` → 0, 1, 2), including when
-the body or the update changes `i`.
-**M6:** stack relocation: deep recursion forcing several moves, native→JS callback growing
-the stack then reading its args, closure created before a move and called after it. Whole suite
-under `-Dstack-stress`.
+**M6 (done):** every item runs on both engines; programs marked (node) are `tests/diff` programs.
+- per-iteration `for (let …)` (node): each iteration's closure sees its own value, including
+  when the body or the update changes `i`, with `continue`, and a `const` head (no copies)
+- closures (node): fresh captured bindings for every execution of a block (two sibling blocks;
+  a `while` body run three times); two closures sharing one mutable variable that outlives the
+  scope that created it; independent counter instances; a capture of a capture written
+  through; a captured parameter; a closure over a later `let`, in its TDZ and after
+- calls (node): recursion, mutual recursion through hoisting, call before declaration, a
+  recursive named function expression whose name isn't visible outside, missing and extra
+  arguments (evaluated, in order), `return` from nested blocks and loops, falling off the end,
+  shadowing between parameters, locals and captured names, function identity, calling a
+  non-function, assigning to a captured `const` (right-hand side first)
+- grammar (node-checked classifications): 48 syntax cases (Annex B block functions, duplicate
+  parameters/functions, `arguments`, default/rest parameters, generators, `async`, `return`
+  outside functions, `break` across a function boundary, ASI after `return`)
+- VM: precise fault inside a callee (frames intact); a call failing on a limit or on allocation
+  leaves the caller unchanged; `return` restores the caller's pc, frame and operand depth
+- limits: `call_depth` (both engines, including through a named expression and mutual
+  recursion), `stack_slots` counts every frame (and the script's), `interpreter_depth`: measured
+  stack use stays under half of the tree-walker's own 64 MiB stack in Debug and ReleaseSafe, and
+  worst-case recursion from a 256 KiB host thread ends in LimitExceeded on both engines
+- verifier: one test per new rule (capture descriptors, `halt`/`return`/`push_callee` placement,
+  return depth, nested-proto kinds, tree-wide code size, malformed bytes after a jump)
+- whole suite under `-Dstack-stress` (both stacks move on every call) and in ReleaseSafe, in CI
+- allocation failure at every point with closures, cells, calls and per-iteration copies
+- moved to the milestone that adds the first native able to call JS (with `NativeCtx`, D12): a
+  native→JS callback that grows the stack, then reads its arguments
 **M7:** property order: `0,1,b,a` example, `"4294967295"` vs `"4294967294"`, `"01"`, `"-1"`,
 delete + re-add.
 **M8:** GC rooting and atom lifetime: the targeted stress tests in DESIGN_DECISIONS D10 and

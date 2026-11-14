@@ -1,56 +1,151 @@
-//! Tree-walking interpreter: executes the AST directly, using the resolver's slots.
-//! Deliberately simple: plain recursion over the tree, no caching, no compilation.
+//! Tree-walking interpreter: executes the AST directly. It is the oracle the VM is
+//! tested against, so it is deliberately simple and deliberately *different* from the
+//! VM where they could share a mistake (DESIGN_DECISIONS D16, D37).
 //!
-//! Frame: one `?Value` per slot (Resolution.max_slots). `null` means "not yet
-//! initialised" (the temporal dead zone); Zig's optional type guarantees this marker
-//! can never escape into a JavaScript value.
+//! Environments (M6, D37): as in the spec, every scope that declares something gets an
+//! environment record (`heap.Env`) when it is entered: the script, each block entry,
+//! each `for` head (copied per iteration), each call (parameters + body), a named
+//! function expression's own name. Records point to their parent; a closure keeps the
+//! record it was created in. A binding is found by walking the chain to the record of
+//! the binding's scope (Resolution.bindings[b].scope), then indexing it. `null` in a
+//! record is the TDZ. The resolver's capture analysis is *not* used: the VM depends on
+//! it, the tree-walker doesn't, so a capture-analysis bug shows up as a disagreement.
 //!
-//! Control flow: `exec` returns a Completion (`.normal`, `.break`, `.continue`) up the
-//! recursion; loops consume break/continue. Zig errors are reserved for things that
-//! stop the whole script (runtime.zig).
+//! Control flow: `exec` returns a Completion up the recursion; loops consume
+//! break/continue, calls consume return. Zig errors are reserved for things that stop
+//! the whole script (runtime.zig).
 //!
-//! Recursion depth is bounded: the parser limits AST depth (Limits.max_nesting_depth)
-//! and M3 has no user functions.
+//! Recursion: every exec/eval/call nests a Zig call, and a JS call nests a whole body,
+//! so the interpreter counts its total depth across calls and stops at
+//! Limits.max_interpreter_depth (LimitExceeded) before the Zig stack can overflow.
+//!
+//! Memory: records are heap objects; with no GC until M8 every scope entry's record
+//! lives until the run ends (bounded by the heap limit). Long loops therefore use far
+//! more heap here than on the VM; limits are engine-specific (LANGUAGE.md).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("../frontend/ast.zig");
 const Resolution = @import("../frontend/resolver.zig").Resolution;
 const Value = @import("../runtime/value.zig").Value;
+const heap = @import("../runtime/heap.zig");
+const Env = heap.Env;
 const rt_mod = @import("../runtime/runtime.zig");
 const Runtime = rt_mod.Runtime;
 const Error = rt_mod.Error;
 const ops = @import("../runtime/ops.zig");
 const globals = @import("../runtime/globals.zig");
 
-const Completion = enum { normal, @"break", @"continue" };
+const Completion = enum { normal, @"break", @"continue", @"return" };
 
 /// Runs a resolved script. On error.Thrown, `rt.exception` describes the exception.
 pub fn run(rt: *Runtime, script: ast.Script, res: Resolution) Error!void {
-    const slots = try rt.gpa.alloc(?Value, res.max_slots);
-    defer rt.gpa.free(slots);
-    @memset(slots, null);
-    var it: Interpreter = .{ .rt = rt, .res = res, .slots = slots };
-    // The parser guarantees break/continue only occur inside loops.
+    return runOnOwnStack(rt, script, res, null);
+}
+
+/// The tree-walker's own stack (DESIGN_DECISIONS D37). Measured worst case at
+/// Limits.max_interpreter_depth = 6000: ~14.5 MB in Debug, ~4 MB in ReleaseSafe; the
+/// test at the end of this file keeps it under half of this.
+pub const stack_bytes = 64 * 1024 * 1024;
+
+/// Runs the interpreter on a thread with `stack_bytes` of stack, so its recursion
+/// guard holds whatever stack the host's thread has (8 MiB, or a small worker thread).
+/// The caller waits, so the Runtime is never used by two threads at once.
+fn runOnOwnStack(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUse) Error!void {
+    if (builtin.single_threaded) return runMeasured(rt, script, res, use);
+    const Job = struct {
+        fn work(r: *Runtime, sc: ast.Script, rs: Resolution, u: ?*StackUse, result: *Error!void) void {
+            result.* = runMeasured(r, sc, rs, u);
+        }
+    };
+    var result: Error!void = {};
+    const thread = std.Thread.spawn(.{ .stack_size = stack_bytes }, Job.work, .{ rt, script, res, use, &result }) catch return error.OutOfMemory;
+    thread.join();
+    return result;
+}
+
+/// Test builds only: the deepest the interpreter recursed and the Zig stack it used.
+const StackUse = struct { depth: u32 = 0, bytes: usize = 0 };
+
+fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUse) Error!void {
+    var it: Interpreter = .{ .rt = rt, .res = res, .stack_top = @frameAddress(), .lowest_frame = @frameAddress() };
+    defer if (use) |u| {
+        u.* = .{ .depth = it.max_depth, .bytes = it.stack_top - it.lowest_frame };
+    };
+    // The parser guarantees break/continue only occur in loops and return in functions.
     std.debug.assert(try it.block(script.statements) == .normal);
 }
 
 const Interpreter = struct {
     rt: *Runtime,
     res: Resolution,
-    slots: []?Value,
+    env: ?*Env = null,
+    /// Nesting of exec/eval/call, across JS calls (Limits.max_interpreter_depth).
+    depth: u32 = 0,
+    /// Active JS calls (Limits.max_call_depth).
+    calls: u32 = 0,
+    /// The value of the `return` being propagated (valid while a `.return` completion is).
+    ret: Value = .undefined,
+    // Stack measurement, test builds only (see the test at the end).
+    stack_top: usize = 0,
+    lowest_frame: usize = 0,
+    max_depth: u32 = 0,
 
-    fn slotOf(it: *const Interpreter, binding: u32) *?Value {
-        return &it.slots[it.res.bindings[binding].slot];
+    // Inlined so the frame address is the caller's (exec/eval/call), whose frames are
+    // the ones that pile up.
+    inline fn enter(it: *Interpreter) Error!void {
+        if (it.depth >= it.rt.limits.max_interpreter_depth) return it.rt.limit(.interpreter_depth);
+        it.depth += 1;
+        if (builtin.is_test) {
+            it.lowest_frame = @min(it.lowest_frame, @frameAddress());
+            it.max_depth = @max(it.max_depth, it.depth);
+        }
     }
 
-    /// Entering a scope puts its bindings in the TDZ. This matters when a block is
-    /// re-entered (loop bodies): the previous iteration's values must not leak.
-    fn enterScope(it: *Interpreter, decl: ast.Declaration) void {
-        for (decl.declarators) |d| it.slotOf(d.binding).* = null;
+    // ---- environments
+
+    /// The record holding binding `b`: walk outward to the record of its scope.
+    fn slotOf(it: *const Interpreter, b: u32) *?Value {
+        const binding = it.res.bindings[b];
+        var e = it.env;
+        while (e) |rec| : (e = rec.parent) {
+            if (rec.scope == binding.scope) return &rec.values[binding.index];
+        }
+        unreachable; // the resolver only resolves names to bindings in enclosing scopes
     }
 
+    /// A new record for `scope` (if it declares anything) inside the current one.
+    fn pushScope(it: *Interpreter, scope: ?u32) Error!void {
+        const s = scope orelse return;
+        it.env = try it.rt.heap.newEnv(it.env, s, it.res.scopes[s].len);
+    }
+
+    /// The scope a statement list declares into, if it declares anything.
+    fn scopeOf(it: *const Interpreter, stmts: []const ast.Stmt) ?u32 {
+        for (stmts) |s| switch (s.data) {
+            .declaration => |decl| return it.res.bindings[decl.declarators[0].binding].scope,
+            .function => |f| return it.res.bindings[f.name.?.binding].scope,
+            else => {},
+        };
+        return null;
+    }
+
+    /// A block: a fresh record per *execution*, so a re-entered block (a loop body) gets
+    /// fresh bindings in the TDZ, and closures from earlier executions keep theirs.
     fn block(it: *Interpreter, stmts: []const ast.Stmt) Error!Completion {
-        for (stmts) |s| if (s.data == .declaration) it.enterScope(s.data.declaration);
+        const saved = it.env;
+        defer it.env = saved;
+        try it.pushScope(it.scopeOf(stmts));
+        return it.body(stmts);
+    }
+
+    /// Statements in the current record: function declarations are created first
+    /// (hoisted and initialised on entry), then everything runs in order.
+    fn body(it: *Interpreter, stmts: []const ast.Stmt) Error!Completion {
+        for (stmts) |s| if (s.data == .function) {
+            const f = s.data.function;
+            it.slotOf(f.name.?.binding).* = .{ .closure = try it.rt.heap.newTreeClosure(f, it.env) };
+        };
         for (stmts) |s| {
             const c = try it.exec(s);
             if (c != .normal) return c;
@@ -65,13 +160,28 @@ const Interpreter = struct {
         }
     }
 
+    /// CreatePerIterationEnvironment: a copy of the `for` head's record, so closures
+    /// from one iteration keep that iteration's values.
+    fn copyScope(it: *Interpreter) Error!void {
+        const old = it.env.?;
+        const new = try it.rt.heap.newEnv(old.parent, old.scope, old.values.len);
+        @memcpy(new.values, old.values);
+        it.env = new;
+    }
+
     fn exec(it: *Interpreter, s: ast.Stmt) Error!Completion {
+        try it.enter();
+        defer it.depth -= 1;
         try it.rt.step();
         switch (s.data) {
-            .empty => {},
+            .empty, .function => {}, // functions were created on entry to the body
             .expression => |e| _ = try it.eval(e),
             .declaration => |decl| try it.declare(decl),
             .block => |stmts| return it.block(stmts),
+            .@"return" => |v| {
+                it.ret = if (v) |e| try it.eval(e) else .undefined;
+                return .@"return";
+            },
             .@"if" => |i| {
                 if (ops.toBoolean(try it.eval(i.cond))) return it.exec(i.then.*);
                 if (i.@"else") |e| return it.exec(e.*);
@@ -79,21 +189,34 @@ const Interpreter = struct {
             .@"while" => |w| while (true) {
                 try it.rt.step();
                 if (!ops.toBoolean(try it.eval(w.cond))) break;
-                if (try it.exec(w.body.*) == .@"break") break;
+                switch (try it.exec(w.body.*)) {
+                    .normal, .@"continue" => {},
+                    .@"break" => break,
+                    .@"return" => return .@"return",
+                }
             },
             .@"for" => |f| {
+                const saved = it.env;
+                defer it.env = saved;
+                var per_iteration = false;
                 if (f.init) |init| switch (init) {
                     .declaration => |decl| {
-                        it.enterScope(decl);
+                        try it.pushScope(it.res.bindings[decl.declarators[0].binding].scope);
                         try it.declare(decl);
+                        per_iteration = decl.kind == .let; // the spec copies only `let` bindings
                     },
                     .expression => |e| _ = try it.eval(e),
                 };
+                if (per_iteration) try it.copyScope();
                 while (true) {
                     try it.rt.step();
                     if (f.cond) |c| if (!ops.toBoolean(try it.eval(c))) break;
-                    if (try it.exec(f.body.*) == .@"break") break;
-                    // `continue` lands here: the update still runs.
+                    switch (try it.exec(f.body.*)) {
+                        .normal, .@"continue" => {}, // `continue` lands here: the update still runs
+                        .@"break" => break,
+                        .@"return" => return .@"return",
+                    }
+                    if (per_iteration) try it.copyScope();
                     if (f.update) |u| _ = try it.eval(u);
                 }
             },
@@ -105,11 +228,13 @@ const Interpreter = struct {
 
     fn eval(it: *Interpreter, e: *const ast.Expr) Error!Value {
         const rt = it.rt;
+        try it.enter();
+        defer it.depth -= 1;
         try rt.step();
         switch (e.data) {
             .number => |n| return .{ .number = n },
-            // shortcut: allocates a new string on every evaluation; the M4 constant pool
-            // creates each literal once.
+            // shortcut: allocates a new string on every evaluation (D30); the VM's constant
+            // pool creates each literal once.
             .string => |units| return .{ .string = try rt.heap.newString(&.{.{ .utf16 = units }}) },
             .boolean => |b| return .{ .boolean = b },
             .null => return .null,
@@ -150,28 +275,72 @@ const Interpreter = struct {
                 try it.write(u.target, .{ .number = new });
                 return .{ .number = if (u.prefix) new else old };
             },
+            .function => |f| {
+                // A named expression's name lives in its own record around the function.
+                if (f.name) |n| {
+                    const own = try rt.heap.newEnv(it.env, it.res.bindings[n.binding].scope, 1);
+                    const c = try rt.heap.newTreeClosure(f, own);
+                    own.values[0] = .{ .closure = c };
+                    return .{ .closure = c };
+                }
+                return .{ .closure = try rt.heap.newTreeClosure(f, it.env) };
+            },
             .call => |c| {
                 const callee = try it.eval(c.callee);
                 const args = try rt.gpa.alloc(Value, c.args.len);
                 defer rt.gpa.free(args);
                 for (c.args, args) |arg, *slot| slot.* = try it.eval(arg);
-                if (callee != .native) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
-                return callee.native.call(rt, args);
+                return switch (callee) {
+                    .native => |n| n.call(rt, args),
+                    .closure => |cl| it.call(cl, args),
+                    else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
+                };
             },
         }
     }
 
-    fn read(it: *Interpreter, ref: ast.Ref) Error!Value {
-        switch (it.res.refs[ref.id]) {
-            .local => |b| return it.slotOf(b).* orelse it.tdz(ref),
-            .global => return globals.lookup(ref.name) orelse
-                it.rt.throw(.ReferenceError, &.{ .{ .ascii = ref.name }, .{ .ascii = " is not defined" } }),
-        }
+    fn call(it: *Interpreter, closure: *const heap.Closure, args: []const Value) Error!Value {
+        const t = switch (closure.impl) {
+            .tree => |t| t,
+            .vm => unreachable, // each engine only ever sees its own closures
+        };
+        const f: *const ast.Function = @ptrCast(@alignCast(t.func));
+        if (it.calls >= it.rt.limits.max_call_depth) return it.rt.limit(.call_depth);
+        it.calls += 1;
+        defer it.calls -= 1;
+        try it.enter();
+        defer it.depth -= 1;
+
+        const saved = it.env;
+        defer it.env = saved;
+        it.env = t.env;
+        // Parameters and the body's declarations share one scope.
+        const scope = if (f.params.len > 0) it.res.bindings[f.params[0].binding].scope else it.scopeOf(f.body);
+        try it.pushScope(scope);
+        for (f.params, 0..) |p, i| it.slotOf(p.binding).* = if (i < args.len) args[i] else .undefined;
+        return switch (try it.body(f.body)) {
+            .@"return" => it.ret,
+            else => .undefined,
+        };
     }
 
-    /// The resolver rejects writes to globals, so every target here is local.
+    fn bindingOf(it: *const Interpreter, ref: ast.Ref) ?u32 {
+        return switch (it.res.refs[ref.id]) {
+            .local => |b| b,
+            .capture => |c| c.binding,
+            .global => null,
+        };
+    }
+
+    fn read(it: *Interpreter, ref: ast.Ref) Error!Value {
+        const b = it.bindingOf(ref) orelse return globals.lookup(ref.name) orelse
+            it.rt.throw(.ReferenceError, &.{ .{ .ascii = ref.name }, .{ .ascii = " is not defined" } });
+        return it.slotOf(b).* orelse it.tdz(ref);
+    }
+
+    /// The resolver rejects writes to globals and to function-expression names.
     fn write(it: *Interpreter, ref: ast.Ref, v: Value) Error!void {
-        const b = it.res.refs[ref.id].local;
+        const b = it.bindingOf(ref).?;
         const slot = it.slotOf(b);
         if (slot.* == null) return it.tdz(ref);
         if (it.res.bindings[b].kind == .@"const")
@@ -183,3 +352,40 @@ const Interpreter = struct {
         return it.rt.throw(.ReferenceError, &.{ .{ .ascii = "Cannot access '" }, .{ .ascii = ref.name }, .{ .ascii = "' before initialization" } });
     }
 };
+
+// ---- the recursion guard really bounds the Zig stack
+
+test "max_interpreter_depth keeps the interpreter well inside its own stack" {
+    const parse = @import("../frontend/parser.zig").parse;
+    const resolve = @import("../frontend/resolver.zig").resolve;
+    const Diagnostic = @import("../frontend/diag.zig").Diagnostic;
+    const gpa = std.testing.allocator;
+    // Worst cases: plain recursion (call → body → exec → eval → call …) and recursion
+    // through a deeply nested expression (eval → eval → …), each until the limit stops it.
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("function f(n) { return ");
+    for (0..200) |_| try w.writeByte('(');
+    try w.writeAll("-f(n + 1)");
+    for (0..200) |_| try w.writeByte(')');
+    try w.writeAll("; } f(0);");
+    for ([_][]const u8{ "function g(n) { return g(n + 1); } g(0);", w.buffered() }) |source| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var d: Diagnostic = .{};
+        const limits: @import("../limits.zig").Limits = .{ .max_call_depth = 1 << 30 }; // the depth limit must stop it
+        const script = try parse(arena.allocator(), source, limits, &d);
+        const res = try resolve(arena.allocator(), script, &d);
+        var discard: std.Io.Writer.Discarding = .init(&.{});
+        var rt = Runtime.init(gpa, limits, &discard.writer);
+        defer rt.deinit();
+        var use: StackUse = .{};
+        try std.testing.expectError(error.LimitExceeded, runOnOwnStack(&rt, script, res, &use));
+        try std.testing.expectEqual(@import("../limits.zig").Limit.interpreter_depth, rt.limitHit().?);
+        try std.testing.expectEqual(limits.max_interpreter_depth, use.depth);
+        std.testing.expect(use.bytes < stack_bytes / 2) catch |e| {
+            std.debug.print("tree-walker used {d} bytes of stack for depth {d} ({d} per level)\n", .{ use.bytes, use.depth, use.bytes / use.depth });
+            return e;
+        };
+    }
+}

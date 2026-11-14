@@ -89,7 +89,23 @@ pub const Expr = struct {
         call: struct { callee: *const Expr, args: []const *const Expr },
         /// `++x`, `--x`, `x++`, `x--`.
         update: struct { op: enum { inc, dec }, prefix: bool, target: Ref },
+        /// `function [name](params) { body }` as an expression.
+        function: *const Function,
     };
+};
+
+/// A function declaration or expression (M6).
+pub const Function = struct {
+    span: Span,
+    /// Index into `Resolution.functions`; 0 is the script itself, so functions count from 1.
+    id: u32,
+    kind: enum { declaration, expression },
+    /// Required for declarations (bound in the enclosing scope); optional for
+    /// expressions (bound only inside the function, DESIGN_DECISIONS D36).
+    name: ?Declarator,
+    /// Plain identifiers only (no defaults, rest or destructuring). `init` is always null.
+    params: []const Declarator,
+    body: []const Stmt,
 };
 
 pub const DeclKind = enum { let, @"const" };
@@ -123,6 +139,10 @@ pub const Stmt = struct {
         @"for": struct { init: ?ForInit, cond: ?*const Expr, update: ?*const Expr, body: *const Stmt },
         @"break",
         @"continue",
+        /// Only at the top level of a script or a function body (blocks: Unsupported).
+        function: *const Function,
+        /// `return [value];`, only inside a function.
+        @"return": ?*const Expr,
     };
 };
 
@@ -136,4 +156,6 @@ pub const Script = struct {
     /// Number of `Ref`s and `Declarator`s, so the resolver can size its tables exactly.
     ref_count: u32,
     binding_count: u32,
+    /// Number of functions plus one (the script is function 0).
+    function_count: u32,
 };

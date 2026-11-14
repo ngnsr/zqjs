@@ -31,8 +31,8 @@ pub fn parse(arena: Allocator, source: []const u8, limits: Limits, diag: *Diagno
     p.tok = try p.lexer.next();
 
     var statements: std.ArrayList(ast.Stmt) = .empty;
-    while (p.tok.tag != .eof) try statements.append(arena, try p.statementListItem());
-    return .{ .statements = statements.items, .ref_count = p.ref_count, .binding_count = p.binding_count };
+    while (p.tok.tag != .eof) try statements.append(arena, try p.statementListItem(.body));
+    return .{ .statements = statements.items, .ref_count = p.ref_count, .binding_count = p.binding_count, .function_count = p.function_count };
 }
 
 const unary_bp = 8;
@@ -81,10 +81,14 @@ const Parser = struct {
     limits: Limits,
     /// Current recursion depth of `statement` + `expression` (both count toward the limit).
     depth: u32 = 0,
-    /// Number of enclosing loops; `break`/`continue` are legal only when > 0.
+    /// Number of enclosing loops *in the current function*; `break`/`continue` are
+    /// legal only when > 0 (they cannot cross a function boundary).
     loop_depth: u32 = 0,
+    /// Number of enclosing functions; `return` is legal only when > 0.
+    function_depth: u32 = 0,
     ref_count: u32 = 0,
     binding_count: u32 = 0,
+    function_count: u32 = 1, // function 0 is the script
 
     fn advance(p: *Parser) Error!void {
         p.tok = try p.lexer.next();
@@ -112,8 +116,16 @@ const Parser = struct {
 
     // ------------------------------------------------------------ statements
 
-    /// A statement where declarations are allowed: script top level and blocks.
-    fn statementListItem(p: *Parser) Error!ast.Stmt {
+    /// A statement where declarations are allowed: script top level, function bodies
+    /// (`.body`) and blocks (`.block`). Function declarations only in `.body`: inside
+    /// blocks sloppy-mode JS gives them Annex B semantics, which ZQJS doesn't implement.
+    fn statementListItem(p: *Parser, context: enum { body, block }) Error!ast.Stmt {
+        if (p.isText(p.tok, "function")) {
+            if (context == .block) return p.fail(.{ .unsupported = .block_function }, p.tok);
+            const t = p.tok;
+            const f = try p.function(.declaration);
+            return .{ .span = .{ .start = t.start, .end = f.span.end }, .data = .{ .function = f } };
+        }
         if (p.tok.tag == .kw_const) return p.declarationStatement(.@"const");
         if (p.isText(p.tok, "let") and try p.letStartsDeclaration()) return p.declarationStatement(.let);
         return p.statement();
@@ -147,6 +159,9 @@ const Parser = struct {
             .kw_const => return p.fail(.{ .syntax_error = "lexical declaration cannot appear in a single-statement context" }, t),
             else => {},
         }
+        // `if (c) function f() {}` is legal sloppy JS (Annex B).
+        if (p.isText(t, "function")) return p.fail(.{ .unsupported = .block_function }, t);
+        if (p.isText(t, "return")) return p.returnStatement();
         if (p.isText(t, "let")) {
             const next = try p.peek();
             // `if (c) let x` is an error, but `if (c) let\nx` may be ASI + two statements.
@@ -205,7 +220,7 @@ const Parser = struct {
         var list: std.ArrayList(ast.Stmt) = .empty;
         while (p.tok.tag != .r_brace) {
             if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated block" }, open);
-            try list.append(p.arena, try p.statementListItem());
+            try list.append(p.arena, try p.statementListItem(.block));
         }
         const close = p.tok;
         try p.advance();
@@ -292,6 +307,93 @@ const Parser = struct {
         const end = p.tok;
         try p.endStatement();
         return .{ .span = span(t, end), .data = if (t.tag == .kw_break) .@"break" else .@"continue" };
+    }
+
+    /// `return;` / `return value;`. A line break after `return` means ASI (`return;`),
+    /// reported as Unsupported like any other ASI.
+    fn returnStatement(p: *Parser) Error!ast.Stmt {
+        const t = p.tok;
+        if (p.function_depth == 0) return p.fail(.{ .syntax_error = "'return' outside a function" }, t);
+        try p.advance();
+        if (p.tok.tag == .semicolon) {
+            const end = p.tok;
+            try p.advance();
+            return .{ .span = span(t, end), .data = .{ .@"return" = null } };
+        }
+        if (p.tok.newline_before or p.tok.tag == .eof or p.tok.tag == .r_brace) return p.fail(.{ .unsupported = .asi }, p.tok);
+        const value = try p.expression();
+        const end = p.tok;
+        try p.endStatement();
+        return .{ .span = span(t, end), .data = .{ .@"return" = value } };
+    }
+
+    /// `function [name](a, b, …) { body }`, starting at `function`.
+    fn function(p: *Parser, kind: @FieldType(ast.Function, "kind")) Error!*const ast.Function {
+        try p.enter();
+        defer p.depth -= 1;
+        const start = p.tok.start;
+        try p.advance(); // `function`
+        if (p.tok.tag == .star) return p.fail(.{ .unsupported = .syntax }, p.tok); // generator
+        const id = p.function_count;
+        p.function_count += 1;
+
+        var name: ?ast.Declarator = null;
+        if (p.tok.tag != .l_paren) {
+            name = try p.bindingName();
+        } else if (kind == .declaration) {
+            return p.fail(.{ .syntax_error = "function declaration needs a name" }, p.tok);
+        }
+
+        if (p.tok.tag != .l_paren) return p.fail(.{ .syntax_error = "expected '('" }, p.tok);
+        try p.advance();
+        var params: std.ArrayList(ast.Declarator) = .empty;
+        while (p.tok.tag != .r_paren) {
+            // Defaults, rest parameters and destructuring are valid JS outside ZQJS.
+            if (p.tok.tag != .identifier and !token.isKeyword(p.tok.tag)) return p.fail(.{ .unsupported = .syntax }, p.tok);
+            try params.append(p.arena, try p.bindingName());
+            if (p.tok.tag == .eq) return p.fail(.{ .unsupported = .syntax }, p.tok);
+            if (p.tok.tag != .comma) break;
+            try p.advance(); // a trailing comma is allowed: `function f(a,) {}`
+        }
+        try p.expectAfterExpression(.r_paren);
+
+        if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{'" }, p.tok);
+        const open = p.tok;
+        try p.advance();
+        const outer_loops = p.loop_depth;
+        p.loop_depth = 0;
+        p.function_depth += 1;
+        defer {
+            p.loop_depth = outer_loops;
+            p.function_depth -= 1;
+        }
+        var body: std.ArrayList(ast.Stmt) = .empty;
+        while (p.tok.tag != .r_brace) {
+            if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated function body" }, open);
+            try body.append(p.arena, try p.statementListItem(.body));
+        }
+        const close = p.tok;
+        try p.advance();
+
+        const f = try p.arena.create(ast.Function);
+        f.* = .{ .span = .{ .start = start, .end = close.end }, .id = id, .kind = kind, .name = name, .params = params.items, .body = body.items };
+        return f;
+    }
+
+    /// A function or parameter name. Reserved words are SyntaxErrors; `let` is a legal
+    /// sloppy-mode name ZQJS doesn't support; `arguments` would shadow the arguments object.
+    fn bindingName(p: *Parser) Error!ast.Declarator {
+        const t = p.tok;
+        const name = t.text(p.source());
+        if (t.tag != .identifier and !token.isKeyword(t.tag)) return p.fail(.{ .unsupported = .syntax }, t);
+        if (token.isKeyword(t.tag) or token.reserved_identifiers.has(name))
+            return p.fail(.{ .syntax_error = "reserved word cannot be a binding name" }, t);
+        if (std.mem.eql(u8, name, "let")) return p.fail(.{ .unsupported = .syntax }, t);
+        if (std.mem.eql(u8, name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
+        try p.advance();
+        const d: ast.Declarator = .{ .name = name, .span = span(t, t), .binding = p.binding_count, .init = null };
+        p.binding_count += 1;
+        return d;
     }
 
     fn endStatement(p: *Parser) Error!void {
@@ -460,6 +562,12 @@ const Parser = struct {
             },
             .identifier => {
                 const name = t.text(p.source());
+                if (std.mem.eql(u8, name, "function")) {
+                    const f = try p.function(.expression);
+                    return p.node(f.span, .{ .function = f }, 0);
+                }
+                // Inside a function, `arguments` is the arguments object.
+                if (std.mem.eql(u8, name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
                 // `this`, `new`, `typeof`, `function`, … start constructs ZQJS lacks;
                 // `let` as a variable name is legal sloppy JS we choose not to support.
                 if (token.reserved_identifiers.has(name) or std.mem.eql(u8, name, "let"))
@@ -490,8 +598,8 @@ const Parser = struct {
     fn unexpectedAfterExpression(p: *Parser, t: Token) Error {
         const certain = switch (t.tag) {
             .number, .string, .kw_true, .kw_false, .kw_null, .r_paren, .r_bracket, .r_brace, .semicolon, .eof => true,
-            // `in` and `instanceof` are binary operators.
-            .identifier => !p.isText(t, "in") and !p.isText(t, "instanceof"),
+            // `in` and `instanceof` are binary operators; `async function` is valid JS.
+            .identifier => !p.isText(t, "in") and !p.isText(t, "instanceof") and !p.isText(t, "function"),
             else => false,
         };
         if (certain) return p.fail(.{ .syntax_error = "unexpected token" }, t);

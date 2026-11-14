@@ -24,8 +24,8 @@ fn runScript(arena: Allocator, rt: *Runtime, source: []const u8, engine: zqjs.En
             var proto = try zqjs.compile(rt.gpa, &rt.heap, script, res, .{}, &d);
             defer proto.deinit(rt.gpa);
             var failure: zqjs.verify.Failure = .{};
-            _ = try zqjs.verify.verify(rt.gpa, proto, .{}, &failure);
-            var vm = try zqjs.Vm.init(rt, &proto);
+            _ = try zqjs.verify.verify(rt.gpa, &proto, .{}, &failure);
+            var vm = zqjs.Vm.init(rt, &proto) catch |e| return @as(?anyerror, e);
             defer vm.deinit();
             vm.run() catch |e| return @as(?anyerror, e);
         },
@@ -60,6 +60,28 @@ test "step budget covers loops, straight-line code and deep expressions" {
     for (0..300) |_| try w.writeAll("+1");
     try w.writeAll(";");
     try expectLimit(w.buffered(), .{ .max_steps = 100 }, .steps);
+}
+
+test "call depth is limited on both engines; stack slots on the VM" {
+    try expectLimit("function f(n) { return f(n + 1); } f(0);", .{ .max_call_depth = 50 }, .call_depth);
+    try expectLimit("const f = function self() { return self(); }; f();", .{ .max_call_depth = 50 }, .call_depth);
+    // Mutual recursion through hoisted declarations.
+    try expectLimit("function a() { return b(); } function b() { return a(); } a();", .{ .max_call_depth = 50 }, .call_depth);
+}
+
+test "the VM's stack-slot limit counts every active frame's reservation" {
+    // Each frame of f reserves its slots and operands; 20 frames need well over 64.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var rt = Runtime.init(testing.allocator, .{ .max_stack_slots = 64 }, &discard.writer);
+    defer rt.deinit();
+    try testing.expectEqual(@as(?anyerror, error.LimitExceeded), try runScript(arena.allocator(), &rt, "function f(n) { let a = n, b = n; if (n === 0) return 0; return f(n - 1); } f(20);", .vm));
+    try testing.expectEqual(Limit.stack_slots, rt.limitHit().?);
+    // The script's own frame counts too.
+    var rt2 = Runtime.init(testing.allocator, .{ .max_stack_slots = 1 }, &discard.writer);
+    defer rt2.deinit();
+    try testing.expectEqual(@as(?anyerror, error.LimitExceeded), try runScript(arena.allocator(), &rt2, "let a = 1, b = 2;", .vm));
 }
 
 test "heap and string limits stop runaway strings" {
@@ -133,6 +155,10 @@ test "error paths: every allocation failing once leaks nothing" {
         "let x = 1; { x; let x = 2; }", // ends in an exception whose message is allocated
         "const c = 1; c = print('rhs');",
         "", // empty script: max_stack 0, no slots
+        // Functions: closures, cells, captures, per-iteration copies, calls and returns.
+        "function counter() { let n = 0; return function() { n++; return n; }; } const c = counter(); c(); print(c());",
+        "let fs = ''; for (let i = 0; i < 3; i++) { const f = function self(k) { if (k) return self(k - 1); return i; }; fs += f(2); } print(fs);",
+        "function f(a, b) { return a + b; } print(f(1), f(1, 2, 3), f('x', print('arg')));",
     };
     for (support.engines) |engine| for (sources) |src|
         try testing.checkAllAllocationFailures(testing.allocator, runOnce, .{ src, engine });
@@ -148,6 +174,13 @@ const corpus = [_][]const u8{
     "const k = 1; k += print('rhs') + y;",
     "print(1)(2);",
     "for (;;) { if (print('once')) continue; else break; } print('after');",
+    "function fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); } print(fib(12));",
+    "let a, b; { let x = 1; a = function() { return x; }; } { let x = 2; b = function() { x++; return x; }; } print(a(), b(), b());",
+    "let fs = ''; for (let i = 0; i < 3; i++) { let g = function() { return i; }; i++; fs += g(); } print(fs);",
+    "function o() { let v = 1; function m() { function i() { v = v * 2; return v; } return i; } return m(); } const d = o(); print(d(), d());",
+    "const k = 1; function w() { k = 2; } w();",
+    "function t() { return later; } t(); let later;",
+    "const f = function g(x) { return x ? g(x - 1) + 1 : 0; };",
 };
 
 test "the engines agree on every syntax case and corpus program" {
@@ -180,4 +213,33 @@ fn fuzzOne(_: void, smith: *testing.Smith) anyerror!void {
 
 test "fuzz: both engines agree on any input" {
     try testing.fuzz({}, fuzzOne, .{ .corpus = &corpus });
+}
+
+test "deep recursion stops cleanly even when the host thread has a tiny stack" {
+    // The tree-walker recurses in Zig, but on its own stack (DESIGN_DECISIONS D37); the VM
+    // doesn't recurse at all. So both must end in LimitExceeded, not a stack overflow.
+    // (A small max_stack_slots keeps this fast under -Dstack-stress, which copies the
+    // stacks on every call.)
+    const Host = struct {
+        fn work(result: *?support.Outcome, engine: zqjs.Engine, err: *?anyerror) void {
+            result.* = support.run(testing.allocator, "function g(n) { return (((-g(n + 1)))); } g(0);", .{ .max_call_depth = 1 << 30, .max_stack_slots = 1 << 16 }, engine, .normal) catch |e| {
+                err.* = e;
+                return;
+            };
+        }
+    };
+    for (support.engines) |engine| {
+        var result: ?support.Outcome = null;
+        var err: ?anyerror = null;
+        const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Host.work, .{ &result, engine, &err });
+        t.join();
+        if (err) |e| return e;
+        var r = result.?;
+        defer r.deinit(testing.allocator);
+        const expected = switch (engine) {
+            .treewalk => "t.js: LimitExceeded(interpreter_depth)\n",
+            .vm => "t.js: LimitExceeded(stack_slots)\n",
+        };
+        try testing.expectEqualStrings(expected, r.err);
+    }
 }

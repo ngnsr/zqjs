@@ -197,7 +197,7 @@ intern table, so the table never holds a dangling pointer.
 - key used only as a bytecode constant (`o.someName`) survives collection with no object holding it
 - atom table cleanup runs before sweep (verify: no table entry points to a poisoned object)
 
-## D12. VM stack: growable, addressed by index *(planned, M5/M6)*
+## D12. VM stack: growable, addressed by index *(M5/M6; two stacks since M6, see D36)*
 - `stack: []Value`, `sp: u32`; frames store `base: u32`, never pointers.
 - The compiler computes `max_stack` per function. On entry the VM ensures
   `sp + max_stack ≤ capacity`, growing (realloc) up to `Limits.max_stack_slots`, else
@@ -320,7 +320,7 @@ Until hosts can define globals (M9), ZQJS rejects such writes in the resolver
 (`Unsupported(global_assignment)`). Reads of undeclared names stay legal (they reach the global
 object at runtime: `undefined`, `NaN`, and later `print`).
 
-## D22. `for (let …)`: one slot now, per-iteration copies in M6
+## D22. `for (let …)`: one slot now, per-iteration copies in M6 *(done in M6: D36, D37)*
 The spec creates a fresh copy of the loop-head bindings for every iteration
 (CreatePerIterationEnvironment). Only closures can observe the difference. M3 and M4 use one
 slot per head binding. **This is a simplification, not an architectural limit:** the head
@@ -391,6 +391,8 @@ compare with the hash above before relying on bit-identity.
 That is documented in LANGUAGE.md as a known deviation, not a bug.
 
 ## D26. TDZ marker: slots are `?Value`
+*(M6: VM slots are `Slot = union { value: ?Value, cell: *Cell }` and cells hold `?Value`; the
+marker is still an optional, never a Value.)*
 `null` means "not yet initialised". Zig's optional type makes it impossible for the marker to
 reach JS code: every read must unwrap it, and the unwrap is where the ReferenceError is thrown.
 **Alternative:** an internal `Value.uninitialized` tag, which every operation would have to remember
@@ -513,3 +515,65 @@ f(vm.peek(0)) }` is wrong in Zig: the union literal is built in place (result lo
 slot's tag becomes `.number` *before* `f` reads the old value through `peek`, which then reads a
 pointer's bits as a float. Every in-place store in the VM computes into a local first.
 `tests/diff/unary_strings.js` is the regression test.
+
+## D36. Functions in the VM: cells, two stacks, transactional calls *(M6)*
+**Captured bindings are cells (decision A).** The resolver marks a binding `captured` when an
+inner function refers to it, and gives each function a capture list: for each captured binding,
+"my parent's slot i" or "my parent's capture j", so a binding two functions out is passed down
+through the function in between. A captured binding's slot holds a heap `Cell { ?Value }`:
+`new_cell` on scope entry (so *every execution* of a block gets fresh cells; a closure from an
+earlier execution keeps its own), `box_local` for a captured parameter on function entry,
+`*_cell` instructions to access it, and `*_capture` through the running closure from inner
+functions. `make_closure` copies the cell pointers into the new closure, so all closures of a
+binding share it, and it lives as long as any of them. Per-iteration `for (let …)` copies
+(`fresh_cell`, before the first test and before each update) are emitted only for captured head
+bindings; for the others the copy is unobservable. *Alternative:* open/closed upvalues (Lua,
+clox, ~QuickJS): fewer allocations, but closing on every scope exit and `break`/`continue`,
+per-iteration copies and stack relocation fix-ups are subtle code; cells cost one allocation
+per captured binding per scope execution, measurable later.
+**Frames and stacks (decision B).** `frames` (Proto, closure, return pc, where its locals and
+operands start, where its callee sits), `locals: []Slot` (D26) and `stack: []Value`, all
+addressed by index, all growable (`realloc`, geometric). Parameters occupy slots
+`param_slot…` (1 in a named function expression, whose own name comes first). A callee's
+operands start above its arguments; `return` cuts the stack back to the callee's position and
+pushes the result there. *Alternative:* one stack with locals inline (no argument copy), but
+TDZ would need a Value tag that could escape, or a `?Value` operand stack.
+**Calls are transactional.** `enter` checks `max_call_depth` and `max_stack_slots`, reserves the
+capacity of all three stacks (this may move them, which is invisible: everything is an index),
+initialises the callee's locals *above* the live ones, and only then commits (pushes the frame,
+advances `locals_len`, sets `pc = 0`). So a call that fails (a limit, out of memory) leaves the
+caller exactly as it was: pc on the `call`, callee and arguments on its operand stack. `return`
+restores the caller's pc, frame and operand depth. Both are tested directly (`tests/vm_test.zig`).
+**`max_stack_slots`** bounds Σ(slot_count + max_stack) over all active frames, the script's
+included: each frame's full reservation counts whether used or not, so neither deep recursion
+of small frames nor shallow recursion of huge ones can get around it.
+**`-Dstack-stress`** moves both stacks to fresh allocations on every call; the whole suite runs
+with it in CI. Natives still cannot call back into JS, so the borrowed argument slice stays
+valid; `NativeCtx.arg(i)` (D12) arrives with the first native that can.
+**Lifetime.** Closures, cells and Protos: closures point at their Proto, which the Proto tree
+owns; in `runSource` the tree outlives the run, and freeing a closure never touches its Proto.
+Until M8 cells and closures live until `Heap.deinit` (bounded by the heap limit).
+**Caught by the differential tests while building this:** a named function expression's
+parameters were copied into slot 0, the function's own name (the VM assumed parameters start
+at 0); the tree-walker, which doesn't use slots, disagreed. Fixed with `param_slot`.
+
+## D37. Functions in the tree-walker: spec environments on its own stack *(M6)*
+**Environment records (decision C).** The oracle deliberately does *not* use the resolver's
+capture analysis or slots: every scope that declares something gets a heap `Env { parent,
+scope, values: []?Value }` when entered (script, block, `for` head, call, a named function
+expression's name), closures keep the record they were created in, and a binding is found by
+walking the chain to its scope's record. Per-iteration bindings copy the `for` head's record,
+as the spec does. So a mistake in capture analysis, cell handling or slot assignment in the VM
+shows up as a disagreement, not as two engines agreeing on the same wrong answer. Cost: one
+allocation per scope entry (garbage until M8), so long loops use far more heap here than on the
+VM; limits are engine-specific (LANGUAGE.md).
+**Native recursion.** The tree-walker recurses in Zig for every statement, expression and call,
+across JS calls, so it counts that depth and stops at `max_interpreter_depth` (default 6000)
+with `LimitExceeded(interpreter_depth)`. *Measured* worst case at 6000 (plain recursion, and
+recursion through a 200-deep nested expression): **~14.5 MB of stack in Debug** (2.4 KB per
+level), ~4 MB in ReleaseSafe. That is more than an 8 MiB thread has (it only passed at first
+because Zig gives executables a 16 MiB main stack), so the tree-walker runs on **its own thread
+with a 64 MiB stack**; the caller waits, so the Runtime is never shared. The guard then holds
+whatever stack the host thread has: a test runs worst-case recursion from a 256 KiB host thread
+on both engines, and a unit test asserts the measured use stays under half of the 64 MiB, in
+every build mode CI tests (Debug and ReleaseSafe).

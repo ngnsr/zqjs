@@ -12,6 +12,12 @@ pub const Value = union(enum) {
     string: *const heap.String,
     /// A function implemented in Zig. Becomes a function object in M7.
     native: *const Native,
+    /// A function defined in the script (M6). Becomes a function object in M7.
+    closure: *const heap.Closure,
+
+    pub fn isFunction(v: Value) bool {
+        return v == .native or v == .closure;
+    }
 };
 
 pub const Native = struct {

@@ -50,7 +50,20 @@ invariant: the store API is the *only supported way* to mutate a GC-visible refe
   only; no temp roots; weak atoms; Protos as roots; +8-byte header; scheduling; stats);
   `GC_DESIGN.md` status becomes "approved".
 
-### P1. Collector core, VM collecting
+### P1. Collector core, VM collecting *(done)*
+
+Done as planned, plus, from the P1 review: a cross-type chain test (a value reachable only
+through object → array → VM closure → cell → object → prototype, and tree closure → env →
+parent env, survives a collection that frees garbage of every kind pointing into it); and an
+allocation-free proof (a collection with the backing allocator failing every request makes
+zero allocations and reuses the atom table's storage). Two findings while building it: `Vm.init`
+returns the VM by value, so the VM registers its roots at each safepoint rather than in
+`init` (a pointer taken there would point at a copy), and unregisters in `deinit`; and a
+mutation test (locals left unmarked) is caught by the root tests, but as a crash on the freed
+memory rather than a clean failure, which is what P3's zombie mode turns into a deterministic
+panic. Measured: VM peak heap falls from 14-30 MB to ~260 KB on the garbage-heavy benchmarks,
+steps unchanged; every diff program matches node on the VM with a collection at every
+safepoint.
 
 - `Obj`: `marked: bool`, `gray_next: ?*Obj` (header 16 → 24 bytes). All constructors default
   them; `destroy` unchanged.

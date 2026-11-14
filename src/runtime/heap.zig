@@ -39,7 +39,12 @@ pub const per_allocation_overhead = 16;
 
 pub const Obj = struct {
     kind: Kind,
+    /// The list of every object (the sweep list).
     next: ?*Obj,
+    /// Set during a collection's mark phase; cleared by the sweep (D8).
+    marked: bool = false,
+    /// The gray list while marking: intrusive, so marking never allocates (D9).
+    gray_next: ?*Obj = null,
 
     pub const Kind = enum { string, cell, closure, env, object };
 };
@@ -140,9 +145,95 @@ pub const Heap = struct {
     atoms: std.HashMapUnmanaged(*String, void, AtomContext, 80) = .empty,
     /// `allocator()` refused an allocation because of the heap limit (see `failed`).
     refused: bool = false,
+    /// When `bytes` passes this, a collection is requested for the next safepoint.
+    next_gc: usize = 0,
+    collect_requested: bool = false,
+    /// Collect at every safepoint, not only when requested (tests; `-Dgc-stress` in P3).
+    collect_always: bool = false,
+    /// The gray list while marking (empty otherwise).
+    gray: ?*Obj = null,
+    stats: Stats = .{},
+
+    /// Deterministic collector statistics (D8): work units, not wall-clock time.
+    pub const Stats = struct {
+        collections: u64 = 0,
+        /// Cumulative bytes freed by collections.
+        bytes_freed: u64 = 0,
+        /// Accounted bytes surviving the last collection.
+        live_after_last: usize = 0,
+        /// Cumulative objects surviving collections, and freed by them.
+        marked: u64 = 0,
+        swept: u64 = 0,
+    };
 
     pub fn init(gpa: Allocator, limits: Limits) Heap {
-        return .{ .gpa = gpa, .max_bytes = limits.max_heap_bytes, .max_string_length = limits.max_string_length };
+        var h: Heap = .{ .gpa = gpa, .max_bytes = limits.max_heap_bytes, .max_string_length = limits.max_string_length };
+        h.next_gc = h.schedule(0);
+        return h;
+    }
+
+    // ---- the collector (D8; GC_DESIGN §6). Runs only at safepoints, by the engine.
+
+    /// Collect when `bytes` passes this (set by `schedule`).
+    pub fn schedule(h: *const Heap, live: usize) usize {
+        const min_gc = 256 * 1024;
+        const cap = h.max_bytes - h.max_bytes / 8; // an eighth of the limit as headroom (D8)
+        return @min(@max(live *| 2, min_gc), cap);
+    }
+
+    /// Marks `obj` and queues it for scanning, once.
+    pub fn markObj(h: *Heap, obj: *Obj) void {
+        if (obj.marked) return;
+        obj.marked = true;
+        obj.gray_next = h.gray;
+        h.gray = obj;
+    }
+
+    pub fn markValue(h: *Heap, v: Value) void {
+        visitValue(v, h, markObj);
+    }
+
+    /// A full stop-the-world collection. `markRoots(roots, h)` marks every root (with
+    /// `markObj`/`markValue`); everything not reachable from them is freed. Allocates
+    /// nothing and can't fail (I4).
+    pub fn collect(h: *Heap, roots: anytype, comptime markRoots: fn (@TypeOf(roots), *Heap) void) void {
+        std.debug.assert(h.gray == null);
+        markRoots(roots, h);
+        // Drain: each gray object's children (D38's edges), iteratively, never recursively.
+        while (h.gray) |obj| {
+            h.gray = obj.gray_next;
+            obj.gray_next = null;
+            forEachChild(obj, h, markObj);
+        }
+        // Weak atoms (D11, I6): rebuild the table from the marked atoms, before any atom is
+        // freed. Walking the object list (not the table) keeps the rebuild deterministic,
+        // and reinserting at most as many entries as were there needs no allocation.
+        h.atoms.clearRetainingCapacity();
+        var it = h.objects;
+        while (it) |obj| : (it = obj.next) {
+            if (obj.kind != .string or !obj.marked) continue;
+            const str: *String = @fieldParentPtr("obj", obj);
+            if (str.atom != null) h.atoms.putAssumeCapacityNoClobber(str, {});
+        }
+        // Sweep: free the unmarked, unmark the survivors.
+        const before = h.bytes;
+        var link: *?*Obj = &h.objects;
+        while (link.*) |obj| {
+            if (obj.marked) {
+                obj.marked = false;
+                h.stats.marked += 1;
+                link = &obj.next;
+            } else {
+                link.* = obj.next;
+                h.destroy(obj);
+                h.stats.swept += 1;
+            }
+        }
+        h.stats.collections += 1;
+        h.stats.bytes_freed += before - h.bytes;
+        h.stats.live_after_last = h.bytes;
+        h.next_gc = h.schedule(h.bytes);
+        h.collect_requested = false;
     }
 
     pub fn deinit(h: *Heap) void {
@@ -502,6 +593,7 @@ pub const Heap = struct {
         const total = std.math.add(usize, h.bytes, charge) catch return h.exceeded(.heap_bytes);
         if (total > h.max_bytes) return h.exceeded(.heap_bytes);
         h.bytes = total;
+        if (total > h.next_gc) h.collect_requested = true; // collected at the next safepoint
         h.peak = @max(h.peak, total);
         h.allocated += charge;
         return charge;

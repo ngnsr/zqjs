@@ -39,6 +39,8 @@ pub const Options = struct {
     engine: Engine = .vm,
     /// VM only: before each instruction, write its listing line and the operand stack.
     trace: ?*Writer = null,
+    /// Collect at every safepoint, not only when the heap asks (tests; GC_DESIGN §11).
+    collect_always: bool = false,
 };
 
 pub const Error = Allocator.Error || Writer.Error;
@@ -58,6 +60,7 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
 
     var rt = Runtime.init(gpa, limits, out);
     defer rt.deinit();
+    rt.heap.collect_always = options.collect_always;
     const outcome = switch (options.engine) {
         .treewalk => treewalk.run(&rt, script, res),
         .vm => vm: {

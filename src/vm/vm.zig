@@ -111,6 +111,9 @@ pub const Vm = struct {
     }
 
     pub fn deinit(vm: *Vm) void {
+        if (vm.rt.engine_roots) |e| if (e.ctx == @as(*anyopaque, vm)) {
+            vm.rt.engine_roots = null; // no collection may scan a VM that is gone
+        };
         const gpa = vm.rt.gpa;
         vm.frames.deinit(gpa);
         gpa.free(vm.locals);
@@ -121,6 +124,33 @@ pub const Vm = struct {
     /// Runs to `halt` or the first error.
     pub fn run(vm: *Vm) Error!void {
         while (try vm.step() == .running) {}
+    }
+
+    /// The VM's roots (GC_DESIGN §4): the operand stack, the locals (values and cells), each
+    /// frame's closure and `this`, and the script's Proto tree (its string constants; the
+    /// Protos aren't heap objects, so the tree being run is what keeps them).
+    fn markRoots(ctx: *anyopaque, h: *heap.Heap) void {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        for (vm.stack[0..vm.sp]) |v| h.markValue(v);
+        for (vm.locals[0..vm.locals_len]) |s| switch (s) {
+            .value => |v| if (v) |x| h.markValue(x),
+            .cell => |c| h.markObj(&c.obj),
+        };
+        for (vm.frames.items) |f| {
+            if (f.closure) |c| h.markObj(@constCast(&c.obj));
+            if (f.this) |t| h.markValue(t);
+        }
+        markProto(h, vm.frames.items[0].proto);
+    }
+
+    fn markProto(h: *heap.Heap, p: *const Proto) void {
+        for (p.consts) |k| h.markValue(k);
+        for (p.functions) |*f| markProto(h, f); // nesting depth is bounded by the AST's
+    }
+
+    /// The Proto this VM runs (the one `init` was given), for tests.
+    pub fn scriptProto(vm: *const Vm) *const Proto {
+        return vm.frames.items[0].proto;
     }
 
     /// The operand stack of all frames, bottom first (for traces and tests).
@@ -139,6 +169,15 @@ pub const Vm = struct {
     pub fn step(vm: *Vm) Error!State {
         if (vm.fault) |e| return e;
         if (vm.halted) return .halted;
+        // The safepoint (D8): every live value is in the stacks and frames now, so a
+        // collection can run. Before the budget charge, so collecting never costs a step.
+        // Registered here rather than in init, which returns the VM by value (a pointer
+        // taken there would point at a copy).
+        const h = &vm.rt.heap;
+        if (h.collect_requested or h.collect_always) {
+            vm.rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
+            vm.rt.collect();
+        }
         return vm.execute() catch |e| {
             vm.fault = e;
             return e;

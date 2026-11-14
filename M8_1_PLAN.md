@@ -436,6 +436,127 @@ themselves.
 **Atom growth:** a test runs 60k dead dynamic keys in a 1 MiB heap. Major collections free
 them and the run fits. With the growth trigger disabled it fails with `LimitExceeded`.
 
+## P2b design: property-table cards and adaptive major scheduling (for review)
+
+Approved in principle after P2. Nothing below is implemented yet.
+
+### Property-table cards
+
+**Storage.** A property table is an `AutoArrayHashMapUnmanaged(*String, Property)`. Its entries
+sit in insertion order at stable indices (`keys()[i]`, `values()[i]`), and the hash index on
+top doesn't affect them. A card covers 512 *entries*: entry i's key and value share card
+`i / 512`.
+
+The bitmaps live in a second side table, `prop_cards`, next to the elements' `cards`. An array
+can have both; they share the bit-twiddling helpers and nothing else, because the layouts
+differ. Elements are a plain slice indexed by element. Property entries are indexed by
+insertion and can shift on delete.
+
+**Invariants:**
+
+- **PC1 (I-gen2 extended).** An old object whose table has a bitmap, and a young key or value
+  at entry i, is remembered *and* has property card `i / 512` dirty. The verifier checks it.
+  A table without a bitmap is remembered whole, as today.
+- **PC2: index shifts.** Entry indices change only through `orderedRemove` (`delete o[k]`),
+  which moves every later entry down one place. On removal from a carded table, every card
+  from the removed entry's card to the last one is dirtied. That's because a young entry
+  just past a card boundary can move into a clean card, for example from 1024 (card 2) to
+  1023 (card 1). Nothing else changes indices: growing or rehashing the index doesn't, and
+  replacing an existing key keeps its index.
+- **PC3: coverage, and the hole rule.** A table gets a bitmap before the insertion that takes
+  it to 512 entries, and the bitmap is grown before any insertion it wouldn't cover.
+  - **Growth:** coverage grows geometrically, independently of the hash map's capacity.
+  - **The hole rule:** a first bitmap for an owner that is already remembered starts all
+    dirty, the same rule as for arrays.
+  - **Allocation order:** the bitmap grows *before* the table grows. If the bitmap can't
+    grow, nothing has changed. If the table's `getOrPut` then fails, a larger bitmap is
+    harmless.
+- **PC4 (I-gen3 extended).** After any collection, every property card is clean.
+- **PC5: lifetime.** A table's bitmap is freed with its object, in `release`. `deinit`
+  asserts that `prop_cards` is empty.
+
+**Scanning a remembered owner:**
+
+1. its prototype;
+2. its properties: the dirty property cards if the table has a bitmap, every entry if not;
+3. its elements: the dirty element cards, or all of them.
+
+Dirty cards past the current count are clamped. Each card is scanned, then cleared. A
+missing bitmap falls back to a whole scan, which is always safe.
+
+**Tests**, under normal and stress builds:
+- young stores at entries 0, 511, 512, 1023, 1024 and the last;
+- a young *key* with an old value;
+- the delete shift across a card boundary;
+- the hole: remembered at 400 entries, grown to 600;
+- growth to 40k entries;
+- `checkAllAllocationFailures` on inserts that grow the bitmap;
+- the bitmap dying in a minor collection and in a major one.
+
+**Mutants** (`gc-mutants`): `no_prop_card_set`, `no_dirty_on_remove` and
+`clean_first_prop_bitmap`. Each must fail PC1.
+
+**Acceptance:** game_big_dictionary's minor p95 under 1 ms, and its remembered-set p95 under
+0.1 ms (1.9 and 1.85 ms today).
+
+### Adaptive major scheduling
+
+Today `next_major = live + min(max(live, 256 KiB), (max − live)/2)`, which is D8's formula. It
+grows the heap by 1× live, whatever the last major collection found.
+
+**Proposal:** a growth factor `f ∈ {1, 2, 4, 8}`, updated at each major collection from that
+collection's own reclamation `r = freed / bytes_before`.
+
+- `r < 10%` → `f = min(2f, 8)`: the heap is growing for real, so don't collect again at the
+  next doubling.
+- `r ≥ 50%` → `f = 1`: there's real old garbage, so go back to conservative.
+- otherwise `f` is unchanged.
+- `next_major = live + min(max(f · live, 256 KiB), (max − live)/2)`.
+
+**Invariants:**
+
+- **AS1: the hard limit.** For every `f`, `next_major ≤ live + (max − live)/2 < max`.
+  Scheduling can never push the heap past its limit. Near the limit, major collections still
+  come at halving distances, so M8's O(log limit) guarantee holds. The existing
+  "no pathological collection loop" test must keep passing.
+- **AS2: deterministic.** `f` changes only at a major collection, and only from that
+  collection's byte counts. It never depends on time.
+- **AS3: bounded overhead.** At the next major collection, old bytes are at most
+  `(1 + f_max) · live`, and never more than the limit.
+- **AS4: fast reset.** One major collection that reclaims at least half returns `f` to 1. So
+  after a phase change from growth to churn, there's at most one long gap.
+
+**What it buys, and what it doesn't** (simulated on game_1m's growth curve):
+
+- Major collections happen at about 0.5, 1.5, 7.5 and 67.5 MB, instead of nine doublings up to
+  240 MB.
+- So about half as many majors during growth: the count goes from log₂ to log₉ of the final
+  size.
+- The longest pause *here* falls from about 59 ms to about 15 ms, but only because the
+  thresholds happen to land there. A heap that ends just past a threshold still pays a full
+  pause at that size. Making major pauses shorter in general is M8.2.
+
+**`f_max` is for review:** 8, or 4 to be more conservative.
+
+| `f_max` | majors on game_1m | last major at | worst-case old-garbage overhead |
+|---|---|---|---|
+| 8 | ~4 | 67.5 MB | 9× live |
+| 4 | ~5 | 187 MB | 5× live |
+
+**Tests:**
+- a unit test of the `f` sequence: repeated non-reclaiming majors go 1→2→4→8→8, and one
+  reclaiming major resets to 1;
+- the extremes loop over `schedule(live, f)`: never above `max`, never below `live`;
+- the existing O(log limit) fill test;
+- new: growth followed by churn of objects that die *old*, under a small limit. It must
+  finish without `LimitExceeded`, with `peak ≤ limit`.
+
+These are scheduling properties, so they're unit tests, not verifier mutants: the heap stays
+sound under any `f`, only its timing changes.
+
+**Decisions:** this changes D8's scheduling formula, so D8 gets a revision entry in
+P3's docs.
+
 ## Out of scope
 
 - Incremental marking (M8.2).

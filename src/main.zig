@@ -33,6 +33,10 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator(); // process lifetime
     const args = try init.minimal.args.toSlice(arena);
+    // The runtime's allocator (M8.1 P2): smp_allocator in release builds, where libc
+    // malloc's free was ~80% of a minor collection; safe builds keep the std default,
+    // which checks for leaks. Embedders choose their own (Runtime.init takes one).
+    const gpa = if (std.debug.runtime_safety) init.gpa else std.heap.smp_allocator;
 
     // Streaming, not positional, writers: with `> file 2>&1` both descriptors share one
     // file offset, and positional writers would each start at 0 and overwrite each other.
@@ -97,13 +101,13 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     switch (command) {
-        .run => return zqjs.runSource(init.gpa, name, source, limits, options, out, err),
+        .run => return zqjs.runSource(gpa, name, source, limits, options, out, err),
         .@"test" => {
             options.mode = .harness;
-            return zqjs.runSource(init.gpa, name, source, limits, options, out, err);
+            return zqjs.runSource(gpa, name, source, limits, options, out, err);
         },
         .dump => return dump(arena, name, source, limits, out, err),
-        .dump_bytecode => return dumpBytecode(init.gpa, arena, name, source, limits, out, err),
+        .dump_bytecode => return dumpBytecode(gpa, arena, name, source, limits, out, err),
     }
 }
 

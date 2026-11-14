@@ -8,6 +8,8 @@
 //!     end        bytes still live when the script ends
 //!     collections  garbage collections during the run (M8)
 //!   `allocated` measures allocation volume, `peak` the memory a run really needs.
+//!   The runtime runs on std.heap.smp_allocator (M8.1; the header says so). Baselines
+//!   before M8.1 used libc malloc: compare times only between rows of the same allocator.
 //!   median  wall time of `runs` in-process runs (parse → resolve → [compile → verify] →
 //!           run), in milliseconds. Machine-dependent; compare only on the same machine.
 //!           Every run gets a fresh arena, Runtime and heap, so runs can't influence each
@@ -34,7 +36,7 @@ const Result = struct { steps: u64, allocated: u64, peak: usize, end: usize, col
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
-    const gpa = init.gpa;
+    const gpa = std.heap.smp_allocator;
     const arena = init.arena.allocator();
 
     var buf: [4096]u8 = undefined;
@@ -55,7 +57,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }.lt);
 
-    try out.print("# zqjs benchmark baseline: zig {s}, {s}-{s} ({s}), {s}, median of {d} runs\n", .{
+    try out.print("# zqjs benchmark baseline: zig {s}, {s}-{s} ({s}), {s}, median of {d} runs, smp_allocator\n", .{
         builtin.zig_version_string, @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), builtin.cpu.model.name, @tagName(builtin.mode), runs,
     });
     try out.print("{s:<22} {s:<9} {s:>12} {s:>12} {s:>12} {s:>12} {s:>11} {s:>10}\n", .{ "program", "engine", "steps", "allocated", "peak", "end", "collections", "median ms" });

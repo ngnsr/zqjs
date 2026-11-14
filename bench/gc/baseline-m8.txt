@@ -1,3 +1,4 @@
+# allocator: libc malloc (the macOS default before M8.1 P2, noted afterwards; later reports use smp_allocator: compare times only within one allocator)
 # zqjs GC report: zig 0.17.1, aarch64-macos (apple_m4), fast, 5 runs per row (medians; max also [min-max])
 program                engine        ms alloc MB   MB/s live MB  gc % | kind    gcs     p50     p95     max      max spread rem p95 |  <0.1    <1    <4   <16   >16
 arrays.js              vm          26.9      2.3     85     1.4   0.0 | major     3   0.007   0.016   0.016     [0.02-0.02]   0.000 |    15     0     0     0     0

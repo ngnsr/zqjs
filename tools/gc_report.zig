@@ -28,8 +28,11 @@
 //!   zig build gc-report              (always ReleaseFast)
 //!   zig build gc-report -- game_1m   (only programs whose name contains the text)
 //!   zig build gc-report -- --nursery=256K game_   (another nursery size, K or M suffix)
-//!   zig build gc-report -- --allocator=smp        (the runtime on std.heap.smp_allocator
-//!                                                 instead of the default, libc malloc)
+//!   zig build gc-report -- --allocator=libc       (the runtime on libc malloc instead of
+//!                                                 the default, std.heap.smp_allocator;
+//!                                                 macOS reports before M8.1 P2 used
+//!                                                 libc; on Linux, without libc, the
+//!                                                 default already was smp_allocator)
 //!   zig build gc-report > bench/gc/baseline-m8.txt
 
 const std = @import("std");
@@ -78,15 +81,18 @@ const PerRun = struct { count: usize = 0, gc_ns: u64 = 0, p50: u64 = 0, p95: u64
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
-    var gpa = init.gpa;
+    var gpa = std.heap.smp_allocator;
+    var libc = false;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     var only: ?[]const u8 = null;
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--nursery=")) {
             limits.nursery_bytes = try parseSize(arg["--nursery=".len..]);
-        } else if (std.mem.eql(u8, arg, "--allocator=smp")) {
-            gpa = std.heap.smp_allocator;
+        } else if (std.mem.eql(u8, arg, "--allocator=libc")) {
+            if (!builtin.link_libc) return error.LibcNotLinked; // Linux: not linked at all
+            gpa = if (builtin.link_libc) std.heap.c_allocator else unreachable;
+            libc = true;
         } else only = arg;
     }
 
@@ -96,7 +102,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer out.flush() catch {};
 
     try out.print("# zqjs GC report: zig {s}, {s}-{s} ({s}), {s}, {d} runs per row (medians; max also [min-max]), nursery {d} KiB, {s}\n", .{
-        builtin.zig_version_string, @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), builtin.cpu.model.name, @tagName(builtin.mode), runs, limits.nursery_bytes >> 10, if (gpa.vtable == std.heap.smp_allocator.vtable) "smp_allocator" else "libc malloc",
+        builtin.zig_version_string, @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), builtin.cpu.model.name, @tagName(builtin.mode), runs, limits.nursery_bytes >> 10, if (libc) "libc malloc" else "smp_allocator",
     });
     try out.print("{s:<22} {s:<8} {s:>7} {s:>8} {s:>6} {s:>7} {s:>7} {s:>5} | {s:<5} {s:>5} {s:>7} {s:>7} {s:>7} {s:>15} {s:>7} | {s:>5} {s:>5} {s:>5} {s:>5} {s:>5}\n", .{
         "program", "engine", "ms", "alloc MB", "MB/s", "live MB", "peak MB", "gc %", "kind", "gcs", "p50", "p95", "max", "max spread", "rem p95", "<0.1", "<1", "<4", "<16", ">16",

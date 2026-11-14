@@ -34,20 +34,32 @@ permissions:
 
 jobs:
   check:
-    name: ${{ matrix.name }}
+    # One job per (platform, test configuration), all in parallel: the configurations are
+    # independent builds, and run one after another they took ~7 min a platform.
+    name: ${{ matrix.platform.name }} / ${{ matrix.suite.name }}
     # A same-repo PR branch is already checked by its push run; only fork PRs need their own.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform.os }}
     timeout-minutes: 30
     strategy:
-      fail-fast: false # one platform failing shouldn't hide the others' results
+      fail-fast: false # one job failing shouldn't hide the others' results
       matrix:
-        include:
+        platform:
           - { name: macOS arm64, os: macos-latest }
           - { name: Linux x86_64, os: ubuntu-latest }
           # GitHub's arm64 Linux runners are free for public repositories; for a private
           # repository this job may need a paid runner (or remove it).
           - { name: Linux arm64, os: ubuntu-24.04-arm }
+        # Both stress modes at once: the VM moves its stacks on every call (D36), and both
+        # engines collect at every safepoint, keep collected objects as tombstones and
+        # verify the heap before and after every collection (D8, GC_DESIGN §11).
+        # ReleaseSafe checks the tree-walker's measured stack use in another mode (D37),
+        # and that the stress checks don't exist only in Debug.
+        suite:
+          - { name: tests, flags: "" }
+          - { name: gc-stress + stack-stress, flags: "-Dgc-stress -Dstack-stress" }
+          - { name: ReleaseSafe, flags: "-Doptimize=ReleaseSafe" }
+          - { name: gc-stress ReleaseSafe, flags: "-Dgc-stress -Doptimize=ReleaseSafe" }
     steps:
       - uses: actions/checkout@v4
 
@@ -56,46 +68,40 @@ jobs:
         with:
           version: 0.17.1
 
+      - name: Tests (${{ matrix.suite.name }})
+        run: zig build test ${{ matrix.suite.flags }} --summary all
+
+      # The checks below run once per platform, in the plain-tests job.
+
       # Dev-time tools for check-goldens: node (goldens, syntax contract) and Python 3
       # (pow reference values; standard library only, preinstalled on the runners).
-      - uses: actions/setup-node@v4
+      - if: matrix.suite.name == 'tests'
+        uses: actions/setup-node@v4
         with:
           node-version: 22
 
       - name: Formatting
+        if: matrix.suite.name == 'tests'
         run: zig fmt --check .
-
-      - name: Tests (unit + integration)
-        run: zig build test --summary all
-
-      # Both stress modes at once: the VM moves its stacks on every call (D36), and both
-      # engines collect at every safepoint, keep collected objects as tombstones and verify
-      # the heap after every collection (D8, GC_DESIGN §11). ReleaseSafe checks the
-      # tree-walker's measured stack use in another mode (D37), and that the stress checks
-      # don't exist only in Debug.
-      - name: Tests under -Dgc-stress -Dstack-stress
-        run: zig build test -Dgc-stress -Dstack-stress --summary all
-
-      - name: Tests in ReleaseSafe
-        run: zig build test -Doptimize=ReleaseSafe --summary all
-
-      - name: Tests under -Dgc-stress in ReleaseSafe
-        run: zig build test -Dgc-stress -Doptimize=ReleaseSafe --summary all
 
       # M8.1: each deliberately broken GC piece must be caught by the heap verifier.
       - name: GC mutants
+        if: matrix.suite.name == 'tests'
         run: zig build gc-mutants --summary all
 
       - name: Generated files and node contract
+        if: matrix.suite.name == 'tests'
         run: zig build check-goldens
 
       - name: Release build
+        if: matrix.suite.name == 'tests'
         run: zig build --release=fast
 
       # pow must give bit-identical results everywhere (DESIGN_DECISIONS D25). The expected
       # hash was measured on aarch64-macos and x86_64 under Rosetta 2; these runners add
       # real x86_64 and arm64 Linux hardware.
       - name: pow portability hash
+        if: matrix.suite.name == 'tests'
         shell: bash
         run: |
           expected=b02251ea683f1d7d845373dba7eba1a0aa02f8253761095beb95de2a03ab2b19

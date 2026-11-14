@@ -285,10 +285,10 @@ test "scheduling: a collection is requested past next_gc, with headroom under th
 test "no pathological collection loop: filling the heap with live data collects O(log limit) times" {
     // Live data grows to the limit (every string is kept): each collection frees nothing,
     // and must not be followed by another one at the very next safepoint.
-    const r = try runVm("let keep = []; let n = 0; while (true) { keep.push('item number ' + n++); }", .{ .max_heap_bytes = 4 << 20 }, false);
+    const r = try runVm("let keep = []; let n = 0; while (true) { keep.push('item number ' + n++); }", .{ .max_heap_bytes = 1 << 20 }, false);
     defer testing.allocator.free(r.out);
     try testing.expectEqual(@as(?anyerror, error.LimitExceeded), r.err);
-    try testing.expect(r.collections > 0 and r.collections <= 30); // log2(4 MiB / 256 KiB) + the halvings
+    try testing.expect(r.collections > 0 and r.collections <= 30); // the halvings of the room left: ~log2(1 MiB)
 }
 
 // ---- the VM collecting
@@ -379,7 +379,7 @@ test "the exception message and the unsupported name are roots" {
     }
 }
 
-test "garbage under a 1 MiB limit: the VM runs to its step budget, not the heap limit" {
+test "garbage under a small limit: the VM runs to its step budget, not the heap limit" {
     const r = try runVm(
         \\let n = 0;
         \\while (true) {
@@ -387,7 +387,7 @@ test "garbage under a 1 MiB limit: the VM runs to its step budget, not the heap 
         \\  let o = { s, list: [s, s + '!'], f: function () { return s; } };
         \\  n = n + o.list.length;
         \\}
-    , .{ .max_heap_bytes = 1 << 20, .max_steps = 2_000_000 }, false);
+    , .{ .max_heap_bytes = 128 << 10, .max_steps = 50_000 }, false); // allocates ~4× the limit
     defer testing.allocator.free(r.out);
     try testing.expectEqual(@as(?anyerror, error.LimitExceeded), r.err);
     try testing.expect(r.collections > 0);
@@ -421,4 +421,132 @@ test "every diff program matches node on the VM with a collection at every safep
     }
     try testing.expect(count > 50);
     try testing.expectEqual(@as(usize, 0), failures);
+}
+
+// ---------------------------------------------------------------- P2: the tree-walker
+
+/// Runs `source` on `engine` through runSource (harness mode), collecting at every
+/// safepoint, and returns what it printed.
+fn runCollecting(source: []const u8, engine: zqjs.Engine, limits: zqjs.Limits) ![]u8 {
+    var got: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer got.deinit();
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    _ = try zqjs.runSource(testing.allocator, "t", source, limits, .{ .mode = .harness, .engine = engine, .collect_always = true }, &got.writer, &discard.writer);
+    return got.toOwnedSlice();
+}
+
+test "every shadow-stack site: a value held only there survives collections in the sub-evaluation" {
+    // In each program, `g()` allocates and returns while the tree-walker holds the value of
+    // the site in a Zig local; with a collection at every safepoint, a missing `hold` frees
+    // it. Expected outputs are node's. Both engines run each one.
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "binary operator: left operand held while the right one runs", "function g() { let s = ''; for (let i = 0; i < 5; i++) { s = s + i; let o = { a: [s] }; } return 0; } print(('le' + 'ft') + g(), g() + ('ri' + 'ght'));", "left0 0right\n" },
+        .{ "x op= e: old value", "function g() { let o = { a: [1] }; return 0; } let x = 'old' + 1; x += g(); print(x);", "old10\n" },
+        .{ "o[k] = e: base and evaluated key", "function g() { let o = { a: [1] }; return 'k'; } let o = {}; o['ba' + 'se'] = 1; let b = { v: 'base' }; ({ q: b })['q'][g()] = 'set'; print(b.k);", "set\n" },
+        .{ "o[k] op= e: base, key atom and old value", "function g() { let o = { a: [1] }; return 'v'; } let t = { v: 10 }; t[g()] += 5 + g().length; print(t.v);", "16\n" },
+        .{ "o[k]++ / ++o[k] / delete o[k]: base", "function g() { let o = { a: [1] }; return 'v'; } let t = { v: 1 }; print(t[g()]++, ++t[g()], t.v, delete t[g()], 'v' in t);", "1 3 3 true false\n" },
+        .{ "array literal under construction", "function g() { let o = { a: [1] }; return 'x' + 1; } let a = [g(), g(), [g(), [g()]]]; print(a, a.length);", "x1,x1,x1,x1 3\n" },
+        .{ "object literal under construction and its key atoms", "function g() { let o = { a: [1] }; return 'x' + 1; } let o = { [g()]: g(), b: [g()], [g() + 'k']: g() }; print(Object.keys(o), o.x1, o.b, o.x1k);", "x1,b,x1k x1 x1 x1\n" },
+        .{ "call: callee and each argument, natives too", "function g() { let o = { a: [1] }; return 'arg' + 1; } function f(a, b, c) { g(); return a + b + c; } print(f(g(), g(), g()), [1, 2].join(g()));", "arg1arg1arg1 1arg12\n" },
+        .{ "method call: receiver and this", "function g() { let o = { a: [1] }; return 0; } let r = { v: 'recv' + 1, m(x) { g(); return this.v + x; } }; print(r.m(g()), ({ v: 'tmp', m() { g(); return this.v; } }).m());", "recv10 tmp\n" },
+        .{ "recursion: values held in every frame", "function g() { let o = { a: [1] }; return 0; } function deep(n) { let s = 'level' + n; if (n === 0) return s; let r = deep(n - 1); g(); return s + ',' + r; } print(deep(15));", "level15,level14,level13,level12,level11,level10,level9,level8,level7,level6,level5,level4,level3,level2,level1,level0\n" },
+        .{ "closures created and called around collections", "function mk(n) { let s = 'cl' + n; return function () { return s; }; } function g() { let o = { a: [1] }; return 0; } let fs = [mk(1), mk(2)]; g(); print(fs[0]() + fs[1](), mk(3)() + g());", "cl1cl2 cl30\n" },
+        .{ "temporary return values", "function g() { let o = { a: [1] }; return 'ret' + 1; } function f() { return g() + g(); } function h() { return f() + '/' + f(); } print(h(), h().length);", "ret1ret1/ret1ret1 17\n" },
+        .{ "per-iteration bindings and immediately-called closures", "function g() { let o = { a: [1] }; return 0; } let acc = ''; for (let i = 0; i < 4; i++) { let k = 'it' + i; acc = acc + (function () { g(); return k; })(); } print(acc);", "it0it1it2it3\n" },
+    };
+    for (cases) |c| for ([_]zqjs.Engine{ .treewalk, .vm }) |engine| {
+        const got = try runCollecting(c[1], engine, .{});
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[2], got) catch |e| {
+            std.debug.print("site: {s} ({s})\n", .{ c[0], @tagName(engine) });
+            return e;
+        };
+    };
+}
+
+test "every diff program matches node on the tree-walker with a collection at every safepoint" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var dir = try std.Io.Dir.cwd().openDir(io, "tests/diff", .{ .iterate = true });
+    defer dir.close(io);
+    var count: usize = 0;
+    var failures: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".js")) continue;
+        count += 1;
+        const source = try dir.readFileAlloc(io, entry.name, gpa, .limited(1 << 20));
+        defer gpa.free(source);
+        const out_name = try std.fmt.allocPrint(gpa, "{s}.out", .{entry.name[0 .. entry.name.len - 3]});
+        defer gpa.free(out_name);
+        const expected = try dir.readFileAlloc(io, out_name, gpa, .limited(1 << 20));
+        defer gpa.free(expected);
+        const got = try runCollecting(source, .treewalk, .{ .max_steps = 50_000_000 });
+        defer gpa.free(got);
+        if (!std.mem.eql(u8, got, expected)) {
+            std.debug.print("\n== {s} on the tree-walker, collecting at every safepoint\n-- expected (node)\n{s}-- got\n{s}", .{ entry.name, expected, got });
+            failures += 1;
+        }
+    }
+    try testing.expect(count > 50);
+    try testing.expectEqual(@as(usize, 0), failures);
+}
+
+test "exceptions and limits mid-evaluation leave the shadow stack balanced and the heap sound" {
+    // Each program fails deep inside held values (a nested call's argument list, a literal
+    // under construction, a method's receiver); the run must end cleanly (the debug
+    // assertion in exec checks the balance on every exit), on both engines.
+    for ([_][]const u8{
+        "function f(a, b) { return a + b; } print(f('x' + 1, [1, { k: 'y' + 2 }, nope]));",
+        "let o = { a: 'x' + 1, b: [1, 2, { c: (function () { return missing; })() }] };",
+        "let r = { v: 'r' + 1, m(x) { return this.v + x.y.z; } }; print(r.m({ y: null }));",
+        "function d(n) { let s = 'd' + n; if (n === 0) return s + undefined.x; return s + d(n - 1); } d(30);",
+        "let a = []; while (true) { a.push({ s: 'grow' + a.length, l: [a.length] }); }",
+    }) |src| for ([_]zqjs.Engine{ .treewalk, .vm }) |engine| {
+        // A small limit: collecting at every step costs one heap walk per step, so a heap
+        // that grows to the limit costs (steps × heap); 64 KiB keeps that to milliseconds.
+        const got = try runCollecting(src, engine, .{ .max_heap_bytes = 64 << 10 });
+        defer testing.allocator.free(got);
+        try testing.expect(std.mem.indexOf(u8, got, "Uncaught") != null or std.mem.indexOf(u8, got, "LimitExceeded") != null);
+    };
+}
+
+fn runOnceCollecting(allocator: Allocator, source: []const u8, engine: zqjs.Engine) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    _ = zqjs.runSource(allocator, "t", source, .{ .max_steps = 100_000 }, .{ .mode = .harness, .engine = engine, .collect_always = true }, &out.writer, &discard.writer) catch |e| switch (e) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => |other| return other,
+    };
+}
+
+test "allocation failing at every point, with a collection at every safepoint" {
+    // Error paths unwind through held values and registered roots: no leak, no stale root.
+    for ([_][]const u8{
+        "let o = { a: ['x' + 1, { b: 'y' + 2 }], m(k) { return this.a[k]; } }; print(o.m(0), [o.m(1)].join());",
+        "function c(n) { let s = 'c' + n; return function () { return s + n; }; } let fs = [c(1), c(2)]; print(fs[0]() + fs[1]());",
+    }) |src| for ([_]zqjs.Engine{ .treewalk, .vm }) |engine|
+        try testing.checkAllAllocationFailures(testing.allocator, runOnceCollecting, .{ src, engine });
+}
+
+test "garbage under a small limit: the tree-walker runs to its step budget too" {
+    for ([_]zqjs.Engine{ .treewalk, .vm }) |engine| {
+        var got: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer got.deinit();
+        var discard: std.Io.Writer.Discarding = .init(&.{});
+        const source =
+            \\let n = 0;
+            \\while (true) {
+            \\  let s = 'garbage ' + n;
+            \\  let o = { s, list: [s, s + '!'], f: function () { return s; } };
+            \\  n = n + o.list.length;
+            \\}
+        ;
+        // The run allocates several times the 128 KiB limit, so reaching the step budget at
+        // all means garbage was reclaimed. Kept small: in Debug every allocation goes through
+        // std.testing.allocator, which records a stack trace for each one.
+        _ = try zqjs.runSource(testing.allocator, "t", source, .{ .max_heap_bytes = 128 << 10, .max_steps = 50_000 }, .{ .mode = .harness, .engine = engine }, &got.writer, &discard.writer);
+        try testing.expectEqualStrings("t: LimitExceeded(steps)\n", got.written());
+    }
 }

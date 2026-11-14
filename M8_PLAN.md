@@ -98,7 +98,22 @@ safepoint.
   when the VM is destroyed. Subtlety pinned by a test: registration holds the same `*const
   Proto` its owner owns (the script `runSource`/`bench` keeps alive), never a temporary.
 
-### P2. Tree-walker roots
+### P2. Tree-walker roots *(done)*
+
+Done as planned. Exact site list from the code: binary left operand; `x op= e` old value;
+member base, evaluated key, converted key atom and old value; array/object literal under
+construction and its key atoms; callee, receiver and each argument; the caller's environment
+and `this` while a closure's body runs. Not needed, and why: blocks and `for` loops push a
+record whose parent is the saved environment (reachable through the chain); return values
+are consumed before the next safepoint unless they become a held value above. Tests: 13
+node-checked site programs on both engines collecting at every safepoint (calls, recursion,
+receivers, literals, returns, closures, per-iteration bindings), every diff program on the
+tree-walker collecting at every safepoint, exceptions and limits mid-evaluation, allocation
+failure at every point with collection forced, garbage under a small limit (a mutation that
+stops the tree-walker collecting fails it). Test cost: two garbage tests first ran 2M steps
+under std.testing.allocator (which traces every allocation) and took minutes; they now run
+50k steps under a 128 KiB limit, allocating several times the limit, which proves more in
+seconds. Integration suite back to ~1 min.
 
 The risky phase: the tree-walker holds values in Zig locals across sub-evaluations.
 

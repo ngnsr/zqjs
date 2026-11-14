@@ -75,6 +75,13 @@ fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUs
     defer if (use) |u| {
         u.* = .{ .depth = it.max_depth, .bytes = it.stack_top - it.lowest_frame };
     };
+    defer {
+        // No collection may scan this interpreter once it returns (D8).
+        if (rt.engine_roots) |e| if (e.ctx == @as(*anyopaque, &it)) {
+            rt.engine_roots = null;
+        };
+        it.roots.deinit(rt.gpa);
+    }
     // The parser guarantees break/continue only occur in loops and return in functions.
     std.debug.assert(try it.block(script.statements) == .normal);
 }
@@ -91,6 +98,10 @@ const Interpreter = struct {
     ret: Value = .undefined,
     /// The running call's `this`: its receiver, or null for a call without one (D41).
     this: ?Value = null,
+    /// The shadow stack (D10, GC_DESIGN §4): heap objects held in Zig locals across a
+    /// sub-evaluation, which may contain a safepoint. Pushed with `hold`, released with
+    /// `release` in a `defer`, so it is balanced on every exit path; `exec`/`eval` assert it.
+    roots: std.ArrayList(*heap.Obj) = .empty,
     // Stack measurement, test builds only (see the test at the end).
     stack_top: usize = 0,
     lowest_frame: usize = 0,
@@ -105,6 +116,57 @@ const Interpreter = struct {
             it.lowest_frame = @min(it.lowest_frame, @frameAddress());
             it.max_depth = @max(it.max_depth, it.depth);
         }
+    }
+
+    // ---- the collector (D8, D10)
+
+    /// A safepoint: at the start of every statement and expression evaluation. Every heap
+    /// value the interpreter still needs is reachable from `env`, `this`, `ret` or the
+    /// shadow stack here, so a collection can run.
+    fn safepoint(it: *Interpreter) void {
+        const h = &it.rt.heap;
+        if (!h.collect_requested and !h.collect_always) return;
+        it.rt.engine_roots = .{ .ctx = it, .mark = markRoots };
+        it.rt.collect();
+    }
+
+    fn markRoots(ctx: *anyopaque, h: *heap.Heap) void {
+        const it: *Interpreter = @ptrCast(@alignCast(ctx));
+        for (it.roots.items) |o| h.markObj(o);
+        if (it.env) |e| h.markObj(&e.obj);
+        if (it.this) |t| h.markValue(t);
+        h.markValue(it.ret);
+    }
+
+    /// The shadow stack's depth, to `release` back to.
+    fn mark(it: *const Interpreter) usize {
+        return it.roots.items.len;
+    }
+
+    fn release(it: *Interpreter, m: usize) void {
+        it.roots.shrinkRetainingCapacity(m);
+    }
+
+    /// Roots `v` until the matching `release` (non-heap values need nothing).
+    fn hold(it: *Interpreter, v: Value) Error!void {
+        const o: *heap.Obj = switch (v) {
+            .undefined, .null, .boolean, .number, .native => return,
+            .string => |x| @constCast(&x.obj),
+            .closure => |x| @constCast(&x.obj),
+            .object => |x| &x.obj,
+        };
+        try it.roots.append(it.rt.gpa, o);
+    }
+
+    fn holdKey(it: *Interpreter, k: object.Key) Error!void {
+        switch (k) {
+            .atom => |a| try it.roots.append(it.rt.gpa, &a.obj),
+            .index => {},
+        }
+    }
+
+    fn holdEnv(it: *Interpreter, e: ?*Env) Error!void {
+        if (e) |x| try it.roots.append(it.rt.gpa, &x.obj);
     }
 
     // ---- environments
@@ -187,6 +249,9 @@ const Interpreter = struct {
     fn exec(it: *Interpreter, s: ast.Stmt) Error!Completion {
         try it.enter();
         defer it.depth -= 1;
+        const balanced = it.mark();
+        defer std.debug.assert(it.mark() == balanced); // shadow-stack symmetry, every exit
+        it.safepoint();
         try it.rt.step();
         switch (s.data) {
             .empty, .function => {}, // functions were created on entry to the body
@@ -245,6 +310,11 @@ const Interpreter = struct {
         const rt = it.rt;
         try it.enter();
         defer it.depth -= 1;
+        it.safepoint();
+        // Every value held across a sub-evaluation below is on the shadow stack until the
+        // end of this evaluation (`hold`); this release balances it on every exit path.
+        const balanced = it.mark();
+        defer it.release(balanced);
         try rt.step();
         switch (e.data) {
             .number => |n| return .{ .number = n },
@@ -266,9 +336,13 @@ const Interpreter = struct {
                 const lhs = try it.eval(b.lhs);
                 switch (b.op) {
                     // Short-circuit, and return an operand, not a boolean: '' || 'd' is 'd'.
+                    // (`lhs` isn't needed once the right side runs.)
                     .logical_and => return if (ops.toBoolean(lhs)) it.eval(b.rhs) else lhs,
                     .logical_or => return if (ops.toBoolean(lhs)) lhs else it.eval(b.rhs),
-                    else => return ops.binary(rt, b.op, lhs, try it.eval(b.rhs)),
+                    else => {
+                        try it.hold(lhs);
+                        return ops.binary(rt, b.op, lhs, try it.eval(b.rhs));
+                    },
                 }
             },
             .assign => |a| switch (a.target) {
@@ -276,6 +350,7 @@ const Interpreter = struct {
                     if (a.op) |op| {
                         // x op= e: read x first (TDZ), then evaluate e, then write (const check).
                         const old = try it.read(ref);
+                        try it.hold(old);
                         const v = try ops.binary(rt, op, old, try it.eval(a.value));
                         try it.write(ref, v);
                         return v;
@@ -290,10 +365,14 @@ const Interpreter = struct {
                     // side. The key is *converted* (ToPropertyKey) when the reference is first
                     // used: for `=` after the right-hand side, for `op=` at the read before it.
                     const base = try it.eval(m.object);
+                    try it.hold(base);
                     const kv = try it.keyValue(m);
+                    if (kv == .value) try it.hold(kv.value);
                     if (a.op) |op| {
                         const k = try it.toKey(kv);
+                        try it.holdKey(k);
                         const old = try object.get(rt, base, k);
+                        try it.hold(old);
                         const v = try ops.binary(rt, op, old, try it.eval(a.value));
                         try object.set(rt, base, k, v);
                         return v;
@@ -313,6 +392,7 @@ const Interpreter = struct {
                     },
                     .member => |m| blk: {
                         const base = try it.eval(m.object);
+                        try it.hold(base);
                         const k = try it.toKey(try it.keyValue(m));
                         const old = try ops.toNumber(rt, try object.get(rt, base, k));
                         const new = if (u.op == .inc) old + 1 else old - 1;
@@ -324,15 +404,18 @@ const Interpreter = struct {
             },
             .member => |m| {
                 const base = try it.eval(m.object);
+                try it.hold(base);
                 return object.get(rt, base, try it.toKey(try it.keyValue(m)));
             },
             .delete => |m| {
                 const base = try it.eval(m.object);
+                try it.hold(base);
                 return .{ .boolean = try object.delete(rt, base, try it.toKey(try it.keyValue(m))) };
             },
             .this => return it.this orelse rt.fail(.sloppy_this),
             .array => |items| {
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
+                try it.hold(.{ .object = arr });
                 for (items) |item| {
                     const v = try it.eval(item);
                     try rt.heap.appendElement(arr, v);
@@ -341,9 +424,13 @@ const Interpreter = struct {
             },
             .object => |props| {
                 const o = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
+                try it.hold(.{ .object = o });
                 // Each key, then its value, in source order.
                 for (props) |prop| {
+                    const m = it.mark();
+                    defer it.release(m);
                     const k = try it.literalKey(prop.key);
+                    try it.holdKey(k);
                     try object.define(rt, o, k, try it.eval(prop.value));
                 }
                 return .{ .object = o };
@@ -365,14 +452,20 @@ const Interpreter = struct {
                 const callee = switch (c.callee.data) {
                     .member => |m| blk: {
                         const base = try it.eval(m.object);
+                        try it.hold(base);
                         receiver = base;
                         break :blk try object.get(rt, base, try it.toKey(try it.keyValue(m)));
                     },
                     else => try it.eval(c.callee),
                 };
+                try it.hold(callee);
                 const args = try rt.gpa.alloc(Value, c.args.len);
                 defer rt.gpa.free(args);
-                for (c.args, args) |arg, *slot| slot.* = try it.eval(arg);
+                // `args` is not traced: each value is on the shadow stack too.
+                for (c.args, args) |arg, *slot| {
+                    slot.* = try it.eval(arg);
+                    try it.hold(slot.*);
+                }
                 return switch (callee) {
                     .native => |n| n.call(rt, receiver orelse .undefined, args),
                     // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
@@ -429,6 +522,12 @@ const Interpreter = struct {
             it.env = saved;
             it.this = saved_this;
         }
+        // The caller's environment and `this` are held only here while the body runs (the
+        // callee's record descends from where the closure was made, not from the caller).
+        const m = it.mark();
+        defer it.release(m);
+        try it.holdEnv(saved);
+        if (saved_this) |v| try it.hold(v);
         it.env = t.env;
         it.this = this; // decided by the call, not by where the function was defined
         // Parameters and the body's declarations share one scope.

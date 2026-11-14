@@ -1,7 +1,11 @@
 # M8.1 plan: generational collection (non-moving)
 
-Status: **revision 2, for review.** It answers the five review points and adds element cards,
-which a new measurement showed are needed. Nothing below is implemented yet.
+Status: **revision 3, for review.** Revision 2 answered the five review points and added element
+cards, which a measurement showed are needed. Revision 3:
+- states the weak-atom safety rule explicitly;
+- fixes a card-creation hole found while writing the card lifecycle;
+- adds card boundary tests;
+- fixes the benchmark methodology. Nothing below is implemented yet.
 
 - Baseline: `bench/gc/baseline-m8.txt` (`zig build gc-report`, M4, ReleaseFast).
 - All targets below are for that machine, not universal guarantees.
@@ -130,18 +134,75 @@ It never allocates and never fails (D9).
   mutation.
 - Smaller arrays are scanned whole. The 100k measurement (0.09 ms) suggests that's fine; 512 is
   the starting point, and P2's sweep can move it.
-- **Known gap, not solved in M8.1:** dictionary-like objects with huge *property* tables have the
+- **Known gap, not solved in P1:** P1 covers arrays' elements only. It does not claim that every
+  large container is handled. Dictionary-like objects with huge *property* tables have the
   same problem, because their entries are scanned whole. Entry-index cards would be the same
   mechanism. P2 adds a `game_big_dictionary.js` workload to measure it before deciding.
+
+**Card lifecycle:**
+
+| event | effect |
+|---|---|
+| capacity first reaches 512 | allocate the bitmap. **If the array is already remembered, every card starts dirty.** |
+| capacity grows past the bitmap | resize the bitmap. Existing bits are kept and new bits are zero. |
+| a young value is stored or appended into an old carded array | the barrier sets bit `index / 512` and remembers the owner |
+| a minor collection drains the owner | for each dirty card: scan its elements first, then clear its bit |
+| a major collection | clears every bitmap of every remembered owner |
+| pop or shrink | nothing changes. Dirty cards past the length are clamped by the scan and cleared with the rest. |
+
+**Why the bold rule matters (the hole):**
+
+1. An old array of 400 elements stores a young value at index 3. It has no bitmap yet, so it is
+   remembered whole.
+2. Appends then grow it past 512. A clean bitmap gets created.
+3. The next minor collection scans only dirty cards, so it never looks at index 3. The young
+   object is freed while the array still points to it.
+
+Starting every card dirty makes that first scan whole, exactly what the remembered bit had
+promised.
+
+**Failure safety:** the bitmap is resized *before* the elements buffer. If the bitmap allocation
+fails, nothing has changed. If the elements allocation fails afterwards, a bitmap that is already
+large enough is harmless.
 
 **Measuring it separately:** `Sample` gains `remembered_ns` (timed by the observer's clock around
 step 1) and `remembered_children` (deterministic: the number of children checked). The report
 shows both for minor collections.
 
-## Weak atoms (point 5)
+## Weak atoms (point 5, and the review's correctness question)
 
 Today's atom-table rebuild walks the whole object list, which is O(heap). A minor collection
-mustn't do that.
+mustn't do that. So the table is pruned only by major collections, which raises the review's
+question: what keeps the table from holding a pointer that a minor collection freed?
+
+**The answer: a minor collection never frees an atom.** The table can only point at objects that
+a minor collection cannot free. The rule takes two existing facts and one new one:
+
+1. The table holds only strings whose `atom` field is set. This is M8's
+   `AtomTableHoldsNonAtom` check, unchanged.
+2. A minor collection frees only young objects, and never a string whose `atom` field is set.
+   When the sweep meets an unmarked young atom, it promotes it instead of freeing it.
+3. Only a major collection frees atoms, and it rebuilds the table from the marked atoms *before*
+   it sweeps, exactly as M8 does today.
+
+So no atom is ever freed while the table still points at it.
+
+**Checks:**
+
+- The verifier's existing `AtomTableHoldsCollectedObject` check runs after every minor
+  collection too, under stress.
+- With tombstones, a freed atom left in the table is a deterministic failure, not a read of freed
+  memory.
+- **Mutation test:** let the minor sweep free unmarked atoms. A stress run of a dynamic-key
+  program must then fail `AtomTableHoldsCollectedObject`.
+- **Behaviour test:**
+  1. intern a dynamic key on an object that dies;
+  2. run a minor collection;
+  3. intern the same text again: it must return the same (promoted) atom;
+  4. run a major collection with no references left;
+  5. the atom is gone and the table no longer holds it.
+
+**What this costs:**
 
 - **In a minor collection, atoms are strong.** A young atom always survives and is promoted. The
   sweep already holds each young object, so this costs O(nursery) and never touches the table.
@@ -223,13 +284,45 @@ only makes major collections rare. The report states this rather than hiding it.
 
 - delete the `storeElement` barrier: fails I-gen2;
 - delete the card set: fails I-gen2 on a carded array;
-- skip clearing `remembered`: fails I-gen3 or I-gen4.
+- skip clearing `remembered`: fails I-gen3 or I-gen4;
+- create the bitmap clean for a remembered array: fails I-gen2 (the hole above);
+- let the minor sweep free atoms: fails `AtomTableHoldsCollectedObject`.
+
+**Card tests** (gc-stress and normal builds):
+
+- In an old 2048-element array, store young objects at indices 0, 511, 512, 1023, 1024 and
+  2047, one test each and then all together. After a minor collection each one is alive and
+  reachable, and every other card was never scanned (checked through `remembered_children`).
+- The hole case: remember at 400 elements, grow to 600, run a minor collection; the young value
+  survives.
+- Bitmap growth: grow a dirty-carded array through several resizes. Dirty bits survive and new
+  bits are clean.
+- Pop or shrink after a store: the minor collection is correct and the cards end clean.
+- Allocation failure (`checkAllAllocationFailures`) on appends that grow the bitmap.
 
 **Unchanged and still passing:** step counts and `zig build bench` rows, node outputs, and every
 M8 GC test. Collection counts change, so the exact-stats tests get updated explicitly for minor
 and major collections, not weakened.
 
-## Acceptance (M4, ReleaseFast, `zig build gc-report`)
+## Benchmark methodology
+
+`gc-report` changes *before* P1 starts, and the M8 baseline is taken again with it. That way M8
+and M8.1 are measured the same way.
+
+- **5 runs per (workload, engine).** The steps and collection counts must be identical across
+  runs, as `bench` already checks.
+- **Statistics:** the median across runs of each run's p50, p95 and max pause, plus the spread
+  (min to max) of those values across the runs. In this revision's baseline, game_100k's max
+  pause was 24 ms in one run and 41 ms in another. One run can't settle a comparison.
+- **Pause distribution,** all runs pooled, in buckets: under 0.1 ms, 0.1–1, 1–4, 4–16 and over
+  16 ms.
+- **Minor and major collections reported separately.** For minor collections, three numbers on
+  separate lines: the remembered-set scan time (`remembered_ns`), the rest of the pause, and the
+  total.
+- **A comparison is valid only on the same machine, build mode and workload file.** The report
+  header records the machine and build mode.
+
+## Acceptance (M4, ReleaseFast, `zig build gc-report`, medians of 5 runs)
 
 | metric | target |
 |---|---|
@@ -243,6 +336,7 @@ and major collections, not weakened.
 
 ## Phases
 
+- **P0 (before P1):** the methodology above, and the M8 baseline taken again with it.
 - **P1:** the header bits, the two lists, minor collection, the barrier, the remembered list, element
   cards, the I-gen invariants, stress with minor and major collections, and the mutation tests.
 - **P2:** scheduling (`nursery_bytes`, `next_major`, the atom-growth test), observer kinds plus

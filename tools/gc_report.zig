@@ -254,13 +254,15 @@ fn runOnce(gpa: std.mem.Allocator, io: std.Io, source: []const u8, engine: zqjs.
 fn scanLargestArray(io: std.Io, h: *zqjs.heap.Heap) Scan {
     var largest: ?*zqjs.heap.Obj = null;
     var elements: usize = 0;
-    var it = h.objects;
-    while (it) |obj| : (it = obj.next) {
-        if (obj.kind != .object) continue;
-        const o: *zqjs.heap.Object = @fieldParentPtr("obj", obj);
-        if (o.kind == .array and o.kind.array.items.len > elements) {
-            largest = obj;
-            elements = o.kind.array.items.len;
+    for ([_]?*zqjs.heap.Obj{ h.young, h.old }) |list| {
+        var it = list;
+        while (it) |obj| : (it = obj.next) {
+            if (obj.kind != .object) continue;
+            const o: *zqjs.heap.Object = @fieldParentPtr("obj", obj);
+            if (o.kind == .array and o.kind.array.items.len > elements) {
+                largest = obj;
+                elements = o.kind.array.items.len;
+            }
         }
     }
     const array = largest orelse return .{};

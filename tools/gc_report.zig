@@ -9,6 +9,9 @@
 //!   gc ms / %   total time in the collector, and its share of the run
 //! and, for bench/gc/*.js, every collection: live objects and bytes after it, its pause.
 //! That series is the M8 → M8.1 comparison: pause against live size.
+//! For bench/gc/*.js it also times one scan of the largest array's children, reading each
+//! child's header (what an old-bit check does): the cost a per-object remembered set pays
+//! at every minor collection once that array is remembered.
 //!
 //! The clock lives here, not in the runtime: the heap only calls the observer it is given.
 //! Timings are machine-dependent; compare only on the same machine. One run per row (a
@@ -48,7 +51,11 @@ const Recorder = struct {
     }
 };
 
-const Result = struct { ns: u64, allocated: u64 };
+const Result = struct { ns: u64, allocated: u64, scan: Scan = .{} };
+
+/// One child scan of the largest array left at the end of a run (median of `scan_runs`).
+const Scan = struct { elements: usize = 0, ns: u64 = 0 };
+const scan_runs = 21;
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
@@ -79,10 +86,13 @@ pub fn main(init: std.process.Init) !u8 {
             for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
                 rec.samples.clearRetainingCapacity();
                 rec.dropped = false;
-                const r = try runOnce(gpa, io, source, engine, &rec);
+                const r = try runOnce(gpa, io, source, engine, &rec, std.mem.eql(u8, path, "bench/gc"));
                 if (rec.dropped) return error.TooManyCollections;
                 try summary(out, name, engine, r, rec.samples.items, gpa);
-                if (std.mem.eql(u8, path, "bench/gc")) try collections(&series.writer, name, engine, rec.samples.items);
+                if (std.mem.eql(u8, path, "bench/gc")) {
+                    try collections(&series.writer, name, engine, rec.samples.items);
+                    try series.writer.print("largest array: {d} elements, one child scan {d:.3} ms\n", .{ r.scan.elements, ns_f(r.scan.ns) / 1e6 });
+                }
             }
         }
     }
@@ -149,7 +159,7 @@ fn mb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1 << 20);
 }
 
-fn runOnce(gpa: std.mem.Allocator, io: std.Io, source: []const u8, engine: zqjs.Engine, rec: *Recorder) !Result {
+fn runOnce(gpa: std.mem.Allocator, io: std.Io, source: []const u8, engine: zqjs.Engine, rec: *Recorder, probe: bool) !Result {
     const start = std.Io.Timestamp.now(io, .awake);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -173,5 +183,36 @@ fn runOnce(gpa: std.mem.Allocator, io: std.Io, source: []const u8, engine: zqjs.
         },
     }
     const ns = start.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds();
-    return .{ .ns = @intCast(ns), .allocated = rt.heap.allocated };
+    return .{ .ns = @intCast(ns), .allocated = rt.heap.allocated, .scan = if (probe) scanLargestArray(io, &rt.heap) else .{} };
+}
+
+fn scanLargestArray(io: std.Io, h: *zqjs.heap.Heap) Scan {
+    var largest: ?*zqjs.heap.Obj = null;
+    var elements: usize = 0;
+    var it = h.objects;
+    while (it) |obj| : (it = obj.next) {
+        if (obj.kind != .object) continue;
+        const o: *zqjs.heap.Object = @fieldParentPtr("obj", obj);
+        if (o.kind == .array and o.kind.array.items.len > elements) {
+            largest = obj;
+            elements = o.kind.array.items.len;
+        }
+    }
+    const array = largest orelse return .{};
+    const Visit = struct {
+        seen: usize = 0,
+        fn child(v: *@This(), obj: *zqjs.heap.Obj) void {
+            if (!obj.marked) v.seen += 1; // stands in for `if (obj.old) return`
+        }
+    };
+    var times: [scan_runs]u64 = undefined;
+    var v: Visit = .{};
+    for (&times) |*t| {
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        zqjs.heap.forEachChild(array, &v, Visit.child);
+        t.* = @intCast(t0.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds());
+    }
+    std.mem.doNotOptimizeAway(v.seen);
+    std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+    return .{ .elements = elements, .ns = times[scan_runs / 2] };
 }

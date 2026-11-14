@@ -1,10 +1,28 @@
-# Runs on every push and pull request. Same commands as a local check (see README).
+# Runs on pushes and pull requests that touch code, tests, tools or the build.
+# Same commands as a local check (see README). Docs-only changes (*.md) skip CI.
 name: CI
 
+# Allowlist, not a *.md ignore list: other non-code files stay out of CI by default.
+# Keep both lists in sync.
 on:
   push:
     branches: ["**"] # not tags: a tag points at a commit CI already checked
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "tools/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - ".github/workflows/ci.yml"
   pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "tools/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch: # manual run from the Actions tab
 
 # A newer push to the same branch cancels the older run (saves CI minutes).
 concurrency:
@@ -17,6 +35,8 @@ permissions:
 jobs:
   check:
     name: ${{ matrix.name }}
+    # A same-repo PR branch is already checked by its push run; only fork PRs need their own.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:

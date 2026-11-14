@@ -362,6 +362,80 @@ and M8.1 are measured the same way.
 - **P3:** the M8 → M8.1 comparison, and docs: GC_DESIGN §7 and §13 (the order is now generational
   in M8.1, then incremental in M8.2), new D-entries, and ROADMAP.
 
+## P2 results (measured, M4, ReleaseFast, `gc-report`, 5 runs per row)
+
+**Nursery size** (game workloads, VM; the small programs agree):
+
+| nursery | minor p95 (game_100k / game_1m) | GC share (game_100k / game_1m) | peak memory overhead | majors (game_1m) |
+|---|---|---|---|---|
+| 256 KiB | 0.064 / 0.062 ms | 17.7% / 25.4% | +0.25 MB | 9 |
+| 512 KiB | 0.136 / 0.139 ms | 17.7% / 26.6% | +0.5 MB | 8 |
+| 1 MiB | 0.319 / 0.289 ms | 17.7% / 27.3% | +1 MB | 7 |
+| 2 MiB | 0.620 / 0.579 ms | 17.5% / 34.5% | +2 MB | 7 |
+| 4 MiB | 1.279 / 1.090 ms | 18.5% / 36.4% | +4 MB | 6 |
+
+- **Pause and memory grow with the nursery.** A minor collection is almost all sweep of
+  garbage, so the pause is proportional to the nursery size, and so is the peak overhead.
+- **Total GC time doesn't fall with a bigger nursery.** The sweep's total work follows the
+  garbage, not the collection count. Past about 1 MiB it gets *worse*, because a nursery that
+  outgrows the cache sweeps slower.
+- **What a bigger nursery does buy** is less premature promotion: game_1m runs 9 majors at
+  256K and 6 at 4M.
+- **Default: 256 KiB** (`limits.zig`). That's also M8's first trigger, so small programs'
+  peak memory is back to M8's.
+- **Caveat for M9:** each minor collection marks the roots, including every constant of the
+  running script, so a script with tens of thousands of constants pays that 4× more often
+  than at 1 MiB.
+
+**Profile of the sweep (before changing its structure): it's the allocator.**
+
+zqjs links libc, so the runtime's default allocator is macOS `malloc`, and `free` is about 80%
+of the sweep. The same runs on `std.heap.smp_allocator` (`gc-report -- --allocator=smp`), medians
+of 3 rounds:
+
+| | libc malloc | smp_allocator |
+|---|---|---|
+| game_100k VM: minor p50 | 0.061 ms | 0.011 ms |
+| game_100k VM: GC share | 17.8% | 5.3% |
+| game_growing tree-walker: GC share | 28% | 13% |
+| sweep cost per freed object | ~38 ns | ~7 ns |
+
+The young list itself is not the bottleneck. The allocator is the embedder's choice
+(`Heap.init` takes one), so this belongs to M9's API and documentation, not to the collector.
+
+**Minor-pause outliers (1–30 ms, rare): OS preemption.**
+
+- A different collection is slow each run, and its work is normal.
+- The whole stall lands inside one tiny object's release.
+- One report run had 0 IO page faults, 0 swaps and 573 involuntary context switches.
+- SmpAllocator, whose small frees make no syscalls, shows them too.
+
+That's strong evidence, not proof. `malloc` returning memory to the kernel (`madvise`, seen
+rarely in profiles) may add some.
+
+**Large dictionary** (`game_big_dictionary.js`, 200k entries, one young store per frame):
+
+- minor p95 1.9 ms, of which 1.85 ms is the remembered-set scan;
+- the whole property table (keys and values) is rescanned at every minor collection;
+- at 1M entries it would be about 10 ms.
+
+This is the gap P1 left open, now measured: entry-index cards for property tables are the
+candidate fix (decision pending).
+
+**Major collections: all of them happen while live data grows.**
+
+- In every game workload the majors fall at each doubling of the live heap during setup
+  (0.5, 1.5, 3.3 … 240 MB).
+- The frame loops run no major collection at all.
+- The long pauses (60–90 ms at 1M) are the last doubling.
+
+Options: grow faster when a major frees almost nothing (fewer majors during growth; that
+changes D8's formula, decision pending), and M8.2's incremental marking for the pauses
+themselves.
+
+**Atom growth:** a test runs 60k dead dynamic keys in a 1 MiB heap. Major collections free
+them and the run fits. With the growth trigger disabled it fails with `LimitExceeded`.
+
 ## Out of scope
 
 - Incremental marking (M8.2).

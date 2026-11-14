@@ -19,8 +19,11 @@ pub const Limits = struct {
     max_heap_bytes: usize = 256 * 1024 * 1024,
     /// Young generation size (M8.1): a minor collection is requested once this many
     /// accounted bytes have been allocated since the last collection (or half the room
-    /// left under `max_heap_bytes`, if that is less).
-    nursery_bytes: usize = 1024 * 1024,
+    /// left under `max_heap_bytes`, if that is less). Measured (M8.1 P2, 256K-4M): a
+    /// minor pause is proportional to it, total GC time isn't (it follows the garbage),
+    /// and a nursery that outgrows the cache sweeps slower; so the smallest that doesn't
+    /// promote much short-lived data.
+    nursery_bytes: usize = 256 * 1024,
     /// Longest string, in UTF-16 code units.
     max_string_length: usize = 1 << 28,
     /// Largest bytecode of one compiled script, in bytes. Must stay below 4 GiB: jump

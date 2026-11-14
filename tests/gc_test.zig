@@ -272,10 +272,10 @@ test "after a collection the atom table holds only live atoms (no stale pointers
 test "scheduling: a collection is requested past next_gc, with headroom under the limit" {
     var h = heap.Heap.init(testing.allocator, .{ .max_heap_bytes = 1 << 20 });
     defer h.deinit();
-    // M8.1: a minor collection after a nursery's worth (1 MiB), but never closer than
+    // M8.1: a minor collection after a nursery's worth (256 KiB), but never closer than
     // halfway to the limit; a major one once the heap left after a collection reaches
     // `schedule` of the last major's survivors.
-    try testing.expectEqual(@as(usize, 512 * 1024), h.next_gc);
+    try testing.expectEqual(@as(usize, 256 * 1024), h.next_gc);
     try testing.expectEqual(@as(usize, 256 * 1024), h.next_major);
     while (!h.collect_requested) _ = try h.ascii("0123456789");
     try testing.expect(h.bytes > h.next_gc);
@@ -634,7 +634,7 @@ test "under -Dgc-stress every run collects at every safepoint, whatever the opti
 
 // ---------------------------------------------------------------- P4: acceptance
 
-const EngineStats = struct { atoms: u32, collections: u64, peak: usize, live: usize, err: ?anyerror };
+const EngineStats = struct { atoms: u32, collections: u64, peak: usize, live: usize, err: ?anyerror, majors: u64 = 0 };
 
 /// Runs `source` on `engine` (normal scheduling, unless stress) and returns the heap's state.
 fn runStats(source: []const u8, engine: zqjs.Engine, limits: zqjs.Limits) !EngineStats {
@@ -662,9 +662,10 @@ fn runStats(source: []const u8, engine: zqjs.Engine, limits: zqjs.Limits) !Engin
             };
         },
     }
+    const majors = rt.heap.stats.collections - rt.heap.stats.minor; // during the run
     rt.heap.major_requested = true; // the run is over: only the runtime's own roots remain,
     rt.collect(); // and only a major collection frees old objects and atoms
-    return .{ .atoms = rt.heap.atoms.count(), .collections = rt.heap.stats.collections, .peak = rt.heap.peak, .live = rt.heap.bytes, .err = err };
+    return .{ .atoms = rt.heap.atoms.count(), .collections = rt.heap.stats.collections, .peak = rt.heap.peak, .live = rt.heap.bytes, .err = err, .majors = majors };
 }
 
 test "weak atoms are reclaimed in real programs, on both engines" {
@@ -989,4 +990,19 @@ test "mutation: a minor collection that frees atoms leaves the table dangling" {
     _ = try h.internAscii("dynamic key");
     h.collect(TestRoots{ .objs = &.{} }, TestRoots.mark);
     try expectCaught(.minor_frees_atoms, error.AtomTableHoldsCollectedObject, h.verifyCollected());
+}
+
+test "dead dynamic keys drive major collections: atoms can't pile up past the heap limit" {
+    // Minor collections promote every atom (they never free one), so 60 000 distinct keys
+    // on objects that die young become old garbage. They count in the heap like any
+    // promotion, so major collections come and free them: the run fits in 1 MiB. (Each
+    // key costs ~110 bytes as an atom: kept, they would need ~6.5 MiB.)
+    const source = "for (let i = 0; i < 60000; i++) { let o = {}; o['dynamic key ' + i] = i; }";
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const r = try runStats(source, engine, .{ .max_heap_bytes = 1 << 20 });
+        try testing.expectEqual(@as(?anyerror, null), r.err);
+        try testing.expect(r.majors > 0);
+        try testing.expect(r.peak <= 1 << 20);
+        try testing.expect(r.atoms < 50); // and the final major one leaves only the realm's
+    }
 }

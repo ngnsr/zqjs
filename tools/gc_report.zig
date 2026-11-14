@@ -3,6 +3,7 @@
 //! per collection kind (minor, major; M8 only has major):
 //!   ms, alloc MB, MB/s   wall time of a run (parse → run) and allocation volume and rate
 //!   live MB              largest heap left after a collection
+//!   peak MB              highest accounted heap during the run (what the run needs)
 //!   gc %                 share of the run spent collecting
 //!   gcs                  collections of that kind in one run (identical across runs)
 //!   p50, p95, max        pause percentiles of one run, in ms: the median over the runs,
@@ -26,6 +27,9 @@
 //!
 //!   zig build gc-report              (always ReleaseFast)
 //!   zig build gc-report -- game_1m   (only programs whose name contains the text)
+//!   zig build gc-report -- --nursery=256K game_   (another nursery size, K or M suffix)
+//!   zig build gc-report -- --allocator=smp        (the runtime on std.heap.smp_allocator
+//!                                                 instead of the default, libc malloc)
 //!   zig build gc-report > bench/gc/baseline-m8.txt
 
 const std = @import("std");
@@ -33,7 +37,7 @@ const builtin = @import("builtin");
 const zqjs = @import("zqjs");
 const Heap = zqjs.heap.Heap;
 
-const limits: zqjs.Limits = .{
+var limits: zqjs.Limits = .{
     .max_steps = std.math.maxInt(u64),
     .max_heap_bytes = 4 << 30,
 };
@@ -59,7 +63,7 @@ const Recorder = struct {
     }
 };
 
-const Result = struct { ns: u64, allocated: u64, live: usize, scan: Scan = .{} };
+const Result = struct { ns: u64, allocated: u64, live: usize, peak: usize, scan: Scan = .{} };
 
 /// One child scan of the largest array left at the end of a run (median of `scan_runs`).
 const Scan = struct { elements: usize = 0, ns: u64 = 0 };
@@ -74,21 +78,28 @@ const PerRun = struct { count: usize = 0, gc_ns: u64 = 0, p50: u64 = 0, p95: u64
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
-    const gpa = init.gpa;
+    var gpa = init.gpa;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    const only: ?[]const u8 = if (args.len > 1) args[1] else null;
+    var only: ?[]const u8 = null;
+    for (args[1..]) |arg| {
+        if (std.mem.startsWith(u8, arg, "--nursery=")) {
+            limits.nursery_bytes = try parseSize(arg["--nursery=".len..]);
+        } else if (std.mem.eql(u8, arg, "--allocator=smp")) {
+            gpa = std.heap.smp_allocator;
+        } else only = arg;
+    }
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const out = &stdout.interface;
     defer out.flush() catch {};
 
-    try out.print("# zqjs GC report: zig {s}, {s}-{s} ({s}), {s}, {d} runs per row (medians; max also [min-max])\n", .{
-        builtin.zig_version_string, @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), builtin.cpu.model.name, @tagName(builtin.mode), runs,
+    try out.print("# zqjs GC report: zig {s}, {s}-{s} ({s}), {s}, {d} runs per row (medians; max also [min-max]), nursery {d} KiB, {s}\n", .{
+        builtin.zig_version_string, @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), builtin.cpu.model.name, @tagName(builtin.mode), runs, limits.nursery_bytes >> 10, if (gpa.vtable == std.heap.smp_allocator.vtable) "smp_allocator" else "libc malloc",
     });
-    try out.print("{s:<22} {s:<8} {s:>7} {s:>8} {s:>6} {s:>7} {s:>5} | {s:<5} {s:>5} {s:>7} {s:>7} {s:>7} {s:>15} {s:>7} | {s:>5} {s:>5} {s:>5} {s:>5} {s:>5}\n", .{
-        "program", "engine", "ms", "alloc MB", "MB/s", "live MB", "gc %", "kind", "gcs", "p50", "p95", "max", "max spread", "rem p95", "<0.1", "<1", "<4", "<16", ">16",
+    try out.print("{s:<22} {s:<8} {s:>7} {s:>8} {s:>6} {s:>7} {s:>7} {s:>5} | {s:<5} {s:>5} {s:>7} {s:>7} {s:>7} {s:>15} {s:>7} | {s:>5} {s:>5} {s:>5} {s:>5} {s:>5}\n", .{
+        "program", "engine", "ms", "alloc MB", "MB/s", "live MB", "peak MB", "gc %", "kind", "gcs", "p50", "p95", "max", "max spread", "rem p95", "<0.1", "<1", "<4", "<16", ">16",
     });
 
     var rec: Recorder = .{ .io = io, .samples = try .initCapacity(gpa, max_samples) };
@@ -153,14 +164,14 @@ fn summary(out: *std.Io.Writer, gpa: std.mem.Allocator, name: []const u8, engine
     }
     const ms = ns_f(median(&ns)) / 1e6;
     const alloc = mb(results[0].allocated);
-    try out.print("{s:<22} {s:<8} {d:>7.1} {d:>8.1} {d:>6.0} {d:>7.1} {d:>5.1} |", .{ name, @tagName(engine), ms, alloc, alloc / (ms / 1e3), mb(live), ns_f(median(&gc_pct)) / 10 });
+    try out.print("{s:<22} {s:<8} {d:>7.1} {d:>8.1} {d:>6.0} {d:>7.1} {d:>7.1} {d:>5.1} |", .{ name, @tagName(engine), ms, alloc, alloc / (ms / 1e3), mb(live), mb(results[0].peak), ns_f(median(&gc_pct)) / 10 });
     var first = true;
     for ([_]Kind{ .minor, .major }) |kind| {
         var per: [runs]PerRun = undefined;
         var buckets: [bucket_limits_ns.len + 1]usize = @splat(0);
         for (samples, &per) |ss, *p| p.* = try perRun(gpa, ss, kind, &buckets);
         if (per[0].count == 0) continue;
-        if (!first) try out.print("{s:<22} {s:<8} {s:>7} {s:>8} {s:>6} {s:>7} {s:>5} |", .{ "", "", "", "", "", "", "" });
+        if (!first) try out.print("{s:<22} {s:<8} {s:>7} {s:>8} {s:>6} {s:>7} {s:>7} {s:>5} |", .{ "", "", "", "", "", "", "", "" });
         first = false;
         var p50: [runs]u64 = undefined;
         var p95: [runs]u64 = undefined;
@@ -230,6 +241,18 @@ fn slowestMinor(out: *std.Io.Writer, samples: *const [runs][]Heap.Sample) !void 
     });
 }
 
+/// "262144", "256K", "1M".
+fn parseSize(text: []const u8) !usize {
+    if (text.len == 0) return error.InvalidNurserySize;
+    const shift: u6 = switch (text[text.len - 1]) {
+        'K', 'k' => 10,
+        'M', 'm' => 20,
+        else => 0,
+    };
+    const digits = if (shift == 0) text else text[0 .. text.len - 1];
+    return (try std.fmt.parseInt(usize, digits, 10)) << shift;
+}
+
 fn median(xs: []u64) u64 {
     std.mem.sort(u64, xs, {}, std.sort.asc(u64));
     return xs[xs.len / 2];
@@ -277,7 +300,7 @@ fn runOnce(gpa: std.mem.Allocator, io: std.Io, source: []const u8, engine: zqjs.
     const ns = start.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds();
     var live: usize = 0;
     for (rec.samples.items) |x| live = @max(live, x.bytes_after);
-    return .{ .ns = @intCast(ns), .allocated = rt.heap.allocated, .live = live, .scan = if (probe) scanLargestArray(io, &rt.heap) else .{} };
+    return .{ .ns = @intCast(ns), .allocated = rt.heap.allocated, .live = live, .peak = rt.heap.peak, .scan = if (probe) scanLargestArray(io, &rt.heap) else .{} };
 }
 
 fn scanLargestArray(io: std.Io, h: *zqjs.heap.Heap) Scan {

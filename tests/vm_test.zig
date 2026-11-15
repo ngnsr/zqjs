@@ -405,3 +405,172 @@ test "chain: engine records stack with proof and teardown discipline (D52)" {
     try testing.expect(!r1.live);
     try testing.expect(cx.topRecord() == null);
 }
+
+// ---- The nested-call VM (M9.1, D51, model B): a closure run as frame 0 of a fresh VM
+// over the shared heap and realm. This is the machinery `rt.call` and native dispatch
+// (P4) share; the public round-trip tests complete in P4, when the host can first
+// obtain a function token (a native's dup — no test-only public API before that).
+
+/// The script's first closure value, after a run created it (the declaration's slot).
+fn firstClosure(vm: *zqjs.Vm) !*const zqjs.heap.Closure {
+    for (vm.locals[0..vm.locals_len]) |s| switch (s) {
+        .value => |v| if (v) |x| if (x == .closure) return x.closure,
+        .cell => {},
+    };
+    return error.TestUnexpectedResult;
+}
+
+fn runCall(source: []const u8, this: ?zqjs.Value, args: []const zqjs.Value) !zqjs.Value {
+    const script = try Setup.create(source, .{});
+    defer script.destroy();
+    var vm = try zqjs.Vm.init(&script.rt, &script.proto);
+    defer vm.deinit();
+    try testing.expect(runUntilStop(&vm) == null);
+    const c = try firstClosure(&vm);
+
+    // A fresh chain with the nested VM registered and depth-charged, exactly as the
+    // embedding API's rt.call does it (D51).
+    const cx = &script.rt.exec_ctx;
+    script.rt.beginChain(0, std.math.maxInt(u64));
+    defer _ = script.rt.endChain();
+    var cvm = try zqjs.Vm.initCall(&script.rt, c, this, args);
+    defer cvm.deinit(); // unwinds the frames a fault left live
+    cvm.chain = cx;
+    cx.call_depth += 1; // frame 0 is live
+    try cx.vms.append(script.rt.gpa, cvm.roots());
+    defer cx.removeVm(&cvm);
+
+    const e = runUntilStop(&cvm);
+    if (e) |err| return err;
+    return cvm.nested_result.?;
+}
+
+test "nested call: runs a closure with arguments and returns its value" {
+    const v = try runCall("function f(x) { return x * 2; } f(1);", null, &.{.{ .number = 21 }});
+    try testing.expectEqual(@as(f64, 42), v.number);
+}
+
+test "nested call: arity variants bind like a call does (D41)" {
+    // Missing parameters are undefined.
+    const missing = try runCall("function f(x) { return x; } f(1);", null, &.{});
+    try testing.expect(missing == .undefined);
+    // Extra arguments are ignored.
+    const extra = try runCall("function f() { return 7; } f(1);", null, &.{ .{ .number = 1 }, .{ .number = 2 } });
+    try testing.expectEqual(@as(f64, 7), extra.number);
+}
+
+test "nested call: `this` binds by the VM's sloppy rule (D41)" {
+    // No receiver: `this` is unset (undefined).
+    const none = try runCall("function f() { return this === undefined; } f();", null, &.{});
+    try testing.expectEqual(true, none.boolean);
+    // A primitive receiver is not boxed: `this` stays unset (D41).
+    const prim = try runCall("function f() { return this === undefined; } f();", .{ .number = 42 }, &.{});
+    try testing.expectEqual(true, prim.boolean);
+}
+
+test "nested call: a script exception is a Thrown fault with the exception set" {
+    const script = try Setup.create("function f() { let a = null; a(); } f();", .{});
+    defer script.destroy();
+    var vm = try zqjs.Vm.init(&script.rt, &script.proto);
+    defer vm.deinit();
+    try testing.expect(runUntilStop(&vm) == null);
+    const c = try firstClosure(&vm);
+
+    const cx = &script.rt.exec_ctx;
+    script.rt.beginChain(0, std.math.maxInt(u64));
+    defer _ = script.rt.endChain();
+    var cvm = try zqjs.Vm.initCall(&script.rt, c, null, &.{});
+    defer cvm.deinit();
+    cvm.chain = cx;
+    cx.call_depth += 1;
+    try cx.vms.append(script.rt.gpa, cvm.roots());
+    defer cx.removeVm(&cvm);
+
+    try testing.expectEqual(error.Thrown, runUntilStop(&cvm).?);
+    try testing.expectEqual(zqjs.runtime.ErrorName.TypeError, script.rt.exception.?.name);
+}
+
+test "nested call: the chain's budget bounds it and latches (D51, Q8)" {
+    const s = try Setup.create("", .{});
+    defer s.destroy();
+    const script = try Setup.create("function f() { let i = 0; while (true) i++; } f();", .{});
+    defer script.destroy();
+    var vm = try zqjs.Vm.init(&script.rt, &script.proto);
+    defer vm.deinit();
+    try testing.expect(runUntilStop(&vm) == null);
+    const c = try firstClosure(&vm);
+
+    const cx = &script.rt.exec_ctx;
+    script.rt.beginChain(0, 100);
+    var cvm = try zqjs.Vm.initCall(&script.rt, c, null, &.{});
+    defer cvm.deinit();
+    cvm.chain = cx;
+    cx.call_depth += 1;
+    try cx.vms.append(script.rt.gpa, cvm.roots());
+    defer cx.removeVm(&cvm);
+
+    try testing.expectEqual(error.LimitExceeded, runUntilStop(&cvm).?);
+    // The shared counter never exceeded the cumulative max, and the latch is set.
+    try testing.expectEqual(@as(u64, 100), script.rt.steps);
+    try testing.expectEqual(zqjs.runtime.Error.LimitExceeded, cx.budget_fault.?);
+    try testing.expectEqual(zqjs.Limit.steps, script.rt.limitHit().?);
+}
+
+test "nested call: the chain's depth counts its recursion as one number (D51)" {
+    const script = try Setup.create("function f(n) { if (n > 0) return f(n - 1); return n; } f(9);", .{ .max_call_depth = 5 });
+    defer script.destroy();
+    var vm = try zqjs.Vm.init(&script.rt, &script.proto);
+    defer vm.deinit();
+    try testing.expect(runUntilStop(&vm) == null);
+    const c = try firstClosure(&vm);
+
+    const cx = &script.rt.exec_ctx;
+    script.rt.beginChain(0, std.math.maxInt(u64));
+    defer _ = script.rt.endChain();
+    var cvm = try zqjs.Vm.initCall(&script.rt, c, null, &.{.{ .number = 1e9 }});
+    errdefer cvm.deinit();
+    cvm.chain = cx;
+    cx.call_depth += 1;
+    try cx.vms.append(script.rt.gpa, cvm.roots());
+
+    // Recursion faults on the chain's shared counter: 5 frames live at once.
+    try testing.expectEqual(error.LimitExceeded, runUntilStop(&cvm).?);
+    try testing.expectEqual(@as(u32, 5), cx.call_depth);
+    try testing.expectEqual(@as(u32, 5), cvm.frames.items.len);
+    try testing.expectEqual(zqjs.Limit.call_depth, script.rt.limitHit().?);
+    // Teardown mid-recursion unwinds the charge exactly.
+    cvm.deinit();
+    try testing.expectEqual(@as(u32, 0), cx.call_depth);
+}
+
+test "nested call: a collection between steps keeps the suspended VM's state (R2 groundwork)" {
+    const script = try Setup.create(
+        "function f(n) { if (n <= 0) return 'done'; return f(n - 1) + '!'; } f(5);",
+        .{},
+    );
+    defer script.destroy();
+    var vm = try zqjs.Vm.init(&script.rt, &script.proto);
+    defer vm.deinit();
+    try testing.expect(runUntilStop(&vm) == null);
+    const c = try firstClosure(&vm);
+
+    const cx = &script.rt.exec_ctx;
+    script.rt.beginChain(0, std.math.maxInt(u64));
+    defer _ = script.rt.endChain();
+    var cvm = try zqjs.Vm.initCall(&script.rt, c, null, &.{.{ .number = 8 }});
+    defer cvm.deinit();
+    cvm.chain = cx;
+    cx.call_depth += 1;
+    try cx.vms.append(script.rt.gpa, cvm.roots());
+    defer cx.removeVm(&cvm);
+
+    // Suspend mid-recursion and collect: the collector traces the chain's registered
+    // VM, so every live frame, stack value and cell survives (GC_DESIGN §4, D51 #4).
+    for (0..3) |_| _ = try cvm.step();
+    script.rt.collect();
+    // Resume to completion: recursion continues over the moved/collected state.
+    try testing.expect(runUntilStop(&cvm) == null);
+    const r = cvm.nested_result.?;
+    try testing.expect(r == .string);
+    try testing.expectEqual(@as(usize, 9), r.string.units.len); // "!!!!!!!!!"
+}

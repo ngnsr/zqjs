@@ -68,6 +68,15 @@ pub const Token = struct {
         return t.owner.handles.slots.items[t.slot].value;
     }
 
+    /// Validates the token against `rt` — live, and minted by *this* runtime: a token
+    /// from another runtime panics (D50's identity rule; the callers that hand a runtime
+    /// and a handle together, like `rt.call`, are where the check is exercisable) — and
+    /// returns the value it names. The caller holds the guard.
+    pub fn checkedValue(rt: *Runtime, t: *const Token) Value {
+        t.validate(rt);
+        return t.value();
+    }
+
     /// Reads, under the caller's guard: leaves copy (never allocate, Q10/D54).
     pub fn kind(t: *const Token) Kind {
         validate(t, null);

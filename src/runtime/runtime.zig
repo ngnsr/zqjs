@@ -117,6 +117,16 @@ pub const ExecContext = struct {
         record.live = false;
         _ = cx.records.pop();
     }
+
+    /// Deregisters a chain VM at teardown (D51 #4). `ctx` is the VM whose `roots()` was
+    /// added; removing one that was never added is an engine bug (D49).
+    pub fn removeVm(cx: *ExecContext, ctx: *anyopaque) void {
+        for (cx.vms.items, 0..) |e, i| if (e.ctx == ctx) {
+            _ = cx.vms.swapRemove(i);
+            return;
+        };
+        unreachable; // a chain VM torn down without its registration
+    }
 };
 
 pub const Runtime = struct {

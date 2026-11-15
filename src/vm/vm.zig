@@ -95,6 +95,13 @@ pub const Vm = struct {
     pc: u32 = 0,
     halted: bool = false,
     fault: ?Error = null,
+    /// A nested-call VM (M9.1, D51): the closure runs as frame 0 and `return` ends the
+    /// call into `nested_result` — no caller frame exists. The `.return` "in the script"
+    /// bug applies only to ordinary script frames.
+    nested: bool = false,
+    /// The nested call's result, set when its frame 0 returns. Null until then; a halt
+    /// without one is an engine bug (a function's proto always ends in `return`).
+    nested_result: ?Value = null,
     /// The execution context this VM charges (M9.1, D51): set while a chain runs it —
     /// the embedding API's resume, or a nested call — so frames check the chain's shared
     /// `call_depth` instead of a per-VM limit. Null for a chain-less VM (the CLI's),
@@ -127,6 +134,50 @@ pub const Vm = struct {
         gpa.free(vm.locals);
         gpa.free(vm.stack);
         vm.* = undefined;
+    }
+
+    /// A VM for one nested call (M9.1, D51): the closure runs as frame 0 with `this` and
+    /// `args` bound (missing parameters undefined, extra ones ignored, as a call binds
+    /// them); its `return` ends the call into `nested_result`, so no caller frame exists.
+    /// It shares the runtime's heap and realm. The caller sets `chain` (the shared
+    /// budget and depth), registers `roots()` with the execution context before the
+    /// first step, and tears the VM down with `deinit` — which unwinds exactly the
+    /// frames a fault left live. Transactional: on failure nothing is left allocated.
+    pub fn initCall(rt: *Runtime, c: *const Closure, this: ?Value, args: []const Value) Error!Vm {
+        c.obj.checkLive();
+        const v = switch (c.impl) {
+            .vm => |v| v,
+            .tree => return rt.bug("a tree-walker closure in a nested call"),
+        };
+        const callee: *const Proto = @ptrCast(@alignCast(v.proto));
+        // The arguments sit on the operand stack below the frame's own region, exactly
+        // where a caller frame puts them; they are bounded by the same stack-slots
+        // limit a caller's reservation obeys (D36).
+        const argc: u32 = @intCast(args.len);
+        if (@as(u64, argc) + callee.slot_count + callee.max_stack > rt.limits.max_stack_slots) return rt.limit(.stack_slots);
+        var vm: Vm = .{ .rt = rt, .nested = true, .sp = argc };
+        errdefer vm.deinit();
+        // 1. capacity: the stack must hold the arguments plus the frame's region. With
+        // no frames below, `stackEnd` is `sp + max_stack` — the arguments included.
+        try vm.reserve(callee);
+        try vm.frames.ensureTotalCapacity(rt.gpa, 1);
+        // 2. the arguments and the bound locals (nothing is live yet)
+        @memcpy(vm.stack[0..args.len], args);
+        vm.initLocals(callee, 0, argc);
+        // 3. commit
+        vm.frames.appendAssumeCapacity(.{
+            .proto = callee,
+            .closure = c,
+            .return_pc = 0,
+            .locals_base = 0,
+            .stack_base = argc,
+            .result_index = 0,
+            .this = this,
+            .stack_end = @intCast(args.len + callee.max_stack),
+        });
+        vm.locals_len = callee.slot_count;
+        vm.reserved = callee.slot_count + callee.max_stack;
+        return vm;
     }
 
     /// Runs to `halt` or the first error.
@@ -461,7 +512,18 @@ pub const Vm = struct {
                 }
             },
             .@"return" => {
-                if (vm.frames.items.len < 2) return vm.bug("return in the script");
+                if (vm.frames.items.len < 2) {
+                    // A nested call's body returned (D51): the value is the call's
+                    // result, and the call ends here — no caller frame to unwind to.
+                    if (vm.nested and vm.frames.items.len == 1) {
+                        const v = try vm.peek(0);
+                        if (vm.chain) |cx| cx.call_depth -= 1; // the frame died
+                        vm.nested_result = v;
+                        vm.halted = true;
+                        return .halted;
+                    }
+                    return vm.bug("return in the script");
+                }
                 const v = try vm.peek(0);
                 const f = vm.frames.pop().?;
                 if (vm.chain) |cx| cx.call_depth -= 1; // the frame died (D51 #2)

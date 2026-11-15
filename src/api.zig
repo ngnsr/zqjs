@@ -269,6 +269,19 @@ pub const Runtime = opaque {
         };
         return @ptrCast(try handles.Table.mint(&r.rt, .{ .string = s }));
     }
+
+    /// Host → JS (M9.1, D51): calls the function `f` names with `this` and the
+    /// arguments, runs it to completion under a fresh chain's cumulative budget (Q8: no
+    /// steps parameter in M9.1), and returns the result as a token the caller owns.
+    /// This works while an execution is suspended (a fresh context over the shared
+    /// realm); mid-callback (inside a native, P4) it is the guard's engine descent, not
+    /// a host entry. A script exception is error.Thrown with the details in `failure`.
+    pub fn call(rt: *Runtime, f: *Handle, this: ?*Handle, args: []const *Handle, failure: ?*Failure) RunError!*Handle {
+        const r = rt.impl();
+        const guard = Guard.enter(r);
+        defer guard.exit();
+        return callImpl(r, f, this, args, failure);
+    }
 };
 
 pub const HandleError = error{ OutOfMemory, LimitExceeded, Internal };
@@ -575,13 +588,7 @@ const ExecutionImpl = struct {
         var n: u64 = 0;
         while (n < steps) : (n += 1) {
             const state = x.vm.step() catch |e| {
-                // Every Internal poisons (E7), whoever raised it: rt.bug does it, and
-                // this is the belt that keeps the guarantee if a producer ever forgets.
-                if (e == error.Internal and !rt.poisoned) {
-                    rt.poisoned = true;
-                    if (rt.internal_reason == null) rt.internal_reason = "Internal from a path that does not poison";
-                }
-                const f: Fault = .{ .err = publicError(e), .failure = describe(rt, e) };
+                const f = faultOf(rt, e); // the poison belt runs for every fault (E7)
                 x.fault = f;
                 if (failure) |out| out.* = f.failure;
                 return f.err;
@@ -591,6 +598,106 @@ const ExecutionImpl = struct {
         return if (x.vm.halted) .finished else .suspended;
     }
 };
+
+/// The belt and the description every fault goes through (E7/E10): an `Internal` from
+/// any path poisons the runtime (whoever raised it), and the failure carries the
+/// host-facing classification and text. Used by both `resume` and `rt.call`.
+fn faultOf(rt: *IRuntime, e: internal.runtime.Error) Fault {
+    if (e == error.Internal and !rt.poisoned) {
+        rt.poisoned = true;
+        if (rt.internal_reason == null) rt.internal_reason = "Internal from a path that does not poison";
+    }
+    return .{ .err = publicError(e), .failure = describe(rt, e) };
+}
+
+/// Host → JS (M9.1, D51): runs the call on a fresh chain. The callee may be a built-in
+/// native (runs directly: it never calls back into JS, D40, and charges no steps) or a
+/// VM closure (a nested VM over the shared heap and realm, model B).
+fn callImpl(r: *RuntimeImpl, f: *Handle, this_h: ?*Handle, args: []const *Handle, failure: ?*Failure) RunError!*Handle {
+    const rt = &r.rt;
+    if (rt.poisoned) {
+        if (failure) |out| out.* = internalFailure();
+        return error.Internal; // E7: only destroy works now
+    }
+    // Fresh chain (D51): a host call at guard depth 0 begins with a zeroed cumulative
+    // budget and saves nothing back (Q8: no slicing in M9.1).
+    rt.beginChain(0, rt.limits.max_steps);
+    defer _ = rt.endChain();
+    rt.exception = null;
+    rt.unsupported = null;
+    rt.unsupported_name = null;
+    rt.limit_hit = null;
+    rt.heap.limit_hit = null;
+
+    // Every token is validated against THIS runtime first: a released or foreign handle
+    // panics here, deterministically (E1/D50) — the identity check's exercisable site.
+    const callee = handles.checkedValue(rt, f.tok());
+    const this_v: internal.Value = if (this_h) |h| handles.checkedValue(rt, h.tok()) else .undefined;
+    const argv = r.gpa.alloc(internal.Value, args.len) catch |e| {
+        const fo = faultOf(rt, e);
+        if (failure) |out| out.* = fo.failure;
+        return fo.err;
+    };
+    defer r.gpa.free(argv);
+    for (args, 0..) |h, i| argv[i] = handles.checkedValue(rt, h.tok());
+
+    switch (callee) {
+        .native => |n| {
+            const result = n.call(rt, this_v, argv) catch |e| {
+                const fo = faultOf(rt, e);
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            };
+            return mintHandle(r, result, failure);
+        },
+        .closure => |c| {
+            // Model B (D51): a fresh VM, frame 0 the callee; `this` binds by the VM's
+            // sloppy rule (object receivers only, D41). Its `return` ends the call.
+            var vm = internal.Vm.initCall(rt, c, if (this_v == .object) this_v else null, argv) catch |e| {
+                const fo = faultOf(rt, e);
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            };
+            defer vm.deinit(); // unwinds exactly the frames a fault left live
+            vm.chain = &rt.exec_ctx;
+            rt.exec_ctx.call_depth += 1; // frame 0 is live from here (D51 #2)
+            rt.exec_ctx.vms.append(rt.gpa, vm.roots()) catch |e| { // traced from now on
+                const fo = faultOf(rt, e);
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            };
+            defer rt.exec_ctx.removeVm(vm); // before deinit frees what it marks
+            while (true) {
+                const state = vm.step() catch |e| {
+                    const fo = faultOf(rt, e);
+                    if (failure) |out| out.* = fo.failure;
+                    return fo.err;
+                };
+                if (state == .halted) break;
+            }
+            const result = vm.nested_result orelse return rt.bug("a nested call ended without a result");
+            return mintHandle(r, result, failure);
+        },
+        else => {
+            // Not a function: the same TypeError the VM throws at a `.call` (E5: a
+            // JS-visible event, described as a thrown failure — not a host error).
+            const e = rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
+            const fo = faultOf(rt, e);
+            if (failure) |out| out.* = fo.failure;
+            return fo.err;
+        },
+    }
+}
+
+/// Mints the result token the caller owns (D50). A failed mint faults the call with
+/// LimitExceeded(handles) or OutOfMemory; the runtime stays usable (E6), nothing leaks.
+fn mintHandle(r: *RuntimeImpl, v: internal.Value, failure: ?*Failure) RunError!*Handle {
+    return @ptrCast(handles.Table.mint(&r.rt, v) catch |e| {
+        const fo = faultOf(&r.rt, e);
+        if (failure) |out| out.* = fo.failure;
+        return fo.err;
+    });
+}
 
 fn sourceError(e: anyerror, d: internal.Diagnostic, source: []const u8, diag: ?*Diagnostic) CompileError {
     if (e == error.OutOfMemory) return error.OutOfMemory;

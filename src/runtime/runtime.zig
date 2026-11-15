@@ -54,6 +54,9 @@ pub const Runtime = struct {
     joining: std.ArrayList(*heap_mod.Object) = .empty,
     /// The running engine's roots (its stacks and frames), marked by `collect` (D8).
     engine_roots: ?EngineRoots = null,
+    /// More root sets, marked by every collection (M9.0): the embedding API registers each
+    /// live program (its constants) and execution (its VM, suspended or not) here.
+    extra_roots: std.ArrayList(EngineRoots) = .empty,
     limit_hit: ?Limit = null,
 
     pub fn init(gpa: Allocator, limits: Limits, out: *std.Io.Writer) Runtime {
@@ -62,6 +65,7 @@ pub const Runtime = struct {
 
     pub fn deinit(rt: *Runtime) void {
         rt.joining.deinit(rt.gpa);
+        rt.extra_roots.deinit(rt.gpa);
         rt.heap.deinit();
         rt.* = undefined;
     }
@@ -109,6 +113,20 @@ pub const Runtime = struct {
         // Only non-empty inside an instruction, never at a safepoint.
         std.debug.assert(rt.joining.items.len == 0);
         if (rt.engine_roots) |e| e.mark(e.ctx, h);
+        for (rt.extra_roots.items) |e| e.mark(e.ctx, h);
+    }
+
+    /// Adds a root set every collection marks, until `removeRoots` (M9.0).
+    pub fn addRoots(rt: *Runtime, roots: EngineRoots) error{OutOfMemory}!void {
+        try rt.extra_roots.append(rt.gpa, roots);
+    }
+
+    pub fn removeRoots(rt: *Runtime, ctx: *anyopaque) void {
+        for (rt.extra_roots.items, 0..) |e, i| if (e.ctx == ctx) {
+            _ = rt.extra_roots.swapRemove(i);
+            return;
+        };
+        unreachable; // removing a root set that was never added
     }
 
     pub fn limitHit(rt: *const Runtime) ?Limit {

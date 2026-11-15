@@ -129,6 +129,22 @@ pub const Vm = struct {
     /// The VM's roots (GC_DESIGN §4): the operand stack, the locals (values and cells), each
     /// frame's closure and `this`, and the script's Proto tree (its string constants; the
     /// Protos aren't heap objects, so the tree being run is what keeps them).
+    /// This VM as a root set, for a host that keeps it across calls (the embedding API's
+    /// suspended executions). `vm` must not move while registered.
+    pub fn roots(vm: *Vm) rt_mod.EngineRoots {
+        return .{ .ctx = vm, .mark = markRoots };
+    }
+
+    /// A compiled script's constants as a root set (the embedding API keeps programs that
+    /// aren't running alive). `p` must not move while registered.
+    pub fn protoRoots(p: *const Proto) rt_mod.EngineRoots {
+        return .{ .ctx = @constCast(p), .mark = struct {
+            fn mark(ctx: *anyopaque, h: *heap.Heap) void {
+                markProto(h, @ptrCast(@alignCast(ctx)));
+            }
+        }.mark };
+    }
+
     fn markRoots(ctx: *anyopaque, h: *heap.Heap) void {
         const vm: *Vm = @ptrCast(@alignCast(ctx));
         for (vm.stack[0..vm.sp]) |v| h.markValue(v);

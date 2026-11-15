@@ -499,7 +499,7 @@ const Interpreter = struct {
             try it.hold(slot.*);
         }
         return switch (callee) {
-            .native => |n| n.call(rt, receiver orelse .undefined, args),
+            .native => |n| if (n.host != null) rt.fail(.builtin) else n.call(rt, receiver orelse .undefined, args),
             // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
             .closure => |cl| it.call(cl, if (receiver) |r| (if (r == .object) r else null) else null, args),
             else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),

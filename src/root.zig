@@ -22,12 +22,15 @@ pub const disassemble = @import("bytecode/disasm.zig").disassemble;
 pub const Heap = @import("runtime/heap.zig").Heap;
 pub const heap = @import("runtime/heap.zig");
 pub const runtime = @import("runtime/runtime.zig");
+pub const builtins = @import("runtime/builtins.zig");
+pub const handles = @import("runtime/handles.zig");
 pub const runSource = @import("run.zig").runSource;
 pub const RunMode = @import("run.zig").Mode;
 pub const RunOptions = @import("run.zig").Options;
 pub const Engine = @import("run.zig").Engine;
 pub const Vm = @import("vm/vm.zig").Vm;
 pub const Value = @import("runtime/value.zig").Value;
+pub const Native = @import("runtime/value.zig").Native;
 
 // Small unit tests live next to the code they test (`test` blocks in each file);
 // integration, golden and fuzz tests live in tests/ (one test binary per file, build.zig).

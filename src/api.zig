@@ -16,14 +16,18 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const internal = @import("zqjs_internal");
 const IRuntime = internal.Runtime;
+const handles = internal.handles;
 const Proto = internal.bytecode.Proto;
 const Vm = internal.Vm;
+const alive_magic = internal.runtime.alive_magic;
 
 /// Resource limits of a runtime (DESIGN_DECISIONS D15): heap bytes, string length, call
 /// depth, steps per execution (`max_steps`, cumulative over its resumes: E4)…
 pub const Limits = internal.Limits;
 /// Which limit an operation hit.
 pub const Limit = internal.Limit;
+/// Which JavaScript error constructor `throwJs` raises (M9.1, D53).
+pub const ErrorName = internal.ErrorName;
 
 pub const Options = struct {
     limits: Limits = .{},
@@ -33,9 +37,40 @@ pub const Options = struct {
 
 pub const Status = enum { finished, suspended };
 
-pub const CompileError = error{ Source, OutOfMemory, Internal };
-pub const StartError = error{ LimitExceeded, OutOfMemory, Internal };
-pub const RunError = error{ Thrown, LimitExceeded, Unsupported, OutOfMemory, OutputFailed, Internal };
+pub const CompileError = error{ Source, Busy, OutOfMemory, Internal };
+pub const StartError = error{ Busy, LimitExceeded, OutOfMemory, Internal };
+pub const RunError = error{ Thrown, HostError, LimitExceeded, Unsupported, OutOfMemory, OutputFailed, Internal };
+
+/// A host native (M9.1, D53): runs with the guard held at depth ≥ 1 and may call back
+/// into JS through the sanctioned API (D52).
+///
+/// Handle ownership across a callback (D50, D53):
+/// - **Borrowed temporary handles (`this`, `args`):** owned by the engine's native-call
+///   record — valid only during the call, released automatically at teardown on every
+///   outcome. A native that wants to retain one beyond the callback must `dup` it; a
+///   native may also assign `this` or `args[i]` directly to `out.result` (its value is
+///   copied before teardown releases the record's tokens, without double-releasing).
+/// - **Result handle (`out.result`):** transfers ownership of the assigned token to the
+///   engine, which copies its value into the caller's operand slot and releases the token
+///   at teardown on every outcome. Freshly minted tokens (`new*`, `call`) may be assigned
+///   directly.
+/// - **Host-owned retained handles:** to return a handle `H` the host already owns while
+///   keeping `H` valid for later use, the callback must assign `out.result = try H.dup()`.
+///   Assigning `H` directly moves `H` to the engine and releases it on teardown.
+pub const NativeFn = fn (rt: *Runtime, ctx: ?*anyopaque, this: ?*Handle, args: []const *Handle, out: *NativeOut) NativeError!void;
+
+pub const NativeOut = struct {
+    /// Set on success (null → JS `undefined`). Ownership of the assigned token moves to
+    /// the engine, which copies its value into the caller's operand slot and releases the
+    /// token at teardown on every outcome (D50). To return a host-owned retained handle
+    /// without consuming it, assign `try h.dup()`.
+    result: ?*Handle = null,
+    /// Set on `error.HostError` (D53): the engine copies it into the `Failure` before
+    /// the native's stack unwinds.
+    host_message: []const u8 = "",
+};
+
+pub const NativeError = error{ Thrown, HostError, LimitExceeded, Unsupported, OutOfMemory, Internal };
 
 /// UTF-8 text in a fixed buffer, never allocated (E10): always valid UTF-8, cut at a code
 /// point boundary with "…" when it doesn't fit, `truncated` then set.
@@ -111,7 +146,7 @@ pub const Failure = struct {
     text_len: usize = 0,
     truncated: bool = false,
 
-    pub const Kind = enum { thrown, limit, unsupported, out_of_memory, output, internal };
+    pub const Kind = enum { thrown, host, limit, unsupported, out_of_memory, output, internal };
 
     pub fn message(f: *const Failure) []const u8 {
         return f.text[0..f.text_len];
@@ -172,9 +207,11 @@ pub const Runtime = opaque {
         const r = rt.impl();
         const guard = Guard.enter(r);
         _ = guard;
-        r.magic = 0;
+        r.rt.magic = 0; // handle operations must not enter after this (E1)
         while (r.executions.items.len > 0) r.executions.items[r.executions.items.len - 1].free();
         while (r.programs.items.len > 0) r.programs.items[r.programs.items.len - 1].free();
+        for (r.host_natives.items) |entry| r.gpa.destroy(entry);
+        r.host_natives.deinit(r.gpa);
         r.executions.deinit(r.gpa);
         r.programs.deinit(r.gpa);
         r.rt.deinit();
@@ -182,42 +219,45 @@ pub const Runtime = opaque {
     }
 
     /// Parses, resolves, compiles and verifies `source` (E8). On error.Source, `diag` (if
-    /// given) says why and where; the runtime is unchanged.
+    /// given) says why and where; the runtime is unchanged. Returns `error.Busy` if called
+    /// from inside an active native callback (D52).
     pub fn compile(rt: *Runtime, name: []const u8, source: []const u8, diag: ?*Diagnostic) CompileError!*Program {
         const r = rt.impl();
-        const guard = Guard.enter(r);
+        const guard = try Guard.enterTopLevel(r);
         defer guard.exit();
         return r.compileImpl(name, source, diag);
     }
 
     /// Starts `program` from its first instruction, with fresh top-level bindings (E3).
+    /// Returns `error.Busy` if called from inside an active native callback (D52).
     pub fn start(rt: *Runtime, program: *Program) StartError!*Execution {
         const r = rt.impl();
         const p = program.impl();
         checkProgramAlive(p);
-        const guard = Guard.enter(r);
+        const guard = try Guard.enterTopLevel(r);
         defer guard.exit();
         const x = try r.startImpl(p);
         return @ptrCast(x);
     }
 
     /// Starts `program`, runs it to the end (within `limits.max_steps`), destroys the
-    /// execution.
+    /// execution. Returns `error.Busy` if called from inside an active native callback (D52).
     pub fn run(rt: *Runtime, program: *Program, failure: ?*Failure) (StartError || RunError)!void {
         const r = rt.impl();
         const p = program.impl();
         checkProgramAlive(p);
-        const guard = Guard.enter(r);
+        const guard = try Guard.enterTopLevel(r);
         defer guard.exit();
         const ex = try r.startImpl(p);
         defer ex.free();
         _ = try ex.resumeImpl(std.math.maxInt(u64), failure);
     }
 
-    /// A major collection, now (between calls: no script is mid-instruction).
+    /// A major collection, now (between calls or inside a native callback: no script is
+    /// mid-instruction, D52).
     pub fn collectGarbage(rt: *Runtime) void {
         const r = rt.impl();
-        const guard = Guard.enter(r);
+        const guard = Guard.enterReentrant(r);
         defer guard.exit();
         r.rt.heap.major_requested = true;
         r.rt.collect();
@@ -225,12 +265,154 @@ pub const Runtime = opaque {
 
     pub fn memory(rt: *const Runtime) Memory {
         const r = rt.implConst();
-        const guard = Guard.enter(@constCast(r));
+        const guard = Guard.enterReentrant(@constCast(r));
         defer guard.exit();
         const h = &r.rt.heap;
-        return .{ .bytes = h.bytes, .peak = h.peak, .collections = h.stats.collections };
+        return .{
+            .bytes = h.bytes + r.rt.handles.accounted, // handle pool bytes (D50)
+            .peak = h.peak + r.rt.handles.peak,
+            .collections = h.stats.collections,
+        };
+    }
+
+    /// Mints a number handle (M9.1, D50). The token is the caller's to `release` (or
+    /// `dup`); while the runtime is poisoned, nothing is minted (E7).
+    pub fn newNumber(rt: *Runtime, n: f64) HandleError!*Handle {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) return error.Internal; // E7: only destroy works now
+        return @ptrCast(try handles.Table.mint(&r.rt, .{ .number = n }));
+    }
+
+    pub fn newBoolean(rt: *Runtime, b: bool) HandleError!*Handle {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) return error.Internal; // E7
+        return @ptrCast(try handles.Table.mint(&r.rt, .{ .boolean = b }));
+    }
+
+    /// Creates a heap string (E10: UTF-16 units in, lone surrogates kept) and mints a
+    /// handle to it. Length and heap limits apply as for script strings.
+    pub fn newStringUtf16(rt: *Runtime, units: []const u16) HandleError!*Handle {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) return error.Internal; // E7
+        const s = r.rt.heap.newString(&.{.{ .utf16 = units }}) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.LimitExceeded => return error.LimitExceeded,
+            else => unreachable, // newString only allocates and checks a limit
+        };
+        return @ptrCast(try handles.Table.mint(&r.rt, .{ .string = s }));
+    }
+
+    /// JS → host (M9.1, D53): registers a host native as a global function under `name`.
+    /// Duplicate names — including built-in names — return `error.NameTaken` and leave
+    /// the realm unchanged. `ctx` is borrowed by the runtime until `Runtime.destroy`.
+    pub fn defineGlobalFunction(rt: *Runtime, name: []const u8, native: *const NativeFn, ctx: ?*anyopaque) error{ OutOfMemory, NameTaken }!void {
+        const r = rt.impl();
+        const guard = Guard.enter(r);
+        defer guard.exit();
+        return r.defineGlobalFunctionImpl(name, native, ctx);
+    }
+
+    /// JS → host failure for a deliberate JS exception (M9.1, D53): kind + UTF-16 message,
+    /// converted through the E10 rules for the `Failure` text. Must be paired with
+    /// returning `error.Thrown` from a `NativeFn`; returning `error.Thrown` without doing
+    /// so is a host bug (checked).
+    pub fn throwJs(rt: *Runtime, name: ErrorName, message: []const u16) void {
+        const r = rt.impl();
+        if (!Guard.isActiveCallback(&r.rt))
+            @panic("zqjs: throwJs called outside an active NativeFn callback");
+        r.rt.exec_ctx.topRecord().?.threw_js = true;
+        if (r.rt.poisoned) return;
+        const msg = r.rt.heap.newString(&.{.{ .utf16 = message }}) catch |e| {
+            r.rt.exception = null;
+            r.rt.pending_throw_fault = e;
+            return;
+        };
+        r.rt.pending_throw_fault = null;
+        r.rt.exception = .{ .name = name, .message = msg };
+    }
+
+    /// Host → JS (M9.1, D51): calls the function `f` names with `this` and the
+    /// arguments, runs it to completion under a fresh chain's cumulative budget (Q8: no
+    /// steps parameter in M9.1), and returns the result as a token the caller owns.
+    /// This works while an execution is suspended (a fresh context over the shared
+    /// realm); mid-callback (inside a native, P4) it is the guard's engine descent, not
+    /// a host entry. A script exception is error.Thrown with the details in `failure`.
+    pub fn call(rt: *Runtime, f: *Handle, this: ?*Handle, args: []const *Handle, failure: ?*Failure) RunError!*Handle {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        return callImpl(r, f, this, args, failure);
     }
 };
+
+pub const HandleError = error{ OutOfMemory, LimitExceeded, Internal };
+
+/// A GC-safe reference to one JS value (M9.1, D50): a pointer to a token the runtime
+/// owns. Handles may be copied only through `dup`; a released (or foreign) handle panics
+/// when used, deterministically while the runtime is alive. Every operation works while
+/// the runtime is poisoned — like `collectGarbage`/`memory`, they touch no VM state.
+pub const Handle = opaque {
+    fn tok(h: *const Handle) *handles.Token {
+        return @ptrCast(@alignCast(@constCast(h)));
+    }
+
+    /// What the handle refers to (D54: uniform across all values).
+    pub fn kind(h: *const Handle) HandleKind {
+        const guard = Guard.enterReentrantIrt(h.tok().owner);
+        defer guard.exit();
+        return h.tok().kind();
+    }
+
+    /// The number, or null for any other kind (copies; never allocates, Q10/D54).
+    pub fn number(h: *const Handle) ?f64 {
+        const guard = Guard.enterReentrantIrt(h.tok().owner);
+        defer guard.exit();
+        return h.tok().number();
+    }
+
+    pub fn boolean(h: *const Handle) ?bool {
+        const guard = Guard.enterReentrantIrt(h.tok().owner);
+        defer guard.exit();
+        return h.tok().boolean();
+    }
+
+    /// Wrong kind → null. Otherwise the string's full UTF-16 length; copies
+    /// min(len, buf.len) units, so a too-small `buf` truncates visibly (D54).
+    pub fn string(h: *const Handle, buf: []u16) ?usize {
+        const guard = Guard.enterReentrantIrt(h.tok().owner);
+        defer guard.exit();
+        return h.tok().string(buf);
+    }
+
+    /// A new independently owned handle to the same value (Q3/Q4): the slot's reference
+    /// count goes up. Fails with `LimitExceeded(handles)` at the pool's cap (D50).
+    pub fn dup(h: *const Handle) HandleError!*Handle {
+        const t = h.tok();
+        const guard = Guard.enterReentrantIrt(t.owner);
+        defer guard.exit();
+        if (t.owner.poisoned) return error.Internal; // E7: nothing is minted
+        return @ptrCast(try handles.Table.dup(t.owner, t));
+    }
+
+    /// Kills this handle and drops its slot reference; the slot's value becomes
+    /// collectible at the last release (D50). Releasing twice is the host bug the token
+    /// check panics on.
+    pub fn release(h: *Handle) void {
+        const guard = Guard.enterReentrantIrt(h.tok().owner);
+        defer guard.exit();
+        h.tok().release();
+    }
+};
+
+/// How `Handle.kind` classifies a value (D54). Named `HandleKind` to stay clear of
+/// `Failure.Kind`.
+pub const HandleKind = handles.Kind;
 
 pub const Program = opaque {
     fn impl(p: *Program) *ProgramImpl {
@@ -286,13 +468,34 @@ const RuntimeImpl = struct {
     discard: std.Io.Writer.Discarding,
     programs: std.ArrayList(*ProgramImpl) = .empty,
     executions: std.ArrayList(*ExecutionImpl) = .empty,
-    in_call: std.atomic.Value(bool) = .init(false),
-    /// Use-after-destroy detection (E1): safe builds check this tag at every entry point.
-    /// Best effort: freed memory may be reused, so the check can miss.
-    magic: u32 = alive_magic,
+    host_natives: std.ArrayList(*HostNativeEntry) = .empty,
     /// A static-format buffer for `rt.internal_reason` (the reason of the first
     /// defensive-check failure), so poisoning never allocates.
     reason_buf: [160]u8 = undefined,
+
+    fn defineGlobalFunctionImpl(r: *RuntimeImpl, name: []const u8, native: *const NativeFn, ctx: ?*anyopaque) error{ OutOfMemory, NameTaken }!void {
+        if (internal.builtins.isBuiltinGlobal(name)) return error.NameTaken;
+        for (r.rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return error.NameTaken;
+
+        const gpa = r.gpa;
+        const name_copy = try gpa.dupe(u8, name);
+        errdefer gpa.free(name_copy);
+        const entry = try gpa.create(HostNativeEntry);
+        errdefer gpa.destroy(entry);
+        const nat = try gpa.create(internal.Native);
+        errdefer gpa.destroy(nat);
+        try r.host_natives.ensureUnusedCapacity(gpa, 1);
+        try r.rt.host_globals.ensureUnusedCapacity(gpa, 1);
+
+        entry.* = .{ .owner = r, .func = native, .ctx = ctx };
+        nat.* = .{
+            .name = name_copy,
+            .call = unreachableNativeCall,
+            .host = .{ .call = dispatchHostNative, .ctx = entry },
+        };
+        r.host_natives.appendAssumeCapacity(entry);
+        r.rt.host_globals.appendAssumeCapacity(nat);
+    }
 
     fn compileImpl(r: *RuntimeImpl, name: []const u8, source: []const u8, diag: ?*Diagnostic) CompileError!*Program {
         if (r.rt.poisoned) return error.Internal; // E7: only destroy works now
@@ -353,26 +556,77 @@ const RuntimeImpl = struct {
 };
 
 const Guard = struct {
-    runtime: *RuntimeImpl,
+    rt: *IRuntime,
+    claimed: bool,
 
+    /// Whether the current thread is inside an active, un-suspended `NativeFn` callback
+    /// on `rt` (D52: the top engine record is the capability proof).
+    fn isActiveCallback(rt: *IRuntime) bool {
+        checkAlive(rt.magic, "Runtime");
+        if (!rt.in_call.load(.seq_cst)) return false;
+        if (rt.owner_thread != std.Thread.getCurrentId()) return false;
+        const rec = rt.exec_ctx.topRecord() orelse return false;
+        return rec.live and !rec.suspended;
+    }
+
+    /// A host entry (E2): requires depth 0 and an unclaimed thread; claims `in_call` and
+    /// `owner_thread`. At depth > 0 (same thread or not): panics, exactly as in M9.0.
     fn enter(r: *RuntimeImpl) Guard {
-        checkAlive(r.magic, "Runtime"); // through a runtime that's gone: caught here (E1)
-        if (r.in_call.cmpxchgStrong(false, true, .seq_cst, .seq_cst) != null) {
+        return enterIrt(&r.rt);
+    }
+
+    fn enterIrt(rt: *IRuntime) Guard {
+        checkAlive(rt.magic, "Runtime"); // through a runtime that's gone: caught here (E1)
+        if (rt.in_call.cmpxchgStrong(false, true, .seq_cst, .seq_cst) != null) {
             @panic("zqjs: Runtime entered while another call into it is running");
         }
-        return .{ .runtime = r };
+        rt.owner_thread = std.Thread.getCurrentId();
+        return .{ .rt = rt, .claimed = true };
+    }
+
+    /// Top-level entry for `compile`, `start`, and `run` (Q7, D52): returns `error.Busy`
+    /// when called on the owner thread from inside an active native callback; panics on
+    /// any other overlap (e.g. from an output writer or another thread).
+    fn enterTopLevel(r: *RuntimeImpl) error{Busy}!Guard {
+        const rt = &r.rt;
+        checkAlive(rt.magic, "Runtime");
+        if (rt.in_call.cmpxchgStrong(false, true, .seq_cst, .seq_cst) != null) {
+            if (isActiveCallback(rt)) return error.Busy;
+            @panic("zqjs: Runtime entered while another call into it is running");
+        }
+        rt.owner_thread = std.Thread.getCurrentId();
+        return .{ .rt = rt, .claimed = true };
+    }
+
+    /// Sanctioned re-entrant entry (Q7, D52): claims depth 0 as a host entry if idle, or
+    /// descends at depth > 0 on the owner thread when an un-suspended native-call record
+    /// is at the top of `exec_ctx.records`. Any other overlap panics.
+    fn enterReentrant(r: *RuntimeImpl) Guard {
+        return enterReentrantIrt(&r.rt);
+    }
+
+    fn enterReentrantIrt(rt: *IRuntime) Guard {
+        checkAlive(rt.magic, "Runtime");
+        if (rt.in_call.cmpxchgStrong(false, true, .seq_cst, .seq_cst) != null) {
+            if (isActiveCallback(rt)) return .{ .rt = rt, .claimed = false };
+            @panic("zqjs: Runtime entered while another call into it is running");
+        }
+        rt.owner_thread = std.Thread.getCurrentId();
+        return .{ .rt = rt, .claimed = true };
     }
 
     fn exit(g: Guard) void {
-        g.runtime.in_call.store(false, .seq_cst);
+        if (g.claimed) {
+            g.rt.owner_thread = null;
+            g.rt.in_call.store(false, .seq_cst);
+        }
     }
 };
 
-/// The tag live implementations carry; cleared (or the memory freed) on destroy, so a
-/// safe build's entry-point check catches a use after destroy (E1). Best effort: the
-/// memory may have been reused, so a missed catch is possible; documented as such.
-const alive_magic: u32 = 0x5A514A53; // "ZQJS"
-
+/// The tag live implementations carry is the internal runtime's (`alive_magic`,
+/// runtime.zig): cleared (or the memory freed) on destroy, so a safe build's entry-point
+/// check catches a use after destroy (E1). Best effort: the memory may have been reused,
+/// so a missed catch is possible; documented as such.
 fn checkAlive(magic: u32, comptime type_name: []const u8) void {
     if (std.debug.runtime_safety and magic != alive_magic)
         @panic("zqjs: " ++ type_name ++ " used after destroy");
@@ -447,26 +701,27 @@ const ExecutionImpl = struct {
         }
         if (x.vm.halted) return .finished;
         const rt = &x.owner.rt;
-        // The cap is per execution and cumulative (E4): the runtime's counter is this
-        // execution's for the length of the call.
-        rt.steps = x.used;
-        rt.max_steps = rt.limits.max_steps;
+        // The chain (M9.1, D51): one shared execution context per top-level entry. The
+        // budget is cumulative per execution (E4): the context adopts `used`, every VM
+        // and native record in the chain charges the same live counters, and the updated
+        // count is saved back at the chain's end.
+        rt.beginChain(x.used, rt.limits.max_steps);
+        defer x.used = rt.endChain();
+        x.vm.chain = &rt.exec_ctx; // its frames charge the chain's shared depth
+        defer {
+            std.debug.assert(rt.exec_ctx.call_depth == x.vm.frames.items.len);
+            x.vm.chain = null;
+        }
+        rt.exec_ctx.call_depth = @intCast(x.vm.frames.items.len); // the frames already live count (D51 #2)
         rt.exception = null;
         rt.unsupported = null;
         rt.unsupported_name = null;
         rt.limit_hit = null;
         rt.heap.limit_hit = null;
-        defer x.used = rt.steps;
         var n: u64 = 0;
         while (n < steps) : (n += 1) {
             const state = x.vm.step() catch |e| {
-                // Every Internal poisons (E7), whoever raised it: rt.bug does it, and
-                // this is the belt that keeps the guarantee if a producer ever forgets.
-                if (e == error.Internal and !rt.poisoned) {
-                    rt.poisoned = true;
-                    if (rt.internal_reason == null) rt.internal_reason = "Internal from a path that does not poison";
-                }
-                const f: Fault = .{ .err = publicError(e), .failure = describe(rt, e) };
+                const f = faultOf(rt, e); // the poison belt runs for every fault (E7)
                 x.fault = f;
                 if (failure) |out| out.* = f.failure;
                 return f.err;
@@ -476,6 +731,288 @@ const ExecutionImpl = struct {
         return if (x.vm.halted) .finished else .suspended;
     }
 };
+
+/// The belt and the description every fault goes through (E7/E10): an `Internal` from
+/// any path poisons the runtime (whoever raised it), and the failure carries the
+/// host-facing classification and text. Used by both `resume` and `rt.call`.
+fn faultOf(rt: *IRuntime, e: internal.runtime.Error) Fault {
+    if (e == error.Internal and !rt.poisoned) {
+        rt.poisoned = true;
+        if (rt.internal_reason == null) rt.internal_reason = "Internal from a path that does not poison";
+    }
+    return .{ .err = publicError(e), .failure = describe(rt, e) };
+}
+
+/// Host → JS (M9.1, D51): runs the call on a fresh chain. The callee may be a built-in
+/// native (runs directly: it never calls back into JS, D40, and charges no steps) or a
+/// VM closure (a nested VM over the shared heap and realm, model B).
+fn callImpl(r: *RuntimeImpl, f: *Handle, this_h: ?*Handle, args: []const *Handle, failure: ?*Failure) RunError!*Handle {
+    const rt = &r.rt;
+    if (rt.poisoned) {
+        if (failure) |out| out.* = internalFailure();
+        return error.Internal; // E7: only destroy works now
+    }
+    // Every token is validated against THIS runtime first: a released or foreign handle
+    // panics here, deterministically (E1/D50) — the identity check's exercisable site.
+    const callee = handles.Token.checkedValue(rt, f.tok());
+    const this_v: internal.Value = if (this_h) |h| handles.Token.checkedValue(rt, h.tok()) else .undefined;
+    for (args) |h| _ = handles.Token.checkedValue(rt, h.tok());
+
+    // Fresh chain at depth 0 (D51): a host call begins with a zeroed cumulative budget
+    // and saves nothing back (Q8: no slicing in M9.1). Inside an active chain (a native
+    // callback calling back into JS), joins the existing chain without resetting budget.
+    const top_level = !rt.exec_ctx.active;
+    if (top_level) rt.beginChain(0, rt.limits.max_steps);
+    const parent_record = rt.exec_ctx.topRecord();
+    if (parent_record) |rec| rec.suspended = true;
+    const depth_before = rt.exec_ctx.call_depth;
+    defer {
+        if (parent_record) |rec| rec.suspended = false;
+        std.debug.assert(rt.exec_ctx.call_depth == depth_before);
+        if (top_level) _ = rt.endChain();
+    }
+    if (rt.exec_ctx.budget_fault != null) {
+        const fo = faultOf(rt, rt.limit(.steps));
+        if (failure) |out| out.* = fo.failure;
+        return fo.err;
+    }
+    rt.exception = null;
+    rt.pending_throw_fault = null;
+    rt.unsupported = null;
+    rt.unsupported_name = null;
+    rt.limit_hit = null;
+    rt.heap.limit_hit = null;
+    rt.host_message_len = 0;
+    rt.host_message_truncated = false;
+
+    const argv = r.gpa.alloc(internal.Value, args.len) catch |e| {
+        const fo = faultOf(rt, e);
+        if (failure) |out| out.* = fo.failure;
+        return fo.err;
+    };
+    defer r.gpa.free(argv);
+    for (args, 0..) |h, i| argv[i] = handles.Token.checkedValue(rt, h.tok());
+
+    switch (callee) {
+        .native => |n| {
+            const this_obj: ?internal.Value = if (this_v == .object) this_v else null;
+            const result = (if (n.host) |h|
+                h.call(rt, h.ctx, this_obj, argv)
+            else
+                n.call(rt, this_v, argv)) catch |e| {
+                const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                const fo = faultOf(rt, err);
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            };
+            if (rt.exec_ctx.budget_fault != null) {
+                const fo = faultOf(rt, rt.limit(.steps));
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            }
+            return mintHandle(r, result, failure);
+        },
+        .closure => |c| {
+            // Model B (D51): a fresh VM, frame 0 the callee; `this` binds by the VM's
+            // sloppy rule (object receivers only, D41). Its `return` ends the call.
+            if (rt.exec_ctx.call_depth >= rt.limits.max_call_depth) {
+                const fo = faultOf(rt, rt.limit(.call_depth));
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            }
+            var vm = internal.Vm.initCall(rt, c, if (this_v == .object) this_v else null, argv) catch |e| {
+                const fo = faultOf(rt, e);
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            };
+            defer vm.deinit(); // unwinds exactly the frames a fault left live
+            vm.chain = &rt.exec_ctx;
+            rt.exec_ctx.call_depth += 1; // frame 0 is live from here (D51 #2)
+            rt.exec_ctx.vms.append(rt.gpa, vm.roots()) catch |e| { // traced from now on
+                const fo = faultOf(rt, e);
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            };
+            defer rt.exec_ctx.removeVm(&vm); // before deinit frees what it marks
+            while (true) {
+                const state = vm.step() catch |e| {
+                    const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                    const fo = faultOf(rt, err);
+                    if (failure) |out| out.* = fo.failure;
+                    return fo.err;
+                };
+                if (state == .halted) break;
+            }
+            if (rt.exec_ctx.budget_fault != null) {
+                const fo = faultOf(rt, rt.limit(.steps));
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            }
+            const result = vm.nested_result orelse {
+                const fo = faultOf(rt, rt.bug("a nested call ended without a result"));
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            };
+            return mintHandle(r, result, failure);
+        },
+        else => {
+            // Not a function: the same TypeError the VM throws at a `.call` (E5: a
+            // JS-visible event, described as a thrown failure — not a host error).
+            const e = rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
+            const fo = faultOf(rt, e);
+            if (failure) |out| out.* = fo.failure;
+            return fo.err;
+        },
+    }
+}
+
+/// Mints the result token the caller owns (D50). A failed mint faults the call with
+/// LimitExceeded(handles) or OutOfMemory; the runtime stays usable (E6), nothing leaks.
+fn mintHandle(r: *RuntimeImpl, v: internal.Value, failure: ?*Failure) RunError!*Handle {
+    return @ptrCast(handles.Table.mint(&r.rt, v) catch |e| {
+        const fo = faultOf(&r.rt, e);
+        if (failure) |out| out.* = fo.failure;
+        return fo.err;
+    });
+}
+
+const HostNativeEntry = struct {
+    owner: *RuntimeImpl,
+    func: *const NativeFn,
+    ctx: ?*anyopaque,
+};
+
+fn unreachableNativeCall(_: *IRuntime, _: internal.Value, _: []const internal.Value) internal.runtime.Error!internal.Value {
+    unreachable;
+}
+
+/// Validates and releases every temporary handle (and `out.result`, if distinct and live)
+/// at `NativeFn` teardown. Calling this *after* copying any return value into the caller's
+/// stack slot preserves the release-order invariant (D50).
+fn releaseNativeTokens(irt: *IRuntime, this_tok: ?*handles.Token, arg_handles: []const *Handle, res_h: ?*Handle) void {
+    if (res_h) |rh| {
+        const rt_tok = rh.tok();
+        _ = handles.Token.checkedValue(irt, rt_tok);
+        rt_tok.release();
+    }
+    for (arg_handles) |ah| {
+        const t = ah.tok();
+        if (t.state == .live) t.release();
+    }
+    if (this_tok) |t| if (t.state == .live) t.release();
+}
+
+/// Dispatches a call to a host-registered native function (M9.1, D50–D53):
+/// - Checks `poisoned` (E7) and `max_call_depth` (D51 #2).
+/// - Mints temporary tokens for `this` (object receivers only, D41) and `args` (D50).
+/// - Pushes a `NativeRecord` onto `exec_ctx.records` as the guard's engine capability (D52).
+/// - Invokes the host's `NativeFn`.
+/// - Enforces the latched budget check first (D51, S10), then copies `out.result` before
+///   releasing any tokens (the release-order invariant, D50), then releases all temporary
+///   and result tokens, pops the `NativeRecord`, and unwinds `call_depth` on every outcome.
+fn dispatchHostNative(rt: *IRuntime, raw_ctx: ?*anyopaque, this: ?internal.Value, args: []const internal.Value) internal.runtime.Error!internal.Value {
+    if (rt.poisoned) return error.Internal;
+    const entry: *const HostNativeEntry = @ptrCast(@alignCast(raw_ctx.?));
+    const cx = &rt.exec_ctx;
+    if (cx.active) {
+        if (cx.call_depth >= rt.limits.max_call_depth) return rt.limit(.call_depth);
+    }
+
+    const arg_handles = try rt.gpa.alloc(*Handle, args.len);
+    defer rt.gpa.free(arg_handles);
+    var minted_args: usize = 0;
+    var this_tok: ?*handles.Token = null;
+    errdefer {
+        for (arg_handles[0..minted_args]) |h| {
+            const t = h.tok();
+            if (t.state == .live) t.release();
+        }
+        if (this_tok) |t| if (t.state == .live) t.release();
+    }
+
+    if (this) |tv| {
+        this_tok = try handles.Table.mint(rt, tv);
+    }
+    for (args, 0..) |av, i| {
+        const tok = try handles.Table.mint(rt, av);
+        arg_handles[i] = @ptrCast(tok);
+        minted_args += 1;
+    }
+
+    var record: internal.runtime.NativeRecord = .{};
+    try cx.pushRecord(rt.gpa, &record);
+    if (cx.active) cx.call_depth += 1;
+    defer {
+        if (cx.active) cx.call_depth -= 1;
+        cx.popRecord(&record);
+    }
+
+    rt.exception = null;
+    rt.pending_throw_fault = null;
+    rt.host_message_len = 0;
+    rt.host_message_truncated = false;
+
+    const pub_rt: *Runtime = @ptrCast(entry.owner);
+    const this_h: ?*Handle = if (this_tok) |t| @ptrCast(t) else null;
+    var out: NativeOut = .{};
+    const call_res = entry.func(pub_rt, entry.ctx, this_h, arg_handles, &out);
+
+    // S10: Check latched budget fault FIRST — a native cannot launder a budget exhaustion
+    // into success or another non-Internal error (D51, Q8).
+    if (cx.active and cx.budget_fault != null) {
+        if (call_res) |_| {} else |err| {
+            if (err == error.Internal) {
+                releaseNativeTokens(rt, this_tok, arg_handles, out.result);
+                return rt.bug("NativeFn returned error.Internal");
+            }
+        }
+        releaseNativeTokens(rt, this_tok, arg_handles, out.result);
+        return rt.limit(.steps);
+    }
+
+    if (call_res) |_| {
+        if (record.threw_js)
+            @panic("zqjs: throwJs called without returning error.Thrown");
+        rt.exception = null;
+        rt.pending_throw_fault = null;
+        // Copy result value BEFORE releasing tokens (release-order invariant, D50).
+        const val: internal.Value = if (out.result) |rh| handles.Token.checkedValue(rt, rh.tok()) else .undefined;
+        releaseNativeTokens(rt, this_tok, arg_handles, out.result);
+        return val;
+    } else |err| {
+        if (record.threw_js and err != error.Thrown)
+            @panic("zqjs: throwJs called without returning error.Thrown");
+        releaseNativeTokens(rt, this_tok, arg_handles, out.result);
+        switch (err) {
+            error.Thrown => {
+                if (rt.pending_throw_fault) |f| {
+                    rt.pending_throw_fault = null;
+                    return f;
+                }
+                if (rt.exception == null)
+                    @panic("zqjs: NativeFn returned error.Thrown without calling throwJs");
+                return error.Thrown;
+            },
+            error.HostError => {
+                if (out.host_message.len == 0)
+                    @panic("zqjs: NativeFn returned error.HostError with an empty host_message");
+                var w = TextWriter.init(&rt.host_message_buf, &rt.host_message_len, &rt.host_message_truncated);
+                w.utf8(out.host_message);
+                return error.HostError;
+            },
+            error.LimitExceeded => {
+                if (rt.limitHit() == null) rt.limit_hit = .steps;
+                return error.LimitExceeded;
+            },
+            error.Unsupported => {
+                if (rt.unsupported == null) rt.unsupported = .builtin;
+                return error.Unsupported;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Internal => return rt.bug("NativeFn returned error.Internal"),
+        }
+    }
+}
 
 fn sourceError(e: anyerror, d: internal.Diagnostic, source: []const u8, diag: ?*Diagnostic) CompileError {
     if (e == error.OutOfMemory) return error.OutOfMemory;
@@ -520,6 +1057,7 @@ fn internalFailure() Failure {
 fn publicError(e: internal.runtime.Error) RunError {
     return switch (e) {
         error.Thrown => error.Thrown,
+        error.HostError => error.HostError,
         error.LimitExceeded => error.LimitExceeded,
         error.Unsupported => error.Unsupported,
         error.OutOfMemory => error.OutOfMemory,
@@ -538,6 +1076,12 @@ fn describe(rt: *IRuntime, e: internal.runtime.Error) Failure {
             w.utf8(@tagName(ex.name));
             w.utf8(": ");
             w.utf16(ex.message.units);
+        },
+        error.HostError => {
+            f.kind = .host;
+            @memcpy(f.text[0..rt.host_message_len], rt.host_message_buf[0..rt.host_message_len]);
+            f.text_len = rt.host_message_len;
+            f.truncated = rt.host_message_truncated;
         },
         error.LimitExceeded => {
             f.kind = .limit;

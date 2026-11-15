@@ -124,6 +124,7 @@ fn runPublic(gpa: std.mem.Allocator, name: []const u8, source: []const u8, limit
     var diag: api.Diagnostic = .{};
     const program = rt.compile(name, source, &diag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.Busy => unreachable,
         error.Source => {
             try diag.render(source, name, err);
             return 1;
@@ -138,6 +139,7 @@ fn runPublic(gpa: std.mem.Allocator, name: []const u8, source: []const u8, limit
     var failure: api.Failure = .{};
     rt.run(program, &failure) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.Busy => unreachable,
         error.OutputFailed => return error.WriteFailed,
         error.Internal => {
             try err.print("{s}: internal error\n", .{name});
@@ -147,7 +149,7 @@ fn runPublic(gpa: std.mem.Allocator, name: []const u8, source: []const u8, limit
             try err.print("Uncaught {s}\n", .{failure.message()});
             return 1;
         },
-        error.LimitExceeded, error.Unsupported => {
+        error.LimitExceeded, error.Unsupported, error.HostError => {
             try err.print("{s}: {s}\n", .{ name, failure.message() });
             return 1;
         },

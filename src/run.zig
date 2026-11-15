@@ -103,6 +103,7 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
                 }
                 try report.writeByte('\n');
             },
+            error.HostError => try report.print("{s}: {s}\n", .{ name, rt.host_message_buf[0..rt.host_message_len] }),
             error.LimitExceeded => try report.print("{s}: LimitExceeded({s})\n", .{ name, @tagName(rt.limitHit().?) }),
             error.Unsupported => {
                 try report.print("{s}: Unsupported({s}): {s}", .{ name, @tagName(rt.unsupported.?), rt.unsupported.?.description() });

@@ -3,6 +3,7 @@
 //!
 //! Errors are split by who caused them (LANGUAGE.md §1):
 //!   error.Thrown         a JavaScript exception; details in `exception`
+//!   error.HostError      a host native operation failed (M9.1, D53); message in `host_message`
 //!   error.LimitExceeded  a resource limit; which one in `limitHit()`
 //!   error.Unsupported    outside ZQJS at runtime; which feature in `unsupported`
 //!   error.OutOfMemory    the host allocator failed
@@ -15,13 +16,19 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const heap_mod = @import("heap.zig");
 const Heap = heap_mod.Heap;
+const handles = @import("handles.zig");
+const Native = @import("value.zig").Native;
 const Limits = @import("../limits.zig").Limits;
 const Limit = @import("../limits.zig").Limit;
 const Feature = @import("../frontend/diag.zig").Feature;
 
-pub const Error = error{ Thrown, LimitExceeded, Unsupported, OutOfMemory, WriteFailed, Internal };
+pub const Error = error{ Thrown, HostError, LimitExceeded, Unsupported, OutOfMemory, WriteFailed, Internal };
 
 pub const ErrorName = enum { ReferenceError, TypeError, RangeError };
+
+/// The tag a live runtime carries; cleared on destroy (E1). The embedding API's checks
+/// and the handle operations read this one (the internal runtime is what a handle names).
+pub const alive_magic: u32 = 0x5A514A53; // "ZQJS"
 
 /// A JavaScript exception, until M7 gives us Error objects.
 /// Ownership: `name` is static; `message` is a heap string owned by `Runtime.heap`,
@@ -38,6 +45,99 @@ pub const EngineRoots = struct {
     mark: *const fn (ctx: *anyopaque, h: *Heap) void,
 };
 
+/// A host native call in flight (M9.1, D53): the engine's record of the crossing —
+/// its temporary argument tokens (D50), the caller VM's result slot and pc, a depth
+/// charge. The record is the guard's engine capability (D52): native dispatch pushes it
+/// on the execution context and consumes it — releasing the tokens — at teardown, on
+/// every outcome, so it cannot be reused after its callback ends. Internal only; never
+/// exported through `zqjs`. (Native dispatch arrives in M9.1 P4; the type and the
+/// context's record stack exist from P3, so the guard's invariants are in place first.)
+pub const NativeRecord = struct {
+    /// Set while the record is on an execution context's stack; consumed (null) at
+    /// teardown. A stale record reference fails the stack-top check (D52).
+    live: bool = false,
+    /// True while a nested `rt.call` inside this callback is running a VM or built-in
+    /// native: while suspended, the callback's capability is paused (e.g. an output
+    /// writer's `drain` during a nested `print` must still panic, D52).
+    suspended: bool = false,
+    /// Set by `rt.throwJs`: must be paired with returning `error.Thrown` from `NativeFn`
+    /// (D53).
+    threw_js: bool = false,
+};
+
+/// The shared execution context (M9.1, D51): one per top-level entry — a `resume` of an
+/// execution, or a host `rt.call` at guard depth 0. It owns the four things a model B
+/// chain shares, and every nested call (a nested VM, or a native-call record) charges
+/// the same instance instead of installing a fresh one. It lives on the runtime and is
+/// `active` only while a chain is in flight; outside a chain everything below is inert.
+pub const ExecContext = struct {
+    /// A chain is in flight: the budget, depth and registrations below are meaningful.
+    active: bool = false,
+    /// The chain's cumulative budget (E4). While active it is mirrored in
+    /// `rt.steps`/`rt.max_steps` — the counters `rt.step()` charges — so every VM in the
+    /// chain shares one counter and a nested call never installs a fresh budget. The
+    /// outer execution adopts its `used` here and saves the updated count back at the
+    /// chain's end (E4: cumulative over its resumes); a host `rt.call` begins at 0 and
+    /// discards the count (no slicing in M9.1, Q8).
+    used: u64 = 0,
+    max: u64 = 0,
+    /// The latched budget fault (Q8, review-frozen): the first exhaustion latches
+    /// `LimitExceeded`, so later nested execution cannot consume instructions
+    /// (`rt.step()` faults at once) and no native callback can clear or replace it. The
+    /// native boundary check (P4) faults the outer execution with the latch whatever the
+    /// native returned. Cleared when a new chain begins.
+    budget_fault: ?Error = null,
+    /// Logical call depth across the chain (D51 #2): every chained VM's live frames
+    /// plus every native-call record, checked against `max_call_depth` as one number.
+    /// A chain-less VM (the CLI's) keeps its own per-VM check in `Vm.enter`.
+    call_depth: u32 = 0,
+    /// The guard's engine entries (D52): one per in-flight native-call record, pushed
+    /// by native dispatch with the record as proof and popped (consumed) at its
+    /// teardown. The host entry needs no stack entry: the atomic `in_call` claim is the
+    /// depth-0 host entry, and any further host entry panics against it exactly as in
+    /// M9.0 (E2). Empty outside a chain.
+    records: std.ArrayList(*NativeRecord) = .empty,
+    /// VMs created inside the chain (D51 #4): registered while alive, so every
+    /// collection traces their stacks; a suspended VM stays registered for its whole
+    /// suspension. Empty outside a chain (asserted at chain begin and end).
+    vms: std.ArrayList(EngineRoots) = .empty,
+
+    /// The chain's top engine record, or null at depth 0 (no native in flight).
+    pub fn topRecord(cx: *const ExecContext) ?*NativeRecord {
+        return if (cx.records.items.len > 0) cx.records.items[cx.records.items.len - 1] else null;
+    }
+
+    /// Native dispatch (P4): pushes the record as the engine entry (D52). The record
+    /// must be fresh — never already on a stack — so a consumed record cannot be pushed
+    /// again (an engine bug, D49).
+    pub fn pushRecord(cx: *ExecContext, gpa: Allocator, record: *NativeRecord) error{OutOfMemory}!void {
+        std.debug.assert(!record.live);
+        record.live = true;
+        try cx.records.append(gpa, record);
+    }
+
+    /// Teardown (P4): consumes the record and pops its entry, on every outcome. The
+    /// record must be the stack's top — the callback that owns it is the innermost one
+    /// running — so a stale or foreign record reference cannot pop a different entry
+    /// (D52's scoping requirement: the capability dies with its callback).
+    pub fn popRecord(cx: *ExecContext, record: *NativeRecord) void {
+        std.debug.assert(record.live);
+        std.debug.assert(cx.topRecord() == record);
+        record.live = false;
+        _ = cx.records.pop();
+    }
+
+    /// Deregisters a chain VM at teardown (D51 #4). `ctx` is the VM whose `roots()` was
+    /// added; removing one that was never added is an engine bug (D49).
+    pub fn removeVm(cx: *ExecContext, ctx: *anyopaque) void {
+        for (cx.vms.items, 0..) |e, i| if (e.ctx == ctx) {
+            _ = cx.vms.swapRemove(i);
+            return;
+        };
+        unreachable; // a chain VM torn down without its registration
+    }
+};
+
 pub const Runtime = struct {
     gpa: Allocator,
     heap: Heap,
@@ -46,10 +146,37 @@ pub const Runtime = struct {
     /// All limits, for the engines (call depth, stack slots, interpreter depth).
     limits: Limits,
     steps: u64 = 0,
+    /// Host handles (M9.1, D50): the table is one GC root set (marked in `markRoots`).
+    handles: handles.Table,
+    /// The shared execution context (M9.1, D51): a chain's budget, depth, engine records
+    /// and active-VM registrations. Inert (inactive, lists empty) outside a chain.
+    exec_ctx: ExecContext = .{},
+    /// Overlap guard state (E2): true while a call into the runtime is running. The
+    /// embedding API's Guard claims it (M9.0), as do handle operations (M9.1); entry
+    /// kinds arrive with the execution context (P3). Atomic: cross-thread entry loses.
+    in_call: std.atomic.Value(bool) = .init(false),
+    /// The thread holding the depth-0 host entry while `in_call` is true (D52). Only
+    /// this thread may take a sanctioned engine descent while a native callback is active.
+    owner_thread: ?std.Thread.Id = null,
+    /// Use-after-destroy tag (E1): safe builds check it at every entry point. Best
+    /// effort: freed memory may be reused, so the check can miss; documented as such.
+    magic: u32 = alive_magic,
     exception: ?Exception = null,
+    /// Set by `rt.throwJs` when building the exception message string itself fails
+    /// (`OutOfMemory` or `LimitExceeded`): consumed when the native returns `error.Thrown`.
+    pending_throw_fault: ?Error = null,
     unsupported: ?Feature = null,
     /// For Unsupported(builtin): which global or member (an atom on the heap).
     unsupported_name: ?*const heap_mod.String = null,
+    /// Host-registered global functions (`defineGlobalFunction`, M9.1 D53). Persist
+    /// across runs (E3) and die with the runtime (E1).
+    host_globals: std.ArrayList(*Native) = .empty,
+    /// For `error.HostError` (M9.1, D53): the native's `out.host_message` copied into a
+    /// fixed buffer before the callback's stack unwinds, formatted into `Failure` via
+    /// `TextWriter` (E10).
+    host_message_buf: [256]u8 = undefined,
+    host_message_len: usize = 0,
+    host_message_truncated: bool = false,
     /// The built-in objects, created on first use (builtins.zig).
     realm: ?@import("builtins.zig").Realm = null,
     /// Arrays being converted to strings right now (cycle detection, object.join).
@@ -70,10 +197,26 @@ pub const Runtime = struct {
     internal_reason: ?[]const u8 = null,
 
     pub fn init(gpa: Allocator, limits: Limits, out: *std.Io.Writer) Runtime {
-        return .{ .gpa = gpa, .heap = .init(gpa, limits), .out = out, .max_steps = limits.max_steps, .limits = limits };
+        return .{
+            .gpa = gpa,
+            .heap = .init(gpa, limits),
+            .out = out,
+            .max_steps = limits.max_steps,
+            .limits = limits,
+            .handles = .{ .gpa = gpa, .max_tokens = limits.max_handles },
+        };
     }
 
     pub fn deinit(rt: *Runtime) void {
+        rt.magic = 0; // handles and API entries must not enter after this (E1)
+        for (rt.host_globals.items) |n| {
+            rt.gpa.free(n.name);
+            rt.gpa.destroy(n);
+        }
+        rt.host_globals.deinit(rt.gpa);
+        rt.handles.deinit();
+        rt.exec_ctx.records.deinit(rt.gpa);
+        rt.exec_ctx.vms.deinit(rt.gpa);
         rt.joining.deinit(rt.gpa);
         rt.extra_roots.deinit(rt.gpa);
         rt.heap.deinit();
@@ -83,12 +226,52 @@ pub const Runtime = struct {
     /// Charges one step of the execution budget, *before* the work it pays for. Checks
     /// first, so `steps` never exceeds `max_steps` and cannot overflow (even with
     /// `max_steps = maxInt(u64)`). What a step is depends on the engine (Limits.max_steps).
+    /// Under a chain (M9.1, D51) the counter is the execution context's: shared by every
+    /// VM and native record, and an exhaustion latches `budget_fault` (Q8) so no nested
+    /// call or native can clear or replace it.
     pub fn step(rt: *Runtime) Error!void {
         if (rt.steps >= rt.max_steps) {
             rt.limit_hit = .steps;
+            if (rt.exec_ctx.active and rt.exec_ctx.budget_fault == null)
+                rt.exec_ctx.budget_fault = error.LimitExceeded;
             return error.LimitExceeded;
         }
         rt.steps += 1;
+        if (rt.exec_ctx.active) rt.exec_ctx.used = rt.steps;
+    }
+
+    /// Begins a chain (M9.1, D51): one per top-level entry. Installs the cumulative
+    /// budget as the live counters, so every VM in the chain charges it via `rt.step()`;
+    /// resets the per-chain state. The guard's host entry (E2) must already be held.
+    pub fn beginChain(rt: *Runtime, used: u64, max: u64) void {
+        const cx = &rt.exec_ctx;
+        std.debug.assert(!cx.active);
+        std.debug.assert(cx.records.items.len == 0);
+        std.debug.assert(cx.vms.items.len == 0); // the last chain's VMs all deregistered
+        cx.active = true;
+        cx.used = used;
+        cx.max = max;
+        cx.budget_fault = null;
+        cx.call_depth = 0;
+        rt.steps = used;
+        rt.max_steps = max;
+    }
+
+    /// Ends the chain: returns the cumulative step count for the caller to save back
+    /// (E4), and deactivates the context. The engine records and VM registrations must
+    /// already be gone (their teardowns pop/subtract as they go).
+    pub fn endChain(rt: *Runtime) u64 {
+        const cx = &rt.exec_ctx;
+        std.debug.assert(cx.active);
+        std.debug.assert(cx.records.items.len == 0);
+        std.debug.assert(cx.vms.items.len == 0);
+        cx.active = false;
+        cx.used = 0;
+        cx.max = 0;
+        cx.budget_fault = null;
+        cx.call_depth = 0;
+        rt.max_steps = rt.limits.max_steps;
+        return rt.steps;
     }
 
     /// Records a JavaScript exception and returns error.Thrown. If building the message
@@ -133,6 +316,11 @@ pub const Runtime = struct {
         std.debug.assert(rt.joining.items.len == 0);
         if (rt.engine_roots) |e| e.mark(e.ctx, h);
         for (rt.extra_roots.items) |e| e.mark(e.ctx, h);
+        // The chain's nested VMs (M9.1, D51 #4): registered while alive, so a collection
+        // inside a native callback keeps a suspended VM's stacks and everything they
+        // reference. Empty outside a chain.
+        for (rt.exec_ctx.vms.items) |e| e.mark(e.ctx, h);
+        rt.handles.mark(h); // host handles (M9.1, D50): slots with a reference
     }
 
     /// Adds a root set every collection marks, until `removeRoots` (M9.0).

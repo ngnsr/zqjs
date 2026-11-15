@@ -95,6 +95,19 @@ pub const Vm = struct {
     pc: u32 = 0,
     halted: bool = false,
     fault: ?Error = null,
+    /// A nested-call VM (M9.1, D51): the closure runs as frame 0 and `return` ends the
+    /// call into `nested_result` — no caller frame exists. The `.return` "in the script"
+    /// bug applies only to ordinary script frames.
+    nested: bool = false,
+    /// The nested call's result, set when its frame 0 returns. Null until then; a halt
+    /// without one is an engine bug (a function's proto always ends in `return`).
+    nested_result: ?Value = null,
+    /// The execution context this VM charges (M9.1, D51): set while a chain runs it —
+    /// the embedding API's resume, or a nested call — so frames check the chain's shared
+    /// `call_depth` instead of a per-VM limit. Null for a chain-less VM (the CLI's),
+    /// which keeps its own per-VM check. Torn down in `deinit` (subtracting the frames
+    /// still live), so a VM faulting mid-recursion unwinds its charge exactly.
+    chain: ?*rt_mod.ExecContext = null,
 
     /// `script` must have passed `verify` and must outlive the VM (and every use of its
     /// closures). Allocates with `rt.gpa`; on failure nothing is left allocated.
@@ -104,7 +117,7 @@ pub const Vm = struct {
         errdefer vm.deinit();
         try vm.reserve(script);
         try vm.frames.ensureTotalCapacity(rt.gpa, 1);
-        vm.initLocals(script, 0, 0);
+        vm.initLocals(script, &.{});
         vm.frames.appendAssumeCapacity(.{ .proto = script, .closure = null, .return_pc = 0, .locals_base = 0, .stack_base = 0, .result_index = 0, .this = null, .stack_end = script.max_stack });
         vm.locals_len = script.slot_count;
         vm.reserved = script.slot_count + script.max_stack;
@@ -112,6 +125,9 @@ pub const Vm = struct {
     }
 
     pub fn deinit(vm: *Vm) void {
+        if (vm.chain) |cx| if (cx.active) {
+            cx.call_depth -= @intCast(vm.frames.items.len); // the frames still live unwind their depth charge (D51)
+        };
         if (vm.rt.engine_roots) |e| if (e.ctx == @as(*anyopaque, vm)) {
             vm.rt.engine_roots = null; // no collection may scan a VM that is gone
         };
@@ -120,6 +136,42 @@ pub const Vm = struct {
         gpa.free(vm.locals);
         gpa.free(vm.stack);
         vm.* = undefined;
+    }
+
+    /// A VM for one nested call (M9.1, D51): the closure runs as frame 0 with `this` and
+    /// `args` bound (missing parameters undefined, extra ones ignored, as a call binds
+    /// them); its `return` ends the call into `nested_result`, so no caller frame exists.
+    /// It shares the runtime's heap and realm. The caller sets `chain` (the shared
+    /// budget and depth), registers `roots()` with the execution context before the
+    /// first step, and tears the VM down with `deinit` — which unwinds exactly the
+    /// frames a fault left live. Transactional: on failure nothing is left allocated.
+    pub fn initCall(rt: *Runtime, c: *const Closure, this: ?Value, args: []const Value) Error!Vm {
+        c.obj.checkLive();
+        const v = switch (c.impl) {
+            .vm => |v| v,
+            .tree => return rt.bug("a tree-walker closure in a nested call"),
+        };
+        const callee: *const Proto = @ptrCast(@alignCast(v.proto));
+        const argc: u32 = @intCast(args.len);
+        if (@as(u64, argc) + callee.slot_count + callee.max_stack > rt.limits.max_stack_slots) return rt.limit(.stack_slots);
+        var vm: Vm = .{ .rt = rt, .nested = true };
+        errdefer vm.deinit();
+        try vm.reserve(callee);
+        try vm.frames.ensureTotalCapacity(rt.gpa, 1);
+        vm.initLocals(callee, args);
+        vm.frames.appendAssumeCapacity(.{
+            .proto = callee,
+            .closure = c,
+            .return_pc = 0,
+            .locals_base = 0,
+            .stack_base = 0,
+            .result_index = 0,
+            .this = this,
+            .stack_end = callee.max_stack,
+        });
+        vm.locals_len = callee.slot_count;
+        vm.reserved = callee.slot_count + callee.max_stack;
+        return vm;
     }
 
     /// Runs to `halt` or the first error.
@@ -192,7 +244,7 @@ pub const Vm = struct {
         // taken there would point at a copy).
         const h = &vm.rt.heap;
         if (h.collect_requested or h.collect_always) {
-            vm.rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
+            if (!vm.nested) vm.rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
             vm.rt.collect();
         }
         return vm.execute() catch |e| {
@@ -436,11 +488,22 @@ pub const Vm = struct {
                 const args = vm.sp - argc;
                 const receiver: ?Value = if (op == .call_method) vm.stack[base] else null;
                 switch (vm.stack[args - 1]) {
-                    // The native *borrows* the argument slice: valid only during the call; it
-                    // cannot call back into JS, so the stack cannot move under it. If it fails,
-                    // nothing has been popped: the stack is still a valid pre-call state.
+                    // A built-in native *borrows* the argument slice: valid only during the call; it
+                    // cannot call back into JS, so the stack cannot move under it. A host native
+                    // (D53) receives temporary handles owned by its native-call record. If either
+                    // fails, nothing has been popped: the stack is still a valid pre-call state (D35).
                     .native => |n| {
-                        const result = try n.call(rt, receiver orelse .undefined, vm.stack[args..vm.sp]);
+                        const this_obj: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
+                        const result = (if (n.host) |h|
+                            h.call(rt, h.ctx, this_obj, vm.stack[args..vm.sp])
+                        else
+                            n.call(rt, receiver orelse .undefined, vm.stack[args..vm.sp])) catch |e| {
+                            if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
+                                return rt.limit(.steps);
+                            return e;
+                        };
+                        if (rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
+                            return rt.limit(.steps);
                         vm.stack[base] = result;
                         vm.sp = base + 1;
                     },
@@ -454,9 +517,20 @@ pub const Vm = struct {
                 }
             },
             .@"return" => {
-                if (vm.frames.items.len < 2) return vm.bug("return in the script");
+                if (vm.frames.items.len < 2) {
+                    // A nested call's body returned (D51): the value is the call's
+                    // result, and the call ends here — no caller frame to unwind to.
+                    if (vm.nested and vm.frames.items.len == 1) {
+                        const v = try vm.peek(0);
+                        vm.nested_result = v;
+                        vm.halted = true;
+                        return .halted;
+                    }
+                    return vm.bug("return in the script");
+                }
                 const v = try vm.peek(0);
                 const f = vm.frames.pop().?;
+                if (vm.chain) |cx| cx.call_depth -= 1; // the frame died (D51 #2)
                 vm.locals_len = f.locals_base;
                 vm.reserved -= f.proto.slot_count + f.proto.max_stack;
                 vm.sp = f.result_index;
@@ -490,14 +564,18 @@ pub const Vm = struct {
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
         const limits = vm.rt.limits;
-        // 1. limits
-        if (vm.frames.items.len >= limits.max_call_depth) return vm.rt.limit(.call_depth);
+        // 1. limits — a chained VM checks the chain's shared depth (D51 #2: every VM's
+        // frames plus every native record, one `max_call_depth` across the chain); a
+        // chain-less VM (the CLI) checks its own frames.
+        if (vm.chain) |cx| {
+            if (cx.call_depth >= limits.max_call_depth) return vm.rt.limit(.call_depth);
+        } else if (vm.frames.items.len >= limits.max_call_depth) return vm.rt.limit(.call_depth);
         if (vm.reserved + callee.slot_count + callee.max_stack > limits.max_stack_slots) return vm.rt.limit(.stack_slots);
         // 2. capacity (may move the stacks: fine, everything is an index)
         try vm.frames.ensureUnusedCapacity(vm.rt.gpa, 1);
         try vm.reserve(callee);
         // 3. the callee's locals, above locals_len (not live yet, so nothing visible changes)
-        vm.initLocals(callee, args, argc);
+        vm.initLocals(callee, vm.stack[args..][0..argc]);
         // 4. commit
         vm.frames.appendAssumeCapacity(.{
             .proto = callee,
@@ -512,6 +590,7 @@ pub const Vm = struct {
         vm.locals_len += callee.slot_count;
         vm.reserved += callee.slot_count + callee.max_stack;
         vm.pc = 0;
+        if (vm.chain) |cx| cx.call_depth += 1; // the frame is live now (D51 #2)
     }
 
     /// Makes room for a frame of `p` above the current locals and operands. Grows
@@ -547,12 +626,12 @@ pub const Vm = struct {
     }
 
     /// Initialises the `p.slot_count` locals above locals_len: the parameters (slots
-    /// param_slot…) from the `argc` values at stack[args…] (missing ones are undefined,
-    /// extra ones ignored), everything else in the TDZ.
-    fn initLocals(vm: *Vm, p: *const Proto, args: u32, argc: u32) void {
+    /// param_slot…) from `args` (missing ones are undefined, extra ones ignored),
+    /// everything else in the TDZ.
+    fn initLocals(vm: *Vm, p: *const Proto, args: []const Value) void {
         for (vm.locals[vm.locals_len..][0..p.slot_count], 0..) |*s, n| {
             const i = @as(i64, @intCast(n)) - p.param_slot; // parameter number
-            s.* = .{ .value = if (i >= 0 and i < p.param_count) (if (i < argc) vm.stack[args + @as(u32, @intCast(i))] else .undefined) else null };
+            s.* = .{ .value = if (i >= 0 and i < p.param_count) (if (i < args.len) args[@intCast(i)] else .undefined) else null };
         }
     }
 

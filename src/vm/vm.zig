@@ -488,11 +488,16 @@ pub const Vm = struct {
                 const args = vm.sp - argc;
                 const receiver: ?Value = if (op == .call_method) vm.stack[base] else null;
                 switch (vm.stack[args - 1]) {
-                    // The native *borrows* the argument slice: valid only during the call; it
-                    // cannot call back into JS, so the stack cannot move under it. If it fails,
-                    // nothing has been popped: the stack is still a valid pre-call state.
+                    // A built-in native *borrows* the argument slice: valid only during the call; it
+                    // cannot call back into JS, so the stack cannot move under it. A host native
+                    // (D53) receives temporary handles owned by its native-call record. If either
+                    // fails, nothing has been popped: the stack is still a valid pre-call state (D35).
                     .native => |n| {
-                        const result = n.call(rt, receiver orelse .undefined, vm.stack[args..vm.sp]) catch |e| {
+                        const this_obj: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
+                        const result = (if (n.host) |h|
+                            h.call(rt, h.ctx, this_obj, vm.stack[args..vm.sp])
+                        else
+                            n.call(rt, receiver orelse .undefined, vm.stack[args..vm.sp])) catch |e| {
                             if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
                                 return rt.limit(.steps);
                             return e;

@@ -23,12 +23,23 @@ pub const Value = union(enum) {
     }
 };
 
+/// A host native's internal callback (M9.1, D53): implemented in `src/api.zig`, which
+/// mints the temporary argument tokens, pushes the native-call record, calls the host's
+/// `NativeFn`, and copies the result out before releasing the tokens (D50).
+pub const HostCallFn = fn (rt: *Runtime, ctx: ?*anyopaque, this: ?Value, args: []const Value) Error!Value;
+
 pub const Native = struct {
     name: []const u8,
     /// `this` is the call's receiver (`.undefined` for a plain call); `args` is a temporary
-    /// slice owned by the caller, valid only during the call. A native never calls back
-    /// into JS (M7: conversions that would need to are Unsupported, D40).
+    /// slice owned by the caller, valid only during the call. A built-in native never calls
+    /// back into JS (M7: conversions that would need to are Unsupported, D40).
     call: *const fn (rt: *Runtime, this: Value, args: []const Value) Error!Value,
+    /// Set for host-registered globals (`defineGlobalFunction`, M9.1 D53): called instead
+    /// of `call`, with `ctx` borrowed from the host until `Runtime.destroy`.
+    host: ?struct {
+        call: *const HostCallFn,
+        ctx: ?*anyopaque,
+    } = null,
     /// For the namespace globals (`Object`, `Array`): where their static members live.
     namespace: ?enum { object, array } = null,
 };

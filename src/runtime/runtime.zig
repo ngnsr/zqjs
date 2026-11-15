@@ -3,6 +3,7 @@
 //!
 //! Errors are split by who caused them (LANGUAGE.md §1):
 //!   error.Thrown         a JavaScript exception; details in `exception`
+//!   error.HostError      a host native operation failed (M9.1, D53); message in `host_message`
 //!   error.LimitExceeded  a resource limit; which one in `limitHit()`
 //!   error.Unsupported    outside ZQJS at runtime; which feature in `unsupported`
 //!   error.OutOfMemory    the host allocator failed
@@ -16,11 +17,12 @@ const Allocator = std.mem.Allocator;
 const heap_mod = @import("heap.zig");
 const Heap = heap_mod.Heap;
 const handles = @import("handles.zig");
+const Native = @import("value.zig").Native;
 const Limits = @import("../limits.zig").Limits;
 const Limit = @import("../limits.zig").Limit;
 const Feature = @import("../frontend/diag.zig").Feature;
 
-pub const Error = error{ Thrown, LimitExceeded, Unsupported, OutOfMemory, WriteFailed, Internal };
+pub const Error = error{ Thrown, HostError, LimitExceeded, Unsupported, OutOfMemory, WriteFailed, Internal };
 
 pub const ErrorName = enum { ReferenceError, TypeError, RangeError };
 
@@ -54,6 +56,13 @@ pub const NativeRecord = struct {
     /// Set while the record is on an execution context's stack; consumed (null) at
     /// teardown. A stale record reference fails the stack-top check (D52).
     live: bool = false,
+    /// True while a nested `rt.call` inside this callback is running a VM or built-in
+    /// native: while suspended, the callback's capability is paused (e.g. an output
+    /// writer's `drain` during a nested `print` must still panic, D52).
+    suspended: bool = false,
+    /// Set by `rt.throwJs`: must be paired with returning `error.Thrown` from `NativeFn`
+    /// (D53).
+    threw_js: bool = false,
 };
 
 /// The shared execution context (M9.1, D51): one per top-level entry — a `resume` of an
@@ -146,13 +155,28 @@ pub const Runtime = struct {
     /// embedding API's Guard claims it (M9.0), as do handle operations (M9.1); entry
     /// kinds arrive with the execution context (P3). Atomic: cross-thread entry loses.
     in_call: std.atomic.Value(bool) = .init(false),
+    /// The thread holding the depth-0 host entry while `in_call` is true (D52). Only
+    /// this thread may take a sanctioned engine descent while a native callback is active.
+    owner_thread: ?std.Thread.Id = null,
     /// Use-after-destroy tag (E1): safe builds check it at every entry point. Best
     /// effort: freed memory may be reused, so the check can miss; documented as such.
     magic: u32 = alive_magic,
     exception: ?Exception = null,
+    /// Set by `rt.throwJs` when building the exception message string itself fails
+    /// (`OutOfMemory` or `LimitExceeded`): consumed when the native returns `error.Thrown`.
+    pending_throw_fault: ?Error = null,
     unsupported: ?Feature = null,
     /// For Unsupported(builtin): which global or member (an atom on the heap).
     unsupported_name: ?*const heap_mod.String = null,
+    /// Host-registered global functions (`defineGlobalFunction`, M9.1 D53). Persist
+    /// across runs (E3) and die with the runtime (E1).
+    host_globals: std.ArrayList(*Native) = .empty,
+    /// For `error.HostError` (M9.1, D53): the native's `out.host_message` copied into a
+    /// fixed buffer before the callback's stack unwinds, formatted into `Failure` via
+    /// `TextWriter` (E10).
+    host_message_buf: [256]u8 = undefined,
+    host_message_len: usize = 0,
+    host_message_truncated: bool = false,
     /// The built-in objects, created on first use (builtins.zig).
     realm: ?@import("builtins.zig").Realm = null,
     /// Arrays being converted to strings right now (cycle detection, object.join).
@@ -185,6 +209,11 @@ pub const Runtime = struct {
 
     pub fn deinit(rt: *Runtime) void {
         rt.magic = 0; // handles and API entries must not enter after this (E1)
+        for (rt.host_globals.items) |n| {
+            rt.gpa.free(n.name);
+            rt.gpa.destroy(n);
+        }
+        rt.host_globals.deinit(rt.gpa);
         rt.handles.deinit();
         rt.exec_ctx.records.deinit(rt.gpa);
         rt.exec_ctx.vms.deinit(rt.gpa);

@@ -100,7 +100,8 @@ pub const print: Native = .{ .name = "print", .call = printImpl };
 pub const object_global: Native = .{ .name = "Object", .call = notCallable, .namespace = .object };
 pub const array_global: Native = .{ .name = "Array", .call = notCallable, .namespace = .array };
 
-/// A global read: implemented, known to node (Unsupported), or a ReferenceError.
+/// A global read: implemented, host-registered (M9.1, D53), known to node (Unsupported),
+/// or a ReferenceError.
 pub fn global(rt: *Runtime, name: []const u8) Error!Value {
     if (std.mem.eql(u8, name, "undefined")) return .undefined;
     if (std.mem.eql(u8, name, "NaN")) return .{ .number = std.math.nan(f64) };
@@ -108,11 +109,18 @@ pub fn global(rt: *Runtime, name: []const u8) Error!Value {
     if (std.mem.eql(u8, name, "print")) return .{ .native = &print };
     if (std.mem.eql(u8, name, "Object")) return .{ .native = &object_global };
     if (std.mem.eql(u8, name, "Array")) return .{ .native = &array_global };
+    for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return .{ .native = n };
     if (names.has(.global, name)) {
         rt.unsupported_name = try rt.heap.internAscii(name);
         return rt.fail(.builtin);
     }
     return rt.throw(.ReferenceError, &.{ .{ .ascii = name }, .{ .ascii = " is not defined" } });
+}
+
+/// Whether `name` is already a built-in or node-known global name (D53: duplicate
+/// registration is rejected, including built-in names).
+pub fn isBuiltinGlobal(name: []const u8) bool {
+    return std.mem.eql(u8, name, "print") or names.has(.global, name);
 }
 
 fn notCallable(rt: *Runtime, this: Value, args: []const Value) Error!Value {

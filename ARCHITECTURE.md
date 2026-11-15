@@ -12,10 +12,11 @@ source ─▶ Lexer ─▶ Parser ─▶ AST ─▶ Resolver ─▶ Compiler ─
 Dependencies point one way: frontend → compiler → runtime/VM. The frontend knows nothing about
 the runtime.
 
-## Built so far (M8)
+## Built so far (M9.1)
 
 | file | role |
 |---|---|
+| `src/api.zig` | public `zqjs` embedding module: `Runtime`, `Program`, `Execution`, `Handle`, `defineGlobalFunction`, `call`, `throwJs`, `Diagnostic`, `Failure`, and the re-entrant entry guard (D46–D54) |
 | `src/frontend/token.zig` | `Token` (tag + byte span + `newline_before`) and the full JS punctuator set |
 | `src/frontend/lexer.zig` | pull-based, allocation-free tokenizer. Validates numbers; finds string ends |
 | `src/frontend/ast.zig` | `Expr` and `Stmt` nodes, `Ref` (variable use), `Declarator`, `Script` |
@@ -25,7 +26,8 @@ the runtime.
 | `src/frontend/diag.zig` | `Diagnostic` (kind, feature, span), line/column, rendering with caret |
 | `src/runtime/value.zig` | `Value` (tagged union) and `Native` |
 | `src/runtime/heap.zig` | `Heap`: all objects (`String`, `Cell`, `Closure`, `Env`, `Object`), atoms (weak table), counting allocator, byte accounting and limits, the store API (barrier hook), the collector (mark through `forEachChild`, weak-atom cleanup, sweep, scheduling, stats), tombstones and the heap verifier (D8-D11, GC_DESIGN) |
-| `src/runtime/runtime.zig` | `Runtime`: heap, output, step budget, exception / stop reason |
+| `src/runtime/handles.zig` | `Table` and `Token`: reference-counted GC-rooted value slots and generation-checked handle tokens (D50, D54) |
+| `src/runtime/runtime.zig` | `Runtime`: heap, output, `ExecContext` (shared step budget, call depth, active VM roots, native records), exception / stop reason (D51–D53) |
 | `src/runtime/ops.zig` | all JS value semantics: ToNumber, ToString (number formatting), ToBoolean, operators |
 | `src/runtime/object.zig` | property get/set/define/delete/`in`, keys, prototype chains, ToPrimitive, join (D38, D40) |
 | `src/runtime/builtins.zig` | the realm (built-in objects), implemented built-ins, global lookup (D39) |
@@ -75,7 +77,10 @@ oracle (D16).
 ## Tests
 ```
 src/**                    unit tests next to the code (`test` blocks)
-tests/*_test.zig          integration tests, one binary per file (through the public zqjs module)
+tests/*_test.zig          integration tests, one binary per file
+tests/api_test.zig        public `zqjs` embedding API, handles, native callbacks, R1/R2, guard panics
+tests/vm_test.zig         VM execution, step contract, nested-call VMs, shared execution context
+tests/gc_test.zig         generational GC, cards, remembered set, adaptive scheduling, raw-store scanner
 tests/frontend_test.zig   allocation-failure paths + fuzzing of parse → resolve → dump
 tests/interpreter_test.zig limits, allocation failures, exception ownership, fuzzing of runs
 tests/syntax_test.zig     tests/syntax/cases.jsonl: outcome + resolved dump per source

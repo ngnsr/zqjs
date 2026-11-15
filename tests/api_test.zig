@@ -2273,3 +2273,65 @@ test "stress: 1,000,000+ native calls under max_handles = 16 recycle slots with 
     try testing.expectEqual(@as(?f64, 42), anchor.number());
     try testing.expectEqual(@as(?f64, 42), anchor_dup.number());
 }
+
+test "M9.1: Memory reports minor/major GC counts and last/max pause durations with Options.clock" {
+    const FakeClock = struct {
+        now_ns: u64 = 1_000_000,
+        step_ns: u64 = 10_000,
+
+        fn tick(raw: ?*anyopaque) u64 {
+            const c: *@This() = @ptrCast(@alignCast(raw.?));
+            const cur = c.now_ns;
+            c.now_ns += c.step_ns;
+            return cur;
+        }
+    };
+
+    var clock: FakeClock = .{};
+    const rt = try zqjs.Runtime.create(testing.allocator, .{
+        .limits = .{
+            .nursery_bytes = 4 * 1024,
+            .max_heap_bytes = 512 * 1024,
+        },
+        .clock = FakeClock.tick,
+        .clock_ctx = &clock,
+    });
+    defer rt.destroy();
+
+    const p = try rt.compile(
+        "gc_telemetry.js",
+        \\let sink = 0;
+        \\for (let i = 0; i < 300; i = i + 1) {
+        \\  let tmp = { a: i, b: i + 1 };
+        \\  sink = sink + tmp.a;
+        \\}
+    ,
+        null,
+    );
+    defer p.destroy();
+    try rt.run(p, null);
+
+    const after_minor = rt.memory();
+    try testing.expect(after_minor.minor_collections >= 1);
+    try testing.expectEqual(
+        after_minor.collections,
+        after_minor.minor_collections + after_minor.major_collections,
+    );
+    try testing.expect(after_minor.last_gc_pause_ns > 0);
+    try testing.expect(after_minor.max_gc_pause_ns >= after_minor.last_gc_pause_ns);
+
+    // Force a shorter pause on an explicit major collection and verify max_gc_pause_ns stays at the high-water mark.
+    const prev_max = after_minor.max_gc_pause_ns;
+    clock.step_ns = 1_000;
+    rt.collectGarbage();
+
+    const after_major = rt.memory();
+    try testing.expectEqual(after_minor.major_collections + 1, after_major.major_collections);
+    try testing.expectEqual(
+        after_major.collections,
+        after_major.minor_collections + after_major.major_collections,
+    );
+    try testing.expect(after_major.last_gc_pause_ns > 0);
+    try testing.expect(after_major.last_gc_pause_ns < prev_max);
+    try testing.expectEqual(prev_max, after_major.max_gc_pause_ns);
+}

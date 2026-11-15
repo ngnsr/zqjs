@@ -78,7 +78,7 @@ Any JavaScript value held by the host across an allocation, garbage collection, 
 - **Stale/Foreign Handle Detection, Concurrent `Limits.max_handles`, & `Memory` Accounting:**
   - Every handle operation validates `owner`, slot bounds, `live`, and `generation`. Using a handle after `release()` — even after its old slot has been reused by a newer handle — deterministically panics with `"zqjs: Handle used after release"`. Passing a handle minted by one runtime into another live runtime deterministically panics with `"zqjs: Handle from another Runtime"`.
   - `Limits.max_handles` bounds the **maximum slot capacity / concurrent handle capacity** of the handle table, not cumulative lifetime handle creations. Freed slots on the free list are reused on subsequent `mint`/`dup`/callback calls without growing the table; exceeding `max_handles` concurrent handles returns `error.LimitExceeded` (`Limit.handles`) and leaves the runtime usable.
-  - `rt.memory()` reports separated metrics: `heap_bytes` (GC-managed JS heap), `handle_bytes` (actual allocated handle-table capacity), and `bytes` (`heap_bytes + handle_bytes`).
+  - `rt.memory()` reports separated metrics (`heap_bytes` for the GC-managed JS heap, `handle_bytes` for actual allocated handle-table capacity, `bytes` = `heap_bytes + handle_bytes`, `peak`), collection counts (`collections`, `minor_collections`, `major_collections`), and — when an optional monotonic nanosecond `Options.clock` callback is supplied — GC pause telemetry (`last_gc_pause_ns`, `max_gc_pause_ns`).
 
 ### 6. Host Natives & Callback Handle Ownership (`defineGlobalFunction`, D53)
 Host functions are registered on the realm with `rt.defineGlobalFunction(name, native_fn, ctx)`:

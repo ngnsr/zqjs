@@ -33,6 +33,10 @@ pub const Options = struct {
     limits: Limits = .{},
     /// Where `print` writes. Null: output is discarded.
     output: ?*std.Io.Writer = null,
+    /// Optional monotonic nanosecond clock for GC pause telemetry (`Memory.last_gc_pause_ns`
+    /// and `Memory.max_gc_pause_ns`). Null: pause durations stay 0 (D8).
+    clock: ?*const fn (ctx: ?*anyopaque) u64 = null,
+    clock_ctx: ?*anyopaque = null,
 };
 
 pub const Status = enum { finished, suspended };
@@ -189,8 +193,16 @@ pub const Memory = struct {
     heap_bytes: usize,
     /// Allocated handle-table capacity in bytes.
     handle_bytes: usize,
-    /// Number of GC collections completed so far.
+    /// Number of GC collections completed so far (`minor_collections + major_collections`).
     collections: u64,
+    /// Number of minor (nursery) collections completed so far.
+    minor_collections: u64 = 0,
+    /// Number of major (full-heap) collections completed so far.
+    major_collections: u64 = 0,
+    /// Duration of the most recent GC pause in nanoseconds (`0` when `Options.clock == null`).
+    last_gc_pause_ns: u64 = 0,
+    /// Maximum GC pause duration observed so far in nanoseconds (`0` when `Options.clock == null`).
+    max_gc_pause_ns: u64 = 0,
 };
 
 pub const Runtime = opaque {
@@ -204,8 +216,21 @@ pub const Runtime = opaque {
 
     pub fn create(gpa: Allocator, options: Options) error{OutOfMemory}!*Runtime {
         const r = try gpa.create(RuntimeImpl);
-        r.* = .{ .gpa = gpa, .rt = undefined, .discard = .init(&.{}) };
+        r.* = .{
+            .gpa = gpa,
+            .rt = undefined,
+            .discard = .init(&.{}),
+            .clock = options.clock,
+            .clock_ctx = options.clock_ctx,
+        };
         r.rt = IRuntime.init(gpa, options.limits, options.output orelse &r.discard.writer);
+        if (options.clock != null) {
+            r.rt.heap.observer = .{
+                .ctx = r,
+                .clock = RuntimeImpl.observerClock,
+                .record = RuntimeImpl.observerRecord,
+            };
+        }
         return @ptrCast(r);
     }
 
@@ -282,6 +307,10 @@ pub const Runtime = opaque {
             .heap_bytes = h.bytes,
             .handle_bytes = hdl.accounted,
             .collections = h.stats.collections,
+            .minor_collections = h.stats.minor,
+            .major_collections = h.stats.collections - h.stats.minor,
+            .last_gc_pause_ns = r.last_gc_pause_ns,
+            .max_gc_pause_ns = r.max_gc_pause_ns,
         };
     }
 
@@ -501,9 +530,26 @@ const RuntimeImpl = struct {
     programs: std.ArrayList(*ProgramImpl) = .empty,
     executions: std.ArrayList(*ExecutionImpl) = .empty,
     host_natives: std.ArrayList(*HostNativeEntry) = .empty,
+    clock: ?*const fn (ctx: ?*anyopaque) u64 = null,
+    clock_ctx: ?*anyopaque = null,
+    last_gc_pause_ns: u64 = 0,
+    max_gc_pause_ns: u64 = 0,
     /// A static-format buffer for `rt.internal_reason` (the reason of the first
     /// defensive-check failure), so poisoning never allocates.
     reason_buf: [160]u8 = undefined,
+
+    fn observerClock(ctx: *anyopaque) u64 {
+        const r: *RuntimeImpl = @ptrCast(@alignCast(ctx));
+        return r.clock.?(r.clock_ctx);
+    }
+
+    fn observerRecord(ctx: *anyopaque, sample: internal.heap.Heap.Sample) void {
+        const r: *RuntimeImpl = @ptrCast(@alignCast(ctx));
+        r.last_gc_pause_ns = sample.duration_ns;
+        if (sample.duration_ns > r.max_gc_pause_ns) {
+            r.max_gc_pause_ns = sample.duration_ns;
+        }
+    }
 
     fn defineGlobalFunctionImpl(r: *RuntimeImpl, name: []const u8, native: *const NativeFn, ctx: ?*anyopaque) error{ OutOfMemory, NameTaken }!void {
         if (internal.builtins.isBuiltinGlobal(name)) return error.NameTaken;

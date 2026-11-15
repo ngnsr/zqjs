@@ -5,7 +5,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const zqjs = @import("zqjs");
+const zqjs = @import("zqjs_internal");
 const support = @import("support.zig");
 const Op = zqjs.bytecode.Op;
 

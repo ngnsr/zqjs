@@ -11,7 +11,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const mod = b.addModule("zqjs", .{
+    // Two modules (M9.0, D46). `zqjs_internal` is everything (src/root.zig): tests, tools and
+    // the CLI's debug modes import it, and it is never exported. `zqjs` (src/api.zig) is the
+    // embedding API built on it, and the only module an embedder's build can get: the VM,
+    // heap and bytecode stay unreachable, so changing them never breaks an embedder.
+    const mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -29,7 +33,13 @@ pub fn build(b: *std.Build) void {
     // `zig build gc-mutants` uses it; never set it for a real build.
     options.addOption([]const u8, "gc_mutation", b.option([]const u8, "gc-mutation", "GC: break one barrier piece on purpose (tests)") orelse "none");
     mod.addOptions("build_options", options);
-    const imports: []const std.Build.Module.Import = &.{.{ .name = "zqjs", .module = mod }};
+    const api = b.addModule("zqjs", .{
+        .root_source_file = b.path("src/api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zqjs_internal", .module = mod }},
+    });
+    const imports: []const std.Build.Module.Import = &.{ .{ .name = "zqjs_internal", .module = mod }, .{ .name = "zqjs", .module = api } };
 
     const exe = b.addExecutable(.{
         .name = "zqjs",
@@ -75,6 +85,16 @@ pub fn build(b: *std.Build) void {
         integration.setCwd(b.path(".")); // diff_test reads tests/diff at runtime
         test_step.dependOn(&integration.step);
     }
+    // The embedding API's tests see only `zqjs`, as an embedder does: an import of
+    // `zqjs_internal` there fails to build.
+    const api_tests = b.addRunArtifact(b.addTest(.{ .name = "api_test", .filters = filters, .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/api_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zqjs", .module = api }},
+    }) }));
+    api_tests.setCwd(b.path("."));
+    test_step.dependOn(&api_tests.step);
 
     // The broken builds (M8.1): for each heap.Mutation, the `mutation:` tests under
     // -Dgc-stress, which pass only if the verifier catches that mutant.
@@ -90,7 +110,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/gc_test.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zqjs", .module = mutant_mod }},
+            .imports = &.{.{ .name = "zqjs_internal", .module = mutant_mod }},
         }) }));
         mutant.setCwd(b.path("."));
         mutants.dependOn(&mutant.step);
@@ -122,7 +142,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/bench.zig"),
             .target = target,
             .optimize = .ReleaseFast,
-            .imports = &.{.{ .name = "zqjs", .module = bench_mod }},
+            .imports = &.{.{ .name = "zqjs_internal", .module = bench_mod }},
         }),
     }));
     bench.setCwd(b.path("."));
@@ -135,7 +155,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/gc_report.zig"),
             .target = target,
             .optimize = .ReleaseFast,
-            .imports = &.{.{ .name = "zqjs", .module = bench_mod }},
+            .imports = &.{.{ .name = "zqjs_internal", .module = bench_mod }},
         }),
     }));
     gc_report.setCwd(b.path("."));

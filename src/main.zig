@@ -10,7 +10,7 @@
 //!   --verify-heap    verify the heap after every collection (a GC debugging aid)
 
 const std = @import("std");
-const zqjs = @import("zqjs");
+const zqjs = @import("zqjs_internal");
 
 const usage =
     \\usage: zqjs [--test | --dump-ast | --dump-bytecode] [options] FILE

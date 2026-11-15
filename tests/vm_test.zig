@@ -808,10 +808,10 @@ test "public Runtime.call: poisoned runtime returns Internal, closure round-trip
         const h = try rt.newNumber(7);
         defer h.release();
 
-        // Poison the internal runtime via the token's owner pointer (simulating a prior D49 bug).
-        const tok: *zqjs.handles.Token = @ptrCast(@alignCast(h));
-        tok.owner.bug("simulated internal failure") catch {};
-        try testing.expect(tok.owner.poisoned);
+        // Poison the internal runtime via the handle's owner pointer (simulating a prior D49 bug).
+        const irt: *zqjs.Runtime = @ptrCast(@alignCast(h.owner));
+        irt.bug("simulated internal failure") catch {};
+        try testing.expect(irt.poisoned);
 
         var failure: api.Failure = .{};
         try testing.expectError(error.Internal, rt.call(h, null, &.{}, &failure));
@@ -858,14 +858,17 @@ test "public Runtime.call: poisoned runtime returns Internal, closure round-trip
 
         const arg = try rt.newNumber(5);
         defer arg.release();
-        const irt = @as(*zqjs.handles.Token, @ptrCast(@alignCast(arg))).owner;
+        const irt: *zqjs.Runtime = @ptrCast(@alignCast(arg.owner));
         const ex_vm: *zqjs.Vm = @ptrCast(@alignCast(irt.extra_roots.items[1].ctx));
 
-        const sum_h: *api.Handle = @ptrCast(try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[0].cell.value.?.closure }));
+        const sum_tok = try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[0].cell.value.?.closure });
+        const sum_h: api.Handle = .{ .owner = sum_tok.owner, .slot = sum_tok.slot, .generation = sum_tok.generation };
         defer sum_h.release();
-        const throw_h: *api.Handle = @ptrCast(try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[1].value.?.closure }));
+        const throw_tok = try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[1].value.?.closure });
+        const throw_h: api.Handle = .{ .owner = throw_tok.owner, .slot = throw_tok.slot, .generation = throw_tok.generation };
         defer throw_h.release();
-        const unsup_h: *api.Handle = @ptrCast(try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[2].value.?.closure }));
+        const unsup_tok = try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[2].value.?.closure });
+        const unsup_h: api.Handle = .{ .owner = unsup_tok.owner, .slot = unsup_tok.slot, .generation = unsup_tok.generation };
         defer unsup_h.release();
 
         // Normal closure call through public Runtime.call while `ex` is suspended:
@@ -932,13 +935,13 @@ fn checkClosureCallAllocFailOnce(allocator: std.mem.Allocator) !void {
     };
     defer arg.release();
 
-    const irt = @as(*zqjs.handles.Token, @ptrCast(@alignCast(arg))).owner;
+    const irt: *zqjs.Runtime = @ptrCast(@alignCast(arg.owner));
     const ex_vm: *zqjs.Vm = @ptrCast(@alignCast(irt.extra_roots.items[1].ctx));
     const fn_tok = zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[0].value.?.closure }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.TestUnexpectedResult,
     };
-    const fn_h: *api.Handle = @ptrCast(fn_tok);
+    const fn_h: api.Handle = .{ .owner = fn_tok.owner, .slot = fn_tok.slot, .generation = fn_tok.generation };
     defer fn_h.release();
 
     var failure: api.Failure = .{};
@@ -961,4 +964,33 @@ fn checkClosureCallAllocFailOnce(allocator: std.mem.Allocator) !void {
 
 test "public Runtime.call: checkAllAllocationFailures over closure call and root registration (E6, D51)" {
     try testing.checkAllAllocationFailures(testing.allocator, checkClosureCallAllocFailOnce, .{});
+}
+
+test "handles: slot at maxInt(u64) generation retires on release instead of wrapping (D50)" {
+    const rt = try api.Runtime.create(testing.allocator, .{ .limits = .{ .max_handles = 2 } });
+    defer rt.destroy();
+
+    const h1 = try rt.newNumber(10);
+    const irt: *zqjs.Runtime = @ptrCast(@alignCast(h1.owner));
+    // Fast-forward slot 0's generation to maxInt(u64) and release the matching token.
+    irt.handles.slots.items[h1.slot].generation = std.math.maxInt(u64);
+    const retired_h: api.Handle = .{
+        .owner = h1.owner,
+        .slot = h1.slot,
+        .generation = std.math.maxInt(u64),
+    };
+    retired_h.release();
+
+    // Slot 0 is dead and was retired rather than returned to `free_slot_head`, so
+    // minting a new handle allocates slot 1 instead of wrapping slot 0's generation.
+    try testing.expect(!irt.handles.slots.items[0].live);
+    try testing.expectEqual(std.math.maxInt(u32), irt.handles.free_slot_head);
+
+    const h2 = try rt.newNumber(20);
+    defer h2.release();
+    try testing.expectEqual(@as(u32, 1), h2.slot);
+    try testing.expectEqual(@as(?f64, 20), h2.number());
+
+    // With slot 0 permanently retired and slot 1 live, max_handles = 2 is full.
+    try testing.expectError(error.LimitExceeded, rt.newNumber(30));
 }

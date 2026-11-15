@@ -57,14 +57,14 @@ pub const RunError = error{ Thrown, HostError, LimitExceeded, Unsupported, OutOf
 /// - **Host-owned retained handles:** to return a handle `H` the host already owns while
 ///   keeping `H` valid for later use, the callback must assign `out.result = try H.dup()`.
 ///   Assigning `H` directly moves `H` to the engine and releases it on teardown.
-pub const NativeFn = fn (rt: *Runtime, ctx: ?*anyopaque, this: ?*Handle, args: []const *Handle, out: *NativeOut) NativeError!void;
+pub const NativeFn = fn (rt: *Runtime, ctx: ?*anyopaque, this: ?Handle, args: []const Handle, out: *NativeOut) NativeError!void;
 
 pub const NativeOut = struct {
-    /// Set on success (null → JS `undefined`). Ownership of the assigned token moves to
+    /// Set on success (null → JS `undefined`). Ownership of the assigned handle moves to
     /// the engine, which copies its value into the caller's operand slot and releases the
-    /// token at teardown on every outcome (D50). To return a host-owned retained handle
+    /// handle at teardown on every outcome (D50). To return a host-owned retained handle
     /// without consuming it, assign `try h.dup()`.
-    result: ?*Handle = null,
+    result: ?Handle = null,
     /// Set on `error.HostError` (D53): the engine copies it into the `Failure` before
     /// the native's stack unwinds.
     host_message: []const u8 = "",
@@ -179,10 +179,17 @@ pub const Diagnostic = struct {
     }
 };
 
-/// Memory numbers of a runtime (accounted bytes, D28).
+/// Memory numbers of a runtime (accounted bytes, D28/D50).
 pub const Memory = struct {
+    /// Total accounted runtime memory (`heap_bytes + handle_bytes`).
     bytes: usize,
+    /// High-water mark of total accounted runtime memory.
     peak: usize,
+    /// GC-managed JavaScript heap bytes.
+    heap_bytes: usize,
+    /// Allocated handle-table capacity in bytes.
+    handle_bytes: usize,
+    /// Number of GC collections completed so far.
     collections: u64,
 };
 
@@ -268,34 +275,37 @@ pub const Runtime = opaque {
         const guard = Guard.enterReentrant(@constCast(r));
         defer guard.exit();
         const h = &r.rt.heap;
+        const hdl = &r.rt.handles;
         return .{
-            .bytes = h.bytes + r.rt.handles.accounted, // handle pool bytes (D50)
-            .peak = h.peak + r.rt.handles.peak,
+            .bytes = h.bytes + hdl.accounted,
+            .peak = h.peak + hdl.peak,
+            .heap_bytes = h.bytes,
+            .handle_bytes = hdl.accounted,
             .collections = h.stats.collections,
         };
     }
 
-    /// Mints a number handle (M9.1, D50). The token is the caller's to `release` (or
+    /// Mints a number handle (M9.1, D50). The handle is the caller's to `release` (or
     /// `dup`); while the runtime is poisoned, nothing is minted (E7).
-    pub fn newNumber(rt: *Runtime, n: f64) HandleError!*Handle {
+    pub fn newNumber(rt: *Runtime, n: f64) HandleError!Handle {
         const r = rt.impl();
         const guard = Guard.enterReentrant(r);
         defer guard.exit();
         if (r.rt.poisoned) return error.Internal; // E7: only destroy works now
-        return @ptrCast(try handles.Table.mint(&r.rt, .{ .number = n }));
+        return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .number = n }));
     }
 
-    pub fn newBoolean(rt: *Runtime, b: bool) HandleError!*Handle {
+    pub fn newBoolean(rt: *Runtime, b: bool) HandleError!Handle {
         const r = rt.impl();
         const guard = Guard.enterReentrant(r);
         defer guard.exit();
         if (r.rt.poisoned) return error.Internal; // E7
-        return @ptrCast(try handles.Table.mint(&r.rt, .{ .boolean = b }));
+        return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .boolean = b }));
     }
 
     /// Creates a heap string (E10: UTF-16 units in, lone surrogates kept) and mints a
     /// handle to it. Length and heap limits apply as for script strings.
-    pub fn newStringUtf16(rt: *Runtime, units: []const u16) HandleError!*Handle {
+    pub fn newStringUtf16(rt: *Runtime, units: []const u16) HandleError!Handle {
         const r = rt.impl();
         const guard = Guard.enterReentrant(r);
         defer guard.exit();
@@ -305,7 +315,7 @@ pub const Runtime = opaque {
             error.LimitExceeded => return error.LimitExceeded,
             else => unreachable, // newString only allocates and checks a limit
         };
-        return @ptrCast(try handles.Table.mint(&r.rt, .{ .string = s }));
+        return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .string = s }));
     }
 
     /// JS → host (M9.1, D53): registers a host native as a global function under `name`.
@@ -339,11 +349,11 @@ pub const Runtime = opaque {
 
     /// Host → JS (M9.1, D51): calls the function `f` names with `this` and the
     /// arguments, runs it to completion under a fresh chain's cumulative budget (Q8: no
-    /// steps parameter in M9.1), and returns the result as a token the caller owns.
+    /// steps parameter in M9.1), and returns the result as a handle the caller owns.
     /// This works while an execution is suspended (a fresh context over the shared
     /// realm); mid-callback (inside a native, P4) it is the guard's engine descent, not
     /// a host entry. A script exception is error.Thrown with the details in `failure`.
-    pub fn call(rt: *Runtime, f: *Handle, this: ?*Handle, args: []const *Handle, failure: ?*Failure) RunError!*Handle {
+    pub fn call(rt: *Runtime, f: Handle, this: ?Handle, args: []const Handle, failure: ?*Failure) RunError!Handle {
         const r = rt.impl();
         const guard = Guard.enterReentrant(r);
         defer guard.exit();
@@ -353,60 +363,82 @@ pub const Runtime = opaque {
 
 pub const HandleError = error{ OutOfMemory, LimitExceeded, Internal };
 
-/// A GC-safe reference to one JS value (M9.1, D50): a pointer to a token the runtime
-/// owns. Handles may be copied only through `dup`; a released (or foreign) handle panics
-/// when used, deterministically while the runtime is alive. Every operation works while
-/// the runtime is poisoned — like `collectGarbage`/`memory`, they touch no VM state.
-pub const Handle = opaque {
-    fn tok(h: *const Handle) *handles.Token {
-        return @ptrCast(@alignCast(@constCast(h)));
+/// A GC-safe reference to one JS value (M9.1, D50): a value token `{ owner, slot,
+/// generation }` naming a reusable slot in the runtime's handle table. Independent
+/// ownership is created through `dup`; a released (or foreign) handle panics when used,
+/// deterministically while the runtime is alive — even after its slot has been reused.
+/// Every read and `release` works while the runtime is poisoned — like
+/// `collectGarbage`/`memory`, they touch no VM state.
+pub const Handle = struct {
+    owner: *anyopaque,
+    slot: u32,
+    generation: u64,
+
+    fn fromToken(t: handles.Token) Handle {
+        return .{
+            .owner = t.owner,
+            .slot = t.slot,
+            .generation = t.generation,
+        };
+    }
+
+    fn tok(h: Handle) handles.Token {
+        return .{
+            .owner = @ptrCast(@alignCast(h.owner)),
+            .slot = h.slot,
+            .generation = h.generation,
+        };
     }
 
     /// What the handle refers to (D54: uniform across all values).
-    pub fn kind(h: *const Handle) HandleKind {
-        const guard = Guard.enterReentrantIrt(h.tok().owner);
+    pub fn kind(h: Handle) HandleKind {
+        const t = h.tok();
+        const guard = Guard.enterReentrantIrt(t.owner);
         defer guard.exit();
-        return h.tok().kind();
+        return t.kind();
     }
 
     /// The number, or null for any other kind (copies; never allocates, Q10/D54).
-    pub fn number(h: *const Handle) ?f64 {
-        const guard = Guard.enterReentrantIrt(h.tok().owner);
+    pub fn number(h: Handle) ?f64 {
+        const t = h.tok();
+        const guard = Guard.enterReentrantIrt(t.owner);
         defer guard.exit();
-        return h.tok().number();
+        return t.number();
     }
 
-    pub fn boolean(h: *const Handle) ?bool {
-        const guard = Guard.enterReentrantIrt(h.tok().owner);
+    pub fn boolean(h: Handle) ?bool {
+        const t = h.tok();
+        const guard = Guard.enterReentrantIrt(t.owner);
         defer guard.exit();
-        return h.tok().boolean();
+        return t.boolean();
     }
 
     /// Wrong kind → null. Otherwise the string's full UTF-16 length; copies
     /// min(len, buf.len) units, so a too-small `buf` truncates visibly (D54).
-    pub fn string(h: *const Handle, buf: []u16) ?usize {
-        const guard = Guard.enterReentrantIrt(h.tok().owner);
+    pub fn string(h: Handle, buf: []u16) ?usize {
+        const t = h.tok();
+        const guard = Guard.enterReentrantIrt(t.owner);
         defer guard.exit();
-        return h.tok().string(buf);
+        return t.string(buf);
     }
 
-    /// A new independently owned handle to the same value (Q3/Q4): the slot's reference
-    /// count goes up. Fails with `LimitExceeded(handles)` at the pool's cap (D50).
-    pub fn dup(h: *const Handle) HandleError!*Handle {
+    /// A new independently owned handle to the same value in its own slot (D50). Fails
+    /// with `LimitExceeded(handles)` at the slot table's cap.
+    pub fn dup(h: Handle) HandleError!Handle {
         const t = h.tok();
         const guard = Guard.enterReentrantIrt(t.owner);
         defer guard.exit();
         if (t.owner.poisoned) return error.Internal; // E7: nothing is minted
-        return @ptrCast(try handles.Table.dup(t.owner, t));
+        return fromToken(try handles.Table.dup(t.owner, t));
     }
 
-    /// Kills this handle and drops its slot reference; the slot's value becomes
-    /// collectible at the last release (D50). Releasing twice is the host bug the token
-    /// check panics on.
-    pub fn release(h: *Handle) void {
-        const guard = Guard.enterReentrantIrt(h.tok().owner);
+    /// Invalidates this handle and recycles its slot (D50). Releasing twice is a host
+    /// bug that panics deterministically.
+    pub fn release(h: Handle) void {
+        const t = h.tok();
+        const guard = Guard.enterReentrantIrt(t.owner);
         defer guard.exit();
-        h.tok().release();
+        t.release();
     }
 };
 
@@ -746,7 +778,7 @@ fn faultOf(rt: *IRuntime, e: internal.runtime.Error) Fault {
 /// Host → JS (M9.1, D51): runs the call on a fresh chain. The callee may be a built-in
 /// native (runs directly: it never calls back into JS, D40, and charges no steps) or a
 /// VM closure (a nested VM over the shared heap and realm, model B).
-fn callImpl(r: *RuntimeImpl, f: *Handle, this_h: ?*Handle, args: []const *Handle, failure: ?*Failure) RunError!*Handle {
+fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, failure: ?*Failure) RunError!Handle {
     const rt = &r.rt;
     if (rt.poisoned) {
         if (failure) |out| out.* = internalFailure();
@@ -868,8 +900,8 @@ fn callImpl(r: *RuntimeImpl, f: *Handle, this_h: ?*Handle, args: []const *Handle
 
 /// Mints the result token the caller owns (D50). A failed mint faults the call with
 /// LimitExceeded(handles) or OutOfMemory; the runtime stays usable (E6), nothing leaks.
-fn mintHandle(r: *RuntimeImpl, v: internal.Value, failure: ?*Failure) RunError!*Handle {
-    return @ptrCast(handles.Table.mint(&r.rt, v) catch |e| {
+fn mintHandle(r: *RuntimeImpl, v: internal.Value, failure: ?*Failure) RunError!Handle {
+    return Handle.fromToken(handles.Table.mint(&r.rt, v) catch |e| {
         const fo = faultOf(&r.rt, e);
         if (failure) |out| out.* = fo.failure;
         return fo.err;
@@ -889,7 +921,7 @@ fn unreachableNativeCall(_: *IRuntime, _: internal.Value, _: []const internal.Va
 /// Validates and releases every temporary handle (and `out.result`, if distinct and live)
 /// at `NativeFn` teardown. Calling this *after* copying any return value into the caller's
 /// stack slot preserves the release-order invariant (D50).
-fn releaseNativeTokens(irt: *IRuntime, this_tok: ?*handles.Token, arg_handles: []const *Handle, res_h: ?*Handle) void {
+fn releaseNativeTokens(irt: *IRuntime, this_tok: ?handles.Token, arg_handles: []const Handle, res_h: ?Handle) void {
     if (res_h) |rh| {
         const rt_tok = rh.tok();
         _ = handles.Token.checkedValue(irt, rt_tok);
@@ -897,9 +929,9 @@ fn releaseNativeTokens(irt: *IRuntime, this_tok: ?*handles.Token, arg_handles: [
     }
     for (arg_handles) |ah| {
         const t = ah.tok();
-        if (t.state == .live) t.release();
+        if (t.isLive()) t.release();
     }
-    if (this_tok) |t| if (t.state == .live) t.release();
+    if (this_tok) |t| if (t.isLive()) t.release();
 }
 
 /// Dispatches a call to a host-registered native function (M9.1, D50–D53):
@@ -918,16 +950,20 @@ fn dispatchHostNative(rt: *IRuntime, raw_ctx: ?*anyopaque, this: ?internal.Value
         if (cx.call_depth >= rt.limits.max_call_depth) return rt.limit(.call_depth);
     }
 
-    const arg_handles = try rt.gpa.alloc(*Handle, args.len);
-    defer rt.gpa.free(arg_handles);
+    var inline_args: [8]Handle = undefined;
+    const arg_handles = if (args.len <= inline_args.len)
+        inline_args[0..args.len]
+    else
+        try rt.gpa.alloc(Handle, args.len);
+    defer if (args.len > inline_args.len) rt.gpa.free(arg_handles);
     var minted_args: usize = 0;
-    var this_tok: ?*handles.Token = null;
+    var this_tok: ?handles.Token = null;
     errdefer {
         for (arg_handles[0..minted_args]) |h| {
             const t = h.tok();
-            if (t.state == .live) t.release();
+            if (t.isLive()) t.release();
         }
-        if (this_tok) |t| if (t.state == .live) t.release();
+        if (this_tok) |t| if (t.isLive()) t.release();
     }
 
     if (this) |tv| {
@@ -935,7 +971,7 @@ fn dispatchHostNative(rt: *IRuntime, raw_ctx: ?*anyopaque, this: ?internal.Value
     }
     for (args, 0..) |av, i| {
         const tok = try handles.Table.mint(rt, av);
-        arg_handles[i] = @ptrCast(tok);
+        arg_handles[i] = Handle.fromToken(tok);
         minted_args += 1;
     }
 
@@ -953,7 +989,7 @@ fn dispatchHostNative(rt: *IRuntime, raw_ctx: ?*anyopaque, this: ?internal.Value
     rt.host_message_truncated = false;
 
     const pub_rt: *Runtime = @ptrCast(entry.owner);
-    const this_h: ?*Handle = if (this_tok) |t| @ptrCast(t) else null;
+    const this_h: ?Handle = if (this_tok) |t| Handle.fromToken(t) else null;
     var out: NativeOut = .{};
     const call_res = entry.func(pub_rt, entry.ctx, this_h, arg_handles, &out);
 

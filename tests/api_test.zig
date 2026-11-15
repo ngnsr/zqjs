@@ -104,10 +104,29 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
         _ = h.number(); // host bug: a dead handle → the token check panics (E1/D50)
         return;
     }
+    if (std.mem.eql(u8, scenario, "handle-after-slot-reuse")) {
+        const rt = try zqjs.Runtime.create(testing.allocator, .{ .limits = .{ .max_handles = 1 } });
+        const h1 = try rt.newNumber(7);
+        h1.release();
+        const h2 = try rt.newNumber(99); // reuses slot 0 with generation 1
+        std.debug.assert(h2.number() == 99);
+        _ = h1.number(); // stale handle (generation 0 != 1) → panics (D50)
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "dup-original-released-after-reuse")) {
+        const rt = try zqjs.Runtime.create(testing.allocator, .{ .limits = .{ .max_handles = 2 } });
+        const h1 = try rt.newNumber(7);
+        const h2 = try h1.dup();
+        h1.release();
+        const h3 = try rt.newNumber(8); // reuses h1's slot while h2 stays live
+        std.debug.assert(h2.number() == 7 and h3.number() == 8);
+        _ = h1.number(); // stale original handle → panics (D50)
+        return;
+    }
     if (std.mem.eql(u8, scenario, "writer-call")) {
         var buf: [1]u8 = undefined;
         const cb = struct {
-            var h: *zqjs.Handle = undefined;
+            var h: zqjs.Handle = undefined;
             fn drain(_: *std.Io.Writer, _: []const []const u8, _: usize) std.Io.Writer.Error!usize {
                 _ = child_rt.?.call(h, null, &.{}, null) catch {}; // host re-entry via call (E2/D52)
                 return 0;
@@ -161,7 +180,7 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
     }
     if (std.mem.eql(u8, scenario, "native-thrown-without-throwjs")) {
         const S = struct {
-            fn cb(_: *zqjs.Runtime, _: ?*anyopaque, _: ?*zqjs.Handle, _: []const *zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+            fn cb(_: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
                 return error.Thrown; // without calling throwJs → panics (D53)
             }
         };
@@ -173,7 +192,7 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
     }
     if (std.mem.eql(u8, scenario, "native-throwjs-without-thrown")) {
         const S = struct {
-            fn cb(rt_in: *zqjs.Runtime, _: ?*anyopaque, _: ?*zqjs.Handle, _: []const *zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+            fn cb(rt_in: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
                 const msg = [_]u16{ 'o', 'o', 'p', 's' };
                 rt_in.throwJs(.TypeError, &msg);
                 // returning Ok after throwJs → panics (D53)
@@ -187,7 +206,7 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
     }
     if (std.mem.eql(u8, scenario, "native-host-error-empty-msg")) {
         const S = struct {
-            fn cb(_: *zqjs.Runtime, _: ?*anyopaque, _: ?*zqjs.Handle, _: []const *zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+            fn cb(_: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
                 return error.HostError; // empty host_message → panics (D53)
             }
         };
@@ -199,7 +218,7 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
     }
     if (std.mem.eql(u8, scenario, "native-resume-outer")) {
         const S = struct {
-            fn cb(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?*zqjs.Handle, _: []const *zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+            fn cb(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
                 const ex: *zqjs.Execution = @ptrCast(@alignCast(raw.?));
                 _ = ex.@"resume"(1, null) catch {}; // host-entry inside callback → panics (D52)
             }
@@ -213,8 +232,8 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
     }
     if (std.mem.eql(u8, scenario, "native-define-global")) {
         const S = struct {
-            fn dummy(_: *zqjs.Runtime, _: ?*anyopaque, _: ?*zqjs.Handle, _: []const *zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {}
-            fn cb(rt_in: *zqjs.Runtime, _: ?*anyopaque, _: ?*zqjs.Handle, _: []const *zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+            fn dummy(_: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {}
+            fn cb(rt_in: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
                 rt_in.defineGlobalFunction("inner", dummy, null) catch {}; // host-entry inside callback → panics (D52)
             }
         };
@@ -226,7 +245,7 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
     }
     if (std.mem.eql(u8, scenario, "native-destroy-program")) {
         const S = struct {
-            fn cb(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?*zqjs.Handle, _: []const *zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+            fn cb(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
                 const p: *zqjs.Program = @ptrCast(@alignCast(raw.?));
                 p.destroy(); // host-entry inside callback → panics (D52)
             }
@@ -239,9 +258,9 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
         return;
     }
     if (std.mem.eql(u8, scenario, "native-use-temp-after-return")) {
-        const Box = struct { h: *zqjs.Handle = undefined };
+        const Box = struct { h: zqjs.Handle = undefined };
         const S = struct {
-            fn cb(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?*zqjs.Handle, args: []const *zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+            fn cb(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
                 const slot: *Box = @ptrCast(@alignCast(raw.?));
                 slot.h = args[0]; // saved without dup!
             }
@@ -254,10 +273,32 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
         _ = box.h.number(); // temporary token was released on callback teardown → panics (D50)
         return;
     }
-    if (std.mem.eql(u8, scenario, "native-return-retained-without-dup")) {
-        const Box = struct { h: *zqjs.Handle };
+    if (std.mem.eql(u8, scenario, "native-use-temp-after-slot-reuse")) {
+        const Box = struct {
+            first: zqjs.Handle = undefined,
+            calls: usize = 0,
+        };
         const S = struct {
-            fn cb(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?*zqjs.Handle, _: []const *zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+            fn cb(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+                const slot: *Box = @ptrCast(@alignCast(raw.?));
+                if (slot.calls == 0) slot.first = args[0]; // saved without dup!
+                slot.calls += 1;
+            }
+        };
+        const rt = try zqjs.Runtime.create(testing.allocator, .{ .limits = .{ .max_handles = 1 } });
+        var box: Box = .{};
+        try rt.defineGlobalFunction("stash", S.cb, &box);
+        const p = try rt.compile("t.js", "stash(42); stash(99);", null);
+        try rt.run(p, null);
+        const live = try rt.newNumber(777); // slot 0 is now live with generation 2!
+        std.debug.assert(live.number() == 777);
+        _ = box.first.number(); // stale temporary handle from first call → panics (D50)
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "native-return-retained-without-dup")) {
+        const Box = struct { h: zqjs.Handle };
+        const S = struct {
+            fn cb(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
                 const slot: *Box = @ptrCast(@alignCast(raw.?));
                 out.result = slot.h; // moves ownership of `slot.h` to the engine without `dup`!
             }
@@ -282,7 +323,7 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
                 _ = self.rt.memory(); // writer re-entry during nested print inside callback → panics (D52)
                 return 0;
             }
-            fn cb(rt_in: *zqjs.Runtime, _: ?*anyopaque, _: ?*zqjs.Handle, args: []const *zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+            fn cb(rt_in: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
                 const r = rt_in.call(args[0], null, &.{}, null) catch return error.Internal;
                 r.release();
             }
@@ -860,43 +901,93 @@ test "handles: a token survives collections taken by script activity (D50)" {
     n.release();
 }
 
-test "handles: the token pool is capped and accounted (D50: bounded growth)" {
+test "handles: max_handles caps concurrent slot capacity and release recycles slots (D50)" {
     const rt = try zqjs.Runtime.create(testing.allocator, .{ .limits = .{ .max_handles = 8 } });
     defer rt.destroy();
 
-    var toks: [8]*zqjs.Handle = undefined;
-    for (&toks) |*slot| slot.* = try rt.newNumber(1);
-    // The cap counts records, live and dead together: minting one more fails, and the
-    // failure is catchable (E6).
-    try testing.expectError(error.LimitExceeded, rt.newNumber(2));
+    var toks: [8]zqjs.Handle = undefined;
+    for (&toks, 0..) |*slot, i| slot.* = try rt.newNumber(@floatFromInt(i));
+    // All 8 slots are concurrently live: minting or duping a 9th fails with LimitExceeded (E6).
+    try testing.expectError(error.LimitExceeded, rt.newNumber(99));
     try testing.expectError(error.LimitExceeded, rt.newBoolean(true));
+    try testing.expectError(error.LimitExceeded, toks[0].dup());
+
+    const cap_handle_bytes = rt.memory().handle_bytes;
+    try testing.expect(cap_handle_bytes > 0);
+
+    // Releasing tokens marks their slots dead, increments their generation, and pushes
+    // them onto the free list so concurrent capacity is available again without growing
+    // the handle table (D50).
     for (toks) |t| t.release();
-    // Released records are never reused (a stale handle must stay detectable, D50), so
-    // the spent cap is not refunded: minting stays refused even with zero live tokens.
-    try testing.expectError(error.LimitExceeded, rt.newNumber(2));
-    // The runtime stays usable (E6): everything but minting works as before.
+    for (&toks, 0..) |*slot, i| slot.* = try rt.newNumber(@floatFromInt(i + 100));
+    try testing.expectEqual(cap_handle_bytes, rt.memory().handle_bytes);
+    for (toks, 0..) |t, i| {
+        try testing.expectEqual(@as(?f64, @floatFromInt(i + 100)), t.number());
+        t.release();
+    }
+
+    // The runtime stays usable (E6).
     rt.collectGarbage();
-    _ = rt.memory();
     const p = try rt.compile("ok.js", "let x = 1; print(x);", null);
     defer p.destroy();
     try rt.run(p, null);
 }
 
-test "handles: churn within the cap recycles slots (D50)" {
-    const rt = try zqjs.Runtime.create(testing.allocator, .{ .limits = .{ .max_handles = 64 } });
+test "handles: churn within max_handles recycles slots indefinitely with flat handle_bytes (D50)" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{ .limits = .{ .max_handles = 4 } });
     defer rt.destroy();
 
-    // Create/release cycles burn records but recycle slots, so the table itself does
-    // not grow with the churn (the cap bounds the pool's memory).
-    for (0..32) |i| {
-        const h = try rt.newNumber(@floatFromInt(i));
-        try testing.expectEqual(@as(?f64, @floatFromInt(i)), h.number());
-        h.release();
+    try testing.expectEqual(@as(usize, 0), rt.memory().handle_bytes);
+
+    // Warm 2 slots via mint + dup, then release both.
+    {
+        const h1 = try rt.newNumber(1);
+        const h2 = try h1.dup();
+        h1.release();
+        h2.release();
     }
-    // The runtime is still far from the cap and keeps minting.
-    const h = try rt.newNumber(42);
-    defer h.release();
-    try testing.expectEqual(@as(?f64, 42), h.number());
+    const warm_handle_bytes = rt.memory().handle_bytes;
+    try testing.expect(warm_handle_bytes > 0);
+
+    // Create/release 1,000 times under `max_handles = 4`: slots recycle via the free list
+    // and `handle_bytes` never grows beyond the initial allocation.
+    for (0..1000) |i| {
+        const h = try rt.newNumber(@floatFromInt(i));
+        const d = try h.dup();
+        h.release(); // releasing original leaves dup valid in its own slot
+        try testing.expectEqual(@as(?f64, @floatFromInt(i)), d.number());
+        d.release();
+    }
+    try testing.expectEqual(warm_handle_bytes, rt.memory().handle_bytes);
+}
+
+test "memory: separates heap_bytes, handle_bytes, and total bytes (D50)" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+
+    const m0 = rt.memory();
+    try testing.expectEqual(@as(usize, 0), m0.handle_bytes);
+    try testing.expectEqual(m0.heap_bytes, m0.bytes);
+
+    // Minting a string allocates both on the JS heap (`heap_bytes`) and in the handle
+    // slot table (`handle_bytes`), and `bytes == heap_bytes + handle_bytes`.
+    const units = [_]u16{ 'h', 'e', 'a', 'p', '-', 's', 't', 'r', 'i', 'n', 'g' };
+    const s = try rt.newStringUtf16(&units);
+    const m1 = rt.memory();
+    try testing.expect(m1.heap_bytes > m0.heap_bytes);
+    try testing.expect(m1.handle_bytes > 0);
+    try testing.expectEqual(m1.heap_bytes + m1.handle_bytes, m1.bytes);
+    try testing.expect(m1.peak >= m1.bytes);
+
+    // Releasing the handle and collecting garbage reclaims the JS string from `heap_bytes`
+    // while the handle table retains its slot capacity in `handle_bytes`.
+    s.release();
+    rt.collectGarbage();
+    const m2 = rt.memory();
+    try testing.expectEqual(m0.heap_bytes, m2.heap_bytes);
+    try testing.expectEqual(m1.handle_bytes, m2.handle_bytes);
+    try testing.expectEqual(m2.heap_bytes + m2.handle_bytes, m2.bytes);
+    try testing.expect(m2.collections > m1.collections);
 }
 
 fn checkHandleAllocFailOnce(allocator: std.mem.Allocator) !void {
@@ -974,9 +1065,11 @@ test "the guard and the tag checks panic, as expected, in a child process (E1, E
         .{ .name = "writer-destroy", .message = guard_message }, // Runtime.destroy from the writer
         .{ .name = "writer-call", .message = guard_message }, // Runtime.call from the writer
         .{ .name = "threads", .message = guard_message }, // two threads hammering one runtime
-        // The handle checks (D50) are not gated on runtime_safety: the token record
+        // The handle checks (D50) are not gated on runtime_safety: the slot generation
         // exists in every build mode, so release-then-use and cross-runtime panic everywhere.
         .{ .name = "handle-after-release", .message = "zqjs: Handle used after release" },
+        .{ .name = "handle-after-slot-reuse", .message = "zqjs: Handle used after release" },
+        .{ .name = "dup-original-released-after-reuse", .message = "zqjs: Handle used after release" },
         .{ .name = "call-released-callee", .message = "zqjs: Handle used after release" },
         .{ .name = "call-released-arg", .message = "zqjs: Handle used after release" },
         .{ .name = "call-foreign-callee", .message = "zqjs: Handle from another Runtime" },
@@ -989,6 +1082,7 @@ test "the guard and the tag checks panic, as expected, in a child process (E1, E
         .{ .name = "native-define-global", .message = guard_message },
         .{ .name = "native-destroy-program", .message = guard_message },
         .{ .name = "native-use-temp-after-return", .message = "zqjs: Handle used after release" },
+        .{ .name = "native-use-temp-after-slot-reuse", .message = "zqjs: Handle used after release" },
         .{ .name = "native-return-retained-without-dup", .message = "zqjs: Handle used after release" },
         .{ .name = "writer-reenter-inside-nested-call", .message = guard_message },
         .{ .name = "program-after-destroy", .message = "zqjs: Program used after destroy" },
@@ -1261,7 +1355,7 @@ test "Runtime.call: non-function callee throws TypeError (E5/D51)" {
     const s = try rt.newStringUtf16(&units);
     defer s.release();
 
-    for ([_]*zqjs.Handle{ n, b, s }) |callee| {
+    for ([_]zqjs.Handle{ n, b, s }) |callee| {
         var failure: zqjs.Failure = .{};
         try testing.expectError(error.Thrown, rt.call(callee, n, &.{ b, s }, &failure));
         try testing.expectEqual(zqjs.Failure.Kind.thrown, failure.kind);
@@ -1357,7 +1451,7 @@ test "defineGlobalFunction: registration, ctx passing, this binding (D41), and d
         calls: usize = 0,
     };
     const S = struct {
-        fn addWithBias(rt: *zqjs.Runtime, raw: ?*anyopaque, this: ?*zqjs.Handle, args: []const *zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+        fn addWithBias(rt: *zqjs.Runtime, raw: ?*anyopaque, this: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
             const st: *State = @ptrCast(@alignCast(raw.?));
             st.calls += 1;
             st.last_this_kind = if (this) |t| t.kind() else null;
@@ -1425,19 +1519,19 @@ test "defineGlobalFunction: registration, ctx passing, this binding (D41), and d
 
 test "native callbacks: temporary handle ownership, dup/release, and returning args directly (D50)" {
     const Holder = struct {
-        saved_fn: ?*zqjs.Handle = null,
-        saved_obj: ?*zqjs.Handle = null,
+        saved_fn: ?zqjs.Handle = null,
+        saved_obj: ?zqjs.Handle = null,
     };
     const S = struct {
         // Returns `args[0]` directly as `out.result` (aliasing a temporary token) without
         // double-releasing it on teardown (D50).
-        fn identity(_: *zqjs.Runtime, _: ?*anyopaque, _: ?*zqjs.Handle, args: []const *zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+        fn identity(_: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
             if (args.len > 0) out.result = args[0];
         }
 
         // `dup`s both a closure and an object handle so they survive callback teardown,
         // and leaves `out.result = null` (which becomes JS `undefined`).
-        fn keep(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?*zqjs.Handle, args: []const *zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+        fn keep(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
             const h: *Holder = @ptrCast(@alignCast(raw.?));
             h.saved_fn = try args[0].dup();
             h.saved_obj = try args[1].dup();
@@ -1487,7 +1581,7 @@ test "native callbacks: temporary handle ownership, dup/release, and returning a
     // `out.result` transfers token ownership to the engine (D50). With `try h.dup()`, the
     // host's retained handle stays live across repeated calls and GC.
     const Retained = struct {
-        fn getSavedObj(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?*zqjs.Handle, _: []const *zqjs.Handle, out_r: *zqjs.NativeOut) zqjs.NativeError!void {
+        fn getSavedObj(_: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, out_r: *zqjs.NativeOut) zqjs.NativeError!void {
             const h: *Holder = @ptrCast(@alignCast(raw.?));
             out_r.result = try h.saved_obj.?.dup();
         }
@@ -1515,7 +1609,7 @@ test "native callbacks: throwJs, HostError, LimitExceeded, Unsupported, OutOfMem
         internal,
     };
     const S = struct {
-        fn failWith(rt: *zqjs.Runtime, raw: ?*anyopaque, _: ?*zqjs.Handle, _: []const *zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+        fn failWith(rt: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
             const mode: *const Mode = @ptrCast(@alignCast(raw.?));
             // Also populate `out.result` before returning an error: teardown must still
             // release the transferred result token on every error outcome (D50, D53).
@@ -1646,7 +1740,7 @@ test "native callbacks: throwJs, HostError, LimitExceeded, Unsupported, OutOfMem
     }
 }
 
-fn callInNative(rt: *zqjs.Runtime, f: *zqjs.Handle, this: ?*zqjs.Handle, args: []const *zqjs.Handle) zqjs.NativeError!*zqjs.Handle {
+fn callInNative(rt: *zqjs.Runtime, f: zqjs.Handle, this: ?zqjs.Handle, args: []const zqjs.Handle) zqjs.NativeError!zqjs.Handle {
     return rt.call(f, this, args, null) catch |e| switch (e) {
         error.OutputFailed => error.Internal,
         else => |ne| ne,
@@ -1659,7 +1753,7 @@ test "sanctioned re-entry vs error.Busy inside a native callback (D52)" {
         checked: bool = false,
     };
     const S = struct {
-        fn checkApi(rt: *zqjs.Runtime, raw: ?*anyopaque, _: ?*zqjs.Handle, args: []const *zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+        fn checkApi(rt: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
             const ctx: *Ctx = @ptrCast(@alignCast(raw.?));
 
             // 1. `compile`, `start`, and `run` return `error.Busy` without affecting the active execution.
@@ -1716,7 +1810,7 @@ test "sanctioned re-entry vs error.Busy inside a native callback (D52)" {
 
 test "R1: native callback invokes nested JS that grows stacks and creates closures; outer VM and args stay intact" {
     const S = struct {
-        fn bridge(rt: *zqjs.Runtime, _: ?*anyopaque, _: ?*zqjs.Handle, args: []const *zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+        fn bridge(rt: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
             // args[0] = callback closure, args[1] = number 10, args[2] = string " suffix"
             const n_before = args[1].number() orelse return error.Internal;
             const factor = try rt.newNumber(4);
@@ -1777,7 +1871,7 @@ test "R2: JS passes an object to a native; native retains handle, calls back int
         // args[0] = obj (`{ x: 42, label: 'kept' }`)
         // args[1] = churnFn (allocates heavy garbage in nested JS and mutates `obj.y = 8`)
         // args[2] = readFn (`function(o) { return o.x + o.y + ':' + o.label; }`)
-        fn inspectAfterGc(rt: *zqjs.Runtime, raw: ?*anyopaque, _: ?*zqjs.Handle, args: []const *zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+        fn inspectAfterGc(rt: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
             const ctx: *Ctx = @ptrCast(@alignCast(raw.?));
             if (args[0].kind() != .object) return error.Internal;
 
@@ -1911,7 +2005,7 @@ test "R2: JS passes an object to a native; native retains handle, calls back int
 test "nested JS -> native -> JS -> native -> JS: 3 levels deep and shared max_call_depth (D51)" {
     const S = struct {
         // Calls `args[0]` with `args[1..]`.
-        fn passthrough(rt: *zqjs.Runtime, _: ?*anyopaque, _: ?*zqjs.Handle, args: []const *zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+        fn passthrough(rt: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
             out.result = try callInNative(rt, args[0], null, args[1..]);
         }
     };
@@ -1967,7 +2061,7 @@ test "nested JS -> native -> JS -> native -> JS: 3 levels deep and shared max_ca
 test "slice overshoot and latched budget exhaustion across native callbacks (D51, Q8, S10)" {
     const LatchMode = enum { propagate, swallow_ok, swallow_host_err, swallow_throw };
     const S = struct {
-        fn runNested(rt: *zqjs.Runtime, raw: ?*anyopaque, _: ?*zqjs.Handle, args: []const *zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+        fn runNested(rt: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
             const mode: *const LatchMode = @ptrCast(@alignCast(raw.?));
             const res = rt.call(args[0], null, &.{}, null) catch |e| switch (mode.*) {
                 .propagate => return switch (e) {
@@ -2060,7 +2154,7 @@ test "slice overshoot and latched budget exhaustion across native callbacks (D51
 
 fn checkNativeRoundTripAllocFailOnce(allocator: std.mem.Allocator) !void {
     const S = struct {
-        fn nativeStep(rt: *zqjs.Runtime, _: ?*anyopaque, _: ?*zqjs.Handle, args: []const *zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+        fn nativeStep(rt: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
             // args[0] = callback, args[1] = object, args[2] = number
             const kept = try args[1].dup();
             defer kept.release();
@@ -2108,4 +2202,74 @@ fn checkNativeRoundTripAllocFailOnce(allocator: std.mem.Allocator) !void {
 
 test "native callbacks: checkAllAllocationFailures across defineGlobalFunction and JS -> native -> JS round trip (E6)" {
     try testing.checkAllAllocationFailures(testing.allocator, checkNativeRoundTripAllocFailOnce, .{});
+}
+
+test "stress: 1,000,000+ native calls under max_handles = 16 recycle slots with flat handle_bytes (D50)" {
+    const State = struct {
+        calls: u64 = 0,
+    };
+    const S = struct {
+        // Each call receives 3 temporary argument handles and mints 1 result handle
+        // (4 handle creations/releases per call = 4,000,000 handle slot cycles across 1M calls).
+        fn tick(rt: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+            const st: *State = @ptrCast(@alignCast(raw.?));
+            st.calls += 1;
+            const a = args[0].number() orelse return error.Internal;
+            const b = args[1].number() orelse return error.Internal;
+            const c = args[2].number() orelse return error.Internal;
+            out.result = try rt.newNumber(a + b - c);
+        }
+    };
+
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    const rt = try zqjs.Runtime.create(testing.allocator, .{
+        .limits = .{
+            .max_handles = 16,
+            .max_steps = 25_000_000,
+        },
+        .output = &out,
+    });
+    defer rt.destroy();
+
+    var state: State = .{};
+    try rt.defineGlobalFunction("tick", S.tick, &state);
+
+    // Hold 2 long-lived handles across the entire 1,000,000-call run to verify live
+    // handles coexist with high-frequency slot recycling in the same small table.
+    const anchor = try rt.newNumber(42);
+    defer anchor.release();
+    const anchor_dup = try anchor.dup();
+    defer anchor_dup.release();
+
+    const p = try rt.compile(
+        "stress_handles.js",
+        \\let acc = 0;
+        \\for (let i = 0; i < 1000000; i++) {
+        \\  acc = tick(acc, 3, 2);
+        \\}
+        \\print(acc);
+    ,
+        null,
+    );
+    defer p.destroy();
+
+    // Warm 1 call so the initial slot table capacity is established, then run the 1M-call script.
+    const p_warm = try rt.compile("warm.js", "tick(1, 2, 3);", null);
+    defer p_warm.destroy();
+    try rt.run(p_warm, null);
+    const warm_mem = rt.memory();
+    try testing.expect(warm_mem.handle_bytes > 0);
+    try testing.expect(warm_mem.handle_bytes <= 16 * 64);
+
+    try rt.run(p, null);
+
+    const after_mem = rt.memory();
+    try testing.expectEqual(@as(u64, 1_000_001), state.calls);
+    try testing.expectEqualStrings("1000000\n", out.buffered());
+    // Handle table memory and JS heap memory did not grow across 1,000,000 native calls!
+    try testing.expectEqual(warm_mem.handle_bytes, after_mem.handle_bytes);
+    try testing.expectEqual(warm_mem.heap_bytes, after_mem.heap_bytes);
+    try testing.expectEqual(@as(?f64, 42), anchor.number());
+    try testing.expectEqual(@as(?f64, 42), anchor_dup.number());
 }

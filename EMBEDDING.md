@@ -64,20 +64,21 @@ ZQJS separates step scheduling into two distinct concepts:
 - **Fault persistence:** once an execution faults, further `resume` calls immediately return the cached error and `Failure`. Other executions on the same runtime remain unaffected.
 
 ### 5. GC-Safe Handles (`Handle`, D50, D54)
-Any JavaScript value held by the host across an allocation, garbage collection, or execution step is referenced through an opaque `*zqjs.Handle`:
+Any JavaScript value held by the host across an allocation, garbage collection, or execution step is referenced through a value `zqjs.Handle`:
 
-- **Rooting & Reference Counting:** A `*Handle` is a single-owned token pointing to a reference-counted slot in the runtime's handle table. Every slot with `refs > 0` is a GC root: the collector traces it during both minor and major collections.
+- **Generation-Checked Reusable Slots & Rooting:** A `Handle` is a small value token (`owner`, `slot`, `generation`) referencing an owned slot in the runtime's reusable handle table. Every live slot (`live == true`) is a GC root: the collector traces it during both minor and major collections.
 - **Creating & Reading Handles:**
-  - `rt.newNumber(f64)`, `rt.newBoolean(bool)`, and `rt.newStringUtf16([]const u16)` mint a new token owned by the caller.
+  - `rt.newNumber(f64)`, `rt.newBoolean(bool)`, and `rt.newStringUtf16([]const u16)` mint a new handle owned by the caller.
   - `h.kind()` returns `HandleKind` (`.undefined`, `.null`, `.boolean`, `.number`, `.string`, `.function`, `.object`, `.array`).
   - `h.number()` (`?f64`) and `h.boolean()` (`?bool`) copy primitive values out without allocating (`null` if wrong kind).
   - `h.string(buf: []u16)` (`?usize`) returns `null` if `h` is not a string; otherwise it copies `min(len, buf.len)` UTF-16 code units into `buf` **without allocating** and returns the string's **full UTF-16 length** (so truncation is visible whenever `full_len > buf.len`).
 - **`dup` and `release`:**
-  - `try h.dup()` mints a new, independently owned token referencing the same slot (`refs + 1`).
-  - `h.release()` invalidates that token and decrements the slot's reference count (`refs - 1`). When the last token for a slot is released, the value becomes eligible for garbage collection.
-- **Stale/Foreign Handle Detection & Cumulative `Limits.max_handles`:**
-  - Token records are **never reused** while the runtime is alive. Using a handle after `release()` deterministically panics with `"zqjs: Handle used after release"`. Passing a handle minted by one runtime into another live runtime deterministically panics with `"zqjs: Handle from another Runtime"`.
-  - `Limits.max_handles` bounds the **cumulative** number of token records ever minted over a runtime's lifetime (both host-minted handles and temporary callback handles). While slots recycle on `release()`, token records do not, so handle churn consumes the cumulative pool cap; exceeding `max_handles` returns `error.LimitExceeded` (`Limit.handles`) and leaves the runtime usable. Pool and table bytes are included in `rt.memory().bytes`.
+  - `try h.dup()` allocates an independent slot holding the same `Value` and returns a new `Handle` with that slot's index and generation.
+  - `h.release()` validates `h`, marks its slot dead (`live = false`), increments its `u64` generation (`generation += 1`), and pushes the slot onto the runtime's free list for zero-allocation reuse. If a slot's generation reaches `std.math.maxInt(u64)`, it is permanently retired rather than returned to the free list so generations never wrap around.
+- **Stale/Foreign Handle Detection, Concurrent `Limits.max_handles`, & `Memory` Accounting:**
+  - Every handle operation validates `owner`, slot bounds, `live`, and `generation`. Using a handle after `release()` — even after its old slot has been reused by a newer handle — deterministically panics with `"zqjs: Handle used after release"`. Passing a handle minted by one runtime into another live runtime deterministically panics with `"zqjs: Handle from another Runtime"`.
+  - `Limits.max_handles` bounds the **maximum slot capacity / concurrent handle capacity** of the handle table, not cumulative lifetime handle creations. Freed slots on the free list are reused on subsequent `mint`/`dup`/callback calls without growing the table; exceeding `max_handles` concurrent handles returns `error.LimitExceeded` (`Limit.handles`) and leaves the runtime usable.
+  - `rt.memory()` reports separated metrics: `heap_bytes` (GC-managed JS heap), `handle_bytes` (actual allocated handle-table capacity), and `bytes` (`heap_bytes + handle_bytes`).
 
 ### 6. Host Natives & Callback Handle Ownership (`defineGlobalFunction`, D53)
 Host functions are registered on the realm with `rt.defineGlobalFunction(name, native_fn, ctx)`:
@@ -91,9 +92,9 @@ Every handle crossing a `NativeFn` callback boundary falls into one of three exp
 
 | Category | Owner | Lifetime & Rule |
 |---|---|---|
-| **1. Borrowed temporary handles (`this`, `args[i]`)** | Engine (`NativeRecord`) | Valid **only** during the `NativeFn` call; automatically released by the engine at callback teardown on every outcome. To keep one after the callback returns, the host **must** call `try args[i].dup()`. Assigning `this` or `args[i]` directly to `out.result` is also permitted (copied before teardown without double-release). |
-| **2. Transferred result handle (`out.result`)** | Moved to Engine | Assigning a `*Handle` to `out.result` **transfers ownership** of that token to the engine. At teardown, the engine copies its `Value` into the caller's operand slot first and then releases the token on **every** outcome (success, `Thrown`, `HostError`, `LimitExceeded`, `OutOfMemory`, `Internal`), preserving the release-order invariant. Fresh tokens from `rt.new*` or `rt.call` may be assigned directly. |
-| **3. Host-owned retained handles** | Host | Remain owned by the host until explicitly `release()`d. To return a retained handle `H` as `out.result` while keeping `H` valid for later use, the callback **must** assign `out.result = try H.dup()`. Assigning `H` directly moves `H` to the engine and releases it at teardown (any later use of `H` panics with `"zqjs: Handle used after release"`). |
+| **1. Borrowed temporary handles (`this`, `args[i]`)** | Engine (`NativeRecord`) | Valid **only** during the `NativeFn` call; their slots are automatically released and recycled by the engine at callback teardown on every outcome. To keep one after the callback returns, the host **must** call `try args[i].dup()`. Assigning `this` or `args[i]` directly to `out.result` is also permitted (copied before teardown without double-release). |
+| **2. Transferred result handle (`out.result`)** | Moved to Engine | Assigning a `Handle` to `out.result` **transfers ownership** of that handle to the engine. At teardown, the engine copies its `Value` into the caller's operand slot first and then releases and recycles its slot on **every** outcome (success, `Thrown`, `HostError`, `LimitExceeded`, `OutOfMemory`, `Internal`), preserving the release-order invariant. Fresh handles from `rt.new*` or `rt.call` may be assigned directly. |
+| **3. Host-owned retained handles** | Host | Remain owned by the host until explicitly `release()`d. To return a retained handle `H` as `out.result` while keeping `H` valid for later use, the callback **must** assign `out.result = try H.dup()`. Assigning `H` directly moves `H` to the engine and releases its slot at teardown (any later use of `H` panics with `"zqjs: Handle used after release"`). |
 
 #### Raising Errors from a `NativeFn`
 - **JavaScript Exception (`rt.throwJs` + `error.Thrown`):** Call `rt.throwJs(.TypeError | .RangeError | .ReferenceError, utf16_msg)` and return `error.Thrown`. Surfaces as a `Failure.Kind.thrown` failure formatted by E10 rules. Calling `throwJs` without returning `error.Thrown`, or returning `error.Thrown` without a pending exception, is a checked host bug (panics).
@@ -102,7 +103,7 @@ Every handle crossing a `NativeFn` callback boundary falls into one of three exp
 
 ### 7. Calling JS from the Host (`Runtime.call`, D51)
 `rt.call(f, this, args, &failure)` invokes a JS function (or native) `f` with optional object receiver `this` (`null` or non-object leaves `this` unset, D41) and `args`:
-- Returns a newly-minted `*Handle` owned by the caller (who must `release()` it, or assign it to `out.result` inside a `NativeFn`).
+- Returns a newly-minted `Handle` owned by the caller (who must `release()` it, or assign it to `out.result` inside a `NativeFn`).
 - If `f` is not a function, throws a JS `TypeError: value is not a function` (`error.Thrown`, `Failure.Kind.thrown`).
 - **Model B execution:** each JS closure call runs on a fresh nested VM sharing the runtime's heap and realm, registered in the execution context's GC root list for its entire lifetime while any outer VM stays suspended mid-instruction with its roots registered.
 - **Top-level vs. nested chains:** calling `rt.call` at guard depth 0 (including while another `Execution` is `.suspended`) runs on a fresh execution context bounded by `limits.max_steps` and `limits.max_call_depth` without disturbing any suspended `Execution`. Calling `rt.call` from inside a `NativeFn` joins the active chain and shares its cumulative step budget and call-depth counter.
@@ -142,13 +143,13 @@ const std = @import("std");
 const zqjs = @import("zqjs");
 
 const Bridge = struct {
-    hook: ?*zqjs.Handle = null,
+    hook: ?zqjs.Handle = null,
 
     fn onScore(
         rt: *zqjs.Runtime,
         raw_ctx: ?*anyopaque,
-        _: ?*zqjs.Handle,
-        args: []const *zqjs.Handle,
+        _: ?zqjs.Handle,
+        args: []const zqjs.Handle,
         out: *zqjs.NativeOut,
     ) zqjs.NativeError!void {
         const self: *Bridge = @ptrCast(@alignCast(raw_ctx.?));

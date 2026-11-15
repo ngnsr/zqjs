@@ -33,7 +33,7 @@
 //!                                                 macOS reports before M8.1 P2 used
 //!                                                 libc; on Linux, without libc, the
 //!                                                 default already was smp_allocator)
-//!   zig build gc-report > bench/gc/baseline-m8.txt
+//!   zig build gc-report > bench/gc/baseline-m8.1.txt
 
 const std = @import("std");
 const builtin = @import("builtin");

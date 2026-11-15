@@ -24,7 +24,7 @@
 //! written into a heap object goes through the `store*`/`append*` functions below, so a
 //! write barrier has one place to hook into. M8.1's barrier keeps the remembered set: an
 //! old object that stores a young reference is recorded, so a minor collection can find
-//! young objects reachable only through old ones (M8_1_PLAN.md). `tests/gc_test.zig`
+//! young objects reachable only through old ones (GC_DESIGN.md §15). `tests/gc_test.zig`
 //! greps for raw stores.
 
 const std = @import("std");
@@ -194,7 +194,7 @@ pub const Heap = struct {
     /// When the heap left after a collection (all of it old) reaches this, the next
     /// collection is a major one (M8.1).
     next_major: usize = 0,
-    /// The major-growth factor f ∈ {1, 2, 4} (M8.1 AS5, M8_1_PLAN.md): doubled (to at most 4)
+    /// The major-growth factor f ∈ {1, 2, 4} (M8.1 AS5, GC_DESIGN.md §15): doubled (to at most 4)
     /// after a major collection that freed under 10% of the heap, back to 1 after one that
     /// freed at least half, unchanged in between. Only byte counts decide it.
     growth: u8 = 1,
@@ -293,7 +293,7 @@ pub const Heap = struct {
     /// collect after growing (1 + growth)×, and near the limit each collection needs a
     /// share of the remaining room allocated first: a program filling its heap with live
     /// data collects O(log limit) times. The quarter keeps a burst's worst-case room at
-    /// least as large as at growth 1 (the HL2 proof, M8_1_PLAN.md). Overflow-free: the
+    /// least as large as at growth 1 (the HL2 proof, GC_DESIGN.md §15). Overflow-free: the
     /// result is at most `live + (max − live) / 2 ≤ max`.
     pub fn schedule(h: *const Heap, live: usize) usize {
         const min_growth = 256 * 1024;
@@ -319,7 +319,7 @@ pub const Heap = struct {
         return h.bytes + @min(h.nursery_bytes, (h.max_bytes -| h.bytes) / 2);
     }
 
-    /// Whether the next collection is a major one (M8.1 scheduling, M8_1_PLAN.md).
+    /// Whether the next collection is a major one (M8.1 scheduling, GC_DESIGN.md §15).
     pub fn majorDue(h: *const Heap) bool {
         if (h.major_requested or h.stats.live_after_last >= h.next_major) return true;
         return h.collect_always and (h.stats.collections + 1) % stress_major_every == 0;
@@ -549,7 +549,7 @@ pub const Heap = struct {
     /// a collected one (roots are checked as they are marked, `markObj`); the atom table
     /// holds only live atoms; the accounting is exact: `bytes` = Σ every live object's
     /// fixed charge + every buffer byte charged through `allocator()`; and the generational
-    /// invariants I-gen1, 2 and 4 (M8_1_PLAN.md). Allocates nothing.
+    /// invariants I-gen1, 2 and 4 (GC_DESIGN.md §15). Allocates nothing.
     pub fn verify(h: *const Heap) VerifyError!void {
         if (h.gray != null) return error.GrayListNotEmpty;
         var sum: usize = h.buffer_bytes;
@@ -801,7 +801,7 @@ pub const Heap = struct {
         h.elementBarrier(arr, i, value);
     }
 
-    /// Makes room for `needed` elements, growing the card bitmap first (M8_1_PLAN.md): if
+    /// Makes room for `needed` elements, growing the card bitmap first (GC_DESIGN.md §15): if
     /// the bitmap can't grow nothing has changed, and if the elements can't, a bitmap
     /// that is already big enough is harmless (its new bits are clean).
     fn growElements(h: *Heap, arr: *Object, needed: usize) Error!void {

@@ -1,0 +1,19 @@
+# M8 code (tag m8), with tools/bench.zig temporarily switched to smp_allocator: the same-allocator comparison for bench/baseline.txt (M8.1).
+# zqjs benchmark baseline: zig 0.17.1, aarch64-macos (apple_m4), fast, median of 5 runs
+program                engine           steps    allocated         peak          end collections  median ms
+arrays.js              vm             5455249      8991008      3689632      2386272           7       28.2
+arrays.js              treewalk       3803441     31405140      4430842      3401968          27       38.1
+closures.js            vm             4500028     32800336       262896        21328         125       26.8
+closures.js            treewalk       3700021     62400784       263288         1920         238       41.5
+fib.js                 vm             2670640          160          160          160           0       15.2
+fib.js                 treewalk       2670637     27192120       264856       188584         103       28.6
+loop.js                vm            25666675            0            0            0           0      162.4
+loop.js                treewalk      18333340    112000336       262416        44576         427      200.9
+objects.js             vm             3025022     16415768       266504       160112          62       21.8
+objects.js             treewalk       2425016     35567028       267158       172842         135       30.7
+per_iteration.js       vm             2400016     16000128       262400         3744          61       13.6
+per_iteration.js       treewalk       1600012     31200336       262616          848         119       15.6
+scopes.js              vm             6400015            0            0            0           0       30.7
+scopes.js              treewalk       5000012     89600336       262752       193312         341       47.6
+strings.js             vm              540236      3933264       263324        12930          15        4.0
+strings.js             treewalk        400158     11975126       262830       175978          45        5.8

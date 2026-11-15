@@ -76,7 +76,13 @@ both engines and the compiler, each a use-after-free when missed. Safepoint-only
 leaves exactly one place that holds values across a safepoint: the tree-walker (D10).
 *Cost:* garbage made within one step can't be collected before the step ends (bounded; D8).
 
-## D8. GC: non-moving, precise, stop-the-world mark-and-sweep, at safepoints *(M8; GC_DESIGN)*
+## D8. GC: non-moving, precise, stop-the-world mark-and-sweep, at safepoints *(M8; generational since M8.1, D42–D44; GC_DESIGN)*
+**M8.1 revision.** Collections are minor or major (D42), and the trigger is
+`next_gc = B + min(nursery_bytes, (limit − B)/2)` after every collection, where `B` is the
+heap left by that collection. The formula below (`next_gc = live + …`) became the
+*major*-collection threshold `next_major`, adapted by D44. Everything else here holds for
+both kinds: safepoints, roots, phases, no allocation while collecting, and deterministic
+statistics.
 **The safepoint contract.** No collection can occur during instruction execution (or during a
 tree-walker evaluation step): every GC-managed reference an instruction needs is either
 reachable from the root set at the safepoint that started it, or was allocated after that
@@ -642,3 +648,104 @@ level is Unsupported at parse time. So `const f = o.m; f()` and a function neste
 and called plainly both have no receiver; tests cover both on both engines. The receiver is
 evaluated once (the callee is read from it, then the arguments are evaluated): the VM's
 `call_method` takes `[receiver, callee, args…]`.
+
+## D42. Generations: non-moving, promote on first survival *(M8.1; GC_DESIGN §15)*
+**Two lists and two bits.**
+- Objects live on two intrusive lists: `young` (every new object) and `old`.
+- Two header bits, `old` and `remembered`, sit in existing padding, so objects don't grow.
+- Nothing moves (D8; M9's C ABI relies on stable addresses). Promotion relinks an object and
+  sets its bit.
+
+**Minor collection.**
+- It marks from the remembered set and the roots, but never traces into old objects, and
+  sweeps only `young`.
+- **Every survivor of any collection is promoted.** So after every collection the nursery,
+  the remembered set and every card are empty (I-gen3), and no age counter is needed.
+- **A minor collection never frees an atom:** an unmarked young atom is promoted instead,
+  because the atom table still points at it. Promotion isn't marking, and strings have no
+  children, so promoting keeps nothing else alive.
+
+**Major collection.**
+- It's M8's collector over both lists.
+- It forgets the remembered set and cards first, rebuilds the atom table before any atom is
+  freed, and sweeps the old list before the young one (survivors promoted onto `old` arrive
+  unmarked).
+
+**Nursery size.** `Limits.nursery_bytes`, default 256 KiB, chosen by measurement: a minor pause
+is proportional to the nursery, while total GC time follows the garbage (and gets worse once
+the nursery outgrows the cache).
+
+*Alternatives:*
+- an age counter (survive twice): no evidence that premature promotion costs enough;
+- a copying nursery: moves objects, which the C ABI forbids.
+
+## D43. Remembered set and cards *(M8.1; GC_DESIGN §15)*
+**The remembered set.**
+- The barrier in the store API (D8, I3) puts an old owner that stores a young reference
+  (value, or new property key) on an intrusive list through `gray_next`, at most once (the
+  `remembered` bit).
+- It records owners, not edges: a minor collection scans the owner's current contents.
+- It never allocates.
+
+**Cards.** Arrays with capacity ≥ 512 and property tables with ≥ 512 entries keep side-table
+bitmaps, one bit per 512 elements or entries (`cards`, `prop_cards`), so `Object` doesn't grow.
+- A young store dirties the card of its index.
+- `delete` dirties every card from the removed entry on, because entries shift down.
+- A first bitmap for an already-remembered owner starts all dirty: the hole rule.
+- Bitmaps grow before their buffers, so a failed allocation leaves both consistent.
+- A minor collection scans only dirty cards (each scanned, then cleared).
+
+**Checked.** The verifier checks every old-to-young edge independently of the bitmaps (I-gen2,
+PC8). `zig build gc-mutants` proves that each of 8 deliberately broken pieces is caught.
+
+*Measured:*
+- one young store into a 1M-element array cost a 4.4 ms rescan without cards, against about
+  0.012 ms with them;
+- a 200k-entry dictionary's minor p95 went from 1.9 to 0.04 ms.
+
+## D44. Adaptive major scheduling *(M8.1; GC_DESIGN §15 "Adaptive major scheduling", AS1–AS5)*
+**The formula.** `next_major = live + min(max(f · live, 256 KiB), (limit − live)/c(f))`:
+- `f ∈ {1, 2, 4}`, starting at 1;
+- `c(1) = 2` (D8 as before), and `c(f > 1) = 4`, the quarter-room cap.
+
+**The update rule.** After each major collection that went from `before` to `after` bytes:
+- freed under 10% → `f = min(2f, 4)`;
+- freed at least half → `f = 1`;
+- anything in between → unchanged.
+
+All of it is integer arithmetic on byte counts, so it's deterministic.
+
+**What's proven** (GC_DESIGN §15):
+- the limit is never exceeded (HL1);
+- a burst of size `S ≤ (limit − B)/2` never fails, for every `f` (HL2), and the quarter cap
+  makes the worst-case burst room for `f > 1` at least that of `f = 1`;
+- a burst whose data truly doesn't fit fails as `LimitExceeded(heap_bytes)` under any
+  schedule (HL3).
+
+**Tests** cover the grid of bounds, the adaptation cycle, and a burst simulator on the heap API
+that fails when the minor trigger ignores the half room. They also cover JS programs whose
+bursts fit, and one that outgrows the limit.
+
+*Measured:* game_1m runs 12 → 5 major collections over M8, and the frame loops of every game
+workload run none.
+
+*Not promised:* a burst between `(limit − B)/2` and `limit − R` may fail, depending on where it
+lands. That comes from allocation never collecting (D7), and was true in M8 too.
+
+## D45. The allocator: the embedder's choice; smp_allocator for the CLI and tools *(M8.1)*
+`Heap.init` and `Runtime.init` take any `std.mem.Allocator`.
+
+**Measured on macOS:** libc `free` was about 80% of a minor collection.
+- On smp_allocator, minor p50 went from 0.061 to 0.011 ms, and game_100k's GC share from 18%
+  to 5%.
+- On Linux, without libc, the std default already was smp_allocator.
+
+**The choice for our own binaries.**
+- The CLI uses smp_allocator in release builds, and the std default (leak-checking) in safe
+  builds.
+- `zig build bench` and `gc-report` use smp_allocator and name it in every report header.
+- `gc-report -- --allocator=libc` reproduces the older macOS numbers.
+- Baselines from before M8.1 say which allocator they ran on. The `allocated` column also
+  depends on it, because an allocator that can resize in place charges growth differently.
+
+*Embedders* pick their own. M9's documentation will repeat the measurement.

@@ -1,13 +1,12 @@
 # M9.0 plan: the Zig embedding API
 
-Status: **revision 2, for final review.** Nothing below is implemented.
-- Round 1 approved the direction and decided questions 1, 2, 3 and 5.
-- This revision:
-  - answers question 4 (several executions);
-  - makes ownership and destruction explicit (E1);
-  - proves the step cap can't be bypassed (E4);
-  - defines the failure text's truncation and UTF-8 behaviour;
-  - adds the required tests.
+Status: **frozen (revision 3, approved).** Implementation follows in phases P1–P4.
+- Round 1 decided questions 1, 2, 3 and 5.
+- Round 2 approved several executions (E5) and the failure text (E10).
+- Revision 3 resolves round 2's three details:
+  - the atomic entry guard (E2);
+  - `Program.destroy` with live executions (E1);
+  - the exact hard-limit behaviour (E4).
 
 Scope, from ROADMAP.md (Direction):
 - lifecycle;
@@ -103,11 +102,18 @@ Runtime                      owns its heap, realm, root list and everything belo
 - **Nothing outlives its runtime.** `Runtime.destroy` releases every program and execution
   it still owns, in any order, along with their roots, the heap and the realm. Afterwards,
   every pointer the host still holds to them is dangling.
-- **Destroying a program early.** `Program.destroy` drops the host's reference.
-  - The program's root and memory are released once no execution of it remains: an execution
-    keeps its program alive internally. So a host may destroy a program right after starting
-    it.
-  - After `Program.destroy` and a collection, its constants are freed. A test checks it.
+- **Destroying a program early.** When `Program.destroy` is called while executions of it
+  still exist:
+  - the public `*Program` becomes invalid at once, and using it is a host bug (caught below);
+  - each execution of it keeps the compiled code and its GC roots, and runs to the end
+    unaffected;
+  - the program's memory and root are released when the last internal reference goes (the
+    last of its executions destroyed), or when the runtime is destroyed, whichever comes
+    first.
+
+  It's an internal reference count: one for the public handle, plus one per execution.
+  After the count reaches zero and a collection runs, the program's constants are freed. A test
+  checks it.
 - **Destroying an execution early.** `Execution.destroy` unregisters its roots immediately,
   whether it's suspended, finished or faulted.
 - **Use after destroy** of any of the three, including through a runtime that's gone, is a host
@@ -116,8 +122,19 @@ Runtime                      owns its heap, realm, root list and everything belo
 - **Allocation.** No call allocates through anything but the runtime's allocator. There are no
   globals and no thread-locals.
 
-**E2: threads.**
-- A runtime is used by one thread at a time; calls never overlap.
+**E2: threads, and the atomic entry guard.**
+- **The guard.** Every API call that takes a runtime, or anything it owns, first claims the
+  runtime's entry guard with an atomic compare-and-swap, and releases it on return. That
+  includes `Runtime.destroy`.
+  - It's on in every build mode, because it costs one atomic operation per *call*, never per
+    instruction.
+  - If the guard is already held, two calls overlap. That means another thread, or a call from
+    inside the host's own output writer. It's a host bug, and it panics:
+    `zqjs: Runtime entered while another call into it is running`. With an atomic flag two
+    racing threads can't both get in, which a plain boolean wouldn't guarantee.
+- **Destroying a runtime during an active call** is forbidden: `destroy` claims the same
+  guard, so it's caught the same way. Destroying it with *suspended* executions is fine (E1).
+- A runtime is used by one thread at a time; calls never overlap (the guard above enforces it).
 - It may move between threads between calls.
 - Separate runtimes are fully independent.
 
@@ -142,6 +159,18 @@ Runtime                      owns its heap, realm, root list and everything belo
     gets a second million.
 - *Per execution, not per runtime:* a new execution gets a fresh cap. A host that keeps
   starting executions has chosen to; the API never refills a cap behind its back.
+- **Exactly, with one counter `used` per execution:** instruction number `used + 1` runs only
+  if `used < max_steps`. Then:
+  - **the slice runs out** (the call executed `steps` instructions) with the script
+    unfinished → `.suspended`;
+  - **the cap is reached** (`used = max_steps`) with the script unfinished → the *next
+    attempted* instruction fails with `LimitExceeded(steps)`, in whichever call attempts it;
+  - **a script that completes stays completed**, even if it used exactly `max_steps`
+    instructions (its `halt` included): `.finished`, never `LimitExceeded`;
+  - **a tie:** the slice and the cap end on the same instruction, with the script unfinished →
+    `.suspended`, because no instruction past the cap was attempted. The next resume fails;
+  - `resume(ex, 0)` executes nothing and returns `.suspended`, or `.finished` if the script
+    already finished.
 - So a game can slice a script across frames, and a runaway script still stops.
 
 **E5: several executions, cooperative, never concurrent.**
@@ -239,6 +268,9 @@ ReleaseSafe in CI.
 - **Slices change nothing** (the core test). Every `tests/diff` program runs through the API
   with slices of 1, 7 and 1000 steps and unbounded, and each output must equal node's `.out`.
   Under gc-stress that also collects between resumes.
+- **`Program.destroy` (E1):** destroyed right after `start`, its execution still finishes
+  correctly (gc-stress collects throughout); memory is released only after the execution is
+  destroyed too.
 - **Several executions (E5):**
   - 3 executions of different programs, suspended and resumed interleaved, with garbage, each
     output exact;
@@ -246,12 +278,19 @@ ReleaseSafe in CI.
   - two executions of the *same* program each get their own top-level bindings;
   - a change to a built-in made by one execution is seen by the other (the shared realm);
   - destroying one suspended execution doesn't disturb the others;
-  - in safe builds, a call into a runtime from its own output writer during `resume` is caught
-    as a host bug.
+  - a call into a runtime from its own output writer during `resume`, or a `Runtime.destroy`
+    from there, panics with the guard's message (an expected-panic test, run as a child
+    process);
+  - two threads hammering one runtime: exactly one is inside at any time (a counter checked
+    inside the guarded region). One of them panics on the guard, and the test expects that;
 - **The step cap holds across resumes (E4):**
   - a script that never ends, with `max_steps` = 1000, resumed in slices of 1: exactly 1000
     `.suspended`, then `LimitExceeded(steps)` on the 1001st resume;
   - slices of 7, 1000 and maxInt give the same end, after the same total;
+  - a script needing exactly `max_steps` instructions finishes, with slices and without;
+    one more instruction gives `LimitExceeded`;
+  - the tie (the slice and the cap ending together) gives `.suspended`, then the error;
+    `resume(0)` executes nothing;
   - a second execution gets a fresh cap; the faulted one stays faulted.
 - **Errors:**
   - `max_steps` → `LimitExceeded(steps)`; that execution is faulted, and a new one runs fine;
@@ -301,6 +340,27 @@ ReleaseSafe in CI.
 | 1. opaque types or plain structs | **Opaque types** (round 1) |
 | 2. slice exhaustion suspends, `max_steps` faults | **Approved** (round 1). E4 adds the cumulative cap and its tests |
 | 3. the runtime owns everything | **Approved** (round 1), with E1's explicit hierarchy and destruction rules |
-| 4. several executions | **Proposed: yes, cooperative, never concurrent** (E5). The fallback is one at a time, with an unchanged API. *For final review* |
+| 4. several executions | **Approved** (round 2): cooperative, never concurrent (E5) |
 | 5. internal errors poison the runtime | **Approved** (round 1) |
-| 6. a fixed 256-byte message | **Conditionally approved** (round 1). E10 defines truncation and UTF-8. *For final review* |
+| 6. a fixed 256-byte message | **Approved** (round 2), with E10's truncation and UTF-8 rules |
+| round 2: entry guard | **atomic**, every build, panics on overlap; covers `destroy` (E2) |
+| round 2: `Program.destroy` with live executions | the handle is invalid at once; executions keep the code and roots; released at the last reference or with the runtime (E1) |
+| round 2: the exact hard limit | slice → suspended; cap → the next attempted instruction fails; a finished script stays finished; tie → suspended (E4) |
+
+## Phases
+
+- **P1 — modules.**
+  - `zqjs` (exported, `src/api.zig`) and `zqjs_internal` (today's root, for tests, tools and
+    the CLI's debug modes).
+  - The public-surface snapshot test. `tests/api_test.zig` imports only `zqjs`.
+- **P2 — the API.**
+  - `Runtime`, `Program` and `Execution`: lifecycle, the reference count (E1), the root list,
+    slices and the cap (E4), `Failure` and E10.
+  - The CLI's default path on the API.
+- **P3 — safety.**
+  - Defensive checks return `Internal` (E7, D35 revised).
+  - The atomic entry guard (E2).
+  - The safe-build tag checks.
+- **P4 — proof.**
+  - The acceptance tests above, and `examples/embed.zig` (`zig build example`).
+  - `EMBEDDING.md`, D46–D49, ROADMAP, README.

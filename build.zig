@@ -129,6 +129,21 @@ pub fn build(b: *std.Build) void {
     pow_bits.addPassthruArgs();
     b.step("pow-bits", "Hash pow results for a target (compare across targets)").dependOn(&pow_bits.step);
 
+    // Embedding example (examples/embed.zig): imports only `zqjs`, as an embedder does.
+    const example_exe = b.addExecutable(.{
+        .name = "embed-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/embed.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zqjs", .module = api }},
+        }),
+    });
+    const run_example = b.addRunArtifact(example_exe);
+    run_example.setCwd(b.path("."));
+    run_example.addPassthruArgs();
+    b.step("example", "Run the embedding API example (examples/embed.zig)").dependOn(&run_example.step);
+
     // Benchmark baseline (tools/bench.zig): bench/*.js on both engines, always ReleaseFast.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),

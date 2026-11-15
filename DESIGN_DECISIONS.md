@@ -749,3 +749,32 @@ lands. That comes from allocation never collecting (D7), and was true in M8 too.
   depends on it, because an allocator that can resize in place charges growth differently.
 
 *Embedders* pick their own. M9's documentation will repeat the measurement.
+
+## D46. Two modules: public zqjs and internal zqjs_internal *(M9.0)*
+**Decision.** The repository provides two separate Zig modules:
+- `zqjs` (`src/api.zig`): the only module an embedder's build can reach. It exposes only high-level opaque types (`Runtime`, `Program`, `Execution`), limits, error sets, and diagnostic structures.
+- `zqjs_internal` (`src/root.zig`): all compiler, AST, parser, VM, heap, and GC internals. Used only by our own CLI debug tools, benchmarks, and internal integration tests.
+**Why.** Zig cannot place one file in multiple modules with different visibility rules. Separating modules prevents accidental leaks of VM internals into host embedder code, ensuring internal refactors (heap, bytecode, GC) never break external embedders.
+**Enforcement.** `tests/api_test.zig` and `examples/embed.zig` import only `zqjs`. A comptime snapshot test asserts the exact list of public declarations; adding an export requires explicit review.
+
+## D47. Opaque types, strict ownership hierarchy, and the atomic guard *(M9.0)*
+**Decision.** The public API exposes three opaque types: `Runtime`, `Program`, and `Execution`.
+- `Runtime` owns its heap, realm, root list, and all programs/executions created under it. Nothing outlives its runtime; `Runtime.destroy` reclaims everything.
+- `Program` uses internal reference counting (1 for the host handle, plus 1 for each active `Execution`). Calling `Program.destroy` invalidates the host handle immediately, while running executions continue cleanly. Bytecode and constant GC roots are freed when the last execution dies or the runtime is destroyed.
+- `Execution` holds independent VM state (stacks, frames, pc, top-level bindings). `Execution.destroy` drops its roots and stacks immediately.
+**Concurrency.** A runtime is strictly single-threaded at any moment. Every API call claims an atomic CAS entry guard on the runtime and releases it via `defer`. Overlapping calls (from concurrent threads or host output writer re-entrancy) panic with `"zqjs: Runtime entered while another call into it is running"`.
+
+## D48. Cooperative executions, slices, and cumulative step limits *(M9.0)*
+**Decision.** Executions are sliceable and cooperative:
+- **Slice:** `resume(ex, steps)` bounds the maximum instructions executed in a single call. Running out of a slice returns `.suspended`, leaving VM state exact and intact for subsequent frames.
+- **Cap:** `limits.max_steps` bounds the cumulative instructions an execution may execute over its lifetime across all resumes.
+- **Exact limit rules:**
+  - Instructions run only if `used < max_steps`.
+  - An execution reaching the cap yields `.suspended` if the slice also ended; the subsequent instruction attempt fails with `LimitExceeded(steps)`.
+  - A script completing at or before the cap finishes with `.finished`, never an error.
+  - A faulted execution remains faulted; subsequent resumes return the cached error.
+
+## D49. Internal errors as results instead of panics *(M9.0; D35 revised)*
+**Decision.** Bytecode verification failures and defensive VM sanity checks return `error.Internal` and record an `internal` `Failure` rather than panicking.
+**Why.** In an embedded context, a scripting engine bug must not crash the host process. An `Internal` error flags an invariant violation in ZQJS itself.
+**Poisoning.** An internal error poisons the runtime: subsequent calls return `Internal`, and only `Runtime.destroy` is permitted, because the VM's internal invariants can no longer be trusted.

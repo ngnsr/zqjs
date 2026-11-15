@@ -7,9 +7,8 @@ Inspired by QuickJS and Crafting Interpreters; it does not reuse their code.
 Priorities: correctness, simplicity, inspectability. Speed comes last.
 
 ## Status
-Milestones 1–8 and 8.1 done (tags `m1` … `m8`, `m8.1`, and `p1` for accurate `**`). Next is M9:
-an embedding API, so a Zig or C host can run ZQJS scripts ([ROADMAP.md](ROADMAP.md),
-Direction). ZQJS has:
+Milestones 1–8, 8.1, and 9.0 done (tags `m1` … `m8`, `m8.1`, `m9.0`, and `p1` for accurate `**`). Next are M9.1
+(GC-safe handles and natives) and M9.2 (C ABI) ([ROADMAP.md](ROADMAP.md), Direction). ZQJS has:
 
 - **the language so far:** `let`/`const`, blocks, `if`/`while`/`for`, `break`/`continue`;
   functions, closures and recursion; objects, arrays, prototypes, methods with `this`; numbers,
@@ -83,7 +82,16 @@ zig build gc-report -- --nursery=1M game_   # another nursery size, only the gam
 zig build gc-mutants                        # each deliberately broken GC piece must be caught
 zig build check-goldens                     # verify syntax cases against node; generated files up to date
 zig build update-golden                     # regenerate goldens (node) and pow references (Python)
+zig build example                           # run the embedding API example (examples/embed.zig)
 ```
+
+## Embedding
+ZQJS provides a private-VM Zig embedding API (`@import("zqjs")`) designed for host-controlled execution (games, tools, event loops):
+- **Opaque handles:** `Runtime`, `Program`, `Execution`. The VM, stack layout, and GC internals remain private.
+- **Slices and step limits:** cooperative multitasking running executions in bounded step slices per frame, under cumulative lifetime caps.
+- **Results over panics:** syntax and execution errors return Zig errors and non-allocating UTF-8 `Failure` records.
+
+See [EMBEDDING.md](EMBEDDING.md) for full details, semantics, and examples.
 
 ## Benchmarks
 `zig build bench` (always ReleaseFast) runs every `bench/*.js` five times in-process on both
@@ -116,6 +124,7 @@ faster or slower.
   should.
 
 ## Documents
+- [EMBEDDING.md](EMBEDDING.md): embedding ZQJS in Zig (lifecycle, slices, step caps, errors)
 - [LANGUAGE.md](LANGUAGE.md): what ZQJS accepts and the compatibility contract with node
 - [ARCHITECTURE.md](ARCHITECTURE.md): components and ownership
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md): why things are the way they are

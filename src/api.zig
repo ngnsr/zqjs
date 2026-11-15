@@ -308,11 +308,15 @@ const RuntimeImpl = struct {
         const gpa = r.gpa;
         const x = try gpa.create(ExecutionImpl);
         errdefer gpa.destroy(x);
-        x.* = .{ .owner = r, .program = p, .vm = Vm.init(&r.rt, &p.proto) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.LimitExceeded => error.LimitExceeded,
-            else => unreachable, // init only checks a limit and allocates
-        } };
+        x.* = .{
+            .owner = r,
+            .program = p,
+            .vm = Vm.init(&r.rt, &p.proto) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.LimitExceeded => error.LimitExceeded,
+                else => unreachable, // init only checks a limit and allocates
+            },
+        };
         errdefer x.vm.deinit();
         try r.executions.ensureUnusedCapacity(gpa, 1);
         try r.rt.addRoots(x.vm.roots());

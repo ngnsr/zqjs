@@ -16,7 +16,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | 8 | Mark-and-sweep GC: safepoints, precise roots, weak atoms, stress modes, heap verifier | **done** |
 | 8.1 | Generational GC (non-moving): nursery, remembered set, array and property cards, adaptive major scheduling; GC report and game workloads (GC_DESIGN §15) | **done** |
 | 8.2 | Incremental major marking | deferred (see Direction) |
-| 9.0 | Zig embedding API: lifecycle, compile once / run many, execution under limits and step budgets, results instead of panics | – |
+| 9.0 | Zig embedding API: lifecycle, compile once / run many, execution under limits and step budgets, results instead of panics | **done** |
 | 9.1 | GC-safe handles, native functions (`NativeCtx`), JS callbacks from natives, error handling across the boundary | – |
 | 9.2 | C ABI: header, opaque handles, error codes, a C example and integration tests in CI | – |
 | D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | – |
@@ -314,3 +314,12 @@ runs on both engines unless noted.
 - program-sized tests on a leak-checking allocator without stack traces;
 - a watchdog per test binary;
 - the suite went from ~160 s to ~17 s, and CI runs one parallel job per configuration.
+
+**M9.0 (done)**
+- **Public surface pinned:** `zqjs` is the sole module exported to embedders; snapshot test prevents accidental exports (D46).
+- **Lifecycle (E1):** leak-free create and destroy; `Runtime.destroy` reclaims all live programs and executions; programs compiled but never run leave no leak; `Program.destroy` releases constants after collections once all executions terminate.
+- **Atomic entry guard (E2):** single-threaded runtime enforcement; CAS entry guard prevents overlapping calls and catches re-entrant host calls.
+- **Cooperative executions & step budgets (E4, E5):** slice execution yields `.suspended`; cumulative per-execution cap halts runaway scripts; ties yield `.suspended` before faulting; multiple executions maintain isolated frames and stacks while sharing realm state.
+- **Slices change nothing:** differential test programs produce node-identical outputs with slices of 1, 7, 1000, and unbounded steps under GC collections.
+- **Failure text rules (E10):** non-allocating, guaranteed UTF-8, truncated at code point boundaries with `…`, surrogate pairs preserved, lone surrogates converted to U+FFFD.
+- **Runnable example:** `examples/embed.zig` (`zig build example`) demonstrating two interleaved executions stepping across frames.

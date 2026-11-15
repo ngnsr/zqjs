@@ -377,3 +377,31 @@ test "chain: depth returns to its starting count after a full run (D51)" {
     try testing.expectEqual(vm.frames.items.len, cx.call_depth);
     try testing.expectEqual(@as(u32, 1), cx.call_depth);
 }
+
+test "chain: engine records stack with proof and teardown discipline (D52)" {
+    const s = try Setup.create("let x = 1;", .{});
+    defer s.destroy();
+    const cx = &s.rt.exec_ctx;
+    s.rt.beginChain(0, std.math.maxInt(u64));
+    defer _ = s.rt.endChain();
+
+    // At depth 0 no native is in flight: no sanctioned engine descent is possible.
+    try testing.expect(cx.topRecord() == null);
+
+    // Native dispatch pushes the record as the engine entry; nested dispatch stacks
+    // above it (native -> JS -> native).
+    var r1: zqjs.runtime.NativeRecord = .{};
+    var r2: zqjs.runtime.NativeRecord = .{};
+    try cx.pushRecord(s.rt.gpa, &r1);
+    try cx.pushRecord(s.rt.gpa, &r2);
+    try testing.expect(cx.topRecord() == &r2); // the innermost callback owns the top
+    try testing.expect(r1.live and r2.live);
+
+    // Teardown consumes the innermost record and pops exactly its entry.
+    cx.popRecord(&r2);
+    try testing.expect(!r2.live and r1.live);
+    try testing.expect(cx.topRecord() == &r1);
+    cx.popRecord(&r1);
+    try testing.expect(!r1.live);
+    try testing.expect(cx.topRecord() == null);
+}

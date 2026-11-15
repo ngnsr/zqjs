@@ -453,9 +453,14 @@ const RuntimeImpl = struct {
 const Guard = struct {
     rt: *IRuntime,
 
-    /// A host entry (E2). In M9.0 the guard was only this; the execution context (P3)
-    /// adds per-depth entry kinds (`engine` entries for native re-entry) without
-    /// changing any panic behaviour tested here.
+    /// A host entry (E2). The atomic claim *is* the entry-kind stack's depth-0 bottom
+    /// (D52): while it is held — for the whole top-level call, native callbacks
+    /// included — any further host entry panics, same thread or not, exactly as in
+    /// M9.0. The sanctioned engine descents (a native calling back through the public
+    /// API, Q7) do not claim: they check the execution context's engine records (the
+    /// in-flight native-call record as proof, D52) and run on the owner thread; that
+    /// wiring lands with native dispatch (P4), which is what first creates engine
+    /// entries.
     fn enter(r: *RuntimeImpl) Guard {
         return enterIrt(&r.rt);
     }

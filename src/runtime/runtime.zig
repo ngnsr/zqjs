@@ -97,6 +97,26 @@ pub const ExecContext = struct {
     pub fn topRecord(cx: *const ExecContext) ?*NativeRecord {
         return if (cx.records.items.len > 0) cx.records.items[cx.records.items.len - 1] else null;
     }
+
+    /// Native dispatch (P4): pushes the record as the engine entry (D52). The record
+    /// must be fresh — never already on a stack — so a consumed record cannot be pushed
+    /// again (an engine bug, D49).
+    pub fn pushRecord(cx: *ExecContext, gpa: Allocator, record: *NativeRecord) error{OutOfMemory}!void {
+        std.debug.assert(!record.live);
+        record.live = true;
+        try cx.records.append(gpa, record);
+    }
+
+    /// Teardown (P4): consumes the record and pops its entry, on every outcome. The
+    /// record must be the stack's top — the callback that owns it is the innermost one
+    /// running — so a stale or foreign record reference cannot pop a different entry
+    /// (D52's scoping requirement: the capability dies with its callback).
+    pub fn popRecord(cx: *ExecContext, record: *NativeRecord) void {
+        std.debug.assert(record.live);
+        std.debug.assert(cx.topRecord() == record);
+        record.live = false;
+        _ = cx.records.pop();
+    }
 };
 
 pub const Runtime = struct {

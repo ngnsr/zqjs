@@ -9,6 +9,76 @@ test "watchdog: this binary fails, instead of hanging, if a test gets stuck" {
     @import("watchdog.zig").start(@src().file, 20 * 60);
 }
 
+// The guard and tag checks (E1, E2) panic by design; an expected panic must run as a
+// child process, so it doesn't kill this binary. The parent tests below spawn this same
+// binary with `ZQJS_GUARD_CHILD` set to a scenario name; this test, second in the file
+// so the child gets here fast, runs that scenario and panics, as the host bug it is.
+
+/// The runtime a child scenario calls back into (set by the scenario, read by the writers).
+var child_rt: ?*zqjs.Runtime = null;
+
+/// A re-entrant `print` writer: its drain calls back into the runtime, from *inside* the
+/// guarded region. The buffer is 1 byte, so every write drains.
+fn drainIntoMemory(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    _ = w;
+    _ = data;
+    _ = splat;
+    child_rt.?.collectGarbage(); // a call from inside the runtime's own writer (E2)
+    return 0;
+}
+
+fn drainIntoDestroy(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    _ = w;
+    _ = data;
+    _ = splat;
+    child_rt.?.destroy(); // destroying the runtime from inside its own writer (E2)
+    return 0;
+}
+
+test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" {
+    const scenario = std.process.Environ.getPosix(std.testing.environ, "ZQJS_GUARD_CHILD") orelse return;
+    if (std.mem.eql(u8, scenario, "writer-reenter") or std.mem.eql(u8, scenario, "writer-destroy")) {
+        var buf: [1]u8 = undefined;
+        var writer: std.Io.Writer = .{
+            .buffer = &buf,
+            .vtable = &.{ .drain = if (std.mem.eql(u8, scenario, "writer-reenter")) drainIntoMemory else drainIntoDestroy },
+        };
+        const rt = try zqjs.Runtime.create(testing.allocator, .{ .output = &writer });
+        child_rt = rt;
+        const p = try rt.compile("s.js", "print('hello');", null);
+        rt.run(p, null) catch {};
+        return; // the child must have panicked inside the writer
+    }
+    if (std.mem.eql(u8, scenario, "threads")) {
+        const rt = try zqjs.Runtime.create(testing.allocator, .{});
+        child_rt = rt;
+        // Long enough that whichever thread wins the guard is still inside when the
+        // other arrives; the loser panics on the guard.
+        const p = try rt.compile("s.js", "let n = 0; while (n < 3000000) n = n + 1;", null);
+        const work = struct {
+            fn run(p_: *zqjs.Program) void {
+                child_rt.?.run(p_, null) catch {};
+            }
+        }.run;
+        const a = try std.Thread.spawn(.{}, work, .{p});
+        const b = try std.Thread.spawn(.{}, work, .{p});
+        a.join();
+        b.join();
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "program-after-destroy")) {
+        const rt = try zqjs.Runtime.create(testing.allocator, .{});
+        child_rt = rt;
+        const p = try rt.compile("s.js", "let x = 1;", null);
+        _ = try rt.start(p); // an execution keeps the program's impl alive
+        p.destroy(); // the public handle dies at once (E1)
+        rt.run(p, null) catch {}; // host bug: the dead handle → the tag check panics
+        return;
+    }
+    @panic("unknown guard scenario");
+}
+
+
 test "the public API declares exactly the approved names (D46: a new export is a reviewed decision)" {
     const approved = [_][]const u8{
         "CompileError",
@@ -463,6 +533,37 @@ test "atomic guard: every API exit path releases guard on failure" {
     const ex_loop2 = try rt_limited.start(p_loop);
     defer ex_loop2.destroy();
     try testing.expectEqual(zqjs.Status.suspended, try ex_loop2.@"resume"(1, null));
+}
+
+test "the guard and the tag checks panic, as expected, in a child process (E1, E2)" {
+    if (std.process.Environ.getPosix(std.testing.environ, "ZQJS_GUARD_CHILD") != null) return; // we are the child
+
+    const gpa = testing.allocator;
+    const exe = try std.process.executablePathAlloc(std.testing.io, gpa);
+    defer gpa.free(exe);
+
+    const Scenario = struct { name: []const u8, message: []const u8 };
+    const guard_message = "zqjs: Runtime entered while another call into it is running";
+    // The first three panic through the guard, which is on in every build mode. The tag
+    // check exists only in safe builds (E1), so in a ReleaseFast run it is skipped.
+    const scenarios = [_]Scenario{
+        .{ .name = "writer-reenter", .message = guard_message }, // resume, and a call from its own writer
+        .{ .name = "writer-destroy", .message = guard_message }, // Runtime.destroy from the writer
+        .{ .name = "threads", .message = guard_message }, // two threads hammering one runtime
+        .{ .name = "program-after-destroy", .message = "zqjs: Program used after destroy" },
+    };
+    const count = if (std.debug.runtime_safety) scenarios.len else 3;
+
+    var map = std.process.Environ.Map.init(gpa);
+    defer map.deinit();
+    for (scenarios[0..count]) |s| {
+        try map.put("ZQJS_GUARD_CHILD", s.name);
+        const res = try std.process.run(gpa, std.testing.io, .{ .argv = &.{exe}, .environ_map = &map });
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+        try testing.expect(!res.term.success()); // the panic killed the child
+        try testing.expect(std.mem.indexOf(u8, res.stderr, s.message) != null);
+    }
 }
 
 test "program refcount: all destruction orders with multiple executions (E1)" {

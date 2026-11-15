@@ -25,6 +25,7 @@ Runtime                       owns heap, realm, root list, and everything below
   - Any active executions of that program continue running unaffected, retaining the bytecode and string constants as GC roots.
   - The program's constants and bytecode are freed once the last execution is destroyed, or when the runtime is destroyed, whichever comes first.
 - **Early Execution Destruction:** Calling `Execution.destroy(ex)` drops its VM stacks and unregisters its GC roots immediately, regardless of whether it is running, suspended, or faulted.
+- **Use after destroy is a host bug.** In safe builds every entry point checks a tag on the object it receives and panics naming the type (`zqjs: Program used after destroy`, `zqjs: Runtime used after destroy`, `zqjs: Execution used after destroy`). This is best effort: freed memory may have been reused, so a missed catch is possible.
 
 ### 2. Thread Safety & The Entry Guard (E2)
 - A runtime is strictly single-threaded at any instant: calls into a runtime or any object it owns must never overlap.
@@ -72,6 +73,12 @@ pub const Failure = struct {
 - `text` is guaranteed to be valid UTF-8.
 - If a message exceeds 256 bytes, it is truncated strictly at a code point boundary and terminated with `…` (U+2026), setting `truncated = true`.
 - UTF-16 surrogate pairs are decoded into valid 4-byte UTF-8 sequences and never split across boundaries; lone surrogates are converted to U+FFFD.
+
+### 6. Internal Errors Poison the Runtime (E7, D49)
+A ZQJS bug must never crash the host. A failed VM defensive check, or a bytecode verifier rejection after a successful compile, returns `error.Internal` with an `internal` `Failure` instead of panicking.
+- The error faults the execution like any other, and **poisons the runtime**: every later call that runs code (`compile`, `start`, `run`, `resume`) returns `error.Internal` until `Runtime.destroy`.
+- `collectGarbage`, `memory` and the destroy paths stay usable, so the host can still clean up.
+- The CLI prints `internal error: <reason>` and exits with code 70; the `Failure` text itself stays the fixed `internal error`.
 
 ---
 

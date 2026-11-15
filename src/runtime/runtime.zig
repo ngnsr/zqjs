@@ -7,6 +7,8 @@
 //!   error.Unsupported    outside ZQJS at runtime; which feature in `unsupported`
 //!   error.OutOfMemory    the host allocator failed
 //!   error.WriteFailed    the host's output writer failed
+//!   error.Internal       a VM defensive check failure (an engine bug, D49): the runtime
+//!                        is poisoned, because the VM's state can no longer be trusted
 //! Only Thrown is a JavaScript-visible event; the others are never catchable by scripts.
 
 const std = @import("std");
@@ -17,7 +19,7 @@ const Limits = @import("../limits.zig").Limits;
 const Limit = @import("../limits.zig").Limit;
 const Feature = @import("../frontend/diag.zig").Feature;
 
-pub const Error = error{ Thrown, LimitExceeded, Unsupported, OutOfMemory, WriteFailed };
+pub const Error = error{ Thrown, LimitExceeded, Unsupported, OutOfMemory, WriteFailed, Internal };
 
 pub const ErrorName = enum { ReferenceError, TypeError, RangeError };
 
@@ -58,6 +60,14 @@ pub const Runtime = struct {
     /// live program (its constants) and execution (its VM, suspended or not) here.
     extra_roots: std.ArrayList(EngineRoots) = .empty,
     limit_hit: ?Limit = null,
+    /// Set by a defensive-check failure (D49): an invariant of the VM, compiler or
+    /// verifier is broken, so nothing about the state can be trusted. The embedding API
+    /// checks this at every entry point and then returns `error.Internal` until
+    /// `deinit`; the CLI reports the failure and exits.
+    poisoned: bool = false,
+    /// What the first defensive check that failed said (a static string; never
+    /// allocated). Only for the host's report; the failure's text stays fixed (E10).
+    internal_reason: ?[]const u8 = null,
 
     pub fn init(gpa: Allocator, limits: Limits, out: *std.Io.Writer) Runtime {
         return .{ .gpa = gpa, .heap = .init(gpa, limits), .out = out, .max_steps = limits.max_steps, .limits = limits };
@@ -97,6 +107,15 @@ pub const Runtime = struct {
     pub fn limit(rt: *Runtime, which: Limit) Error {
         rt.limit_hit = which;
         return error.LimitExceeded;
+    }
+
+    /// A defensive check failed (D49): a bug in ZQJS, never in the script. Poisons the
+    /// runtime and returns `error.Internal`. `what` is a static string for the host's
+    /// report; the first reason wins, because later failures may follow from the first.
+    pub fn bug(rt: *Runtime, comptime what: []const u8) Error {
+        rt.poisoned = true;
+        if (rt.internal_reason == null) rt.internal_reason = what;
+        return error.Internal;
     }
 
     /// A full collection. Engines call it only at safepoints (D8); tests may call it when

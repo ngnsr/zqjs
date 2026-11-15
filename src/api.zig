@@ -172,6 +172,7 @@ pub const Runtime = opaque {
         const r = rt.impl();
         const guard = Guard.enter(r);
         _ = guard;
+        r.magic = 0;
         while (r.executions.items.len > 0) r.executions.items[r.executions.items.len - 1].free();
         while (r.programs.items.len > 0) r.programs.items[r.programs.items.len - 1].free();
         r.executions.deinit(r.gpa);
@@ -192,9 +193,11 @@ pub const Runtime = opaque {
     /// Starts `program` from its first instruction, with fresh top-level bindings (E3).
     pub fn start(rt: *Runtime, program: *Program) StartError!*Execution {
         const r = rt.impl();
+        const p = program.impl();
+        checkProgramAlive(p);
         const guard = Guard.enter(r);
         defer guard.exit();
-        const x = try r.startImpl(program.impl());
+        const x = try r.startImpl(p);
         return @ptrCast(x);
     }
 
@@ -202,9 +205,10 @@ pub const Runtime = opaque {
     /// execution.
     pub fn run(rt: *Runtime, program: *Program, failure: ?*Failure) (StartError || RunError)!void {
         const r = rt.impl();
+        const p = program.impl();
+        checkProgramAlive(p);
         const guard = Guard.enter(r);
         defer guard.exit();
-        const p = program.impl();
         const ex = try r.startImpl(p);
         defer ex.free();
         _ = try ex.resumeImpl(std.math.maxInt(u64), failure);
@@ -237,8 +241,11 @@ pub const Program = opaque {
     /// with the last of them, or with the runtime.
     pub fn destroy(program: *Program) void {
         const p = program.impl();
+        checkAlive(p.magic, "Program");
+        if (std.debug.runtime_safety and !p.host) @panic("zqjs: Program used after destroy");
         const guard = Guard.enter(p.owner);
         defer guard.exit();
+        p.host = false;
         p.refs -= 1;
         if (p.refs == 0) p.free();
     }
@@ -255,6 +262,7 @@ pub const Execution = opaque {
     /// and failure; the runtime stays usable (E6).
     pub fn @"resume"(ex: *Execution, steps: u64, failure: ?*Failure) RunError!Status {
         const x = ex.impl();
+        checkAlive(x.magic, "Execution");
         const guard = Guard.enter(x.owner);
         defer guard.exit();
         return x.resumeImpl(steps, failure);
@@ -263,6 +271,7 @@ pub const Execution = opaque {
     /// Releases the execution and its roots, whatever its state (E1).
     pub fn destroy(ex: *Execution) void {
         const x = ex.impl();
+        checkAlive(x.magic, "Execution");
         const guard = Guard.enter(x.owner);
         defer guard.exit();
         x.free();
@@ -278,8 +287,15 @@ const RuntimeImpl = struct {
     programs: std.ArrayList(*ProgramImpl) = .empty,
     executions: std.ArrayList(*ExecutionImpl) = .empty,
     in_call: std.atomic.Value(bool) = .init(false),
+    /// Use-after-destroy detection (E1): safe builds check this tag at every entry point.
+    /// Best effort: freed memory may be reused, so the check can miss.
+    magic: u32 = alive_magic,
+    /// A static-format buffer for `rt.internal_reason` (the reason of the first
+    /// defensive-check failure), so poisoning never allocates.
+    reason_buf: [160]u8 = undefined,
 
     fn compileImpl(r: *RuntimeImpl, name: []const u8, source: []const u8, diag: ?*Diagnostic) CompileError!*Program {
+        if (r.rt.poisoned) return error.Internal; // E7: only destroy works now
         _ = name;
         const gpa = r.gpa;
         const limits = r.rt.limits;
@@ -295,7 +311,7 @@ const RuntimeImpl = struct {
         var failure: internal.verify.Failure = .{};
         _ = internal.verify.verify(gpa, &p.proto, limits, &failure) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
-            error.InvalidBytecode => error.Internal, // a compiler bug, never the script's (E7)
+            error.InvalidBytecode => r.invalidBytecode(&failure), // a compiler bug, never the script's (E7)
         };
         try r.programs.ensureUnusedCapacity(gpa, 1);
         try r.rt.addRoots(Vm.protoRoots(&p.proto)); // its constants live from now on (E3)
@@ -303,7 +319,17 @@ const RuntimeImpl = struct {
         return @ptrCast(p);
     }
 
+    /// Poisons the runtime (E7): the compiler or verifier broke an invariant, so nothing
+    /// it produced can be trusted.
+    fn invalidBytecode(r: *RuntimeImpl, failure: *const internal.verify.Failure) CompileError {
+        r.rt.poisoned = true;
+        if (r.rt.internal_reason == null)
+            r.rt.internal_reason = std.fmt.bufPrint(&r.reason_buf, "invalid bytecode at {d}: {s}", .{ failure.pc, failure.reason }) catch "invalid bytecode";
+        return error.Internal;
+    }
+
     fn startImpl(r: *RuntimeImpl, p: *ProgramImpl) StartError!*ExecutionImpl {
+        if (r.rt.poisoned) return error.Internal; // E7: only destroy works now
         std.debug.assert(p.owner == r);
         const gpa = r.gpa;
         const x = try gpa.create(ExecutionImpl);
@@ -330,6 +356,7 @@ const Guard = struct {
     runtime: *RuntimeImpl,
 
     fn enter(r: *RuntimeImpl) Guard {
+        checkAlive(r.magic, "Runtime"); // through a runtime that's gone: caught here (E1)
         if (r.in_call.cmpxchgStrong(false, true, .seq_cst, .seq_cst) != null) {
             @panic("zqjs: Runtime entered while another call into it is running");
         }
@@ -341,14 +368,38 @@ const Guard = struct {
     }
 };
 
+/// The tag live implementations carry; cleared (or the memory freed) on destroy, so a
+/// safe build's entry-point check catches a use after destroy (E1). Best effort: the
+/// memory may have been reused, so a missed catch is possible; documented as such.
+const alive_magic: u32 = 0x5A514A53; // "ZQJS"
+
+fn checkAlive(magic: u32, comptime type_name: []const u8) void {
+    if (std.debug.runtime_safety and magic != alive_magic)
+        @panic("zqjs: " ++ type_name ++ " used after destroy");
+}
+
+/// A program's public handle dies at `Program.destroy`, even while its impl lives on for
+/// its executions (E1): the `host` flag catches that case deterministically, the magic tag
+/// the rest.
+fn checkProgramAlive(p: *ProgramImpl) void {
+    checkAlive(p.magic, "Program");
+    if (std.debug.runtime_safety and !p.host) @panic("zqjs: Program used after destroy");
+}
+
 const ProgramImpl = struct {
     owner: *RuntimeImpl,
     proto: Proto,
     /// The host's handle, plus one per execution (E1).
     refs: u32 = 1,
+    magic: u32 = alive_magic,
+    /// The public handle still exists; `Program.destroy` clears it while executions keep
+    /// the impl alive, so a later use of the handle is caught deterministically (E1).
+    host: bool = true,
 
     fn free(p: *ProgramImpl) void {
         const r = p.owner;
+        p.magic = 0;
+        p.host = false;
         r.rt.removeRoots(&p.proto);
         for (r.programs.items, 0..) |q, i| if (q == p) {
             _ = r.programs.swapRemove(i);
@@ -368,9 +419,11 @@ const ExecutionImpl = struct {
     /// Steps charged over all resumes (E4): never reset.
     used: u64 = 0,
     fault: ?Fault = null,
+    magic: u32 = alive_magic,
 
     fn free(x: *ExecutionImpl) void {
         const r = x.owner;
+        x.magic = 0;
         r.rt.removeRoots(&x.vm);
         x.vm.deinit();
         for (r.executions.items, 0..) |y, i| if (y == x) {
@@ -384,6 +437,10 @@ const ExecutionImpl = struct {
     }
 
     fn resumeImpl(x: *ExecutionImpl, steps: u64, failure: ?*Failure) RunError!Status {
+        if (x.owner.rt.poisoned) {
+            if (failure) |out| out.* = internalFailure();
+            return error.Internal;
+        }
         if (x.fault) |f| {
             if (failure) |out| out.* = f.failure;
             return f.err;
@@ -446,12 +503,21 @@ fn sourceError(e: anyerror, d: internal.Diagnostic, source: []const u8, diag: ?*
     return error.Source;
 }
 
+/// The fixed text of an `internal` failure (E10): a ZQJS bug, never the script's.
+fn internalFailure() Failure {
+    var f: Failure = .{};
+    var w = TextWriter.init(&f.text, &f.text_len, &f.truncated);
+    w.utf8("internal error");
+    return f;
+}
+
 fn publicError(e: internal.runtime.Error) RunError {
     return switch (e) {
         error.Thrown => error.Thrown,
         error.LimitExceeded => error.LimitExceeded,
         error.Unsupported => error.Unsupported,
         error.OutOfMemory => error.OutOfMemory,
+        error.Internal => error.Internal,
         error.WriteFailed => error.OutputFailed,
     };
 }
@@ -490,6 +556,10 @@ fn describe(rt: *IRuntime, e: internal.runtime.Error) Failure {
         error.OutOfMemory => {
             f.kind = .out_of_memory;
             w.utf8("out of memory");
+        },
+        error.Internal => {
+            f.kind = .internal;
+            w.utf8("internal error");
         },
         error.WriteFailed => {
             f.kind = .output;

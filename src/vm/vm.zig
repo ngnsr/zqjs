@@ -32,8 +32,9 @@
 //! the VM, the compiler or the verifier themselves: pc and instruction bounds, opcode
 //! validity, a frame's stack underflow/overflow, slot, constant, name, function and
 //! capture indices, and the kind of a slot (value or cell). They are cheap compares,
-//! kept in every build mode, and a failure is a bug, so it panics (`bug`) rather than
-//! producing a JavaScript-visible result.
+//! kept in every build mode, and a failure is a bug: it returns `error.Internal` and
+//! poisons the runtime (D49), rather than producing a JavaScript-visible result or
+//! crashing an embedder's process.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -206,123 +207,126 @@ pub const Vm = struct {
         const p = vm.proto();
         const code = p.code;
         const pc = vm.pc;
-        if (pc >= code.len) vm.bug("pc outside the code");
-        const op = Op.decode(code[pc]) orelse vm.bug("invalid opcode");
-        if (op.size() > code.len - pc) vm.bug("instruction runs past the end of the code");
+        if (pc >= code.len) return vm.bug("pc outside the code");
+        const op = Op.decode(code[pc]) orelse return vm.bug("invalid opcode");
+        if (op.size() > code.len - pc) return vm.bug("instruction runs past the end of the code");
         try vm.rt.step();
         const rt = vm.rt;
         var next: u32 = pc + op.size();
 
         switch (op) {
-            .push_undefined => vm.push(.undefined),
-            .push_null => vm.push(.null),
-            .push_true => vm.push(.{ .boolean = true }),
-            .push_false => vm.push(.{ .boolean = false }),
+            .push_undefined => try vm.push(.undefined),
+            .push_null => try vm.push(.null),
+            .push_true => try vm.push(.{ .boolean = true }),
+            .push_false => try vm.push(.{ .boolean = false }),
             .push_const => {
                 const k = vm.operand(0);
-                if (k >= p.consts.len) vm.bug("constant index out of range");
-                vm.push(p.consts[k]);
+                if (k >= p.consts.len) return vm.bug("constant index out of range");
+                try vm.push(p.consts[k]);
             },
 
             .get_local => {
-                const v = vm.value(vm.operand(0)).* orelse return vm.tdz(vm.operand(1));
-                vm.push(v);
+                const v = (try vm.value(vm.operand(0))).* orelse return vm.tdz(vm.operand(1));
+                try vm.push(v);
             },
             .set_local => {
-                const s = vm.value(vm.operand(0));
+                const s = try vm.value(vm.operand(0));
                 if (s.* == null) return vm.tdz(vm.operand(1));
-                s.* = vm.peek(0); // the assignment's value stays on the stack
+                s.* = try vm.peek(0); // the assignment's value stays on the stack
             },
             .init_local => {
-                vm.slot(vm.operand(0)).* = .{ .value = vm.peek(0) };
-                vm.drop(1);
+                (try vm.slot(vm.operand(0))).* = .{ .value = try vm.peek(0) };
+                try vm.drop(1);
             },
-            .clear_local => vm.slot(vm.operand(0)).* = .{ .value = null },
+            .clear_local => (try vm.slot(vm.operand(0))).* = .{ .value = null },
             .assign_const => {
-                if (vm.value(vm.operand(0)).* == null) return vm.tdz(vm.operand(1));
+                if ((try vm.value(vm.operand(0))).* == null) return vm.tdz(vm.operand(1));
                 return vm.constAssignment();
             },
             .get_global => {
-                vm.ensurePush();
-                vm.push(try builtins.global(rt, vm.name(vm.operand(0))));
+                try vm.ensurePush();
+                try vm.push(try builtins.global(rt, try vm.name(vm.operand(0))));
             },
 
             .new_cell => {
-                const s = vm.slot(vm.operand(0));
-                s.* = .{ .cell = try rt.heap.newCell(null) };
+                (try vm.slot(vm.operand(0))).* = .{ .cell = try rt.heap.newCell(null) };
             },
             .box_local => {
-                const s = vm.slot(vm.operand(0));
-                const v = switch (s.*) {
-                    .value => |v| v orelse vm.bug("boxing a slot in the TDZ"),
-                    .cell => vm.bug("boxing a cell"),
+                const s = try vm.slot(vm.operand(0));
+                const v: Value = switch (s.*) {
+                    .value => |v| v orelse return vm.bug("boxing a slot in the TDZ"),
+                    .cell => return vm.bug("boxing a cell"),
                 };
                 s.* = .{ .cell = try rt.heap.newCell(v) };
             },
             .fresh_cell => {
-                const s = vm.slot(vm.operand(0));
-                const old = vm.cellIn(s);
+                const s = try vm.slot(vm.operand(0));
+                const old = try vm.cellIn(s);
                 s.* = .{ .cell = try rt.heap.newCell(old.value) };
             },
             .get_cell => {
-                const v = vm.cellAt(vm.operand(0)).value orelse return vm.tdz(vm.operand(1));
-                vm.push(v);
+                const v = (try vm.cellAt(vm.operand(0))).value orelse return vm.tdz(vm.operand(1));
+                try vm.push(v);
             },
             .set_cell => {
-                const c = vm.cellAt(vm.operand(0));
+                const c = try vm.cellAt(vm.operand(0));
                 if (c.value == null) return vm.tdz(vm.operand(1));
-                rt.heap.storeCell(c, vm.peek(0));
+                rt.heap.storeCell(c, try vm.peek(0));
             },
             .init_cell => {
-                rt.heap.storeCell(vm.cellAt(vm.operand(0)), vm.peek(0));
-                vm.drop(1);
+                rt.heap.storeCell(try vm.cellAt(vm.operand(0)), try vm.peek(0));
+                try vm.drop(1);
             },
             .assign_const_cell => {
-                if (vm.cellAt(vm.operand(0)).value == null) return vm.tdz(vm.operand(1));
+                if ((try vm.cellAt(vm.operand(0))).value == null) return vm.tdz(vm.operand(1));
                 return vm.constAssignment();
             },
             .get_capture => {
-                const v = vm.capture(vm.operand(0)).value orelse return vm.tdz(vm.operand(1));
-                vm.push(v);
+                const v = (try vm.capture(vm.operand(0))).value orelse return vm.tdz(vm.operand(1));
+                try vm.push(v);
             },
             .set_capture => {
-                const c = vm.capture(vm.operand(0));
+                const c = try vm.capture(vm.operand(0));
                 if (c.value == null) return vm.tdz(vm.operand(1));
-                rt.heap.storeCell(c, vm.peek(0));
+                rt.heap.storeCell(c, try vm.peek(0));
             },
             .assign_const_capture => {
-                if (vm.capture(vm.operand(0)).value == null) return vm.tdz(vm.operand(1));
+                if ((try vm.capture(vm.operand(0))).value == null) return vm.tdz(vm.operand(1));
                 return vm.constAssignment();
             },
 
             .make_closure => {
                 const f = vm.operand(0);
-                if (f >= p.functions.len) vm.bug("function index out of range");
+                if (f >= p.functions.len) return vm.bug("function index out of range");
                 const child = &p.functions[f];
-                vm.ensurePush();
+                try vm.ensurePush();
                 const c = try rt.heap.newVmClosure(child, child.captures.len);
-                // Nothing below can fail: the closure is complete before it is pushed.
+                // Fills the captures. These accessors fail only on a bug (a real failure
+                // would leave an incomplete closure on the heap, collected, never reachable).
                 for (child.captures, c.impl.vm.captures) |desc, *dst| dst.* = switch (desc.from) {
-                    .parent_slot => vm.cellAt(desc.index),
-                    .parent_capture => vm.capture(desc.index),
+                    .parent_slot => try vm.cellAt(desc.index),
+                    .parent_capture => try vm.capture(desc.index),
                 };
-                vm.push(.{ .closure = c });
+                try vm.push(.{ .closure = c });
             },
-            .push_callee => vm.push(.{ .closure = vm.frame().closure orelse vm.bug("push_callee in the script") }),
+            .push_callee => {
+                const c = vm.frame().closure orelse return vm.bug("push_callee in the script");
+                try vm.push(.{ .closure = c });
+            },
 
-            .pop => vm.drop(1),
-            .dup => vm.push(vm.peek(0)),
+            .pop => try vm.drop(1),
+            .dup => try vm.push(try vm.peek(0)),
             .dup2 => {
-                const a = vm.peek(1);
-                const b = vm.peek(0);
-                vm.ensurePush2();
-                vm.push(a);
-                vm.push(b);
+                const a = try vm.peek(1);
+                const b = try vm.peek(0);
+                try vm.ensurePush2();
+                try vm.push(a);
+                try vm.push(b);
             },
             .rot3, .rot4 => {
                 const n: u32 = if (op == .rot3) 3 else 4;
-                const t = vm.peek(0);
-                _ = vm.peek(n - 1); // underflow check
+                const t = try vm.peek(0);
+                _ = try vm.peek(n - 1); // underflow check
                 const at = vm.sp - n;
                 std.mem.copyBackwards(Value, vm.stack[at + 1 .. vm.sp], vm.stack[at .. vm.sp - 1]);
                 vm.stack[at] = t;
@@ -330,104 +334,104 @@ pub const Vm = struct {
 
             // ---- objects: compute first (any of these can fail), then commit
             .new_object => {
-                vm.ensurePush();
+                try vm.ensurePush();
                 const o = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
-                vm.push(.{ .object = o });
+                try vm.push(.{ .object = o });
             },
             .new_array => {
                 const n = vm.operand(0);
-                if (n > vm.sp - vm.frame().stack_base) vm.bug("stack underflow");
+                if (n > vm.sp - vm.frame().stack_base) return vm.bug("stack underflow");
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
                 try rt.heap.appendElements(arr, vm.stack[vm.sp - n .. vm.sp]);
                 vm.sp -= n;
-                vm.push(.{ .object = arr });
+                try vm.push(.{ .object = arr });
             },
             .define_prop => {
-                const o = vm.peek(1);
-                if (o != .object) vm.bug("define on a non-object");
-                try object.define(rt, o.object, try object.named(rt, vm.name(vm.operand(0))), vm.peek(0));
-                vm.drop(1);
+                const o = try vm.peek(1);
+                if (o != .object) return vm.bug("define on a non-object");
+                try object.define(rt, o.object, try object.named(rt, try vm.name(vm.operand(0))), try vm.peek(0));
+                try vm.drop(1);
             },
             .define_elem => {
-                const o = vm.peek(2);
-                if (o != .object) vm.bug("define on a non-object");
-                try object.define(rt, o.object, try object.key(rt, vm.peek(1)), vm.peek(0));
-                vm.drop(2);
+                const o = try vm.peek(2);
+                if (o != .object) return vm.bug("define on a non-object");
+                try object.define(rt, o.object, try object.key(rt, try vm.peek(1)), try vm.peek(0));
+                try vm.drop(2);
             },
             .get_prop => {
-                const r = try object.get(rt, vm.peek(0), try object.named(rt, vm.name(vm.operand(0))));
-                vm.top().* = r;
+                const r = try object.get(rt, try vm.peek(0), try object.named(rt, try vm.name(vm.operand(0))));
+                (try vm.top()).* = r;
             },
             .get_elem => {
-                const k = try object.key(rt, vm.peek(0));
-                const r = try object.get(rt, vm.peek(1), k);
-                vm.drop(1);
-                vm.top().* = r;
+                const k = try object.key(rt, try vm.peek(0));
+                const r = try object.get(rt, try vm.peek(1), k);
+                try vm.drop(1);
+                (try vm.top()).* = r;
             },
             .set_prop => {
-                const v = vm.peek(0);
-                try object.set(rt, vm.peek(1), try object.named(rt, vm.name(vm.operand(0))), v);
-                vm.drop(1);
-                vm.top().* = v;
+                const v = try vm.peek(0);
+                try object.set(rt, try vm.peek(1), try object.named(rt, try vm.name(vm.operand(0))), v);
+                try vm.drop(1);
+                (try vm.top()).* = v;
             },
             .set_elem => {
-                const v = vm.peek(0);
-                const k = try object.key(rt, vm.peek(1)); // after the value: JS's order for `=`
-                try object.set(rt, vm.peek(2), k, v);
-                vm.drop(2);
-                vm.top().* = v;
+                const v = try vm.peek(0);
+                const k = try object.key(rt, try vm.peek(1)); // after the value: JS's order for `=`
+                try object.set(rt, try vm.peek(2), k, v);
+                try vm.drop(2);
+                (try vm.top()).* = v;
             },
             .delete_prop => {
-                const r = try object.delete(rt, vm.peek(0), try object.named(rt, vm.name(vm.operand(0))));
-                vm.top().* = .{ .boolean = r };
+                const r = try object.delete(rt, try vm.peek(0), try object.named(rt, try vm.name(vm.operand(0))));
+                (try vm.top()).* = .{ .boolean = r };
             },
             .delete_elem => {
-                const k = try object.key(rt, vm.peek(0));
-                const r = try object.delete(rt, vm.peek(1), k);
-                vm.drop(1);
-                vm.top().* = .{ .boolean = r };
+                const k = try object.key(rt, try vm.peek(0));
+                const r = try object.delete(rt, try vm.peek(1), k);
+                try vm.drop(1);
+                (try vm.top()).* = .{ .boolean = r };
             },
             .push_this => {
-                vm.ensurePush();
-                vm.push(vm.frame().this orelse return rt.fail(.sloppy_this));
+                try vm.ensurePush();
+                try vm.push(vm.frame().this orelse return rt.fail(.sloppy_this));
             },
 
             .add, .sub, .mul, .div, .mod, .pow, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in => {
-                const r = try ops.binary(rt, binaryOp(op), vm.peek(1), vm.peek(0)); // into a local (see .neg)
-                vm.drop(1);
-                vm.top().* = r;
+                const r = try ops.binary(rt, binaryOp(op), try vm.peek(1), try vm.peek(0)); // into a local (see .neg)
+                try vm.drop(1);
+                (try vm.top()).* = r;
             },
             // Compute into a local, then store. `top().* = .{ .number = f(peek(0)) }` would
             // be wrong: Zig builds the union in place, so the slot's tag changes *before*
             // f reads the old value through peek (result-location aliasing).
             .neg, .to_number, .not => {
-                const v = vm.peek(0);
+                const v = try vm.peek(0);
                 const r: Value = switch (op) {
                     .neg => .{ .number = -(try ops.toNumber(rt, v)) },
                     .to_number => .{ .number = try ops.toNumber(rt, v) },
                     .not => .{ .boolean = !ops.toBoolean(v) },
                     else => unreachable,
                 };
-                vm.top().* = r;
+                (try vm.top()).* = r;
             },
             .inc, .dec => {
-                const t = vm.top();
-                if (t.* != .number) vm.bug("inc/dec on a non-number"); // always after to_number
+                const t = try vm.top();
+                if (t.* != .number) return vm.bug("inc/dec on a non-number"); // always after to_number
                 t.number += if (op == .inc) 1 else -1;
             },
 
-            .jump => next = vm.target(),
+            .jump => next = try vm.target(),
             .jump_if_false, .jump_if_true => {
-                const truthy = ops.toBoolean(vm.peek(0));
-                vm.drop(1);
-                if (truthy == (op == .jump_if_true)) next = vm.target();
+                const truthy = ops.toBoolean(try vm.peek(0));
+                try vm.drop(1);
+                if (truthy == (op == .jump_if_true)) next = try vm.target();
             },
             .call, .call_method => {
                 // Stack: [callee, args…] or [receiver, callee, args…], arguments in source
                 // order. The result replaces the whole group, from `base`.
                 const argc = vm.operand(0);
                 const group = argc + @as(u32, if (op == .call_method) 2 else 1);
-                if (group > vm.sp - vm.frame().stack_base) vm.bug("stack underflow");
+                if (group > vm.sp - vm.frame().stack_base) return vm.bug("stack underflow");
                 const base = vm.sp - group;
                 const args = vm.sp - argc;
                 const receiver: ?Value = if (op == .call_method) vm.stack[base] else null;
@@ -450,8 +454,8 @@ pub const Vm = struct {
                 }
             },
             .@"return" => {
-                if (vm.frames.items.len < 2) vm.bug("return in the script");
-                const v = vm.peek(0);
+                if (vm.frames.items.len < 2) return vm.bug("return in the script");
+                const v = try vm.peek(0);
                 const f = vm.frames.pop().?;
                 vm.locals_len = f.locals_base;
                 vm.reserved -= f.proto.slot_count + f.proto.max_stack;
@@ -462,13 +466,13 @@ pub const Vm = struct {
                 return .running;
             },
             .halt => {
-                if (vm.frames.items.len != 1) vm.bug("halt in a function");
-                if (vm.sp != 0) vm.bug("stack not empty at halt");
+                if (vm.frames.items.len != 1) return vm.bug("halt in a function");
+                if (vm.sp != 0) return vm.bug("stack not empty at halt");
                 vm.halted = true;
                 return .halted; // pc stays on `halt`
             },
         }
-        if (next >= code.len) vm.bug("pc outside the code");
+        if (next >= code.len) return vm.bug("pc outside the code");
         vm.pc = next;
         return .running;
     }
@@ -482,7 +486,7 @@ pub const Vm = struct {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
-            .tree => vm.bug("a tree-walker closure in the VM"),
+            .tree => return vm.bug("a tree-walker closure in the VM"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
         const limits = vm.rt.limits;
@@ -552,99 +556,103 @@ pub const Vm = struct {
         }
     }
 
-    // ---- checked accessors (see "Defensive checks")
+    // ---- checked accessors (see "Defensive checks"). Every one either returns its
+    // result or, on a failed check, poisons the runtime and returns `error.Internal`
+    // before anything it guards was touched (D35, D49).
 
     fn operand(vm: *const Vm, i: usize) u32 {
         return bc.readU32(vm.proto().code, vm.pc + 1 + 4 * i); // instruction bounds checked in execute
     }
 
-    fn target(vm: *const Vm) u32 {
+    fn target(vm: *const Vm) Error!u32 {
         const t = vm.operand(0);
-        if (t >= vm.proto().code.len) vm.bug("jump target outside the code");
+        if (t >= vm.proto().code.len) return vm.bug("jump target outside the code");
         return t;
     }
 
-    fn slot(vm: *Vm, i: u32) *Slot {
-        if (i >= vm.proto().slot_count) vm.bug("slot index out of range");
+    fn slot(vm: *Vm, i: u32) Error!*Slot {
+        if (i >= vm.proto().slot_count) return vm.bug("slot index out of range");
         return &vm.locals[vm.frame().locals_base + i];
     }
 
     /// A plain (uncaptured) slot's value.
-    fn value(vm: *Vm, i: u32) *?Value {
-        return switch (vm.slot(i).*) {
+    fn value(vm: *Vm, i: u32) Error!*?Value {
+        return switch ((try vm.slot(i)).*) {
             .value => |*v| v,
-            .cell => vm.bug("value access to a cell slot"),
+            .cell => return vm.bug("value access to a cell slot"),
         };
     }
 
-    fn cellIn(vm: *const Vm, s: *Slot) *Cell {
+    fn cellIn(vm: *const Vm, s: *const Slot) Error!*Cell {
         return switch (s.*) {
             .cell => |c| blk: {
                 c.obj.checkLive(); // stress builds: a collected cell
                 break :blk c;
             },
-            .value => vm.bug("cell access to a value slot"),
+            .value => return vm.bug("cell access to a value slot"),
         };
     }
 
-    fn cellAt(vm: *Vm, i: u32) *Cell {
-        return vm.cellIn(vm.slot(i));
+    fn cellAt(vm: *Vm, i: u32) Error!*Cell {
+        return vm.cellIn(try vm.slot(i));
     }
 
-    fn capture(vm: *const Vm, i: u32) *Cell {
-        const c = vm.frame().closure orelse vm.bug("capture access in the script");
+    fn capture(vm: *const Vm, i: u32) Error!*Cell {
+        const c = vm.frame().closure orelse return vm.bug("capture access in the script");
         const caps = c.impl.vm.captures;
-        if (i >= caps.len) vm.bug("capture index out of range");
+        if (i >= caps.len) return vm.bug("capture index out of range");
         caps[i].obj.checkLive();
         return caps[i];
     }
 
-    fn name(vm: *const Vm, i: u32) []const u8 {
-        if (i >= vm.proto().names.len) vm.bug("name index out of range");
+    fn name(vm: *const Vm, i: u32) Error![]const u8 {
+        if (i >= vm.proto().names.len) return vm.bug("name index out of range");
         return vm.proto().names[i];
     }
 
     /// Stack room for one more operand in the current frame.
-    fn ensurePush(vm: *const Vm) void {
-        if (vm.sp >= vm.frame().stack_base + vm.proto().max_stack or vm.sp >= vm.stack.len) vm.bug("stack overflow");
+    fn ensurePush(vm: *const Vm) Error!void {
+        if (vm.sp >= vm.frame().stack_base + vm.proto().max_stack or vm.sp >= vm.stack.len) return vm.bug("stack overflow");
     }
 
-    fn ensurePush2(vm: *const Vm) void {
-        if (vm.sp + 1 >= vm.frame().stack_base + vm.proto().max_stack or vm.sp + 1 >= vm.stack.len) vm.bug("stack overflow");
+    fn ensurePush2(vm: *const Vm) Error!void {
+        if (vm.sp + 1 >= vm.frame().stack_base + vm.proto().max_stack or vm.sp + 1 >= vm.stack.len) return vm.bug("stack overflow");
     }
 
-    fn push(vm: *Vm, v: Value) void {
-        vm.ensurePush();
+    fn push(vm: *Vm, v: Value) Error!void {
+        try vm.ensurePush();
         vm.stack[vm.sp] = v;
         vm.sp += 1;
     }
 
     /// The value `depth` places below the top (0 = top), within the current frame.
-    fn peek(vm: *const Vm, depth: u32) Value {
-        if (depth >= vm.sp - vm.frame().stack_base) vm.bug("stack underflow");
+    fn peek(vm: *const Vm, depth: u32) Error!Value {
+        if (depth >= vm.sp - vm.frame().stack_base) return vm.bug("stack underflow");
         return vm.stack[vm.sp - 1 - depth];
     }
 
-    fn top(vm: *Vm) *Value {
-        if (vm.sp == vm.frame().stack_base) vm.bug("stack underflow");
+    fn top(vm: *Vm) Error!*Value {
+        if (vm.sp == vm.frame().stack_base) return vm.bug("stack underflow");
         return &vm.stack[vm.sp - 1];
     }
 
-    fn drop(vm: *Vm, n: u32) void {
-        if (n > vm.sp - vm.frame().stack_base) vm.bug("stack underflow");
+    fn drop(vm: *Vm, n: u32) Error!void {
+        if (n > vm.sp - vm.frame().stack_base) return vm.bug("stack underflow");
         vm.sp -= n;
     }
 
     fn tdz(vm: *Vm, name_index: u32) Error {
-        return vm.rt.throw(.ReferenceError, &.{ .{ .ascii = "Cannot access '" }, .{ .ascii = vm.name(name_index) }, .{ .ascii = "' before initialization" } });
+        return vm.rt.throw(.ReferenceError, &.{ .{ .ascii = "Cannot access '" }, .{ .ascii = try vm.name(name_index) }, .{ .ascii = "' before initialization" } });
     }
 
     fn constAssignment(vm: *Vm) Error {
         return vm.rt.throw(.TypeError, &.{.{ .ascii = "Assignment to constant variable." }});
     }
 
-    fn bug(vm: *const Vm, comptime what: []const u8) noreturn {
-        std.debug.panic("zqjs VM bug at pc {d}: " ++ what, .{vm.pc});
+    /// A defensive check failed (D49): poison the runtime and return `error.Internal`.
+    /// The compare that called this has run; nothing else has changed.
+    fn bug(vm: *const Vm, comptime what: []const u8) Error {
+        return vm.rt.bug(what);
     }
 };
 

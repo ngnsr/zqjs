@@ -90,6 +90,10 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
     outcome catch |e| {
         switch (e) {
             error.OutOfMemory, error.WriteFailed => |host| return host,
+            error.Internal => {
+                try report.print("{s}: internal error: {s}\n", .{ name, rt.internal_reason orelse "unknown" });
+                return 70;
+            },
             error.Thrown => {
                 const ex = rt.exception.?;
                 try report.print("Uncaught {s}", .{@tagName(ex.name)});

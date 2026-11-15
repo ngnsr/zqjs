@@ -240,3 +240,42 @@ test "return restores the caller's pc, frame and operand depth" {
     try testing.expectEqual(zqjs.Value{ .number = 3 }, vm.operands()[2]);
     try testing.expectEqual(s.proto.slot_count, vm.locals_len);
 }
+
+// ---- D49: defensive checks return `error.Internal` and poison the runtime
+
+test "a defensive-check failure returns Internal and poisons the runtime (D49)" {
+    const s = try Setup.create("let x = 1;", .{});
+    defer s.destroy();
+    // Corrupt the verified code by hand, as a compiler or verifier bug would: an opcode
+    // the verifier never lets through. `code` is gpa-allocated; the const slice only
+    // protects the reader.
+    @constCast(s.proto.code)[0] = 0xFF;
+    var vm = try zqjs.Vm.init(&s.rt, &s.proto);
+    defer vm.deinit();
+    try testing.expectError(error.Internal, vm.step());
+    try testing.expect(vm.fault != null);
+    try testing.expect(s.rt.poisoned);
+    try testing.expectEqualStrings("invalid opcode", s.rt.internal_reason.?);
+    try testing.expectEqual(@as(u64, 0), s.rt.steps); // nothing was charged
+    // Faulted like every error: further steps return the same error, execute nothing.
+    try testing.expectError(error.Internal, vm.step());
+    try testing.expectEqual(@as(u64, 0), s.rt.steps);
+    // The first reason is kept: a later check may only follow from the first.
+    @constCast(s.proto.code)[1] = 0xFF;
+    try testing.expectError(error.Internal, vm.step());
+    try testing.expectEqualStrings("invalid opcode", s.rt.internal_reason.?);
+}
+
+test "other defensive checks also return Internal, with their own reason (D49)" {
+    // `push_const` with a constant index the verifier would have rejected.
+    const s = try Setup.create("let x = 1; let y = \"s\";", .{});
+    defer s.destroy();
+    var vm = try zqjs.Vm.init(&s.rt, &s.proto);
+    defer vm.deinit();
+    // Find the push_const that loads "s" and point it past the constants.
+    while (@as(Op, @fromBackingInt(vm.proto().code[vm.pc])) != .push_const) _ = try vm.step();
+    @constCast(vm.proto().code)[vm.pc + 1] = 0xFF; // little-endian operand, low byte
+    try testing.expectError(error.Internal, vm.step());
+    try testing.expect(s.rt.poisoned);
+    try testing.expectEqualStrings("constant index out of range", s.rt.internal_reason.?);
+}

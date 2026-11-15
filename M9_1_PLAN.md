@@ -61,7 +61,7 @@ Also true today, and unchanged by this plan unless a decision below says otherwi
 | Q5 | **`error.HostError`**: a host operation failed; the execution faults with a host-facing classification and message. It does not poison the runtime. No RangeError abuse for host failures. |
 | Q6 | Host globals live in the realm: `defineGlobalFunction`. **Duplicate names are rejected — including built-in names.** `ctx` is **borrowed by the runtime until `Runtime.destroy`**; ZQJS never frees or touches it; no destructor callback in M9.1. |
 | Q7 | A native may call back into: `rt.call`, handle operations, `throwJs`, `collectGarbage`, read-only `memory`. `compile`/`start`/`run` during an active callback return **`error.Busy`**. The existing panics for accidental host API re-entry and cross-thread access are kept. |
-| Q8 | `rt.call` runs to completion under the **shared cumulative budget**; no slicing in M9.1. Synchronous native callbacks may **overshoot a `resume()` slice** but never the cumulative `max_steps` — documented here, proven by an explicit test. |
+| Q8 | `rt.call` runs to completion under the **shared cumulative budget**; no slicing in M9.1. Synchronous native callbacks may **overshoot a `resume()` slice** but never the cumulative `max_steps`. Budget exhaustion **latches** and faults the outer execution at the native boundary (specified under *Step budgets*). |
 | Q9 | D40 stands: user `valueOf`/`toString` stay `Unsupported(user_conversion)`. |
 | Q10 | Strings get handles like everything else (uniform model). `Handle.string(buf)` returns the **full length** and signals a wrong-kind handle **separately**; copying into a caller buffer never allocates, so no `OutOfMemory`. |
 | Q11 | Re-entrancy mechanism: **model B — separate nested VM executions** — for M9.1. Model A is a future optimization, revisited only if a feasibility prototype justifies it (measured nested-VM creation cost). |
@@ -175,9 +175,16 @@ It lives on the runtime and owns exactly the four things the review named:
    per-execution cumulative counter, but *shared by every VM and native record in the chain*.
    A nested call never installs a fresh budget: it charges the same counter through the
    existing `rt.step()` (which checks `used ≥ max` before charging, so the counter can never
-   exceed `max_steps`, E4). Budget exhaustion is **sticky**: once the counter hits `max`, the
-   next `rt.step()` on any VM in the chain faults with `LimitExceeded` — a native cannot
-   launder a budget fault by returning a normal result.
+   exceed `max_steps`, E4). Budget exhaustion **latches** in the execution context, with
+   exactly this semantics (review-frozen):
+   - the first exhaustion latches `LimitExceeded` in the shared execution context;
+   - subsequent nested JS execution cannot consume more instructions (`rt.step()` faults
+     immediately);
+   - the native may finish its current callback, but cannot clear or replace the latched
+     failure;
+   - when the native boundary is reached, the outer execution faults with the latched
+     `LimitExceeded`, **regardless of the native callback's return value** — a native cannot
+     turn a budget failure into success.
 2. **The logical call-depth counter.** Charged by every VM's frames *and* by every native-call
    record, checked against `limits.max_call_depth` across the whole chain — no per-VM counters
    to keep in step.
@@ -257,6 +264,18 @@ down — on success, on `Thrown`, on `HostError`, on any fault. A native that wa
 value beyond the call must `dup` the token; `dup`'s allocation failure is checked under
 `checkAllAllocationFailures` like every other crossing (E6).
 
+**Token-pool growth is bounded and accounted (review condition).** Never freeing individual
+token records buys deterministic stale detection, but a host looping create/release would
+grow the pool forever while retaining no JS values at all. So:
+- `Limits.max_handles` caps the pool's total records, live and dead together (free-list
+  reuse keeps a churn loop at its high-water mark instead of growing it); minting beyond the
+  cap is `error.LimitExceeded` with `Limit(.handles)`, catchable by the host, and the
+  runtime stays usable (E6).
+- The pool's and table's bytes are part of `memory()` (accounted like heap bytes, D28), so
+  the embedder can see the cost.
+- Test: repeated create/`dup`/release cycles drive the pool to a plateau, not unbounded
+  growth; the plateau is reflected in `memory().bytes`.
+
 ## The native-call record and the guard (Q7/Q12, frozen)
 
 When a `.call` instruction reaches a host native, the engine pushes a **native-call record**
@@ -300,6 +319,11 @@ depth charge. The record is the *capability*:
   documented in EMBEDDING.md and proven by an explicit test (below).
 - The hard stop is the cumulative `max_steps`, enforced by `rt.step()` at every instruction
   of every VM in the chain; the counter never exceeds it (E4's no-overflow property).
+- **The boundary check (review-frozen):** when a native-call record tears down, the engine
+  checks the latched budget fault *before* reading the native's outcome — a latched
+  `LimitExceeded` faults the outer execution even if the native returned success. The host
+  callback cannot be forcibly interrupted (its C call stack is active), but it cannot convert
+  a budget failure into a result.
 - `rt.call` from the host at depth 0 runs to completion under a fresh context's budget;
   no `steps` parameter in M9.1 (slicing is additive later, Q8).
 - While a native chain is in flight, the outer execution's slice bookkeeping simply waits:
@@ -409,15 +433,23 @@ S9    g returns → rt.call completes.
       Result minted as token T_r (refs +1); ownership → the caller (n1).
       V2 deregistered and torn down; call_depth −1.
       Error paths: Thrown → n1 sees error.Thrown + the pending exception;
-        LimitExceeded (X.budget exhausted) → n1 sees it, and exhaustion is
-        STICKY: the next rt.step() on V1 faults too — a budget fault cannot be
-        laundered by a native returning a normal result.
+        LimitExceeded (X.budget exhausted) → LATCHED in X: n1 may finish its
+        callback but cannot clear or replace the latch, and the outer
+        execution faults with it at the native boundary (S10) regardless of
+        n1's return value — a budget fault cannot be laundered.
 
 S10   n1 returns.
-      Engine tears down N1: if out.result is set, its value is copied into V1's
-        operand slot (V1 is a root), then ALL of N1's tokens are released
-        (T_this, T_a…, and T_r if n1 did not release it) — on EVERY outcome:
-        success, Thrown, HostError, any fault. The exceptional path leaks nothing.
+      Engine tears down N1: FIRST the latched-budget check (a latched
+        LimitExceeded faults the outer execution now, whatever n1 returned);
+        then, if out.result is set, its value is copied into V1's operand slot
+        (V1 is a root), then ALL of N1's tokens are released (T_this, T_a…,
+        and T_r if n1 did not release it) — on EVERY outcome: success, Thrown,
+        HostError, any fault. The exceptional path leaks nothing.
+      Release-order invariant (review-frozen): a temporary token stays a GC
+        root until its destination is safely written. If writing to V1's
+        operand slot can trigger an allocation (stack growth) or a collection,
+        T_r remains live across that operation — it is released only after
+        the destination has become a root.
       call_depth −1; guard pops engine·N1; V1 resumes f.
 
 S11   f continues on V1; rt.step() still charges X.budget (nested consumption
@@ -457,6 +489,9 @@ Consistency checks the diagram pins (each becomes an assertion or a test):
   collection between S4 and S9 cannot free what V1 or the table holds.
 - Temp tokens exist exactly between a record's push (S3/S6) and its teardown (S10/S8) — the
   leak checks run at both teardowns, on every outcome.
+- Release order: a temp token is released only after its destination has been written and
+  become a root — including across any allocation the write itself may trigger (the
+  gc-stress build turns that window into a test).
 
 ## Acceptance criteria (all under plain, `-Dgc-stress`, `-Dstack-stress`, ReleaseSafe)
 
@@ -471,12 +506,15 @@ Consistency checks the diagram pins (each becomes an assertion or a test):
 - **Slice overshoot (named test, Q8):** `resume(steps: 1)` on a script whose first
   instruction calls a host native that `rt.call`s a long-running JS loop: the host regains
   control only after the whole chain completes (charged steps ≫ slice); a nested runaway
-  loop hits `max_steps` exactly (`LimitExceeded`), the counter never exceeds it, the fault
-  surfaces through `rt.call` to the native, and the outer execution faults with it
-  (stickiness).
+  loop hits `max_steps` exactly (`LimitExceeded`), the counter never exceeds it, the latch
+  is set, and — even when the native returns success — **the outer execution faults at the
+  native boundary** with the latched `LimitExceeded`
 - **Handles:**
   - mint/`dup`/`release`, leak-checked; a released token's use is caught — expected-panic
     child test (deterministic, safe builds, runtime alive);
+  - **token-pool churn:** repeated create/`dup`/release cycles plateau at the pool's
+    high-water mark (free-list reuse), reflected in `memory().bytes`; minting past
+    `Limits.max_handles` is `LimitExceeded(handles)`, catchable, the runtime stays usable;
   - a token survives collections taken by *other* executions (gc-stress throughout);
   - a token to a value that becomes garbage *while held* stays alive; releasing it lets the
     next collection free it (`memory().bytes` before/after);
@@ -537,11 +575,14 @@ Consistency checks the diagram pins (each becomes an assertion or a test):
 
 ## Design-decision records to write (P1's deliverable once approved)
 
-- **D50** — handles: table + reference-counted slots + generation-checked tokens; the E1
-  amendment (detection only while the runtime is alive; cross-runtime rejection).
+- **D50** — handles: table + reference-counted slots + generation-checked tokens; the token
+  pool's bounded, accounted growth (`Limits.max_handles`, bytes in `memory()`); the E1
+  amendment (detection only while the runtime is alive; cross-runtime rejection); the
+  release-order invariant (a temp token stays a root until its destination is written,
+  across any allocation the write may trigger).
 - **D51** — the shared execution context: one cumulative budget, one logical depth counter,
-  re-entry state, active-VM root registrations; model B; the slice-overshoot rule and
-  budget stickiness (Q8/Q11).
+  re-entry state, active-VM root registrations; model B; the slice-overshoot rule, the
+  latched budget fault, and the boundary check (Q8/Q11).
 - **D52** — the guard's entry-kind stack and the callback-scoped capability; the sanctioned
   re-entrant API and `Busy` (Q7/Q12).
 - **D53** — host natives: `defineGlobalFunction` (duplicate rejection, `ctx` lifetime),

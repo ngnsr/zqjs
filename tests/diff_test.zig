@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const zqjs = @import("zqjs");
+const zqjs = @import("zqjs_internal");
 const support = @import("support.zig");
 
 test "watchdog: this binary fails, instead of hanging, if a test gets stuck" {

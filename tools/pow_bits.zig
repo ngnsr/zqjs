@@ -8,7 +8,7 @@
 //! Results so far are recorded in DESIGN_DECISIONS D25.
 
 const std = @import("std");
-const pow = @import("zqjs").ops.pow;
+const pow = @import("zqjs_internal").ops.pow;
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;

@@ -37,7 +37,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zqjs = @import("zqjs");
+const zqjs = @import("zqjs_internal");
 const Heap = zqjs.heap.Heap;
 
 var limits: zqjs.Limits = .{

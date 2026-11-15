@@ -102,7 +102,10 @@ jobs:
 
       - name: Release build
         if: matrix.suite.name == 'tests'
-        run: zig build --release=fast ${{ matrix.platform.cpu }}
+        run: |
+          zig build --release=fast ${{ matrix.platform.cpu }}
+          # The embedding example builds and runs in release mode too (M9.0).
+          zig build example --release=fast ${{ matrix.platform.cpu }}
 
       # pow must give bit-identical results everywhere (DESIGN_DECISIONS D25). The expected
       # hash was measured on aarch64-macos and x86_64 under Rosetta 2; these runners add

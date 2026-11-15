@@ -23,7 +23,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zqjs = @import("zqjs");
+const zqjs = @import("zqjs_internal");
 
 const runs = 5;
 

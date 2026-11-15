@@ -4,7 +4,7 @@
 //! The same file is checked against node by harness/check_syntax_cases.js.
 
 const std = @import("std");
-const zqjs = @import("zqjs");
+const zqjs = @import("zqjs_internal");
 const support = @import("support.zig");
 
 fn frontend(arena: std.mem.Allocator, source: []const u8, diag: *zqjs.Diagnostic, w: *std.Io.Writer) !void {

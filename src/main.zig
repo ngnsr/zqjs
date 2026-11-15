@@ -10,7 +10,8 @@
 //!   --verify-heap    verify the heap after every collection (a GC debugging aid)
 
 const std = @import("std");
-const zqjs = @import("zqjs");
+const zqjs = @import("zqjs_internal");
+const api = @import("zqjs");
 
 const usage =
     \\usage: zqjs [--test | --dump-ast | --dump-bytecode] [options] FILE
@@ -101,7 +102,12 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     switch (command) {
-        .run => return zqjs.runSource(gpa, name, source, limits, options, out, err),
+        .run => {
+            if (options.engine == .vm and options.trace == null and !options.verify_heap) {
+                return runPublic(gpa, name, source, limits, out, err);
+            }
+            return zqjs.runSource(gpa, name, source, limits, options, out, err);
+        },
         .@"test" => {
             options.mode = .harness;
             return zqjs.runSource(gpa, name, source, limits, options, out, err);
@@ -109,6 +115,44 @@ pub fn main(init: std.process.Init) !u8 {
         .dump => return dump(arena, name, source, limits, out, err),
         .dump_bytecode => return dumpBytecode(gpa, arena, name, source, limits, out, err),
     }
+}
+
+fn runPublic(gpa: std.mem.Allocator, name: []const u8, source: []const u8, limits: api.Limits, out: *std.Io.Writer, err: *std.Io.Writer) !u8 {
+    const rt = try api.Runtime.create(gpa, .{ .limits = limits, .output = out });
+    defer rt.destroy();
+
+    var diag: api.Diagnostic = .{};
+    const program = rt.compile(name, source, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Source => {
+            try diag.render(source, name, err);
+            return 1;
+        },
+        error.Internal => {
+            try err.print("{s}: internal error\n", .{name});
+            return 70;
+        },
+    };
+    defer program.destroy();
+
+    var failure: api.Failure = .{};
+    rt.run(program, &failure) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OutputFailed => return error.WriteFailed,
+        error.Internal => {
+            try err.print("{s}: internal error\n", .{name});
+            return 70;
+        },
+        error.Thrown => {
+            try err.print("Uncaught {s}\n", .{failure.message()});
+            return 1;
+        },
+        error.LimitExceeded, error.Unsupported => {
+            try err.print("{s}: {s}\n", .{ name, failure.message() });
+            return 1;
+        },
+    };
+    return 0;
 }
 
 fn dump(arena: std.mem.Allocator, name: []const u8, source: []const u8, limits: zqjs.Limits, out: *std.Io.Writer, err: *std.Io.Writer) !u8 {

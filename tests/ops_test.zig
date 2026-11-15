@@ -5,7 +5,7 @@
 const std = @import("std");
 const support = @import("support.zig");
 const testing = std.testing;
-const ops = @import("zqjs").ops;
+const ops = @import("zqjs_internal").ops;
 
 fn fromBits(hex: []const u8) !f64 {
     return @bitCast(try std.fmt.parseInt(u64, hex, 16));

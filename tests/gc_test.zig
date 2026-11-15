@@ -121,7 +121,7 @@ test "every store into a heap object goes through the heap's store API (I3)" {
 
 // ---------------------------------------------------------------- P1: the collector
 
-const zqjs = @import("zqjs");
+const zqjs = @import("zqjs_internal");
 const support = @import("support.zig");
 const heap = zqjs.heap;
 const Allocator = std.mem.Allocator;

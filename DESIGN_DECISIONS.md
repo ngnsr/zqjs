@@ -497,9 +497,10 @@ is `maxInt(u64)`. The unit is engine-defined, so thresholds differ between engin
 **Trust.** The pipeline always verifies before running (D33), in every build mode. The VM still
 keeps cheap defensive checks (pc and instruction bounds, opcode validity, stack underflow and
 overflow, slot, constant and name indices, jump targets) because the verifier protects against
-malformed bytecode, not against bugs in the VM or the verifier. A failed check is a bug, so it
-panics with the pc instead of producing a JavaScript-visible result. They stay until a benchmark
-says otherwise.
+malformed bytecode, not against bugs in the VM or the verifier. A failed check is a bug. Until
+M9.0 it panicked with the pc instead of producing a JavaScript-visible result; D49 revised that:
+it returns `error.Internal` and poisons the runtime, because an embedder's process must not
+crash on ZQJS's behalf.
 **Messages.** The VM writes the same exception messages as the tree-walker. The tree-walker is
 left untouched as the oracle, so the four message texts exist twice; the differential tests
 compare messages, which catches any drift.
@@ -749,3 +750,33 @@ lands. That comes from allocation never collecting (D7), and was true in M8 too.
   depends on it, because an allocator that can resize in place charges growth differently.
 
 *Embedders* pick their own. M9's documentation will repeat the measurement.
+
+## D46. Two modules: public zqjs and internal zqjs_internal *(M9.0)*
+**Decision.** The repository provides two separate Zig modules:
+- `zqjs` (`src/api.zig`): the only module an embedder's build can reach. It exposes only high-level opaque types (`Runtime`, `Program`, `Execution`), limits, error sets, and diagnostic structures.
+- `zqjs_internal` (`src/root.zig`): all compiler, AST, parser, VM, heap, and GC internals. Used only by our own CLI debug tools, benchmarks, and internal integration tests.
+**Why.** Zig cannot place one file in multiple modules with different visibility rules. Separating modules prevents accidental leaks of VM internals into host embedder code, ensuring internal refactors (heap, bytecode, GC) never break external embedders.
+**Enforcement.** `tests/api_test.zig` and `examples/embed.zig` import only `zqjs`. A comptime snapshot test asserts the exact list of public declarations; adding an export requires explicit review.
+
+## D47. Opaque types, strict ownership hierarchy, and the atomic guard *(M9.0)*
+**Decision.** The public API exposes three opaque types: `Runtime`, `Program`, and `Execution`.
+- `Runtime` owns its heap, realm, root list, and all programs/executions created under it. Nothing outlives its runtime; `Runtime.destroy` reclaims everything.
+- `Program` uses internal reference counting (1 for the host handle, plus 1 for each active `Execution`). Calling `Program.destroy` invalidates the host handle immediately, while running executions continue cleanly. Bytecode and constant GC roots are freed when the last execution dies or the runtime is destroyed.
+- `Execution` holds independent VM state (stacks, frames, pc, top-level bindings). `Execution.destroy` drops its roots and stacks immediately.
+**Concurrency.** A runtime is strictly single-threaded at any moment. Every API call claims an atomic CAS entry guard on the runtime and releases it via `defer`. Overlapping calls (from concurrent threads or host output writer re-entrancy) panic with `"zqjs: Runtime entered while another call into it is running"`.
+**Use after destroy.** A host bug, caught at every entry point in safe builds by a tag check that panics naming the type (`"zqjs: Program used after destroy"`…). `Program.destroy` also clears a `host` flag on the impl, so the case "destroyed while executions keep it alive" is caught deterministically, not only while the freed memory happens to stay poisoned. Best effort by design: freed memory may be reused, so a missed catch is possible; documented as such. The guard is on in every build mode; the tag checks compile out in ReleaseFast.
+
+## D48. Cooperative executions, slices, and cumulative step limits *(M9.0)*
+**Decision.** Executions are sliceable and cooperative:
+- **Slice:** `resume(ex, steps)` bounds the maximum instructions executed in a single call. Running out of a slice returns `.suspended`, leaving VM state exact and intact for subsequent frames.
+- **Cap:** `limits.max_steps` bounds the cumulative instructions an execution may execute over its lifetime across all resumes.
+- **Exact limit rules:**
+  - Instructions run only if `used < max_steps`.
+  - An execution reaching the cap yields `.suspended` if the slice also ended; the subsequent instruction attempt fails with `LimitExceeded(steps)`.
+  - A script completing at or before the cap finishes with `.finished`, never an error.
+  - A faulted execution remains faulted; subsequent resumes return the cached error.
+
+## D49. Internal errors as results instead of panics *(M9.0; D35 revised)*
+**Decision.** Bytecode verification failures and defensive VM sanity checks return `error.Internal` and record an `internal` `Failure` rather than panicking.
+**Why.** In an embedded context, a scripting engine bug must not crash the host process. An `Internal` error flags an invariant violation in ZQJS itself.
+**Poisoning.** An internal error poisons the runtime: subsequent calls return `Internal`, and only `Runtime.destroy` is permitted, because the VM's internal invariants can no longer be trusted. The flag lives on the internal `Runtime` (`poisoned`), checked by the embedding API's every entry that runs code; `collectGarbage` and `memory` stay usable (they touch no VM state), and the destroy paths stay usable, since the host must be able to clean up. The first failed check's reason (a static string, or formatted into a fixed buffer for the verifier's report) is kept for the host's report and the CLI's `internal error: …` line; the `Failure` text itself stays the fixed `internal error` (E10).

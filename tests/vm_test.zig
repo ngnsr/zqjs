@@ -279,3 +279,101 @@ test "other defensive checks also return Internal, with their own reason (D49)" 
     try testing.expect(s.rt.poisoned);
     try testing.expectEqualStrings("constant index out of range", s.rt.internal_reason.?);
 }
+
+// ---- The shared execution context (M9.1, D51): the budget and the logical call depth
+// a chain shares. Driven directly, before the nested VM lifecycle (P3) is layered on.
+
+/// Steps `vm` until it halts or faults, returning the error if any.
+fn runUntilStop(vm: *zqjs.Vm) ?zqjs.runtime.Error {
+    while (true) {
+        const state = vm.step() catch |e| return e;
+        if (state == .halted) return null;
+    }
+}
+
+test "chain: one cumulative budget, shared and latched (D51, Q8)" {
+    const s = try Setup.create("let i = 0; while (i < 10) i++;", .{ .max_steps = 5 });
+    defer s.destroy();
+    var vm = try zqjs.Vm.init(&s.rt, &s.proto);
+    defer vm.deinit();
+
+    const cx = &s.rt.exec_ctx;
+    s.rt.beginChain(0, 5);
+    vm.chain = cx;
+    try testing.expectEqual(@as(u64, 0), s.rt.steps);
+
+    // The 6th instruction exhausts the budget: exactly 5 charged, never more (E4), and
+    // the exhaustion latched in the context (Q8).
+    try testing.expectEqual(error.LimitExceeded, runUntilStop(&vm).?);
+    try testing.expectEqual(@as(u64, 5), s.rt.steps);
+    try testing.expectEqual(zqjs.runtime.Error.LimitExceeded, cx.budget_fault.?);
+    try testing.expectEqual(zqjs.Limit.steps, s.rt.limitHit().?);
+    // Faulted like every error: further steps consume nothing and keep the latch.
+    try testing.expectEqual(error.LimitExceeded, runUntilStop(&vm).?);
+    try testing.expectEqual(@as(u64, 5), s.rt.steps);
+
+    // The chain ends with the count saved back for the caller (E4).
+    try testing.expectEqual(@as(u64, 5), s.rt.endChain());
+    vm.chain = null;
+
+    // A new chain starts fresh: adopted count, no latch (a native cannot carry a
+    // previous chain's fault into the next one).
+    s.rt.beginChain(2, 100);
+    try testing.expectEqual(@as(u64, 2), s.rt.steps);
+    try testing.expect(cx.budget_fault == null);
+    try testing.expectEqual(@as(u64, 2), s.rt.endChain());
+}
+
+test "chain: the logical call depth counts the chain's frames as one number (D51)" {
+    // max_call_depth = 3: the script frame plus two live calls fill it; the third call
+    // faults on the chain's shared counter, not a per-VM one.
+    const s = try Setup.create("function f(n) { if (n > 0) return f(n - 1); return n; } f(9);", .{ .max_call_depth = 3 });
+    defer s.destroy();
+    var vm = try zqjs.Vm.init(&s.rt, &s.proto);
+    errdefer vm.deinit();
+
+    const cx = &s.rt.exec_ctx;
+    s.rt.beginChain(0, std.math.maxInt(u64));
+    defer _ = s.rt.endChain();
+    vm.chain = cx;
+    // The frames already live when the chain begins count from the start (the
+    // embedding API's resume sets this from the suspended VM's frames).
+    cx.call_depth = @intCast(vm.frames.items.len);
+
+    while (true) {
+        const state = vm.step() catch |e| {
+            try testing.expectEqual(error.LimitExceeded, e);
+            break;
+        };
+        if (state == .halted) break;
+        // At every step boundary the chain's depth is exactly the live frames.
+        try testing.expectEqual(vm.frames.items.len, cx.call_depth);
+    }
+    // Faulted: three live frames (script + f(9) + f(8)), depth and frames in step.
+    try testing.expectEqual(@as(u32, 3), cx.call_depth);
+    try testing.expectEqual(@as(u32, 3), vm.frames.items.len);
+    try testing.expectEqual(zqjs.Limit.call_depth, s.rt.limitHit().?);
+    try testing.expectEqual(@as(u32, 3), cx.call_depth);
+
+    // Teardown mid-chain unwinds exactly the frames still live: the chain's depth is
+    // back to what it was before the VM ran.
+    vm.deinit();
+    try testing.expectEqual(@as(u32, 0), cx.call_depth);
+}
+
+test "chain: depth returns to its starting count after a full run (D51)" {
+    const s = try Setup.create("function f(n) { if (n > 0) return f(n - 1); return n; } f(3);", .{});
+    defer s.destroy();
+    var vm = try zqjs.Vm.init(&s.rt, &s.proto);
+    defer vm.deinit();
+
+    const cx = &s.rt.exec_ctx;
+    s.rt.beginChain(0, std.math.maxInt(u64));
+    defer _ = s.rt.endChain();
+    vm.chain = cx;
+    cx.call_depth = @intCast(vm.frames.items.len);
+    try testing.expect(runUntilStop(&vm) == null); // completes: no limit
+    // Every call's charge was unwound by its return; the script frame remains.
+    try testing.expectEqual(vm.frames.items.len, cx.call_depth);
+    try testing.expectEqual(@as(u32, 1), cx.call_depth);
+}

@@ -553,16 +553,20 @@ const ExecutionImpl = struct {
         }
         if (x.vm.halted) return .finished;
         const rt = &x.owner.rt;
-        // The cap is per execution and cumulative (E4): the runtime's counter is this
-        // execution's for the length of the call.
-        rt.steps = x.used;
-        rt.max_steps = rt.limits.max_steps;
+        // The chain (M9.1, D51): one shared execution context per top-level entry. The
+        // budget is cumulative per execution (E4): the context adopts `used`, every VM
+        // and native record in the chain charges the same live counters, and the updated
+        // count is saved back at the chain's end.
+        rt.beginChain(x.used, rt.limits.max_steps);
+        defer x.used = rt.endChain();
+        x.vm.chain = &rt.exec_ctx; // its frames charge the chain's shared depth
+        defer x.vm.chain = null;
+        rt.exec_ctx.call_depth = @intCast(x.vm.frames.items.len); // the frames already live count (D51 #2)
         rt.exception = null;
         rt.unsupported = null;
         rt.unsupported_name = null;
         rt.limit_hit = null;
         rt.heap.limit_hit = null;
-        defer x.used = rt.steps;
         var n: u64 = 0;
         while (n < steps) : (n += 1) {
             const state = x.vm.step() catch |e| {

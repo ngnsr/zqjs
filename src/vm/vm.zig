@@ -95,6 +95,12 @@ pub const Vm = struct {
     pc: u32 = 0,
     halted: bool = false,
     fault: ?Error = null,
+    /// The execution context this VM charges (M9.1, D51): set while a chain runs it —
+    /// the embedding API's resume, or a nested call — so frames check the chain's shared
+    /// `call_depth` instead of a per-VM limit. Null for a chain-less VM (the CLI's),
+    /// which keeps its own per-VM check. Torn down in `deinit` (subtracting the frames
+    /// still live), so a VM faulting mid-recursion unwinds its charge exactly.
+    chain: ?*rt_mod.ExecContext = null,
 
     /// `script` must have passed `verify` and must outlive the VM (and every use of its
     /// closures). Allocates with `rt.gpa`; on failure nothing is left allocated.
@@ -112,6 +118,7 @@ pub const Vm = struct {
     }
 
     pub fn deinit(vm: *Vm) void {
+        if (vm.chain) |cx| cx.call_depth -= @intCast(vm.frames.items.len); // the frames still live unwind their depth charge (D51)
         if (vm.rt.engine_roots) |e| if (e.ctx == @as(*anyopaque, vm)) {
             vm.rt.engine_roots = null; // no collection may scan a VM that is gone
         };
@@ -457,6 +464,7 @@ pub const Vm = struct {
                 if (vm.frames.items.len < 2) return vm.bug("return in the script");
                 const v = try vm.peek(0);
                 const f = vm.frames.pop().?;
+                if (vm.chain) |cx| cx.call_depth -= 1; // the frame died (D51 #2)
                 vm.locals_len = f.locals_base;
                 vm.reserved -= f.proto.slot_count + f.proto.max_stack;
                 vm.sp = f.result_index;
@@ -490,8 +498,12 @@ pub const Vm = struct {
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
         const limits = vm.rt.limits;
-        // 1. limits
-        if (vm.frames.items.len >= limits.max_call_depth) return vm.rt.limit(.call_depth);
+        // 1. limits — a chained VM checks the chain's shared depth (D51 #2: every VM's
+        // frames plus every native record, one `max_call_depth` across the chain); a
+        // chain-less VM (the CLI) checks its own frames.
+        if (vm.chain) |cx| {
+            if (cx.call_depth >= limits.max_call_depth) return vm.rt.limit(.call_depth);
+        } else if (vm.frames.items.len >= limits.max_call_depth) return vm.rt.limit(.call_depth);
         if (vm.reserved + callee.slot_count + callee.max_stack > limits.max_stack_slots) return vm.rt.limit(.stack_slots);
         // 2. capacity (may move the stacks: fine, everything is an index)
         try vm.frames.ensureUnusedCapacity(vm.rt.gpa, 1);
@@ -512,6 +524,7 @@ pub const Vm = struct {
         vm.locals_len += callee.slot_count;
         vm.reserved += callee.slot_count + callee.max_stack;
         vm.pc = 0;
+        if (vm.chain) |cx| cx.call_depth += 1; // the frame is live now (D51 #2)
     }
 
     /// Makes room for a frame of `p` above the current locals and operands. Grows

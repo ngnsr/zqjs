@@ -244,7 +244,7 @@ pub const Runtime = opaque {
         const guard = Guard.enter(r);
         defer guard.exit();
         if (r.rt.poisoned) return error.Internal; // E7: only destroy works now
-        return @ptrCast(try handles.mint(&r.rt, .{ .number = n }));
+        return @ptrCast(try handles.Table.mint(&r.rt, .{ .number = n }));
     }
 
     pub fn newBoolean(rt: *Runtime, b: bool) HandleError!*Handle {
@@ -252,7 +252,7 @@ pub const Runtime = opaque {
         const guard = Guard.enter(r);
         defer guard.exit();
         if (r.rt.poisoned) return error.Internal; // E7
-        return @ptrCast(try handles.mint(&r.rt, .{ .boolean = b }));
+        return @ptrCast(try handles.Table.mint(&r.rt, .{ .boolean = b }));
     }
 
     /// Creates a heap string (E10: UTF-16 units in, lone surrogates kept) and mints a
@@ -267,7 +267,7 @@ pub const Runtime = opaque {
             error.LimitExceeded => return error.LimitExceeded,
             else => unreachable, // newString only allocates and checks a limit
         };
-        return @ptrCast(try handles.mint(&r.rt, .{ .string = s }));
+        return @ptrCast(try handles.Table.mint(&r.rt, .{ .string = s }));
     }
 };
 
@@ -317,7 +317,7 @@ pub const Handle = opaque {
         const guard = Guard.enterIrt(t.owner);
         defer guard.exit();
         if (t.owner.poisoned) return error.Internal; // E7: nothing is minted
-        return @ptrCast(try t.owner.handles.dup(t.owner, t));
+        return @ptrCast(try handles.Table.dup(t.owner, t));
     }
 
     /// Kills this handle and drops its slot reference; the slot's value becomes

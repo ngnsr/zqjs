@@ -97,6 +97,13 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
         rt.run(p, null) catch {}; // host bug: the dead handle → the tag check panics
         return;
     }
+    if (std.mem.eql(u8, scenario, "handle-after-release")) {
+        const rt = try zqjs.Runtime.create(testing.allocator, .{});
+        const h = try rt.newNumber(7);
+        h.release();
+        _ = h.number(); // host bug: a dead handle → the token check panics (E1/D50)
+        return;
+    }
     @panic("unknown guard scenario");
 }
 
@@ -560,6 +567,204 @@ test "atomic guard: every API exit path releases guard on failure" {
     try testing.expectEqual(zqjs.Status.suspended, try ex_loop2.@"resume"(1, null));
 }
 
+// ---- Handles (M9.1, P2/D50): values crossing the boundary, GC-safe with explicit
+// ownership. Every test here runs on the host thread at depth 0: the sanctioned
+// re-entry (a native calling back, Q7) arrives with the entry-kind stack in P3.
+
+test "handles: mint, read, release (D50, Q10/D54)" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+    var buf: [16]u16 = undefined;
+
+    // Numbers copy out bit for bit (f64 through the boundary).
+    const n = try rt.newNumber(-1.5);
+    defer n.release();
+    try testing.expectEqual(zqjs.HandleKind.number, n.kind());
+    try testing.expectEqual(@as(?f64, -1.5), n.number());
+    try testing.expectEqual(@as(?bool, null), n.boolean());
+    try testing.expectEqual(@as(?usize, null), n.string(&buf));
+
+    const b = try rt.newBoolean(true);
+    defer b.release();
+    try testing.expectEqual(zqjs.HandleKind.boolean, b.kind());
+    try testing.expectEqual(@as(?bool, true), b.boolean());
+    try testing.expectEqual(@as(?f64, null), b.number());
+
+    // Strings are UTF-16 in and out (E10); lone surrogates are kept, not repaired.
+    const units = [_]u16{ 'h', 'i', 0xD83D, 0xDE00, 0xD800 }; // "hi" + 😀 + lone surrogate
+    const s = try rt.newStringUtf16(&units);
+    defer s.release();
+    try testing.expectEqual(zqjs.HandleKind.string, s.kind());
+    try testing.expectEqual(@as(?bool, null), s.boolean());
+    try testing.expectEqual(@as(?usize, units.len), s.string(&buf)); // the full length
+    try testing.expectEqualSlices(u16, &units, buf[0..units.len]);
+
+    // A too-small buffer copies min(len, buf.len) units and still reports the full
+    // length, so truncation is visible (D54); copying never allocates (Q10).
+    var small: [2]u16 = undefined;
+    try testing.expectEqual(@as(?usize, units.len), s.string(&small));
+    try testing.expectEqualSlices(u16, units[0..2], &small);
+
+    // Wrong kind for a reader → null, separately from any length question (Q10).
+    try testing.expectEqual(@as(?usize, null), n.string(&buf));
+}
+
+test "handles: dup mints an independent token (Q3/Q4)" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+
+    const n = try rt.newNumber(9);
+    const n2 = try n.dup();
+    n.release(); // the original token dies; the value lives through the dup
+    try testing.expectEqual(@as(?f64, 9), n2.number());
+    n2.release();
+
+    // A dup of a string reads the same units through both tokens.
+    const units = [_]u16{ 's', 'h', 'a', 'r', 'e', 'd' };
+    const s2 = blk: {
+        const s = try rt.newStringUtf16(&units);
+        const dup = try s.dup();
+        s.release(); // the original token dies; the value lives through the dup
+        break :blk dup;
+    };
+    defer s2.release();
+    var buf: [8]u16 = undefined;
+    try testing.expectEqual(@as(?usize, 6), s2.string(&buf));
+    try testing.expectEqualSlices(u16, &units, buf[0..6]);
+}
+
+test "handles: a held token roots its value; the last release makes it collectible (D50)" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+
+    // The string's only reference is the token: without the table's rooting, the
+    // collection would free it.
+    const want = [_]u16{ 'k', 'e', 'e', 'p', ' ', 'm', 'e' };
+    const s = try rt.newStringUtf16(&want);
+    _ = try rt.newNumber(0); // a second live token, so the table is non-trivially marked
+    rt.collectGarbage();
+
+    var buf: [16]u16 = undefined;
+    try testing.expectEqual(@as(?usize, want.len), s.string(&buf));
+    try testing.expectEqualSlices(u16, &want, buf[0..want.len]); // survived the collection
+
+    const before_release = rt.memory().bytes;
+    s.release(); // the last token: the value becomes garbage
+    rt.collectGarbage();
+    try testing.expect(rt.memory().bytes < before_release); // the sweep freed it
+}
+
+test "handles: a token survives collections taken by script activity (D50)" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+
+    const n = try rt.newNumber(3.25);
+    const p = try rt.compile("churn.js", "for (let i = 0; i < 200; i++) { let o = { a: [i, i + 1] }; }", null);
+    defer p.destroy();
+    try rt.run(p, null); // allocates and drops plenty of garbage
+    rt.collectGarbage();
+    try testing.expectEqual(@as(?f64, 3.25), n.number()); // untouched by the churn
+    n.release();
+}
+
+test "handles: the token pool is capped and accounted (D50: bounded growth)" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{ .limits = .{ .max_handles = 8 } });
+    defer rt.destroy();
+
+    var toks: [8]*zqjs.Handle = undefined;
+    for (&toks) |*slot| slot.* = try rt.newNumber(1);
+    // The cap counts records, live and dead together: minting one more fails, and the
+    // failure is catchable (E6).
+    try testing.expectError(error.LimitExceeded, rt.newNumber(2));
+    try testing.expectError(error.LimitExceeded, rt.newBoolean(true));
+    for (toks) |t| t.release();
+    // Released records are never reused (a stale handle must stay detectable, D50), so
+    // the spent cap is not refunded: minting stays refused even with zero live tokens.
+    try testing.expectError(error.LimitExceeded, rt.newNumber(2));
+    // The runtime stays usable (E6): everything but minting works as before.
+    rt.collectGarbage();
+    _ = rt.memory();
+    const p = try rt.compile("ok.js", "let x = 1; print(x);", null);
+    defer p.destroy();
+    try rt.run(p, null);
+}
+
+test "handles: churn within the cap recycles slots (D50)" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{ .limits = .{ .max_handles = 64 } });
+    defer rt.destroy();
+
+    // Create/release cycles burn records but recycle slots, so the table itself does
+    // not grow with the churn (the cap bounds the pool's memory).
+    for (0..32) |i| {
+        const h = try rt.newNumber(@floatFromInt(i));
+        try testing.expectEqual(@as(?f64, @floatFromInt(i)), h.number());
+        h.release();
+    }
+    // The runtime is still far from the cap and keeps minting.
+    const h = try rt.newNumber(42);
+    defer h.release();
+    try testing.expectEqual(@as(?f64, 42), h.number());
+}
+
+fn checkHandleAllocFailOnce(allocator: std.mem.Allocator) !void {
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    const rt = zqjs.Runtime.create(allocator, .{ .output = &discard.writer }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer rt.destroy();
+
+    const n = rt.newNumber(1) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.LimitExceeded => return error.LimitExceeded, // impossible here: fresh runtime
+        error.Internal => return error.Internal,
+    };
+    const units = [_]u16{'x'};
+    const s = rt.newStringUtf16(&units) catch |e| switch (e) {
+        error.OutOfMemory => {
+            n.release();
+            return error.OutOfMemory;
+        },
+        error.LimitExceeded => {
+            n.release();
+            return error.LimitExceeded;
+        },
+        error.Internal => return error.Internal,
+    };
+    const d = n.dup() catch |e| switch (e) {
+        error.OutOfMemory => {
+            s.release();
+            n.release();
+            return error.OutOfMemory;
+        },
+        error.LimitExceeded => {
+            s.release();
+            n.release();
+            return error.LimitExceeded;
+        },
+        error.Internal => return error.Internal,
+    };
+    d.release();
+    s.release();
+    n.release();
+}
+
+test "handles: allocation failures leave nothing behind (E6)" {
+    try testing.checkAllAllocationFailures(testing.allocator, checkHandleAllocFailOnce, .{});
+}
+
+test "handles: Runtime.destroy with live tokens frees everything (E1)" {
+    // No releases before destroy: the table, the pool and the values die with the
+    // runtime (the testing allocator's leak check is the assertion).
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    const n = try rt.newNumber(5);
+    const n2 = try n.dup();
+    const held_units = [_]u16{ 'h', 'e', 'l', 'd', ' ', 'a', 't', ' ', 'd', 'e', 's', 't', 'r', 'o', 'y' };
+    const s = try rt.newStringUtf16(&held_units);
+    _ = n2;
+    _ = s;
+    rt.destroy();
+}
+
 test "the guard and the tag checks panic, as expected, in a child process (E1, E2)" {
     if (std.process.Environ.getPosix(std.testing.environ, "ZQJS_GUARD_CHILD") != null) return; // we are the child
 
@@ -575,9 +780,12 @@ test "the guard and the tag checks panic, as expected, in a child process (E1, E
         .{ .name = "writer-reenter", .message = guard_message }, // resume, and a call from its own writer
         .{ .name = "writer-destroy", .message = guard_message }, // Runtime.destroy from the writer
         .{ .name = "threads", .message = guard_message }, // two threads hammering one runtime
+        // The handle checks (D50) are not gated on runtime_safety: the token record
+        // exists in every build mode, so release-then-use panics everywhere.
+        .{ .name = "handle-after-release", .message = "zqjs: Handle used after release" },
         .{ .name = "program-after-destroy", .message = "zqjs: Program used after destroy" },
     };
-    const count = if (std.debug.runtime_safety) scenarios.len else 3;
+    const count = if (std.debug.runtime_safety) scenarios.len else 4;
 
     var map = std.process.Environ.Map.init(gpa);
     defer map.deinit();

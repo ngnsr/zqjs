@@ -138,7 +138,8 @@ pub const Slot = struct {
 /// bounded and accounted).
 pub const Table = struct {
     gpa: Allocator,
-    /// Most tokens ever minted, live and dead together (`Limits.max_handles`).
+    /// Most tokens ever minted on this runtime, live and dead together — host- and
+    /// engine-owned temporaries alike (`Limits.max_handles`; cumulative, never refunded).
     max_tokens: u32,
     slots: std.ArrayList(Slot) = .empty,
     free_slot_head: u32 = no_slot,
@@ -179,7 +180,7 @@ pub const Table = struct {
     /// receives the limit report. May fail with `LimitExceeded(handles)` (the pool's cap,
     /// D50) or `OutOfMemory`; on failure nothing is minted, not even a reservation, and
     /// the runtime stays usable (E6).
-    pub fn mint(rt: *Runtime, v: Value) Error!*Token {
+    pub fn mint(rt: *Runtime, v: Value) error{ OutOfMemory, LimitExceeded }!*Token {
         const t = &rt.handles;
         if (t.tokens_ever >= t.max_tokens) {
             rt.limit_hit = .handles;
@@ -209,7 +210,7 @@ pub const Table = struct {
     }
 
     /// A new token for the same value as `t`, sharing its slot (refs + 1, D50).
-    pub fn dup(rt: *Runtime, t: *const Token) Error!*Token {
+    pub fn dup(rt: *Runtime, t: *const Token) error{ OutOfMemory, LimitExceeded }!*Token {
         t.validate(rt);
         const h = &rt.handles;
         if (h.tokens_ever >= h.max_tokens) {

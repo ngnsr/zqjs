@@ -267,14 +267,12 @@ value beyond the call must `dup` the token; `dup`'s allocation failure is checke
 **Token-pool growth is bounded and accounted (review condition).** Never freeing individual
 token records buys deterministic stale detection, but a host looping create/release would
 grow the pool forever while retaining no JS values at all. So:
-- `Limits.max_handles` caps the pool's total records, live and dead together (free-list
-  reuse keeps a churn loop at its high-water mark instead of growing it); minting beyond the
-  cap is `error.LimitExceeded` with `Limit(.handles)`, catchable by the host, and the
-  runtime stays usable (E6).
+- `Limits.max_handles` caps the pool's total records — every token ever minted, host- and engine-owned temporaries alike, cumulative over the runtime's lifetime (never reused: a released record stays dead so stale detection holds; a churn loop consumes records until the cap even with nothing held, the deliberate safety/resource trade-off). Minting beyond the cap is `error.LimitExceeded` with `Limit(.handles)`, catchable by the host, and the runtime stays usable (E6).
 - The pool's and table's bytes are part of `memory()` (accounted like heap bytes, D28), so
   the embedder can see the cost.
-- Test: repeated create/`dup`/release cycles drive the pool to a plateau, not unbounded
-  growth; the plateau is reflected in `memory().bytes`.
+- Test: repeated create/`dup`/release cycles stay inside the cap and stay mintable until
+  it is spent (records are cumulative, slots recycle); the spent cap refuses minting with
+  the runtime still usable.
 
 ## The native-call record and the guard (Q7/Q12, frozen)
 
@@ -512,16 +510,23 @@ Consistency checks the diagram pins (each becomes an assertion or a test):
 - **Handles:**
   - mint/`dup`/`release`, leak-checked; a released token's use is caught — expected-panic
     child test (deterministic, safe builds, runtime alive);
-  - **token-pool churn:** repeated create/`dup`/release cycles plateau at the pool's
-    high-water mark (free-list reuse), reflected in `memory().bytes`; minting past
-    `Limits.max_handles` is `LimitExceeded(handles)`, catchable, the runtime stays usable;
+  - **token-pool churn:** records are never reused (stale detection), so create/`dup`/release
+    cycles consume records cumulatively; slots recycle, and minting past `Limits.max_handles`
+    is `LimitExceeded(handles)`, catchable, the runtime stays usable — even with zero live
+    tokens after the cap is spent (P2: done; D50 amended from the review wording, since
+    free-list reuse would undermine stale-token detection);
   - a token survives collections taken by *other* executions (gc-stress throughout);
   - a token to a value that becomes garbage *while held* stays alive; releasing it lets the
     next collection free it (`memory().bytes` before/after);
   - `Runtime.destroy` with live tokens frees everything (leak check); use-after-destroy is
     a documented host lifetime violation (no expected-panic test — the checking memory is
     gone; E1 states this);
-  - a token passed to a different live runtime → expected-panic child test;
+  - a token passed to a different live runtime → expected-panic child test (**deferred to
+    P4**: the public API derives the runtime from the token, so the identity check only
+    becomes exercisable when `rt.call` takes a runtime and a handle together; no test-only
+    API);
+  - minting while the runtime is poisoned → `error.Internal` (E7) (**deferred to P4**:
+    poisoning is not publicly reachable until a native can return `Internal`);
   - `checkAllAllocationFailures` over mint/copy/read/release; the runtime stays usable (E6).
 - **Natives from JS:**
   - a global function defined by the host, called by scripts, `this`-correct (D41), arity

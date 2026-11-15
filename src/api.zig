@@ -460,6 +460,12 @@ const ExecutionImpl = struct {
         var n: u64 = 0;
         while (n < steps) : (n += 1) {
             const state = x.vm.step() catch |e| {
+                // Every Internal poisons (E7), whoever raised it: rt.bug does it, and
+                // this is the belt that keeps the guarantee if a producer ever forgets.
+                if (e == error.Internal and !rt.poisoned) {
+                    rt.poisoned = true;
+                    if (rt.internal_reason == null) rt.internal_reason = "Internal from a path that does not poison";
+                }
                 const f: Fault = .{ .err = publicError(e), .failure = describe(rt, e) };
                 x.fault = f;
                 if (failure) |out| out.* = f.failure;

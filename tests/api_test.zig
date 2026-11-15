@@ -35,6 +35,28 @@ fn drainIntoDestroy(w: *std.Io.Writer, data: []const []const u8, splat: usize) s
     return 0;
 }
 
+// The two-thread scenario's handoff: A signals from *inside* the guarded region (its
+// writer's drain runs there) and blocks until B has observed it and attempted entry,
+// so B always finds the guard held. The script's length plays no part.
+var thread_a_inside = std.atomic.Value(bool).init(false);
+var thread_b_go = std.atomic.Value(bool).init(false);
+
+/// Thread A's writer: prove A is inside, then hold the region until B has come.
+fn drainHoldForB(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    _ = w;
+    _ = data;
+    _ = splat;
+    thread_a_inside.store(true, .seq_cst);
+    while (!thread_b_go.load(.seq_cst)) std.Thread.yield() catch {};
+    return 0;
+}
+
+fn childThreadB(p: *zqjs.Program) void {
+    while (!thread_a_inside.load(.seq_cst)) std.Thread.yield() catch {};
+    thread_b_go.store(true, .seq_cst);
+    child_rt.?.run(p, null) catch {}; // the guard is provably held: this panics (E2)
+}
+
 test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" {
     const scenario = std.process.Environ.getPosix(std.testing.environ, "ZQJS_GUARD_CHILD") orelse return;
     if (std.mem.eql(u8, scenario, "writer-reenter") or std.mem.eql(u8, scenario, "writer-destroy")) {
@@ -50,21 +72,21 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
         return; // the child must have panicked inside the writer
     }
     if (std.mem.eql(u8, scenario, "threads")) {
-        const rt = try zqjs.Runtime.create(testing.allocator, .{});
+        var buf: [1]u8 = undefined;
+        var writer: std.Io.Writer = .{ .buffer = &buf, .vtable = &.{ .drain = drainHoldForB } };
+        const rt = try zqjs.Runtime.create(testing.allocator, .{ .output = &writer });
         child_rt = rt;
-        // Long enough that whichever thread wins the guard is still inside when the
-        // other arrives; the loser panics on the guard.
-        const p = try rt.compile("s.js", "let n = 0; while (n < 3000000) n = n + 1;", null);
+        const p = try rt.compile("s.js", "print('in A');", null);
         const work = struct {
-            fn run(p_: *zqjs.Program) void {
-                child_rt.?.run(p_, null) catch {};
+            fn a(p_: *zqjs.Program) void {
+                child_rt.?.run(p_, null) catch {}; // A's writer signals and holds (E2)
             }
-        }.run;
-        const a = try std.Thread.spawn(.{}, work, .{p});
-        const b = try std.Thread.spawn(.{}, work, .{p});
+        };
+        const b = try std.Thread.spawn(.{}, childThreadB, .{p});
+        const a = try std.Thread.spawn(.{}, work.a, .{p});
         a.join();
         b.join();
-        return;
+        return; // B must have panicked while A provably held the guard
     }
     if (std.mem.eql(u8, scenario, "program-after-destroy")) {
         const rt = try zqjs.Runtime.create(testing.allocator, .{});

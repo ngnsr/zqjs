@@ -117,7 +117,7 @@ pub const Vm = struct {
         errdefer vm.deinit();
         try vm.reserve(script);
         try vm.frames.ensureTotalCapacity(rt.gpa, 1);
-        vm.initLocals(script, 0, 0);
+        vm.initLocals(script, &.{});
         vm.frames.appendAssumeCapacity(.{ .proto = script, .closure = null, .return_pc = 0, .locals_base = 0, .stack_base = 0, .result_index = 0, .this = null, .stack_end = script.max_stack });
         vm.locals_len = script.slot_count;
         vm.reserved = script.slot_count + script.max_stack;
@@ -125,7 +125,9 @@ pub const Vm = struct {
     }
 
     pub fn deinit(vm: *Vm) void {
-        if (vm.chain) |cx| cx.call_depth -= @intCast(vm.frames.items.len); // the frames still live unwind their depth charge (D51)
+        if (vm.chain) |cx| if (cx.active) {
+            cx.call_depth -= @intCast(vm.frames.items.len); // the frames still live unwind their depth charge (D51)
+        };
         if (vm.rt.engine_roots) |e| if (e.ctx == @as(*anyopaque, vm)) {
             vm.rt.engine_roots = null; // no collection may scan a VM that is gone
         };
@@ -150,30 +152,22 @@ pub const Vm = struct {
             .tree => return rt.bug("a tree-walker closure in a nested call"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
-        // The arguments sit on the operand stack below the frame's own region, exactly
-        // where a caller frame puts them; they are bounded by the same stack-slots
-        // limit a caller's reservation obeys (D36).
         const argc: u32 = @intCast(args.len);
         if (@as(u64, argc) + callee.slot_count + callee.max_stack > rt.limits.max_stack_slots) return rt.limit(.stack_slots);
-        var vm: Vm = .{ .rt = rt, .nested = true, .sp = argc };
+        var vm: Vm = .{ .rt = rt, .nested = true };
         errdefer vm.deinit();
-        // 1. capacity: the stack must hold the arguments plus the frame's region. With
-        // no frames below, `stackEnd` is `sp + max_stack` — the arguments included.
         try vm.reserve(callee);
         try vm.frames.ensureTotalCapacity(rt.gpa, 1);
-        // 2. the arguments and the bound locals (nothing is live yet)
-        @memcpy(vm.stack[0..args.len], args);
-        vm.initLocals(callee, 0, argc);
-        // 3. commit
+        vm.initLocals(callee, args);
         vm.frames.appendAssumeCapacity(.{
             .proto = callee,
             .closure = c,
             .return_pc = 0,
             .locals_base = 0,
-            .stack_base = argc,
+            .stack_base = 0,
             .result_index = 0,
             .this = this,
-            .stack_end = @intCast(args.len + callee.max_stack),
+            .stack_end = callee.max_stack,
         });
         vm.locals_len = callee.slot_count;
         vm.reserved = callee.slot_count + callee.max_stack;
@@ -250,7 +244,7 @@ pub const Vm = struct {
         // taken there would point at a copy).
         const h = &vm.rt.heap;
         if (h.collect_requested or h.collect_always) {
-            vm.rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
+            if (!vm.nested) vm.rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
             vm.rt.collect();
         }
         return vm.execute() catch |e| {
@@ -498,7 +492,13 @@ pub const Vm = struct {
                     // cannot call back into JS, so the stack cannot move under it. If it fails,
                     // nothing has been popped: the stack is still a valid pre-call state.
                     .native => |n| {
-                        const result = try n.call(rt, receiver orelse .undefined, vm.stack[args..vm.sp]);
+                        const result = n.call(rt, receiver orelse .undefined, vm.stack[args..vm.sp]) catch |e| {
+                            if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
+                                return rt.limit(.steps);
+                            return e;
+                        };
+                        if (rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
+                            return rt.limit(.steps);
                         vm.stack[base] = result;
                         vm.sp = base + 1;
                     },
@@ -517,7 +517,6 @@ pub const Vm = struct {
                     // result, and the call ends here — no caller frame to unwind to.
                     if (vm.nested and vm.frames.items.len == 1) {
                         const v = try vm.peek(0);
-                        if (vm.chain) |cx| cx.call_depth -= 1; // the frame died
                         vm.nested_result = v;
                         vm.halted = true;
                         return .halted;
@@ -571,7 +570,7 @@ pub const Vm = struct {
         try vm.frames.ensureUnusedCapacity(vm.rt.gpa, 1);
         try vm.reserve(callee);
         // 3. the callee's locals, above locals_len (not live yet, so nothing visible changes)
-        vm.initLocals(callee, args, argc);
+        vm.initLocals(callee, vm.stack[args..][0..argc]);
         // 4. commit
         vm.frames.appendAssumeCapacity(.{
             .proto = callee,
@@ -622,12 +621,12 @@ pub const Vm = struct {
     }
 
     /// Initialises the `p.slot_count` locals above locals_len: the parameters (slots
-    /// param_slot…) from the `argc` values at stack[args…] (missing ones are undefined,
-    /// extra ones ignored), everything else in the TDZ.
-    fn initLocals(vm: *Vm, p: *const Proto, args: u32, argc: u32) void {
+    /// param_slot…) from `args` (missing ones are undefined, extra ones ignored),
+    /// everything else in the TDZ.
+    fn initLocals(vm: *Vm, p: *const Proto, args: []const Value) void {
         for (vm.locals[vm.locals_len..][0..p.slot_count], 0..) |*s, n| {
             const i = @as(i64, @intCast(n)) - p.param_slot; // parameter number
-            s.* = .{ .value = if (i >= 0 and i < p.param_count) (if (i < argc) vm.stack[args + @as(u32, @intCast(i))] else .undefined) else null };
+            s.* = .{ .value = if (i >= 0 and i < p.param_count) (if (i < args.len) args[@intCast(i)] else .undefined) else null };
         }
     }
 

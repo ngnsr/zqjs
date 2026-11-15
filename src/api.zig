@@ -496,7 +496,6 @@ const Guard = struct {
 /// runtime.zig): cleared (or the memory freed) on destroy, so a safe build's entry-point
 /// check catches a use after destroy (E1). Best effort: the memory may have been reused,
 /// so a missed catch is possible; documented as such.
-
 fn checkAlive(magic: u32, comptime type_name: []const u8) void {
     if (std.debug.runtime_safety and magic != alive_magic)
         @panic("zqjs: " ++ type_name ++ " used after destroy");
@@ -578,7 +577,10 @@ const ExecutionImpl = struct {
         rt.beginChain(x.used, rt.limits.max_steps);
         defer x.used = rt.endChain();
         x.vm.chain = &rt.exec_ctx; // its frames charge the chain's shared depth
-        defer x.vm.chain = null;
+        defer {
+            std.debug.assert(rt.exec_ctx.call_depth == x.vm.frames.items.len);
+            x.vm.chain = null;
+        }
         rt.exec_ctx.call_depth = @intCast(x.vm.frames.items.len); // the frames already live count (D51 #2)
         rt.exception = null;
         rt.unsupported = null;
@@ -619,40 +621,64 @@ fn callImpl(r: *RuntimeImpl, f: *Handle, this_h: ?*Handle, args: []const *Handle
         if (failure) |out| out.* = internalFailure();
         return error.Internal; // E7: only destroy works now
     }
-    // Fresh chain (D51): a host call at guard depth 0 begins with a zeroed cumulative
-    // budget and saves nothing back (Q8: no slicing in M9.1).
-    rt.beginChain(0, rt.limits.max_steps);
-    defer _ = rt.endChain();
+    // Every token is validated against THIS runtime first: a released or foreign handle
+    // panics here, deterministically (E1/D50) — the identity check's exercisable site.
+    const callee = handles.Token.checkedValue(rt, f.tok());
+    const this_v: internal.Value = if (this_h) |h| handles.Token.checkedValue(rt, h.tok()) else .undefined;
+    for (args) |h| _ = handles.Token.checkedValue(rt, h.tok());
+
+    // Fresh chain at depth 0 (D51): a host call begins with a zeroed cumulative budget
+    // and saves nothing back (Q8: no slicing in M9.1). Inside an active chain (a native
+    // callback calling back into JS), joins the existing chain without resetting budget.
+    const top_level = !rt.exec_ctx.active;
+    if (top_level) rt.beginChain(0, rt.limits.max_steps);
+    const depth_before = rt.exec_ctx.call_depth;
+    defer {
+        std.debug.assert(rt.exec_ctx.call_depth == depth_before);
+        if (top_level) _ = rt.endChain();
+    }
+    if (rt.exec_ctx.budget_fault != null) {
+        const fo = faultOf(rt, rt.limit(.steps));
+        if (failure) |out| out.* = fo.failure;
+        return fo.err;
+    }
     rt.exception = null;
     rt.unsupported = null;
     rt.unsupported_name = null;
     rt.limit_hit = null;
     rt.heap.limit_hit = null;
 
-    // Every token is validated against THIS runtime first: a released or foreign handle
-    // panics here, deterministically (E1/D50) — the identity check's exercisable site.
-    const callee = handles.checkedValue(rt, f.tok());
-    const this_v: internal.Value = if (this_h) |h| handles.checkedValue(rt, h.tok()) else .undefined;
     const argv = r.gpa.alloc(internal.Value, args.len) catch |e| {
         const fo = faultOf(rt, e);
         if (failure) |out| out.* = fo.failure;
         return fo.err;
     };
     defer r.gpa.free(argv);
-    for (args, 0..) |h, i| argv[i] = handles.checkedValue(rt, h.tok());
+    for (args, 0..) |h, i| argv[i] = handles.Token.checkedValue(rt, h.tok());
 
     switch (callee) {
         .native => |n| {
             const result = n.call(rt, this_v, argv) catch |e| {
-                const fo = faultOf(rt, e);
+                const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                const fo = faultOf(rt, err);
                 if (failure) |out| out.* = fo.failure;
                 return fo.err;
             };
+            if (rt.exec_ctx.budget_fault != null) {
+                const fo = faultOf(rt, rt.limit(.steps));
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            }
             return mintHandle(r, result, failure);
         },
         .closure => |c| {
             // Model B (D51): a fresh VM, frame 0 the callee; `this` binds by the VM's
             // sloppy rule (object receivers only, D41). Its `return` ends the call.
+            if (rt.exec_ctx.call_depth >= rt.limits.max_call_depth) {
+                const fo = faultOf(rt, rt.limit(.call_depth));
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            }
             var vm = internal.Vm.initCall(rt, c, if (this_v == .object) this_v else null, argv) catch |e| {
                 const fo = faultOf(rt, e);
                 if (failure) |out| out.* = fo.failure;
@@ -666,16 +692,26 @@ fn callImpl(r: *RuntimeImpl, f: *Handle, this_h: ?*Handle, args: []const *Handle
                 if (failure) |out| out.* = fo.failure;
                 return fo.err;
             };
-            defer rt.exec_ctx.removeVm(vm); // before deinit frees what it marks
+            defer rt.exec_ctx.removeVm(&vm); // before deinit frees what it marks
             while (true) {
                 const state = vm.step() catch |e| {
-                    const fo = faultOf(rt, e);
+                    const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                    const fo = faultOf(rt, err);
                     if (failure) |out| out.* = fo.failure;
                     return fo.err;
                 };
                 if (state == .halted) break;
             }
-            const result = vm.nested_result orelse return rt.bug("a nested call ended without a result");
+            if (rt.exec_ctx.budget_fault != null) {
+                const fo = faultOf(rt, rt.limit(.steps));
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            }
+            const result = vm.nested_result orelse {
+                const fo = faultOf(rt, rt.bug("a nested call ended without a result"));
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            };
             return mintHandle(r, result, failure);
         },
         else => {

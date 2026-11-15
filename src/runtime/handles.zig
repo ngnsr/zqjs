@@ -24,12 +24,12 @@ const Value = value_mod.Value;
 const heap = @import("heap.zig");
 
 /// What a handle refers to (D54/Q10's uniform model; objects vs arrays distinguished).
-pub const Kind = enum { @"undefined", @"null", boolean, number, string, function, object, array };
+pub const Kind = enum { undefined, null, boolean, number, string, function, object, array };
 
 pub fn kindOf(v: Value) Kind {
     return switch (v) {
-        .undefined => .@"undefined",
-        .null => .@"null",
+        .undefined => .undefined,
+        .null => .null,
         .boolean => .boolean,
         .number => .number,
         .string => .string,

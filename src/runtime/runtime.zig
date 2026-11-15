@@ -208,6 +208,7 @@ pub const Runtime = struct {
             return error.LimitExceeded;
         }
         rt.steps += 1;
+        if (rt.exec_ctx.active) rt.exec_ctx.used = rt.steps;
     }
 
     /// Begins a chain (M9.1, D51): one per top-level entry. Installs the cumulative
@@ -236,6 +237,11 @@ pub const Runtime = struct {
         std.debug.assert(cx.records.items.len == 0);
         std.debug.assert(cx.vms.items.len == 0);
         cx.active = false;
+        cx.used = 0;
+        cx.max = 0;
+        cx.budget_fault = null;
+        cx.call_depth = 0;
+        rt.max_steps = rt.limits.max_steps;
         return rt.steps;
     }
 

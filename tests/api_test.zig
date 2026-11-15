@@ -104,9 +104,63 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
         _ = h.number(); // host bug: a dead handle → the token check panics (E1/D50)
         return;
     }
+    if (std.mem.eql(u8, scenario, "writer-call")) {
+        var buf: [1]u8 = undefined;
+        const cb = struct {
+            var h: *zqjs.Handle = undefined;
+            fn drain(_: *std.Io.Writer, _: []const []const u8, _: usize) std.Io.Writer.Error!usize {
+                _ = child_rt.?.call(h, null, &.{}, null) catch {}; // host re-entry via call (E2/D52)
+                return 0;
+            }
+        };
+        var writer: std.Io.Writer = .{ .buffer = &buf, .vtable = &.{ .drain = cb.drain } };
+        const rt = try zqjs.Runtime.create(testing.allocator, .{ .output = &writer });
+        child_rt = rt;
+        cb.h = try rt.newNumber(1);
+        const p = try rt.compile("s.js", "print('hello');", null);
+        rt.run(p, null) catch {};
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "call-released-callee")) {
+        const rt = try zqjs.Runtime.create(testing.allocator, .{});
+        const h = try rt.newNumber(7);
+        h.release();
+        _ = rt.call(h, null, &.{}, null) catch {}; // dead callee handle → panics (E1/D50)
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "call-released-arg")) {
+        const rt = try zqjs.Runtime.create(testing.allocator, .{});
+        const f = try rt.newNumber(1);
+        const arg = try rt.newNumber(2);
+        arg.release();
+        _ = rt.call(f, null, &.{arg}, null) catch {}; // dead argument handle → panics (E1/D50)
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "call-foreign-callee")) {
+        const rt1 = try zqjs.Runtime.create(testing.allocator, .{});
+        const rt2 = try zqjs.Runtime.create(testing.allocator, .{});
+        const h = try rt2.newNumber(7);
+        _ = rt1.call(h, null, &.{}, null) catch {}; // foreign callee handle → panics (D50)
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "call-foreign-arg")) {
+        const rt1 = try zqjs.Runtime.create(testing.allocator, .{});
+        const rt2 = try zqjs.Runtime.create(testing.allocator, .{});
+        const f = try rt1.newNumber(1);
+        const arg = try rt2.newNumber(2);
+        _ = rt1.call(f, null, &.{arg}, null) catch {}; // foreign argument handle → panics (D50)
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "call-foreign-this")) {
+        const rt1 = try zqjs.Runtime.create(testing.allocator, .{});
+        const rt2 = try zqjs.Runtime.create(testing.allocator, .{});
+        const f = try rt1.newNumber(1);
+        const this_h = try rt2.newNumber(2);
+        _ = rt1.call(f, this_h, &.{}, null) catch {}; // foreign `this` handle → panics (D50)
+        return;
+    }
     @panic("unknown guard scenario");
 }
-
 
 test "the public API declares exactly the approved names (D46: a new export is a reviewed decision)" {
     const approved = [_][]const u8{
@@ -779,13 +833,19 @@ test "the guard and the tag checks panic, as expected, in a child process (E1, E
     const scenarios = [_]Scenario{
         .{ .name = "writer-reenter", .message = guard_message }, // resume, and a call from its own writer
         .{ .name = "writer-destroy", .message = guard_message }, // Runtime.destroy from the writer
+        .{ .name = "writer-call", .message = guard_message }, // Runtime.call from the writer
         .{ .name = "threads", .message = guard_message }, // two threads hammering one runtime
         // The handle checks (D50) are not gated on runtime_safety: the token record
-        // exists in every build mode, so release-then-use panics everywhere.
+        // exists in every build mode, so release-then-use and cross-runtime panic everywhere.
         .{ .name = "handle-after-release", .message = "zqjs: Handle used after release" },
+        .{ .name = "call-released-callee", .message = "zqjs: Handle used after release" },
+        .{ .name = "call-released-arg", .message = "zqjs: Handle used after release" },
+        .{ .name = "call-foreign-callee", .message = "zqjs: Handle from another Runtime" },
+        .{ .name = "call-foreign-arg", .message = "zqjs: Handle from another Runtime" },
+        .{ .name = "call-foreign-this", .message = "zqjs: Handle from another Runtime" },
         .{ .name = "program-after-destroy", .message = "zqjs: Program used after destroy" },
     };
-    const count = if (std.debug.runtime_safety) scenarios.len else 4;
+    const count = if (std.debug.runtime_safety) scenarios.len else scenarios.len - 1;
 
     var map = std.process.Environ.Map.init(gpa);
     defer map.deinit();
@@ -1039,4 +1099,100 @@ test "step accounting: 0, 1, slice equal to cap, completion at cap, unfinished a
         try testing.expectError(error.LimitExceeded, ex.@"resume"(1, &failure));
         try testing.expectEqualStrings("LimitExceeded(steps)", failure.message());
     }
+}
+
+test "Runtime.call: non-function callee throws TypeError (E5/D51)" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+
+    const n = try rt.newNumber(42);
+    defer n.release();
+    const b = try rt.newBoolean(false);
+    defer b.release();
+    const units = [_]u16{ 'n', 'o', 't', '_', 'f', 'n' };
+    const s = try rt.newStringUtf16(&units);
+    defer s.release();
+
+    for ([_]*zqjs.Handle{ n, b, s }) |callee| {
+        var failure: zqjs.Failure = .{};
+        try testing.expectError(error.Thrown, rt.call(callee, n, &.{ b, s }, &failure));
+        try testing.expectEqual(zqjs.Failure.Kind.thrown, failure.kind);
+        try testing.expectEqualStrings("TypeError: value is not a function", failure.message());
+    }
+
+    // The runtime remains clean and usable after thrown call failures (E6).
+    const p = try rt.compile("ok.js", "let x = 2 + 2;", null);
+    defer p.destroy();
+    try rt.run(p, null);
+}
+
+test "Runtime.call: works while another execution is suspended, leaving it intact (D51)" {
+    var buf: [128]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    const rt = try zqjs.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\function add(a, b) { return a + b; }
+        \\let s = 'keep-' + add(20, 22);
+        \\print(s);
+    ;
+    const p = try rt.compile("susp.js", src, null);
+    defer p.destroy();
+    const ex = try rt.start(p);
+    defer ex.destroy();
+
+    // Suspend mid-execution.
+    try testing.expectEqual(zqjs.Status.suspended, try ex.@"resume"(3, null));
+
+    // Host invokes Runtime.call while `ex` is suspended: runs on a fresh chain and
+    // leaves `ex`'s suspended state and step budget untouched.
+    const n = try rt.newNumber(7);
+    defer n.release();
+    var failure: zqjs.Failure = .{};
+    try testing.expectError(error.Thrown, rt.call(n, null, &.{n}, &failure));
+    try testing.expectEqualStrings("TypeError: value is not a function", failure.message());
+
+    rt.collectGarbage();
+
+    // Resume the suspended execution to completion.
+    try testing.expectEqual(zqjs.Status.finished, try ex.@"resume"(1000, null));
+    try testing.expectEqualStrings("keep-42\n", out.buffered());
+}
+
+fn checkCallAllocFailOnce(allocator: std.mem.Allocator) !void {
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    const rt = zqjs.Runtime.create(allocator, .{ .output = &discard.writer }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer rt.destroy();
+
+    const callee = rt.newNumber(1) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.TestUnexpectedResult,
+    };
+    defer callee.release();
+
+    const arg = rt.newNumber(2) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.TestUnexpectedResult,
+    };
+    defer arg.release();
+
+    var failure: zqjs.Failure = .{};
+    const res = rt.call(callee, arg, &.{arg}, &failure) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Thrown => {
+            try testing.expectEqual(zqjs.Failure.Kind.thrown, failure.kind);
+            try testing.expectEqualStrings("TypeError: value is not a function", failure.message());
+            return;
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    res.release();
+    return error.TestUnexpectedResult;
+}
+
+test "Runtime.call: allocation failures leave nothing behind (E6)" {
+    try testing.checkAllAllocationFailures(testing.allocator, checkCallAllocFailOnce, .{});
 }

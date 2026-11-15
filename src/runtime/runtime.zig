@@ -15,6 +15,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const heap_mod = @import("heap.zig");
 const Heap = heap_mod.Heap;
+const handles = @import("handles.zig");
 const Limits = @import("../limits.zig").Limits;
 const Limit = @import("../limits.zig").Limit;
 const Feature = @import("../frontend/diag.zig").Feature;
@@ -22,6 +23,10 @@ const Feature = @import("../frontend/diag.zig").Feature;
 pub const Error = error{ Thrown, LimitExceeded, Unsupported, OutOfMemory, WriteFailed, Internal };
 
 pub const ErrorName = enum { ReferenceError, TypeError, RangeError };
+
+/// The tag a live runtime carries; cleared on destroy (E1). The embedding API's checks
+/// and the handle operations read this one (the internal runtime is what a handle names).
+pub const alive_magic: u32 = 0x5A514A53; // "ZQJS"
 
 /// A JavaScript exception, until M7 gives us Error objects.
 /// Ownership: `name` is static; `message` is a heap string owned by `Runtime.heap`,
@@ -46,6 +51,15 @@ pub const Runtime = struct {
     /// All limits, for the engines (call depth, stack slots, interpreter depth).
     limits: Limits,
     steps: u64 = 0,
+    /// Host handles (M9.1, D50): the table is one GC root set (marked in `markRoots`).
+    handles: handles.Table,
+    /// Overlap guard state (E2): true while a call into the runtime is running. The
+    /// embedding API's Guard claims it (M9.0), as do handle operations (M9.1); entry
+    /// kinds arrive with the execution context (P3). Atomic: cross-thread entry loses.
+    in_call: std.atomic.Value(bool) = .init(false),
+    /// Use-after-destroy tag (E1): safe builds check it at every entry point. Best
+    /// effort: freed memory may be reused, so the check can miss; documented as such.
+    magic: u32 = alive_magic,
     exception: ?Exception = null,
     unsupported: ?Feature = null,
     /// For Unsupported(builtin): which global or member (an atom on the heap).
@@ -70,10 +84,19 @@ pub const Runtime = struct {
     internal_reason: ?[]const u8 = null,
 
     pub fn init(gpa: Allocator, limits: Limits, out: *std.Io.Writer) Runtime {
-        return .{ .gpa = gpa, .heap = .init(gpa, limits), .out = out, .max_steps = limits.max_steps, .limits = limits };
+        return .{
+            .gpa = gpa,
+            .heap = .init(gpa, limits),
+            .out = out,
+            .max_steps = limits.max_steps,
+            .limits = limits,
+            .handles = .{ .gpa = gpa, .max_tokens = limits.max_handles },
+        };
     }
 
     pub fn deinit(rt: *Runtime) void {
+        rt.magic = 0; // handles and API entries must not enter after this (E1)
+        rt.handles.deinit();
         rt.joining.deinit(rt.gpa);
         rt.extra_roots.deinit(rt.gpa);
         rt.heap.deinit();
@@ -133,6 +156,7 @@ pub const Runtime = struct {
         std.debug.assert(rt.joining.items.len == 0);
         if (rt.engine_roots) |e| e.mark(e.ctx, h);
         for (rt.extra_roots.items) |e| e.mark(e.ctx, h);
+        rt.handles.mark(h); // host handles (M9.1, D50): slots with a reference
     }
 
     /// Adds a root set every collection marks, until `removeRoots` (M9.0).

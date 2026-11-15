@@ -50,6 +50,12 @@ pub const Limits = struct {
     /// Nesting of built-in conversions that recurse in Zig: converting an array to a
     /// string converts its elements (`[[[…]]]`). LimitExceeded(conversion_depth).
     max_conversion_depth: u32 = 1_000,
+    /// Host handles (M9.1, D50): the most token records the pool ever holds, live and
+    /// dead together. Token records are never reused (a released one must stay
+    /// detectable), so a host that mints and releases in a loop consumes records until
+    /// this cap: LimitExceeded(handles), catchable, runtime stays usable (E6). Slots are
+    /// recycled, so this bounds the pool's memory, not the values' lifetimes.
+    max_handles: u32 = 1 << 18,
 };
 
 /// Elements per card (M8.1): an array with at least this capacity records young stores
@@ -68,6 +74,7 @@ pub const Limit = enum {
     stack_slots,
     interpreter_depth,
     conversion_depth,
+    handles,
 };
 
 comptime {

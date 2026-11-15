@@ -22,6 +22,7 @@ pub const disassemble = @import("bytecode/disasm.zig").disassemble;
 pub const Heap = @import("runtime/heap.zig").Heap;
 pub const heap = @import("runtime/heap.zig");
 pub const runtime = @import("runtime/runtime.zig");
+pub const handles = @import("runtime/handles.zig");
 pub const runSource = @import("run.zig").runSource;
 pub const RunMode = @import("run.zig").Mode;
 pub const RunOptions = @import("run.zig").Options;

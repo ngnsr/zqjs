@@ -16,8 +16,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const internal = @import("zqjs_internal");
 const IRuntime = internal.Runtime;
+const handles = internal.handles;
 const Proto = internal.bytecode.Proto;
 const Vm = internal.Vm;
+const alive_magic = internal.runtime.alive_magic;
 
 /// Resource limits of a runtime (DESIGN_DECISIONS D15): heap bytes, string length, call
 /// depth, steps per execution (`max_steps`, cumulative over its resumes: E4)…
@@ -172,7 +174,7 @@ pub const Runtime = opaque {
         const r = rt.impl();
         const guard = Guard.enter(r);
         _ = guard;
-        r.magic = 0;
+        r.rt.magic = 0; // handle operations must not enter after this (E1)
         while (r.executions.items.len > 0) r.executions.items[r.executions.items.len - 1].free();
         while (r.programs.items.len > 0) r.programs.items[r.programs.items.len - 1].free();
         r.executions.deinit(r.gpa);
@@ -228,9 +230,109 @@ pub const Runtime = opaque {
         const guard = Guard.enter(@constCast(r));
         defer guard.exit();
         const h = &r.rt.heap;
-        return .{ .bytes = h.bytes, .peak = h.peak, .collections = h.stats.collections };
+        return .{
+            .bytes = h.bytes + r.rt.handles.accounted, // handle pool bytes (D50)
+            .peak = h.peak + r.rt.handles.peak,
+            .collections = h.stats.collections,
+        };
+    }
+
+    /// Mints a number handle (M9.1, D50). The token is the caller's to `release` (or
+    /// `dup`); while the runtime is poisoned, nothing is minted (E7).
+    pub fn newNumber(rt: *Runtime, n: f64) HandleError!*Handle {
+        const r = rt.impl();
+        const guard = Guard.enter(r);
+        defer guard.exit();
+        if (r.rt.poisoned) return error.Internal; // E7: only destroy works now
+        return @ptrCast(try handles.mint(&r.rt, .{ .number = n }));
+    }
+
+    pub fn newBoolean(rt: *Runtime, b: bool) HandleError!*Handle {
+        const r = rt.impl();
+        const guard = Guard.enter(r);
+        defer guard.exit();
+        if (r.rt.poisoned) return error.Internal; // E7
+        return @ptrCast(try handles.mint(&r.rt, .{ .boolean = b }));
+    }
+
+    /// Creates a heap string (E10: UTF-16 units in, lone surrogates kept) and mints a
+    /// handle to it. Length and heap limits apply as for script strings.
+    pub fn newStringUtf16(rt: *Runtime, units: []const u16) HandleError!*Handle {
+        const r = rt.impl();
+        const guard = Guard.enter(r);
+        defer guard.exit();
+        if (r.rt.poisoned) return error.Internal; // E7
+        const s = r.rt.heap.newString(&.{.{ .utf16 = units }}) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.LimitExceeded => return error.LimitExceeded,
+            else => unreachable, // newString only allocates and checks a limit
+        };
+        return @ptrCast(try handles.mint(&r.rt, .{ .string = s }));
     }
 };
+
+pub const HandleError = error{ OutOfMemory, LimitExceeded, Internal };
+
+/// A GC-safe reference to one JS value (M9.1, D50): a pointer to a token the runtime
+/// owns. Handles may be copied only through `dup`; a released (or foreign) handle panics
+/// when used, deterministically while the runtime is alive. Every operation works while
+/// the runtime is poisoned — like `collectGarbage`/`memory`, they touch no VM state.
+pub const Handle = opaque {
+    fn tok(h: *const Handle) *handles.Token {
+        return @ptrCast(@alignCast(@constCast(h)));
+    }
+
+    /// What the handle refers to (D54: uniform across all values).
+    pub fn kind(h: *const Handle) HandleKind {
+        const guard = Guard.enterIrt(h.tok().owner);
+        defer guard.exit();
+        return h.tok().kind();
+    }
+
+    /// The number, or null for any other kind (copies; never allocates, Q10/D54).
+    pub fn number(h: *const Handle) ?f64 {
+        const guard = Guard.enterIrt(h.tok().owner);
+        defer guard.exit();
+        return h.tok().number();
+    }
+
+    pub fn boolean(h: *const Handle) ?bool {
+        const guard = Guard.enterIrt(h.tok().owner);
+        defer guard.exit();
+        return h.tok().boolean();
+    }
+
+    /// Wrong kind → null. Otherwise the string's full UTF-16 length; copies
+    /// min(len, buf.len) units, so a too-small `buf` truncates visibly (D54).
+    pub fn string(h: *const Handle, buf: []u16) ?usize {
+        const guard = Guard.enterIrt(h.tok().owner);
+        defer guard.exit();
+        return h.tok().string(buf);
+    }
+
+    /// A new independently owned handle to the same value (Q3/Q4): the slot's reference
+    /// count goes up. Fails with `LimitExceeded(handles)` at the pool's cap (D50).
+    pub fn dup(h: *const Handle) HandleError!*Handle {
+        const t = h.tok();
+        const guard = Guard.enterIrt(t.owner);
+        defer guard.exit();
+        if (t.owner.poisoned) return error.Internal; // E7: nothing is minted
+        return @ptrCast(try t.owner.handles.dup(t.owner, t));
+    }
+
+    /// Kills this handle and drops its slot reference; the slot's value becomes
+    /// collectible at the last release (D50). Releasing twice is the host bug the token
+    /// check panics on.
+    pub fn release(h: *Handle) void {
+        const guard = Guard.enterIrt(h.tok().owner);
+        defer guard.exit();
+        h.tok().release();
+    }
+};
+
+/// How `Handle.kind` classifies a value (D54). Named `HandleKind` to stay clear of
+/// `Failure.Kind`.
+pub const HandleKind = handles.Kind;
 
 pub const Program = opaque {
     fn impl(p: *Program) *ProgramImpl {
@@ -286,10 +388,6 @@ const RuntimeImpl = struct {
     discard: std.Io.Writer.Discarding,
     programs: std.ArrayList(*ProgramImpl) = .empty,
     executions: std.ArrayList(*ExecutionImpl) = .empty,
-    in_call: std.atomic.Value(bool) = .init(false),
-    /// Use-after-destroy detection (E1): safe builds check this tag at every entry point.
-    /// Best effort: freed memory may be reused, so the check can miss.
-    magic: u32 = alive_magic,
     /// A static-format buffer for `rt.internal_reason` (the reason of the first
     /// defensive-check failure), so poisoning never allocates.
     reason_buf: [160]u8 = undefined,
@@ -353,25 +451,33 @@ const RuntimeImpl = struct {
 };
 
 const Guard = struct {
-    runtime: *RuntimeImpl,
+    rt: *IRuntime,
 
+    /// A host entry (E2). In M9.0 the guard was only this; the execution context (P3)
+    /// adds per-depth entry kinds (`engine` entries for native re-entry) without
+    /// changing any panic behaviour tested here.
     fn enter(r: *RuntimeImpl) Guard {
-        checkAlive(r.magic, "Runtime"); // through a runtime that's gone: caught here (E1)
-        if (r.in_call.cmpxchgStrong(false, true, .seq_cst, .seq_cst) != null) {
+        return enterIrt(&r.rt);
+    }
+
+    /// Entry reached through an internal reference (a handle names its runtime).
+    fn enterIrt(rt: *IRuntime) Guard {
+        checkAlive(rt.magic, "Runtime"); // through a runtime that's gone: caught here (E1)
+        if (rt.in_call.cmpxchgStrong(false, true, .seq_cst, .seq_cst) != null) {
             @panic("zqjs: Runtime entered while another call into it is running");
         }
-        return .{ .runtime = r };
+        return .{ .rt = rt };
     }
 
     fn exit(g: Guard) void {
-        g.runtime.in_call.store(false, .seq_cst);
+        g.rt.in_call.store(false, .seq_cst);
     }
 };
 
-/// The tag live implementations carry; cleared (or the memory freed) on destroy, so a
-/// safe build's entry-point check catches a use after destroy (E1). Best effort: the
-/// memory may have been reused, so a missed catch is possible; documented as such.
-const alive_magic: u32 = 0x5A514A53; // "ZQJS"
+/// The tag live implementations carry is the internal runtime's (`alive_magic`,
+/// runtime.zig): cleared (or the memory freed) on destroy, so a safe build's entry-point
+/// check catches a use after destroy (E1). Best effort: the memory may have been reused,
+/// so a missed catch is possible; documented as such.
 
 fn checkAlive(magic: u32, comptime type_name: []const u8) void {
     if (std.debug.runtime_safety and magic != alive_magic)

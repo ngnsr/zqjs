@@ -50,15 +50,13 @@ pub const Limits = struct {
     /// Nesting of built-in conversions that recurse in Zig: converting an array to a
     /// string converts its elements (`[[[…]]]`). LimitExceeded(conversion_depth).
     max_conversion_depth: u32 = 1_000,
-    /// Host handles (M9.1, D50): the most token records ever minted on this runtime —
-    /// host-owned and engine-owned temporary tokens (native-call records, D53) alike —
-    /// cumulative over the runtime's lifetime, **not** the currently-live count. Token
-    /// records are never reused (a released one must stay detectable), so a host that
-    /// mints and releases in a loop consumes records until this cap even with nothing
-    /// held: LimitExceeded(handles), catchable, runtime stays usable (E6). Re-entrancy
-    /// depth multiplies the burn (each native crossing mints its arguments' tokens from
-    /// the same pool), so size the cap with the workload's nesting in mind. Slots are
-    /// recycled, so the cap bounds the pool's memory, not the values' lifetimes.
+    /// Host handles (M9.1, D50): maximum slot / concurrent handle capacity on this
+    /// runtime — host-owned handles and engine-owned callback temporaries (native-call
+    /// records, D53) alike. Released slots increment their 64-bit generation and return
+    /// to the free list for reuse (retired only on `u64` wraparound), so long-running
+    /// hosts can mint and release handles in a loop indefinitely without growing the
+    /// table or hitting this cap. Exceeding it returns `LimitExceeded(handles)`,
+    /// catchable, leaving the runtime usable (E6).
     max_handles: u32 = 1 << 18,
 };
 

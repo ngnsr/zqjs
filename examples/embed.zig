@@ -18,8 +18,8 @@ const zqjs = @import("zqjs");
 
 const HostBridge = struct {
     /// Retained JS object and callback closure (`dup`ed from temporary native argument handles).
-    guard_obj: ?*zqjs.Handle = null,
-    on_waypoint: ?*zqjs.Handle = null,
+    guard_obj: ?zqjs.Handle = null,
+    on_waypoint: ?zqjs.Handle = null,
     bonus_per_waypoint: f64 = 10,
 
     fn deinit(self: *HostBridge) void {
@@ -38,8 +38,8 @@ const HostBridge = struct {
     fn registerWaypointHook(
         rt: *zqjs.Runtime,
         raw_ctx: ?*anyopaque,
-        _: ?*zqjs.Handle,
-        args: []const *zqjs.Handle,
+        _: ?zqjs.Handle,
+        args: []const zqjs.Handle,
         _: *zqjs.NativeOut,
     ) zqjs.NativeError!void {
         const self: *HostBridge = @ptrCast(@alignCast(raw_ctx.?));
@@ -64,8 +64,8 @@ const HostBridge = struct {
     fn notifyWaypoint(
         rt: *zqjs.Runtime,
         raw_ctx: ?*anyopaque,
-        _: ?*zqjs.Handle,
-        args: []const *zqjs.Handle,
+        _: ?zqjs.Handle,
+        args: []const zqjs.Handle,
         out: *zqjs.NativeOut,
     ) zqjs.NativeError!void {
         const self: *HostBridge = @ptrCast(@alignCast(raw_ctx.?));

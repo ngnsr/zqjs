@@ -194,6 +194,12 @@ pub const Heap = struct {
     /// When the heap left after a collection (all of it old) reaches this, the next
     /// collection is a major one (M8.1).
     next_major: usize = 0,
+    /// The major-growth factor f ∈ {1, 2, 4} (M8.1 AS5, M8_1_PLAN.md): doubled (to at most 4)
+    /// after a major collection that freed under 10% of the heap, back to 1 after one that
+    /// freed at least half, unchanged in between. Only byte counts decide it.
+    growth: u8 = 1,
+    /// Tests pin `growth` by clearing this.
+    adapt_growth: bool = true,
     /// Make the next collection a major one (tests; heap pressure).
     major_requested: bool = false,
     /// While a minor collection marks: old objects are not traced.
@@ -281,16 +287,29 @@ pub const Heap = struct {
 
     // ---- the collector (D8; GC_DESIGN §6). Runs only at safepoints, by the engine.
 
-    /// The next collection trigger after `live` bytes survived (D8): grow by the live size
-    /// (at least 256 KiB), but never beyond half the room left under the limit. So small
-    /// heaps collect after doubling, and near the limit each collection needs half the
-    /// remaining room allocated first: a program filling its heap with live data collects
-    /// O(log limit) times, never at every safepoint. Overflow-free: the result is at most
-    /// `live + (max − live) / 2 ≤ max`.
+    /// The next major-collection trigger after `live` bytes survived a major collection
+    /// (D8, M8.1 AS5): grow by `growth` × the live size (at least 256 KiB), but never beyond
+    /// half the room left under the limit, or a quarter when `growth` > 1. So small heaps
+    /// collect after growing (1 + growth)×, and near the limit each collection needs a
+    /// share of the remaining room allocated first: a program filling its heap with live
+    /// data collects O(log limit) times. The quarter keeps a burst's worst-case room at
+    /// least as large as at growth 1 (the HL2 proof, M8_1_PLAN.md). Overflow-free: the
+    /// result is at most `live + (max − live) / 2 ≤ max`.
     pub fn schedule(h: *const Heap, live: usize) usize {
         const min_growth = 256 * 1024;
-        const room = (h.max_bytes -| live) / 2;
-        return live + @min(@max(live, min_growth), room);
+        const room = (h.max_bytes -| live) / @as(usize, if (h.growth > 1) 4 else 2);
+        return live + @min(@max(live *| h.growth, min_growth), room);
+    }
+
+    /// AS5's rule, after a major collection that went from `before` to `after` bytes.
+    fn adaptGrowth(h: *Heap, before: usize, after: usize) void {
+        if (!h.adapt_growth) return;
+        const freed = before - after;
+        if (freed *| 10 < before) {
+            h.growth = @min(h.growth * 2, 4);
+        } else if (freed *| 2 >= before) {
+            h.growth = 1;
+        }
     }
 
     /// The next minor-collection trigger: a nursery's worth of allocation, or half the
@@ -414,6 +433,7 @@ pub const Heap = struct {
             }
         }
         if (major) {
+            h.adaptGrowth(bytes_before, h.bytes);
             h.next_major = h.schedule(h.bytes);
             h.major_requested = false;
         } else h.stats.minor += 1;

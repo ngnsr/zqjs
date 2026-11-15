@@ -648,7 +648,7 @@ test "under -Dgc-stress every run collects at every safepoint, whatever the opti
 
 // ---------------------------------------------------------------- P4: acceptance
 
-const EngineStats = struct { atoms: u32, collections: u64, peak: usize, live: usize, err: ?anyerror, majors: u64 = 0 };
+const EngineStats = struct { atoms: u32, collections: u64, peak: usize, live: usize, err: ?anyerror, majors: u64 = 0, limit: ?zqjs.Limit = null };
 
 /// Runs `source` on `engine` (normal scheduling, unless stress) and returns the heap's state.
 fn runStats(source: []const u8, engine: zqjs.Engine, limits: zqjs.Limits) !EngineStats {
@@ -681,7 +681,7 @@ fn runStats(source: []const u8, engine: zqjs.Engine, limits: zqjs.Limits) !Engin
     const majors = rt.heap.stats.collections - rt.heap.stats.minor; // during the run
     rt.heap.major_requested = true; // the run is over: only the runtime's own roots remain,
     rt.collect(); // and only a major collection frees old objects and atoms
-    return .{ .atoms = rt.heap.atoms.count(), .collections = rt.heap.stats.collections, .peak = rt.heap.peak, .live = rt.heap.bytes, .err = err, .majors = majors };
+    return .{ .atoms = rt.heap.atoms.count(), .collections = rt.heap.stats.collections, .peak = rt.heap.peak, .live = rt.heap.bytes, .err = err, .majors = majors, .limit = rt.limitHit() };
 }
 
 test "weak atoms are reclaimed in real programs, on both engines" {
@@ -1269,4 +1269,162 @@ test "mutation: a clean first property bitmap for a remembered table fails PC1 (
     try h.storeProperty(o, try h.internAscii(keyName(&buf, 3)), .{ .string = try h.ascii("young") });
     for (400..600) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .null);
     try expectCaught(.clean_first_prop_bitmap, error.CleanCardOverYoungProperty, h.verify());
+}
+
+// ---------------------------------------------------------------- M8.1 AS5: adaptive scheduling
+
+test "scheduling (AS5) T1: for every f, growth stays within its share of the room, without overflow" {
+    for ([_]usize{ 256 << 10, 1 << 20, 64 << 20, std.math.maxInt(usize) }) |limit| {
+        for ([_]u8{ 1, 2, 4 }) |f| {
+            var h = heap.Heap.init(testing.allocator, .{ .max_heap_bytes = limit });
+            defer h.deinit();
+            h.growth = f;
+            const share: usize = if (f > 1) 4 else 2; // the quarter-room cap
+            for ([_]usize{ 0, 1, limit / 8, limit / 2, limit -| 1, limit }) |live| {
+                const next = h.schedule(live);
+                try testing.expect(next >= live);
+                try testing.expect(next <= limit);
+                try testing.expect(next - live <= (limit - live) / share);
+            }
+        }
+    }
+}
+
+test "scheduling (AS5): f doubles to 4 while majors free little, holds in between, resets after one that frees half" {
+    var dbg: ProgramAllocator = .init;
+    defer endProgram(&dbg);
+    var h = heap.Heap.init(dbg.allocator(), .{});
+    defer h.deinit();
+    const keep = try h.newArray(null);
+    for (0..2000) |_| try h.appendElement(keep, .{ .string = try h.ascii("live data, kept") });
+    try testing.expectEqual(@as(u8, 1), h.growth);
+    for ([_]u8{ 2, 4, 4 }) |want| { // nothing to free: < 10% each time, capped at 4
+        collectMajor(&h, &.{&keep.obj});
+        try testing.expectEqual(want, h.growth);
+    }
+    h.shrinkElements(keep, 1400); // ~25% of the heap becomes garbage: between 10% and 50%
+    collectMajor(&h, &.{&keep.obj});
+    try testing.expectEqual(@as(u8, 4), h.growth);
+    h.shrinkElements(keep, 300); // most of it: ≥ 50%
+    collectMajor(&h, &.{&keep.obj});
+    try testing.expectEqual(@as(u8, 1), h.growth);
+}
+
+/// T2's mutator: roots[0..ring_len] are a ring of objects that live through a collection and
+/// then die old; the next two slots hold the latest surviving bursts (so reachable data stays
+/// bounded: kept for good, bursts would fill the heap until even small allocations fail,
+/// legitimately); the rest are kept for good. A safepoint collects when one was requested,
+/// as an engine does, and checks the trigger it leaves behind.
+const BurstSim = struct {
+    h: *heap.Heap,
+    roots: std.ArrayList(*heap.Obj) = .empty,
+    filler: []const u8,
+    const ring_len = 8;
+
+    fn safepoint(sim: *BurstSim) !void {
+        const h = sim.h;
+        if (h.collect_requested) h.collect(TestRoots{ .objs = sim.roots.items }, TestRoots.mark);
+        try testing.expect(h.bytes <= h.max_bytes); // HL1
+        const b = h.stats.live_after_last;
+        try testing.expect(h.next_gc <= b + (h.max_bytes - b) / 2); // the room HL2 rests on
+    }
+
+    /// One garbage allocation, one ring replacement, a safepoint.
+    fn churn(sim: *BurstSim, i: usize) !void {
+        _ = try sim.h.ascii("short-lived garbage");
+        sim.roots.items[i % ring_len] = &(try sim.h.ascii("dies old, after a collection")).obj;
+        try sim.safepoint();
+    }
+
+    /// A string whose charge is at most `bytes` (null if even an empty one costs more).
+    fn burst(sim: *BurstSim, bytes: usize) !?*heap.String {
+        const fixed = @sizeOf(heap.String) + 2 * heap.per_allocation_overhead;
+        if (bytes < fixed) return null;
+        const units = @min((bytes - fixed) / 2, sim.filler.len);
+        return try sim.h.newString(&.{.{ .ascii = sim.filler[0..units] }});
+    }
+};
+
+test "scheduling (AS5) T2: bursts at the HL2 bound always fit, surviving or not, for every f; HL3 failures are exact" {
+    const limit = 1 << 20;
+    const filler = try testing.allocator.alloc(u8, limit / 2);
+    defer testing.allocator.free(filler);
+    @memset(filler, 'x');
+    for ([_]?u8{ 1, 2, 4, null }) |pinned| { // null: adaptive
+        var dbg: ProgramAllocator = .init;
+        defer endProgram(&dbg);
+        var h = heap.Heap.init(dbg.allocator(), .{ .max_heap_bytes = limit });
+        defer h.deinit();
+        if (pinned) |f| {
+            h.growth = f;
+            h.adapt_growth = false;
+        }
+        var sim: BurstSim = .{ .h = &h, .filler = filler };
+        defer sim.roots.deinit(testing.allocator);
+        const placeholder = try h.ascii("ring slot");
+        for (0..BurstSim.ring_len + 2) |_| try sim.roots.append(testing.allocator, &placeholder.obj);
+        // Phase A: reachable data to ~40% of the limit, with churn and old garbage.
+        var i: usize = 0;
+        while (h.stats.live_after_last < limit * 2 / 5) : (i += 1) {
+            try sim.churn(i);
+            try sim.roots.append(testing.allocator, &(try h.newString(&.{.{ .ascii = filler[0..500] }})).obj);
+        }
+        // Phase B (HL2): right after a safepoint, at a different point between collections
+        // each time, a burst of exactly (L − B)/2. Every other one survives (into one of two
+        // slots, so it lives through collections and later dies old).
+        var bursts: usize = 0;
+        for (0..400) |n| {
+            for (0..n % 7) |k| try sim.churn(i + k);
+            i += 7;
+            const b = h.stats.live_after_last;
+            const big = (try sim.burst((limit - b) / 2)) orelse break; // the room is used up by kept bursts
+            if (n % 2 == 0) sim.roots.items[BurstSim.ring_len + (n / 2) % 2] = &big.obj;
+            bursts += 1;
+            try sim.safepoint();
+        }
+        try testing.expect(bursts > 20);
+        // Phase C (HL3): once a major collection has made R exact, a burst of L − R + 1
+        // can't fit under any schedule. It fails cleanly, and the heap stays usable.
+        collectMajor(&h, sim.roots.items);
+        const reachable = h.bytes;
+        try testing.expectError(error.LimitExceeded, sim.burst(limit - reachable + 1 + @sizeOf(heap.String) + 2 * heap.per_allocation_overhead));
+        try testing.expectEqual(zqjs.Limit.heap_bytes, h.limit_hit.?);
+        try h.verify();
+        try testing.expect((try sim.burst((limit - h.stats.live_after_last) / 2)) != null);
+    }
+}
+
+test "scheduling (AS5) T3: programs with bursts that fit complete; surviving bursts past the limit fail as LimitExceeded" {
+    // (a) A ~100 KB join every iteration, half of them kept, among churn and old garbage at
+    // shifting phases: within (L − B)/2 throughout, so it must finish.
+    const fits =
+        \\let part = ''; for (let j = 0; j < 500; j++) part = part + 'x';
+        \\let parts = []; for (let i = 0; i < 100; i++) parts.push(part);
+        \\let kept = [null, null];
+        \\let ring = []; for (let i = 0; i < 64; i++) ring.push({ i: i });
+        \\let total = 0;
+        \\for (let n = 0; n < 200; n++) {
+        \\  ring[n % 64] = { n: n, s: 'g' + n };
+        \\  for (let k = 0; k < n % 7; k++) { let t = { k: k, s: 't' + k }; }
+        \\  let big = parts.join('');
+        \\  if (n % 2 === 0) kept[(n / 2) % 2] = big;
+        \\  total = total + big.length;
+        \\}
+        \\if (total !== 10000000) undefinedCheck;
+    ;
+    // (b) Every doubling is kept: reachable data outgrows the limit.
+    const outgrows = "let keep = []; let s = 'xxxxxxxxxxxxxxxx'; while (true) { s = s + s; keep.push(s); }";
+    const limit = 1 << 20;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const a = try runStats(fits, engine, .{ .max_heap_bytes = limit });
+        try testing.expectEqual(@as(?anyerror, null), a.err);
+        const b = try runStats(outgrows, engine, .{ .max_heap_bytes = limit });
+        try testing.expectEqual(@as(?anyerror, error.LimitExceeded), b.err);
+        try testing.expectEqual(@as(?zqjs.Limit, .heap_bytes), b.limit);
+        // It failed with the heap full of live data (after the run nothing is reachable, so
+        // the peak is the measure): every doubling was kept, and HL2 says a burst no larger
+        // than half the free room can't fail.
+        try testing.expect(b.peak > limit / 4);
+        try testing.expect(b.majors > 0);
+    }
 }

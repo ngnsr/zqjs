@@ -45,11 +45,15 @@ jobs:
       fail-fast: false # one job failing shouldn't hide the others' results
       matrix:
         platform:
-          - { name: macOS arm64, os: macos-latest }
-          - { name: Linux x86_64, os: ubuntu-latest }
+          # `cpu` pins the build's CPU where the runners differ. The Zig cache key includes
+          # the exact CPU of a `native` build, and GitHub's x86_64 runners are a mix of
+          # models, so a native build there missed the cache almost every run (each test
+          # binary recompiled, ~5 min a job). The pow step below still runs native.
+          - { name: macOS arm64, os: macos-latest, cpu: "" }
+          - { name: Linux x86_64, os: ubuntu-latest, cpu: "-Dcpu=x86_64_v3" }
           # GitHub's arm64 Linux runners are free for public repositories; for a private
           # repository this job may need a paid runner (or remove it).
-          - { name: Linux arm64, os: ubuntu-24.04-arm }
+          - { name: Linux arm64, os: ubuntu-24.04-arm, cpu: "" }
         # Both stress modes at once: the VM moves its stacks on every call (D36), and both
         # engines collect at every safepoint, keep collected objects as tombstones and
         # verify the heap before and after every collection (D8, GC_DESIGN §11).
@@ -72,7 +76,7 @@ jobs:
           cache-key: ${{ matrix.suite.name }}
 
       - name: Tests (${{ matrix.suite.name }})
-        run: zig build test ${{ matrix.suite.flags }} --summary all
+        run: zig build test ${{ matrix.suite.flags }} ${{ matrix.platform.cpu }} --summary all
 
       # The checks below run once per platform, in the plain-tests job.
 
@@ -90,15 +94,15 @@ jobs:
       # M8.1: each deliberately broken GC piece must be caught by the heap verifier.
       - name: GC mutants
         if: matrix.suite.name == 'tests'
-        run: zig build gc-mutants --summary all
+        run: zig build gc-mutants ${{ matrix.platform.cpu }} --summary all
 
       - name: Generated files and node contract
         if: matrix.suite.name == 'tests'
-        run: zig build check-goldens
+        run: zig build check-goldens ${{ matrix.platform.cpu }}
 
       - name: Release build
         if: matrix.suite.name == 'tests'
-        run: zig build --release=fast
+        run: zig build --release=fast ${{ matrix.platform.cpu }}
 
       # pow must give bit-identical results everywhere (DESIGN_DECISIONS D25). The expected
       # hash was measured on aarch64-macos and x86_64 under Rosetta 2; these runners add

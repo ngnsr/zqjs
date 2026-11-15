@@ -543,7 +543,9 @@ at a major collection:
 | at least 50% (`freed · 2 ≥ before`) | 1 |
 | anything in between | unchanged |
 
-`next_major = live + min(max(f · live, 256 KiB), (max − live)/2)`, with `f · live` saturating.
+`next_major = live + min(max(f · live, 256 KiB), (max − live)/c(f))`, with `f · live`
+saturating, `c(1) = 2` (D8 today) and `c(2) = c(4) = 4`: the quarter-room cap, from the burst
+analysis below (AS5).
 
 **The hard limit (AS1), argued from the code as it stands.** Write `L` for `max_heap_bytes`.
 
@@ -571,71 +573,117 @@ at a major collection:
 `f` appears only inside the `min(…)` that (2) bounds, so all of the above holds at
 `f = 1, 2, 4` alike.
 
-**Bursts (AS5, added for the second review).**
+**Bursts and the hard limit (AS5, revision 3: the proof asked for in the third review).**
 
-A *burst* is allocation inside one step: `a.join()`, a long concatenation, a native that
-builds a big result. There's no safepoint inside it, so no collection can run mid-burst (D7).
-Its only room is what's free at the safepoint before it.
+**Definitions.**
 
-Notation: `L` is the limit, `live` the heap after the last major collection, `B` the heap after
-the last collection of any kind (all of it old), and `N = nursery_bytes`.
+| symbol | meaning |
+|---|---|
+| `L` | `max_heap_bytes` |
+| `N` | `nursery_bytes` |
+| `bytes` | the accounted heap at a given moment |
+| `R` | reachable bytes: what a full mark would keep |
+| `B` | the heap after the last collection of any kind (all of it old) |
+| `live` | the heap after the last major collection |
+| `P` | what one minor collection promotes |
 
-1. **Exact, for every `f`.** After any collection, `next_gc = B + min(N, (L − B)/2)`. So at
-   every safepoint with no collection pending, `bytes ≤ B + (L − B)/2`: **a burst always has
-   at least `(L − B)/2` of room.** `f` doesn't appear in this at all.
-2. **`B` is live data plus old garbage.** `f` decides only how much old garbage can build up
-   before a major collection clears it:
-   - that's at most `next_major − live`, plus what the one collection that crosses
-     `next_major` promotes;
-   - it's bounded by `(L − live)/2` for every `f` (F3), and by `(L − live)/4` with the
-     mitigation below.
-3. **What this doesn't bound:** a burst that *overshoots* a trigger by its whole size, with a
-   result that stays live. Then `B` rises by that much, but that's live data genuinely filling
-   the heap, the same as in M8 at any `f`.
+A *burst* is all the allocation between two safepoints. Nothing collects inside it (D7).
 
-(A first draft claimed a fixed `(L − live)/8` of room for every `f`. It's wrong: the overshoot
-in point 3 breaks it.)
+**The rule under review:**
 
-**What `f` does change is the typical headroom away from the limit.**
+- `growth(f, live) = min(max(f · live, 256 KiB), (L − live) / c(f))`, with `c(1) = 2` (D8 as it is
+  today) and `c(2) = c(4) = 4` (the quarter-room cap);
+- `next_major = live + growth`;
+- after every collection, `next_gc = B + min(N, (L − B)/2)`;
+- a collection is major iff, when it starts, `B ≥ next_major` (or a major one was requested).
 
-Example: `L` = 100 MB, `live` = 10 MB.
+"The hard-limit guarantee" covers three separate statements.
 
-| `f` | `next_major` | room just before that major |
+**HL1: the limit is never exceeded.** `bytes ≤ L` at every moment, for every program and every
+`f`. `reserve` refuses any charge that would take `bytes` past `L`, before allocating. That
+doesn't depend on scheduling at all.
+
+**HL2: a burst within the bound never fails.** A burst of total size `S` succeeds whenever
+`S ≤ (L − B)/2`, where `B` is the heap left by the last collection before it. This holds for
+every `f`.
+
+*Proof:*
+- At the safepoint before the burst, a pending collection runs first and resets `B` and
+  `next_gc`.
+- With none pending, `bytes ≤ next_gc ≤ B + (L − B)/2`, so the free room is at least
+  `(L − B)/2 ≥ S`.
+- During the burst only allocation happens, so the burst fits.
+- `f` appears nowhere in this.
+
+**What `f` does to that bound.** How big `(L − B)/2` can be depends on how far `B` gets from
+`live`.
+
+*Lemma: `B < next_major + P`.*
+- `B` only grows at a minor collection, by that collection's promotion.
+- A collection is minor only if the `B` before it was below `next_major`.
+
+*So the guaranteed burst room is*
+`(L − B)/2 > (L − live − growth − P)/2 ≥ (L − live)(1 − 1/c(f))/2 − P/2`:
+
+| `f` | `c(f)` | worst-case burst room |
 |---|---|---|
-| 1 | 20 MB | about 80 MB |
-| 4 | 50 MB | about 50 MB |
+| 1 | 2 | `(L − live)/4 − P/2`: D8's guarantee today |
+| 2, 4 | 4 | `3(L − live)/8 − P/2`, which is more |
 
-So a 60 MB burst that always fits at `f = 1` can fail at `f = 4` if it arrives just before a
-major collection. That's the real cost of adaptive scheduling: fewer major collections in
-exchange for less headroom against bursts.
+So **with the quarter-room cap, no supported `f` has a smaller worst-case burst room than
+today's rule.** Revision 2 (no cap) only matched it, and was worse in the typical case.
 
-**Proposed mitigation (for review):** when `f > 1`, the growth is also capped at a *quarter* of
-the room, not half: `growth = min(max(f · live, 256 KiB), (L − live)/(f > 1 ? 4 : 2))`. Then
-`f > 1` never leaves less than three quarters of the room free (minus a nursery) at its major
-trigger.
+**Bursts whose results survive.** A surviving burst of size `S` is reachable data.
+- The next safepoint's collection promotes it, so it's part of `P`.
+- It raises `B` and `R` alike. The next burst's room shrinks because live data grew, not
+  because of garbage.
+- The old garbage that schedule decisions can leave is `B − R ≤ growth + D`. Here `D` is
+  promoted-but-dead data: floating garbage, and dead atoms (minor collections never free
+  atoms).
+- `D` is cleared by the next major collection, and `growth` is the capped term above.
 
-In the example that's `next_major` = 32.5 MB, so the 60 MB burst fits. The costs:
-- point 1's guarantee is unchanged;
-- growth phases far from the limit keep most of their benefit;
-- near the limit, `f` effectively falls back to 1.
+**HL3: a failure is legitimate when the data truly doesn't fit.** If `R + S > L`, the burst fails
+under any scheduler and any `f`: `bytes ≥ R` always, and `reserve` refuses. It reports
+`LimitExceeded(heap_bytes)`.
 
-**Tests for AS5:**
+**The gap, stated honestly.** When `R + S ≤ L` but `S > (L − B)/2`, a burst *may* fail. That's
+the cost of an allocator that never collects (D7): it exists in M8 and under D8 today. The
+adaptive rule doesn't widen its worst case (HL2's table). It narrows the typical headroom far
+from the limit by at most `growth − live` (at most `3·live` at `f = 4`), and the quarter cap
+keeps even that within a quarter of the room.
 
-- **A grid of the bound itself** (unit, no programs):
-  - inputs: `L ∈ {256K, 1M, 64M, maxInt}`, `live` and `B` across `[0, L]`, `f ∈ {1, 2, 4}`;
-  - checks: `next_major ≤ live + (L − live)/2`, or `/4` when `f > 1`; `next_gc ≤ B +
-    (L − B)/2`;
-  - with overflow-checked arithmetic throughout.
-- **Bursts at every phase** (both engines, 1 MiB limit):
-  1. grow live data to push `f` to 4;
-  2. churn objects that die old;
-  3. every *k* iterations, run one burst: a `join` of a prepared array into a short-lived
-     string of about 90% of the smallest `(L − B)/2` the run can reach. Because *k* is coprime with the collection period, bursts
-     land at every point between collections.
+**Tests:**
 
-  It must finish without `LimitExceeded`. A control run with a burst of about 110% of the
-  *typical* room (not the guaranteed one) must hit `LimitExceeded`, so the test can't pass
-  by accident.
+- **T1: a grid of the formulas** (unit).
+  - Inputs: `L ∈ {256 KiB, 1 MiB, 64 MiB, maxInt}`, `live ∈ {0, 1, L/8, L/2, L − 1, L}`,
+    `B ∈ [live, L]` at the same points, `f ∈ {1, 2, 4}`.
+  - Checks: `growth ≤ (L − live)/c(f)`, `next_major ≤ L`, `next_gc ≤ B + (L − B)/2`, and no
+    overflow (saturating `f · live`).
+- **T2: a burst simulator on the heap API** (unit, fast, no engine).
+  - **Setup:** a mutator loop. Its "safepoints" collect whenever `collect_requested`, and its
+    roots are a test root set. It runs with `f` pinned at 1, 2 and 4, and once adaptive.
+  - **Phase A:** grow reachable data to about 40% of `L` while churning short-lived garbage,
+    plus *old* garbage: objects kept for one collection, then dropped.
+  - **Phase B (HL2), at hundreds of positions between collections:** a burst of exactly
+    `S = (L − B)/2`.
+    - Its result is kept on alternate bursts, so surviving bursts are covered.
+    - Each one must succeed.
+    - `bytes ≤ L` always (HL1).
+  - **Phase C (HL3):**
+    1. after a major collection gives the exact `R`, request `S = L − R + 1`;
+    2. it must fail with `LimitExceeded(heap_bytes)`;
+    3. `verify()` must pass afterwards;
+    4. the next in-bound burst must succeed (the failure left the heap usable).
+- **T3: programs, both engines, 1 MiB limit.**
+  - (a) Bursts via `join`, sized within the bound at every phase, results kept on alternate
+    iterations: the program completes.
+  - (b) Surviving bursts that keep growing until `R + S > L`: the run ends with
+    `LimitExceeded(heap_bytes)`. Before that, a major collection must have run, so nothing
+    failed for lack of a major collection.
+- **The existing O(log limit) fill test**, unchanged.
+
+**What isn't promised:** that a burst with `(L − B)/2 < S ≤ L − R` succeeds. No test asserts it
+either way, because the outcome depends on where between collections the burst lands.
 
 **Overhead bound (AS3).** At the next major collection, old bytes are at most `(1 + 4) · live`,
 and never more than `L`.

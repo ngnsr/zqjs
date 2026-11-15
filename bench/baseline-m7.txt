@@ -1,3 +1,4 @@
+# allocator: libc malloc (the macOS default before M8.1 P2, noted afterwards; later reports use smp_allocator: compare times only within one allocator)
 # zqjs benchmark baseline: zig 0.17.1, aarch64-macos (apple_m4), fast, median of 5 runs
 program                engine           steps    allocated         peak          end  median ms
 arrays.js              vm             5455249      2379800      2379688      2379688       53.2

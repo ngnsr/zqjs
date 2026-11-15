@@ -1,7 +1,8 @@
 //! The runtime heap (DESIGN_DECISIONS D7): the only code that allocates runtime values.
 //!
-//! M3 has no garbage collector. Every object is linked into `objects` and lives until
-//! `deinit`. The list is what the M8 collector will sweep, so only marking is missing.
+//! Every object is linked into one of two lists (M8.1, generational, non-moving): `young`
+//! (every new object) and `old` (everything that survived a collection). Nothing moves:
+//! promotion relinks an object and sets its `old` bit.
 //!
 //! Accounting (revision for M3): every allocation is charged
 //!     @sizeOf(header struct) + payload bytes + `per_allocation_overhead`
@@ -21,18 +22,25 @@
 //!
 //! Reference stores (M8, DESIGN_DECISIONS D8/I3): after construction, every reference
 //! written into a heap object goes through the `store*`/`append*` functions below, so a
-//! later write barrier (incremental marking, generations) has one place to hook into. In
-//! M8 the barrier is a no-op: collection is stop-the-world and only at safepoints, so no
-//! store can happen during a collection. `tests/gc_test.zig` greps for raw stores.
+//! write barrier has one place to hook into. M8.1's barrier keeps the remembered set: an
+//! old object that stores a young reference is recorded, so a minor collection can find
+//! young objects reachable only through old ones (GC_DESIGN.md §15). `tests/gc_test.zig`
+//! greps for raw stores.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 /// `-Dgc-stress` (GC_DESIGN §11): collect at every safepoint, turn freed objects into
 /// tombstones, verify the heap after every collection. In any build mode, ReleaseSafe too.
 pub const gc_stress = @import("build_options").gc_stress;
+/// `-Dgc-mutation` (tests only: `zig build gc-mutants`): one deliberately broken piece of
+/// the generational collector. Each `mutation:` test in tests/gc_test.zig must see the
+/// verifier catch its mutant; `.none` everywhere else.
+pub const Mutation = enum { none, no_element_barrier, no_card_set, keep_remembered_bit, clean_first_bitmap, minor_frees_atoms, no_prop_card_set, no_dirty_on_remove, clean_first_prop_bitmap };
+pub const mutation: Mutation = std.meta.stringToEnum(Mutation, @import("build_options").gc_mutation) orelse @compileError("unknown -Dgc-mutation");
 const limits_mod = @import("../limits.zig");
 const Limits = limits_mod.Limits;
 const Limit = limits_mod.Limit;
+const card_elements = limits_mod.card_elements;
 const Value = @import("value.zig").Value;
 const Builtin = @import("builtin_names.zig").Builtin;
 
@@ -46,7 +54,13 @@ pub const Obj = struct {
     next: ?*Obj,
     /// Set during a collection's mark phase; cleared by the sweep (D8).
     marked: bool = false,
-    /// The gray list while marking: intrusive, so marking never allocates (D9).
+    /// On the `old` list: survived a collection (M8.1). Never cleared.
+    old: bool = false,
+    /// An old object on the remembered list (it stored a young reference since the last
+    /// collection). The list is linked through `gray_next`, free between collections.
+    remembered: bool = false,
+    /// The gray list while marking: intrusive, so marking never allocates (D9). Between
+    /// collections, the remembered list (M8.1).
     gray_next: ?*Obj = null,
     /// Stress builds only: an allocation number, and the kind a tombstone used to be.
     debug: Debug = if (gc_stress) .{} else {},
@@ -158,7 +172,9 @@ pub const Heap = struct {
     gpa: Allocator,
     max_bytes: usize,
     max_string_length: usize,
-    objects: ?*Obj = null,
+    /// The young generation (new objects, newest first) and the old one (M8.1).
+    young: ?*Obj = null,
+    old: ?*Obj = null,
     /// Accounted bytes currently allocated (live, until M8: everything not rolled back).
     bytes: usize = 0,
     /// Highest value `bytes` has had.
@@ -174,6 +190,32 @@ pub const Heap = struct {
     /// When `bytes` passes this, a collection is requested for the next safepoint.
     next_gc: usize = 0,
     collect_requested: bool = false,
+    nursery_bytes: usize,
+    /// When the heap left after a collection (all of it old) reaches this, the next
+    /// collection is a major one (M8.1).
+    next_major: usize = 0,
+    /// The major-growth factor f ∈ {1, 2, 4} (M8.1 AS5, GC_DESIGN.md §15): doubled (to at most 4)
+    /// after a major collection that freed under 10% of the heap, back to 1 after one that
+    /// freed at least half, unchanged in between. Only byte counts decide it.
+    growth: u8 = 1,
+    /// Tests pin `growth` by clearing this.
+    adapt_growth: bool = true,
+    /// Make the next collection a major one (tests; heap pressure).
+    major_requested: bool = false,
+    /// While a minor collection marks: old objects are not traced.
+    in_minor: bool = false,
+    /// Old objects that stored a young reference since the last collection, linked
+    /// through `gray_next` (M8.1). Each is on it once (`Obj.remembered`).
+    remembered: ?*Obj = null,
+    /// Card bitmaps of arrays with capacity ≥ `card_elements`: bit i covers elements
+    /// [i·card_elements, (i+1)·card_elements). A side table, so Object doesn't grow;
+    /// touched only when such an array's capacity grows, on a young store into an old
+    /// one, and when a minor collection scans it.
+    cards: std.AutoHashMapUnmanaged(*Object, []u64) = .empty,
+    /// The same for property tables with ≥ `card_elements` entries (M8.1 P2b): bit i
+    /// covers entries [i·card_elements, (i+1)·card_elements), key and value alike. Entry
+    /// indices are insertion order; only `removeProperty` shifts them (and dirties).
+    prop_cards: std.AutoHashMapUnmanaged(*Object, []u64) = .empty,
     /// Collect at every safepoint, not only when requested (tests; always under -Dgc-stress).
     collect_always: bool = gc_stress,
     /// Run the heap verifier after every collection (always under -Dgc-stress; a
@@ -189,9 +231,41 @@ pub const Heap = struct {
     gray: ?*Obj = null,
     stats: Stats = .{},
 
+    /// An optional observer of collections (the GC report tool). The runtime has no
+    /// clock: the observer brings one, and gets one sample per collection. Unset (the
+    /// default), collections don't call anything.
+    observer: ?Observer = null,
+
+    pub const Observer = struct {
+        ctx: *anyopaque,
+        /// Monotonic nanoseconds.
+        clock: *const fn (ctx: *anyopaque) u64,
+        record: *const fn (ctx: *anyopaque, sample: Sample) void,
+    };
+
+    /// One collection, as seen by an observer.
+    pub const Sample = struct {
+        kind: enum { minor, major },
+        start_ns: u64,
+        duration_ns: u64,
+        bytes_before: usize,
+        bytes_after: usize,
+        /// Objects that survived (were marked) and that were freed, in this collection.
+        marked: u64,
+        swept: u64,
+        /// Minor collections: the part of the pause spent scanning the remembered set.
+        remembered_ns: u64 = 0,
+        /// The part of the pause spent sweeping (freeing, promoting).
+        sweep_ns: u64 = 0,
+    };
+
     /// Deterministic collector statistics (D8): work units, not wall-clock time.
     pub const Stats = struct {
         collections: u64 = 0,
+        /// How many of `collections` were minor (M8.1).
+        minor: u64 = 0,
+        /// Children checked while scanning remembered owners: the remembered-set work.
+        remembered_children: u64 = 0,
         /// Cumulative bytes freed by collections.
         bytes_freed: u64 = 0,
         /// Accounted bytes surviving the last collection.
@@ -202,29 +276,60 @@ pub const Heap = struct {
     };
 
     pub fn init(gpa: Allocator, limits: Limits) Heap {
-        var h: Heap = .{ .gpa = gpa, .max_bytes = limits.max_heap_bytes, .max_string_length = limits.max_string_length };
-        h.next_gc = h.schedule(0);
+        var h: Heap = .{ .gpa = gpa, .max_bytes = limits.max_heap_bytes, .max_string_length = limits.max_string_length, .nursery_bytes = limits.nursery_bytes };
+        h.next_major = h.schedule(0);
+        h.next_gc = h.nextMinor();
         return h;
     }
 
+    /// Under collect_always (stress), every this-many-th collection is a major one.
+    pub const stress_major_every = 64;
+
     // ---- the collector (D8; GC_DESIGN §6). Runs only at safepoints, by the engine.
 
-    /// The next collection trigger after `live` bytes survived (D8): grow by the live size
-    /// (at least 256 KiB), but never beyond half the room left under the limit. So small
-    /// heaps collect after doubling, and near the limit each collection needs half the
-    /// remaining room allocated first: a program filling its heap with live data collects
-    /// O(log limit) times, never at every safepoint. Overflow-free: the result is at most
-    /// `live + (max − live) / 2 ≤ max`.
+    /// The next major-collection trigger after `live` bytes survived a major collection
+    /// (D8, M8.1 AS5): grow by `growth` × the live size (at least 256 KiB), but never beyond
+    /// half the room left under the limit, or a quarter when `growth` > 1. So small heaps
+    /// collect after growing (1 + growth)×, and near the limit each collection needs a
+    /// share of the remaining room allocated first: a program filling its heap with live
+    /// data collects O(log limit) times. The quarter keeps a burst's worst-case room at
+    /// least as large as at growth 1 (the HL2 proof, GC_DESIGN.md §15). Overflow-free: the
+    /// result is at most `live + (max − live) / 2 ≤ max`.
     pub fn schedule(h: *const Heap, live: usize) usize {
         const min_growth = 256 * 1024;
-        const room = (h.max_bytes -| live) / 2;
-        return live + @min(@max(live, min_growth), room);
+        const room = (h.max_bytes -| live) / @as(usize, if (h.growth > 1) 4 else 2);
+        return live + @min(@max(live *| h.growth, min_growth), room);
     }
 
-    /// Marks `obj` and queues it for scanning, once.
+    /// AS5's rule, after a major collection that went from `before` to `after` bytes.
+    fn adaptGrowth(h: *Heap, before: usize, after: usize) void {
+        if (!h.adapt_growth) return;
+        const freed = before - after;
+        if (freed *| 10 < before) {
+            h.growth = @min(h.growth * 2, 4);
+        } else if (freed *| 2 >= before) {
+            h.growth = 1;
+        }
+    }
+
+    /// The next minor-collection trigger: a nursery's worth of allocation, or half the
+    /// room left under the limit if that is less (so a heap filling up still collects
+    /// O(log limit) times, as in M8).
+    fn nextMinor(h: *const Heap) usize {
+        return h.bytes + @min(h.nursery_bytes, (h.max_bytes -| h.bytes) / 2);
+    }
+
+    /// Whether the next collection is a major one (M8.1 scheduling, GC_DESIGN.md §15).
+    pub fn majorDue(h: *const Heap) bool {
+        if (h.major_requested or h.stats.live_after_last >= h.next_major) return true;
+        return h.collect_always and (h.stats.collections + 1) % stress_major_every == 0;
+    }
+
+    /// Marks `obj` and queues it for scanning, once. A minor collection doesn't trace
+    /// old objects: what they reach that is young, the remembered set reaches.
     pub fn markObj(h: *Heap, obj: *Obj) void {
         obj.checkLive(); // a root or an edge to a collected object (stress builds)
-        if (obj.marked) return;
+        if (obj.marked or (h.in_minor and obj.old)) return;
         obj.marked = true;
         obj.gray_next = h.gray;
         h.gray = obj;
@@ -234,11 +339,40 @@ pub const Heap = struct {
         visitValue(v, h, markObj);
     }
 
-    /// A full stop-the-world collection. `markRoots(roots, h)` marks every root (with
-    /// `markObj`/`markValue`); everything not reachable from them is freed. Allocates
-    /// nothing and can't fail (I4).
+    /// One collection (D8, M8.1): minor or major as `majorDue` says. Minor: mark from the
+    /// remembered set and the roots without tracing old objects, sweep only `young`.
+    /// Major: mark everything, rebuild the weak atom table, sweep both lists. Either way
+    /// every survivor ends up old, so afterwards `young` and the remembered set are empty.
+    /// Allocates nothing and can't fail (I4).
     pub fn collect(h: *Heap, roots: anytype, comptime markRoots: fn (@TypeOf(roots), *Heap) void) void {
+        const major = h.majorDue();
+        if (h.verify_always) h.verify() catch |e| std.debug.panic("zqjs GC bug: heap verification failed before a collection: {s}", .{@errorName(e)});
+        const start: u64 = if (h.observer) |o| o.clock(o.ctx) else 0;
+        const bytes_before = h.bytes;
+        const marked_before = h.stats.marked;
+        const swept_before = h.stats.swept;
+        var remembered_ns: u64 = 0;
+        var sweep_start: u64 = 0;
+        defer if (h.observer) |o| o.record(o.ctx, .{
+            .kind = if (major) .major else .minor,
+            .start_ns = start,
+            .duration_ns = o.clock(o.ctx) - start,
+            .bytes_before = bytes_before,
+            .bytes_after = h.bytes,
+            .marked = h.stats.marked - marked_before,
+            .swept = h.stats.swept - swept_before,
+            .remembered_ns = remembered_ns,
+            .sweep_ns = o.clock(o.ctx) - sweep_start,
+        });
         std.debug.assert(h.gray == null);
+        if (major) {
+            h.forgetRemembered(); // a major collection traces everything anyway
+        } else {
+            h.in_minor = true;
+            const t0: u64 = if (h.observer) |o| o.clock(o.ctx) else 0;
+            h.scanRemembered();
+            if (h.observer) |o| remembered_ns = o.clock(o.ctx) - t0;
+        }
         markRoots(roots, h);
         // Drain: each gray object's children (D38's edges), iteratively, never recursively.
         while (h.gray) |obj| {
@@ -246,62 +380,212 @@ pub const Heap = struct {
             obj.gray_next = null;
             forEachChild(obj, h, markObj);
         }
-        // Weak atoms (D11, I6): rebuild the table from the marked atoms, before any atom is
-        // freed. Walking the object list (not the table) keeps the rebuild deterministic,
-        // and reinserting at most as many entries as were there needs no allocation.
-        h.atoms.clearRetainingCapacity();
-        var it = h.objects;
-        while (it) |obj| : (it = obj.next) {
-            if (obj.kind != .string or !obj.marked) continue;
-            const str: *String = @fieldParentPtr("obj", obj);
-            if (str.atom != null) h.atoms.putAssumeCapacityNoClobber(str, {});
+        h.in_minor = false;
+        if (major) {
+            // Weak atoms (D11, I6): rebuild the table from the marked atoms, before any atom
+            // is freed. Walking the lists (not the table) keeps the rebuild deterministic,
+            // and reinserting at most as many entries as were there needs no allocation.
+            // A minor collection never frees an atom (below), so only here can one go.
+            h.atoms.clearRetainingCapacity();
+            for ([_]?*Obj{ h.young, h.old }) |list| {
+                var it = list;
+                while (it) |obj| : (it = obj.next) {
+                    if (obj.kind != .string or !obj.marked) continue;
+                    const str: *String = @fieldParentPtr("obj", obj);
+                    if (str.atom != null) h.atoms.putAssumeCapacityNoClobber(str, {});
+                }
+            }
         }
-        // Sweep: free the unmarked, unmark the survivors.
         const before = h.bytes;
-        var link: *?*Obj = &h.objects;
-        while (link.*) |obj| {
-            if (obj.marked) {
+        if (h.observer) |o| sweep_start = o.clock(o.ctx);
+        // A major collection sweeps the old list first: survivors promoted below arrive
+        // there unmarked.
+        if (major) {
+            var link: *?*Obj = &h.old;
+            while (link.*) |obj| {
+                if (obj.marked) {
+                    obj.marked = false;
+                    h.stats.marked += 1;
+                    link = &obj.next;
+                } else {
+                    link.* = obj.next;
+                    if (gc_stress) h.entomb(obj) else h.destroy(obj);
+                    h.stats.swept += 1;
+                }
+            }
+        }
+        // Sweep the young: survivors are promoted (relinked, never moved). In a minor
+        // collection an unmarked atom is promoted too, not freed: the table still holds
+        // it. Promotion is not marking: a string has no children, so it keeps nothing else.
+        var it = h.young;
+        h.young = null;
+        while (it) |obj| {
+            it = obj.next;
+            if (obj.marked or (!major and isAtom(obj) and mutation != .minor_frees_atoms)) {
                 obj.marked = false;
+                obj.old = true;
+                obj.next = h.old;
+                h.old = obj;
                 h.stats.marked += 1;
-                link = &obj.next;
             } else {
-                link.* = obj.next;
                 if (gc_stress) h.entomb(obj) else h.destroy(obj);
                 h.stats.swept += 1;
             }
         }
+        if (major) {
+            h.adaptGrowth(bytes_before, h.bytes);
+            h.next_major = h.schedule(h.bytes);
+            h.major_requested = false;
+        } else h.stats.minor += 1;
         h.stats.collections += 1;
         h.stats.bytes_freed += before - h.bytes;
         h.stats.live_after_last = h.bytes;
-        h.next_gc = h.schedule(h.bytes);
+        h.next_gc = h.nextMinor();
         h.collect_requested = false;
-        if (h.verify_always) h.verify() catch |e| std.debug.panic("zqjs GC bug: heap verification failed after a collection: {s}", .{@errorName(e)});
+        if (h.verify_always) h.verifyCollected() catch |e| std.debug.panic("zqjs GC bug: heap verification failed after a collection: {s}", .{@errorName(e)});
     }
 
-    pub const VerifyError = error{ GrayListNotEmpty, EdgeToCollectedObject, CollectedObjectInList, AtomTableHoldsCollectedObject, AtomTableHoldsNonAtom, AccountingMismatch };
+    fn isAtom(obj: *Obj) bool {
+        return obj.kind == .string and @as(*String, @fieldParentPtr("obj", obj)).atom != null;
+    }
 
-    /// The heap verifier (GC_DESIGN §11; after every collection in stress builds, and
-    /// callable from tests): the gray list is empty; no live object references a collected
-    /// one (roots are checked as they are marked, `markObj`); the atom table holds only live
-    /// atoms; and the accounting is exact: `bytes` = Σ every live object's fixed charge +
-    /// every buffer byte charged through `allocator()`. Allocates nothing.
+    /// Minor collection, first step: mark the young children of every remembered owner,
+    /// emptying the list. An object with cards has only its dirty cards scanned (each card
+    /// scanned, then cleared): property cards over its entries, element cards over an
+    /// array's elements. Without a bitmap, that part is scanned whole.
+    fn scanRemembered(h: *Heap) void {
+        var scan: RememberedScan = .{ .h = h };
+        while (h.remembered) |owner| {
+            h.remembered = owner.gray_next;
+            owner.gray_next = null;
+            if (mutation != .keep_remembered_bit) owner.remembered = false;
+            if (owner.kind != .object) {
+                forEachChild(owner, &scan, RememberedScan.child);
+                continue;
+            }
+            const o: *Object = @fieldParentPtr("obj", owner);
+            if (o.proto) |p| scan.child(&p.obj);
+            if (h.prop_cards.get(o)) |words| {
+                scanDirty(words, o.props.count(), &scan, o, RememberedScan.entries);
+            } else scan.entries(o, 0, o.props.count());
+            switch (o.kind) {
+                .ordinary => {},
+                .array => |elements| if (h.cards.get(o)) |words| {
+                    scanDirty(words, elements.items.len, &scan, o, RememberedScan.elements);
+                } else scan.elements(o, 0, elements.items.len),
+            }
+        }
+    }
+
+    const RememberedScan = struct {
+        h: *Heap,
+        fn child(c: *RememberedScan, obj: *Obj) void {
+            c.h.stats.remembered_children += 1;
+            c.h.markObj(obj);
+        }
+        fn entries(c: *RememberedScan, o: *Object, lo: usize, hi: usize) void {
+            for (o.props.keys()[lo..hi], o.props.values()[lo..hi]) |k, p| {
+                c.child(&k.obj);
+                visitValue(p.value, c, child);
+            }
+        }
+        fn elements(c: *RememberedScan, o: *Object, lo: usize, hi: usize) void {
+            for (elementsOf(o).items[lo..hi]) |v| visitValue(v, c, child);
+        }
+    };
+
+    /// Calls `visit(scan, o, lo, hi)` for each dirty card's range, clamped to `len` (cards
+    /// past a pop, shrink or delete cover nothing), then clears each word it scanned.
+    fn scanDirty(words: []u64, len: usize, scan: *RememberedScan, o: *Object, comptime visit: fn (*RememberedScan, *Object, usize, usize) void) void {
+        for (words, 0..) |*w, wi| {
+            var word = w.*;
+            while (word != 0) : (word &= word - 1) {
+                const lo = (wi * 64 + @ctz(word)) * card_elements;
+                if (lo < len) visit(scan, o, lo, @min(lo + card_elements, len));
+            }
+            w.* = 0;
+        }
+    }
+
+    /// Major collection, first step: empty the remembered list and every card of its
+    /// owners (cards are dirty only on remembered owners).
+    fn forgetRemembered(h: *Heap) void {
+        while (h.remembered) |owner| {
+            h.remembered = owner.gray_next;
+            owner.gray_next = null;
+            owner.remembered = false;
+            if (owner.kind != .object) continue;
+            const o: *Object = @fieldParentPtr("obj", owner);
+            if (h.cards.get(o)) |words| @memset(words, 0);
+            if (h.prop_cards.get(o)) |words| @memset(words, 0);
+        }
+    }
+
+    pub const VerifyError = error{
+        GrayListNotEmpty,
+        EdgeToCollectedObject,
+        CollectedObjectInList,
+        AtomTableHoldsCollectedObject,
+        AtomTableHoldsNonAtom,
+        AccountingMismatch,
+        /// I-gen1: an object on the wrong list for its `old` bit.
+        WrongGenerationList,
+        /// I-gen2: an old object holds a young reference but isn't remembered, or (a
+        /// carded array) the card covering that element is clean: a missing barrier.
+        UnrememberedOldToYoungEdge,
+        CleanCardOverYoungElement,
+        CleanCardOverYoungProperty,
+        /// I-gen4: the remembered list isn't exactly the objects with `remembered` set,
+        /// each old and live, each once.
+        RememberedListCorrupt,
+        /// I-gen3 (after a collection): something young, remembered or dirty is left.
+        NurseryNotEmpty,
+        RememberedSetNotEmpty,
+        DirtyCardAfterCollection,
+    };
+
+    /// The heap verifier (GC_DESIGN §11; before and after every collection in stress
+    /// builds, and callable from tests): the gray list is empty; no live object references
+    /// a collected one (roots are checked as they are marked, `markObj`); the atom table
+    /// holds only live atoms; the accounting is exact: `bytes` = Σ every live object's
+    /// fixed charge + every buffer byte charged through `allocator()`; and the generational
+    /// invariants I-gen1, 2 and 4 (GC_DESIGN.md §15). Allocates nothing.
     pub fn verify(h: *const Heap) VerifyError!void {
         if (h.gray != null) return error.GrayListNotEmpty;
         var sum: usize = h.buffer_bytes;
+        var remembered: usize = 0;
         const Check = struct {
             bad: bool = false,
+            young: bool = false,
             fn edge(c: *@This(), child: *Obj) void {
                 if (child.kind == .dead) c.bad = true;
+                if (!child.old) c.young = true;
             }
         };
-        var it = h.objects;
-        while (it) |obj| : (it = obj.next) {
-            if (obj.kind == .dead) return error.CollectedObjectInList;
-            sum += fixedCharge(obj);
-            var c: Check = .{};
-            forEachChild(obj, &c, Check.edge);
-            if (c.bad) return error.EdgeToCollectedObject;
+        for ([_]?*Obj{ h.young, h.old }, [_]bool{ false, true }) |list, old| {
+            var it = list;
+            while (it) |obj| : (it = obj.next) {
+                if (obj.kind == .dead) return error.CollectedObjectInList;
+                if (obj.old != old) return error.WrongGenerationList;
+                if (obj.remembered) remembered += 1;
+                sum += fixedCharge(obj);
+                var c: Check = .{};
+                forEachChild(obj, &c, Check.edge);
+                if (c.bad) return error.EdgeToCollectedObject;
+                if (old and c.young) {
+                    if (!obj.remembered) return error.UnrememberedOldToYoungEdge;
+                    if (obj.kind == .object) try h.checkCards(@fieldParentPtr("obj", obj));
+                }
+            }
         }
+        // I-gen4: the walk is bounded by the count, so a cycle can't hang the verifier.
+        var listed: usize = 0;
+        var r = h.remembered;
+        while (r) |obj| : (r = obj.gray_next) {
+            listed += 1;
+            if (listed > remembered or obj.kind == .dead or !obj.old or !obj.remembered) return error.RememberedListCorrupt;
+        }
+        if (listed != remembered) return error.RememberedListCorrupt;
         var atoms = h.atoms.keyIterator();
         while (atoms.next()) |k| {
             if (k.*.obj.kind == .dead) return error.AtomTableHoldsCollectedObject;
@@ -310,13 +594,55 @@ pub const Heap = struct {
         if (sum != h.bytes) return error.AccountingMismatch;
     }
 
+    /// I-gen2 for carded objects (PC8): walks every edge itself, and each young element,
+    /// key or value must sit under a dirty card. The bitmap is only ever the thing checked.
+    fn checkCards(h: *const Heap, o: *Object) VerifyError!void {
+        if (h.prop_cards.get(o)) |words| {
+            for (o.props.keys(), o.props.values(), 0..) |k, p, i| {
+                if ((!k.obj.old or isYoung(p.value)) and !cardSet(words, i)) return error.CleanCardOverYoungProperty;
+            }
+        }
+        if (o.kind == .array) if (h.cards.get(o)) |words| {
+            for (elementsOf(o).items, 0..) |v, i| {
+                if (isYoung(v) and !cardSet(words, i)) return error.CleanCardOverYoungElement;
+            }
+        };
+    }
+
+    fn cardSet(words: []const u64, i: usize) bool {
+        const card = i / card_elements;
+        return words[card / 64] & (@as(u64, 1) << @intCast(card % 64)) != 0;
+    }
+
+    fn setCard(words: []u64, i: usize) void {
+        const card = i / card_elements;
+        words[card / 64] |= @as(u64, 1) << @intCast(card % 64);
+    }
+
+    /// `verify`, plus what must hold right after a collection (I-gen3): nothing young,
+    /// nothing remembered, no dirty card.
+    pub fn verifyCollected(h: *const Heap) VerifyError!void {
+        try h.verify();
+        if (h.young != null) return error.NurseryNotEmpty;
+        if (h.remembered != null) return error.RememberedSetNotEmpty;
+        for ([_]*const std.AutoHashMapUnmanaged(*Object, []u64){ &h.cards, &h.prop_cards }) |table| {
+            var it = table.valueIterator();
+            while (it.next()) |words| for (words.*) |w| if (w != 0) return error.DirtyCardAfterCollection;
+        }
+    }
+
     pub fn deinit(h: *Heap) void {
         h.atoms.deinit(h.allocator());
-        var it = h.objects;
-        while (it) |obj| {
-            it = obj.next;
-            h.destroy(obj);
+        for ([_]?*Obj{ h.young, h.old }) |list| {
+            var it = list;
+            while (it) |obj| {
+                it = obj.next;
+                h.destroy(obj);
+            }
         }
+        std.debug.assert(h.cards.count() == 0 and h.prop_cards.count() == 0); // gone with their objects (release)
+        h.cards.deinit(h.allocator());
+        h.prop_cards.deinit(h.allocator());
         var t = h.tombstones;
         while (t) |obj| {
             t = obj.next;
@@ -327,18 +653,19 @@ pub const Heap = struct {
 
     /// The current newest object, for `rollback`.
     pub fn mark(h: *const Heap) ?*Obj {
-        return h.objects;
+        return h.young;
     }
 
     /// Frees every object allocated since `m` (a value of `mark()`), newest first, and
     /// gives their charge back to the accounting. Used when a compilation fails: the strings it created are
     /// unreachable, so they are freed at once instead of lingering until `deinit`.
-    /// Only valid if nothing allocated since `m` is referenced anywhere.
+    /// Only valid if nothing allocated since `m` is referenced anywhere, and no collection
+    /// ran in between (it would have promoted them).
     pub fn rollback(h: *Heap, m: ?*Obj) void {
-        while (h.objects != m) {
-            const obj = h.objects.?; // `m` must be in the list
+        while (h.young != m) {
+            const obj = h.young.?; // `m` must be in the list
             if (obj.kind == .string) std.debug.assert(@as(*String, @fieldParentPtr("obj", obj)).atom == null); // the table would dangle
-            h.objects = obj.next;
+            h.young = obj.next;
             h.destroy(obj);
         }
     }
@@ -350,7 +677,7 @@ pub const Heap = struct {
         errdefer h.bytes -= charge;
         const o = try h.gpa.create(Object);
         o.* = .{ .obj = h.newHeader(.object), .proto = proto };
-        h.objects = &o.obj;
+        h.young = &o.obj;
         return o;
     }
 
@@ -364,43 +691,104 @@ pub const Heap = struct {
     //
     // After construction, every reference written into a heap object goes through one of
     // these. Each knows the owner, the old value and the new one: what an insertion barrier
-    // (Dijkstra), a deletion barrier (Yuasa) or a generational remembered set needs. In M8
-    // `barrier` does nothing; tests/gc_test.zig scans the sources for raw stores.
+    // (Dijkstra), a deletion barrier (Yuasa) or a generational remembered set needs. M8.1's
+    // `barrier` keeps the remembered set; tests/gc_test.zig scans the sources for raw stores.
 
     /// `o[key] = value`: updates an own property in place (keeping its position and
     /// enumerability) or adds an enumerable one at the end (D13).
     pub fn storeProperty(h: *Heap, o: *Object, key: *String, value: Value) Error!void {
         o.obj.checkLive();
+        try h.growPropCards(o);
         const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
         const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
         if (gop.found_existing) gop.value_ptr.value = value else gop.value_ptr.* = .{ .value = value };
+        if (!gop.found_existing) h.barrier(&o.obj, null, .{ .string = key }); // the key is a child too
         h.barrier(&o.obj, old, value);
+        h.propertyBarrier(o, gop.index, key, value);
     }
 
     /// Adds or replaces a property with explicit attributes (built-in method tables).
     pub fn defineProperty(h: *Heap, o: *Object, key: *String, p: Property) Error!void {
         o.obj.checkLive();
+        try h.growPropCards(o);
         const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
         const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
         gop.value_ptr.* = p;
+        if (!gop.found_existing) h.barrier(&o.obj, null, .{ .string = key }); // the key is a child too
         h.barrier(&o.obj, old, p.value);
+        h.propertyBarrier(o, gop.index, key, p.value);
     }
 
-    /// `delete o[key]` for an own property; keeps the others' order (O(n), D13).
+    /// `delete o[key]` for an own property; keeps the others' order (O(n), D13). Every
+    /// later entry moves down one index, so on a remembered carded table every card from
+    /// the removed entry's on is dirtied (PC2): a young entry may have moved under a clean
+    /// one. An owner that isn't remembered has nothing young to move.
     pub fn removeProperty(h: *Heap, o: *Object, key: *String) void {
-        const old = o.props.get(key) orelse return;
-        _ = o.props.orderedRemove(key);
+        const index = o.props.getIndex(key) orelse return;
+        const old = o.props.values()[index];
+        o.props.orderedRemoveAt(index);
         h.barrier(&o.obj, old.value, null);
+        if (!o.obj.remembered or mutation == .no_dirty_on_remove) return;
+        const words = h.prop_cards.get(o) orelse return;
+        const first = index / card_elements;
+        words[first / 64] |= ~@as(u64, 0) << @intCast(first % 64);
+        for (words[first / 64 + 1 ..]) |*w| w.* = ~@as(u64, 0);
+    }
+
+    /// Before an insertion: a table about to reach `card_elements` entries gets its
+    /// bitmap, and one about to outgrow its bitmap gets a bigger one (PC3). Entry counts
+    /// grow one at a time, so checking at exactly those counts sees every crossing. Grown
+    /// before the table: if this fails nothing has changed, and if the table then can't
+    /// grow, a bigger bitmap is harmless. A first bitmap for a remembered owner is all
+    /// dirty (the hole rule, as for arrays).
+    fn growPropCards(h: *Heap, o: *Object) Error!void {
+        const per_word = 64 * card_elements;
+        const n = o.props.count() + 1;
+        if (n < card_elements or (n != card_elements and (n - 1) % per_word != 0)) return;
+        const needed = (n + per_word - 1) / per_word;
+        const gop = h.prop_cards.getOrPut(h.allocator(), o) catch |e| return h.failed(e);
+        const fresh = !gop.found_existing;
+        if (fresh) gop.value_ptr.* = &.{};
+        const old = gop.value_ptr.*;
+        if (old.len >= needed) return;
+        const new = h.allocator().alloc(u64, @max(needed, 2 * old.len)) catch |e| {
+            if (fresh) h.prop_cards.removeByPtr(gop.key_ptr);
+            return h.failed(e);
+        };
+        @memcpy(new[0..old.len], old);
+        @memset(new[old.len..], if (fresh and o.obj.remembered and mutation != .clean_first_prop_bitmap) std.math.maxInt(u64) else 0);
+        h.allocator().free(old);
+        gop.value_ptr.* = new;
+    }
+
+    /// A property store's card (PC6): after `barrier`, a young key or value in an old
+    /// carded table dirties the card of entry `index`, new entry or updated one alike.
+    /// Looked up whenever an old owner stores something young: a table can keep its
+    /// bitmap after deletes take it below `card_elements` entries.
+    inline fn propertyBarrier(h: *Heap, o: *Object, index: usize, key: *String, value: Value) void {
+        if (!o.obj.old or (key.obj.old and !isYoung(value))) return;
+        if (mutation == .no_prop_card_set) return;
+        const words = h.prop_cards.get(o) orelse return; // no bitmap: scanned whole
+        setCard(words, index);
     }
 
     pub fn appendElement(h: *Heap, arr: *Object, value: Value) Error!void {
-        elementsOf(arr).append(h.allocator(), value) catch |e| return h.failed(e);
+        const elements = elementsOf(arr);
+        try h.growElements(arr, elements.items.len + 1);
+        elements.appendAssumeCapacity(value);
         h.barrier(&arr.obj, null, value);
+        h.elementBarrier(arr, elements.items.len - 1, value);
     }
 
     pub fn appendElements(h: *Heap, arr: *Object, values: []const Value) Error!void {
-        elementsOf(arr).appendSlice(h.allocator(), values) catch |e| return h.failed(e);
-        for (values) |v| h.barrier(&arr.obj, null, v);
+        const elements = elementsOf(arr);
+        const first = elements.items.len;
+        try h.growElements(arr, std.math.add(usize, first, values.len) catch return h.exceeded(.heap_bytes));
+        elements.appendSliceAssumeCapacity(values);
+        for (values, first..) |v, i| {
+            h.barrier(&arr.obj, null, v);
+            h.elementBarrier(arr, i, v);
+        }
     }
 
     /// `arr[i] = value` for an existing element (i < length).
@@ -408,7 +796,50 @@ pub const Heap = struct {
         const slot = &elementsOf(arr).items[i];
         const old = slot.*;
         slot.* = value;
+        if (mutation == .no_element_barrier) return;
         h.barrier(&arr.obj, old, value);
+        h.elementBarrier(arr, i, value);
+    }
+
+    /// Makes room for `needed` elements, growing the card bitmap first (GC_DESIGN.md §15): if
+    /// the bitmap can't grow nothing has changed, and if the elements can't, a bitmap
+    /// that is already big enough is harmless (its new bits are clean).
+    fn growElements(h: *Heap, arr: *Object, needed: usize) Error!void {
+        const elements = elementsOf(arr);
+        if (elements.capacity >= needed) return;
+        const capacity = std.ArrayList(Value).growCapacity(needed);
+        if (capacity >= card_elements) try h.growCards(arr, capacity);
+        elements.ensureTotalCapacityPrecise(h.allocator(), capacity) catch |e| return h.failed(e);
+    }
+
+    /// Makes `arr`'s card bitmap cover `capacity` elements. A first bitmap for an array
+    /// that is already remembered starts all dirty: the array was remembered as a whole,
+    /// and a clean bitmap would hide the young element that put it there.
+    fn growCards(h: *Heap, arr: *Object, capacity: usize) Error!void {
+        const words = (capacity + card_elements * 64 - 1) / (card_elements * 64);
+        const gop = h.cards.getOrPut(h.allocator(), arr) catch |e| return h.failed(e);
+        const fresh = !gop.found_existing;
+        if (fresh) gop.value_ptr.* = &.{};
+        const old = gop.value_ptr.*;
+        if (old.len >= words) return;
+        const new = h.allocator().alloc(u64, words) catch |e| {
+            if (fresh) h.cards.removeByPtr(gop.key_ptr);
+            return h.failed(e);
+        };
+        @memcpy(new[0..old.len], old);
+        @memset(new[old.len..], if (fresh and arr.obj.remembered and mutation != .clean_first_bitmap) std.math.maxInt(u64) else 0);
+        h.allocator().free(old);
+        gop.value_ptr.* = new;
+    }
+
+    /// An element store's card: after `barrier`, a young value in an old carded array
+    /// dirties the card covering index `i`.
+    inline fn elementBarrier(h: *Heap, arr: *Object, i: usize, new: Value) void {
+        if (!arr.obj.old or !isYoung(new) or elementsOf(arr).capacity < card_elements) return;
+        h.remember(&arr.obj);
+        if (mutation == .no_card_set) return;
+        const words = h.cards.get(arr) orelse return; // no bitmap: scanned whole
+        setCard(words, i);
     }
 
     /// Truncates to `len` (≤ length): `arr.length = len`.
@@ -438,16 +869,34 @@ pub const Heap = struct {
         h.barrier(&e.obj, old, value);
     }
 
-    /// The write barrier: `owner` now holds `new` where it held `old`. A no-op in M8:
-    /// collection is stop-the-world and only at safepoints, so no store can happen during
-    /// one (GC_DESIGN §7). M8.1 (incremental) and M8.2 (generations) change only this.
+    /// The write barrier: `owner` now holds `new` where it held `old` (GC_DESIGN §7). M8.1:
+    /// an old owner storing a young reference joins the remembered set. It records owners,
+    /// not edges, so a reference overwritten later keeps nothing alive. Never allocates.
     inline fn barrier(h: *Heap, owner: *Obj, old: ?Value, new: ?Value) void {
-        _ = h;
         _ = old;
         // Not the barrier's job, but every store passes here: in stress builds, a store
         // into or of a collected object is caught at the store.
         owner.checkLive();
-        if (new) |v| checkValue(v);
+        const v = new orelse return;
+        checkValue(v);
+        if (owner.old and isYoung(v)) h.remember(owner);
+    }
+
+    /// Puts an old object on the remembered list, once (the bit makes it idempotent).
+    fn remember(h: *Heap, owner: *Obj) void {
+        if (owner.remembered) return;
+        owner.remembered = true;
+        owner.gray_next = h.remembered;
+        h.remembered = owner;
+    }
+
+    fn isYoung(v: Value) bool {
+        return switch (v) {
+            .undefined, .null, .boolean, .number, .native => false,
+            .string => |s| !s.obj.old,
+            .closure => |c| !c.obj.old,
+            .object => |o| !o.obj.old,
+        };
     }
 
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
@@ -554,7 +1003,7 @@ pub const Heap = struct {
         errdefer h.bytes -= charge;
         const c = try h.gpa.create(Cell);
         c.* = .{ .obj = h.newHeader(.cell), .value = value };
-        h.objects = &c.obj;
+        h.young = &c.obj;
         return c;
     }
 
@@ -567,7 +1016,7 @@ pub const Heap = struct {
         errdefer h.gpa.free(captures);
         const c = try h.gpa.create(Closure);
         c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .vm = .{ .proto = proto, .captures = captures } } };
-        h.objects = &c.obj;
+        h.young = &c.obj;
         return c;
     }
 
@@ -576,7 +1025,7 @@ pub const Heap = struct {
         errdefer h.bytes -= charge;
         const c = try h.gpa.create(Closure);
         c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .tree = .{ .func = func, .env = env } } };
-        h.objects = &c.obj;
+        h.young = &c.obj;
         return c;
     }
 
@@ -590,7 +1039,7 @@ pub const Heap = struct {
         @memset(values, null);
         const e = try h.gpa.create(Env);
         e.* = .{ .obj = h.newHeader(.env), .parent = parent, .scope = scope, .values = values };
-        h.objects = &e.obj;
+        h.young = &e.obj;
         return e;
     }
 
@@ -663,9 +1112,13 @@ pub const Heap = struct {
                 const o: *Object = @fieldParentPtr("obj", obj);
                 o.props.deinit(h.allocator()); // refunds through the counting allocator
                 o.props = .empty;
+                if (h.prop_cards.fetchRemove(o)) |kv| h.allocator().free(kv.value);
                 switch (o.kind) {
                     .ordinary => {},
-                    .array => |*elements| elements.deinit(h.allocator()),
+                    .array => |*elements| {
+                        elements.deinit(h.allocator());
+                        if (h.cards.fetchRemove(o)) |kv| h.allocator().free(kv.value);
+                    },
                 }
                 o.kind = .ordinary;
                 o.proto = null;
@@ -688,7 +1141,7 @@ pub const Heap = struct {
     /// A new object's header, linked into the object list (with an allocation number in
     /// stress builds).
     fn newHeader(h: *Heap, kind: Obj.Kind) Obj {
-        var o: Obj = .{ .kind = kind, .next = h.objects };
+        var o: Obj = .{ .kind = kind, .next = h.young };
         if (gc_stress) {
             h.next_id += 1;
             o.debug.id = h.next_id;
@@ -722,7 +1175,7 @@ pub const Heap = struct {
 
         const s = try h.gpa.create(String);
         s.* = .{ .obj = h.newHeader(.string), .units = units };
-        h.objects = &s.obj;
+        h.young = &s.obj;
         return s;
     }
 
@@ -976,8 +1429,8 @@ test "rollback frees exactly the objects allocated since the mark" {
     _ = try h.ascii("bcd");
     h.rollback(m);
     try testing.expectEqual(before, h.bytes);
-    try testing.expectEqual(&keep.obj, h.objects.?);
-    try testing.expectEqual(@as(?*Obj, null), h.objects.?.next);
+    try testing.expectEqual(&keep.obj, h.young.?);
+    try testing.expectEqual(@as(?*Obj, null), h.young.?.next);
 }
 
 test "cells, closures and environments are accounted and freed" {

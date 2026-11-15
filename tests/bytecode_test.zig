@@ -11,6 +11,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const zqjs = @import("zqjs");
+const support = @import("support.zig");
 const Limits = zqjs.Limits;
 
 const Compiled = struct {
@@ -34,7 +35,7 @@ fn compileChecked(gpa: Allocator, source: []const u8, limits: Limits, diag: *zqj
     errdefer heap.deinit();
     var proto = zqjs.compile(gpa, &heap, script, res, limits, diag) catch |e| {
         // A failed compile leaves no trace on the heap (Heap.rollback).
-        try testing.expect(heap.objects == null);
+        try testing.expect(heap.young == null and heap.old == null);
         try testing.expectEqual(@as(usize, 0), heap.bytes);
         return e;
     };
@@ -55,6 +56,10 @@ fn expectCompiles(source: []const u8) !void {
     var diag: zqjs.Diagnostic = .{};
     var c = try compileChecked(testing.allocator, source, .{}, &diag);
     c.deinit(testing.allocator);
+}
+
+test "watchdog: this binary fails, instead of hanging, if a test gets stuck" {
+    support.watchdog(@src().file);
 }
 
 test "every diff program and every accepted syntax case compiles to verified bytecode" {

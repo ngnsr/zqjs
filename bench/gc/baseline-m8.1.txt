@@ -1,0 +1,84 @@
+# zqjs GC report: zig 0.17.1, aarch64-macos (apple_m4), fast, 5 runs per row (medians; max also [min-max]), nursery 256 KiB, smp_allocator
+program                engine        ms alloc MB   MB/s live MB peak MB  gc % | kind    gcs     p50     p95     max      max spread rem p95 |  <0.1    <1    <4   <16   >16
+arrays.js              vm          27.4      8.6    313     2.1     3.5   0.1 | minor     5   0.000   0.002   0.002     [0.00-0.00]   0.000 |    25     0     0     0     0
+                                                                              | major     2   0.005   0.023   0.023     [0.02-0.02]   0.000 |    10     0     0     0     0
+                         slowest minor: run 1, minor #1: 0.003 ms (rem 0.000, sweep 0.000), marked 20, swept 0, 0.2 -> 0.2 MB
+arrays.js              treewalk    39.4     30.0    760     2.1     3.6   3.1 | minor    86   0.014   0.014   0.017     [0.01-0.02]   0.000 |   430     0     0     0     0
+                                                                              | major     3   0.026   0.035   0.035     [0.03-0.04]   0.000 |    15     0     0     0     0
+                         slowest minor: run 4, minor #11: 0.021 ms (rem 0.000, sweep 0.021), marked 1, swept 2340, 0.7 -> 0.4 MB
+closures.js            vm          25.9     31.3   1209     0.0     0.3   7.5 | minor   125   0.016   0.016   0.021     [0.02-0.02]   0.000 |   625     0     0     0     0
+                         slowest minor: run 4, minor #58: 0.024 ms (rem 0.000, sweep 0.024), marked 4, swept 3194, 0.3 -> 0.0 MB
+closures.js            treewalk    43.5     59.5   1368     0.1     0.3   7.3 | minor   238   0.013   0.014   0.020     [0.02-0.02]   0.000 |  1190     0     0     0     0
+                         slowest minor: run 4, minor #35: 0.023 ms (rem 0.000, sweep 0.023), marked 4, swept 2517, 0.3 -> 0.0 MB
+fib.js                 vm          15.0      0.0      0     0.0     0.0   0.0 | none
+fib.js                 treewalk    29.3     25.9    885     0.1     0.4   5.1 | minor   103   0.015   0.015   0.015     [0.01-0.02]   0.000 |   515     0     0     0     0
+                         slowest minor: run 1, minor #10: 0.017 ms (rem 0.000, sweep 0.017), marked 14, swept 2327, 0.3 -> 0.0 MB
+loop.js                vm         161.5      0.0      0     0.0     0.0   0.0 | none
+loop.js                treewalk   199.3    106.8    536     0.0     0.3   3.2 | minor   427   0.015   0.016   0.020     [0.02-0.03]   0.000 |  2135     0     0     0     0
+                         slowest minor: run 5, minor #171: 0.029 ms (rem 0.000, sweep 0.029), marked 1, swept 2340, 0.3 -> 0.0 MB
+objects.js             vm          21.7     15.6    720     0.0     0.3   1.6 | minor    62   0.006   0.006   0.006     [0.01-0.01]   0.000 |   310     0     0     0     0
+                         slowest minor: run 3, minor #33: 0.008 ms (rem 0.000, sweep 0.008), marked 1, swept 799, 0.3 -> 0.0 MB
+objects.js             treewalk    32.0     33.9   1061     0.1     0.3   4.4 | minor   135   0.011   0.011   0.013     [0.01-0.02]   0.000 |   675     0     0     0     0
+                         slowest minor: run 3, minor #116: 0.016 ms (rem 0.000, sweep 0.016), marked 4, swept 1656, 0.3 -> 0.1 MB
+per_iteration.js       vm          13.1     15.3   1164     0.0     0.3   7.6 | minor    61   0.016   0.017   0.019     [0.02-0.02]   0.000 |   305     0     0     0     0
+                         slowest minor: run 1, minor #5: 0.020 ms (rem 0.000, sweep 0.020), marked 2, swept 3276, 0.3 -> 0.0 MB
+per_iteration.js       treewalk    16.3     29.8   1822     0.0     0.3   9.9 | minor   119   0.014   0.014   0.014     [0.01-0.02]   0.000 |   595     0     0     0     0
+                         slowest minor: run 4, minor #73: 0.015 ms (rem 0.000, sweep 0.015), marked 2, swept 2519, 0.3 -> 0.0 MB
+scopes.js              vm          29.3      0.0      0     0.0     0.0   0.0 | none
+scopes.js              treewalk    49.3     85.4   1733     0.1     0.3   9.8 | minor   341   0.014   0.015   0.018     [0.02-0.02]   0.000 |  1705     0     0     0     0
+                         slowest minor: run 1, minor #331: 0.021 ms (rem 0.000, sweep 0.021), marked 1, swept 2340, 0.3 -> 0.1 MB
+strings.js             vm           3.8      3.8    977     0.0     0.3   6.3 | minor    15   0.016   0.018   0.018     [0.02-0.02]   0.000 |    75     0     0     0     0
+                         slowest minor: run 5, minor #8: 0.019 ms (rem 0.000, sweep 0.019), marked 2, swept 2667, 0.3 -> 0.0 MB
+strings.js             treewalk     5.8     11.4   1958     0.0     0.3  11.8 | minor    45   0.015   0.016   0.018     [0.02-0.02]   0.000 |   225     0     0     0     0
+                         slowest minor: run 4, minor #22: 0.020 ms (rem 0.000, sweep 0.019), marked 4, swept 2636, 0.3 -> 0.0 MB
+game_100k.js           vm         412.9    408.3    989    43.4    43.7   4.1 | minor  1599   0.011   0.011   0.019     [0.02-0.02]   0.001 |  7995     0     0     0     0
+                                                                              | major     3   0.067   0.385   0.385     [0.33-0.82]   0.000 |    10     5     0     0     0
+                         slowest minor: run 1, minor #718: 0.025 ms (rem 0.000, sweep 0.025), marked 2, swept 1663, 43.4 -> 43.1 MB
+game_100k.js           treewalk   612.1    686.3   1121    44.7    44.9   5.9 | minor  2709   0.013   0.013   0.026     [0.02-0.03]   0.001 | 13545     0     0     0     0
+                                                                              | major     4   0.094   1.738   1.738     [1.42-2.27]   0.000 |    10     5     5     0     0
+                         slowest minor: run 1, minor #2452: 0.029 ms (rem 0.000, sweep 0.029), marked 5, swept 1932, 44.7 -> 44.5 MB
+game_1m.js             vm         450.8    593.0   1315   426.1   426.3  15.4 | minor  2115   0.008   0.011   0.017     [0.02-0.03]   0.001 | 10575     0     0     0     0
+                                                                              | major     5   0.699  46.846  46.846   [21.06-49.62]   0.000 |     5    10     0     5     5
+                         slowest minor: run 1, minor #1147: 0.028 ms (rem 0.010, sweep 0.001), marked 569, swept 0, 302.8 -> 302.8 MB
+game_1m.js             treewalk   579.1    871.9   1506   426.6   426.9   9.6 | minor  3229   0.012   0.013   0.025     [0.02-0.07]   0.001 | 16145     0     0     0     0
+                                                                              | major     5   0.303  14.685  14.685   [12.83-24.56]   0.000 |     5    10     5     3     2
+                         slowest minor: run 1, minor #976: 0.070 ms (rem 0.001, sweep 0.065), marked 831, swept 829, 173.6 -> 173.5 MB
+game_big_container.js  vm         345.4    496.0   1436   329.0   329.3  12.5 | minor  1728   0.006   0.014   0.021     [0.02-0.02]   0.002 |  8640     0     0     0     0
+                                                                              | major     5   0.357  25.097  25.097   [21.24-26.99]   0.000 |    10     5     0     5     5
+                         slowest minor: run 1, minor #764: 0.023 ms (rem 0.001, sweep 0.002), marked 799, swept 0, 201.2 -> 201.2 MB
+game_big_container.js  treewalk   459.5    689.0   1499   329.4   329.7  12.9 | minor  2499   0.009   0.013   0.020     [0.02-0.02]   0.002 | 12495     0     0     0     0
+                                                                              | major     5   0.414  28.978  28.978   [25.50-32.13]   0.000 |    10     5     0     5     5
+                         slowest minor: run 3, minor #2444: 0.021 ms (rem 0.000, sweep 0.021), marked 2, swept 1944, 329.6 -> 329.4 MB
+game_big_dictionary.js vm         596.0    549.6    922    95.1    95.3   5.7 | minor  2080   0.012   0.017   0.037     [0.02-0.05]   0.005 | 10400     0     0     0     0
+                                                                              | major     4   0.155   6.658   6.658     [5.61-8.07]   0.000 |     5     9     1     5     0
+                         slowest minor: run 5, minor #2019: 0.051 ms (rem 0.005, sweep 0.045), marked 2, swept 1785, 95.3 -> 95.0 MB
+game_big_dictionary.js treewalk   798.1    898.4   1126    96.4    96.6   6.5 | minor  3476   0.014   0.019   0.027     [0.02-0.05]   0.005 | 17380     0     0     0     0
+                                                                              | major     4   0.103   1.847   1.847     [1.76-2.09]   0.000 |     5    10     5     0     0
+                         slowest minor: run 5, minor #3285: 0.047 ms (rem 0.000, sweep 0.047), marked 3, swept 2051, 96.5 -> 96.3 MB
+game_growing.js        vm         490.0    501.7   1024   127.9   128.2   6.4 | minor  1929   0.011   0.012   0.019     [0.02-0.03]   0.001 |  9645     0     0     0     0
+                                                                              | major     6   0.137  10.153  10.153    [8.03-13.17]   0.000 |    10    11     4     5     0
+                         slowest minor: run 2, minor #1283: 0.025 ms (rem 0.000, sweep 0.025), marked 1, swept 1659, 85.4 -> 85.1 MB
+game_growing.js        treewalk   701.2    850.3   1213   128.6   128.9   7.9 | minor  3323   0.013   0.015   0.029     [0.02-0.04]   0.001 | 16615     0     0     0     0
+                                                                              | major     6   0.147  10.490  10.490    [8.94-12.01]   0.000 |    10    13     2     5     0
+                         slowest minor: run 5, minor #175: 0.044 ms (rem 0.001, sweep 0.040), marked 708, swept 1060, 7.1 -> 7.0 MB
+
+largest array: 100000 elements, one child scan 0.088 ms
+
+largest array: 100000 elements, one child scan 0.106 ms
+
+largest array: 1000000 elements, one child scan 2.738 ms
+
+largest array: 1000000 elements, one child scan 2.785 ms
+
+largest array: 1000000 elements, one child scan 2.885 ms
+
+largest array: 1000000 elements, one child scan 3.199 ms
+
+largest array: 0 elements, one child scan 0.000 ms
+
+largest array: 0 elements, one child scan 0.000 ms
+
+largest array: 300000 elements, one child scan 0.869 ms
+
+largest array: 300000 elements, one child scan 0.909 ms
+# per-collection series omitted (regenerate: zig build gc-report)

@@ -5,6 +5,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const zqjs = @import("zqjs");
+const support = @import("support.zig");
 const Diagnostic = zqjs.Diagnostic;
 const Limits = zqjs.Limits;
 const parse = zqjs.parse;
@@ -23,6 +24,10 @@ fn frontendOnce(allocator: Allocator, source: []const u8, limits: Limits) !void 
 fn checkFailure(err: anyerror, d: Diagnostic, source: []const u8) !void {
     if (err == error.OutOfMemory) return err;
     try testing.expect(d.start <= d.end and d.end <= source.len);
+}
+
+test "watchdog: this binary fails, instead of hanging, if a test gets stuck" {
+    support.watchdog(@src().file);
 }
 
 test "error paths: every allocation failing once leaks nothing" {

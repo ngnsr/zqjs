@@ -17,6 +17,13 @@ pub const Limits = struct {
     max_steps: u64 = std.math.maxInt(u64),
     /// Runtime heap budget, in accounted bytes (see Heap.accountedSize).
     max_heap_bytes: usize = 256 * 1024 * 1024,
+    /// Young generation size (M8.1): a minor collection is requested once this many
+    /// accounted bytes have been allocated since the last collection (or half the room
+    /// left under `max_heap_bytes`, if that is less). Measured (M8.1 P2, 256K-4M): a
+    /// minor pause is proportional to it, total GC time isn't (it follows the garbage),
+    /// and a nursery that outgrows the cache sweeps slower; so the smallest that doesn't
+    /// promote much short-lived data.
+    nursery_bytes: usize = 256 * 1024,
     /// Longest string, in UTF-16 code units.
     max_string_length: usize = 1 << 28,
     /// Largest bytecode of one compiled script, in bytes. Must stay below 4 GiB: jump
@@ -44,6 +51,10 @@ pub const Limits = struct {
     /// string converts its elements (`[[[…]]]`). LimitExceeded(conversion_depth).
     max_conversion_depth: u32 = 1_000,
 };
+
+/// Elements per card (M8.1): an array with at least this capacity records young stores
+/// per card, so a minor collection rescans only the dirty cards, not the whole array.
+pub const card_elements = 512;
 
 pub const Limit = enum {
     source_bytes,

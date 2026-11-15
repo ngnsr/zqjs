@@ -14,9 +14,55 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | 6 | Functions, cells/closures, growable stack, call-depth limit | **done** |
 | 7 | Objects, arrays, atoms, ordered properties, prototypes | **done** |
 | 8 | Mark-and-sweep GC: safepoints, precise roots, weak atoms, stress modes, heap verifier | **done** |
-| 9 | Embedding API (handles, `NativeCtx`), then C ABI | – |
+| 8.1 | Generational GC (non-moving): nursery, remembered set, array and property cards, adaptive major scheduling; GC report and game workloads (GC_DESIGN §15) | **done** |
+| 8.2 | Incremental major marking | deferred (see Direction) |
+| 9.0 | Zig embedding API: lifecycle, compile once / run many, execution under limits and step budgets, results instead of panics | – |
+| 9.1 | GC-safe handles, native functions (`NativeCtx`), JS callbacks from natives, error handling across the boundary | – |
+| 9.2 | C ABI: header, opaque handles, error codes, a C example and integration tests in CI | – |
+| D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | – |
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | – |
 | 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
+
+## Direction after M8.1 (reviewed 2026-11-15)
+
+**What ZQJS is for.** A small, controllable, embeddable scripting engine: a host (Zig, C, C++)
+owns rendering, input, physics and resources, and runs script logic under limits it sets. It
+isn't a Node.js clone. Features are judged by whether an embedder needs them.
+
+**Why embedding comes next.** Until a host can call ZQJS, register natives and keep values,
+every other improvement only optimizes a standalone interpreter. Embedding is also what tells us:
+- which language features scripts actually need;
+- which paths are hot;
+- whether major GC pauses matter in practice.
+
+M9 is split into M9.0, M9.1 and M9.2, so that each step is usable on its own. The Raylib demo
+(D1) then proves it in a real application.
+
+**M9.0 keeps the VM private.** The public Zig API exposes only engine-level types (a
+runtime, a compiled program, values through handles, results). `Proto`, heap internals, stack
+layout and GC details stay private, so a VM or collector change never breaks an embedder.
+
+**M9.1 handles need their own design pass**, approved before implementation, like M8.1's. Once
+a host can retain JS values, ownership and lifetime are public API. These need precise
+semantics:
+- stale and released handles;
+- re-entrant callbacks (a native calling JS calling a native);
+- allocation failure at every boundary crossing.
+
+**Deliberately not yet**, each waiting for a measured need:
+
+| what | why it waits | until |
+|---|---|---|
+| VM performance work | 6.3 ns per instruction on `loop.js` (M8 baseline, M4) is the baseline to beat; claims against other engines need a reproducible comparison harness first | M10 |
+| inline caches | profiling must first show property access is the bottleneck, after atoms in the constant pool | after profiling |
+| incremental GC (M8.2) | minor collections are ~0.05 ms; the 46 ms majors (1M objects) happen while live data grows, not in steady frame loops | an embedder hits them |
+| promises, microtasks, async/await, modules | the host owns the event loop; embedding defines it first | after M9 |
+| classes and `new`, regex, JSON, generators | not needed for embedding | an embedder needs them |
+| JIT or AOT | the interpreter isn't optimized yet; JIT is forbidden on iOS and consoles, the game-scripting targets | not planned |
+| more than one thread per runtime | | not planned |
+
+The language floor (try/catch/throw first, `?:`, `Math`, a few string and array methods) is
+sized by what the demo actually needs.
 
 ## Technical debt
 Known shortcuts, each with the decision that explains it and what would replace it.
@@ -27,7 +73,8 @@ Known shortcuts, each with the decision that explains it and what would replace 
 | tree-walker allocates every string literal on every evaluation | D30 | the VM's constant pool already fixes it; the oracle stays simple | not planned |
 | VM panics on a failed defensive check instead of returning an internal error | D35 | an internal-error result, if an embedder needs to survive a VM bug | M9 (embedding API) |
 | VM ~10-19% slower than at M6 on the M6 workloads (same steps), cause outside the VM loop | bench/baseline.txt, M7 notes below | profile the shared paths (ops, runtime layout) | before M10's benchmarks |
-| one step allocating more than the room left can hit LimitExceeded(heap_bytes) while collectable garbage exists | D8 "Acknowledged limitation" | collect and retry at the safepoint (instruction-level) | M8.1, if a real program hits it |
+| one step allocating more than the room left can hit LimitExceeded(heap_bytes) while collectable garbage exists | D8 "Acknowledged limitation"; bounded by D44's HL2: a step allocating at most half the room above the old generation never fails | collect and retry at the safepoint (instruction-level) | M9, if an embedder hits it |
+| tree-walker 2-6% slower than at M8 (closures, objects, fib, scopes; same steps; the VM is unchanged or faster) | `bench/baseline.txt` vs `bench/baseline-m8-smp.txt`; probably the barrier on every environment store | profile; the tree-walker is the oracle, not the shipped engine | when it matters (M10) |
 | property names interned (hashed) on every access by name | `object.named` | atoms in the constant pool, then inline caches if benchmarks justify | M10 |
 
 ## Required regression tests by milestone
@@ -205,3 +252,65 @@ Every item on both engines unless noted.
   collecting) with timing passed in by the tool, never in the runtime, and a game-like
   workload (100k and 1M long-lived objects, thousands of temporaries per frame, minor and major
   pauses measured separately). M9 (embedding) is not to wait for all of this.
+**M8.1 (done):** generational, non-moving collection (GC_DESIGN §15, D42–D45). Every item
+runs on both engines unless noted.
+
+*Measurement first:*
+- a heap observer (the clock is passed in by the tool, never kept in the runtime);
+- `zig build gc-report`: 5 runs per row, medians with their spread, pause buckets, minor and
+  major collections separately, the remembered-set scan time, and peak memory;
+- game-like workloads in `bench/gc/`: 100k and 1M persistent entities, a growing set, a 1M
+  array and a 200k-entry dictionary that each take one young store per frame;
+- an M8 baseline taken before any change.
+
+*Collector:*
+- minor collections never trace old objects;
+- promotion on first survival: after any collection the nursery, the remembered set and every
+  card are empty (I-gen3);
+- a minor collection never frees an atom (promotion is not marking: a dead object keyed by a
+  dead atom is still freed);
+- a major collection rebuilds the atom table before freeing, and sweeps old before young.
+
+*Verifier:*
+- I-gen1–4: the lists, every old-to-young edge checked independently of the bitmaps, the
+  remembered list well formed, and I-gen3;
+- run before and after every collection under stress;
+- `zig build gc-mutants` (in CI): 8 broken builds, each caught by the verifier. They are: the
+  element barrier, the card set, the remembered bit, the first array bitmap, the minor
+  collection freeing atoms, the property card set, the delete dirtying, and the first property
+  bitmap.
+
+*Cards:*
+- array and property cards at boundaries 0, 511, 512, 1023, 1024 and the last;
+- the hole case (remembered before the first bitmap);
+- bitmap growth over reallocations;
+- deletes at the start, middle and end, shifting young entries across cards;
+- pop and shrink;
+- allocation failure while a bitmap grows;
+- the bitmap freed with its object in a minor and in a major collection;
+- a young key with an old value.
+
+*Scheduling:*
+- the nursery size from a 256K–4M sweep;
+- adaptive majors (D44) with T1, the adaptation cycle, the T2 burst simulator (which fails
+  if the minor trigger ignores the half room) and T3 programs;
+- dead dynamic keys drive major collections under a 1 MiB limit (fails if the growth trigger
+  is ignored).
+
+*Results* (`bench/gc/baseline-m8.txt` vs `baseline-m8.1-libc.txt`, the same allocator; VM):
+
+| workload | GC share, M8 → M8.1 | p95 pause → minor p95 | major collections | longest major |
+|---|---|---|---|---|
+| game_100k | 41% → 17% | 39 → 0.06 ms | 16 → 3 | 39 → 0.7 ms |
+| game_1m | 56% → 22% | 283 → 0.06 ms | 12 → 5 | 283 → 68 ms |
+| game_growing | 37% → 17% | 58 → 0.06 ms | 27 → 6 | 85 → 12 ms |
+
+- On smp_allocator, GC share falls further: to 4%, 15% and 6%.
+- `bench`: steps identical on every row. VM time is unchanged or faster. The tree-walker is
+  2–6% slower (in the debt table).
+
+*Tests got faster:*
+- one binary per test file, run in parallel;
+- program-sized tests on a leak-checking allocator without stack traces;
+- a watchdog per test binary;
+- the suite went from ~160 s to ~17 s, and CI runs one parallel job per configuration.

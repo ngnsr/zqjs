@@ -7,7 +7,9 @@ Inspired by QuickJS and Crafting Interpreters; it does not reuse their code.
 Priorities: correctness, simplicity, inspectability. Speed comes last.
 
 ## Status
-Milestone 8 of 11 done (tags `m1` … `m8`, and `p1` for accurate `**`). ZQJS has:
+Milestones 1–8 and 8.1 done (tags `m1` … `m8`, `m8.1`, and `p1` for accurate `**`). Next is M9:
+an embedding API, so a Zig or C host can run ZQJS scripts ([ROADMAP.md](ROADMAP.md),
+Direction). ZQJS has:
 
 - **the language so far:** `let`/`const`, blocks, `if`/`while`/`for`, `break`/`continue`;
   functions, closures and recursion; objects, arrays, prototypes, methods with `this`; numbers,
@@ -18,10 +20,18 @@ Milestone 8 of 11 done (tags `m1` … `m8`, and `p1` for accurate `**`). ZQJS ha
 - **two engines that must agree:** a bytecode compiler, verifier and stack VM (the default),
   and a tree-walking reference interpreter (`--engine=treewalk`). Their output is checked byte
   for byte against node, and against each other under fuzzing.
-- **a garbage collector:** stop-the-world, non-moving, precise mark-and-sweep, running at
-  safepoints in both engines, with weak atoms, a stress mode (`-Dgc-stress`) and a heap verifier
-  ([GC_DESIGN.md](GC_DESIGN.md)). A program whose live data fits the heap limit runs as long as
-  its step budget allows, however much garbage it makes.
+- **a generational garbage collector:** non-moving and precise, running at safepoints in both
+  engines.
+  - A 256 KiB nursery is swept by minor collections that never trace the old generation.
+  - A remembered set with array and property-table cards keeps track of old-to-young
+    references.
+  - Major collections are adaptively scheduled. Atoms are weak.
+  - It comes with a stress mode (`-Dgc-stress`), a heap verifier, and deliberately broken
+    builds the verifier must catch (`zig build gc-mutants`).
+  - On the game workloads, minor pauses are about 0.06 ms (p95) at 100k or 1M live objects
+    ([GC_DESIGN.md](GC_DESIGN.md) §15).
+  - A program whose live data fits the heap limit runs as long as its step budget allows,
+    however much garbage it makes.
 
 ```js
 // ZQJS prints 6765 hi box:3 0,1,b,a. `print` is ZQJS's own built-in, so node needs one defined
@@ -61,13 +71,16 @@ zig-out/bin/zqjs --dump-ast -e "let x = 1; { let x = x + 2; }"
 zig-out/bin/zqjs --dump-bytecode -e "let x = 1; x += 2;"   # compiled, verified, listed (M4)
 zig-out/bin/zqjs --trace -e "print(1 + 2);"                # each VM instruction and the stack, on stderr
 zig-out/bin/zqjs --engine=treewalk program.js               # the reference interpreter instead of the VM
-zig build test                              # unit + integration tests (tests/all.zig)
+zig build test                              # unit + integration tests (tests/*_test.zig, in parallel)
 zig build test -Dstack-stress               # same, with the VM moving its stacks on every call
 zig build test -Dgc-stress                  # same, collecting at every safepoint, with tombstones and a heap verifier
 zig build test --fuzz=100K -Dtest-filter="fuzz: frontend"   # fuzz one target (only one runs per call):
                                             #   "fuzz: frontend", "fuzz: both engines agree",
                                             #   "fuzz: anything the front end", "fuzz: the verifier"
 zig build bench                             # bench/*.js on both engines: steps, heap bytes, median ms
+zig build gc-report                         # GC pauses (minor/major), rates, GC share; bench/ and bench/gc/
+zig build gc-report -- --nursery=1M game_   # another nursery size, only the game workloads
+zig build gc-mutants                        # each deliberately broken GC piece must be caught
 zig build check-goldens                     # verify syntax cases against node; generated files up to date
 zig build update-golden                     # regenerate goldens (node) and pow references (Python)
 ```
@@ -79,23 +92,33 @@ deterministic (identical on every machine, and checked identical across runs): `
 the cumulative volume charged, `peak` the highest live total, `end` what is live at the end
 (they differ as soon as garbage is collected during a run). `median ms` only compares on the same
 machine. `collections` counts garbage collections during the run. `bench/baseline.txt` is the
-current baseline (end of M8, Apple M4); `bench/baseline-m7.txt` is the end of M7, kept to compare
-against (the M6 reference point is commit abbf773). Rerun and diff before and after a change: a
+current baseline (end of M8.1, Apple M4, smp_allocator). The older ones are kept to compare
+against:
+- `bench/baseline-m8-smp.txt`: M8's code on the same allocator;
+- `bench/baseline-m8.txt` and `bench/baseline-m7.txt`: the end of M8 and M7, on libc malloc;
+- the M6 reference point is commit abbf773.
+
+Times compare only between rows on the same allocator. `zig build gc-report` measures the
+collector itself: pauses (minor and major), allocation rate and GC share, 5 runs per row, on
+bench/ and the game-like workloads in bench/gc/. Its baselines are in `bench/gc/`. Rerun and diff before and after a change: a
 change in steps or heap means different work, a change in time alone means the same work got
 faster or slower.
 
 ## Continuous integration
 `.github/workflows/ci.yml` runs on every push that touches code, tests, tools or the build
-(documentation-only changes skip it), on macOS arm64, Linux x86_64 and Linux arm64:
-`zig fmt --check .`, `zig build test` (also with `-Dgc-stress -Dstack-stress`, in ReleaseSafe,
-and with `-Dgc-stress` in ReleaseSafe),
-`zig build check-goldens`, `zig build --release=fast`, and a check that `pow` produces the same
-bits as the reference hash (DESIGN_DECISIONS D25).
+(documentation-only changes skip it), on macOS arm64, Linux x86_64 and Linux arm64.
+- **Test configurations,** one parallel job each: `zig build test`, with
+  `-Dgc-stress -Dstack-stress`, in ReleaseSafe, and with `-Dgc-stress` in ReleaseSafe.
+- **The plain-tests job also runs** `zig fmt --check .`, `zig build gc-mutants`,
+  `zig build check-goldens`, `zig build --release=fast`, and a check that `pow` produces the
+  same bits as the reference hash (DESIGN_DECISIONS D25).
+- **Watchdog:** each test binary aborts, naming itself, if it ever runs far longer than it
+  should.
 
 ## Documents
 - [LANGUAGE.md](LANGUAGE.md): what ZQJS accepts and the compatibility contract with node
 - [ARCHITECTURE.md](ARCHITECTURE.md): components and ownership
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md): why things are the way they are
 - [ROADMAP.md](ROADMAP.md): milestones, required regression tests, technical debt
-- [GC_DESIGN.md](GC_DESIGN.md): the garbage collector's design (M8, proposal under review)
+- [GC_DESIGN.md](GC_DESIGN.md): the garbage collector's design (M8; generations in §15, M8.1)
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): licenses of ported code (musl/Arm `pow`)

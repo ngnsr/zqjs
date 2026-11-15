@@ -75,7 +75,7 @@ oracle (D16).
 ## Tests
 ```
 src/**                    unit tests next to the code (`test` blocks)
-tests/all.zig             root of all integration tests (through the public zqjs module)
+tests/*_test.zig          integration tests, one binary per file (through the public zqjs module)
 tests/frontend_test.zig   allocation-failure paths + fuzzing of parse → resolve → dump
 tests/interpreter_test.zig limits, allocation failures, exception ownership, fuzzing of runs
 tests/syntax_test.zig     tests/syntax/cases.jsonl: outcome + resolved dump per source

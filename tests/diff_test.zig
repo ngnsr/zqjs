@@ -8,9 +8,15 @@ const testing = std.testing;
 const zqjs = @import("zqjs");
 const support = @import("support.zig");
 
+test "watchdog: this binary fails, instead of hanging, if a test gets stuck" {
+    support.watchdog(@src().file);
+}
+
 test "tests/diff programs produce node's output on both engines" {
     const io = testing.io;
-    const gpa = testing.allocator;
+    var dbg: support.ProgramAllocator = .init;
+    defer support.endProgram(&dbg);
+    const gpa = dbg.allocator();
     var dir = try std.Io.Dir.cwd().openDir(io, "tests/diff", .{ .iterate = true });
     defer dir.close(io);
 

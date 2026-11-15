@@ -14,9 +14,51 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | 6 | Functions, cells/closures, growable stack, call-depth limit | **done** |
 | 7 | Objects, arrays, atoms, ordered properties, prototypes | **done** |
 | 8 | Mark-and-sweep GC: safepoints, precise roots, weak atoms, stress modes, heap verifier | **done** |
-| 9 | Embedding API (handles, `NativeCtx`), then C ABI | – |
+| 8.1 | Generational GC (non-moving): nursery, remembered set, array and property cards, adaptive major scheduling; GC report and game workloads (M8_1_PLAN.md) | finishing |
+| 8.2 | Incremental major marking | deferred (see Direction) |
+| 9.0 | Zig embedding API: lifecycle, compile once / run many, execution under limits and step budgets, results instead of panics | – |
+| 9.1 | GC-safe handles, native functions (`NativeCtx`), JS callbacks from natives, error handling across the boundary | – |
+| 9.2 | C ABI: header, opaque handles, error codes, a C example and integration tests in CI | – |
+| D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | – |
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | – |
 | 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
+
+## Direction after M8.1 (reviewed 2026-11-15)
+
+**What ZQJS is for.** A small, controllable, embeddable scripting engine: a host (Zig, C, C++)
+owns rendering, input, physics and resources, and runs script logic under limits it sets. It
+isn't a Node.js clone. Features are judged by whether an embedder needs them.
+
+**Why embedding comes next.** Until a host can call ZQJS, register natives and keep values,
+every other improvement only optimizes a standalone interpreter. Embedding is also what tells us:
+- which language features scripts actually need;
+- which paths are hot;
+- whether major GC pauses matter in practice.
+
+M9 is split into M9.0, M9.1 and M9.2, so that each step is usable on its own. The Raylib demo
+(D1) then proves it in a real application.
+
+**M9.1 handles need their own design pass**, approved before implementation, like M8.1's. Once
+a host can retain JS values, ownership and lifetime are public API. These need precise
+semantics:
+- stale and released handles;
+- re-entrant callbacks (a native calling JS calling a native);
+- allocation failure at every boundary crossing.
+
+**Deliberately not yet**, each waiting for a measured need:
+
+| what | why it waits | until |
+|---|---|---|
+| VM performance work | 6.3 ns per instruction on `loop.js` (M8 baseline, M4) is the baseline to beat; claims against other engines need a reproducible comparison harness first | M10 |
+| inline caches | profiling must first show property access is the bottleneck, after atoms in the constant pool | after profiling |
+| incremental GC (M8.2) | minor collections are ~0.05 ms; the 46 ms majors (1M objects) happen while live data grows, not in steady frame loops | an embedder hits them |
+| promises, microtasks, async/await, modules | the host owns the event loop; embedding defines it first | after M9 |
+| classes and `new`, regex, JSON, generators | not needed for embedding | an embedder needs them |
+| JIT or AOT | the interpreter isn't optimized yet; JIT is forbidden on iOS and consoles, the game-scripting targets | not planned |
+| more than one thread per runtime | | not planned |
+
+The language floor (try/catch/throw first, `?:`, `Math`, a few string and array methods) is
+sized by what the demo actually needs.
 
 ## Technical debt
 Known shortcuts, each with the decision that explains it and what would replace it.

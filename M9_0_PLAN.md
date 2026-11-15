@@ -1,6 +1,13 @@
 # M9.0 plan: the Zig embedding API
 
-Status: **proposal, for review.** Nothing below is implemented.
+Status: **revision 2, for final review.** Nothing below is implemented.
+- Round 1 approved the direction and decided questions 1, 2, 3 and 5.
+- This revision:
+  - answers question 4 (several executions);
+  - makes ownership and destruction explicit (E1);
+  - proves the step cap can't be bypassed (E4);
+  - defines the failure text's truncation and UTF-8 behaviour;
+  - adds the required tests.
 
 Scope, from ROADMAP.md (Direction):
 - lifecycle;
@@ -67,12 +74,14 @@ pub const Execution = opaque {
 
 pub const Status = enum { finished, suspended };
 pub const RunError = error{ Thrown, LimitExceeded, Unsupported, OutOfMemory, OutputFailed, Internal };
-pub const Failure = struct {   // filled when a call returns an error
-    kind: Kind, // thrown, limit, unsupported, internal
+pub const Failure = struct {   // filled when a call returns an error; never allocates
+    kind: Kind,                // thrown, limit, unsupported, internal, out_of_memory, output
     limit: ?zqjs.Limit,
-    /// Copied into `text` (UTF-8, truncated with "…" if it doesn't fit), e.g.
-    /// "TypeError: x is not a function" or "Unsupported(builtin): Math.PI".
-    text: [256]u8, text_len: usize,
+    /// e.g. "TypeError: x is not a function", "Unsupported(builtin): Math.PI" (rules: E10)
+    text: [256]u8,
+    text_len: usize,           // bytes of `text` in use, ≤ 256
+    truncated: bool,
+    pub fn message(f: *const Failure) []const u8; // text[0..text_len]
 };
 ```
 
@@ -81,15 +90,31 @@ what M9.0 commits to.
 
 ## Semantics
 
-**E1: ownership.**
-- A runtime owns everything created from it.
-  - `destroy` on a program or execution is optional.
-  - `Runtime.destroy` frees what's left, in any order.
-- Using a program or execution after its runtime, or after itself, is destroyed is a host bug.
-  In safe builds it's caught by a tag check at every entry point, which panics with the type's
-  name. That's best effort, and documented as such.
-- No call allocates through anything but the runtime's allocator. There are no globals and no
-  thread-locals.
+**E1: ownership and destruction.** A strict hierarchy:
+
+```
+Runtime                      owns its heap, realm, root list and everything below
+ ├── Program A               a GC root (its constants) from compile until released
+ ├── Program B               (compiled, never run: still a root, still owned)
+ ├── Execution 1 (of A)      its own VM (stacks, frames, pc); a GC root until destroyed
+ └── Execution 2 (of B)
+```
+
+- **Nothing outlives its runtime.** `Runtime.destroy` releases every program and execution
+  it still owns, in any order, along with their roots, the heap and the realm. Afterwards,
+  every pointer the host still holds to them is dangling.
+- **Destroying a program early.** `Program.destroy` drops the host's reference.
+  - The program's root and memory are released once no execution of it remains: an execution
+    keeps its program alive internally. So a host may destroy a program right after starting
+    it.
+  - After `Program.destroy` and a collection, its constants are freed. A test checks it.
+- **Destroying an execution early.** `Execution.destroy` unregisters its roots immediately,
+  whether it's suspended, finished or faulted.
+- **Use after destroy** of any of the three, including through a runtime that's gone, is a host
+  bug. Safe builds catch it at every entry point by a tag check that panics naming the type.
+  That's best effort (memory may be reused), and documented as such.
+- **Allocation.** No call allocates through anything but the runtime's allocator. There are no
+  globals and no thread-locals.
 
 **E2: threads.**
 - A runtime is used by one thread at a time; calls never overlap.
@@ -102,18 +127,45 @@ what M9.0 commits to.
   for later runs too, as in any JS realm. That's documented, not prevented.
 - A program is a GC root while it exists: its constants survive any collection.
 
-**E4: two different budgets.**
-- *The slice:* `resume(steps)` is a soft budget. When it runs out, the result is `.suspended`,
-  resumable, with nothing lost. Precision (D35) makes this exact: the next `resume` continues
-  at the same instruction, charged once.
-- *The cap:* `limits.max_steps` is the hard total for one execution. Reaching it is
-  `LimitExceeded(steps)`, and the execution is faulted.
-- So a game can slice a script across frames without a runaway script running forever.
+**E4: two different budgets, and the cap can't be bypassed.**
+- *The slice:* `resume(ex, steps)` runs at most `steps` instructions. When they run out, the
+  result is `.suspended`: resumable, with nothing lost. Precision (D35) makes this exact: the
+  next `resume` continues at the same instruction, charged once.
+- *The cap:* `limits.max_steps` is the hard total for one execution, **cumulative over all its
+  resumes**.
+  - Each instruction is charged once to the execution's lifetime counter, which never resets.
+    A slice only caps how much of the cap one call may spend.
+  - When the counter reaches `max_steps`, the next instruction fails with
+    `LimitExceeded(steps)`, and the execution is faulted.
+  - For example: `max_steps` = 1 000 000, resumed in slices of 1000. The first 1000 resumes
+    each spend a full slice and suspend; the 1001st faults on its first instruction. It never
+    gets a second million.
+- *Per execution, not per runtime:* a new execution gets a fresh cap. A host that keeps
+  starting executions has chosen to; the API never refills a cap behind its back.
+- So a game can slice a script across frames, and a runaway script still stops.
 
-**E5: several executions.**
-- Any number of executions can exist at once, started, suspended or finished, of one program
-  or several. Their roots are a list, so a collection in one keeps every other's values alive.
-- Only one runs at a time (E2).
+**E5: several executions, cooperative, never concurrent.**
+- **What they share and don't.**
+  - Each execution has its own VM: stacks, frames, `pc`, and its script's top-level `let` and
+    `const`. Those are locals of its first frame: ZQJS has no writable globals, and assigning
+    an undeclared name is `Unsupported(global_assignment)`.
+  - All executions of a runtime share its heap and realm. A change to a built-in object (say
+    `Object.prototype.x = 1`) is visible to the others, as in one JS realm.
+  - Nothing else connects them in M9.0, because no values cross the API.
+- **Cooperative:**
+  - any number may exist, started, suspended, finished or faulted;
+  - they're resumed one call at a time, in any interleaving;
+  - a collection during one execution marks every registered execution and program.
+- **Never concurrent:**
+  - a runtime runs one call at a time (E2);
+  - in M9.0 a call can't re-enter the runtime, because no natives exist;
+  - in safe builds an "in a call" flag catches a host calling in while another call runs,
+    from another thread or from its output writer.
+- **Cost:** the runtime's single root slot becomes a list, which programs need anyway (E1).
+  Executions stay registered for their whole lifetime instead of only while stepping.
+- **Fallback, if implementation shows a cost not seen here:** one execution at a time
+  (`start` returns `error.Busy` while another is unfinished). The API wouldn't change: adding
+  several later is purely additive.
 
 **E6: errors leave the runtime usable.**
 - `Thrown`, `LimitExceeded`, `Unsupported`, `OutOfMemory` and `OutputFailed` fault that
@@ -134,6 +186,17 @@ already guarantees it).
 
 **E9: output.** `print` writes to `Options.output`, or nowhere. A failing writer makes the call
 return `OutputFailed`, so output is never lost silently.
+
+**E10: failure text.** `Failure.text` is filled without allocating, and is always valid UTF-8.
+- **Encoding.** Messages are UTF-16 inside ZQJS. They're converted the way `print` does it:
+  pairs become 4-byte sequences, and a lone surrogate becomes U+FFFD.
+- **Truncation.** If the text doesn't fit in 256 bytes, it's cut at a code point boundary,
+  never inside a UTF-8 sequence, and ends with "…" (U+2026, 3 bytes). `truncated` is set, and
+  `text_len` stays ≤ 256.
+- **No NUL terminator.** The Zig API doesn't add one; the C ABI (M9.2) will, in its own
+  buffer.
+- **Kinds without a script message:** `out_of_memory`, `output` and `internal` get a fixed
+  English text.
 
 ## Internal changes (the API keeps all of them hidden)
 
@@ -164,18 +227,41 @@ ReleaseSafe in CI.
 - **Lifecycle:**
   - create and destroy leak nothing;
   - `Runtime.destroy` with live programs and executions frees them all;
+  - **(required by review) several programs compiled but never run, then the runtime
+    destroyed:** no leak (leak-checking allocator), and nothing left registered. With the
+    leak check under gc-stress, a forgotten root fails either as a leak or as a use after
+    free;
+  - `Program.destroy` before the runtime: after a collection, `memory().bytes` is back to
+    its value before the compile. The same with an execution of it started, run, then
+    destroyed (the execution kept the program alive until then);
   - a program compiled once and run 3 times gives the same output each time;
   - a compile error leaves a usable runtime, with the right message, line and column.
 - **Slices change nothing** (the core test). Every `tests/diff` program runs through the API
   with slices of 1, 7 and 1000 steps and unbounded, and each output must equal node's `.out`.
   Under gc-stress that also collects between resumes.
-- **Several executions:**
+- **Several executions (E5):**
   - 3 executions of different programs, suspended and resumed interleaved, with garbage, each
     output exact;
-  - a major collection between resumes keeps every suspended execution's values.
+  - a major collection between resumes keeps every suspended execution's values;
+  - two executions of the *same* program each get their own top-level bindings;
+  - a change to a built-in made by one execution is seen by the other (the shared realm);
+  - destroying one suspended execution doesn't disturb the others;
+  - in safe builds, a call into a runtime from its own output writer during `resume` is caught
+    as a host bug.
+- **The step cap holds across resumes (E4):**
+  - a script that never ends, with `max_steps` = 1000, resumed in slices of 1: exactly 1000
+    `.suspended`, then `LimitExceeded(steps)` on the 1001st resume;
+  - slices of 7, 1000 and maxInt give the same end, after the same total;
+  - a second execution gets a fresh cap; the faulted one stays faulted.
 - **Errors:**
   - `max_steps` → `LimitExceeded(steps)`; that execution is faulted, and a new one runs fine;
   - `Thrown` and `Unsupported` give the right `Failure` text;
+  - E10's text rules:
+    - a message longer than 256 bytes is cut at a code point boundary and ends in "…", with
+      `truncated` set;
+    - a surrogate pair right at the cut point is either whole or cut before it;
+    - a lone surrogate comes out as U+FFFD;
+    - the result is always valid UTF-8 (`std.unicode.utf8ValidateSlice`);
   - a writer that fails → `OutputFailed`;
   - `checkAllAllocationFailures` over create → compile → start → resume → destroy: every
     failure returns `OutOfMemory`, leaks nothing, and leaves the runtime usable (E6).
@@ -208,15 +294,13 @@ ReleaseSafe in CI.
 - **Interrupting a running `resume` from another thread:** slices bound the time a call can
   take instead.
 
-## Questions for review
+## Review decisions
 
-1. **Opaque types** (real privacy, a one-to-one C mapping) or plain structs with fields
-   documented as private?
-2. **Slice exhaustion suspends** (E4), and only `max_steps` faults. Or should one budget do
-   both?
-3. **Runtime-owned cascade** (E1): destroy in any order. Or strict ownership, where destroying
-   a runtime with live programs is a caught bug?
-4. **Several executions** in M9.0 (E5)? Or one at a time, deferring the root list to M9.1?
-5. **Internal errors poison the runtime** (E7), not only the execution: agreed?
-6. **`Failure` text** in a fixed 256-byte buffer, which allocates nothing and maps straight to
-   C. Or an allocating message?
+| question | decision |
+|---|---|
+| 1. opaque types or plain structs | **Opaque types** (round 1) |
+| 2. slice exhaustion suspends, `max_steps` faults | **Approved** (round 1). E4 adds the cumulative cap and its tests |
+| 3. the runtime owns everything | **Approved** (round 1), with E1's explicit hierarchy and destruction rules |
+| 4. several executions | **Proposed: yes, cooperative, never concurrent** (E5). The fallback is one at a time, with an unchanged API. *For final review* |
+| 5. internal errors poison the runtime | **Approved** (round 1) |
+| 6. a fixed 256-byte message | **Conditionally approved** (round 1). E10 defines truncation and UTF-8. *For final review* |

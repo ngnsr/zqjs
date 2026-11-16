@@ -377,7 +377,7 @@ test "M14.4: unsupported iterables, Iterator.prototype methods, and member for-o
 
 test "M15.1: JSON.parse reviver exclusion, new JSON(), nesting limit, and OOM" {
     try expectUnsupported("JSON.parse('{}', function () {});", "", "Unsupported(user_conversion)");
-    try expectUnsupported("JSON.stringify;", "", "('stringify')");
+    try expectUnsupported("JSON.rawJSON;", "", "('rawJSON')");
     for (support.engines) |engine| {
         var r_bad = try support.run(testing.allocator, "JSON.parse('{', function () {});", .{}, engine, .normal);
         defer r_bad.deinit(testing.allocator);
@@ -395,6 +395,29 @@ test "M15.1: JSON.parse reviver exclusion, new JSON(), nesting limit, and OOM" {
     const OomCtx = struct {
         fn runOnce(alloc: std.mem.Allocator) !void {
             var r = try support.run(alloc, "JSON.parse('{\"a\":[1,true,null,\"\\\\u0041\"]}');", .{}, .vm, .normal);
+            defer r.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
+}
+
+test "M15.2: JSON.stringify replacer/space/toJSON exclusions, nesting limit, and OOM" {
+    try expectUnsupported("JSON.stringify({}, function () {});", "", "Unsupported(user_conversion)");
+    try expectUnsupported("JSON.stringify({}, ['a']);", "", "Unsupported(builtin)");
+    try expectUnsupported("JSON.stringify({}, null, 2);", "", "Unsupported(builtin)");
+    try expectUnsupported("JSON.stringify({ toJSON: function () { return 1; } });", "", "Unsupported(user_conversion)");
+    try expectUnsupported("const p = { toJSON: function () { return 1; } }; const o = Object.create(p); JSON.stringify(o);", "", "Unsupported(user_conversion)");
+    try expectUnsupported("JSON.stringify({ nested: { toJSON: function () { return 1; } } });", "", "Unsupported(user_conversion)");
+
+    for (support.engines) |engine| {
+        var r_lim = try support.run(testing.allocator, "JSON.stringify([[[1]]]);", .{ .max_nesting_depth = 2 }, engine, .normal);
+        defer r_lim.deinit(testing.allocator);
+        try testing.expect(std.mem.indexOf(u8, r_lim.err, "LimitExceeded(nesting_depth)") != null);
+    }
+
+    const OomCtx = struct {
+        fn runOnce(alloc: std.mem.Allocator) !void {
+            var r = try support.run(alloc, "JSON.stringify({ a: [1, true, null, 'hi\\n'] });", .{}, .vm, .normal);
             defer r.deinit(alloc);
         }
     };

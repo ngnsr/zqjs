@@ -1,0 +1,29 @@
+null true false
+0 0 42 -3.14
+null null null
+undefined undefined undefined
+1e+21
+1e-7
+0.000001
+100000000000000000000
+1.7976931348623157e+308
+5e-324
+""
+"a\"b\\c\b\f\n\r\t"
+"\u0000\u0007\u000b\u001f"
+"😀"
+"\ud800"
+"\udc00"
+"\ud800\ud800"
+[1,null,null,null,null,"x"]
+{"a":1,"d":null,"e":"ok"}
+{"0":"a","1":"c","2":"b","z":3,"a":4}
+{} {}
+{"toJSON":123,"a":1}
+{"a":1} {"a":1} {"a":1} {"a":1}
+[{"x":1},{"x":1}] {"a":{"x":1},"b":{"x":1}}
+cycObj TypeError
+cycArr TypeError
+indirect TypeError
+1 true true null hi
+"\ false

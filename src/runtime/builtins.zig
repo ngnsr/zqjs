@@ -118,6 +118,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.iterator_prototype, "next", &iterator_next);
     try registerMath(rt, r.math);
     try method(rt, r.json, "parse", &json.parse_native);
+    try method(rt, r.json, "stringify", &json.stringify_native);
     _ = &r;
     rt.realm = r;
     return &rt.realm.?;

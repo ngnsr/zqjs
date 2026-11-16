@@ -1502,3 +1502,20 @@ test "M15.1: JSON.parse objects, arrays, and strings survive GC collections" {
         try testing.expectEqualStrings("10 0 xA 450\n", r.out);
     }
 }
+
+test "M15.2: JSON.stringify and parse round-trips under GC pressure" {
+    const src =
+        \\let out = [];
+        \\for (let i = 0; i < 400; i++) {
+        \\    let obj = { i: i, arr: [1, undefined, "a\nb", { ok: true }] };
+        \\    let s = JSON.stringify(obj);
+        \\    if (i % 100 === 0) out.push(JSON.parse(s).i);
+        \\}
+        \\print(out.join(","));
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("0,100,200,300\n", r.out);
+    }
+}

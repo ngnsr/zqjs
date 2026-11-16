@@ -1,9 +1,10 @@
-//! JSON.parse (M15.1).
+//! JSON.parse (M15.1) and JSON.stringify (M15.2).
 
 const std = @import("std");
 const Value = @import("value.zig").Value;
 const Native = @import("value.zig").Native;
 const heap_mod = @import("heap.zig");
+const Object = heap_mod.Object;
 const rt_mod = @import("runtime.zig");
 const Runtime = rt_mod.Runtime;
 const Error = rt_mod.Error;
@@ -12,6 +13,7 @@ const object = @import("object.zig");
 const builtins = @import("builtins.zig");
 
 pub const parse_native: Native = .{ .name = "parse", .call = jsonParse };
+pub const stringify_native: Native = .{ .name = "stringify", .call = jsonStringify };
 
 fn jsonParse(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const text = if (args.len > 0) args[0] else Value.undefined;
@@ -267,5 +269,206 @@ const Parser = struct {
 
     fn isDigit(u: u16) bool {
         return u >= '0' and u <= '9';
+    }
+};
+
+// ------------------------------------------------------------ JSON.stringify (M15.2)
+
+fn jsonStringify(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const val = if (args.len > 0) args[0] else Value.undefined;
+    if (args.len >= 2) {
+        switch (args[1]) {
+            .native, .closure => return rt.fail(.user_conversion),
+            .object => |o| if (o.kind == .array) return rt.fail(.builtin),
+            else => {},
+        }
+    }
+    if (args.len >= 3 and args[2] != .undefined) return rt.fail(.builtin);
+
+    return (try stringify(rt, val)) orelse Value.undefined;
+}
+
+pub fn stringify(rt: *Runtime, val: Value) Error!?Value {
+    const to_json_atom = try rt.heap.internAscii("toJSON");
+    var s: Stringifier = .{
+        .rt = rt,
+        .to_json_atom = to_json_atom,
+    };
+    defer s.out.deinit(rt.gpa);
+    defer s.stack.deinit(rt.gpa);
+
+    if (!try s.writeValue(val)) return null;
+    const str = try rt.heap.newString(&.{.{ .utf16 = s.out.items }});
+    return .{ .string = str };
+}
+
+const Stringifier = struct {
+    rt: *Runtime,
+    to_json_atom: *heap_mod.String,
+    out: std.ArrayList(u16) = .empty,
+    stack: std.ArrayList(*Object) = .empty,
+
+    fn writeUnit(s: *Stringifier, u: u16) Error!void {
+        if (s.out.items.len >= s.rt.limits.max_string_length) return s.rt.limit(.string_length);
+        try s.out.append(s.rt.gpa, u);
+    }
+
+    fn writeAscii(s: *Stringifier, text: []const u8) Error!void {
+        if (s.out.items.len + text.len > s.rt.limits.max_string_length) return s.rt.limit(.string_length);
+        try s.out.ensureUnusedCapacity(s.rt.gpa, text.len);
+        for (text) |c| s.out.appendAssumeCapacity(c);
+    }
+
+    fn writeValue(s: *Stringifier, v: Value) Error!bool {
+        heap_mod.checkValue(v);
+        switch (v) {
+            .undefined, .native, .closure => return false,
+            .null => {
+                try s.writeAscii("null");
+                return true;
+            },
+            .boolean => |b| {
+                try s.writeAscii(if (b) "true" else "false");
+                return true;
+            },
+            .number => |n| {
+                if (std.math.isNan(n) or std.math.isInf(n)) {
+                    try s.writeAscii("null");
+                } else {
+                    var buf: ops.NumberBuf = undefined;
+                    try s.writeAscii(ops.formatNumber(&buf, n));
+                }
+                return true;
+            },
+            .string => |str| {
+                try s.writeString(str.units);
+                return true;
+            },
+            .object => |o| {
+                try s.checkToJson(o);
+                if (o.kind == .array) {
+                    try s.writeArray(o);
+                } else {
+                    try s.writeObject(o);
+                }
+                return true;
+            },
+        }
+    }
+
+    fn checkToJson(s: *Stringifier, obj: *Object) Error!void {
+        var cur: ?*Object = obj;
+        while (cur) |c| : (cur = c.proto) {
+            c.obj.checkLive();
+            if (c.props.get(s.to_json_atom)) |p| {
+                if (p.value == .native or p.value == .closure) return s.rt.fail(.user_conversion);
+                return;
+            }
+        }
+    }
+
+    fn pushAncestor(s: *Stringifier, o: *Object) Error!void {
+        for (s.stack.items) |anc| {
+            if (anc == o) return s.rt.throw(.TypeError, &.{.{ .ascii = "Converting circular structure to JSON" }});
+        }
+        if (s.stack.items.len >= s.rt.limits.max_nesting_depth) return s.rt.limit(.nesting_depth);
+        try s.stack.append(s.rt.gpa, o);
+    }
+
+    fn writeArray(s: *Stringifier, arr: *Object) Error!void {
+        try s.pushAncestor(arr);
+        defer _ = s.stack.pop();
+
+        try s.writeUnit('[');
+        const len = arr.kind.array.items.len;
+        for (0..len) |i| {
+            if (i > 0) try s.writeUnit(',');
+            const elem = arr.kind.array.items[i];
+            if (!try s.writeValue(elem)) try s.writeAscii("null");
+        }
+        try s.writeUnit(']');
+    }
+
+    fn writeObject(s: *Stringifier, obj: *Object) Error!void {
+        try s.pushAncestor(obj);
+        defer _ = s.stack.pop();
+
+        const keys = try object.ownKeys(s.rt, obj);
+        defer s.rt.gpa.free(keys);
+
+        try s.writeUnit('{');
+        var wrote = false;
+        for (keys) |k| {
+            const val = switch (k) {
+                .atom => |a| obj.props.get(a).?.value,
+                .index => |i| blk: {
+                    var buf: [10]u8 = undefined;
+                    const idx_atom = try s.rt.heap.internAscii(std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
+                    break :blk obj.props.get(idx_atom).?.value;
+                },
+            };
+            // Save position so if property value is omitted (undefined/function), no key/comma is left.
+            const mark = s.out.items.len;
+            if (wrote) try s.writeUnit(',');
+            switch (k) {
+                .atom => |a| try s.writeString(a.units),
+                .index => |i| {
+                    var buf: [10]u8 = undefined;
+                    const idx_str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+                    try s.writeUnit('"');
+                    try s.writeAscii(idx_str);
+                    try s.writeUnit('"');
+                },
+            }
+            try s.writeUnit(':');
+            if (try s.writeValue(val)) {
+                wrote = true;
+            } else {
+                s.out.items.len = mark;
+            }
+        }
+        try s.writeUnit('}');
+    }
+
+    fn writeString(s: *Stringifier, units: []const u16) Error!void {
+        try s.writeUnit('"');
+        var i: usize = 0;
+        while (i < units.len) : (i += 1) {
+            const u = units[i];
+            switch (u) {
+                '"' => try s.writeAscii("\\\""),
+                '\\' => try s.writeAscii("\\\\"),
+                0x08 => try s.writeAscii("\\b"),
+                0x0C => try s.writeAscii("\\f"),
+                0x0A => try s.writeAscii("\\n"),
+                0x0D => try s.writeAscii("\\r"),
+                0x09 => try s.writeAscii("\\t"),
+                0x00...0x07, 0x0B, 0x0E...0x1F => try s.writeUnicodeEscape(u),
+                0xD800...0xDBFF => {
+                    if (i + 1 < units.len and units[i + 1] >= 0xDC00 and units[i + 1] <= 0xDFFF) {
+                        try s.writeUnit(u);
+                        try s.writeUnit(units[i + 1]);
+                        i += 1;
+                    } else {
+                        try s.writeUnicodeEscape(u);
+                    }
+                },
+                0xDC00...0xDFFF => try s.writeUnicodeEscape(u),
+                else => try s.writeUnit(u),
+            }
+        }
+        try s.writeUnit('"');
+    }
+
+    fn writeUnicodeEscape(s: *Stringifier, u: u16) Error!void {
+        const hex = "0123456789abcdef";
+        try s.writeAscii(&.{
+            '\\',
+            'u',
+            hex[(u >> 12) & 0xF],
+            hex[(u >> 8) & 0xF],
+            hex[(u >> 4) & 0xF],
+            hex[u & 0xF],
+        });
     }
 };

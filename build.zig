@@ -52,6 +52,21 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // M9.2 C ABI static library + header
+    const c_api_mod = b.createModule(.{
+        .root_source_file = b.path("src/c_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    });
+    const libzqjs = b.addLibrary(.{
+        .name = "zqjs",
+        .linkage = .static,
+        .root_module = c_api_mod,
+    });
+    libzqjs.installHeader(b.path("include/zqjs.h"), "zqjs.h");
+    b.installArtifact(libzqjs);
+
     const run = b.addRunArtifact(exe);
     run.addPassthruArgs();
     b.step("run", "Run the zqjs CLI").dependOn(&run.step);
@@ -95,6 +110,34 @@ pub fn build(b: *std.Build) void {
     }) }));
     api_tests.setCwd(b.path("."));
     test_step.dependOn(&api_tests.step);
+
+    // C ABI layout & unit tests (M9.2)
+    const c_api_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/c_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    });
+    const c_api_tests = b.addRunArtifact(b.addTest(.{ .name = "c_api_zig_test", .filters = filters, .root_module = c_api_test_mod }));
+    test_step.dependOn(&c_api_tests.step);
+
+    // Pure C11 integration test linked against libzqjs.a (M9.2)
+    const c_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    c_test_mod.addIncludePath(b.path("include"));
+    c_test_mod.addCSourceFile(.{
+        .file = b.path("tests/c_api_test.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    c_test_mod.linkLibrary(libzqjs);
+    const c_test_exe = b.addExecutable(.{
+        .name = "c_api_test",
+        .root_module = c_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(c_test_exe).step);
 
     // The broken builds (M8.1): for each heap.Mutation, the `mutation:` tests under
     // -Dgc-stress, which pass only if the verifier catches that mutant.

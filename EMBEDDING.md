@@ -198,3 +198,32 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 See [examples/embed.zig](examples/embed.zig) for the full runnable example (`zig build example`).
+
+---
+
+### 11. C ABI (`include/zqjs.h`, `libzqjs.a`, M9.2)
+
+ZQJS exports a C11/C++-compatible ABI in [include/zqjs.h](include/zqjs.h) backed by `libzqjs.a` ([src/c_api.zig](src/c_api.zig)). Running `zig build` installs both into `zig-out/include/zqjs.h` and `zig-out/lib/libzqjs.a`. Internally, the C ABI uses `std.heap.smp_allocator` (no allocator vtable or libc dependency required by `libzqjs.a`).
+
+#### No Zig Panics Across the C Boundary
+Every C ABI function returns `zqjs_status` rather than panicking or unwinding across C frames:
+- **Null / invalid arguments:** required out-pointers or invalid `(ptr, len)` pairs return `ZQJS_ERR_INVALID_ARG`.
+- **Stale / foreign handles:** every `zqjs_handle_*` and `zqjs_runtime_call` validates `rt` and `h` before dereferencing:
+  - Released or wrong-generation handles (including `ZQJS_HANDLE_NULL`) return `ZQJS_ERR_STALE_HANDLE`.
+  - Handles minted by another runtime return `ZQJS_ERR_FOREIGN_HANDLE`.
+  - Wrong value kind in `zqjs_handle_number` / `zqjs_handle_boolean` / `zqjs_handle_string_utf16` returns `ZQJS_ERR_TYPE`.
+- **Disallowed re-entrancy & concurrency:** calling into an active runtime from another thread, from inside `output_fn` / `clock_fn`, or calling host-only operations (`compile`, `start`, `run`, `define_global_function`, `*_destroy`) from inside a `zqjs_native_fn` callback returns `ZQJS_ERR_BUSY`. Calling `zqjs_runtime_throw_js` outside an active `zqjs_native_fn` returns `ZQJS_ERR_INVALID_STATE`.
+
+#### Opaque Types, Destruction & Invalidation Semantics
+- **`zqjs_runtime`:** created with `zqjs_runtime_create(opts, &rt)` (`opts == NULL` uses `zqjs_options_default()`); destroyed with `zqjs_runtime_destroy(rt)`. Destroying `rt` invalidates all remaining child `zqjs_program`s, `zqjs_execution`s, and `zqjs_handle`s owned by `rt`.
+- **`zqjs_program`:** compiled with `zqjs_runtime_compile(...)`; destroyed with `zqjs_program_destroy(prog)`. Destroying `prog` invalidates `prog` immediately (`ZQJS_ERR_INVALID_STATE` on reuse), while any active `zqjs_execution`s keep the underlying compiled bytecode alive until they or `rt` are destroyed. Keep `prog` alive while closures compiled in it may still be invoked via `zqjs_runtime_call`.
+- **`zqjs_execution`:** created with `zqjs_runtime_start(rt, prog, &exec)`, stepped via `zqjs_execution_resume(exec, steps, &fail)` (`ZQJS_STATUS_SUSPENDED` or `ZQJS_STATUS_FINISHED`), and freed with `zqjs_execution_destroy(exec)`.
+- **`*_destroy(NULL)`** is a no-op returning `ZQJS_OK`; destroying an already-destroyed wrapper returns `ZQJS_ERR_INVALID_STATE`.
+
+#### Native Callbacks (`zqjs_native_fn`), Result Transfer & Error Mapping
+- **Borrowed temporaries:** `opt_this` (`NULL` when absent) and `args[0..argc-1]` are valid only during the `zqjs_native_fn` call; retain with `zqjs_handle_dup`.
+- **Result transfer (`zqjs_native_out`):** set `out->has_result = true` and `out->result = h` to transfer ownership of `h` to the engine (copied before teardown releases `h`). To return a host-retained handle without consuming it, assign a `zqjs_handle_dup` copy. Invalid/stale `out->result` handles on `ZQJS_OK` map to `ZQJS_ERR_HOST` (`Failure.Kind.host`).
+- **`host_message` lifetime:** `out->host_message` (`out->host_message_len`) is borrowed only until `zqjs_native_fn` returns and is copied into ZQJS's fixed 256-byte NUL-terminated `zqjs_failure.message` buffer (empty `host_message` on `ZQJS_ERR_HOST` defaults to `"host error"`).
+- **Error mapping:** `ZQJS_ERR_THROWN` (paired with `zqjs_runtime_throw_js`) → `ZQJS_FAILURE_THROWN`; `ZQJS_ERR_HOST` → `ZQJS_FAILURE_HOST`; `ZQJS_ERR_LIMIT_EXCEEDED` → `ZQJS_FAILURE_LIMIT`; `ZQJS_ERR_UNSUPPORTED` → `ZQJS_FAILURE_UNSUPPORTED`; `ZQJS_ERR_OUT_OF_MEMORY` → `ZQJS_FAILURE_OUT_OF_MEMORY`; `ZQJS_ERR_INTERNAL` → `ZQJS_FAILURE_INTERNAL` (poisons runtime).
+
+See [examples/c_embed.c](examples/c_embed.c) for a standalone C11 example linking against `zig-out/lib/libzqjs.a` and `zig-out/include/zqjs.h`.

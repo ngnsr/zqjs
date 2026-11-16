@@ -93,6 +93,44 @@ ZQJS provides a private-VM Zig embedding API (`@import("zqjs")`) designed for ho
 
 See [EMBEDDING.md](EMBEDDING.md) for full details, semantics, and examples.
 
+### C ABI (`include/zqjs.h`, `libzqjs.a`)
+Build and install the C header and static library with `zig build`:
+```sh
+zig build
+cc -std=c11 -Izig-out/include examples/c_embed.c zig-out/lib/libzqjs.a -lpthread -o c_embed
+./c_embed
+```
+
+```c
+#include "zqjs.h"
+#include <stdio.h>
+#include <string.h>
+
+static bool on_print(void *ctx, const char *bytes, size_t len) {
+    (void)ctx;
+    return fwrite(bytes, 1, len, stdout) == len;
+}
+
+int main(void) {
+    zqjs_options opts = zqjs_options_default();
+    opts.output_fn = on_print;
+
+    zqjs_runtime *rt = NULL;
+    if (zqjs_runtime_create(&opts, &rt) != ZQJS_OK) return 1;
+
+    const char *src = "print('hello from C');";
+    zqjs_program *prog = NULL;
+    zqjs_diagnostic diag;
+    if (zqjs_runtime_compile(rt, "app.js", 6, src, strlen(src), &diag, &prog) == ZQJS_OK) {
+        zqjs_failure fail;
+        zqjs_runtime_run(rt, prog, &fail);
+        zqjs_program_destroy(prog);
+    }
+    zqjs_runtime_destroy(rt);
+    return 0;
+}
+```
+
 ## Benchmarks
 `zig build bench` (always ReleaseFast) runs every `bench/*.js` five times in-process on both
 engines, each run with a fresh runtime and heap. `steps` and the heap columns are

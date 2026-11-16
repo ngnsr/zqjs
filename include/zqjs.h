@@ -9,6 +9,18 @@
 extern "C" {
 #endif
 
+/**
+ * C ABI version encoded as `(major << 16) | (minor << 8) | patch`.
+ * - Major bumps only on breaking layout, signature, or semantic changes.
+ * - Minor bumps on backward-compatible additions (new functions or trailing
+ *   fields on `zqjs_options` gated by `struct_size`).
+ * Callers can check `(zqjs_abi_version() >> 16) == (ZQJS_ABI_VERSION >> 16)`.
+ */
+#define ZQJS_ABI_MAJOR 1u
+#define ZQJS_ABI_MINOR 1u
+#define ZQJS_ABI_PATCH 0u
+#define ZQJS_ABI_VERSION ((ZQJS_ABI_MAJOR << 16) | (ZQJS_ABI_MINOR << 8) | ZQJS_ABI_PATCH)
+
 typedef struct zqjs_runtime zqjs_runtime;
 typedef struct zqjs_program zqjs_program;
 typedef struct zqjs_execution zqjs_execution;
@@ -105,11 +117,23 @@ typedef bool (*zqjs_output_fn)(void *ctx, const char *bytes, size_t len);
 typedef uint64_t (*zqjs_clock_fn)(void *ctx);
 
 typedef struct zqjs_options {
+    /**
+     * Must be initialized to `sizeof(zqjs_options)` (e.g. via `zqjs_options_default()`).
+     * - Smaller structs (`>= offsetof(zqjs_options, clock_ctx) + sizeof(void *)`) are
+     *   accepted for backward compatibility; omitted trailing fields (e.g. `random_seed`)
+     *   use their documented defaults.
+     * - Zero, truncated, or larger structs (`> sizeof(zqjs_options)`) are rejected with
+     *   `ZQJS_ERR_INVALID_ARG`.
+     */
+    uint32_t struct_size;
+    uint32_t reserved;
     zqjs_limits limits;
     zqjs_output_fn output_fn;
     void *output_ctx;
     zqjs_clock_fn clock_fn;
     void *clock_ctx;
+    /** Deterministic PRNG seed for `Math.random()` (not cryptographically secure). */
+    uint64_t random_seed;
 } zqjs_options;
 
 typedef struct zqjs_diagnostic {
@@ -158,7 +182,8 @@ typedef zqjs_status (*zqjs_native_fn)(
     zqjs_native_out *out
 );
 
-/* Defaults */
+/* ABI version & defaults */
+uint32_t zqjs_abi_version(void);
 zqjs_limits zqjs_limits_default(void);
 zqjs_options zqjs_options_default(void);
 
@@ -193,6 +218,45 @@ zqjs_status zqjs_new_string_utf16(
     const uint16_t *units,
     size_t len,
     zqjs_handle *out_handle
+);
+zqjs_status zqjs_new_object(zqjs_runtime *rt, zqjs_handle *out_handle);
+zqjs_status zqjs_new_array(zqjs_runtime *rt, zqjs_handle *out_handle);
+zqjs_status zqjs_runtime_get_global(
+    zqjs_runtime *rt,
+    const char *name,
+    size_t name_len,
+    zqjs_failure *out_fail,
+    zqjs_handle *out_handle
+);
+zqjs_status zqjs_handle_get_property(
+    zqjs_runtime *rt,
+    zqjs_handle obj,
+    const char *key,
+    size_t key_len,
+    zqjs_failure *out_fail,
+    zqjs_handle *out_handle
+);
+zqjs_status zqjs_handle_set_property(
+    zqjs_runtime *rt,
+    zqjs_handle obj,
+    const char *key,
+    size_t key_len,
+    zqjs_handle val,
+    zqjs_failure *out_fail
+);
+zqjs_status zqjs_handle_get_index(
+    zqjs_runtime *rt,
+    zqjs_handle obj,
+    uint32_t index,
+    zqjs_failure *out_fail,
+    zqjs_handle *out_handle
+);
+zqjs_status zqjs_handle_set_index(
+    zqjs_runtime *rt,
+    zqjs_handle obj,
+    uint32_t index,
+    zqjs_handle val,
+    zqjs_failure *out_fail
 );
 
 zqjs_status zqjs_handle_kind_of(const zqjs_runtime *rt, zqjs_handle h, zqjs_handle_kind *out_kind);

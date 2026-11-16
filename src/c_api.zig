@@ -179,13 +179,20 @@ pub const CLimits = extern struct {
 pub const OutputFn = *const fn (ctx: ?*anyopaque, bytes: [*c]const u8, len: usize) callconv(.c) bool;
 pub const ClockFn = *const fn (ctx: ?*anyopaque) callconv(.c) u64;
 
+pub const abi_version: u32 = (1 << 16) | (1 << 8) | 0;
+
 pub const COptions = extern struct {
+    struct_size: u32,
+    reserved: u32,
     limits: CLimits,
     output_fn: ?OutputFn,
     output_ctx: ?*anyopaque,
     clock_fn: ?ClockFn,
     clock_ctx: ?*anyopaque,
+    random_seed: u64,
 };
+
+const min_options_size: usize = @offsetOf(COptions, "clock_ctx") + @sizeOf(?*anyopaque);
 
 pub const CDiagnostic = extern struct {
     message: [257]u8,
@@ -399,10 +406,20 @@ fn mapRunError(err: zqjs.RunError) Status {
 }
 
 fn createRuntimeWithAllocator(gpa: Allocator, opts_opt: ?*const COptions, out_rt: *?*anyopaque) Status {
+    var opts: COptions = zqjs_options_default();
+    if (opts_opt) |o| {
+        const sz = o.struct_size;
+        if (sz < min_options_size or sz > @sizeOf(COptions)) return .err_invalid_arg;
+        // Copy only the caller-provided prefix so smaller/older structs never read OOB
+        // and omitted trailing fields (e.g. random_seed) retain their defaults.
+        const dst: [*]u8 = @ptrCast(&opts);
+        const src: [*]const u8 = @ptrCast(o);
+        @memcpy(dst[0..sz], src[0..sz]);
+    }
+
     const cr = gpa.create(CRuntime) catch return .err_out_of_memory;
     errdefer gpa.destroy(cr);
 
-    const opts: COptions = if (opts_opt) |o| o.* else zqjs_options_default();
     cr.* = .{
         .gpa = gpa,
         .output_fn = opts.output_fn,
@@ -416,6 +433,7 @@ fn createRuntimeWithAllocator(gpa: Allocator, opts_opt: ?*const COptions, out_rt
         .output = if (opts.output_fn != null) &cr.writer else null,
         .clock = if (opts.clock_fn != null) CRuntime.clockAdapter else null,
         .clock_ctx = if (opts.clock_fn != null) cr else null,
+        .random_seed = opts.random_seed,
     };
 
     cr.rt = zqjs.Runtime.create(gpa, zig_opts) catch return .err_out_of_memory;
@@ -437,17 +455,24 @@ fn createRuntimeWithAllocator(gpa: Allocator, opts_opt: ?*const COptions, out_rt
 
 // ---- Exported C ABI functions ----
 
+pub export fn zqjs_abi_version() callconv(.c) u32 {
+    return abi_version;
+}
+
 pub export fn zqjs_limits_default() callconv(.c) CLimits {
     return CLimits.fromZig(.{});
 }
 
 pub export fn zqjs_options_default() callconv(.c) COptions {
     return .{
+        .struct_size = @sizeOf(COptions),
+        .reserved = 0,
         .limits = zqjs_limits_default(),
         .output_fn = null,
         .output_ctx = null,
         .clock_fn = null,
         .clock_ctx = null,
+        .random_seed = internal.Runtime.default_random_seed,
     };
 }
 
@@ -733,6 +758,159 @@ pub export fn zqjs_new_string_utf16(
     const units: []const u16 = if (units_ptr) |up| up[0..len] else &.{};
     const zh = cr.rt.newStringUtf16(units) catch |err| return mapHandleError(err);
     out.* = ZqjsHandle.fromZig(zh);
+    return .ok;
+}
+
+pub export fn zqjs_new_object(raw_rt: ?*anyopaque, out_handle: ?*ZqjsHandle) callconv(.c) Status {
+    const out = out_handle orelse return .err_invalid_arg;
+    out.* = .{};
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkReentrantEntry()) |st| return st;
+
+    const zh = cr.rt.newObject() catch |err| return mapHandleError(err);
+    out.* = ZqjsHandle.fromZig(zh);
+    return .ok;
+}
+
+pub export fn zqjs_new_array(raw_rt: ?*anyopaque, out_handle: ?*ZqjsHandle) callconv(.c) Status {
+    const out = out_handle orelse return .err_invalid_arg;
+    out.* = .{};
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkReentrantEntry()) |st| return st;
+
+    const zh = cr.rt.newArray() catch |err| return mapHandleError(err);
+    out.* = ZqjsHandle.fromZig(zh);
+    return .ok;
+}
+
+pub export fn zqjs_runtime_get_global(
+    raw_rt: ?*anyopaque,
+    name_ptr: ?[*]const u8,
+    name_len: usize,
+    out_fail: ?*CFailure,
+    out_handle: ?*ZqjsHandle,
+) callconv(.c) Status {
+    const out = out_handle orelse return .err_invalid_arg;
+    out.* = .{};
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkReentrantEntry()) |st| return st;
+    if (name_len > 0 and name_ptr == null) return .err_invalid_arg;
+
+    const name: []const u8 = if (name_ptr) |np| np[0..name_len] else "";
+    var failure: zqjs.Failure = .{};
+    const zh = cr.rt.getGlobal(name, if (out_fail != null) &failure else null) catch |err| {
+        if (out_fail) |of| of.writeFromZig(&failure);
+        return mapRunError(err);
+    };
+    out.* = ZqjsHandle.fromZig(zh);
+    return .ok;
+}
+
+pub export fn zqjs_handle_get_property(
+    raw_rt: ?*anyopaque,
+    obj_h: ZqjsHandle,
+    key_ptr: ?[*]const u8,
+    key_len: usize,
+    out_fail: ?*CFailure,
+    out_handle: ?*ZqjsHandle,
+) callconv(.c) Status {
+    const out = out_handle orelse return .err_invalid_arg;
+    out.* = .{};
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkReentrantEntry()) |st| return st;
+    if (key_len > 0 and key_ptr == null) return .err_invalid_arg;
+
+    const obj = switch (validateHandle(cr, obj_h)) {
+        .ok => |v| v,
+        .err => |st| return st,
+    };
+    const key: []const u8 = if (key_ptr) |kp| kp[0..key_len] else "";
+    var failure: zqjs.Failure = .{};
+    const zh = cr.rt.getProperty(obj, key, if (out_fail != null) &failure else null) catch |err| {
+        if (out_fail) |of| of.writeFromZig(&failure);
+        return mapRunError(err);
+    };
+    out.* = ZqjsHandle.fromZig(zh);
+    return .ok;
+}
+
+pub export fn zqjs_handle_set_property(
+    raw_rt: ?*anyopaque,
+    obj_h: ZqjsHandle,
+    key_ptr: ?[*]const u8,
+    key_len: usize,
+    val_h: ZqjsHandle,
+    out_fail: ?*CFailure,
+) callconv(.c) Status {
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkReentrantEntry()) |st| return st;
+    if (key_len > 0 and key_ptr == null) return .err_invalid_arg;
+
+    const obj = switch (validateHandle(cr, obj_h)) {
+        .ok => |v| v,
+        .err => |st| return st,
+    };
+    const val = switch (validateHandle(cr, val_h)) {
+        .ok => |v| v,
+        .err => |st| return st,
+    };
+    const key: []const u8 = if (key_ptr) |kp| kp[0..key_len] else "";
+    var failure: zqjs.Failure = .{};
+    cr.rt.setProperty(obj, key, val, if (out_fail != null) &failure else null) catch |err| {
+        if (out_fail) |of| of.writeFromZig(&failure);
+        return mapRunError(err);
+    };
+    return .ok;
+}
+
+pub export fn zqjs_handle_get_index(
+    raw_rt: ?*anyopaque,
+    obj_h: ZqjsHandle,
+    index: u32,
+    out_fail: ?*CFailure,
+    out_handle: ?*ZqjsHandle,
+) callconv(.c) Status {
+    const out = out_handle orelse return .err_invalid_arg;
+    out.* = .{};
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkReentrantEntry()) |st| return st;
+
+    const obj = switch (validateHandle(cr, obj_h)) {
+        .ok => |v| v,
+        .err => |st| return st,
+    };
+    var failure: zqjs.Failure = .{};
+    const zh = cr.rt.getIndex(obj, index, if (out_fail != null) &failure else null) catch |err| {
+        if (out_fail) |of| of.writeFromZig(&failure);
+        return mapRunError(err);
+    };
+    out.* = ZqjsHandle.fromZig(zh);
+    return .ok;
+}
+
+pub export fn zqjs_handle_set_index(
+    raw_rt: ?*anyopaque,
+    obj_h: ZqjsHandle,
+    index: u32,
+    val_h: ZqjsHandle,
+    out_fail: ?*CFailure,
+) callconv(.c) Status {
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkReentrantEntry()) |st| return st;
+
+    const obj = switch (validateHandle(cr, obj_h)) {
+        .ok => |v| v,
+        .err => |st| return st,
+    };
+    const val = switch (validateHandle(cr, val_h)) {
+        .ok => |v| v,
+        .err => |st| return st,
+    };
+    var failure: zqjs.Failure = .{};
+    cr.rt.setIndex(obj, index, val, if (out_fail != null) &failure else null) catch |err| {
+        if (out_fail) |of| of.writeFromZig(&failure);
+        return mapRunError(err);
+    };
     return .ok;
 }
 

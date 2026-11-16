@@ -439,6 +439,153 @@ static void test_mid_run_program_destroy_and_runtime_destroy_with_children(void)
     assert(zqjs_runtime_destroy(rt) == ZQJS_OK);
 }
 
+static void test_m12_3_abi_version_options_and_handles(void) {
+    assert(zqjs_abi_version() == ZQJS_ABI_VERSION);
+    assert((zqjs_abi_version() >> 16) == ZQJS_ABI_MAJOR);
+
+    /* struct_size validation */
+    zqjs_runtime *bad_rt = NULL;
+    zqjs_options bad_opts = zqjs_options_default();
+    bad_opts.struct_size = 0;
+    assert(zqjs_runtime_create(&bad_opts, &bad_rt) == ZQJS_ERR_INVALID_ARG);
+    assert(bad_rt == NULL);
+
+    bad_opts.struct_size = 16;
+    assert(zqjs_runtime_create(&bad_opts, &bad_rt) == ZQJS_ERR_INVALID_ARG);
+
+    bad_opts.struct_size = (uint32_t)(sizeof(zqjs_options) + 8u);
+    assert(zqjs_runtime_create(&bad_opts, &bad_rt) == ZQJS_ERR_INVALID_ARG);
+
+    /* Smaller struct (pre-random_seed size) stays valid and uses default seed */
+    typedef struct zqjs_options_v1_0 {
+        uint32_t struct_size;
+        uint32_t reserved;
+        zqjs_limits limits;
+        zqjs_output_fn output_fn;
+        void *output_ctx;
+        zqjs_clock_fn clock_fn;
+        void *clock_ctx;
+    } zqjs_options_v1_0;
+
+    capture_buf cap_v10 = { .len = 0, .reenter_rt = NULL, .reenter_status = ZQJS_OK };
+    zqjs_options def_opts = zqjs_options_default();
+    zqjs_options_v1_0 old_opts;
+    old_opts.struct_size = (uint32_t)sizeof(zqjs_options_v1_0);
+    old_opts.reserved = 0;
+    old_opts.limits = def_opts.limits;
+    old_opts.output_fn = test_output;
+    old_opts.output_ctx = &cap_v10;
+    old_opts.clock_fn = NULL;
+    old_opts.clock_ctx = NULL;
+
+    zqjs_runtime *rt_old = NULL;
+    assert(zqjs_runtime_create((const zqjs_options *)&old_opts, &rt_old) == ZQJS_OK);
+
+    capture_buf cap_def = { .len = 0, .reenter_rt = NULL, .reenter_status = ZQJS_OK };
+    def_opts.output_fn = test_output;
+    def_opts.output_ctx = &cap_def;
+    zqjs_runtime *rt_def = NULL;
+    assert(zqjs_runtime_create(&def_opts, &rt_def) == ZQJS_OK);
+
+    const char *rng_src = "print(Math.random());";
+    zqjs_diagnostic diag;
+    zqjs_program *p_old = NULL;
+    zqjs_program *p_def = NULL;
+    assert(zqjs_runtime_compile(rt_old, "r.js", 4, rng_src, strlen(rng_src), &diag, &p_old) == ZQJS_OK);
+    assert(zqjs_runtime_compile(rt_def, "r.js", 4, rng_src, strlen(rng_src), &diag, &p_def) == ZQJS_OK);
+    assert(zqjs_runtime_run(rt_old, p_old, NULL) == ZQJS_OK);
+    assert(zqjs_runtime_run(rt_def, p_def, NULL) == ZQJS_OK);
+    assert(strcmp(cap_v10.data, cap_def.data) == 0);
+    assert(zqjs_program_destroy(p_old) == ZQJS_OK);
+    assert(zqjs_program_destroy(p_def) == ZQJS_OK);
+    assert(zqjs_runtime_destroy(rt_old) == ZQJS_OK);
+
+    /* Explicit random_seed diverges from default */
+    capture_buf cap_seed = { .len = 0, .reenter_rt = NULL, .reenter_status = ZQJS_OK };
+    zqjs_options seed_opts = zqjs_options_default();
+    seed_opts.output_fn = test_output;
+    seed_opts.output_ctx = &cap_seed;
+    seed_opts.random_seed = 42ull;
+    zqjs_runtime *rt_seed = NULL;
+    assert(zqjs_runtime_create(&seed_opts, &rt_seed) == ZQJS_OK);
+    zqjs_program *p_seed = NULL;
+    assert(zqjs_runtime_compile(rt_seed, "r.js", 4, rng_src, strlen(rng_src), &diag, &p_seed) == ZQJS_OK);
+    assert(zqjs_runtime_run(rt_seed, p_seed, NULL) == ZQJS_OK);
+    assert(strcmp(cap_seed.data, cap_def.data) != 0);
+    assert(zqjs_program_destroy(p_seed) == ZQJS_OK);
+
+    /* newObject, newArray, getProperty/setProperty, getIndex/setIndex, getGlobal */
+    zqjs_handle obj = ZQJS_HANDLE_NULL;
+    zqjs_handle arr = ZQJS_HANDLE_NULL;
+    zqjs_handle num = ZQJS_HANDLE_NULL;
+    assert(zqjs_new_object(rt_def, &obj) == ZQJS_OK);
+    assert(zqjs_new_array(rt_def, &arr) == ZQJS_OK);
+    assert(zqjs_new_number(rt_def, 99.0, &num) == ZQJS_OK);
+
+    zqjs_handle_kind k = ZQJS_HANDLE_UNDEFINED;
+    assert(zqjs_handle_kind_of(rt_def, obj, &k) == ZQJS_OK && k == ZQJS_HANDLE_OBJECT);
+    assert(zqjs_handle_kind_of(rt_def, arr, &k) == ZQJS_OK && k == ZQJS_HANDLE_ARRAY);
+
+    zqjs_failure fail;
+    assert(zqjs_handle_set_property(rt_def, obj, "x", 1, num, &fail) == ZQJS_OK);
+    assert(zqjs_handle_set_property(rt_def, obj, NULL, 1, num, &fail) == ZQJS_ERR_INVALID_ARG);
+
+    zqjs_handle got_x = ZQJS_HANDLE_NULL;
+    assert(zqjs_handle_get_property(rt_def, obj, "x", 1, &fail, &got_x) == ZQJS_OK);
+    double xv = 0.0;
+    assert(zqjs_handle_number(rt_def, got_x, &xv) == ZQJS_OK && xv == 99.0);
+    assert(zqjs_handle_release(rt_def, got_x) == ZQJS_OK);
+
+    zqjs_handle missing = ZQJS_HANDLE_NULL;
+    assert(zqjs_handle_get_property(rt_def, obj, "nope", 4, &fail, &missing) == ZQJS_OK);
+    assert(zqjs_handle_kind_of(rt_def, missing, &k) == ZQJS_OK && k == ZQJS_HANDLE_UNDEFINED);
+
+    /* TypeError on undefined receiver */
+    zqjs_handle bad_prop = ZQJS_HANDLE_NULL;
+    assert(zqjs_handle_get_property(rt_def, missing, "a", 1, &fail, &bad_prop) == ZQJS_ERR_THROWN);
+    assert(fail.kind == ZQJS_FAILURE_THROWN);
+    assert(zqjs_handle_release(rt_def, missing) == ZQJS_OK);
+
+    /* Array dense index operations */
+    assert(zqjs_handle_set_index(rt_def, arr, 0, num, &fail) == ZQJS_OK);
+    assert(zqjs_handle_set_index(rt_def, arr, 3, num, &fail) == ZQJS_ERR_UNSUPPORTED);
+    assert(fail.kind == ZQJS_FAILURE_UNSUPPORTED);
+
+    zqjs_handle got_0 = ZQJS_HANDLE_NULL;
+    assert(zqjs_handle_get_index(rt_def, arr, 0, &fail, &got_0) == ZQJS_OK);
+    double v0 = 0.0;
+    assert(zqjs_handle_number(rt_def, got_0, &v0) == ZQJS_OK && v0 == 99.0);
+    assert(zqjs_handle_release(rt_def, got_0) == ZQJS_OK);
+
+    zqjs_handle oob = ZQJS_HANDLE_NULL;
+    assert(zqjs_handle_get_index(rt_def, arr, 5, &fail, &oob) == ZQJS_OK);
+    assert(zqjs_handle_kind_of(rt_def, oob, &k) == ZQJS_OK && k == ZQJS_HANDLE_UNDEFINED);
+    assert(zqjs_handle_release(rt_def, oob) == ZQJS_OK);
+
+    /* getGlobal */
+    zqjs_handle math_h = ZQJS_HANDLE_NULL;
+    assert(zqjs_runtime_get_global(rt_def, "Math", 4, &fail, &math_h) == ZQJS_OK);
+    zqjs_handle pi_h = ZQJS_HANDLE_NULL;
+    assert(zqjs_handle_get_property(rt_def, math_h, "PI", 2, &fail, &pi_h) == ZQJS_OK);
+    double pi_val = 0.0;
+    assert(zqjs_handle_number(rt_def, pi_h, &pi_val) == ZQJS_OK && pi_val > 3.14 && pi_val < 3.15);
+    assert(zqjs_handle_release(rt_def, pi_h) == ZQJS_OK);
+    assert(zqjs_handle_release(rt_def, math_h) == ZQJS_OK);
+
+    zqjs_handle bad_global = ZQJS_HANDLE_NULL;
+    assert(zqjs_runtime_get_global(rt_def, "nope", 4, &fail, &bad_global) == ZQJS_ERR_THROWN);
+
+    /* Stale and foreign handle validation */
+    assert(zqjs_handle_get_index(rt_def, ZQJS_HANDLE_NULL, 0, &fail, &bad_prop) == ZQJS_ERR_STALE_HANDLE);
+    assert(zqjs_handle_get_property(rt_seed, obj, "x", 1, &fail, &bad_prop) == ZQJS_ERR_FOREIGN_HANDLE);
+
+    assert(zqjs_handle_release(rt_def, num) == ZQJS_OK);
+    assert(zqjs_handle_release(rt_def, arr) == ZQJS_OK);
+    assert(zqjs_handle_release(rt_def, obj) == ZQJS_OK);
+    assert(zqjs_runtime_destroy(rt_seed) == ZQJS_OK);
+    assert(zqjs_runtime_destroy(rt_def) == ZQJS_OK);
+}
+
 int main(void) {
     capture_buf cap = { .len = 0, .reenter_rt = NULL, .reenter_status = ZQJS_OK };
     cap.data[0] = '\0';
@@ -495,6 +642,7 @@ int main(void) {
     test_callbacks_errors_roundtrip_and_reentrancy();
     test_host_js_host_round_trip();
     test_mid_run_program_destroy_and_runtime_destroy_with_children();
+    test_m12_3_abi_version_options_and_handles();
 
     return 0;
 }

@@ -1,18 +1,18 @@
 # zqjs benchmark baseline: zig 0.17.1, aarch64-macos (apple_m4), fast, median of 5 runs, smp_allocator
 program                engine           steps    allocated         peak          end collections  median ms
-arrays.js              vm             5455249      8991400      3689928      2386568           7       27.9
-arrays.js              treewalk       3803441     31405032      3723822      2424952          89       37.8
-closures.js            vm             4500028     32800336       292824        51584         125       24.4
-closures.js            treewalk       3700021     62400784       342648        81816         238       42.9
-fib.js                 vm             2670640          160          160          160           0       12.6
-fib.js                 treewalk       2670637     27192120       397016       322648         103       28.3
-loop.js                vm            25666675            0            0            0           0      124.5
-loop.js                treewalk      18333340    112000336       310016        92288         427      193.8
-objects.js             vm             3025022     16404608       286392       170280          62       18.4
-objects.js             treewalk       2425016     35554788       355736       249288         135       30.8
-per_iteration.js       vm             2400016     16000128       271904        13408          61       12.1
-per_iteration.js       treewalk       1600012     31200336       291208        29864         119       16.2
-scopes.js              vm             6400015            0            0            0           0       34.1
-scopes.js              treewalk       5000012     89600336       357504       288512         341       48.9
-strings.js             vm              540236      3933264       266262        16066          15        4.0
+arrays.js              vm             5455249      8992286      3690730      2387270           7       26.1
+arrays.js              treewalk       3803441     31405032      3723822      2424952          89       38.4
+closures.js            vm             4500028     32801568       293952        54016         125       24.3
+closures.js            treewalk       3700021     62400784       342648        81816         238       42.2
+fib.js                 vm             2670640          554          554          554           0       12.3
+fib.js                 treewalk       2670637     27192120       397016       322648         103       27.7
+loop.js                vm            25666675          390          390          390           0      120.7
+loop.js                treewalk      18333340    112000336       310016        92288         427      199.2
+objects.js             vm             3025022     16405276       287060       171604          62       16.7
+objects.js             treewalk       2425016     35554788       355736       249288         135       31.3
+per_iteration.js       vm             2400016     16000612       272324        14308          61       12.2
+per_iteration.js       treewalk       1600012     31200336       291208        29864         119       15.9
+scopes.js              vm             6400015          664          664          664           0       32.5
+scopes.js              treewalk       5000012     89600336       357504       288512         341       48.0
+strings.js             vm              540236      3934206       267786        16798          15        4.0
 strings.js             treewalk        400158     11975126       280832       194450          45        5.8

@@ -1148,3 +1148,57 @@ test "M10.5c: fastArrayGet matches generic get_elem for -0, bounds, fractions, N
     try testing.expectError(error.Thrown, rt.run(p2, &fail));
     try testing.expect(std.mem.indexOf(u8, fail.message(), "TypeError") != null);
 }
+
+fn nativeThrowJs(rt: *api.Runtime, _: ?*anyopaque, _: ?api.Handle, args: []const api.Handle, out: *api.NativeOut) api.NativeError!void {
+    _ = args;
+    _ = out;
+    rt.throwJs(.RangeError, &.{ 'b', 'a', 'd' });
+    return error.Thrown;
+}
+
+fn nativeCallJs(rt: *api.Runtime, _: ?*anyopaque, _: ?api.Handle, args: []const api.Handle, out: *api.NativeOut) api.NativeError!void {
+    out.result = rt.call(args[0], null, &.{}, null) catch |e| switch (e) {
+        error.OutputFailed => return error.HostError,
+        else => |err| return err,
+    };
+}
+
+test "M11.2: JS->native->JS exception propagation, uncatchable LimitExceeded, and stale thrown_value clearing" {
+    var out_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out, .limits = .{ .max_steps = 5000 } });
+    defer rt.destroy();
+
+    try rt.defineGlobalFunction("nativeThrow", &nativeThrowJs, null);
+    try rt.defineGlobalFunction("callJs", &nativeCallJs, null);
+
+    // 1. Native throwJs and JS->native->JS throw both caught by outer JS try/catch.
+    const src =
+        \\try { nativeThrow(); } catch (e) { print(e.name); }
+        \\function innerThrow() { throw 'from-inner'; }
+        \\try { callJs(innerThrow); } catch (e) { print(e); }
+    ;
+    const p1 = try rt.compile("try_native.js", src, null);
+    defer p1.destroy();
+    try rt.run(p1, null);
+    try testing.expectEqualStrings("RangeError\nfrom-inner\n", out.buffered());
+
+    // 2. Stale thrown_value is cleared when a later throwJs / Runtime.throw sets rt.exception.
+    const stale1 = try rt.compile("stale1.js", "throw 'stale-js';", null);
+    defer stale1.destroy();
+    var f1: api.Failure = .{};
+    try testing.expectError(error.Thrown, rt.run(stale1, &f1));
+    try testing.expect(std.mem.indexOf(u8, f1.message(), "stale-js") != null);
+
+    const stale2 = try rt.compile("stale2.js", "nativeThrow();", null);
+    defer stale2.destroy();
+    var f2: api.Failure = .{};
+    try testing.expectError(error.Thrown, rt.run(stale2, &f2));
+    try testing.expect(std.mem.indexOf(u8, f2.message(), "RangeError: bad") != null);
+
+    // 3. LimitExceeded inside try/catch is uncatchable.
+    const lim = try rt.compile("lim.js", "let ran = false; try { while (true) {} } catch (e) { ran = true; }", null);
+    defer lim.destroy();
+    var f3: api.Failure = .{};
+    try testing.expectError(error.LimitExceeded, rt.run(lim, &f3));
+}

@@ -100,6 +100,7 @@ const Compiler = struct {
     consts: std.ArrayList(Value) = .empty,
     names: std.ArrayList([]const u8) = .empty,
     functions: std.ArrayList(Proto) = .empty,
+    handlers: std.ArrayList(Proto.ExceptionHandler) = .empty,
     // Deduplication. Numbers by bit pattern, so 0 and -0 stay distinct and every NaN
     // literal (there is only one bit pattern the lexer produces) shares one entry.
     number_index: std.AutoHashMapUnmanaged(u64, u32) = .empty,
@@ -126,6 +127,7 @@ const Compiler = struct {
         c.names.deinit(gpa);
         for (c.functions.items) |*f| f.deinit(gpa);
         c.functions.deinit(gpa);
+        c.handlers.deinit(gpa);
     }
 
     /// Moves everything into a Proto. On failure nothing has moved, so `deinit` still
@@ -158,6 +160,11 @@ const Compiler = struct {
             };
         }
         const functions = try gpa.dupe(Proto, c.functions.items);
+        errdefer {
+            for (functions) |*fn_p| fn_p.deinit(gpa);
+            gpa.free(functions);
+        }
+        const handlers = try gpa.dupe(Proto.ExceptionHandler, c.handlers.items);
         // Ownership of names and nested Protos has moved: don't free them twice.
         c.names.clearRetainingCapacity();
         c.functions.clearRetainingCapacity();
@@ -174,6 +181,7 @@ const Compiler = struct {
             .param_slot = info.param_slot,
             .captures = captures,
             .functions = functions,
+            .handlers = handlers,
         };
     }
 
@@ -332,6 +340,39 @@ const Compiler = struct {
                 if (v) |e| try c.expr(e) else try c.emit(.push_undefined, &.{});
                 try c.emit(.@"return", &.{});
                 return false;
+            },
+            .throw => |e| {
+                try c.expr(e);
+                try c.emit(.throw, &.{});
+                return false;
+            },
+            .@"try" => |t| {
+                const try_depth = c.depth;
+                const try_start = c.here();
+                const try_completes = try c.statements(t.body, s.span);
+                const try_end = c.here();
+                const to_end = if (try_completes) try c.jumpForward(.jump) else null;
+                const catch_pc = c.here();
+                c.depth = try_depth;
+                if (t.catch_param) |cp| {
+                    c.depth += 1;
+                    c.max_stack = @max(c.max_stack, c.depth);
+                    const b = c.binding(cp.binding);
+                    if (b.captured) try c.emit(.new_cell, &.{b.slot});
+                    try c.initBinding(cp.binding);
+                }
+                const catch_completes = try c.statements(t.catch_body, s.span);
+                if (to_end) |j| c.patch(j, c.here());
+                if (try_end > try_start) {
+                    try c.handlers.append(c.s.gpa, .{
+                        .try_start = try_start,
+                        .try_end = try_end,
+                        .catch_pc = catch_pc,
+                        .stack_depth = try_depth,
+                        .has_binding = t.catch_param != null,
+                    });
+                }
+                return try_completes or catch_completes;
             },
             .@"if" => |i| {
                 try c.expr(i.cond);

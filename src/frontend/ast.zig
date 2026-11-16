@@ -183,6 +183,12 @@ pub const Stmt = struct {
         function: *const Function,
         /// `return [value];`, only inside a function.
         @"return": ?*const Expr,
+        throw: *const Expr,
+        @"try": struct {
+            body: []const Stmt,
+            catch_param: ?Declarator,
+            catch_body: []const Stmt,
+        },
     };
 };
 

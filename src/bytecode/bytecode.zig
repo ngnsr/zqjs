@@ -123,6 +123,8 @@ pub const Op = enum(u8) {
     set_elem,
     /// [base] → [delete base.name].
     delete_prop,
+    /// [value] → [] (throws value as JS exception).
+    throw,
     /// [base, key] → [delete base[key]].
     delete_elem,
     /// [key, object] → [key in object].
@@ -237,6 +239,7 @@ pub const Op = enum(u8) {
             .jump_if_false, .jump_if_true => .{ .operands = &.{.target}, .pops = 1, .pushes = 0 },
             .call => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
             .halt => .{ .operands = &.{}, .pops = 0, .pushes = 0 },
+            .throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
         };
     }
 
@@ -307,15 +310,26 @@ pub const Proto = struct {
     /// How `make_closure` fills a new closure's captures, in order (empty for the script).
     captures: []const Capture = &.{},
     functions: []Proto = &.{},
+    /// Exception handlers ordered innermost-first (M11.2).
+    handlers: []const ExceptionHandler = &.{},
 
     pub const Capture = struct {
         from: enum { parent_slot, parent_capture },
         index: u32,
     };
 
+    pub const ExceptionHandler = struct {
+        try_start: u32,
+        try_end: u32,
+        catch_pc: u32,
+        stack_depth: u32,
+        has_binding: bool,
+    };
+
     pub fn deinit(p: *Proto, gpa: Allocator) void {
         for (p.functions) |*f| f.deinit(gpa);
         gpa.free(p.functions);
+        gpa.free(p.handlers);
         gpa.free(p.captures);
         gpa.free(p.name);
         gpa.free(p.code);

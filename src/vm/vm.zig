@@ -295,6 +295,15 @@ pub const Vm = struct {
             }
             const state = @call(.always_inline, execute, .{ vm, &cache }) catch |e| {
                 cache.syncSp(vm);
+                if (e == error.Thrown) {
+                    if (vm.unwind(&cache)) |_| {
+                        if (bounded) n += 1;
+                        continue;
+                    } else |ue| {
+                        vm.fault = ue;
+                        return ue;
+                    }
+                }
                 vm.fault = e;
                 return e;
             };
@@ -380,6 +389,15 @@ pub const Vm = struct {
         var cache = FrameCache.fromVm(vm, vm.pc);
         const state = vm.execute(&cache) catch |e| {
             cache.syncSp(vm);
+            if (e == error.Thrown) {
+                if (vm.unwind(&cache)) |_| {
+                    cache.syncSp(vm);
+                    return .running;
+                } else |ue| {
+                    vm.fault = ue;
+                    return ue;
+                }
+            }
             vm.fault = e;
             return e;
         };
@@ -709,6 +727,10 @@ pub const Vm = struct {
                 vm.halted = true;
                 return .halted; // pc stays on `halt`
             },
+            .throw => {
+                const v = try cache.peek(vm, 0);
+                return rt.throwValue(v);
+            },
         }
         if (next >= code.len) return vm.bug("pc outside the code");
         vm.pc = next;
@@ -854,6 +876,46 @@ pub const Vm = struct {
 
     fn constAssignment(vm: *Vm) Error {
         return vm.rt.throw(.TypeError, &.{.{ .ascii = "Assignment to constant variable." }});
+    }
+
+    /// Two-phase JS exception unwind: scans active frames for a matching `try` handler
+    /// before mutating any frame/stack state, so uncaught exceptions preserve exact
+    /// faulting PC, stack, and frames.
+    noinline fn unwind(vm: *Vm, cache: *FrameCache) Error!void {
+        @branchHint(.cold);
+        var match_frame: ?usize = null;
+        var match_handler: Proto.ExceptionHandler = undefined;
+        var fi: usize = vm.frames.items.len;
+        while (fi > 0) {
+            fi -= 1;
+            const check_pc: u32 = if (fi == vm.frames.items.len - 1) cache.pc else vm.frames.items[fi + 1].return_pc - 1;
+            for (vm.frames.items[fi].proto.handlers) |h| {
+                if (h.try_start <= check_pc and check_pc < h.try_end) {
+                    match_frame = fi;
+                    match_handler = h;
+                    break;
+                }
+            }
+            if (match_frame != null) break;
+        }
+        const target_frame = match_frame orelse return error.Thrown;
+        const caught: ?Value = if (match_handler.has_binding) try vm.rt.catchValue() else blk: {
+            vm.rt.clearThrown();
+            break :blk null;
+        };
+        while (vm.frames.items.len - 1 > target_frame) {
+            const popped = vm.frames.pop().?;
+            if (vm.chain) |cx| cx.call_depth -= 1;
+            vm.locals_len = popped.locals_base;
+            vm.reserved -= popped.proto.slot_count + popped.proto.max_stack;
+        }
+        vm.sp = vm.frame().stack_base + match_handler.stack_depth;
+        if (caught) |v| {
+            vm.stack[vm.sp] = v;
+            vm.sp += 1;
+        }
+        vm.pc = match_handler.catch_pc;
+        cache.* = FrameCache.fromVm(vm, match_handler.catch_pc);
     }
 
     /// A defensive check failed (D49): poison the runtime and return `error.Internal`.

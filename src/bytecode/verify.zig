@@ -136,6 +136,13 @@ const Verifier = struct {
         while (pc < p.code.len) : (pc += opAt(p, pc).size()) {
             if (target(p, pc)) |t| if (!starts.isSet(t)) return v.fail(p, @intCast(pc), "jump target inside an instruction");
         }
+        for (p.handlers) |h| {
+            if (h.try_start >= h.try_end or h.try_end > p.code.len) return v.fail(p, 0, "exception handler range out of bounds");
+            if (!starts.isSet(h.try_start)) return v.fail(p, h.try_start, "exception handler try_start inside an instruction");
+            if (h.try_end < p.code.len and !starts.isSet(h.try_end)) return v.fail(p, h.try_end, "exception handler try_end inside an instruction");
+            if (h.catch_pc >= p.code.len or !starts.isSet(h.catch_pc)) return v.fail(p, 0, "exception handler catch_pc invalid");
+            if (h.stack_depth + @intFromBool(h.has_binding) > p.max_stack) return v.fail(p, h.catch_pc, "exception handler stack depth exceeds max_stack");
+        }
 
         // 5-6. abstract interpretation: stack depth at entry of each reachable instruction.
         const unvisited = std.math.maxInt(u32);
@@ -150,6 +157,16 @@ const Verifier = struct {
         var reached: u32 = 1;
         depth[0] = 0;
         work.appendAssumeCapacity(0);
+        for (p.handlers) |h| {
+            const catch_depth = h.stack_depth + @intFromBool(h.has_binding);
+            if (depth[h.catch_pc] == unvisited) {
+                depth[h.catch_pc] = catch_depth;
+                work.appendAssumeCapacity(h.catch_pc);
+                reached += 1;
+            } else if (depth[h.catch_pc] != catch_depth) {
+                return v.fail(p, h.catch_pc, "inconsistent stack depth at catch handler");
+            }
+        }
         while (work.pop()) |at| {
             const op = opAt(p, at);
             const op_info = op.info();
@@ -166,6 +183,7 @@ const Verifier = struct {
             switch (op) {
                 .halt => if (after != 0) return v.fail(p, at, "stack not empty at halt"),
                 .@"return" => if (after != 0) return v.fail(p, at, "stack holds more than the return value at return"),
+                .throw => {},
                 .jump => succ[0] = target(p, at).?,
                 else => {
                     const next = at + op.size();

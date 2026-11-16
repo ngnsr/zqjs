@@ -17,7 +17,11 @@ const Allocator = std.mem.Allocator;
 const heap_mod = @import("heap.zig");
 const Heap = heap_mod.Heap;
 const handles = @import("handles.zig");
-const Native = @import("value.zig").Native;
+const value_mod = @import("value.zig");
+const Value = value_mod.Value;
+const Native = value_mod.Native;
+const builtins_mod = @import("builtins.zig");
+const object_mod = @import("object.zig");
 const Limits = @import("../limits.zig").Limits;
 const Limit = @import("../limits.zig").Limit;
 const Feature = @import("../frontend/diag.zig").Feature;
@@ -162,6 +166,8 @@ pub const Runtime = struct {
     /// effort: freed memory may be reused, so the check can miss; documented as such.
     magic: u32 = alive_magic,
     exception: ?Exception = null,
+    /// Arbitrary JS value thrown by `throw expr` (M11.2). Mutually exclusive with `exception`.
+    thrown_value: ?Value = null,
     /// Set by `rt.throwJs` when building the exception message string itself fails
     /// (`OutOfMemory` or `LimitExceeded`): consumed when the native returns `error.Thrown`.
     pending_throw_fault: ?Error = null,
@@ -278,8 +284,41 @@ pub const Runtime = struct {
     /// itself fails (heap limit, OOM), that failure is returned instead.
     pub fn throw(rt: *Runtime, name: ErrorName, message: []const heap_mod.Piece) Error {
         const msg = try rt.heap.newString(message);
+        rt.thrown_value = null;
         rt.exception = .{ .name = name, .message = msg };
         return error.Thrown;
+    }
+
+    /// Records an arbitrary JS value thrown by `throw expr` and returns error.Thrown.
+    pub fn throwValue(rt: *Runtime, v: Value) Error {
+        rt.exception = null;
+        rt.thrown_value = v;
+        return error.Thrown;
+    }
+
+    /// Clears any pending JS exception without materializing a value (for `catch {}`).
+    pub fn clearThrown(rt: *Runtime) void {
+        rt.exception = null;
+        rt.thrown_value = null;
+    }
+
+    /// Materializes the pending JS exception (`thrown_value` or `{ name, message }` for
+    /// a built-in/native `Exception`) and clears pending exception state only on success.
+    pub fn catchValue(rt: *Runtime) Error!Value {
+        if (rt.thrown_value) |v| {
+            rt.thrown_value = null;
+            rt.exception = null;
+            return v;
+        }
+        const ex = rt.exception.?;
+        const r = try builtins_mod.realm(rt);
+        const obj = try rt.heap.newObject(r.object_prototype);
+        const name_str = try rt.heap.newString(&.{.{ .ascii = @tagName(ex.name) }});
+        try object_mod.define(rt, obj, .{ .atom = try rt.heap.internAscii("name") }, .{ .string = name_str });
+        try object_mod.define(rt, obj, .{ .atom = try rt.heap.internAscii("message") }, .{ .string = ex.message });
+        rt.exception = null;
+        rt.thrown_value = null;
+        return .{ .object = obj };
     }
 
     pub fn fail(rt: *Runtime, feature: Feature) Error {
@@ -311,6 +350,7 @@ pub const Runtime = struct {
     fn markRoots(rt: *Runtime, h: *Heap) void {
         if (rt.realm) |*r| for (r.objects()) |o| h.markObj(&o.obj);
         if (rt.exception) |e| h.markObj(@constCast(&e.message.obj));
+        if (rt.thrown_value) |v| h.markValue(v);
         if (rt.unsupported_name) |n| h.markObj(@constCast(&n.obj));
         // Only non-empty inside an instruction, never at a safepoint.
         std.debug.assert(rt.joining.items.len == 0);

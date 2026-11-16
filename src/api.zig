@@ -368,11 +368,12 @@ pub const Runtime = opaque {
         r.rt.exec_ctx.topRecord().?.threw_js = true;
         if (r.rt.poisoned) return;
         const msg = r.rt.heap.newString(&.{.{ .utf16 = message }}) catch |e| {
-            r.rt.exception = null;
+            r.rt.clearThrown();
             r.rt.pending_throw_fault = e;
             return;
         };
         r.rt.pending_throw_fault = null;
+        r.rt.thrown_value = null;
         r.rt.exception = .{ .name = name, .message = msg };
     }
 
@@ -791,7 +792,7 @@ const ExecutionImpl = struct {
             x.vm.chain = null;
         }
         rt.exec_ctx.call_depth = @intCast(x.vm.frames.items.len); // the frames already live count (D51 #2)
-        rt.exception = null;
+        rt.clearThrown();
         rt.unsupported = null;
         rt.unsupported_name = null;
         rt.limit_hit = null;
@@ -850,7 +851,7 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
         if (failure) |out| out.* = fo.failure;
         return fo.err;
     }
-    rt.exception = null;
+    rt.clearThrown();
     rt.pending_throw_fault = null;
     rt.unsupported = null;
     rt.unsupported_name = null;
@@ -1022,7 +1023,7 @@ fn dispatchHostNative(rt: *IRuntime, raw_ctx: ?*anyopaque, this: ?internal.Value
         cx.popRecord(&record);
     }
 
-    rt.exception = null;
+    rt.clearThrown();
     rt.pending_throw_fault = null;
     rt.host_message_len = 0;
     rt.host_message_truncated = false;
@@ -1048,7 +1049,7 @@ fn dispatchHostNative(rt: *IRuntime, raw_ctx: ?*anyopaque, this: ?internal.Value
     if (call_res) |_| {
         if (record.threw_js)
             @panic("zqjs: throwJs called without returning error.Thrown");
-        rt.exception = null;
+        rt.clearThrown();
         rt.pending_throw_fault = null;
         // Copy result value BEFORE releasing tokens (release-order invariant, D50).
         const val: internal.Value = if (out.result) |rh| handles.Token.checkedValue(rt, rh.tok()) else .undefined;
@@ -1064,7 +1065,7 @@ fn dispatchHostNative(rt: *IRuntime, raw_ctx: ?*anyopaque, this: ?internal.Value
                     rt.pending_throw_fault = null;
                     return f;
                 }
-                if (rt.exception == null)
+                if (rt.exception == null and rt.thrown_value == null)
                     @panic("zqjs: NativeFn returned error.Thrown without calling throwJs");
                 return error.Thrown;
             },
@@ -1147,10 +1148,19 @@ fn describe(rt: *IRuntime, e: internal.runtime.Error) Failure {
     switch (e) {
         error.Thrown => {
             f.kind = .thrown;
-            const ex = rt.exception.?;
-            w.utf8(@tagName(ex.name));
-            w.utf8(": ");
-            w.utf16(ex.message.units);
+            if (rt.thrown_value) |v| {
+                w.utf8("Uncaught ");
+                var buf: internal.ops.NumberBuf = undefined;
+                if (internal.ops.toPiece(rt, v, &buf)) |piece| switch (piece) {
+                    .ascii => |a| w.utf8(a),
+                    .utf16 => |u| w.utf16(u),
+                } else |_| w.utf8("[value]");
+            } else {
+                const ex = rt.exception.?;
+                w.utf8(@tagName(ex.name));
+                w.utf8(": ");
+                w.utf16(ex.message.units);
+            }
         },
         error.HostError => {
             f.kind = .host;

@@ -1,0 +1,10 @@
+num: 42
+obj: 7 oops
+bare catch ok
+type: TypeError
+ref: ReferenceError
+caught1: inner
+caught2: inner+outer
+unwound: boom
+from-try caught-err
+1 2 11 21

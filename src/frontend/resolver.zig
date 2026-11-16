@@ -224,6 +224,19 @@ const Resolver = struct {
             .declaration => |decl| for (decl.declarators) |d| if (d.init) |init| try r.expr(init),
             .function => |f| try r.function(f),
             .@"return" => |v| if (v) |e| try r.expr(e),
+            .throw => |e| try r.expr(e),
+            .@"try" => |t| {
+                try r.block(t.body, .block);
+                const saved = try r.enterScope();
+                defer r.exitScope(saved);
+                if (t.catch_param) |cp| try r.declare(cp, .let, false);
+                for (t.catch_body) |cs| switch (cs.data) {
+                    .declaration => |decl| for (decl.declarators) |d| try r.declare(d, if (decl.kind == .let) .let else .@"const", false),
+                    .function => |f| try r.declare(f.name.?, .function, false),
+                    else => {},
+                };
+                for (t.catch_body) |cs| try r.stmt(cs);
+            },
             .block => |stmts| try r.block(stmts, .block),
             .@"if" => |i| {
                 try r.expr(i.cond);

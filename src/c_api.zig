@@ -861,7 +861,7 @@ fn cNativeBridge(
             .err => {
                 if (status == .ok) {
                     if (rec_opt) |rec| rec.threw_js = false;
-                    cr.irt.exception = null;
+                    cr.irt.clearThrown();
                     out.host_message = "invalid native result handle";
                     return error.HostError;
                 }
@@ -873,7 +873,7 @@ fn cNativeBridge(
         .ok => {
             if (did_throw) {
                 if (rec_opt) |rec| rec.threw_js = false;
-                cr.irt.exception = null;
+                cr.irt.clearThrown();
                 out.host_message = "native returned ZQJS_OK after throw_js";
                 return error.HostError;
             }

@@ -42,6 +42,25 @@ const Dumper = struct {
                 }
                 try w.writeByte(')');
             },
+            .throw => |e| {
+                try w.writeAll("(throw ");
+                try d.expr(e);
+                try w.writeByte(')');
+            },
+            .@"try" => |t| {
+                try w.writeAll("(try (block");
+                for (t.body) |st| {
+                    try w.writeByte(' ');
+                    try d.stmt(st);
+                }
+                try w.writeAll(") (catch ");
+                if (t.catch_param) |cp| try d.binding(cp) else try w.writeByte('_');
+                for (t.catch_body) |st| {
+                    try w.writeByte(' ');
+                    try d.stmt(st);
+                }
+                try w.writeAll("))");
+            },
             .expression => |e| try d.expr(e),
             .declaration => |decl| try d.declaration(decl),
             .block => |stmts| {

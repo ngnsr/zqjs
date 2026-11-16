@@ -95,13 +95,25 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
                 return 70;
             },
             error.Thrown => {
-                const ex = rt.exception.?;
-                try report.print("Uncaught {s}", .{@tagName(ex.name)});
-                if (mode == .normal) {
-                    try report.writeAll(": ");
-                    try ops.writeUtf16(report, ex.message.units);
+                if (rt.thrown_value) |v| {
+                    try report.writeAll("Uncaught ");
+                    if (mode == .normal) {
+                        var buf: ops.NumberBuf = undefined;
+                        if (ops.toPiece(&rt, v, &buf)) |piece| switch (piece) {
+                            .ascii => |a| try report.writeAll(a),
+                            .utf16 => |u| try ops.writeUtf16(report, u),
+                        } else |_| try report.writeAll("[value]");
+                    }
+                    try report.writeByte('\n');
+                } else {
+                    const ex = rt.exception.?;
+                    try report.print("Uncaught {s}", .{@tagName(ex.name)});
+                    if (mode == .normal) {
+                        try report.writeAll(": ");
+                        try ops.writeUtf16(report, ex.message.units);
+                    }
+                    try report.writeByte('\n');
                 }
-                try report.writeByte('\n');
             },
             error.HostError => try report.print("{s}: {s}\n", .{ name, rt.host_message_buf[0..rt.host_message_len] }),
             error.LimitExceeded => try report.print("{s}: LimitExceeded({s})\n", .{ name, @tagName(rt.limitHit().?) }),

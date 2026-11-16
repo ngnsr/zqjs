@@ -359,3 +359,4 @@ runs on both engines unless noted.
 
 **M11 (in progress — Language & Embedding Floor)**
 - **M11.1 (done, tag `m11.1`):** conditional expressions (`?:`), right-associative between `||` and assignment, lowered to `jump_if_false` + `jump` (no new VM opcodes), with syntax and Node-differential tests on both engines.
+- **M11.2 (done, tag `m11.2`):** `throw expr` and `try { ... } catch [(e)] { ... }` (`finally` deferred as `Unsupported`), `Runtime.thrown_value` + `{ name, message }` materialization for native/runtime errors, two-phase `Vm.unwind` preserving uncaught fault state and `FrameCache`, tree-walker `execTry`, and Node-differential + `JS → native → JS` + uncatchable-limit tests.

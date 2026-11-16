@@ -279,8 +279,27 @@ const Interpreter = struct {
             .@"for" => |f| return it.execFor(f),
             .@"break" => return .@"break",
             .@"continue" => return .@"continue",
+            .throw => |e| return it.rt.throwValue(try it.eval(e)),
+            .@"try" => |t| return it.execTry(t),
         }
         return .normal;
+    }
+
+    fn execTry(it: *Interpreter, t: @FieldType(ast.Stmt.Data, "try")) Error!Completion {
+        const saved = it.env;
+        if (it.block(t.body)) |c| return c else |err| {
+            if (err != error.Thrown) return err;
+            it.env = saved;
+            const val: ?Value = if (t.catch_param != null) try it.rt.catchValue() else blk: {
+                it.rt.clearThrown();
+                break :blk null;
+            };
+            defer it.env = saved;
+            const catch_scope: ?u32 = if (t.catch_param) |cp| it.res.bindings[cp.binding].scope else it.scopeOf(t.catch_body);
+            try it.pushScope(catch_scope);
+            if (t.catch_param) |cp| it.store(cp.binding, val.?);
+            return it.body(t.catch_body);
+        }
     }
 
     fn execFor(it: *Interpreter, f: @FieldType(ast.Stmt.Data, "for")) Error!Completion {

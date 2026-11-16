@@ -165,6 +165,8 @@ const Parser = struct {
         // `if (c) function f() {}` is legal sloppy JS (Annex B).
         if (p.isText(t, "function")) return p.fail(.{ .unsupported = .block_function }, t);
         if (p.isText(t, "return")) return p.returnStatement();
+        if (p.isText(t, "throw")) return p.throwStatement();
+        if (p.isText(t, "try")) return p.tryStatement();
         if (p.isText(t, "let")) {
             const next = try p.peek();
             // `if (c) let x` is an error, but `if (c) let\nx` may be ASI + two statements.
@@ -330,6 +332,46 @@ const Parser = struct {
         const end = p.tok;
         try p.endStatement();
         return .{ .span = span(t, end), .data = .{ .@"return" = value } };
+    }
+
+    /// `throw value;`. A line break after `throw` is a SyntaxError (`[no LineTerminator here]`).
+    fn throwStatement(p: *Parser) Error!ast.Stmt {
+        const t = p.tok;
+        try p.advance();
+        if (p.tok.newline_before) return p.fail(.{ .syntax_error = "illegal newline after throw" }, p.tok);
+        if (p.tok.tag == .semicolon or p.tok.tag == .eof or p.tok.tag == .r_brace) {
+            return p.fail(.{ .syntax_error = "expected expression after throw" }, p.tok);
+        }
+        const value = try p.expression();
+        const end = p.tok;
+        try p.endStatement();
+        return .{ .span = span(t, end), .data = .{ .throw = value } };
+    }
+
+    /// `try { ... } catch [(e)] { ... }`. `finally` is Unsupported.
+    fn tryStatement(p: *Parser) Error!ast.Stmt {
+        const start = p.tok.start;
+        try p.advance(); // `try`
+        if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{' after try" }, p.tok);
+        const try_blk = try p.block();
+        if (p.isText(p.tok, "finally")) return p.fail(.{ .unsupported = .syntax }, p.tok);
+        if (!p.isText(p.tok, "catch")) return p.fail(.{ .syntax_error = "missing catch or finally after try" }, p.tok);
+        try p.advance(); // `catch`
+        var param: ?ast.Declarator = null;
+        if (p.tok.tag == .l_paren) {
+            try p.advance();
+            if (p.tok.tag == .l_brace or p.tok.tag == .l_bracket) return p.fail(.{ .unsupported = .syntax }, p.tok);
+            param = try p.bindingName();
+            if (p.tok.tag != .r_paren) return p.fail(.{ .syntax_error = "expected ')' after catch parameter" }, p.tok);
+            try p.advance();
+        }
+        if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{' after catch" }, p.tok);
+        const catch_blk = try p.block();
+        if (p.isText(p.tok, "finally")) return p.fail(.{ .unsupported = .syntax }, p.tok);
+        return .{
+            .span = .{ .start = start, .end = catch_blk.span.end },
+            .data = .{ .@"try" = .{ .body = try_blk.data.block, .catch_param = param, .catch_body = catch_blk.data.block } },
+        };
     }
 
     /// `function [name](a, b, …) { body }`, starting at `function`.

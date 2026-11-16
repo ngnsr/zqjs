@@ -479,10 +479,9 @@ pub const Vm = struct {
             },
 
             .add, .sub, .mul, .div, .mod, .pow, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in => {
-                // M10.2b: fast path when both operands are already `.number` (`f64`),
-                // matching IEEE-754 / JS semantics for NaN, infinities, and -0.
-                // `.mod` stays in `ops.binary` until M10.2c; all mixed/non-number cases
-                // fall back to `ops.binary`.
+                // M10.2b/M10.2c: fast path when both operands are already `.number` (`f64`),
+                // matching IEEE-754 / JS semantics for NaN, infinities, and -0. All mixed or
+                // out-of-domain cases fall back to `ops.binary`.
                 const lhs = try vm.peek(1);
                 const rhs = try vm.peek(0);
                 const r: Value = if (lhs == .number and rhs == .number) switch (op) {
@@ -490,13 +489,14 @@ pub const Vm = struct {
                     .sub => .{ .number = lhs.number - rhs.number },
                     .mul => .{ .number = lhs.number * rhs.number },
                     .div => .{ .number = lhs.number / rhs.number },
+                    .mod => .{ .number = fastRemainder(lhs.number, rhs.number) },
                     .lt => .{ .boolean = lhs.number < rhs.number },
                     .le => .{ .boolean = lhs.number <= rhs.number },
                     .gt => .{ .boolean = lhs.number > rhs.number },
                     .ge => .{ .boolean = lhs.number >= rhs.number },
                     .strict_eq => .{ .boolean = lhs.number == rhs.number },
                     .strict_ne => .{ .boolean = lhs.number != rhs.number },
-                    .mod, .pow, .in => try ops.binary(rt, binaryOp(op), lhs, rhs),
+                    .pow, .in => try ops.binary(rt, binaryOp(op), lhs, rhs),
                     else => unreachable,
                 } else try ops.binary(rt, binaryOp(op), lhs, rhs);
                 vm.sp -= 1;
@@ -801,4 +801,22 @@ fn binaryOp(op: Op) BinaryOp {
         .in => .in,
         else => unreachable,
     };
+}
+
+/// M10.2c: fast exact-integer `%` when both operands are finite, integral, and within
+/// `[-Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]` with non-zero divisor. Preserves
+/// JS dividend-sign remainder and `-0` (`-4 % 2`, `-0 % 5`), falling back to `ops.remainder`
+/// for everything else.
+inline fn fastRemainder(a: f64, b: f64) f64 {
+    const max_safe: f64 = 9007199254740991.0; // 2^53 - 1
+    if (-max_safe <= a and a <= max_safe and -max_safe <= b and b <= max_safe and b != 0) {
+        const ai: i64 = @intFromFloat(a);
+        const bi: i64 = @intFromFloat(b);
+        if (@as(f64, @floatFromInt(ai)) == a and @as(f64, @floatFromInt(bi)) == b) {
+            const r = @rem(ai, bi);
+            if (r == 0) return if (std.math.signbit(a)) -0.0 else 0.0;
+            return @floatFromInt(r);
+        }
+    }
+    return ops.remainder(a, b);
 }

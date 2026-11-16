@@ -994,3 +994,34 @@ test "handles: slot at maxInt(u64) generation retires on release instead of wrap
     // With slot 0 permanently retired and slot 1 live, max_handles = 2 is full.
     try testing.expectError(error.LimitExceeded, rt.newNumber(30));
 }
+
+test "M10.2c: integer remainder fast path matches JS semantics for signs, -0, NaN, Inf, fractions, MAX_SAFE_INTEGER, and mixed types" {
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\function isNegZero(x) { return x === 0 && (1 / x) === -Infinity; }
+        \\print(7 % 3, -7 % 3, 7 % -3, -7 % -3);
+        \\print(isNegZero(4 % 2), isNegZero(4 % -2), isNegZero(-4 % 2), isNegZero(-4 % -2));
+        \\print(isNegZero(-0 % 5), isNegZero(-0 % -5), isNegZero(0 % -5));
+        \\print(5 % 0, 5 % -0, NaN % 2, 2 % NaN, Infinity % 2, 2 % Infinity, 2 % -Infinity);
+        \\print(5.5 % 2, -5.5 % 2, 5 % 1.5);
+        \\print(9007199254740991 % 10, 9007199254740992 % 3, -9007199254740991 % -10, isNegZero(-9007199254740991 % -1));
+        \\print('7' % 3, '-7' % 3, true % 2, false % 2, null % 3, undefined % 3, [] % 3, ({}) % 3);
+    ;
+    const prog = try rt.compile("mod_edges.js", src, null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+
+    const expected =
+        "1 -1 1 -1\n" ++
+        "false false true true\n" ++
+        "true true false\n" ++
+        "NaN NaN NaN NaN NaN 2 2\n" ++
+        "1.5 -1.5 0.5\n" ++
+        "1 2 -1 true\n" ++
+        "1 -1 1 0 0 NaN 0 NaN\n";
+    try testing.expectEqualStrings(expected, out.buffered());
+}

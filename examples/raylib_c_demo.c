@@ -20,6 +20,7 @@ typedef struct demo_host {
     bool headless;
     zqjs_handle update_cb;
     zqjs_handle draw_cb;
+    zqjs_handle state_h;
     uint64_t clear_calls;
     uint64_t circle_calls;
     uint64_t rect_calls;
@@ -59,7 +60,16 @@ static zqjs_status arg_number(
     return ZQJS_OK;
 }
 
-static zqjs_status native_set_callbacks(
+static zqjs_status throw_type(zqjs_runtime *rt, const char *ascii) {
+    uint16_t buf[64];
+    size_t n = strlen(ascii);
+    if (n > sizeof(buf) / sizeof(buf[0])) n = sizeof(buf) / sizeof(buf[0]);
+    for (size_t i = 0; i < n; i++) buf[i] = (uint16_t)(unsigned char)ascii[i];
+    zqjs_runtime_throw_js(rt, ZQJS_ERROR_TYPE, buf, n);
+    return ZQJS_ERR_THROWN;
+}
+
+static zqjs_status native_init_game(
     zqjs_runtime *rt,
     void *raw_ctx,
     const zqjs_handle *opt_this,
@@ -70,36 +80,89 @@ static zqjs_status native_set_callbacks(
     (void)opt_this;
     (void)out;
     demo_host *host = (demo_host *)raw_ctx;
-    if (argc < 2) {
-        const uint16_t msg[] = { 'n', 'e', 'e', 'd', ' ', '2', ' ', 'c', 'b', 's' };
-        zqjs_runtime_throw_js(rt, ZQJS_ERROR_TYPE, msg, 10);
-        return ZQJS_ERR_THROWN;
-    }
-    for (size_t i = 0; i < 2; i++) {
-        zqjs_handle_kind kind = ZQJS_HANDLE_UNDEFINED;
-        zqjs_status st = zqjs_handle_kind_of(rt, args[i], &kind);
-        if (st != ZQJS_OK) return st;
-        if (kind != ZQJS_HANDLE_FUNCTION) {
-            const uint16_t msg[] = { 'e', 'x', 'p', 'e', 'c', 't', 'e', 'd', ' ', 'f', 'n' };
-            zqjs_runtime_throw_js(rt, ZQJS_ERROR_TYPE, msg, 11);
-            return ZQJS_ERR_THROWN;
-        }
-    }
+    if (argc < 1) return throw_type(rt, "initGame expects config object");
 
+    zqjs_handle_kind cfg_kind = ZQJS_HANDLE_UNDEFINED;
+    zqjs_status st = zqjs_handle_kind_of(rt, args[0], &cfg_kind);
+    if (st != ZQJS_OK) return st;
+    if (cfg_kind != ZQJS_HANDLE_OBJECT) return throw_type(rt, "config must be an object");
+
+    zqjs_failure fail;
     zqjs_handle new_update = ZQJS_HANDLE_NULL;
     zqjs_handle new_draw = ZQJS_HANDLE_NULL;
-    zqjs_status st = zqjs_handle_dup(rt, args[0], &new_update);
+    zqjs_handle new_state = ZQJS_HANDLE_NULL;
+
+    st = zqjs_handle_get_property(rt, args[0], "update", 6, &fail, &new_update);
     if (st != ZQJS_OK) return st;
-    st = zqjs_handle_dup(rt, args[1], &new_draw);
+    st = zqjs_handle_get_property(rt, args[0], "draw", 4, &fail, &new_draw);
     if (st != ZQJS_OK) {
         zqjs_handle_release(rt, new_update);
         return st;
     }
+    st = zqjs_handle_get_property(rt, args[0], "state", 5, &fail, &new_state);
+    if (st != ZQJS_OK) {
+        zqjs_handle_release(rt, new_draw);
+        zqjs_handle_release(rt, new_update);
+        return st;
+    }
+
+    zqjs_handle_kind uk = ZQJS_HANDLE_UNDEFINED;
+    zqjs_handle_kind dk = ZQJS_HANDLE_UNDEFINED;
+    zqjs_handle_kind sk = ZQJS_HANDLE_UNDEFINED;
+    assert(zqjs_handle_kind_of(rt, new_update, &uk) == ZQJS_OK);
+    assert(zqjs_handle_kind_of(rt, new_draw, &dk) == ZQJS_OK);
+    assert(zqjs_handle_kind_of(rt, new_state, &sk) == ZQJS_OK);
+    if (uk != ZQJS_HANDLE_FUNCTION || dk != ZQJS_HANDLE_FUNCTION || sk != ZQJS_HANDLE_OBJECT) {
+        zqjs_handle_release(rt, new_state);
+        zqjs_handle_release(rt, new_draw);
+        zqjs_handle_release(rt, new_update);
+        return throw_type(rt, "config requires update/draw functions and state object");
+    }
+
+    /* Inspect nested array/object state (`state.balls[0].c[0]`) and write `state.hostAck = true` */
+    zqjs_handle balls = ZQJS_HANDLE_NULL;
+    st = zqjs_handle_get_property(rt, new_state, "balls", 5, &fail, &balls);
+    if (st == ZQJS_OK) {
+        zqjs_handle_kind bk = ZQJS_HANDLE_UNDEFINED;
+        assert(zqjs_handle_kind_of(rt, balls, &bk) == ZQJS_OK);
+        if (bk == ZQJS_HANDLE_ARRAY) {
+            zqjs_handle b0 = ZQJS_HANDLE_NULL;
+            if (zqjs_handle_get_index(rt, balls, 0, &fail, &b0) == ZQJS_OK) {
+                zqjs_handle col = ZQJS_HANDLE_NULL;
+                if (zqjs_handle_get_property(rt, b0, "c", 1, &fail, &col) == ZQJS_OK) {
+                    zqjs_handle c0 = ZQJS_HANDLE_NULL;
+                    if (zqjs_handle_get_index(rt, col, 0, &fail, &c0) == ZQJS_OK) {
+                        double ch = 0.0;
+                        assert(zqjs_handle_number(rt, c0, &ch) == ZQJS_OK);
+                        assert(ch >= 0.0 && ch <= 255.0);
+                        zqjs_handle_release(rt, c0);
+                    }
+                    zqjs_handle_release(rt, col);
+                }
+                zqjs_handle_release(rt, b0);
+            }
+        }
+        zqjs_handle_release(rt, balls);
+    }
+
+    zqjs_handle ack = ZQJS_HANDLE_NULL;
+    if (zqjs_new_boolean(rt, true, &ack) == ZQJS_OK) {
+        st = zqjs_handle_set_property(rt, new_state, "hostAck", 7, ack, &fail);
+        zqjs_handle_release(rt, ack);
+        if (st != ZQJS_OK) {
+            zqjs_handle_release(rt, new_state);
+            zqjs_handle_release(rt, new_draw);
+            zqjs_handle_release(rt, new_update);
+            return st;
+        }
+    }
 
     if (host->update_cb.owner != NULL) zqjs_handle_release(rt, host->update_cb);
     if (host->draw_cb.owner != NULL) zqjs_handle_release(rt, host->draw_cb);
+    if (host->state_h.owner != NULL) zqjs_handle_release(rt, host->state_h);
     host->update_cb = new_update;
     host->draw_cb = new_draw;
+    host->state_h = new_state;
     return ZQJS_OK;
 }
 
@@ -247,15 +310,18 @@ static zqjs_status native_key_down(
 
 static const char *DEFAULT_SCRIPT =
     "const W = 800, H = 480;\n"
-    "let balls = [];\n"
-    "let frameCount = 0;\n"
-    "let caughtCount = 0;\n"
-    "let hud = '';\n"
+    "let state = {\n"
+    "  balls: [],\n"
+    "  frameCount: 0,\n"
+    "  caughtCount: 0,\n"
+    "  hostAck: false,\n"
+    "  hud: ''\n"
+    "};\n"
     "\n"
     "for (let i = 0; i < 12; i++) {\n"
     "  let angle = (i / 12) * Math.PI * 2;\n"
     "  let speed = 90 + Math.floor(Math.random() * 140);\n"
-    "  balls.push({\n"
+    "  state.balls.push({\n"
     "    x: W * 0.5 + Math.cos(angle) * 60,\n"
     "    y: H * 0.5 + Math.sin(angle) * 60,\n"
     "    vx: Math.cos(angle) * speed,\n"
@@ -265,16 +331,18 @@ static const char *DEFAULT_SCRIPT =
     "  });\n"
     "}\n"
     "\n"
-    "function update(dt) {\n"
-    "  frameCount++;\n"
+    "function update(input) {\n"
+    "  if (!state.hostAck) throw 'missing-host-ack';\n"
+    "  let dt = input.dt;\n"
+    "  state.frameCount++;\n"
     "  try {\n"
-    "    if (frameCount === 1) throw 'simulated-recoverable-error';\n"
+    "    if (state.frameCount === 1) throw 'simulated-recoverable-error';\n"
     "  } catch (e) {\n"
-    "    if (('' + e).includes('recoverable')) caughtCount++;\n"
+    "    if (('' + e).includes('recoverable')) state.caughtCount++;\n"
     "  }\n"
-    "  let boost = keyDown(32) ? 1.8 : 1.0;\n"
-    "  for (let i = 0; i < balls.length; i++) {\n"
-    "    let b = balls[i];\n"
+    "  let boost = input.spaceDown ? 1.8 : 1.0;\n"
+    "  for (let i = 0; i < state.balls.length; i++) {\n"
+    "    let b = state.balls[i];\n"
     "    b.x = b.x + b.vx * dt * boost;\n"
     "    b.y = b.y + b.vy * dt * boost;\n"
     "    if (b.x - b.r < 0) { b.x = b.r; b.vx = Math.abs(b.vx); }\n"
@@ -282,23 +350,23 @@ static const char *DEFAULT_SCRIPT =
     "    if (b.y - b.r < 48) { b.y = 48 + b.r; b.vy = Math.abs(b.vy); }\n"
     "    if (b.y + b.r > H) { b.y = H - b.r; b.vy = -Math.abs(b.vy); }\n"
     "  }\n"
-    "  let sample = balls.slice(0, 3);\n"
-    "  let label = ('zqjs raylib c-abi | f:' + frameCount + ' balls:' + balls.length + ' caught:' + caughtCount).toUpperCase();\n"
-    "  hud = label.slice(0, 64);\n"
-    "  if (sample.length === 0 || hud.indexOf('ZQJS') !== 0) throw 'invariant';\n"
+    "  let sample = state.balls.slice(0, 3);\n"
+    "  let label = ('zqjs raylib c-abi | f:' + state.frameCount + ' balls:' + state.balls.length + ' caught:' + state.caughtCount).toUpperCase();\n"
+    "  state.hud = label.slice(0, 64);\n"
+    "  if (sample.length === 0 || state.hud.indexOf('ZQJS') !== 0) throw 'invariant';\n"
     "}\n"
     "\n"
     "function draw() {\n"
     "  clearBg(18, 22, 32);\n"
     "  drawRect(0, 0, W, 44, 30, 36, 52);\n"
-    "  drawText(hud, 16, 12, 20, 230, 240, 255);\n"
-    "  for (let i = 0; i < balls.length; i++) {\n"
-    "    let b = balls[i];\n"
+    "  drawText(state.hud, 16, 12, 20, 230, 240, 255);\n"
+    "  for (let i = 0; i < state.balls.length; i++) {\n"
+    "    let b = state.balls[i];\n"
     "    drawCircle(b.x, b.y, b.r, b.c[0], b.c[1], b.c[2]);\n"
     "  }\n"
     "}\n"
     "\n"
-    "setCallbacks(update, draw);\n";
+    "initGame({ update: update, draw: draw, state: state });\n";
 
 static char *read_file_all(const char *path, size_t *out_len) {
     FILE *f = fopen(path, "rb");
@@ -368,7 +436,43 @@ static int run_error_handling_check(void) {
     return 0;
 }
 
+static zqjs_status make_frame_input(
+    zqjs_runtime *rt,
+    double dt,
+    bool space_down,
+    zqjs_failure *fail,
+    zqjs_handle *out_input
+) {
+    zqjs_handle input = ZQJS_HANDLE_NULL;
+    zqjs_handle dt_h = ZQJS_HANDLE_NULL;
+    zqjs_handle sp_h = ZQJS_HANDLE_NULL;
+    zqjs_status st = zqjs_new_object(rt, &input);
+    if (st != ZQJS_OK) return st;
+    st = zqjs_new_number(rt, dt, &dt_h);
+    if (st != ZQJS_OK) {
+        zqjs_handle_release(rt, input);
+        return st;
+    }
+    st = zqjs_new_boolean(rt, space_down, &sp_h);
+    if (st != ZQJS_OK) {
+        zqjs_handle_release(rt, dt_h);
+        zqjs_handle_release(rt, input);
+        return st;
+    }
+    st = zqjs_handle_set_property(rt, input, "dt", 2, dt_h, fail);
+    zqjs_handle_release(rt, dt_h);
+    if (st == ZQJS_OK) st = zqjs_handle_set_property(rt, input, "spaceDown", 9, sp_h, fail);
+    zqjs_handle_release(rt, sp_h);
+    if (st != ZQJS_OK) {
+        zqjs_handle_release(rt, input);
+        return st;
+    }
+    *out_input = input;
+    return ZQJS_OK;
+}
+
 int main(int argc, char **argv) {
+    assert((zqjs_abi_version() >> 16) == ZQJS_ABI_MAJOR);
     long headless_frames = -1;
     const char *script_path = NULL;
     bool verify_errors = false;
@@ -421,9 +525,10 @@ int main(int argc, char **argv) {
         .headless = (headless_frames >= 0),
         .update_cb = ZQJS_HANDLE_NULL,
         .draw_cb = ZQJS_HANDLE_NULL,
+        .state_h = ZQJS_HANDLE_NULL,
     };
 
-    assert(zqjs_runtime_define_global_function(rt, "setCallbacks", 12, native_set_callbacks, &host) == ZQJS_OK);
+    assert(zqjs_runtime_define_global_function(rt, "initGame", 8, native_init_game, &host) == ZQJS_OK);
     assert(zqjs_runtime_define_global_function(rt, "clearBg", 7, native_clear_bg, &host) == ZQJS_OK);
     assert(zqjs_runtime_define_global_function(rt, "drawCircle", 10, native_draw_circle, &host) == ZQJS_OK);
     assert(zqjs_runtime_define_global_function(rt, "drawRect", 8, native_draw_rect, &host) == ZQJS_OK);
@@ -446,8 +551,8 @@ int main(int argc, char **argv) {
         goto cleanup_prog;
     }
 
-    if (host.update_cb.owner == NULL || host.draw_cb.owner == NULL) {
-        fprintf(stderr, "script did not register update and draw callbacks\n");
+    if (host.update_cb.owner == NULL || host.draw_cb.owner == NULL || host.state_h.owner == NULL) {
+        fprintf(stderr, "script did not register initGame({ update, draw, state })\n");
         exit_code = 1;
         goto cleanup_prog;
     }
@@ -455,11 +560,11 @@ int main(int argc, char **argv) {
     if (host.headless) {
         const double fixed_dt = 1.0 / 60.0;
         for (long frame = 0; frame < headless_frames; frame++) {
-            zqjs_handle dt_arg = ZQJS_HANDLE_NULL;
+            zqjs_handle input_arg = ZQJS_HANDLE_NULL;
             zqjs_handle res = ZQJS_HANDLE_NULL;
-            assert(zqjs_new_number(rt, fixed_dt, &dt_arg) == ZQJS_OK);
-            zqjs_status st = zqjs_runtime_call(rt, host.update_cb, NULL, &dt_arg, 1, &fail, &res);
-            assert(zqjs_handle_release(rt, dt_arg) == ZQJS_OK);
+            assert(make_frame_input(rt, fixed_dt, false, &fail, &input_arg) == ZQJS_OK);
+            zqjs_status st = zqjs_runtime_call(rt, host.update_cb, NULL, &input_arg, 1, &fail, &res);
+            assert(zqjs_handle_release(rt, input_arg) == ZQJS_OK);
             if (st != ZQJS_OK) {
                 print_failure("update", &fail);
                 exit_code = 1;
@@ -476,6 +581,13 @@ int main(int argc, char **argv) {
             }
             assert(zqjs_handle_release(rt, res) == ZQJS_OK);
         }
+
+        zqjs_handle fc_h = ZQJS_HANDLE_NULL;
+        assert(zqjs_handle_get_property(rt, host.state_h, "frameCount", 10, &fail, &fc_h) == ZQJS_OK);
+        double fc = 0.0;
+        assert(zqjs_handle_number(rt, fc_h, &fc) == ZQJS_OK);
+        assert((long)fc == headless_frames);
+        assert(zqjs_handle_release(rt, fc_h) == ZQJS_OK);
 
         assert(zqjs_runtime_collect_garbage(rt) == ZQJS_OK);
         zqjs_memory mem;
@@ -495,11 +607,11 @@ int main(int argc, char **argv) {
         SetTargetFPS(60);
         while (!WindowShouldClose()) {
             double dt = (double)GetFrameTime();
-            zqjs_handle dt_arg = ZQJS_HANDLE_NULL;
+            zqjs_handle input_arg = ZQJS_HANDLE_NULL;
             zqjs_handle res = ZQJS_HANDLE_NULL;
-            assert(zqjs_new_number(rt, dt, &dt_arg) == ZQJS_OK);
-            zqjs_status st = zqjs_runtime_call(rt, host.update_cb, NULL, &dt_arg, 1, &fail, &res);
-            assert(zqjs_handle_release(rt, dt_arg) == ZQJS_OK);
+            assert(make_frame_input(rt, dt, IsKeyDown(KEY_SPACE), &fail, &input_arg) == ZQJS_OK);
+            zqjs_status st = zqjs_runtime_call(rt, host.update_cb, NULL, &input_arg, 1, &fail, &res);
+            assert(zqjs_handle_release(rt, input_arg) == ZQJS_OK);
             if (st != ZQJS_OK) {
                 print_failure("update", &fail);
                 exit_code = 1;
@@ -524,6 +636,7 @@ int main(int argc, char **argv) {
 cleanup_prog:
     if (host.update_cb.owner != NULL) assert(zqjs_handle_release(rt, host.update_cb) == ZQJS_OK);
     if (host.draw_cb.owner != NULL) assert(zqjs_handle_release(rt, host.draw_cb) == ZQJS_OK);
+    if (host.state_h.owner != NULL) assert(zqjs_handle_release(rt, host.state_h) == ZQJS_OK);
     assert(zqjs_program_destroy(prog) == ZQJS_OK);
 cleanup_rt:
     assert(zqjs_runtime_collect_garbage(rt) == ZQJS_OK);

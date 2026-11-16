@@ -351,6 +351,112 @@ pub const Runtime = opaque {
         return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .string = s }));
     }
 
+    /// Creates an empty ordinary JS object (`Object.prototype`) and mints an owned handle.
+    pub fn newObject(rt: *Runtime) HandleError!Handle {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) return error.Internal;
+        const realm = internal.builtins.realm(&r.rt) catch |e| return mapHandleInternalError(e);
+        const obj = r.rt.heap.newObject(realm.object_prototype) catch |e| return mapHandleInternalError(e);
+        return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .object = obj }));
+    }
+
+    /// Creates an empty dense JS array (`Array.prototype`) and mints an owned handle.
+    pub fn newArray(rt: *Runtime) HandleError!Handle {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) return error.Internal;
+        const realm = internal.builtins.realm(&r.rt) catch |e| return mapHandleInternalError(e);
+        const arr = r.rt.heap.newArray(realm.array_prototype) catch |e| return mapHandleInternalError(e);
+        return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .object = arr }));
+    }
+
+    /// Reads a runtime global (`Math`, `Object`, `Array`, host-registered natives,
+    /// `undefined`, `NaN`, `Infinity`) and mints an owned handle (E3: script top-level
+    /// bindings are per-execution and are not stored here).
+    pub fn getGlobal(rt: *Runtime, name: []const u8, failure: ?*Failure) RunError!Handle {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) {
+            if (failure) |out| out.* = internalFailure();
+            return error.Internal;
+        }
+        prepareRun(&r.rt);
+        const val = internal.builtins.global(&r.rt, name) catch |e| return failRun(&r.rt, e, failure);
+        return mintHandle(r, val, failure);
+    }
+
+    /// Reads `obj[key]` using JS property semantics and mints an owned handle. Missing
+    /// properties return an owned `undefined` handle; `obj` is borrowed.
+    pub fn getProperty(rt: *Runtime, obj: Handle, key: []const u8, failure: ?*Failure) RunError!Handle {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) {
+            if (failure) |out| out.* = internalFailure();
+            return error.Internal;
+        }
+        const base = handles.Token.checkedValue(&r.rt, obj.tok());
+        prepareRun(&r.rt);
+        const k = propertyKey(&r.rt, key) catch |e| return failRun(&r.rt, e, failure);
+        const val = internal.object.get(&r.rt, base, k) catch |e| return failRun(&r.rt, e, failure);
+        return mintHandle(r, val, failure);
+    }
+
+    /// Writes `obj[key] = val` using JS property semantics (dense-array rules apply: D13).
+    /// Both `obj` and `val` are borrowed and never released.
+    pub fn setProperty(rt: *Runtime, obj: Handle, key: []const u8, val: Handle, failure: ?*Failure) RunError!void {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) {
+            if (failure) |out| out.* = internalFailure();
+            return error.Internal;
+        }
+        const base = handles.Token.checkedValue(&r.rt, obj.tok());
+        const v = handles.Token.checkedValue(&r.rt, val.tok());
+        prepareRun(&r.rt);
+        const k = propertyKey(&r.rt, key) catch |e| return failRun(&r.rt, e, failure);
+        internal.object.set(&r.rt, base, k, v) catch |e| return failRun(&r.rt, e, failure);
+    }
+
+    /// Reads `obj[index]` without string formatting and mints an owned handle. Out-of-range
+    /// array indices return an owned `undefined` handle; `obj` is borrowed.
+    pub fn getIndex(rt: *Runtime, obj: Handle, index: u32, failure: ?*Failure) RunError!Handle {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) {
+            if (failure) |out| out.* = internalFailure();
+            return error.Internal;
+        }
+        const base = handles.Token.checkedValue(&r.rt, obj.tok());
+        prepareRun(&r.rt);
+        const k = indexKey(&r.rt, index) catch |e| return failRun(&r.rt, e, failure);
+        const val = internal.object.get(&r.rt, base, k) catch |e| return failRun(&r.rt, e, failure);
+        return mintHandle(r, val, failure);
+    }
+
+    /// Writes `obj[index] = val` (dense-array rules apply: `index == length` appends,
+    /// `index > length` fails with `error.Unsupported`). Both `obj` and `val` are borrowed.
+    pub fn setIndex(rt: *Runtime, obj: Handle, index: u32, val: Handle, failure: ?*Failure) RunError!void {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) {
+            if (failure) |out| out.* = internalFailure();
+            return error.Internal;
+        }
+        const base = handles.Token.checkedValue(&r.rt, obj.tok());
+        const v = handles.Token.checkedValue(&r.rt, val.tok());
+        prepareRun(&r.rt);
+        const k = indexKey(&r.rt, index) catch |e| return failRun(&r.rt, e, failure);
+        internal.object.set(&r.rt, base, k, v) catch |e| return failRun(&r.rt, e, failure);
+    }
+
     /// JS → host (M9.1, D53): registers a host native as a global function under `name`.
     /// Duplicate names — including built-in names — return `error.NameTaken` and leave
     /// the realm unchanged. `ctx` is borrowed by the runtime until `Runtime.destroy`.
@@ -810,6 +916,51 @@ const ExecutionImpl = struct {
         return if (state == .halted) .finished else .suspended;
     }
 };
+
+fn mapHandleInternalError(e: internal.runtime.Error) HandleError {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.LimitExceeded => error.LimitExceeded,
+        error.Internal => error.Internal,
+        else => unreachable,
+    };
+}
+
+fn prepareRun(rt: *IRuntime) void {
+    rt.clearThrown();
+    rt.unsupported = null;
+    rt.unsupported_name = null;
+    rt.limit_hit = null;
+    rt.heap.limit_hit = null;
+}
+
+fn failRun(rt: *IRuntime, e: internal.runtime.Error, failure: ?*Failure) RunError {
+    const fo = faultOf(rt, e);
+    if (failure) |out| out.* = fo.failure;
+    return fo.err;
+}
+
+fn propertyKey(rt: *IRuntime, key: []const u8) internal.runtime.Error!internal.object.Key {
+    var ascii = true;
+    for (key) |b| {
+        if (b >= 0x80) {
+            ascii = false;
+            break;
+        }
+    }
+    if (ascii) return internal.object.named(rt, key);
+    const units = std.unicode.utf8ToUtf16LeAlloc(rt.gpa, key) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return rt.throw(.TypeError, &.{.{ .ascii = "invalid UTF-8 property key" }}),
+    };
+    defer rt.gpa.free(units);
+    return internal.object.keyUnits(rt, units);
+}
+
+fn indexKey(rt: *IRuntime, index: u32) internal.runtime.Error!internal.object.Key {
+    if (index <= std.math.maxInt(u32) - 1) return .{ .index = index };
+    return .{ .atom = try rt.heap.internAscii("4294967295") };
+}
 
 /// The belt and the description every fault goes through (E7/E10): an `Internal` from
 /// any path poisons the runtime (whoever raised it), and the failure carries the

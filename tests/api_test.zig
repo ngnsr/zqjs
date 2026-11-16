@@ -257,6 +257,36 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
         _ = rt.run(p1, null) catch {};
         return;
     }
+    if (std.mem.eql(u8, scenario, "getprop-released")) {
+        const rt = try zqjs.Runtime.create(testing.allocator, .{});
+        defer rt.destroy();
+        const obj = try rt.newObject();
+        obj.release();
+        _ = rt.getProperty(obj, "x", null) catch {};
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "setprop-foreign-val")) {
+        const rt1 = try zqjs.Runtime.create(testing.allocator, .{});
+        defer rt1.destroy();
+        const rt2 = try zqjs.Runtime.create(testing.allocator, .{});
+        defer rt2.destroy();
+        const obj = try rt1.newObject();
+        defer obj.release();
+        const val = try rt2.newNumber(7);
+        defer val.release();
+        rt1.setProperty(obj, "x", val, null) catch {};
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "getindex-foreign")) {
+        const rt1 = try zqjs.Runtime.create(testing.allocator, .{});
+        defer rt1.destroy();
+        const rt2 = try zqjs.Runtime.create(testing.allocator, .{});
+        defer rt2.destroy();
+        const arr = try rt2.newArray();
+        defer arr.release();
+        _ = rt1.getIndex(arr, 0, null) catch {};
+        return;
+    }
     if (std.mem.eql(u8, scenario, "native-use-temp-after-return")) {
         const Box = struct { h: zqjs.Handle = undefined };
         const S = struct {
@@ -1085,6 +1115,9 @@ test "the guard and the tag checks panic, as expected, in a child process (E1, E
         .{ .name = "native-use-temp-after-slot-reuse", .message = "zqjs: Handle used after release" },
         .{ .name = "native-return-retained-without-dup", .message = "zqjs: Handle used after release" },
         .{ .name = "writer-reenter-inside-nested-call", .message = guard_message },
+        .{ .name = "getprop-released", .message = "zqjs: Handle used after release" },
+        .{ .name = "setprop-foreign-val", .message = "zqjs: Handle from another Runtime" },
+        .{ .name = "getindex-foreign", .message = "zqjs: Handle from another Runtime" },
         .{ .name = "program-after-destroy", .message = "zqjs: Program used after destroy" },
     };
     const count = if (std.debug.runtime_safety) scenarios.len else scenarios.len - 1;
@@ -2357,4 +2390,211 @@ fn checkNestedCallAllocFailOnce(gpa: std.mem.Allocator) !void {
 
 test "nested rt.call allocation failures unwind call_depth without panicking" {
     try testing.checkAllAllocationFailures(testing.allocator, checkNestedCallAllocFailOnce, .{});
+}
+
+fn nativeInspectAndMutateGame(rt: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+    const cfg = args[0];
+    const items = rt.getProperty(cfg, "items", null) catch |e| switch (e) {
+        error.OutputFailed => return error.HostError,
+        else => |err| return err,
+    };
+    defer items.release();
+
+    const first = rt.getIndex(items, 0, null) catch |e| switch (e) {
+        error.OutputFailed => return error.HostError,
+        else => |err| return err,
+    };
+    defer first.release();
+
+    const doubled = try rt.newNumber((first.number() orelse 0) * 2.0);
+    defer doubled.release();
+    rt.setIndex(items, 2, doubled, null) catch |e| switch (e) {
+        error.OutputFailed => return error.HostError,
+        else => |err| return err,
+    };
+
+    const reply = try rt.newObject();
+    errdefer reply.release();
+    const ok_val = try rt.newBoolean(true);
+    defer ok_val.release();
+    rt.setProperty(reply, "ok", ok_val, null) catch |e| switch (e) {
+        error.OutputFailed => return error.HostError,
+        else => |err| return err,
+    };
+    out.result = reply;
+}
+
+test "M12.2: newObject, newArray, getGlobal, getProperty/setProperty, getIndex/setIndex, GC survival, and native reentrancy" {
+    var out_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try zqjs.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    // 1. newObject + setProperty/getProperty + missing property + UTF-8 key + __proto__ Unsupported.
+    const obj = try rt.newObject();
+    defer obj.release();
+    try testing.expectEqual(zqjs.HandleKind.object, obj.kind());
+
+    const n42 = try rt.newNumber(42);
+    defer n42.release();
+    try rt.setProperty(obj, "answer", n42, null);
+
+    // Borrowed inputs remain valid after setProperty.
+    try testing.expectEqual(@as(?f64, 42), n42.number());
+
+    const got = try rt.getProperty(obj, "answer", null);
+    defer got.release();
+    try testing.expectEqual(@as(?f64, 42), got.number());
+
+    const missing = try rt.getProperty(obj, "missing", null);
+    defer missing.release();
+    try testing.expectEqual(zqjs.HandleKind.undefined, missing.kind());
+
+    // UTF-8 property key ("café")
+    const cafe_val = try rt.newBoolean(true);
+    defer cafe_val.release();
+    try rt.setProperty(obj, "caf\xc3\xa9", cafe_val, null);
+    const got_cafe = try rt.getProperty(obj, "caf\xc3\xa9", null);
+    defer got_cafe.release();
+    try testing.expectEqual(@as(?bool, true), got_cafe.boolean());
+
+    // __proto__ stays Unsupported.
+    var proto_fail: zqjs.Failure = .{};
+    try testing.expectError(error.Unsupported, rt.setProperty(obj, "__proto__", obj, &proto_fail));
+    try testing.expectEqual(zqjs.Failure.Kind.unsupported, proto_fail.kind);
+
+    // 2. newArray + setIndex/getIndex + length + dense-array rules + maxInt(u32).
+    const arr = try rt.newArray();
+    defer arr.release();
+    try testing.expectEqual(zqjs.HandleKind.array, arr.kind());
+
+    const v0 = try rt.newNumber(10);
+    defer v0.release();
+    const v1 = try rt.newNumber(20);
+    defer v1.release();
+    try rt.setIndex(arr, 0, v0, null); // append at 0
+    try rt.setIndex(arr, 1, v1, null); // append at 1
+
+    const len_h = try rt.getProperty(arr, "length", null);
+    defer len_h.release();
+    try testing.expectEqual(@as(?f64, 2), len_h.number());
+
+    const oob = try rt.getIndex(arr, 99, null);
+    defer oob.release();
+    try testing.expectEqual(zqjs.HandleKind.undefined, oob.kind());
+
+    var sparse_fail: zqjs.Failure = .{};
+    try testing.expectError(error.Unsupported, rt.setIndex(arr, 5, v0, &sparse_fail));
+    try testing.expectEqual(zqjs.Failure.Kind.unsupported, sparse_fail.kind);
+
+    // maxInt(u32) is treated as an ordinary property atom, not an array index.
+    try rt.setIndex(arr, std.math.maxInt(u32), v1, null);
+    const max_idx_got = try rt.getIndex(arr, std.math.maxInt(u32), null);
+    defer max_idx_got.release();
+    try testing.expectEqual(@as(?f64, 20), max_idx_got.number());
+
+    // Shrink via length = 1.
+    const one_h = try rt.newNumber(1);
+    defer one_h.release();
+    try rt.setProperty(arr, "length", one_h, null);
+    const shrunk_oob = try rt.getIndex(arr, 1, null);
+    defer shrunk_oob.release();
+    try testing.expectEqual(zqjs.HandleKind.undefined, shrunk_oob.kind());
+
+    // 3. TypeError vs Unsupported receiver distinctions.
+    var type_fail: zqjs.Failure = .{};
+    try testing.expectError(error.Thrown, rt.getProperty(missing, "x", &type_fail));
+    try testing.expectEqual(zqjs.Failure.Kind.thrown, type_fail.kind);
+    try testing.expect(std.mem.indexOf(u8, type_fail.message(), "TypeError") != null);
+
+    var prim_fail: zqjs.Failure = .{};
+    try testing.expectError(error.Unsupported, rt.setIndex(n42, 0, v0, &prim_fail));
+    try testing.expectEqual(zqjs.Failure.Kind.unsupported, prim_fail.kind);
+
+    // 4. getGlobal: Math, Math.sin, host native, E3 isolation, Unsupported(JSON), ReferenceError.
+    const math_h = try rt.getGlobal("Math", null);
+    defer math_h.release();
+    const pi_h = try rt.getProperty(math_h, "PI", null);
+    defer pi_h.release();
+    try testing.expectApproxEqAbs(std.math.pi, pi_h.number().?, 1e-12);
+
+    const sin_h = try rt.getProperty(math_h, "sin", null);
+    defer sin_h.release();
+    const zero_h = try rt.newNumber(0);
+    defer zero_h.release();
+    const sin_res = try rt.call(sin_h, math_h, &.{zero_h}, null);
+    defer sin_res.release();
+    try testing.expectEqual(@as(?f64, 0), sin_res.number());
+
+    var json_fail: zqjs.Failure = .{};
+    try testing.expectError(error.Unsupported, rt.getGlobal("JSON", &json_fail));
+    try testing.expectEqual(zqjs.Failure.Kind.unsupported, json_fail.kind);
+
+    var ref_fail: zqjs.Failure = .{};
+    try testing.expectError(error.Thrown, rt.getGlobal("notDefined", &ref_fail));
+    try testing.expectEqual(zqjs.Failure.Kind.thrown, ref_fail.kind);
+
+    // 5. GC survival across collections + churn.
+    rt.collectGarbage();
+    const after_gc_arr = try rt.getIndex(arr, 0, null);
+    defer after_gc_arr.release();
+    try testing.expectEqual(@as(?f64, 10), after_gc_arr.number());
+    const after_gc_obj = try rt.getProperty(obj, "answer", null);
+    defer after_gc_obj.release();
+    try testing.expectEqual(@as(?f64, 42), after_gc_obj.number());
+
+    // 6. Reentrant use inside native callback + E3 top-level lexical isolation.
+    try rt.defineGlobalFunction("initGame", &nativeInspectAndMutateGame, null);
+    const p = try rt.compile("game.js",
+        \\let secret = 123;
+        \\let state = { items: [7, 8] };
+        \\let res = initGame(state);
+        \\print(res.ok, state.items.length, state.items[2]);
+    , null);
+    defer p.destroy();
+    try rt.run(p, null);
+    try testing.expectEqualStrings("true 3 14\n", out.buffered());
+    try testing.expectError(error.Thrown, rt.getGlobal("secret", null));
+}
+
+fn checkStructuredApiAllocFailOnce(gpa: std.mem.Allocator) !void {
+    const rt = try zqjs.Runtime.create(gpa, .{});
+    defer rt.destroy();
+
+    const obj = try rt.newObject();
+    defer obj.release();
+    const arr = try rt.newArray();
+    defer arr.release();
+    const n = try rt.newNumber(5);
+    defer n.release();
+
+    rt.setIndex(arr, 0, n, null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return e,
+    };
+    const got_i = rt.getIndex(arr, 0, null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return e,
+    };
+    defer got_i.release();
+
+    rt.setProperty(obj, "arr", arr, null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return e,
+    };
+    const got_p = rt.getProperty(obj, "arr", null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return e,
+    };
+    defer got_p.release();
+
+    const math_h = rt.getGlobal("Math", null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return e,
+    };
+    defer math_h.release();
+}
+
+test "M12.2: allocation failures across object/array/global/property/index APIs" {
+    try testing.checkAllAllocationFailures(testing.allocator, checkStructuredApiAllocFailOnce, .{});
 }

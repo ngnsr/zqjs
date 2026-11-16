@@ -23,6 +23,7 @@ pub const Heap = @import("runtime/heap.zig").Heap;
 pub const heap = @import("runtime/heap.zig");
 pub const runtime = @import("runtime/runtime.zig");
 pub const builtins = @import("runtime/builtins.zig");
+pub const object = @import("runtime/object.zig");
 pub const handles = @import("runtime/handles.zig");
 pub const runSource = @import("run.zig").runSource;
 pub const RunMode = @import("run.zig").Mode;

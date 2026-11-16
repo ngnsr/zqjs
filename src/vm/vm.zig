@@ -149,7 +149,7 @@ pub const Vm = struct {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
-            .tree => return rt.bug("a tree-walker closure in a nested call"),
+            .tree, .promise_cap => return rt.bug("a non-VM closure in a nested call"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
         const argc: u32 = @intCast(args.len);
@@ -196,6 +196,24 @@ pub const Vm = struct {
                 rt.max_steps = saved_max_steps;
             }
         }
+        if (rt.exec_ctx.budget_fault != null) return rt.limit(.steps);
+        if (rt.exec_ctx.call_depth >= rt.limits.max_call_depth) return rt.limit(.call_depth);
+
+        var nested = try Vm.initCall(rt, c, this, args);
+        defer nested.deinit();
+        nested.chain = &rt.exec_ctx;
+        rt.exec_ctx.call_depth += 1;
+        try rt.exec_ctx.vms.append(rt.gpa, nested.roots());
+        defer rt.exec_ctx.removeVm(&nested);
+
+        try nested.run();
+        if (rt.exec_ctx.budget_fault != null) return rt.limit(.steps);
+        return nested.nested_result orelse rt.bug("a nested call ended without a result");
+    }
+
+    /// Invokes a VM closure from a top-level microtask checkpoint outside any outer VM (M18).
+    pub fn callStandalone(ctx: *anyopaque, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
+        const rt: *Runtime = @ptrCast(@alignCast(ctx));
         if (rt.exec_ctx.budget_fault != null) return rt.limit(.steps);
         if (rt.exec_ctx.call_depth >= rt.limits.max_call_depth) return rt.limit(.call_depth);
 
@@ -349,6 +367,12 @@ pub const Vm = struct {
             };
             if (state == .halted) {
                 cache.syncSp(vm);
+                if (!vm.nested) {
+                    rt.drainMicrotasks() catch |e| {
+                        vm.fault = e;
+                        return e;
+                    };
+                }
                 return .halted;
             }
             if (bounded) n += 1;
@@ -750,13 +774,20 @@ pub const Vm = struct {
                         vm.stack[base] = result;
                         cache.sp = base + 1;
                     },
-                    .closure => |c| {
-                        // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
-                        const this: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
-                        cache.syncSp(vm);
-                        try vm.enter(c, base, args, argc, next, this);
-                        cache.* = FrameCache.fromVm(vm, 0);
-                        return .running; // pc is the callee's 0
+                    .closure => |c| switch (c.impl) {
+                        .promise_cap => |cap| {
+                            cache.syncSp(vm);
+                            vm.stack[base] = try @import("../runtime/builtins.zig").callPromiseCapability(rt, cap.promise, cap.is_reject, vm.stack[args..cache.sp]);
+                            cache.sp = base + 1;
+                        },
+                        .vm, .tree => {
+                            // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
+                            const this: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
+                            cache.syncSp(vm);
+                            try vm.enter(c, base, args, argc, next, this);
+                            cache.* = FrameCache.fromVm(vm, 0);
+                            return .running; // pc is the callee's 0
+                        },
                     },
                     else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
                 }
@@ -812,7 +843,7 @@ pub const Vm = struct {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
-            .tree => return vm.bug("a tree-walker closure in the VM"),
+            .tree, .promise_cap => return vm.bug("a non-VM closure in the VM"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
         const limits = vm.rt.limits;

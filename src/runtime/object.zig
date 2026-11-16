@@ -151,6 +151,7 @@ pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
                 .array => r.array_namespace,
                 .map => r.map_namespace,
                 .set => r.set_namespace,
+                .promise => r.promise_namespace,
             };
             if (own(ns, k)) |v| return v;
             if (nodeHas(ns.builtin.?, k) or nodeHas(.function_prototype, k)) return unsupportedBuiltin(rt, k);
@@ -178,7 +179,7 @@ fn ownGet(rt: *Runtime, o: *Object, k: Key) Error!?Value {
             .atom => if (isNamed(k, "length")) return .{ .number = @floatFromInt(elements.items.len) },
         },
         .map, .set => |table| if (isNamed(k, "size")) return .{ .number = @floatFromInt(table.live_count) },
-        .ordinary, .iterator => {},
+        .ordinary, .iterator, .promise => {},
     }
     if (o.props.count() == 0) return null; // don't intern index keys just to miss
     const p = o.props.get(try atomOf(rt, k)) orelse return null;
@@ -223,7 +224,7 @@ pub fn set(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
             .atom => if (isNamed(k, "length")) return setLength(rt, o, v),
         },
         .map, .set => if (isNamed(k, "size")) return, // Map/Set size is a read-only getter
-        .ordinary, .iterator => {},
+        .ordinary, .iterator, .promise => {},
     }
     try putOwn(rt, o, k, v);
 }
@@ -262,7 +263,7 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
             .index => |i| return if (i < elements.items.len) rt.fail(.sparse_array) else true,
             .atom => if (isNamed(k, "length")) return false, // non-configurable
         },
-        .ordinary, .map, .set, .iterator => {},
+        .ordinary, .map, .set, .iterator, .promise => {},
     }
     if (o.props.count() == 0) return true;
     rt.heap.removeProperty(o, try atomOf(rt, k));
@@ -296,7 +297,7 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
         .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
-        .ordinary, .map, .set, .iterator => {},
+        .ordinary, .map, .set, .iterator, .promise => {},
     }
     const first_named = out.items.len;
     for (o.props.keys(), o.props.values()) |a, p| {

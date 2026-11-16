@@ -105,6 +105,8 @@ pub const Closure = struct {
         vm: struct { proto: *const anyopaque, captures: []*Cell },
         /// `func: *const ast.Function`; `env` is the environment it was created in.
         tree: struct { func: *const anyopaque, env: ?*Env },
+        /// Native Promise resolve/reject capability (M18).
+        promise_cap: struct { promise: *Object, is_reject: bool },
     },
 };
 
@@ -282,6 +284,21 @@ pub const IteratorState = struct {
     done: bool = false,
 };
 
+pub const PromiseStateTag = enum { pending, fulfilled, rejected };
+
+pub const PromiseReaction = struct {
+    child: ?*Object,
+    on_fulfilled: Value,
+    on_rejected: Value,
+};
+
+pub const PromiseState = struct {
+    state: PromiseStateTag = .pending,
+    already_resolved: bool = false,
+    result: Value = .undefined,
+    reactions: std.ArrayList(PromiseReaction) = .empty,
+};
+
 /// An ordinary object or an array (DESIGN_DECISIONS D13).
 pub const Object = struct {
     obj: Obj,
@@ -300,6 +317,8 @@ pub const Object = struct {
         set: OrderedTable,
         /// Built-in iterator state (M14.4).
         iterator: IteratorState,
+        /// Native Promise state (M18).
+        promise: PromiseState,
     } = .ordinary,
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
@@ -631,6 +650,14 @@ pub const Heap = struct {
                     visitValue(e.value, &scan, RememberedScan.child);
                 },
                 .iterator => |it| visitValue(it.target, &scan, RememberedScan.child),
+                .promise => |pr| {
+                    visitValue(pr.result, &scan, RememberedScan.child);
+                    for (pr.reactions.items) |rx| {
+                        if (rx.child) |ch| RememberedScan.child(&scan, &ch.obj);
+                        visitValue(rx.on_fulfilled, &scan, RememberedScan.child);
+                        visitValue(rx.on_rejected, &scan, RememberedScan.child);
+                    }
+                },
             }
         }
     }
@@ -904,6 +931,12 @@ pub const Heap = struct {
         return o;
     }
 
+    pub fn newPromise(h: *Heap, proto: ?*Object) Error!*Object {
+        const o = try h.newObject(proto);
+        o.kind = .{ .promise = .{} };
+        return o;
+    }
+
     // ---- the store API (GC_DESIGN §7, I3)
     //
     // After construction, every reference written into a heap object goes through one of
@@ -1089,7 +1122,7 @@ pub const Heap = struct {
     /// The write barrier: `owner` now holds `new` where it held `old` (GC_DESIGN §7). M8.1:
     /// an old owner storing a young reference joins the remembered set. It records owners,
     /// not edges, so a reference overwritten later keeps nothing alive. Never allocates.
-    inline fn barrier(h: *Heap, owner: *Obj, old: ?Value, new: ?Value) void {
+    pub inline fn barrier(h: *Heap, owner: *Obj, old: ?Value, new: ?Value) void {
         _ = old;
         // Not the barrier's job, but every store passes here: in stress builds, a store
         // into or of a collected object is caught at the store.
@@ -1119,7 +1152,7 @@ pub const Heap = struct {
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
         return switch (arr.kind) {
             .array => |*elements| elements,
-            .ordinary, .map, .set, .iterator => unreachable, // only arrays have elements
+            .ordinary, .map, .set, .iterator, .promise => unreachable, // only arrays have elements
         };
     }
 
@@ -1246,6 +1279,15 @@ pub const Heap = struct {
         return c;
     }
 
+    pub fn newPromiseCapability(h: *Heap, promise: *Object, is_reject: bool) Error!*Closure {
+        const charge = try h.reserve(@sizeOf(Closure), 0, 2);
+        errdefer h.bytes -= charge;
+        const c = try h.gpa.create(Closure);
+        c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .promise_cap = .{ .promise = promise, .is_reject = is_reject } } };
+        h.young = &c.obj;
+        return c;
+    }
+
     /// An environment record with `len` bindings, all in the TDZ.
     pub fn newEnv(h: *Heap, parent: ?*Env, scope: u32, len: usize) Error!*Env {
         const payload = std.math.mul(usize, len, @sizeOf(?Value)) catch return h.exceeded(.heap_bytes);
@@ -1289,7 +1331,7 @@ pub const Heap = struct {
             .cell => @sizeOf(Cell) + per_allocation_overhead,
             .closure => switch (@as(*const Closure, @alignCast(@fieldParentPtr("obj", obj))).impl) {
                 .vm => |v| @sizeOf(Closure) + v.captures.len * @sizeOf(*Cell) + 2 * per_allocation_overhead,
-                .tree => @sizeOf(Closure) + 2 * per_allocation_overhead,
+                .tree, .promise_cap => @sizeOf(Closure) + 2 * per_allocation_overhead,
             },
             .env => @sizeOf(Env) + @as(*const Env, @alignCast(@fieldParentPtr("obj", obj))).values.len * @sizeOf(?Value) + 2 * per_allocation_overhead,
             .object => @sizeOf(Object) + per_allocation_overhead,
@@ -1317,6 +1359,7 @@ pub const Heap = struct {
                         v.captures = &.{};
                     },
                     .tree => |*t| t.env = null,
+                    .promise_cap => {},
                 }
             },
             .env => {
@@ -1338,6 +1381,7 @@ pub const Heap = struct {
                     },
                     .map, .set => |*table| table.deinit(h.allocator()),
                     .iterator => {},
+                    .promise => |*pr| pr.reactions.deinit(h.allocator()),
                 }
                 o.kind = .ordinary;
                 o.proto = null;
@@ -1438,6 +1482,7 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                 // The Proto (and its string constants) is not a heap object yet; M8 roots it.
                 .vm => |v| for (v.captures) |cell| visit(ctx, &cell.obj),
                 .tree => |t| if (t.env) |e| visit(ctx, &e.obj),
+                .promise_cap => |pc| visit(ctx, &pc.promise.obj),
             }
         },
         .env => {
@@ -1461,6 +1506,14 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                     visitValue(e.value, ctx, visit);
                 },
                 .iterator => |it| visitValue(it.target, ctx, visit),
+                .promise => |pr| {
+                    visitValue(pr.result, ctx, visit);
+                    for (pr.reactions.items) |rx| {
+                        if (rx.child) |ch| visit(ctx, &ch.obj);
+                        visitValue(rx.on_fulfilled, ctx, visit);
+                        visitValue(rx.on_rejected, ctx, visit);
+                    }
+                },
             }
         },
     }

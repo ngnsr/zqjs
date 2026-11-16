@@ -17,6 +17,8 @@ pub const Builtin = enum {
     map_prototype,
     set_constructor,
     set_prototype,
+    promise_constructor,
+    promise_prototype,
     iterator_prototype,
     math,
     json,
@@ -38,6 +40,8 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .map_prototype => map_prototype.has(name),
         .set_constructor => set_constructor.has(name),
         .set_prototype => set_prototype.has(name),
+        .promise_constructor => promise_constructor.has(name),
+        .promise_prototype => promise_prototype.has(name),
         .iterator_prototype => iterator_prototype.has(name),
         .math => math.has(name),
         .json => json.has(name),
@@ -342,6 +346,27 @@ const set_prototype = std.StaticStringMap(void).initComptime(.{
     .{"symmetricDifference"},
     .{"union"},
     .{"values"},
+});
+
+const promise_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"all"},
+    .{"allSettled"},
+    .{"any"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+    .{"race"},
+    .{"reject"},
+    .{"resolve"},
+    .{"try"},
+    .{"withResolvers"},
+});
+
+const promise_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"catch"},
+    .{"constructor"},
+    .{"finally"},
+    .{"then"},
 });
 
 const iterator_prototype = std.StaticStringMap(void).initComptime(.{

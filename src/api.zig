@@ -1040,9 +1040,40 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
                 if (failure) |out| out.* = fo.failure;
                 return fo.err;
             }
+            if (top_level) {
+                const prev_caller = rt.closure_caller;
+                rt.closure_caller = .{ .ctx = rt, .call = internal.Vm.callStandalone };
+                defer rt.closure_caller = prev_caller;
+                rt.drainMicrotasks() catch |e| {
+                    const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                    const fo = faultOf(rt, err);
+                    if (failure) |out| out.* = fo.failure;
+                    return fo.err;
+                };
+            }
             return mintHandle(r, result, failure);
         },
         .closure => |c| {
+            if (c.impl == .promise_cap) {
+                const pc = c.impl.promise_cap;
+                const result = internal.builtins.callPromiseCapability(rt, pc.promise, pc.is_reject, argv) catch |e| {
+                    const fo = faultOf(rt, e);
+                    if (failure) |out| out.* = fo.failure;
+                    return fo.err;
+                };
+                if (top_level) {
+                    const prev_caller = rt.closure_caller;
+                    rt.closure_caller = .{ .ctx = rt, .call = internal.Vm.callStandalone };
+                    defer rt.closure_caller = prev_caller;
+                    rt.drainMicrotasks() catch |e| {
+                        const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                        const fo = faultOf(rt, err);
+                        if (failure) |out| out.* = fo.failure;
+                        return fo.err;
+                    };
+                }
+                return mintHandle(r, result, failure);
+            }
             // Model B (D51): a fresh VM, frame 0 the callee; `this` binds by the VM's
             // sloppy rule (object receivers only, D41). Its `return` ends the call.
             if (rt.exec_ctx.call_depth >= rt.limits.max_call_depth) {
@@ -1080,6 +1111,17 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
                 if (failure) |out| out.* = fo.failure;
                 return fo.err;
             };
+            if (top_level) {
+                const prev_caller = rt.closure_caller;
+                rt.closure_caller = .{ .ctx = rt, .call = internal.Vm.callStandalone };
+                defer rt.closure_caller = prev_caller;
+                rt.drainMicrotasks() catch |e| {
+                    const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                    const fo = faultOf(rt, err);
+                    if (failure) |out| out.* = fo.failure;
+                    return fo.err;
+                };
+            }
             return mintHandle(r, result, failure);
         },
         else => {

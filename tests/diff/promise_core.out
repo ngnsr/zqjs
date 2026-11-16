@@ -1,0 +1,5 @@
+noNew TypeError
+nonFn TypeError
+sameAfter true
+lateThrow true
+wrapped true true true

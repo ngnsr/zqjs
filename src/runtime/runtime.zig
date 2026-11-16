@@ -73,6 +73,15 @@ pub const ValueRoots = struct {
     }
 };
 
+/// Queued Promise reaction or adoption microtask (M18).
+pub const Microtask = struct {
+    kind: enum { reaction, adopt },
+    child: ?*heap_mod.Object = null,
+    cb: Value = .undefined,
+    arg: Value = .undefined,
+    adopt_rejected: bool = false,
+};
+
 /// A host native call in flight (M9.1, D53): the engine's record of the crossing —
 /// its temporary argument tokens (D50), the caller VM's result slot and pc, a depth
 /// charge. The record is the guard's engine capability (D52): native dispatch pushes it
@@ -215,6 +224,9 @@ pub const Runtime = struct {
     engine_roots: ?EngineRoots = null,
     /// The running engine's closure-invocation hook for JS → Builtin → JS reentrancy (M16.1).
     closure_caller: ?ClosureCaller = null,
+    /// Pending microtasks drained at the outermost turn checkpoint (M18).
+    microtasks: std.ArrayList(Microtask) = .empty,
+    microtask_head: usize = 0,
     /// More root sets, marked by every collection (M9.0): the embedding API registers each
     /// live program (its constants) and execution (its VM, suspended or not) here.
     extra_roots: std.ArrayList(EngineRoots) = .empty,
@@ -264,6 +276,7 @@ pub const Runtime = struct {
         rt.exec_ctx.vms.deinit(rt.gpa);
         rt.joining.deinit(rt.gpa);
         rt.extra_roots.deinit(rt.gpa);
+        rt.microtasks.deinit(rt.gpa);
         rt.heap.deinit();
         rt.* = undefined;
     }
@@ -399,6 +412,11 @@ pub const Runtime = struct {
         // inside a native callback keeps a suspended VM's stacks and everything they
         // reference. Empty outside a chain.
         for (rt.exec_ctx.vms.items) |e| e.mark(e.ctx, h);
+        for (rt.microtasks.items[rt.microtask_head..]) |mt| {
+            if (mt.child) |ch| h.markObj(&ch.obj);
+            h.markValue(mt.cb);
+            h.markValue(mt.arg);
+        }
         rt.handles.mark(h); // host handles (M9.1, D50): slots with a reference
     }
 
@@ -423,11 +441,55 @@ pub const Runtime = struct {
             else
                 n.call(rt, this_val, args),
             .closure => |c| {
-                const cc = rt.closure_caller orelse return rt.bug("closure called without an active engine");
-                return cc.call(cc.ctx, c, if (this_val == .object) this_val else null, args);
+                switch (c.impl) {
+                    .promise_cap => |pc| return builtins_mod.callPromiseCapability(rt, pc.promise, pc.is_reject, args),
+                    .vm, .tree => {
+                        const cc = rt.closure_caller orelse return rt.bug("closure called without an active engine");
+                        return cc.call(cc.ctx, c, if (this_val == .object) this_val else null, args);
+                    },
+                }
             },
             else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
         };
+    }
+
+    /// Drains queued microtasks FIFO at an outermost turn checkpoint (M18).
+    /// On an uncatchable runtime fault, the active job is already consumed and
+    /// remaining queued jobs are preserved for any later valid checkpoint.
+    pub fn drainMicrotasks(rt: *Runtime) Error!void {
+        while (rt.microtask_head < rt.microtasks.items.len) {
+            const job = rt.microtasks.items[rt.microtask_head];
+            rt.microtask_head += 1;
+
+            const child_val: Value = if (job.child) |ch| .{ .object = ch } else .undefined;
+            var root_buf = [_]Value{ child_val, job.cb, job.arg };
+            var roots: ValueRoots = .{ .values = &root_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+
+            switch (job.kind) {
+                .adopt => {
+                    if (job.child) |ch| {
+                        try builtins_mod.settlePromiseFromJob(rt, ch, job.adopt_rejected, job.arg);
+                    }
+                },
+                .reaction => {
+                    if (job.cb == .native or job.cb == .closure) {
+                        if (rt.callCallable(job.cb, .undefined, &.{job.arg})) |ret| {
+                            if (job.child) |ch| try builtins_mod.resolvePromiseValue(rt, ch, ret);
+                        } else |e| {
+                            if (e != error.Thrown) return e;
+                            const err_val = try rt.catchValue();
+                            if (job.child) |ch| try builtins_mod.settlePromiseFromJob(rt, ch, true, err_val);
+                        }
+                    } else if (job.child) |ch| {
+                        try builtins_mod.settlePromiseFromJob(rt, ch, job.adopt_rejected, job.arg);
+                    }
+                },
+            }
+        }
+        rt.microtasks.clearRetainingCapacity();
+        rt.microtask_head = 0;
     }
 
     pub fn limitHit(rt: *const Runtime) ?Limit {

@@ -87,6 +87,7 @@ fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUs
     defer rt.closure_caller = prev_caller;
     // The parser guarantees break/continue only occur in loops and return in functions.
     std.debug.assert(try it.block(script.statements) == .normal);
+    try rt.drainMicrotasks();
 }
 
 const Interpreter = struct {
@@ -621,8 +622,9 @@ const Interpreter = struct {
     fn call(it: *Interpreter, closure: *const heap.Closure, this: ?Value, args: []const Value) Error!Value {
         closure.obj.checkLive();
         const t = switch (closure.impl) {
+            .promise_cap => |pc| return builtins.callPromiseCapability(it.rt, pc.promise, pc.is_reject, args),
             .tree => |t| t,
-            .vm => return it.rt.bug("a VM closure in the tree-walker"),
+            .vm => return it.rt.bug("a non-tree-walker closure in the tree-walker"),
         };
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
         if (it.calls >= it.rt.limits.max_call_depth) return it.rt.limit(.call_depth);

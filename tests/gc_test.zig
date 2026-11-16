@@ -1576,3 +1576,40 @@ test "M16.2: Array.prototype.map keeps returned fresh objects alive during resul
         try testing.expectEqualStrings("true item-0 item-299\n", r.out);
     }
 }
+
+test "M18.1: Promise capability keeps Promise alive and pending adoption survives GC" {
+    const src =
+        \\let keepRes = null;
+        \\let pAdopt = null;
+        \\{
+        \\    const p = new Promise(function (res) { keepRes = res; });
+        \\    pAdopt = new Promise(function (res) { res(p); });
+        \\}
+        \\for (let i = 0; i < 400; i++) { let tmp = { i: i }; }
+        \\keepRes({ ok: 123 });
+        \\print(Promise.resolve(pAdopt) === pAdopt);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("true\n", r.out);
+    }
+}
+
+test "M18.1: Promise self-resolution TypeError allocation survives GC" {
+    const src =
+        \\let last = null;
+        \\for (let i = 0; i < 200; i++) {
+        \\    let res = null;
+        \\    const p = new Promise(function (r) { res = r; });
+        \\    res(p);
+        \\    last = p;
+        \\}
+        \\print(Promise.resolve(last) === last);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("true\n", r.out);
+    }
+}

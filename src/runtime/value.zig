@@ -42,6 +42,6 @@ pub const Native = struct {
     } = null,
     /// For built-in constructors (`Map`, `Set`): called by `new` instead of `call`.
     construct: ?*const fn (rt: *Runtime, args: []const Value) Error!Value = null,
-    /// For the namespace globals (`Object`, `Array`, `Map`, `Set`): where their static members live.
-    namespace: ?enum { object, array, map, set } = null,
+    /// For the namespace globals (`Object`, `Array`, `Map`, `Set`, `Promise`): where their static members live.
+    namespace: ?enum { object, array, map, set, promise } = null,
 };

@@ -41,18 +41,20 @@ pub const Realm = struct {
     function_prototype: *Object,
     map_prototype: *Object,
     set_prototype: *Object,
+    promise_prototype: *Object,
     iterator_prototype: *Object,
-    /// Static members of the `Object`, `Array`, `Map`, and `Set` globals.
+    /// Static members of the `Object`, `Array`, `Map`, `Set`, and `Promise` globals.
     object_namespace: *Object,
     array_namespace: *Object,
     map_namespace: *Object,
     set_namespace: *Object,
+    promise_namespace: *Object,
     math: *Object,
     json: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [15]*Object {
-        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.map_prototype, r.set_prototype, r.iterator_prototype, r.object_namespace, r.array_namespace, r.map_namespace, r.set_namespace, r.math, r.json };
+    pub fn objects(r: *const Realm) [17]*Object {
+        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.map_prototype, r.set_prototype, r.promise_prototype, r.iterator_prototype, r.object_namespace, r.array_namespace, r.map_namespace, r.set_namespace, r.promise_namespace, r.math, r.json };
     }
 };
 
@@ -69,11 +71,13 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .function_prototype = try builtin(h, object_prototype, .function_prototype),
         .map_prototype = try builtin(h, object_prototype, .map_prototype),
         .set_prototype = try builtin(h, object_prototype, .set_prototype),
+        .promise_prototype = try builtin(h, object_prototype, .promise_prototype),
         .iterator_prototype = try builtin(h, object_prototype, .iterator_prototype),
         .object_namespace = try builtin(h, null, .object_constructor),
         .array_namespace = try builtin(h, null, .array_constructor),
         .map_namespace = try builtin(h, null, .map_constructor),
         .set_namespace = try builtin(h, null, .set_constructor),
+        .promise_namespace = try builtin(h, null, .promise_constructor),
         .math = try builtin(h, object_prototype, .math),
         .json = try builtin(h, object_prototype, .json),
     };
@@ -121,6 +125,8 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.set_prototype, "values", &set_values);
     try method(rt, r.set_prototype, "entries", &set_entries);
     try method(rt, r.set_prototype, "forEach", &set_for_each);
+    try method(rt, r.promise_namespace, "resolve", &promise_resolve_static);
+    try method(rt, r.promise_namespace, "reject", &promise_reject_static);
     try method(rt, r.iterator_prototype, "next", &iterator_next);
     try registerMath(rt, r.math);
     try method(rt, r.json, "parse", &json.parse_native);
@@ -158,6 +164,7 @@ pub const object_global: Native = .{ .name = "Object", .call = notCallable, .nam
 pub const array_global: Native = .{ .name = "Array", .call = notCallable, .namespace = .array };
 pub const map_global: Native = .{ .name = "Map", .call = mapWithoutNew, .construct = mapConstruct, .namespace = .map };
 pub const set_global: Native = .{ .name = "Set", .call = setWithoutNew, .construct = setConstruct, .namespace = .set };
+pub const promise_global: Native = .{ .name = "Promise", .call = promiseWithoutNew, .construct = promiseConstruct, .namespace = .promise };
 
 /// A global read: implemented, host-registered (M9.1, D53), known to node (Unsupported),
 /// or a ReferenceError.
@@ -170,6 +177,7 @@ pub fn global(rt: *Runtime, name: []const u8) Error!Value {
     if (std.mem.eql(u8, name, "Array")) return .{ .native = &array_global };
     if (std.mem.eql(u8, name, "Map")) return .{ .native = &map_global };
     if (std.mem.eql(u8, name, "Set")) return .{ .native = &set_global };
+    if (std.mem.eql(u8, name, "Promise")) return .{ .native = &promise_global };
     if (std.mem.eql(u8, name, "Math")) return .{ .object = (try realm(rt)).math };
     if (std.mem.eql(u8, name, "JSON")) return .{ .object = (try realm(rt)).json };
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return .{ .native = n };
@@ -251,6 +259,7 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
                 .array_values, .array_keys, .array_entries => "Array Iterator",
                 .string_chars => "String Iterator",
             },
+            .promise => "Promise",
             .ordinary => "Object",
         },
     };
@@ -1068,6 +1077,152 @@ fn setForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return .undefined;
 }
 
+// ---------------------------------------------------------------- Promise (M18)
+
+const promise_resolve_static: Native = .{ .name = "resolve", .call = promiseResolveStatic };
+const promise_reject_static: Native = .{ .name = "reject", .call = promiseRejectStatic };
+
+fn promiseWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "Constructor Promise requires 'new'" }});
+}
+
+fn promiseConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const exec = try requireCallable(rt, arg(args, 0));
+    const r = try realm(rt);
+    const p = try rt.heap.newPromise(r.promise_prototype);
+    const res_cap = try rt.heap.newPromiseCapability(p, false);
+    const rej_cap = try rt.heap.newPromiseCapability(p, true);
+    const p_val: Value = .{ .object = p };
+    const res_val: Value = .{ .closure = res_cap };
+    const rej_val: Value = .{ .closure = rej_cap };
+
+    var root_buf = [_]Value{ p_val, exec, res_val, rej_val };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    _ = rt.callCallable(exec, .undefined, &.{ res_val, rej_val }) catch |e| {
+        if (e != error.Thrown) return e;
+        const err_val = try rt.catchValue();
+        if (!p.kind.promise.already_resolved) {
+            try settlePromiseFromJob(rt, p, true, err_val);
+        }
+    };
+    return p_val;
+}
+
+fn promiseResolveStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = arg(args, 0);
+    const r = try realm(rt);
+    if (x == .object and x.object.kind == .promise and x.object.proto == r.promise_prototype) {
+        return x;
+    }
+    const p = try rt.heap.newPromise(r.promise_prototype);
+    var root_buf = [_]Value{ .{ .object = p }, x };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    try resolvePromiseValue(rt, p, x);
+    return .{ .object = p };
+}
+
+fn promiseRejectStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const reason = arg(args, 0);
+    const r = try realm(rt);
+    const p = try rt.heap.newPromise(r.promise_prototype);
+    try settlePromiseFromJob(rt, p, true, reason);
+    return .{ .object = p };
+}
+
+pub fn callPromiseCapability(rt: *Runtime, p_obj: *Object, is_reject: bool, args: []const Value) Error!Value {
+    if (p_obj.kind.promise.already_resolved) return .undefined;
+    const val = arg(args, 0);
+    var root_buf = [_]Value{ .{ .object = p_obj }, val };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    if (is_reject) {
+        try settlePromiseFromJob(rt, p_obj, true, val);
+    } else {
+        try resolvePromiseValue(rt, p_obj, val);
+    }
+    return .undefined;
+}
+
+/// Atomic Promise resolution: all allocations and queue reservations succeed
+/// before any Promise state or reaction list is mutated.
+pub fn resolvePromiseValue(rt: *Runtime, p_obj: *Object, val: Value) Error!void {
+    if (val == .object and val.object == p_obj) {
+        const r = try realm(rt);
+        var err_roots_buf = [_]Value{ .{ .object = p_obj }, .undefined, .undefined, .undefined };
+        var err_roots: rt_mod.ValueRoots = .{ .values = &err_roots_buf };
+        try err_roots.register(rt);
+        defer err_roots.unregister(rt);
+
+        const err_obj = try rt.heap.newObject(r.object_prototype);
+        err_roots_buf[1] = .{ .object = err_obj };
+        const name_str = try rt.heap.newString(&.{.{ .ascii = "TypeError" }});
+        err_roots_buf[2] = .{ .string = name_str };
+        const msg_str = try rt.heap.newString(&.{.{ .ascii = "Chaining cycle detected for promise" }});
+        err_roots_buf[3] = .{ .string = msg_str };
+        try object.define(rt, err_obj, try object.named(rt, "name"), err_roots_buf[2]);
+        try object.define(rt, err_obj, try object.named(rt, "message"), err_roots_buf[3]);
+        try settlePromiseFromJob(rt, p_obj, true, err_roots_buf[1]);
+        return;
+    }
+
+    if (val == .object and val.object.kind == .promise) {
+        const other = val.object;
+        const other_pr = &other.kind.promise;
+        if (other_pr.state == .pending) {
+            try other_pr.reactions.ensureUnusedCapacity(rt.heap.allocator(), 1);
+            p_obj.kind.promise.already_resolved = true;
+            other_pr.reactions.appendAssumeCapacity(.{ .child = p_obj, .on_fulfilled = .undefined, .on_rejected = .undefined });
+            rt.heap.barrier(&other.obj, null, .{ .object = p_obj });
+        } else {
+            try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
+            p_obj.kind.promise.already_resolved = true;
+            rt.microtasks.appendAssumeCapacity(.{
+                .kind = .adopt,
+                .child = p_obj,
+                .cb = .undefined,
+                .arg = other_pr.result,
+                .adopt_rejected = (other_pr.state == .rejected),
+            });
+        }
+        return;
+    }
+
+    try settlePromiseFromJob(rt, p_obj, false, val);
+}
+
+/// Atomic Promise settlement: reserves microtask queue capacity before mutating
+/// Promise state or moving reactions.
+pub fn settlePromiseFromJob(rt: *Runtime, p_obj: *Object, is_rejected: bool, val: Value) Error!void {
+    const pr = &p_obj.kind.promise;
+    if (pr.state != .pending) return;
+    try rt.microtasks.ensureUnusedCapacity(rt.gpa, pr.reactions.items.len);
+
+    pr.already_resolved = true;
+    pr.state = if (is_rejected) .rejected else .fulfilled;
+    rt.heap.barrier(&p_obj.obj, pr.result, val);
+    pr.result = val;
+
+    for (pr.reactions.items) |rx| {
+        const cb = if (is_rejected) rx.on_rejected else rx.on_fulfilled;
+        const is_adopt = (cb != .native and cb != .closure);
+        rt.microtasks.appendAssumeCapacity(.{
+            .kind = if (is_adopt) .adopt else .reaction,
+            .child = rx.child,
+            .cb = cb,
+            .arg = val,
+            .adopt_rejected = is_rejected,
+        });
+    }
+    pr.reactions.clearRetainingCapacity();
+}
+
 // ---------------------------------------------------------------- Iterators (M14.4)
 
 const iterator_next: Native = .{ .name = "next", .call = iteratorNext };
@@ -1080,7 +1235,7 @@ pub fn getIterator(rt: *Runtime, iterable: Value) Error!*Object {
             .set => rt.heap.newIterator(r.iterator_prototype, iterable, .set_values),
             .array => rt.heap.newIterator(r.iterator_prototype, iterable, .array_values),
             .iterator => o,
-            .ordinary => unsupportedReceiver(rt, "Symbol.iterator"),
+            .ordinary, .promise => unsupportedReceiver(rt, "Symbol.iterator"),
         },
         .string => rt.heap.newIterator(r.iterator_prototype, iterable, .string_chars),
         else => rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }}),

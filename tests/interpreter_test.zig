@@ -587,3 +587,91 @@ test "M17.1: documented ZQJS deviations on callback thisArg and detached receive
     try expectUnsupported("const f = new Map().forEach; f(function () {});", "", "Unsupported(builtin)");
     try expectUnsupported("const f = new Set().forEach; f(function () {});", "", "Unsupported(builtin)");
 }
+
+test "M18.1: Promise state, self-resolution, native adoption, queue fault preservation, and OOM" {
+    try expectUnsupported("Promise.all;", "", "('all')");
+    try expectUnsupported("Promise.resolve(1).then;", "", "('then')");
+
+    for (support.engines) |engine| {
+        // 1. Rejection, executor throw, self-resolution, and pending/settled native adoption
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var out_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out_buf.deinit();
+        var rt = Runtime.init(testing.allocator, .{}, &out_buf.writer);
+        defer rt.deinit();
+
+        const src =
+            \\const pRej = Promise.reject("bad");
+            \\const pExecThrow = new Promise(function () { throw "exec-err"; });
+            \\let capRes = null;
+            \\const pSelf = new Promise(function (r) { capRes = r; });
+            \\capRes(pSelf);
+            \\let r1 = null;
+            \\const p1 = new Promise(function (r) { r1 = r; });
+            \\const pAdoptPending = new Promise(function (r) { r(p1); });
+            \\r1(55);
+            \\const pAdoptFulfilled = new Promise(function (r) { r(Promise.resolve(77)); });
+            \\const pAdoptRejected = new Promise(function (r) { r(Promise.reject("nope")); });
+            \\print(pRej !== pExecThrow, pSelf !== pAdoptPending, pAdoptFulfilled !== pAdoptRejected, Promise.resolve(pAdoptPending) === pAdoptPending);
+        ;
+        try testing.expectEqual(@as(?anyerror, null), try runScript(arena.allocator(), &rt, src, engine));
+        try testing.expectEqualStrings("true true true true\n", out_buf.written());
+        try testing.expectEqual(@as(usize, 0), rt.microtasks.items.len);
+        try testing.expectEqual(@as(usize, 0), rt.microtask_head);
+    }
+
+    // 2. Microtask queue preserves remaining jobs when active job hits LimitExceeded(steps)
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var q_rt = Runtime.init(testing.allocator, .{ .max_steps = 15 }, &discard.writer);
+    defer q_rt.deinit();
+
+    const r = try zqjs.builtins.realm(&q_rt);
+    const p_child1 = try q_rt.heap.newPromise(r.promise_prototype);
+    const p_child2 = try q_rt.heap.newPromise(r.promise_prototype);
+    const noop = struct {
+        fn call(_: *Runtime, _: zqjs.Value, args: []const zqjs.Value) zqjs.runtime.Error!zqjs.Value {
+            return if (args.len > 0) args[0] else .undefined;
+        }
+    };
+    const step_burner = struct {
+        fn call(rt: *Runtime, _: zqjs.Value, _: []const zqjs.Value) zqjs.runtime.Error!zqjs.Value {
+            var i: usize = 0;
+            while (i < 50) : (i += 1) try rt.step();
+            return .undefined;
+        }
+    };
+    const burn_fn: zqjs.Native = .{ .name = "burn", .call = step_burner.call };
+    const noop_fn: zqjs.Native = .{ .name = "noop", .call = noop.call };
+    try q_rt.microtasks.append(testing.allocator, .{ .kind = .reaction, .child = p_child1, .cb = .{ .native = &burn_fn }, .arg = .{ .number = 1 } });
+    try q_rt.microtasks.append(testing.allocator, .{ .kind = .reaction, .child = p_child2, .cb = .{ .native = &noop_fn }, .arg = .{ .number = 99 } });
+
+    try testing.expectError(error.LimitExceeded, q_rt.drainMicrotasks());
+    try testing.expectEqual(@as(usize, 1), q_rt.microtask_head);
+    try testing.expectEqual(@as(usize, 2), q_rt.microtasks.items.len);
+    try testing.expectEqual(zqjs.heap.PromiseStateTag.pending, p_child1.kind.promise.state);
+    try testing.expectEqual(zqjs.heap.PromiseStateTag.pending, p_child2.kind.promise.state);
+
+    // Later valid checkpoint resumes and drains job 2 cleanly
+    q_rt.max_steps = 10_000;
+    q_rt.limit_hit = null;
+    try q_rt.drainMicrotasks();
+    try testing.expectEqual(@as(usize, 0), q_rt.microtasks.items.len);
+    try testing.expectEqual(zqjs.heap.PromiseStateTag.fulfilled, p_child2.kind.promise.state);
+    try testing.expectEqual(@as(f64, 99), p_child2.kind.promise.result.number);
+
+    // 3. OOM across Promise creation, self-resolution, and native adoption
+    const OomCtx = struct {
+        fn runOnce(alloc: Allocator) !void {
+            var run_res = try support.run(
+                alloc,
+                "let r1; const p1 = new Promise(function (r) { r1 = r; }); const p2 = new Promise(function (r) { r(p1); }); r1({ x: 1 }); Promise.reject('e');",
+                .{},
+                .vm,
+                .normal,
+            );
+            defer run_res.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
+}

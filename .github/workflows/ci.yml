@@ -5,23 +5,24 @@ name: CI
 # Allowlist, not a *.md ignore list: other non-code files stay out of CI by default.
 # Keep both lists in sync.
 on:
-  push:
-    branches: ["**"] # not tags: a tag points at a commit CI already checked
-    paths:
-      - "src/**"
-      - "tests/**"
-      - "tools/**"
-      - "build.zig"
-      - "build.zig.zon"
-      - ".github/workflows/ci.yml"
-  pull_request:
-    paths:
-      - "src/**"
-      - "tests/**"
-      - "tools/**"
-      - "build.zig"
-      - "build.zig.zon"
-      - ".github/workflows/ci.yml"
+  # Automatic triggers disabled (no CI quota).
+  # push:
+  #   branches: ["**"] # not tags: a tag points at a commit CI already checked
+  #   paths:
+  #     - "src/**"
+  #     - "tests/**"
+  #     - "tools/**"
+  #     - "build.zig"
+  #     - "build.zig.zon"
+  #     - ".github/workflows/ci.yml"
+  # pull_request:
+  #   paths:
+  #     - "src/**"
+  #     - "tests/**"
+  #     - "tools/**"
+  #     - "build.zig"
+  #     - "build.zig.zon"
+  #     - ".github/workflows/ci.yml"
   workflow_dispatch: # manual run from the Actions tab
 
 # A newer push to the same branch cancels the older run (saves CI minutes).

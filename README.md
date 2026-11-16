@@ -7,14 +7,14 @@ Inspired by QuickJS and Crafting Interpreters; it does not reuse their code.
 Priorities: correctness, simplicity, inspectability. Speed comes last.
 
 ## Status
-Milestones 1–8, 8.1, and 9.0 done (tags `m1` … `m8`, `m8.1`, `m9.0`, and `p1` for accurate `**`). Next are M9.1
-(GC-safe handles and natives) and M9.2 (C ABI) ([ROADMAP.md](ROADMAP.md), Direction). ZQJS has:
+Milestones 1–18 done (tags `m1` … `m18`, plus `p1` for accurate `**`) ([ROADMAP.md](ROADMAP.md)). ZQJS has:
 
-- **the language so far:** `let`/`const`, blocks, `if`/`while`/`for`, `break`/`continue`;
-  functions, closures and recursion; objects, arrays, prototypes, methods with `this`; numbers,
-  UTF-16 strings, `-0`, the temporal dead zone, `const`; a few built-ins (`print`,
-  `Object.keys/create/getPrototypeOf`, `Array.isArray`, `push`/`pop`/`join`, `charCodeAt`).
-  Everything else node has is reported as `Unsupported(…)`, never silently wrong
+- **the language so far:** `let`/`const`, blocks, `if`/`while`/`for`, `for...of`, `break`/`continue`;
+  functions, closures and recursion; objects, arrays, prototypes, `new`, methods with `this`;
+  numbers, UTF-16 strings, `-0`, the temporal dead zone, `const`; `Map`, `Set`, built-in
+  iterators, `JSON.parse`/`JSON.stringify`, `Promise` (`.then`/`.catch` and microtask
+  checkpoints), and callback-taking built-ins (`Array` methods, `Object.keys/create/getPrototypeOf`,
+  `print`, etc.). Everything else node has is reported as `Unsupported(…)`, never silently wrong
   ([LANGUAGE.md](LANGUAGE.md)).
 - **two engines that must agree:** a bytecode compiler, verifier and stack VM (the default),
   and a tree-walking reference interpreter (`--engine=treewalk`). Their output is checked byte
@@ -42,8 +42,7 @@ const greet = (function () { const word = 'hi'; return function () { return word
 print(fib(20), greet(), box.describe(), Object.keys({ b: 1, a: 2, 1: 3, 0: 4 }));
 ```
 
-Next: M9 (embedding API, with a small Raylib demo), M10 (fuzzing and benchmarks), M11
-(bytecode debugger). The collector's next step is decided by measuring it first (ROADMAP). See [ROADMAP.md](ROADMAP.md).
+See [ROADMAP.md](ROADMAP.md) for milestone details, required regression tests, and planned work.
 
 ## Requirements
 **Zig 0.17.1 exactly** (the build refuses other versions; see DESIGN_DECISIONS D17).
@@ -77,12 +76,15 @@ zig build test --fuzz=100K -Dtest-filter="fuzz: frontend"   # fuzz one target (o
                                             #   "fuzz: frontend", "fuzz: both engines agree",
                                             #   "fuzz: anything the front end", "fuzz: the verifier"
 zig build bench                             # bench/*.js on both engines: steps, heap bytes, median ms
+zig build m10-bench                         # M10 split-phase ZQJS benchmarks (ReleaseFast)
+zig build m10-c-bench                       # M10 C-ABI embedding benchmarks (ReleaseFast)
 zig build gc-report                         # GC pauses (minor/major), rates, GC share; bench/ and bench/gc/
 zig build gc-report -- --nursery=1M game_   # another nursery size, only the game workloads
 zig build gc-mutants                        # each deliberately broken GC piece must be caught
 zig build check-goldens                     # verify syntax cases against node; generated files up to date
 zig build update-golden                     # regenerate goldens (node) and pow references (Python)
 zig build example                           # run the embedding API example (examples/embed.zig)
+zig build plugin-host                       # build and run the M13 multi-plugin C11 host (examples/plugin_host.c)
 ```
 
 ## Embedding
@@ -132,7 +134,9 @@ int main(void) {
 }
 ```
 
-For a full C11 host loop with structured `initGame({ update, draw, state })` handles (optional Raylib dependency — `zig build test` stays Raylib-free), see [examples/raylib_c_demo.c](examples/raylib_c_demo.c):
+For a C11 multi-plugin cooperative host example, see [examples/plugin_host.c](examples/plugin_host.c) (`zig build plugin-host`).
+
+For a full C11 host loop with structured `initGame({ update, draw, state })` handles (optional Raylib dependency — `zig build test` stays Raylib-free; pass `-Draylib-prefix=<path>` if Raylib isn't in a default location), see [examples/raylib_c_demo.c](examples/raylib_c_demo.c):
 ```sh
 zig build raylib-smoke   # headless 60-frame + error-handling smoke test
 zig build raylib-demo    # interactive GUI window (requires Raylib)

@@ -249,6 +249,10 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
 - **`delete o.k`** and **`k in o`** (`in` on a non-object is a TypeError).
 - **Built-ins:** only those listed in DESIGN_DECISIONS D39; every other name node has is
   `Unsupported(builtin)`, every name node doesn't have is `undefined` / a ReferenceError.
+- **Collections & Iterators (M14):**
+  - `new`: supported for `Map` and `Set` (`new` on user functions or other built-ins like `Object`/`Array` is `Unsupported(builtin)`; non-constructors throw `TypeError`).
+  - `Map` & `Set`: insertion-ordered `OrderedTable` with SameValueZero equality (`NaN` matches `NaN`, `-0 === +0`, UTF-16 string equality, pointer identity for objects/functions), read-only `size`, `get`/`set`/`has`/`delete`/`clear` (`Map`) and `add`/`has`/`delete`/`clear` (`Set`), plus `keys`/`values`/`entries`. `forEach` and `WeakMap`/`WeakSet` are `Unsupported(builtin)`.
+  - `for...of` & Iterators: `for (let|const|id of iterable)` over `Array`, `Map`, `Set`, `String` (code-point surrogate pairs + lone surrogates), and built-in iterators (`Iterator.prototype.next`). Live `Map`/`Set` mutations (including `clear()` followed by insertion) are visible to active iterators; exhausted iterators stay `done: true`. `Symbol.iterator` and destructuring targets remain `Unsupported`.
 
 ### Bindings
 

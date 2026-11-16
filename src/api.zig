@@ -796,17 +796,13 @@ const ExecutionImpl = struct {
         rt.unsupported_name = null;
         rt.limit_hit = null;
         rt.heap.limit_hit = null;
-        var n: u64 = 0;
-        while (n < steps) : (n += 1) {
-            const state = x.vm.step() catch |e| {
-                const f = faultOf(rt, e); // the poison belt runs for every fault (E7)
-                x.fault = f;
-                if (failure) |out| out.* = f.failure;
-                return f.err;
-            };
-            if (state == .halted) return .finished;
-        }
-        return if (x.vm.halted) .finished else .suspended;
+        const state = x.vm.runSteps(steps) catch |e| {
+            const f = faultOf(rt, e); // the poison belt runs for every fault (E7)
+            x.fault = f;
+            if (failure) |out| out.* = f.failure;
+            return f.err;
+        };
+        return if (state == .halted) .finished else .suspended;
     }
 };
 
@@ -912,15 +908,12 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
                 return fo.err;
             };
             defer rt.exec_ctx.removeVm(&vm); // before deinit frees what it marks
-            while (true) {
-                const state = vm.step() catch |e| {
-                    const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
-                    const fo = faultOf(rt, err);
-                    if (failure) |out| out.* = fo.failure;
-                    return fo.err;
-                };
-                if (state == .halted) break;
-            }
+            vm.run() catch |e| {
+                const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                const fo = faultOf(rt, err);
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            };
             if (rt.exec_ctx.budget_fault != null) {
                 const fo = faultOf(rt, rt.limit(.steps));
                 if (failure) |out| out.* = fo.failure;

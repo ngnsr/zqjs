@@ -174,9 +174,39 @@ pub const Vm = struct {
         return vm;
     }
 
-    /// Runs to `halt` or the first error.
+    /// Runs to `halt` or the first error (M10.2a: dedicated continuous loop preserving
+    /// `Vm.step()` unchanged for sliced execution and debugging, with exact `rt.step()`
+    /// accounting and per-instruction GC safepoints).
     pub fn run(vm: *Vm) Error!void {
-        while (try vm.step() == .running) {}
+        _ = try vm.runLoop(false, 0);
+    }
+
+    /// Runs up to `steps` instructions (or `std.math.maxInt(u64)` unbounded) using the
+    /// same continuous loop and exact `execute` / GC safepoint semantics as `run()`.
+    pub fn runSteps(vm: *Vm, steps: u64) Error!State {
+        if (steps == std.math.maxInt(u64)) return vm.runLoop(false, 0);
+        return vm.runLoop(true, steps);
+    }
+
+    inline fn runLoop(vm: *Vm, comptime bounded: bool, steps: u64) Error!State {
+        if (vm.fault) |e| return e;
+        if (vm.halted) return .halted;
+        const rt = vm.rt;
+        const h = &rt.heap;
+        if (!vm.nested) rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
+        var n: u64 = 0;
+        while (!bounded or n < steps) {
+            if (h.collect_requested or h.collect_always) {
+                rt.collect();
+            }
+            const state = @call(.always_inline, execute, .{vm}) catch |e| {
+                vm.fault = e;
+                return e;
+            };
+            if (state == .halted) return .halted;
+            if (bounded) n += 1;
+        }
+        return if (vm.halted) .halted else .running;
     }
 
     /// The VM's roots (GC_DESIGN §4): the operand stack, the locals (values and cells), each

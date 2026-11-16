@@ -244,7 +244,9 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
   `null`/`undefined` elements are empty; a cycle is empty), `+[5]` is 5, `[] + {}` is
   `[object Object]`, `===` compares identity.
 - **Strings:** `s.length` and `s[i]` count UTF-16 code units (a surrogate pair is 2);
-  `s.charCodeAt(i)` returns a code unit (NaN out of range).
+  `s.charCodeAt(i)` returns a code unit (NaN out of range). `s.toLowerCase()` and
+  `s.toUpperCase()` only handle ASCII (`< 0x80`); any non-ASCII code unit (`>= 0x80`)
+  fails explicitly with `Unsupported(builtin)` rather than leaving it unchanged.
 - **`this`:** the receiver of a method call; see `sloppy_this` and DESIGN_DECISIONS D41.
 - **`delete o.k`** and **`k in o`** (`in` on a non-object is a TypeError).
 - **Built-ins:** only those listed in DESIGN_DECISIONS D39; every other name node has is
@@ -257,7 +259,7 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
   - `JSON.parse(text [, reviver])`: UTF-16 recursive-descent parser enforcing strict JSON whitespace and number grammar, `\uXXXX` escapes (preserving surrogate pairs and lone surrogates), `"__proto__"` as an own data property, catchable `SyntaxError`, and `Limits.max_nesting_depth` / `Limits.max_string_length`. Non-callable `reviver` values are ignored; callable `reviver` fails with `Unsupported(user_conversion)`.
   - `JSON.stringify(value [, replacer [, space]])`: serializes primitives, dense arrays (`undefined`/functions → `null`), and ordinary objects in `Object.keys` order (`undefined`/functions omitted; `Map`/`Set` → `"{}"`), `NaN`/`±Infinity` → `null`, `-0` → `"0"`, control-char and lone-surrogate escaping, active-ancestor cycle detection (`TypeError`), and `Limits.max_nesting_depth` / `Limits.max_string_length`. Non-callable/non-array `replacer` values are ignored; callable/array `replacer`, non-`undefined` `space`, and own/inherited callable `toJSON` properties fail explicitly (`Unsupported`).
 - **Callback-taking built-ins (M16):**
-  - `Array.prototype.forEach`, `Array.prototype.map`, `Array.prototype.filter`, `Array.prototype.reduce`, `Map.prototype.forEach`, and `Set.prototype.forEach` invoke JS callbacks reentrantly on both engines (`thisArg` follows ZQJS sloppy `this` rules: object receivers bind `this`, primitives/null/undefined leave `this` `undefined`).
+  - `Array.prototype.forEach`, `Array.prototype.map`, `Array.prototype.filter`, `Array.prototype.reduce`, `Map.prototype.forEach`, and `Set.prototype.forEach` invoke JS callbacks reentrantly on both engines (`thisArg` follows ZQJS sloppy `this` rules: object receivers bind `this`, while reading `this` with primitive/`null`/`undefined` `thisArg` fails with `Unsupported(sloppy_this)` per D41).
   - Array callbacks capture the initial length at entry; growing the array does not extend iteration, and shrinking skips missing indices for `forEach`, `filter`, and `reduce`. **Intentional deviation:** if a callback shrinks the array during `Array.prototype.map`, ZQJS fails with `Unsupported(sparse_array)` rather than producing sparse holes (arrays are always dense per D13).
   - `Map.prototype.forEach` and `Set.prototype.forEach` visit entries in insertion order and observe live mutations during iteration (deletes, updates, additions, `clear()` followed by insertion, and delete + reinsert of the current entry).
 

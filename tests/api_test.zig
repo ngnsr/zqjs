@@ -2598,3 +2598,86 @@ fn checkStructuredApiAllocFailOnce(gpa: std.mem.Allocator) !void {
 test "M12.2: allocation failures across object/array/global/property/index APIs" {
     try testing.checkAllAllocationFailures(testing.allocator, checkStructuredApiAllocFailOnce, .{});
 }
+
+test "M17.2: JS -> Builtin -> Host -> JS reentrancy, NativeRecord, GC survival, and limits" {
+    const Host = struct {
+        fn hostApply(rt: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+            const cb = args[0];
+            const val = args[1];
+            rt.collectGarbage();
+            var f: zqjs.Failure = .{};
+            const res = rt.call(cb, null, &.{val}, &f) catch |e| switch (e) {
+                error.LimitExceeded => return error.LimitExceeded,
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Internal => return error.Internal,
+                else => {
+                    out.host_message = "callback failed";
+                    return error.HostError;
+                },
+            };
+            rt.collectGarbage();
+            out.result = res;
+        }
+
+        fn hostDouble(rt: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+            const n = args[0].number().?;
+            out.result = try rt.newNumber(n * 2);
+        }
+
+        fn hostThrow(rt: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+            const u16_buf = [_]u16{ 'b', 'o', 'o', 'm' };
+            rt.throwJs(.TypeError, &u16_buf);
+            return error.Thrown;
+        }
+    };
+
+    var out_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try zqjs.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    try rt.defineGlobalFunction("hostApply", Host.hostApply, null);
+    try rt.defineGlobalFunction("hostDouble", Host.hostDouble, null);
+    try rt.defineGlobalFunction("hostThrow", Host.hostThrow, null);
+
+    // 1. JS -> Array.map -> hostApply (collects GC!) -> JS closure -> object
+    const src =
+        \\const mapped = [1, 2, 3].map(function (n) {
+        \\    return hostApply(function (v) { return { d: v * 2 }; }, n);
+        \\});
+        \\const direct = [4, 5].map(hostDouble);
+        \\let caught = "";
+        \\try { [1].forEach(hostThrow); } catch (e) { caught = e.name + ":" + e.message; }
+        \\print(mapped.map(function (o) { return o.d; }).join(","), direct.join(","), caught);
+    ;
+    const prog = try rt.compile("m17.js", src, null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+    try testing.expectEqualStrings("2,4,6 8,10 TypeError:boom\n", out.buffered());
+
+    // 2. Step budget across JS -> Array.map -> hostApply -> JS closure
+    const step_rt = try zqjs.Runtime.create(testing.allocator, .{ .limits = .{ .max_steps = 25 } });
+    defer step_rt.destroy();
+    try step_rt.defineGlobalFunction("hostApply", Host.hostApply, null);
+    const step_prog = try step_rt.compile("step.js", "[1, 2, 3].map(function (n) { return hostApply(function (v) { let s = 0; for (let i = 0; i < 50; i++) s += i; return v + s; }, n); });", null);
+    defer step_prog.destroy();
+    var fail: zqjs.Failure = .{};
+    try testing.expectError(error.LimitExceeded, step_rt.run(step_prog, &fail));
+    try testing.expectEqual(zqjs.Failure.Kind.limit, fail.kind);
+    try testing.expectEqual(zqjs.Limit.steps, fail.limit.?);
+
+    // 3. Call depth limit across JS -> Array.map -> hostApply -> JS closure, plus clean recovery
+    const depth_rt = try zqjs.Runtime.create(testing.allocator, .{ .limits = .{ .max_call_depth = 4 } });
+    defer depth_rt.destroy();
+    try depth_rt.defineGlobalFunction("hostApply", Host.hostApply, null);
+    const depth_prog = try depth_rt.compile("depth.js", "function rec(n) { return [n].map(function (v) { return hostApply(rec, v); }); } rec(1);", null);
+    defer depth_prog.destroy();
+    var depth_fail: zqjs.Failure = .{};
+    try testing.expectError(error.LimitExceeded, depth_rt.run(depth_prog, &depth_fail));
+    try testing.expectEqual(zqjs.Failure.Kind.limit, depth_fail.kind);
+    try testing.expectEqual(zqjs.Limit.call_depth, depth_fail.limit.?);
+
+    const ok_prog = try depth_rt.compile("ok.js", "hostApply(function (v) { return v + 1; }, 41);", null);
+    defer ok_prog.destroy();
+    try depth_rt.run(ok_prog, null);
+}

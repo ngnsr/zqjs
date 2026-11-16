@@ -34,6 +34,7 @@ const objects = vm.runInNewContext(`({
   set_prototype: Set.prototype,
   iterator_prototype: Object.getPrototypeOf(Object.getPrototypeOf([].values())),
   math: Math,
+  json: JSON,
 })`);
 
 const lines = [

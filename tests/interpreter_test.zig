@@ -293,7 +293,7 @@ test "holes are Unsupported: arrays stay dense" {
 }
 
 test "built-ins: known to node but not implemented is Unsupported, naming the member" {
-    try expectUnsupported("print(JSON === undefined);", "", "Unsupported(builtin): a built-in node has that ZQJS doesn't implement yet ('JSON')");
+    try expectUnsupported("print(Reflect === undefined);", "", "Unsupported(builtin): a built-in node has that ZQJS doesn't implement yet ('Reflect')");
     try expectUnsupported("print([1].length); [1].map;", "1\n", "Unsupported(builtin)");
     try expectUnsupported("[1].map;", "", "('map')");
     try expectUnsupported("'abc'.trim;", "", "('trim')");
@@ -373,4 +373,30 @@ test "M14.4: unsupported iterables, Iterator.prototype methods, and member for-o
     try expectUnsupported("for (const x of {}) {}", "", "Unsupported(builtin)");
     try expectUnsupported("[1].values().map;", "", "('map')");
     try expectUnsupported("let o = {}; for (o.x of [1]) {}", "", "Unsupported(syntax)");
+}
+
+test "M15.1: JSON.parse reviver exclusion, new JSON(), nesting limit, and OOM" {
+    try expectUnsupported("JSON.parse('{}', function () {});", "", "Unsupported(user_conversion)");
+    try expectUnsupported("JSON.stringify;", "", "('stringify')");
+    for (support.engines) |engine| {
+        var r_bad = try support.run(testing.allocator, "JSON.parse('{', function () {});", .{}, engine, .normal);
+        defer r_bad.deinit(testing.allocator);
+        try testing.expect(std.mem.startsWith(u8, r_bad.err, "Uncaught SyntaxError"));
+
+        var r_new = try support.run(testing.allocator, "new JSON();", .{}, engine, .normal);
+        defer r_new.deinit(testing.allocator);
+        try testing.expect(std.mem.startsWith(u8, r_new.err, "Uncaught TypeError"));
+
+        var r_lim = try support.run(testing.allocator, "JSON.parse('[[[1]]]');", .{ .max_nesting_depth = 2 }, engine, .normal);
+        defer r_lim.deinit(testing.allocator);
+        try testing.expect(std.mem.indexOf(u8, r_lim.err, "LimitExceeded(nesting_depth)") != null);
+    }
+
+    const OomCtx = struct {
+        fn runOnce(alloc: std.mem.Allocator) !void {
+            var r = try support.run(alloc, "JSON.parse('{\"a\":[1,true,null,\"\\\\u0041\"]}');", .{}, .vm, .normal);
+            defer r.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
 }

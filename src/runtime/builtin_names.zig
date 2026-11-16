@@ -19,6 +19,7 @@ pub const Builtin = enum {
     set_prototype,
     iterator_prototype,
     math,
+    json,
 };
 
 /// Whether node gives `b` an own property called `name`.
@@ -39,6 +40,7 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .set_prototype => set_prototype.has(name),
         .iterator_prototype => iterator_prototype.has(name),
         .math => math.has(name),
+        .json => json.has(name),
     };
 }
 
@@ -402,4 +404,11 @@ const math = std.StaticStringMap(void).initComptime(.{
     .{"tan"},
     .{"tanh"},
     .{"trunc"},
+});
+
+const json = std.StaticStringMap(void).initComptime(.{
+    .{"isRawJSON"},
+    .{"parse"},
+    .{"rawJSON"},
+    .{"stringify"},
 });

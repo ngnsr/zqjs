@@ -30,6 +30,7 @@ const Error = rt_mod.Error;
 const ops = @import("ops.zig");
 const object = @import("object.zig");
 const names = @import("builtin_names.zig");
+const json = @import("json.zig");
 
 pub const Realm = struct {
     object_prototype: *Object,
@@ -47,10 +48,11 @@ pub const Realm = struct {
     map_namespace: *Object,
     set_namespace: *Object,
     math: *Object,
+    json: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [14]*Object {
-        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.map_prototype, r.set_prototype, r.iterator_prototype, r.object_namespace, r.array_namespace, r.map_namespace, r.set_namespace, r.math };
+    pub fn objects(r: *const Realm) [15]*Object {
+        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.map_prototype, r.set_prototype, r.iterator_prototype, r.object_namespace, r.array_namespace, r.map_namespace, r.set_namespace, r.math, r.json };
     }
 };
 
@@ -73,6 +75,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .map_namespace = try builtin(h, null, .map_constructor),
         .set_namespace = try builtin(h, null, .set_constructor),
         .math = try builtin(h, object_prototype, .math),
+        .json = try builtin(h, object_prototype, .json),
     };
     try method(rt, r.object_prototype, "toString", &object_to_string);
     try method(rt, r.object_prototype, "valueOf", &object_value_of);
@@ -114,6 +117,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.set_prototype, "entries", &set_entries);
     try method(rt, r.iterator_prototype, "next", &iterator_next);
     try registerMath(rt, r.math);
+    try method(rt, r.json, "parse", &json.parse_native);
     _ = &r;
     rt.realm = r;
     return &rt.realm.?;
@@ -160,6 +164,7 @@ pub fn global(rt: *Runtime, name: []const u8) Error!Value {
     if (std.mem.eql(u8, name, "Map")) return .{ .native = &map_global };
     if (std.mem.eql(u8, name, "Set")) return .{ .native = &set_global };
     if (std.mem.eql(u8, name, "Math")) return .{ .object = (try realm(rt)).math };
+    if (std.mem.eql(u8, name, "JSON")) return .{ .object = (try realm(rt)).json };
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return .{ .native = n };
     if (names.has(.global, name)) {
         rt.unsupported_name = try rt.heap.internAscii(name);

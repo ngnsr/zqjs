@@ -380,7 +380,7 @@ test "the exception message and the unsupported name are roots" {
     const gpa = testing.allocator;
     for ([_]struct { []const u8, []const u8 }{
         .{ "let o = {}; o.a.b;", "Cannot read properties of undefined (reading 'b')" },
-        .{ "JSON.parse;", "JSON" },
+        .{ "Reflect.get;", "Reflect" },
     }) |case| {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
@@ -1484,5 +1484,21 @@ test "M14.4: reachable iterator keeps its target Map/Set/Array alive across mino
         var r = try support.run(testing.allocator, src, .{}, engine, .normal);
         defer r.deinit(testing.allocator);
         try testing.expectEqualStrings("false 99 true\n", r.out);
+    }
+}
+
+test "M15.1: JSON.parse objects, arrays, and strings survive GC collections" {
+    const src =
+        \\let kept = [];
+        \\for (let i = 0; i < 500; i++) {
+        \\    let p = JSON.parse('{"idx":' + i + ',"arr":[1,"x\\u0041",true,null]}');
+        \\    if (i % 50 === 0) kept.push(p);
+        \\}
+        \\print(kept.length, kept[0].idx, kept[0].arr[1], kept[9].idx);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("10 0 xA 450\n", r.out);
     }
 }

@@ -28,7 +28,7 @@ const Feature = @import("../frontend/diag.zig").Feature;
 
 pub const Error = error{ Thrown, HostError, LimitExceeded, Unsupported, OutOfMemory, WriteFailed, Internal };
 
-pub const ErrorName = enum { ReferenceError, TypeError, RangeError };
+pub const ErrorName = enum { ReferenceError, TypeError, RangeError, SyntaxError };
 
 /// The tag a live runtime carries; cleared on destroy (E1). The embedding API's checks
 /// and the handle operations read this one (the internal runtime is what a handle names).

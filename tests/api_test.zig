@@ -2526,9 +2526,9 @@ test "M12.2: newObject, newArray, getGlobal, getProperty/setProperty, getIndex/s
     defer sin_res.release();
     try testing.expectEqual(@as(?f64, 0), sin_res.number());
 
-    var json_fail: zqjs.Failure = .{};
-    try testing.expectError(error.Unsupported, rt.getGlobal("JSON", &json_fail));
-    try testing.expectEqual(zqjs.Failure.Kind.unsupported, json_fail.kind);
+    var reflect_fail: zqjs.Failure = .{};
+    try testing.expectError(error.Unsupported, rt.getGlobal("Reflect", &reflect_fail));
+    try testing.expectEqual(zqjs.Failure.Kind.unsupported, reflect_fail.kind);
 
     var ref_fail: zqjs.Failure = .{};
     try testing.expectError(error.Thrown, rt.getGlobal("notDefined", &ref_fail));

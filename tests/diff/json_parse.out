@@ -1,0 +1,21 @@
+null true false
+42
+true true
+0 -123 3.14159 100000000000000000000 1e+21
+0.000001 1e-7 150 -0.0025
+true true
+0 hello
+"\/
+5 8 12 10 13 9
+Aa
+2 55357 56832
+3 55296 45 56320
+true 6 1 two 4 5
+0 0
+2 true false a,b
+true 42 1
+0,1,2,x a c b 3
+123 456 789 2
+123 true null
+noarg SyntaxError
+done

@@ -103,6 +103,25 @@ const Dumper = struct {
                 try d.stmt(f.body.*);
                 try w.writeByte(')');
             },
+            .for_of => |f| {
+                try w.writeAll("(for-of ");
+                switch (f.target) {
+                    .declaration => |dc| {
+                        try w.print("({s} ", .{@tagName(dc.kind)});
+                        try d.binding(dc.declarator);
+                        try w.writeByte(')');
+                    },
+                    .target => |t| switch (t) {
+                        .ref => |r| try d.ref(r),
+                        .member => |m| try d.member(m),
+                    },
+                }
+                try w.writeByte(' ');
+                try d.expr(f.iterable);
+                try w.writeByte(' ');
+                try d.stmt(f.body.*);
+                try w.writeByte(')');
+            },
         }
     }
 

@@ -1472,3 +1472,17 @@ test "M14.3: old Set remembers young values across minor collections and reclaim
         try testing.expectEqualStrings("2 true\n0 false\n", r.out);
     }
 }
+
+test "M14.4: reachable iterator keeps its target Map/Set/Array alive across minor and major collections" {
+    const src =
+        \\let it = new Map([['k', { v: 99 }]]).values();
+        \\for (let i = 0; i < 2000; i++) { let tmp = { i: i }; }
+        \\let r = it.next();
+        \\print(r.done, r.value.v, it.next().done);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("false 99 true\n", r.out);
+    }
+}

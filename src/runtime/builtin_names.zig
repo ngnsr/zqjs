@@ -17,6 +17,7 @@ pub const Builtin = enum {
     map_prototype,
     set_constructor,
     set_prototype,
+    iterator_prototype,
     math,
 };
 
@@ -36,6 +37,7 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .map_prototype => map_prototype.has(name),
         .set_constructor => set_constructor.has(name),
         .set_prototype => set_prototype.has(name),
+        .iterator_prototype => iterator_prototype.has(name),
         .math => math.has(name),
     };
 }
@@ -338,6 +340,21 @@ const set_prototype = std.StaticStringMap(void).initComptime(.{
     .{"symmetricDifference"},
     .{"union"},
     .{"values"},
+});
+
+const iterator_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"drop"},
+    .{"every"},
+    .{"filter"},
+    .{"find"},
+    .{"flatMap"},
+    .{"forEach"},
+    .{"map"},
+    .{"reduce"},
+    .{"some"},
+    .{"take"},
+    .{"toArray"},
 });
 
 const math = std.StaticStringMap(void).initComptime(.{

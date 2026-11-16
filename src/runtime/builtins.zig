@@ -40,6 +40,7 @@ pub const Realm = struct {
     function_prototype: *Object,
     map_prototype: *Object,
     set_prototype: *Object,
+    iterator_prototype: *Object,
     /// Static members of the `Object`, `Array`, `Map`, and `Set` globals.
     object_namespace: *Object,
     array_namespace: *Object,
@@ -48,8 +49,8 @@ pub const Realm = struct {
     math: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [13]*Object {
-        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.map_prototype, r.set_prototype, r.object_namespace, r.array_namespace, r.map_namespace, r.set_namespace, r.math };
+    pub fn objects(r: *const Realm) [14]*Object {
+        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.map_prototype, r.set_prototype, r.iterator_prototype, r.object_namespace, r.array_namespace, r.map_namespace, r.set_namespace, r.math };
     }
 };
 
@@ -66,6 +67,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .function_prototype = try builtin(h, object_prototype, .function_prototype),
         .map_prototype = try builtin(h, object_prototype, .map_prototype),
         .set_prototype = try builtin(h, object_prototype, .set_prototype),
+        .iterator_prototype = try builtin(h, object_prototype, .iterator_prototype),
         .object_namespace = try builtin(h, null, .object_constructor),
         .array_namespace = try builtin(h, null, .array_constructor),
         .map_namespace = try builtin(h, null, .map_constructor),
@@ -81,6 +83,9 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.array_prototype, "includes", &array_includes);
     try method(rt, r.array_prototype, "join", &array_join);
     try method(rt, r.array_prototype, "toString", &array_to_string);
+    try method(rt, r.array_prototype, "keys", &array_keys);
+    try method(rt, r.array_prototype, "values", &array_values);
+    try method(rt, r.array_prototype, "entries", &array_entries);
     try method(rt, r.string_prototype, "charAt", &string_char_at);
     try method(rt, r.string_prototype, "charCodeAt", &string_char_code_at);
     try method(rt, r.string_prototype, "slice", &string_slice);
@@ -97,10 +102,17 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.map_prototype, "has", &map_has);
     try method(rt, r.map_prototype, "delete", &map_delete);
     try method(rt, r.map_prototype, "clear", &map_clear);
+    try method(rt, r.map_prototype, "keys", &map_keys);
+    try method(rt, r.map_prototype, "values", &map_values);
+    try method(rt, r.map_prototype, "entries", &map_entries);
     try method(rt, r.set_prototype, "add", &set_add);
     try method(rt, r.set_prototype, "has", &set_has);
     try method(rt, r.set_prototype, "delete", &set_delete);
     try method(rt, r.set_prototype, "clear", &set_clear);
+    try method(rt, r.set_prototype, "keys", &set_values);
+    try method(rt, r.set_prototype, "values", &set_values);
+    try method(rt, r.set_prototype, "entries", &set_entries);
+    try method(rt, r.iterator_prototype, "next", &iterator_next);
     try registerMath(rt, r.math);
     _ = &r;
     rt.realm = r;
@@ -221,6 +233,12 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
             .array => "Array",
             .map => "Map",
             .set => "Set",
+            .iterator => |it| switch (it.kind) {
+                .map_entries, .map_keys, .map_values => "Map Iterator",
+                .set_values, .set_entries => "Set Iterator",
+                .array_values, .array_keys, .array_entries => "Array Iterator",
+                .string_chars => "String Iterator",
+            },
             .ordinary => "Object",
         },
     };
@@ -243,6 +261,9 @@ const array_index_of: Native = .{ .name = "indexOf", .call = arrayIndexOf };
 const array_includes: Native = .{ .name = "includes", .call = arrayIncludes };
 const array_join: Native = .{ .name = "join", .call = arrayJoin };
 const array_to_string: Native = .{ .name = "toString", .call = arrayToString };
+const array_keys: Native = .{ .name = "keys", .call = arrayKeys };
+const array_values: Native = .{ .name = "values", .call = arrayValues };
+const array_entries: Native = .{ .name = "entries", .call = arrayEntries };
 
 fn toIntegerOrInfinity(rt: *Runtime, v: Value) Error!f64 {
     const n = try ops.toNumber(rt, v);
@@ -343,6 +364,21 @@ fn arrayToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     if (j == .native and j.native == &array_join) return arrayJoin(rt, this, &.{});
     if (j == .closure or j == .native) return rt.fail(.user_conversion);
     return objectToString(rt, this, &.{}); // join not callable: the Object.prototype one
+}
+
+fn arrayKeys(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    _ = try thisArray(rt, this, "keys");
+    return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .array_keys) };
+}
+
+fn arrayValues(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    _ = try thisArray(rt, this, "values");
+    return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .array_values) };
+}
+
+fn arrayEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    _ = try thisArray(rt, this, "entries");
+    return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .array_entries) };
 }
 
 // ---------------------------------------------------------------- String.prototype
@@ -742,6 +778,9 @@ const map_set: Native = .{ .name = "set", .call = mapSet };
 const map_has: Native = .{ .name = "has", .call = mapHas };
 const map_delete: Native = .{ .name = "delete", .call = mapDelete };
 const map_clear: Native = .{ .name = "clear", .call = mapClear };
+const map_keys: Native = .{ .name = "keys", .call = mapKeys };
+const map_values: Native = .{ .name = "values", .call = mapValues };
+const map_entries: Native = .{ .name = "entries", .call = mapEntries };
 
 fn mapWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
     return rt.throw(.TypeError, &.{.{ .ascii = "Constructor Map requires 'new'" }});
@@ -752,19 +791,16 @@ fn mapConstruct(rt: *Runtime, args: []const Value) Error!Value {
     const m = try rt.heap.newMap(r.map_prototype);
     const iterable = arg(args, 0);
     if (iterable == .undefined or iterable == .null) return .{ .object = m };
-    if (iterable == .object and iterable.object.kind == .array) {
-        for (iterable.object.kind.array.items) |entry| {
-            if (entry != .object) {
-                return rt.throw(.TypeError, &.{.{ .ascii = "Iterator value is not an entry object" }});
-            }
-            const k = try object.get(rt, entry, .{ .index = 0 });
-            const v = try object.get(rt, entry, .{ .index = 1 });
-            try rt.heap.mapSet(m, k, v);
+    const iter = try getIterator(rt, iterable);
+    while (try iteratorNextVal(rt, iter)) |entry| {
+        if (entry != .object) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Iterator value is not an entry object" }});
         }
-        return .{ .object = m };
+        const k = try object.get(rt, entry, .{ .index = 0 });
+        const v = try object.get(rt, entry, .{ .index = 1 });
+        try rt.heap.mapSet(m, k, v);
     }
-    if (iterable == .object or iterable == .string) return unsupportedReceiver(rt, "Map"); // M14.4 adds general iterables
-    return rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }});
+    return .{ .object = m };
 }
 
 fn thisMap(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
@@ -799,12 +835,29 @@ fn mapClear(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     return .undefined;
 }
 
+fn mapKeys(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    _ = try thisMap(rt, this, "keys");
+    return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .map_keys) };
+}
+
+fn mapValues(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    _ = try thisMap(rt, this, "values");
+    return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .map_values) };
+}
+
+fn mapEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    _ = try thisMap(rt, this, "entries");
+    return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .map_entries) };
+}
+
 // ---------------------------------------------------------------- Set
 
 const set_add: Native = .{ .name = "add", .call = setAdd };
 const set_has: Native = .{ .name = "has", .call = setHas };
 const set_delete: Native = .{ .name = "delete", .call = setDelete };
 const set_clear: Native = .{ .name = "clear", .call = setClear };
+const set_values: Native = .{ .name = "values", .call = setValues };
+const set_entries: Native = .{ .name = "entries", .call = setEntries };
 
 fn setWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
     return rt.throw(.TypeError, &.{.{ .ascii = "Constructor Set requires 'new'" }});
@@ -815,14 +868,11 @@ fn setConstruct(rt: *Runtime, args: []const Value) Error!Value {
     const s = try rt.heap.newSet(r.set_prototype);
     const iterable = arg(args, 0);
     if (iterable == .undefined or iterable == .null) return .{ .object = s };
-    if (iterable == .object and iterable.object.kind == .array) {
-        for (iterable.object.kind.array.items) |v| {
-            try rt.heap.setAdd(s, v);
-        }
-        return .{ .object = s };
+    const iter = try getIterator(rt, iterable);
+    while (try iteratorNextVal(rt, iter)) |v| {
+        try rt.heap.setAdd(s, v);
     }
-    if (iterable == .object or iterable == .string) return unsupportedReceiver(rt, "Set"); // M14.4 adds general iterables
-    return rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }});
+    return .{ .object = s };
 }
 
 fn thisSet(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
@@ -850,4 +900,115 @@ fn setClear(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     const s = try thisSet(rt, this, "clear");
     heap_mod.Heap.setClear(s);
     return .undefined;
+}
+
+fn setValues(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    _ = try thisSet(rt, this, "values");
+    return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .set_values) };
+}
+
+fn setEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    _ = try thisSet(rt, this, "entries");
+    return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .set_entries) };
+}
+
+// ---------------------------------------------------------------- Iterators (M14.4)
+
+const iterator_next: Native = .{ .name = "next", .call = iteratorNext };
+
+pub fn getIterator(rt: *Runtime, iterable: Value) Error!*Object {
+    const r = try realm(rt);
+    return switch (iterable) {
+        .object => |o| switch (o.kind) {
+            .map => rt.heap.newIterator(r.iterator_prototype, iterable, .map_entries),
+            .set => rt.heap.newIterator(r.iterator_prototype, iterable, .set_values),
+            .array => rt.heap.newIterator(r.iterator_prototype, iterable, .array_values),
+            .iterator => o,
+            .ordinary => unsupportedReceiver(rt, "Symbol.iterator"),
+        },
+        .string => rt.heap.newIterator(r.iterator_prototype, iterable, .string_chars),
+        else => rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }}),
+    };
+}
+
+fn makePairArray(rt: *Runtime, a: Value, b: Value) Error!Value {
+    const r = try realm(rt);
+    const pair = try rt.heap.newArray(r.array_prototype);
+    try rt.heap.appendElements(pair, &.{ a, b });
+    return .{ .object = pair };
+}
+
+pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
+    const it = &iter.kind.iterator;
+    if (it.done) return null;
+    switch (it.kind) {
+        .map_entries, .map_keys, .map_values => {
+            const entries = it.target.object.kind.map.entries.items;
+            while (it.cursor < entries.len) {
+                const i = it.cursor;
+                it.cursor += 1;
+                const e = entries[i];
+                if (!e.alive) continue;
+                return switch (it.kind) {
+                    .map_entries => try makePairArray(rt, e.key, e.value),
+                    .map_keys => e.key,
+                    .map_values => e.value,
+                    else => unreachable,
+                };
+            }
+        },
+        .set_values, .set_entries => {
+            const entries = it.target.object.kind.set.entries.items;
+            while (it.cursor < entries.len) {
+                const i = it.cursor;
+                it.cursor += 1;
+                const e = entries[i];
+                if (!e.alive) continue;
+                return switch (it.kind) {
+                    .set_values => e.key,
+                    .set_entries => try makePairArray(rt, e.key, e.key),
+                    else => unreachable,
+                };
+            }
+        },
+        .array_values, .array_keys, .array_entries => {
+            const items = it.target.object.kind.array.items;
+            if (it.cursor < items.len) {
+                const i = it.cursor;
+                it.cursor += 1;
+                const idx_val: Value = .{ .number = @floatFromInt(i) };
+                return switch (it.kind) {
+                    .array_values => items[i],
+                    .array_keys => idx_val,
+                    .array_entries => try makePairArray(rt, idx_val, items[i]),
+                    else => unreachable,
+                };
+            }
+        },
+        .string_chars => {
+            const units = it.target.string.units;
+            if (it.cursor < units.len) {
+                const start = it.cursor;
+                const first = units[start];
+                const step: usize = if (first >= 0xD800 and first <= 0xDBFF and
+                    start + 1 < units.len and
+                    units[start + 1] >= 0xDC00 and units[start + 1] <= 0xDFFF) 2 else 1;
+                it.cursor += step;
+                return .{ .string = try rt.heap.newString(&.{.{ .utf16 = units[start .. start + step] }}) };
+            }
+        },
+    }
+    it.done = true;
+    it.target = .undefined; // permanently exhausted; allow target collection
+    return null;
+}
+
+fn iteratorNext(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    if (this != .object or this.object.kind != .iterator) return unsupportedReceiver(rt, "next");
+    const r = try realm(rt);
+    const next_v = try iteratorNextVal(rt, this.object);
+    const out = try rt.heap.newObject(r.object_prototype);
+    try object.define(rt, out, try object.named(rt, "value"), next_v orelse .undefined);
+    try object.define(rt, out, try object.named(rt, "done"), .{ .boolean = next_v == null });
+    return .{ .object = out };
 }

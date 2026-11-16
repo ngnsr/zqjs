@@ -158,6 +158,10 @@ pub const Op = enum(u8) {
     /// Pop; jump if falsy / truthy (ToBoolean).
     jump_if_false,
     jump_if_true,
+    /// [iterable] → [iterator]: obtain built-in iterator for `for...of` (M14.4).
+    get_iter,
+    /// [iterator] → [iterator, value, done_bool]: advance iterator (M14.4).
+    iter_next,
     /// Stack: [callee, arg0 … arg(argc-1)] → [result]. The callee is evaluated first,
     /// then the arguments, and only then is it checked (TypeError if not callable,
     /// matching the tree-walker). A closure gets a new frame (D36) with no receiver; a
@@ -239,6 +243,8 @@ pub const Op = enum(u8) {
             .neg, .to_number, .not, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .jump => .{ .operands = &.{.target}, .pops = 0, .pushes = 0 },
             .jump_if_false, .jump_if_true => .{ .operands = &.{.target}, .pops = 1, .pushes = 0 },
+            .get_iter => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .iter_next => .{ .operands = &.{}, .pops = 1, .pushes = 2 },
             .call, .new_call => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
             .halt => .{ .operands = &.{}, .pops = 0, .pushes = 0 },
             .throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },

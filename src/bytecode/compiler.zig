@@ -111,6 +111,8 @@ const Compiler = struct {
 
     depth: u32 = 0,
     max_stack: u32 = 0,
+    temp_depth: u32 = 0,
+    max_temp: u32 = 0,
     loop: ?*Loop = null,
     /// Span of the statement being compiled, for limit diagnostics.
     span: ast.Span = .{ .start = 0, .end = 0 },
@@ -175,7 +177,7 @@ const Compiler = struct {
             .consts = consts,
             .names = names,
             .name_atoms = name_atoms,
-            .slot_count = info.slot_count,
+            .slot_count = info.slot_count + c.max_temp,
             .max_stack = c.max_stack,
             .param_count = info.param_count,
             .param_slot = info.param_slot,
@@ -440,6 +442,54 @@ const Compiler = struct {
                 if (to_end) |j| c.patch(j, c.here());
                 for (loop.breaks.items) |j| c.patch(j, c.here());
                 return to_end != null or loop.breaks.items.len > 0;
+            },
+            .for_of => |f| {
+                // Store iterator in a hidden local slot so the operand stack stays empty
+                // across `body` (preserving `return`/`try`/`break`/`continue` stack invariants).
+                const info = c.s.res.functions[c.function];
+                const iter_slot: u32 = info.slot_count + c.temp_depth;
+                c.temp_depth += 1;
+                c.max_temp = @max(c.max_temp, c.temp_depth);
+                defer c.temp_depth -= 1;
+
+                var single_copy: [1]ast.Declarator = undefined;
+                var copies: []const ast.Declarator = &.{};
+                if (f.target == .declaration) {
+                    const d = f.target.declaration.declarator;
+                    try c.enterBinding(d.binding);
+                    single_copy[0] = d;
+                    copies = &single_copy;
+                }
+                try c.expr(f.iterable);
+                try c.emit(.get_iter, &.{});
+                try c.emit(.init_local, &.{iter_slot});
+                var loop: Loop = .{};
+                defer c.deinitLoop(&loop);
+                const top = c.here();
+                try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
+                try c.emit(.iter_next, &.{});
+                const to_end = try c.jumpForward(.jump_if_true);
+                switch (f.target) {
+                    .declaration => |decl| {
+                        try c.perIteration(copies);
+                        try c.initBinding(decl.declarator.binding);
+                    },
+                    .target => |t| {
+                        try c.write(t.ref);
+                        try c.emit(.pop, &.{});
+                    },
+                }
+                const body_completes = try c.loopBody(&loop, f.body.*);
+                if (body_completes) try c.emit(.jump, &.{top});
+                for (loop.continues.items) |j| c.patch(j, top);
+                c.patch(to_end, c.here());
+                // At `to_end` (reached only from `jump_if_true` after `iter_next`), the
+                // stack holds `[undefined]` (`depth + 1` relative to body).
+                c.depth += 1;
+                try c.emit(.pop, &.{});
+                for (loop.breaks.items) |j| c.patch(j, c.here());
+                try c.emit(.clear_local, &.{iter_slot});
+                return true;
             },
             // The parser guarantees break/continue only occur inside loops.
             .@"break" => {

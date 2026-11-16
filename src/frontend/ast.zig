@@ -183,6 +183,7 @@ pub const Stmt = struct {
         /// The head declaration (if any) lives in its own scope around the body. Its
         /// bindings are the ones the spec copies per iteration (DESIGN_DECISIONS D22).
         @"for": struct { init: ?ForInit, cond: ?*const Expr, update: ?*const Expr, body: *const Stmt },
+        for_of: struct { target: ForOfTarget, iterable: *const Expr, body: *const Stmt },
         @"break",
         @"continue",
         /// Only at the top level of a script or a function body (blocks: Unsupported).
@@ -201,6 +202,11 @@ pub const Stmt = struct {
 pub const ForInit = union(enum) {
     declaration: Declaration,
     expression: *const Expr,
+};
+
+pub const ForOfTarget = union(enum) {
+    declaration: struct { kind: DeclKind, declarator: Declarator },
+    target: Target,
 };
 
 pub const Script = struct {

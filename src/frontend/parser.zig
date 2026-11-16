@@ -184,14 +184,14 @@ const Parser = struct {
 
     fn declarationStatement(p: *Parser, kind: ast.DeclKind) Error!ast.Stmt {
         const start = p.tok.start;
-        const decl = try p.declaration(kind);
+        const decl = try p.declaration(kind, false);
         const end = p.tok;
         try p.endStatement();
         return .{ .span = .{ .start = start, .end = end.end }, .data = .{ .declaration = decl } };
     }
 
     /// `let|const name [= init] (, name [= init])*` without the terminator.
-    fn declaration(p: *Parser, kind: ast.DeclKind) Error!ast.Declaration {
+    fn declaration(p: *Parser, kind: ast.DeclKind, allow_for_of: bool) Error!ast.Declaration {
         try p.advance(); // `let` / `const`
         var list: std.ArrayList(ast.Declarator) = .empty;
         while (true) {
@@ -202,8 +202,13 @@ const Parser = struct {
             if (token.isKeyword(name_tok.tag) or token.reserved_identifiers.has(name) or std.mem.eql(u8, name, "let"))
                 return p.fail(.{ .syntax_error = "reserved word cannot be a variable name" }, name_tok);
             try p.advance();
-            // `for (const x of xs)` must not be reported as a missing initializer.
-            if (p.isText(p.tok, "of") or p.isText(p.tok, "in")) return p.fail(.{ .unsupported = .syntax }, p.tok);
+            if (p.isText(p.tok, "in")) return p.fail(.{ .unsupported = .syntax }, p.tok);
+            if (p.isText(p.tok, "of")) {
+                if (!allow_for_of or list.items.len > 0) return p.fail(.{ .syntax_error = "invalid for-of declaration" }, p.tok);
+                try list.append(p.arena, .{ .name = name, .span = span(name_tok, name_tok), .binding = p.binding_count, .init = null });
+                p.binding_count += 1;
+                return .{ .kind = kind, .declarators = list.items };
+            }
             var init: ?*const ast.Expr = null;
             if (p.tok.tag == .eq) {
                 try p.advance();
@@ -275,15 +280,32 @@ const Parser = struct {
         var init: ?ast.ForInit = null;
         p.no_in = true;
         if (p.tok.tag == .kw_const) {
-            init = .{ .declaration = try p.declaration(.@"const") };
+            init = .{ .declaration = try p.declaration(.@"const", true) };
         } else if (p.isText(p.tok, "let") and try p.letStartsDeclaration()) {
-            init = .{ .declaration = try p.declaration(.let) };
+            init = .{ .declaration = try p.declaration(.let, true) };
         } else if (p.tok.tag != .semicolon) {
             init = .{ .expression = try p.expression() };
         }
         p.no_in = false;
-        // `for (x of xs)` / `for (x in o)`
-        if (p.isText(p.tok, "of") or p.isText(p.tok, "in")) return p.fail(.{ .unsupported = .syntax }, p.tok);
+        if (p.isText(p.tok, "in")) return p.fail(.{ .unsupported = .syntax }, p.tok);
+        if (p.isText(p.tok, "of")) {
+            const target: ast.ForOfTarget = switch (init orelse return p.fail(.{ .syntax_error = "missing left-hand side in for-of" }, p.tok)) {
+                .declaration => |decl| blk: {
+                    if (decl.declarators.len != 1 or decl.declarators[0].init != null)
+                        return p.fail(.{ .syntax_error = "for-of loop variable declaration may not have an initializer" }, p.tok);
+                    break :blk .{ .declaration = .{ .kind = decl.kind, .declarator = decl.declarators[0] } };
+                },
+                .expression => |e| blk: {
+                    if (e.data != .identifier) return p.failAt(.{ .unsupported = .syntax }, e.span.start, e.span.end);
+                    break :blk .{ .target = try p.assignTarget(e, "invalid left-hand side in for-of") };
+                },
+            };
+            try p.advance();
+            const iterable = try p.expression();
+            try p.expectAfterExpression(.r_paren);
+            const body = try p.loopBody();
+            return .{ .span = .{ .start = start, .end = body.span.end }, .data = .{ .for_of = .{ .target = target, .iterable = iterable, .body = body } } };
+        }
         try p.expectAfterExpression(.semicolon);
 
         const cond = if (p.tok.tag == .semicolon) null else try p.expression();

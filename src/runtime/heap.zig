@@ -263,6 +263,25 @@ pub fn hashValue(v: Value) u64 {
     return hasher.final();
 }
 
+pub const IteratorKind = enum {
+    map_entries,
+    map_keys,
+    map_values,
+    set_values,
+    set_entries,
+    array_values,
+    array_keys,
+    array_entries,
+    string_chars,
+};
+
+pub const IteratorState = struct {
+    target: Value,
+    kind: IteratorKind,
+    cursor: usize = 0,
+    done: bool = false,
+};
+
 /// An ordinary object or an array (DESIGN_DECISIONS D13).
 pub const Object = struct {
     obj: Obj,
@@ -279,6 +298,8 @@ pub const Object = struct {
         /// Insertion-ordered collection storage shared by Map and Set (M14).
         map: OrderedTable,
         set: OrderedTable,
+        /// Built-in iterator state (M14.4).
+        iterator: IteratorState,
     } = .ordinary,
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
@@ -609,6 +630,7 @@ pub const Heap = struct {
                     visitValue(e.key, &scan, RememberedScan.child);
                     visitValue(e.value, &scan, RememberedScan.child);
                 },
+                .iterator => |it| visitValue(it.target, &scan, RememberedScan.child),
             }
         }
     }
@@ -875,6 +897,13 @@ pub const Heap = struct {
         o.kind.set.clear();
     }
 
+    pub fn newIterator(h: *Heap, proto: ?*Object, target: Value, kind: IteratorKind) Error!*Object {
+        const o = try h.newObject(proto);
+        o.kind = .{ .iterator = .{ .target = target, .kind = kind } };
+        h.barrier(&o.obj, null, target);
+        return o;
+    }
+
     // ---- the store API (GC_DESIGN §7, I3)
     //
     // After construction, every reference written into a heap object goes through one of
@@ -1090,7 +1119,7 @@ pub const Heap = struct {
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
         return switch (arr.kind) {
             .array => |*elements| elements,
-            .ordinary, .map, .set => unreachable, // only arrays have elements
+            .ordinary, .map, .set, .iterator => unreachable, // only arrays have elements
         };
     }
 
@@ -1308,6 +1337,7 @@ pub const Heap = struct {
                         if (h.cards.fetchRemove(o)) |kv| h.allocator().free(kv.value);
                     },
                     .map, .set => |*table| table.deinit(h.allocator()),
+                    .iterator => {},
                 }
                 o.kind = .ordinary;
                 o.proto = null;
@@ -1430,6 +1460,7 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                     visitValue(e.key, ctx, visit);
                     visitValue(e.value, ctx, visit);
                 },
+                .iterator => |it| visitValue(it.target, ctx, visit),
             }
         },
     }

@@ -655,6 +655,20 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
                 if (truthy == (op == .jump_if_true)) next = try cache.target(vm);
             },
+            .get_iter => {
+                const iterable = try cache.peek(vm, 0);
+                cache.syncSp(vm);
+                const iter = try builtins.getIterator(rt, iterable);
+                vm.stack[cache.sp - 1] = .{ .object = iter };
+            },
+            .iter_next => {
+                const iter_val = try cache.peek(vm, 0);
+                if (iter_val != .object or iter_val.object.kind != .iterator) return vm.bug("iter_next on non-iterator");
+                cache.syncSp(vm);
+                const next_v = try builtins.iteratorNextVal(rt, iter_val.object);
+                vm.stack[cache.sp - 1] = next_v orelse .undefined;
+                try cache.push(vm, .{ .boolean = next_v == null });
+            },
             .new_call => {
                 const argc = cache.operand(0);
                 const group = argc + 1;

@@ -32,6 +32,7 @@ const objects = vm.runInNewContext(`({
   map_prototype: Map.prototype,
   set_constructor: Set,
   set_prototype: Set.prototype,
+  iterator_prototype: Object.getPrototypeOf(Object.getPrototypeOf([].values())),
   math: Math,
 })`);
 

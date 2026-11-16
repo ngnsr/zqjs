@@ -263,6 +263,19 @@ const Resolver = struct {
                 if (f.update) |e| try r.expr(e);
                 try r.stmt(f.body.*);
             },
+            .for_of => |f| {
+                const saved = try r.enterScope();
+                defer r.exitScope(saved);
+                switch (f.target) {
+                    .declaration => |d| try r.declare(d.declarator, if (d.kind == .let) .let else .@"const", false),
+                    .target => |t| switch (t) {
+                        .ref => |ref| r.refs[ref.id] = try r.lookup(ref.name),
+                        .member => |m| try r.member(m),
+                    },
+                }
+                try r.expr(f.iterable);
+                try r.stmt(f.body.*);
+            },
         }
     }
 

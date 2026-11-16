@@ -277,6 +277,7 @@ const Interpreter = struct {
                 }
             },
             .@"for" => |f| return it.execFor(f),
+            .for_of => |f| return it.execForOf(f),
             .@"break" => return .@"break",
             .@"continue" => return .@"continue",
             .throw => |e| return it.rt.throwValue(try it.eval(e)),
@@ -325,6 +326,47 @@ const Interpreter = struct {
             }
             if (per_iteration) try it.copyScope();
             if (f.update) |u| _ = try it.eval(u);
+        }
+        return .normal;
+    }
+
+    fn execForOf(it: *Interpreter, f: @FieldType(ast.Stmt.Data, "for_of")) Error!Completion {
+        const saved = it.env;
+        defer it.env = saved;
+        const balanced = it.mark();
+        defer it.release(balanced);
+        if (f.target == .declaration) {
+            try it.pushScope(it.res.bindings[f.target.declaration.declarator.binding].scope);
+        }
+        const iterable = try it.eval(f.iterable);
+        try it.hold(iterable);
+        const iter = try builtins.getIterator(it.rt, iterable);
+        try it.hold(.{ .object = iter });
+        while (true) {
+            try it.rt.step();
+            const next_val = (try builtins.iteratorNextVal(it.rt, iter)) orelse break;
+            try it.hold(next_val);
+            switch (f.target) {
+                .declaration => |decl| {
+                    try it.copyScope();
+                    it.store(decl.declarator.binding, next_val);
+                },
+                .target => |t| {
+                    const ref = t.ref;
+                    if (it.bindingOf(ref) != null) {
+                        try it.write(ref, next_val);
+                    } else if (builtins.isBuiltinGlobal(ref.name)) {
+                        return it.rt.fail(.builtin);
+                    } else {
+                        return it.rt.throw(.ReferenceError, &.{ .{ .ascii = ref.name }, .{ .ascii = " is not defined" } });
+                    }
+                },
+            }
+            switch (try it.exec(f.body.*)) {
+                .normal, .@"continue" => {},
+                .@"break" => break,
+                .@"return" => return .@"return",
+            }
         }
         return .normal;
     }

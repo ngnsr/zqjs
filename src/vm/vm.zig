@@ -479,9 +479,28 @@ pub const Vm = struct {
             },
 
             .add, .sub, .mul, .div, .mod, .pow, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in => {
-                const r = try ops.binary(rt, binaryOp(op), try vm.peek(1), try vm.peek(0)); // into a local (see .neg)
-                try vm.drop(1);
-                (try vm.top()).* = r;
+                // M10.2b: fast path when both operands are already `.number` (`f64`),
+                // matching IEEE-754 / JS semantics for NaN, infinities, and -0.
+                // `.mod` stays in `ops.binary` until M10.2c; all mixed/non-number cases
+                // fall back to `ops.binary`.
+                const lhs = try vm.peek(1);
+                const rhs = try vm.peek(0);
+                const r: Value = if (lhs == .number and rhs == .number) switch (op) {
+                    .add => .{ .number = lhs.number + rhs.number },
+                    .sub => .{ .number = lhs.number - rhs.number },
+                    .mul => .{ .number = lhs.number * rhs.number },
+                    .div => .{ .number = lhs.number / rhs.number },
+                    .lt => .{ .boolean = lhs.number < rhs.number },
+                    .le => .{ .boolean = lhs.number <= rhs.number },
+                    .gt => .{ .boolean = lhs.number > rhs.number },
+                    .ge => .{ .boolean = lhs.number >= rhs.number },
+                    .strict_eq => .{ .boolean = lhs.number == rhs.number },
+                    .strict_ne => .{ .boolean = lhs.number != rhs.number },
+                    .mod, .pow, .in => try ops.binary(rt, binaryOp(op), lhs, rhs),
+                    else => unreachable,
+                } else try ops.binary(rt, binaryOp(op), lhs, rhs);
+                vm.sp -= 1;
+                vm.stack[vm.sp - 1] = r;
             },
             // Compute into a local, then store. `top().* = .{ .number = f(peek(0)) }` would
             // be wrong: Zig builds the union in place, so the slot's tag changes *before*
@@ -489,8 +508,8 @@ pub const Vm = struct {
             .neg, .to_number, .not => {
                 const v = try vm.peek(0);
                 const r: Value = switch (op) {
-                    .neg => .{ .number = -(try ops.toNumber(rt, v)) },
-                    .to_number => .{ .number = try ops.toNumber(rt, v) },
+                    .neg => .{ .number = if (v == .number) -v.number else -(try ops.toNumber(rt, v)) },
+                    .to_number => if (v == .number) v else .{ .number = try ops.toNumber(rt, v) },
                     .not => .{ .boolean = !ops.toBoolean(v) },
                     else => unreachable,
                 };

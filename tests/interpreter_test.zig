@@ -362,3 +362,9 @@ test "M14.2: Map unsupported methods, non-Map receivers, and non-Map new() targe
     try expectUnsupported("function F() {} new F();", "", "Unsupported(builtin)");
     try expectUnsupported("new Map(new Map());", "", "Unsupported(builtin)");
 }
+
+test "M14.3: Set unsupported methods, non-Set receivers, and non-array iterables" {
+    try expectUnsupported("new Set().forEach;", "", "('forEach')");
+    try expectUnsupported("let o = { has: new Set().has }; o.has('x');", "", "Unsupported(builtin)");
+    try expectUnsupported("new Set(new Set());", "", "Unsupported(builtin)");
+}

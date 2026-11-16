@@ -1452,3 +1452,23 @@ test "M14.2: old Map remembers young keys/values across minor collections and re
         try testing.expectEqualStrings("2 20\n0 undefined\n", r.out);
     }
 }
+
+test "M14.3: old Set remembers young values across minor collections and reclaims cleared entries" {
+    const src =
+        \\let s = new Set();
+        \\for (let i = 0; i < 1500; i++) { let tmp = { i: i }; }
+        \\let v = 'young-set-' + 7;
+        \\s.add(v);
+        \\s.add({ tag: 'obj-' + 1 });
+        \\v = null;
+        \\for (let i = 0; i < 1500; i++) { let tmp = 'churn-' + i; }
+        \\print(s.size, s.has('young-set-7'));
+        \\s.clear();
+        \\print(s.size, s.has('young-set-7'));
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("2 true\n0 false\n", r.out);
+    }
+}

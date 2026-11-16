@@ -39,15 +39,17 @@ pub const Realm = struct {
     boolean_prototype: *Object,
     function_prototype: *Object,
     map_prototype: *Object,
-    /// Static members of the `Object`, `Array`, and `Map` globals.
+    set_prototype: *Object,
+    /// Static members of the `Object`, `Array`, `Map`, and `Set` globals.
     object_namespace: *Object,
     array_namespace: *Object,
     map_namespace: *Object,
+    set_namespace: *Object,
     math: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [11]*Object {
-        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.map_prototype, r.object_namespace, r.array_namespace, r.map_namespace, r.math };
+    pub fn objects(r: *const Realm) [13]*Object {
+        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.map_prototype, r.set_prototype, r.object_namespace, r.array_namespace, r.map_namespace, r.set_namespace, r.math };
     }
 };
 
@@ -63,9 +65,11 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .boolean_prototype = try builtin(h, object_prototype, .boolean_prototype),
         .function_prototype = try builtin(h, object_prototype, .function_prototype),
         .map_prototype = try builtin(h, object_prototype, .map_prototype),
+        .set_prototype = try builtin(h, object_prototype, .set_prototype),
         .object_namespace = try builtin(h, null, .object_constructor),
         .array_namespace = try builtin(h, null, .array_constructor),
         .map_namespace = try builtin(h, null, .map_constructor),
+        .set_namespace = try builtin(h, null, .set_constructor),
         .math = try builtin(h, object_prototype, .math),
     };
     try method(rt, r.object_prototype, "toString", &object_to_string);
@@ -93,6 +97,10 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.map_prototype, "has", &map_has);
     try method(rt, r.map_prototype, "delete", &map_delete);
     try method(rt, r.map_prototype, "clear", &map_clear);
+    try method(rt, r.set_prototype, "add", &set_add);
+    try method(rt, r.set_prototype, "has", &set_has);
+    try method(rt, r.set_prototype, "delete", &set_delete);
+    try method(rt, r.set_prototype, "clear", &set_clear);
     try registerMath(rt, r.math);
     _ = &r;
     rt.realm = r;
@@ -126,6 +134,7 @@ pub const print: Native = .{ .name = "print", .call = printImpl };
 pub const object_global: Native = .{ .name = "Object", .call = notCallable, .namespace = .object };
 pub const array_global: Native = .{ .name = "Array", .call = notCallable, .namespace = .array };
 pub const map_global: Native = .{ .name = "Map", .call = mapWithoutNew, .construct = mapConstruct, .namespace = .map };
+pub const set_global: Native = .{ .name = "Set", .call = setWithoutNew, .construct = setConstruct, .namespace = .set };
 
 /// A global read: implemented, host-registered (M9.1, D53), known to node (Unsupported),
 /// or a ReferenceError.
@@ -137,6 +146,7 @@ pub fn global(rt: *Runtime, name: []const u8) Error!Value {
     if (std.mem.eql(u8, name, "Object")) return .{ .native = &object_global };
     if (std.mem.eql(u8, name, "Array")) return .{ .native = &array_global };
     if (std.mem.eql(u8, name, "Map")) return .{ .native = &map_global };
+    if (std.mem.eql(u8, name, "Set")) return .{ .native = &set_global };
     if (std.mem.eql(u8, name, "Math")) return .{ .object = (try realm(rt)).math };
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return .{ .native = n };
     if (names.has(.global, name)) {
@@ -210,6 +220,7 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
         .object => |o| switch (o.kind) {
             .array => "Array",
             .map => "Map",
+            .set => "Set",
             .ordinary => "Object",
         },
     };
@@ -785,5 +796,58 @@ fn mapDelete(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 fn mapClear(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     const m = try thisMap(rt, this, "clear");
     heap_mod.Heap.mapClear(m);
+    return .undefined;
+}
+
+// ---------------------------------------------------------------- Set
+
+const set_add: Native = .{ .name = "add", .call = setAdd };
+const set_has: Native = .{ .name = "has", .call = setHas };
+const set_delete: Native = .{ .name = "delete", .call = setDelete };
+const set_clear: Native = .{ .name = "clear", .call = setClear };
+
+fn setWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "Constructor Set requires 'new'" }});
+}
+
+fn setConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    const s = try rt.heap.newSet(r.set_prototype);
+    const iterable = arg(args, 0);
+    if (iterable == .undefined or iterable == .null) return .{ .object = s };
+    if (iterable == .object and iterable.object.kind == .array) {
+        for (iterable.object.kind.array.items) |v| {
+            try rt.heap.setAdd(s, v);
+        }
+        return .{ .object = s };
+    }
+    if (iterable == .object or iterable == .string) return unsupportedReceiver(rt, "Set"); // M14.4 adds general iterables
+    return rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }});
+}
+
+fn thisSet(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
+    if (this == .object and this.object.kind == .set) return this.object;
+    return unsupportedReceiver(rt, name);
+}
+
+fn setAdd(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisSet(rt, this, "add");
+    try rt.heap.setAdd(s, arg(args, 0));
+    return this;
+}
+
+fn setHas(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisSet(rt, this, "has");
+    return .{ .boolean = heap_mod.Heap.setHas(s, arg(args, 0)) };
+}
+
+fn setDelete(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisSet(rt, this, "delete");
+    return .{ .boolean = heap_mod.Heap.setDelete(s, arg(args, 0)) };
+}
+
+fn setClear(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const s = try thisSet(rt, this, "clear");
+    heap_mod.Heap.setClear(s);
     return .undefined;
 }

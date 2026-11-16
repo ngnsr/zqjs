@@ -278,6 +278,7 @@ pub const Object = struct {
         array: std.ArrayList(Value),
         /// Insertion-ordered collection storage shared by Map and Set (M14).
         map: OrderedTable,
+        set: OrderedTable,
     } = .ordinary,
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
@@ -603,7 +604,7 @@ pub const Heap = struct {
                 .array => |elements| if (h.cards.get(o)) |words| {
                     scanDirty(words, elements.items.len, &scan, o, RememberedScan.elements);
                 } else scan.elements(o, 0, elements.items.len),
-                .map => |table| for (table.entries.items) |e| {
+                .map, .set => |table| for (table.entries.items) |e| {
                     if (!e.alive) continue;
                     visitValue(e.key, &scan, RememberedScan.child);
                     visitValue(e.value, &scan, RememberedScan.child);
@@ -852,6 +853,28 @@ pub const Heap = struct {
         o.kind.map.clear();
     }
 
+    pub fn newSet(h: *Heap, proto: ?*Object) Error!*Object {
+        const o = try h.newObject(proto);
+        o.kind = .{ .set = .{} };
+        return o;
+    }
+
+    pub fn setHas(o: *const Object, val: Value) bool {
+        return o.kind.set.has(val);
+    }
+
+    pub fn setAdd(h: *Heap, o: *Object, val: Value) Error!void {
+        try o.kind.set.set(h, o, val, .undefined);
+    }
+
+    pub fn setDelete(o: *Object, val: Value) bool {
+        return o.kind.set.delete(val);
+    }
+
+    pub fn setClear(o: *Object) void {
+        o.kind.set.clear();
+    }
+
     // ---- the store API (GC_DESIGN §7, I3)
     //
     // After construction, every reference written into a heap object goes through one of
@@ -1067,7 +1090,7 @@ pub const Heap = struct {
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
         return switch (arr.kind) {
             .array => |*elements| elements,
-            .ordinary, .map => unreachable, // only arrays have elements
+            .ordinary, .map, .set => unreachable, // only arrays have elements
         };
     }
 
@@ -1284,7 +1307,7 @@ pub const Heap = struct {
                         elements.deinit(h.allocator());
                         if (h.cards.fetchRemove(o)) |kv| h.allocator().free(kv.value);
                     },
-                    .map => |*table| table.deinit(h.allocator()),
+                    .map, .set => |*table| table.deinit(h.allocator()),
                 }
                 o.kind = .ordinary;
                 o.proto = null;
@@ -1402,7 +1425,7 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
             switch (o.kind) {
                 .ordinary => {},
                 .array => |elements| for (elements.items) |v| visitValue(v, ctx, visit),
-                .map => |table| for (table.entries.items) |e| {
+                .map, .set => |table| for (table.entries.items) |e| {
                     if (!e.alive) continue;
                     visitValue(e.key, ctx, visit);
                     visitValue(e.value, ctx, visit);

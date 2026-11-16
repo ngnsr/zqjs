@@ -30,6 +30,8 @@ const objects = vm.runInNewContext(`({
   array_constructor: Array,
   map_constructor: Map,
   map_prototype: Map.prototype,
+  set_constructor: Set,
+  set_prototype: Set.prototype,
   math: Math,
 })`);
 

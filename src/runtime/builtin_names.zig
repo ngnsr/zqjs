@@ -15,6 +15,8 @@ pub const Builtin = enum {
     array_constructor,
     map_constructor,
     map_prototype,
+    set_constructor,
+    set_prototype,
     math,
 };
 
@@ -32,6 +34,8 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .array_constructor => array_constructor.has(name),
         .map_constructor => map_constructor.has(name),
         .map_prototype => map_prototype.has(name),
+        .set_constructor => set_constructor.has(name),
+        .set_prototype => set_prototype.has(name),
         .math => math.has(name),
     };
 }
@@ -307,6 +311,32 @@ const map_prototype = std.StaticStringMap(void).initComptime(.{
     .{"keys"},
     .{"set"},
     .{"size"},
+    .{"values"},
+});
+
+const set_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const set_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"add"},
+    .{"clear"},
+    .{"constructor"},
+    .{"delete"},
+    .{"difference"},
+    .{"entries"},
+    .{"forEach"},
+    .{"has"},
+    .{"intersection"},
+    .{"isDisjointFrom"},
+    .{"isSubsetOf"},
+    .{"isSupersetOf"},
+    .{"keys"},
+    .{"size"},
+    .{"symmetricDifference"},
+    .{"union"},
     .{"values"},
 });
 

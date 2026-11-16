@@ -49,6 +49,30 @@ pub const EngineRoots = struct {
     mark: *const fn (ctx: *anyopaque, h: *Heap) void,
 };
 
+/// How an active engine invokes a JS closure from inside a built-in native (M16.1).
+pub const ClosureCaller = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, c: *const heap_mod.Closure, this: ?Value, args: []const Value) Error!Value,
+};
+
+/// Stack-local GC root frame for built-ins that hold live JS values across callbacks (M16.1).
+pub const ValueRoots = struct {
+    values: []Value,
+
+    pub fn register(self: *ValueRoots, rt: *Runtime) error{OutOfMemory}!void {
+        try rt.addRoots(.{ .ctx = self, .mark = mark });
+    }
+
+    pub fn unregister(self: *ValueRoots, rt: *Runtime) void {
+        rt.removeRoots(self);
+    }
+
+    fn mark(ctx: *anyopaque, h: *Heap) void {
+        const self: *ValueRoots = @ptrCast(@alignCast(ctx));
+        for (self.values) |v| h.markValue(v);
+    }
+};
+
 /// A host native call in flight (M9.1, D53): the engine's record of the crossing —
 /// its temporary argument tokens (D50), the caller VM's result slot and pc, a depth
 /// charge. The record is the guard's engine capability (D52): native dispatch pushes it
@@ -189,6 +213,8 @@ pub const Runtime = struct {
     joining: std.ArrayList(*heap_mod.Object) = .empty,
     /// The running engine's roots (its stacks and frames), marked by `collect` (D8).
     engine_roots: ?EngineRoots = null,
+    /// The running engine's closure-invocation hook for JS → Builtin → JS reentrancy (M16.1).
+    closure_caller: ?ClosureCaller = null,
     /// More root sets, marked by every collection (M9.0): the embedding API registers each
     /// live program (its constants) and execution (its VM, suspended or not) here.
     extra_roots: std.ArrayList(EngineRoots) = .empty,
@@ -387,6 +413,21 @@ pub const Runtime = struct {
             return;
         };
         unreachable; // removing a root set that was never added
+    }
+
+    /// Invokes a JS callable (`native` or `closure`) from inside a built-in (M16.1).
+    pub fn callCallable(rt: *Runtime, callee: Value, this_val: Value, args: []const Value) Error!Value {
+        return switch (callee) {
+            .native => |n| if (n.host) |h|
+                h.call(rt, h.ctx, if (this_val == .object) this_val else null, args)
+            else
+                n.call(rt, this_val, args),
+            .closure => |c| {
+                const cc = rt.closure_caller orelse return rt.bug("closure called without an active engine");
+                return cc.call(cc.ctx, c, if (this_val == .object) this_val else null, args);
+            },
+            else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
+        };
     }
 
     pub fn limitHit(rt: *const Runtime) ?Limit {

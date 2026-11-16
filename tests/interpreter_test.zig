@@ -423,3 +423,117 @@ test "M15.2: JSON.stringify replacer/space/toJSON exclusions, nesting limit, and
     };
     try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
 }
+
+test "M16.1: ClosureCaller, callCallable, ValueRoots, exception propagation, depth/step limits, and OOM" {
+    const Helper = struct {
+        fn invokeTwice(rt: *Runtime, _: zqjs.Value, args: []const zqjs.Value) zqjs.runtime.Error!zqjs.Value {
+            const cb = if (args.len > 0) args[0] else zqjs.Value.undefined;
+            const this_v = if (args.len > 1) args[1] else zqjs.Value.undefined;
+            const r = try zqjs.builtins.realm(rt);
+            const acc_obj = try rt.heap.newObject(r.object_prototype);
+            var root_buf = [_]zqjs.Value{ cb, this_v, .{ .object = acc_obj }, .undefined };
+            var roots: zqjs.runtime.ValueRoots = .{ .values = &root_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+
+            const v1 = try rt.callCallable(cb, this_v, &.{.{ .number = 10 }});
+            root_buf[3] = v1;
+            const v2 = try rt.callCallable(cb, this_v, &.{v1});
+            try zqjs.object.define(rt, acc_obj, try zqjs.object.named(rt, "val"), v2);
+            return .{ .object = acc_obj };
+        }
+
+        fn addGlobal(rt: *Runtime, alloc: Allocator) !void {
+            const n = try alloc.create(zqjs.Native);
+            errdefer alloc.destroy(n);
+            n.* = .{
+                .name = try alloc.dupe(u8, "__test_invoke_twice"),
+                .call = invokeTwice,
+            };
+            errdefer alloc.free(n.name);
+            try rt.host_globals.append(alloc, n);
+        }
+    };
+
+    for (support.engines) |engine| {
+        // 1. Nested JS -> Native -> JS + this binding + ValueRoots across allocations
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var out_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out_buf.deinit();
+        var rt = Runtime.init(testing.allocator, .{}, &out_buf.writer);
+        defer rt.deinit();
+        try Helper.addGlobal(&rt, testing.allocator);
+
+        const src =
+            \\const ctx = { k: 5 };
+            \\const res = __test_invoke_twice(function (x) {
+            \\    for (let i = 0; i < 200; i++) { let tmp = { i: i }; }
+            \\    return x + this.k;
+            \\}, ctx);
+            \\print(res.val);
+        ;
+        try testing.expectEqual(@as(?anyerror, null), try runScript(arena.allocator(), &rt, src, engine));
+        try testing.expectEqualStrings("20\n", out_buf.written());
+        try testing.expect(!rt.exec_ctx.active);
+        try testing.expectEqual(@as(u32, 0), rt.exec_ctx.call_depth);
+
+        // 2. Exception propagation from callback + try/catch recovery
+        out_buf.clearRetainingCapacity();
+        const err_src =
+            \\try {
+            \\    __test_invoke_twice(function () { throw "boom"; });
+            \\} catch (e) {
+            \\    print("caught", e);
+            \\}
+        ;
+        try testing.expectEqual(@as(?anyerror, null), try runScript(arena.allocator(), &rt, err_src, engine));
+        try testing.expectEqualStrings("caught boom\n", out_buf.written());
+        try testing.expect(!rt.exec_ctx.active);
+        try testing.expectEqual(@as(u32, 0), rt.exec_ctx.call_depth);
+
+        // 3. Non-callable value throws TypeError
+        out_buf.clearRetainingCapacity();
+        const type_err_src =
+            \\try { __test_invoke_twice(123); } catch (e) { print(e.name); }
+        ;
+        try testing.expectEqual(@as(?anyerror, null), try runScript(arena.allocator(), &rt, type_err_src, engine));
+        try testing.expectEqualStrings("TypeError\n", out_buf.written());
+
+        // 4. Call depth limit across reentrant native boundary
+        var lim_rt = Runtime.init(testing.allocator, .{ .max_call_depth = 3 }, &out_buf.writer);
+        defer lim_rt.deinit();
+        try Helper.addGlobal(&lim_rt, testing.allocator);
+        const depth_src = "function rec(x) { return __test_invoke_twice(rec); } rec(0);";
+        const depth_err = try runScript(arena.allocator(), &lim_rt, depth_src, engine);
+        try testing.expectEqual(@as(?anyerror, error.LimitExceeded), depth_err);
+        try testing.expectEqual(@as(?Limit, .call_depth), lim_rt.limitHit());
+        try testing.expect(!lim_rt.exec_ctx.active);
+        try testing.expectEqual(@as(u32, 0), lim_rt.exec_ctx.call_depth);
+
+        // 5. Step budget limit across reentrant native boundary
+        var step_rt = Runtime.init(testing.allocator, .{ .max_steps = 25 }, &out_buf.writer);
+        defer step_rt.deinit();
+        try Helper.addGlobal(&step_rt, testing.allocator);
+        const step_src = "__test_invoke_twice(function (x) { let s = 0; for (let i = 0; i < 100; i++) s += i; return x + s; });";
+        const step_err = try runScript(arena.allocator(), &step_rt, step_src, engine);
+        try testing.expectEqual(@as(?anyerror, error.LimitExceeded), step_err);
+        try testing.expectEqual(@as(?Limit, .steps), step_rt.limitHit());
+        try testing.expect(!step_rt.exec_ctx.active);
+        try testing.expectEqual(@as(u32, 0), step_rt.exec_ctx.call_depth);
+    }
+
+    // 6. Allocation failure cleanup during chain-less VM callback dispatch
+    const OomCtx = struct {
+        fn runOnce(alloc: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            var discard: std.Io.Writer.Discarding = .init(&.{});
+            var rt = Runtime.init(alloc, .{}, &discard.writer);
+            defer rt.deinit();
+            try Helper.addGlobal(&rt, alloc);
+            if (try runScript(arena.allocator(), &rt, "__test_invoke_twice(function (x) { return x + 1; });", .vm)) |e| return e;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
+}

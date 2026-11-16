@@ -82,6 +82,9 @@ fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUs
         };
         it.roots.deinit(rt.gpa);
     }
+    const prev_caller = rt.closure_caller;
+    rt.closure_caller = .{ .ctx = &it, .call = Interpreter.callFromBuiltin };
+    defer rt.closure_caller = prev_caller;
     // The parser guarantees break/continue only occur in loops and return in functions.
     std.debug.assert(try it.block(script.statements) == .normal);
 }
@@ -610,11 +613,16 @@ const Interpreter = struct {
         };
     }
 
+    fn callFromBuiltin(ctx: *anyopaque, closure: *const heap.Closure, this: ?Value, args: []const Value) Error!Value {
+        const it: *Interpreter = @ptrCast(@alignCast(ctx));
+        return it.call(closure, this, args);
+    }
+
     fn call(it: *Interpreter, closure: *const heap.Closure, this: ?Value, args: []const Value) Error!Value {
         closure.obj.checkLive();
         const t = switch (closure.impl) {
             .tree => |t| t,
-            .vm => unreachable, // each engine only ever sees its own closures
+            .vm => return it.rt.bug("a VM closure in the tree-walker"),
         };
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
         if (it.calls >= it.rt.limits.max_call_depth) return it.rt.limit(.call_depth);

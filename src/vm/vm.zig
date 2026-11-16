@@ -174,6 +174,43 @@ pub const Vm = struct {
         return vm;
     }
 
+    /// Invokes a VM closure from inside a built-in native via Model B nested VM execution (M16.1).
+    fn callFromBuiltin(ctx: *anyopaque, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        const rt = vm.rt;
+
+        const own_chain = !rt.exec_ctx.active;
+        const saved_max_steps = rt.max_steps;
+        if (own_chain) {
+            std.debug.assert(vm.chain == null);
+            rt.beginChain(rt.steps, saved_max_steps);
+            rt.exec_ctx.call_depth = @intCast(vm.frames.items.len);
+            vm.chain = &rt.exec_ctx;
+        }
+        const depth_before = rt.exec_ctx.call_depth;
+        defer {
+            std.debug.assert(rt.exec_ctx.call_depth == depth_before);
+            if (own_chain) {
+                vm.chain = null;
+                _ = rt.endChain();
+                rt.max_steps = saved_max_steps;
+            }
+        }
+        if (rt.exec_ctx.budget_fault != null) return rt.limit(.steps);
+        if (rt.exec_ctx.call_depth >= rt.limits.max_call_depth) return rt.limit(.call_depth);
+
+        var nested = try Vm.initCall(rt, c, this, args);
+        defer nested.deinit();
+        nested.chain = &rt.exec_ctx;
+        rt.exec_ctx.call_depth += 1;
+        try rt.exec_ctx.vms.append(rt.gpa, nested.roots());
+        defer rt.exec_ctx.removeVm(&nested);
+
+        try nested.run();
+        if (rt.exec_ctx.budget_fault != null) return rt.limit(.steps);
+        return nested.nested_result orelse rt.bug("a nested call ended without a result");
+    }
+
     /// Runs to `halt` or the first error (M10.2a: dedicated continuous loop preserving
     /// `Vm.step()` unchanged for sliced execution and debugging, with exact `rt.step()`
     /// accounting and per-instruction GC safepoints).
@@ -286,6 +323,9 @@ pub const Vm = struct {
         const rt = vm.rt;
         const h = &rt.heap;
         if (!vm.nested) rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
+        const prev_caller = rt.closure_caller;
+        rt.closure_caller = .{ .ctx = vm, .call = callFromBuiltin };
+        defer rt.closure_caller = prev_caller;
         var cache = FrameCache.fromVm(vm, vm.pc);
         var n: u64 = 0;
         while (!bounded or n < steps) {

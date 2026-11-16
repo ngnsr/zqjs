@@ -1613,3 +1613,32 @@ test "M18.1: Promise self-resolution TypeError allocation survives GC" {
         try testing.expectEqualStrings("true\n", r.out);
     }
 }
+
+test "M18.2: Promise.then/catch chains survive minor and major GC during microtask drain" {
+    const src =
+        \\let out = 0;
+        \\let res = null;
+        \\const p = new Promise(function (r) { res = r; });
+        \\p.then(function (obj) {
+        \\    for (let i = 0; i < 300; i++) { let tmp = { i: i }; }
+        \\    return { v: obj.v + 1 };
+        \\}).then(function (obj) {
+        \\    for (let i = 0; i < 300; i++) { let tmp = { i: i }; }
+        \\    throw { code: obj.v * 10 };
+        \\}).catch(function (err) {
+        \\    for (let i = 0; i < 300; i++) { let tmp = { i: i }; }
+        \\    out = err.code;
+        \\});
+        \\res({ v: 4 });
+        \\Promise.resolve().then(function () {
+        \\    return Promise.resolve();
+        \\}).then(function () {
+        \\    print(out);
+        \\});
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("50\n", r.out);
+    }
+}

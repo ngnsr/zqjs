@@ -125,6 +125,8 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.set_prototype, "values", &set_values);
     try method(rt, r.set_prototype, "entries", &set_entries);
     try method(rt, r.set_prototype, "forEach", &set_for_each);
+    try method(rt, r.promise_prototype, "then", &promise_then);
+    try method(rt, r.promise_prototype, "catch", &promise_catch);
     try method(rt, r.promise_namespace, "resolve", &promise_resolve_static);
     try method(rt, r.promise_namespace, "reject", &promise_reject_static);
     try method(rt, r.iterator_prototype, "next", &iterator_next);
@@ -1081,6 +1083,61 @@ fn setForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 
 const promise_resolve_static: Native = .{ .name = "resolve", .call = promiseResolveStatic };
 const promise_reject_static: Native = .{ .name = "reject", .call = promiseRejectStatic };
+const promise_then: Native = .{ .name = "then", .call = promiseThen };
+const promise_catch: Native = .{ .name = "catch", .call = promiseCatch };
+
+fn thisPromise(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
+    if (this == .object and this.object.kind == .promise) return this.object;
+    return unsupportedReceiver(rt, name);
+}
+
+fn promiseThen(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const p_obj = try thisPromise(rt, this, "then");
+    const raw_f = arg(args, 0);
+    const raw_r = arg(args, 1);
+    const on_fulfilled: Value = if (raw_f == .native or raw_f == .closure) raw_f else .undefined;
+    const on_rejected: Value = if (raw_r == .native or raw_r == .closure) raw_r else .undefined;
+
+    var root_buf = [_]Value{ .{ .object = p_obj }, on_fulfilled, on_rejected, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const r = try realm(rt);
+    const child = try rt.heap.newPromise(r.promise_prototype);
+    root_buf[3] = .{ .object = child };
+    const pr = &p_obj.kind.promise;
+
+    if (pr.state == .pending) {
+        try pr.reactions.ensureUnusedCapacity(rt.heap.allocator(), 1);
+        pr.reactions.appendAssumeCapacity(.{
+            .child = child,
+            .on_fulfilled = on_fulfilled,
+            .on_rejected = on_rejected,
+        });
+        rt.heap.barrier(&p_obj.obj, null, .{ .object = child });
+        rt.heap.barrier(&p_obj.obj, null, on_fulfilled);
+        rt.heap.barrier(&p_obj.obj, null, on_rejected);
+    } else {
+        const is_rejected = (pr.state == .rejected);
+        const cb = if (is_rejected) on_rejected else on_fulfilled;
+        const is_adopt = (cb != .native and cb != .closure);
+        try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
+        rt.microtasks.appendAssumeCapacity(.{
+            .kind = if (is_adopt) .adopt else .reaction,
+            .child = child,
+            .cb = cb,
+            .arg = pr.result,
+            .adopt_rejected = is_rejected,
+        });
+    }
+    return .{ .object = child };
+}
+
+fn promiseCatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    _ = try thisPromise(rt, this, "catch");
+    return promiseThen(rt, this, &.{ .undefined, arg(args, 0) });
+}
 
 fn promiseWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
     return rt.throw(.TypeError, &.{.{ .ascii = "Constructor Promise requires 'new'" }});
@@ -1173,28 +1230,36 @@ pub fn resolvePromiseValue(rt: *Runtime, p_obj: *Object, val: Value) Error!void 
     }
 
     if (val == .object and val.object.kind == .promise) {
-        const other = val.object;
-        const other_pr = &other.kind.promise;
-        if (other_pr.state == .pending) {
-            try other_pr.reactions.ensureUnusedCapacity(rt.heap.allocator(), 1);
-            p_obj.kind.promise.already_resolved = true;
-            other_pr.reactions.appendAssumeCapacity(.{ .child = p_obj, .on_fulfilled = .undefined, .on_rejected = .undefined });
-            rt.heap.barrier(&other.obj, null, .{ .object = p_obj });
-        } else {
-            try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
-            p_obj.kind.promise.already_resolved = true;
-            rt.microtasks.appendAssumeCapacity(.{
-                .kind = .adopt,
-                .child = p_obj,
-                .cb = .undefined,
-                .arg = other_pr.result,
-                .adopt_rejected = (other_pr.state == .rejected),
-            });
-        }
+        try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
+        p_obj.kind.promise.already_resolved = true;
+        rt.microtasks.appendAssumeCapacity(.{
+            .kind = .resolve_promise,
+            .child = p_obj,
+            .cb = .undefined,
+            .arg = val,
+        });
         return;
     }
 
     try settlePromiseFromJob(rt, p_obj, false, val);
+}
+
+pub fn adoptPromiseNow(rt: *Runtime, p_obj: *Object, other: *Object) Error!void {
+    const other_pr = &other.kind.promise;
+    if (other_pr.state == .pending) {
+        try other_pr.reactions.ensureUnusedCapacity(rt.heap.allocator(), 1);
+        other_pr.reactions.appendAssumeCapacity(.{ .child = p_obj, .on_fulfilled = .undefined, .on_rejected = .undefined });
+        rt.heap.barrier(&other.obj, null, .{ .object = p_obj });
+    } else {
+        try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
+        rt.microtasks.appendAssumeCapacity(.{
+            .kind = .adopt,
+            .child = p_obj,
+            .cb = .undefined,
+            .arg = other_pr.result,
+            .adopt_rejected = (other_pr.state == .rejected),
+        });
+    }
 }
 
 /// Atomic Promise settlement: reserves microtask queue capacity before mutating

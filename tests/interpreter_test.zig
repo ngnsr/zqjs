@@ -590,7 +590,7 @@ test "M17.1: documented ZQJS deviations on callback thisArg and detached receive
 
 test "M18.1: Promise state, self-resolution, native adoption, queue fault preservation, and OOM" {
     try expectUnsupported("Promise.all;", "", "('all')");
-    try expectUnsupported("Promise.resolve(1).then;", "", "('then')");
+    try expectUnsupported("Promise.resolve(1).finally;", "", "('finally')");
 
     for (support.engines) |engine| {
         // 1. Rejection, executor throw, self-resolution, and pending/settled native adoption
@@ -666,6 +666,47 @@ test "M18.1: Promise state, self-resolution, native adoption, queue fault preser
             var run_res = try support.run(
                 alloc,
                 "let r1; const p1 = new Promise(function (r) { r1 = r; }); const p2 = new Promise(function (r) { r(p1); }); r1({ x: 1 }); Promise.reject('e');",
+                .{},
+                .vm,
+                .normal,
+            );
+            defer run_res.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
+}
+
+test "M18.2: Promise.prototype.then/catch receivers, microtask limits, and OOM" {
+    try expectUnsupported("let o = { then: Promise.resolve(1).then }; o.then(function () {});", "", "('then')");
+    try expectUnsupported("let o = { catch: Promise.resolve(1).catch }; o.catch(function () {});", "", "('catch')");
+
+    for (support.engines) |engine| {
+        var r_steps = try support.run(
+            testing.allocator,
+            "Promise.resolve(1).then(function () { let s = 0; for (let i = 0; i < 100; i++) s += i; return s; });",
+            .{ .max_steps = 30 },
+            engine,
+            .normal,
+        );
+        defer r_steps.deinit(testing.allocator);
+        try testing.expect(std.mem.indexOf(u8, r_steps.err, "LimitExceeded(steps)") != null);
+
+        var r_depth = try support.run(
+            testing.allocator,
+            "function rec(n) { if (n > 0) return rec(n - 1); return 1; } Promise.resolve(1).then(function () { return rec(10); });",
+            .{ .max_call_depth = 4 },
+            engine,
+            .normal,
+        );
+        defer r_depth.deinit(testing.allocator);
+        try testing.expect(std.mem.indexOf(u8, r_depth.err, "LimitExceeded(call_depth)") != null);
+    }
+
+    const OomCtx = struct {
+        fn runOnce(alloc: Allocator) !void {
+            var run_res = try support.run(
+                alloc,
+                "let res; const p = new Promise(function (r) { res = r; }); p.then(function (x) { return x + 1; }).catch(function () { return 0; }); res(41);",
                 .{},
                 .vm,
                 .normal,

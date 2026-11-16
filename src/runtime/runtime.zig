@@ -75,7 +75,7 @@ pub const ValueRoots = struct {
 
 /// Queued Promise reaction or adoption microtask (M18).
 pub const Microtask = struct {
-    kind: enum { reaction, adopt },
+    kind: enum { reaction, adopt, resolve_promise },
     child: ?*heap_mod.Object = null,
     cb: Value = .undefined,
     arg: Value = .undefined,
@@ -471,6 +471,11 @@ pub const Runtime = struct {
                 .adopt => {
                     if (job.child) |ch| {
                         try builtins_mod.settlePromiseFromJob(rt, ch, job.adopt_rejected, job.arg);
+                    }
+                },
+                .resolve_promise => {
+                    if (job.child) |ch| {
+                        try builtins_mod.adoptPromiseNow(rt, ch, job.arg.object);
                     }
                 },
                 .reaction => {

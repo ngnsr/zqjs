@@ -568,3 +568,22 @@ test "M16.2: Array/Map/Set callback receivers, map shrink deviation, limits, and
     };
     try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
 }
+
+test "M17.1: documented ZQJS deviations on callback thisArg and detached receivers" {
+    // Ordinary non-strict callbacks: null, undefined, and primitive thisArg trigger Unsupported(sloppy_this) when `this` is read (D41).
+    try expectUnsupported("[1].forEach(function () { return this; }, null);", "", "Unsupported(sloppy_this)");
+    try expectUnsupported("[1].forEach(function () { return this; }, undefined);", "", "Unsupported(sloppy_this)");
+    try expectUnsupported("[1].forEach(function () { return this; }, 42);", "", "Unsupported(sloppy_this)");
+    try expectUnsupported("[1].map(function () { return this; }, 'x');", "", "Unsupported(sloppy_this)");
+    try expectUnsupported("[1].filter(function () { return this; }, true);", "", "Unsupported(sloppy_this)");
+    try expectUnsupported("new Map([['a', 1]]).forEach(function () { return this; }, 42);", "", "Unsupported(sloppy_this)");
+    try expectUnsupported("new Set([1]).forEach(function () { return this; }, 42);", "", "Unsupported(sloppy_this)");
+
+    // Detached/missing receiver on prototype methods reports Unsupported(builtin).
+    try expectUnsupported("const f = [].map; f(function (x) { return x; });", "", "Unsupported(builtin)");
+    try expectUnsupported("const f = [].forEach; f(function () {});", "", "Unsupported(builtin)");
+    try expectUnsupported("const f = [].filter; f(function () { return true; });", "", "Unsupported(builtin)");
+    try expectUnsupported("const f = [].reduce; f(function (a, b) { return a + b; }, 0);", "", "Unsupported(builtin)");
+    try expectUnsupported("const f = new Map().forEach; f(function () {});", "", "Unsupported(builtin)");
+    try expectUnsupported("const f = new Set().forEach; f(function () {});", "", "Unsupported(builtin)");
+}

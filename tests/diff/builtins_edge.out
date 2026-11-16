@@ -1,0 +1,32 @@
+sliceNegZero 10,20
+idxNegZero 1 true
+sliceNaN 10
+idxNaN 1 true
+sliceInf 10,20,30 0 10
+incInf false true -1 0
+sliceFrac 20 30
+sliceRev 0 0
+nanSearch -1 true
+zeroSearch 0 true
+negFrom 3 true
+undefFromIdx 1 1
+undefFromInc true true
+surr 55357 56832 true true
+strSlice c  b 97
+strEmpty 3 true 0 true
+redNonFn 0 TypeError
+redNonFn 1 TypeError
+thisObj 11,12
+nativeCb 1,2,3
+emptyMap undefined 0
+emptySet undefined 0
+mDelUnvisited a:1,c:3
+mUpdExisting a:1,b:20
+mAddNew a:1,b:2
+mClrInsert a:1,c:3,d:4
+mDelReinsert a:1,b:2,a:10
+sDelUnvisited 1,3
+sAddNew 1,2
+sClrInsert 1,3,4
+sDelReinsert 1,2,1
+sSvz NaN,0

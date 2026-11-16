@@ -2681,3 +2681,120 @@ test "M17.2: JS -> Builtin -> Host -> JS reentrancy, NativeRecord, GC survival, 
     defer ok_prog.destroy();
     try depth_rt.run(ok_prog, null);
 }
+
+test "M18.3: Host -> JS -> Promise -> microtask, reentrancy, GC, and fault recovery" {
+    const Capture = struct {
+        run_async: ?zqjs.Handle = null,
+        print_log: ?zqjs.Handle = null,
+    };
+    const Host = struct {
+        fn registerFns(_: *zqjs.Runtime, ud: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+            const cap: *Capture = @ptrCast(@alignCast(ud.?));
+            cap.run_async = try args[0].dup();
+            cap.print_log = try args[1].dup();
+        }
+
+        fn hostGcAndCall(rt: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+            const cb = args[0];
+            const val = args[1];
+            rt.collectGarbage();
+            var f: zqjs.Failure = .{};
+            const res = rt.call(cb, null, &.{val}, &f) catch |e| switch (e) {
+                error.LimitExceeded => return error.LimitExceeded,
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Internal => return error.Internal,
+                else => {
+                    out.host_message = "callback failed";
+                    return error.HostError;
+                },
+            };
+            rt.collectGarbage();
+            out.result = res;
+        }
+    };
+
+    // 1. Host rt.call -> JS -> Promise -> microtask -> Host (GC + nested rt.call) -> JS
+    //    Verifies outermost checkpoint drains FIFO without nested rt.call draining early.
+    var out_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try zqjs.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    var cap: Capture = .{};
+    defer {
+        if (cap.run_async) |h| h.release();
+        if (cap.print_log) |h| h.release();
+    }
+
+    try rt.defineGlobalFunction("registerFns", Host.registerFns, &cap);
+    try rt.defineGlobalFunction("hostGcAndCall", Host.hostGcAndCall, null);
+
+    const setup_src =
+        \\let log = [];
+        \\function runAsync(v) {
+        \\    Promise.resolve(v).then(function (x) {
+        \\        log.push("t1:" + x);
+        \\        const r = hostGcAndCall(function (y) {
+        \\            Promise.resolve(y + 1).then(function (z) {
+        \\                log.push("nested:" + z);
+        \\            });
+        \\            return y * 10;
+        \\        }, x);
+        \\        log.push("after_host:" + r);
+        \\        return r;
+        \\    }).then(function (x) {
+        \\        log.push("t2:" + x);
+        \\    });
+        \\    log.push("sync:" + v);
+        \\    return log;
+        \\}
+        \\function printLog() { print(log.join(",")); }
+        \\registerFns(runAsync, printLog);
+    ;
+    const prog = try rt.compile("m18_api.js", setup_src, null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+
+    const arg_num = try rt.newNumber(4);
+    defer arg_num.release();
+
+    const res_arr = try rt.call(cap.run_async.?, null, &.{arg_num}, null);
+    defer res_arr.release();
+    // Outermost rt.call drained all microtasks before returning; nested rt.call did not drain early.
+    const print_res = try rt.call(cap.print_log.?, null, &.{}, null);
+    defer print_res.release();
+    try testing.expectEqualStrings("sync:4,t1:4,after_host:40,nested:5,t2:40\n", out.buffered());
+
+    // 2. LimitExceeded in active microtask consumes it, preserves remaining queue, and resumes on next checkpoint.
+    var fault_buf: [128]u8 = undefined;
+    var fault_out: std.Io.Writer = .fixed(&fault_buf);
+    const step_rt = try zqjs.Runtime.create(testing.allocator, .{
+        .output = &fault_out,
+        .limits = .{ .max_steps = 40 },
+    });
+    defer step_rt.destroy();
+
+    const fault_src =
+        \\Promise.resolve(1).then(function () {
+        \\    let s = 0;
+        \\    for (let i = 0; i < 100; i++) s += i;
+        \\    print("bad");
+        \\});
+        \\Promise.resolve(2).then(function (v) {
+        \\    print("resumed:" + v);
+        \\});
+    ;
+    const fault_prog = try step_rt.compile("fault.js", fault_src, null);
+    defer fault_prog.destroy();
+    var fail: zqjs.Failure = .{};
+    try testing.expectError(error.LimitExceeded, step_rt.run(fault_prog, &fail));
+    try testing.expectEqual(zqjs.Failure.Kind.limit, fail.kind);
+    try testing.expectEqual(zqjs.Limit.steps, fail.limit.?);
+    try testing.expectEqualStrings("", fault_out.buffered());
+
+    // Subsequent valid checkpoint resumes and drains the preserved second microtask without retrying the first.
+    const resume_prog = try step_rt.compile("resume.js", "print(\"ok\");", null);
+    defer resume_prog.destroy();
+    try step_rt.run(resume_prog, null);
+    try testing.expectEqualStrings("ok\nresumed:2\n", fault_out.buffered());
+}

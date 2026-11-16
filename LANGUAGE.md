@@ -252,7 +252,7 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
 - **Built-ins:** only those listed in DESIGN_DECISIONS D39; every other name node has is
   `Unsupported(builtin)`, every name node doesn't have is `undefined` / a ReferenceError.
 - **Collections & Iterators (M14):**
-  - `new`: supported for `Map` and `Set` (`new` on user functions or other built-ins like `Object`/`Array` is `Unsupported(builtin)`; non-constructors throw `TypeError`).
+  - `new`: supported for `Map`, `Set`, and `Promise` (`new` on user functions or other built-ins like `Object`/`Array` is `Unsupported(builtin)`; non-constructors throw `TypeError`).
   - `Map` & `Set`: insertion-ordered `OrderedTable` with SameValueZero equality (`NaN` matches `NaN`, `-0 === +0`, UTF-16 string equality, pointer identity for objects/functions), read-only `size`, `get`/`set`/`has`/`delete`/`clear` (`Map`) and `add`/`has`/`delete`/`clear` (`Set`), plus `keys`/`values`/`entries`. `forEach` and `WeakMap`/`WeakSet` are `Unsupported(builtin)`.
   - `for...of` & Iterators: `for (let|const|id of iterable)` over `Array`, `Map`, `Set`, `String` (code-point surrogate pairs + lone surrogates), and built-in iterators (`Iterator.prototype.next`). Live `Map`/`Set` mutations (including `clear()` followed by insertion) are visible to active iterators; exhausted iterators stay `done: true`. `Symbol.iterator` and destructuring targets remain `Unsupported`.
 - **JSON (M15):**
@@ -262,6 +262,12 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
   - `Array.prototype.forEach`, `Array.prototype.map`, `Array.prototype.filter`, `Array.prototype.reduce`, `Map.prototype.forEach`, and `Set.prototype.forEach` invoke JS callbacks reentrantly on both engines (`thisArg` follows ZQJS sloppy `this` rules: object receivers bind `this`, while reading `this` with primitive/`null`/`undefined` `thisArg` fails with `Unsupported(sloppy_this)` per D41).
   - Array callbacks capture the initial length at entry; growing the array does not extend iteration, and shrinking skips missing indices for `forEach`, `filter`, and `reduce`. **Intentional deviation:** if a callback shrinks the array during `Array.prototype.map`, ZQJS fails with `Unsupported(sparse_array)` rather than producing sparse holes (arrays are always dense per D13).
   - `Map.prototype.forEach` and `Set.prototype.forEach` visit entries in insertion order and observe live mutations during iteration (deletes, updates, additions, `clear()` followed by insertion, and delete + reinsert of the current entry).
+- **Promises & microtasks (M18):**
+  - `new Promise(executor)`, `Promise.resolve(v)`, `Promise.reject(r)`, `Promise.prototype.then(onFulfilled, onRejected)`, and `Promise.prototype.catch(onRejected)`. Calling `Promise(...)` without `new` or passing a non-callable executor throws `TypeError`; self-resolution rejects with `TypeError`.
+  - `resolve`/`reject` capabilities share an `already_resolved` guard; synchronous exceptions thrown by `executor` reject the Promise if not already resolved.
+  - **Native-only adoption (intentional limitation):** resolving with a native ZQJS `Promise` adopts its state via microtasks. Arbitrary thenables (objects with a `.then` property or accessor) are **not** inspected or assimilated and fulfill directly with that value.
+  - **Microtask checkpoints & fault semantics:** `Runtime.microtasks` drains in FIFO order at the end of each outermost `run`/`call` turn (nested/reentrant calls do not drain early). Caught JS exceptions inside reactions reject the child Promise. Uncatchable runtime faults (`LimitExceeded`, `OutOfMemory`, etc.) consume the active microtask without retry (leaving its child Promise pending), preserve remaining queued microtasks, and propagate cleanly so a later valid checkpoint can resume draining.
+  - **Deferred / out of scope:** `Promise.prototype.finally`, combinators (`Promise.all`, `race`, `allSettled`, `any`), unhandled-rejection tracking, `Symbol.species` subclassing, and `async`/`await`.
 
 ### Bindings
 

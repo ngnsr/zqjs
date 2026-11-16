@@ -226,4 +226,42 @@ Every C ABI function returns `zqjs_status` rather than panicking or unwinding ac
 - **`host_message` lifetime:** `out->host_message` (`out->host_message_len`) is borrowed only until `zqjs_native_fn` returns and is copied into ZQJS's fixed 256-byte NUL-terminated `zqjs_failure.message` buffer (empty `host_message` on `ZQJS_ERR_HOST` defaults to `"host error"`).
 - **Error mapping:** `ZQJS_ERR_THROWN` (paired with `zqjs_runtime_throw_js`) → `ZQJS_FAILURE_THROWN`; `ZQJS_ERR_HOST` → `ZQJS_FAILURE_HOST`; `ZQJS_ERR_LIMIT_EXCEEDED` → `ZQJS_FAILURE_LIMIT`; `ZQJS_ERR_UNSUPPORTED` → `ZQJS_FAILURE_UNSUPPORTED`; `ZQJS_ERR_OUT_OF_MEMORY` → `ZQJS_FAILURE_OUT_OF_MEMORY`; `ZQJS_ERR_INTERNAL` → `ZQJS_FAILURE_INTERNAL` (poisons runtime).
 
-See [examples/c_embed.c](examples/c_embed.c) for a standalone C11 example linking against `zig-out/lib/libzqjs.a` and `zig-out/include/zqjs.h`.
+#### ABI Versioning & `zqjs_options` Compatibility (M12.3)
+- **`ZQJS_ABI_VERSION` / `zqjs_abi_version()`:** encoded as `(major << 16) | (minor << 8) | patch` (`1.1.0` = `0x00010100u`). Major bumps only on breaking layout/signature/semantic changes; minor bumps on backward-compatible additive changes (new functions or trailing `zqjs_options` fields). Hosts should check `(zqjs_abi_version() >> 16) == ZQJS_ABI_MAJOR` at startup.
+- **`zqjs_options.struct_size`:**
+  - Always initialize with `zqjs_options_default()`, which sets `struct_size = sizeof(zqjs_options)` and populates all defaults (including `random_seed`).
+  - Passing `NULL` to `zqjs_runtime_create` uses `zqjs_options_default()`.
+  - Smaller/older structs (`>= offsetof(zqjs_options, clock_ctx) + sizeof(void *)`) are accepted; omitted trailing fields (such as `random_seed`) keep their defaults.
+  - Zero, truncated, or oversized structs (`struct_size > sizeof(zqjs_options)`) are rejected with `ZQJS_ERR_INVALID_ARG`.
+
+#### Structured Handles & Global Access (M12.2–M12.3)
+Both APIs support creating and inspecting JS objects, dense arrays, and runtime globals without flattening values across the boundary:
+- **Zig (`Runtime`):** `newObject`, `newArray`, `getGlobal`, `getProperty`, `setProperty`, `getIndex`, `setIndex`.
+- **C ABI:** `zqjs_new_object`, `zqjs_new_array`, `zqjs_runtime_get_global`, `zqjs_handle_get_property`, `zqjs_handle_set_property`, `zqjs_handle_get_index`, `zqjs_handle_set_index`.
+- **Ownership:** every returned handle is **owned** by the caller and must be released with `zqjs_handle_release` / `Handle.release()`. Input `obj` and `val` handles are **borrowed** and never consumed.
+- **Semantics:** missing properties and out-of-range array indices return an owned `undefined` handle; `setIndex` enforces D13 dense arrays (`index == length` appends, `index > length` fails with `ZQJS_ERR_UNSUPPORTED`); `getGlobal` resolves runtime globals (`Math`, `Array`, `Object`, host-registered natives, `undefined`, `NaN`, `Infinity`) while preserving E3 fresh per-execution top-level script bindings.
+
+```c
+/* Pass structured state from C into JS and read back updated fields */
+zqjs_handle state = ZQJS_HANDLE_NULL, count = ZQJS_HANDLE_NULL;
+zqjs_failure fail;
+assert(zqjs_new_object(rt, &state) == ZQJS_OK);
+assert(zqjs_new_number(rt, 0.0, &count) == ZQJS_OK);
+assert(zqjs_handle_set_property(rt, state, "count", 5, count, &fail) == ZQJS_OK);
+zqjs_handle_release(rt, count); /* input handles are borrowed */
+
+/* Read a nested property (caller owns the returned handle) */
+zqjs_handle out_count = ZQJS_HANDLE_NULL;
+assert(zqjs_handle_get_property(rt, state, "count", 5, &fail, &out_count) == ZQJS_OK);
+double n = 0.0;
+assert(zqjs_handle_number(rt, out_count, &n) == ZQJS_OK);
+zqjs_handle_release(rt, out_count);
+zqjs_handle_release(rt, state);
+```
+
+#### Examples & Raylib C-ABI Demo (M11.4, M12.4)
+- **[examples/c_embed.c](examples/c_embed.c):** minimal standalone C11 embedding example linking `zig-out/lib/libzqjs.a` and `zig-out/include/zqjs.h`.
+- **[examples/raylib_c_demo.c](examples/raylib_c_demo.c):** C11 Raylib host where JS owns `update(input)` / `draw()` / `state` via `initGame({ update, draw, state })` and C owns the frame loop, native drawing bindings, and error teardown.
+  - **Prerequisites:** Raylib installed (auto-detected at `/opt/homebrew/opt/raylib` on macOS, via `pkg-config` elsewhere, or with `-Draylib-prefix=<path>`). Default `zig build` and `zig build test` do not require Raylib.
+  - **Headless smoke test:** `zig build raylib-smoke` (runs `--frames 60 --verify-errors` without opening a GUI window).
+  - **Interactive GUI:** `zig build raylib-demo` (opens the 800x480 Raylib window).

@@ -112,6 +112,7 @@ static bool on_print(void *ctx, const char *bytes, size_t len) {
 }
 
 int main(void) {
+    if ((zqjs_abi_version() >> 16) != ZQJS_ABI_MAJOR) return 1;
     zqjs_options opts = zqjs_options_default();
     opts.output_fn = on_print;
 
@@ -129,6 +130,12 @@ int main(void) {
     zqjs_runtime_destroy(rt);
     return 0;
 }
+```
+
+For a full C11 host loop with structured `initGame({ update, draw, state })` handles (optional Raylib dependency — `zig build test` stays Raylib-free), see [examples/raylib_c_demo.c](examples/raylib_c_demo.c):
+```sh
+zig build raylib-smoke   # headless 60-frame + error-handling smoke test
+zig build raylib-demo    # interactive GUI window (requires Raylib)
 ```
 
 ## Benchmarks

@@ -337,6 +337,7 @@ const Interpreter = struct {
                 };
             },
             .binary => |b| return it.evalBinary(b),
+            .conditional => |c| return if (ops.toBoolean(try it.eval(c.cond))) it.eval(c.then_expr) else it.eval(c.else_expr),
             .assign => |a| return it.evalAssign(a),
             .update => |u| return it.evalUpdate(u),
             .member => |m| {

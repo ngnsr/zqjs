@@ -466,6 +466,17 @@ const Compiler = struct {
                     try c.emit(binaryOp(b.op), &.{});
                 },
             },
+            .conditional => |cond| {
+                // cond; jump_if_false else_lbl; then_expr; jump end; else_lbl: else_expr; end:
+                try c.expr(cond.cond);
+                const to_else = try c.jumpForward(.jump_if_false);
+                try c.expr(cond.then_expr);
+                const to_end = try c.jumpForward(.jump);
+                c.depth -= 1; // else_expr starts at the pre-branch stack depth
+                c.patch(to_else, c.here());
+                try c.expr(cond.else_expr);
+                c.patch(to_end, c.here());
+            },
             .assign => |a| switch (a.target) {
                 .ref => |ref| {
                     if (a.op) |op| {

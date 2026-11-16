@@ -113,6 +113,7 @@ pub const Expr = struct {
         identifier: Ref,
         unary: struct { op: UnaryOp, operand: *const Expr },
         binary: struct { op: BinaryOp, lhs: *const Expr, rhs: *const Expr },
+        conditional: struct { cond: *const Expr, then_expr: *const Expr, else_expr: *const Expr },
         /// `target = value` (op null) or `target op= value`.
         assign: struct { op: ?BinaryOp, target: Target, value: *const Expr },
         /// `callee(args)`. A member callee (`o.f(…)`) is a method call: `this` is `o`.

@@ -200,6 +200,15 @@ const Dumper = struct {
                 try d.expr(b.rhs);
                 try w.writeByte(')');
             },
+            .conditional => |c| {
+                try w.writeAll("(?: ");
+                try d.expr(c.cond);
+                try w.writeByte(' ');
+                try d.expr(c.then_expr);
+                try w.writeByte(' ');
+                try d.expr(c.else_expr);
+                try w.writeByte(')');
+            },
             .assign => |a| {
                 if (a.op) |op| try w.print("({s}= ", .{op.symbol()}) else try w.writeAll("(= ");
                 try d.target(a.target);

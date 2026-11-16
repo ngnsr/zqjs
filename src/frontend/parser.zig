@@ -430,7 +430,7 @@ const Parser = struct {
     fn expression(p: *Parser) Error!*const ast.Expr {
         try p.enter();
         defer p.depth -= 1;
-        const lhs = try p.binary(0);
+        const lhs = try p.conditional();
         const op = assignOp(p.tok.tag) orelse return lhs;
         // Parentheses are transparent, so `(x) = 1` arrives here as a plain identifier, as in JS.
         const target = try p.assignTarget(lhs, "invalid assignment target");
@@ -440,6 +440,25 @@ const Parser = struct {
             .{ .start = lhs.span.start, .end = value.span.end },
             .{ .assign = .{ .op = op, .target = target, .value = value } },
             @max(lhs.depth, value.depth),
+        );
+    }
+
+    /// ConditionalExpression := LogicalORExpression (`?` AssignmentExpression `:` AssignmentExpression)?
+    fn conditional(p: *Parser) Error!*const ast.Expr {
+        const cond = try p.binary(0);
+        if (p.tok.tag != .question) return cond;
+        try p.enter();
+        defer p.depth -= 1;
+        try p.advance();
+        // `then` allows `in` even inside `for (...; ...)` (`no_in = false`); `else` keeps the outer `no_in`.
+        const then_expr = try p.nested();
+        if (p.tok.tag != .colon) return p.fail(.{ .syntax_error = "expected ':'" }, p.tok);
+        try p.advance();
+        const else_expr = try p.expression();
+        return p.node(
+            .{ .start = cond.span.start, .end = else_expr.span.end },
+            .{ .conditional = .{ .cond = cond, .then_expr = then_expr, .else_expr = else_expr } },
+            @max(cond.depth, @max(then_expr.depth, else_expr.depth)),
         );
     }
 

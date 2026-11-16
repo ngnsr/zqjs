@@ -279,6 +279,11 @@ const Resolver = struct {
                 try r.expr(b.lhs);
                 try r.expr(b.rhs);
             },
+            .conditional => |c| {
+                try r.expr(c.cond);
+                try r.expr(c.then_expr);
+                try r.expr(c.else_expr);
+            },
             .assign => |a| {
                 try r.expr(a.value);
                 try r.assignTarget(a.target);

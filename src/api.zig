@@ -37,6 +37,9 @@ pub const Options = struct {
     /// and `Memory.max_gc_pause_ns`). Null: pause durations stay 0 (D8).
     clock: ?*const fn (ctx: ?*anyopaque) u64 = null,
     clock_ctx: ?*anyopaque = null,
+    /// Deterministic PRNG seed for `Math.random()` (M11.3a).
+    /// Note: `Math.random()` is not cryptographically secure.
+    random_seed: u64 = internal.Runtime.default_random_seed,
 };
 
 pub const Status = enum { finished, suspended };
@@ -224,6 +227,7 @@ pub const Runtime = opaque {
             .clock_ctx = options.clock_ctx,
         };
         r.rt = IRuntime.init(gpa, options.limits, options.output orelse &r.discard.writer);
+        r.rt.setRandomSeed(options.random_seed);
         if (options.clock != null) {
             r.rt.heap.observer = .{
                 .ctx = r,

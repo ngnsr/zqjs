@@ -293,7 +293,7 @@ test "holes are Unsupported: arrays stay dense" {
 }
 
 test "built-ins: known to node but not implemented is Unsupported, naming the member" {
-    try expectUnsupported("print(Math === undefined);", "", "Unsupported(builtin): a built-in node has that ZQJS doesn't implement yet ('Math')");
+    try expectUnsupported("print(JSON === undefined);", "", "Unsupported(builtin): a built-in node has that ZQJS doesn't implement yet ('JSON')");
     try expectUnsupported("print([1].length); [1].map;", "1\n", "Unsupported(builtin)");
     try expectUnsupported("[1].map;", "", "('map')");
     try expectUnsupported("'abc'.toUpperCase;", "", "('toUpperCase')");

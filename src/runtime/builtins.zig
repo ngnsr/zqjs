@@ -41,10 +41,11 @@ pub const Realm = struct {
     /// Static members of the `Object` and `Array` globals.
     object_namespace: *Object,
     array_namespace: *Object,
+    math: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [8]*Object {
-        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.object_namespace, r.array_namespace };
+    pub fn objects(r: *const Realm) [9]*Object {
+        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.object_namespace, r.array_namespace, r.math };
     }
 };
 
@@ -61,6 +62,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .function_prototype = try builtin(h, object_prototype, .function_prototype),
         .object_namespace = try builtin(h, null, .object_constructor),
         .array_namespace = try builtin(h, null, .array_constructor),
+        .math = try builtin(h, object_prototype, .math),
     };
     try method(rt, r.object_prototype, "toString", &object_to_string);
     try method(rt, r.object_prototype, "valueOf", &object_value_of);
@@ -73,6 +75,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.object_namespace, "create", &object_create);
     try method(rt, r.object_namespace, "getPrototypeOf", &object_get_prototype_of);
     try method(rt, r.array_namespace, "isArray", &array_is_array);
+    try registerMath(rt, r.math);
     _ = &r;
     rt.realm = r;
     return &rt.realm.?;
@@ -87,6 +90,11 @@ fn builtin(h: *heap_mod.Heap, proto: ?*Object, b: names.Builtin) Error!*Object {
 fn method(rt: *Runtime, o: *Object, name: []const u8, n: *const Native) Error!void {
     const k = try rt.heap.internAscii(name);
     try rt.heap.defineProperty(o, k, .{ .value = .{ .native = n }, .enumerable = false });
+}
+
+fn constant(rt: *Runtime, o: *Object, name: []const u8, v: Value) Error!void {
+    const k = try rt.heap.internAscii(name);
+    try rt.heap.defineProperty(o, k, .{ .value = v, .enumerable = false });
 }
 
 /// The natives ToPrimitive may call (D40); anything else found there is user code.
@@ -109,6 +117,7 @@ pub fn global(rt: *Runtime, name: []const u8) Error!Value {
     if (std.mem.eql(u8, name, "print")) return .{ .native = &print };
     if (std.mem.eql(u8, name, "Object")) return .{ .native = &object_global };
     if (std.mem.eql(u8, name, "Array")) return .{ .native = &array_global };
+    if (std.mem.eql(u8, name, "Math")) return .{ .object = (try realm(rt)).math };
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return .{ .native = n };
     if (names.has(.global, name)) {
         rt.unsupported_name = try rt.heap.internAscii(name);
@@ -303,4 +312,228 @@ fn objectGetPrototypeOf(rt: *Runtime, _: Value, args: []const Value) Error!Value
 fn arrayIsArray(_: *Runtime, _: Value, args: []const Value) Error!Value {
     const v = arg(args, 0);
     return .{ .boolean = v == .object and v.object.kind == .array };
+}
+
+// ---------------------------------------------------------------- Math (M11.3)
+
+fn registerMath(rt: *Runtime, m: *Object) Error!void {
+    try constant(rt, m, "E", .{ .number = std.math.e });
+    try constant(rt, m, "LN2", .{ .number = std.math.ln2 });
+    try constant(rt, m, "LN10", .{ .number = std.math.ln10 });
+    try constant(rt, m, "LOG2E", .{ .number = std.math.log2e });
+    try constant(rt, m, "LOG10E", .{ .number = std.math.log10e });
+    try constant(rt, m, "PI", .{ .number = std.math.pi });
+    try constant(rt, m, "SQRT1_2", .{ .number = std.math.sqrt1_2 });
+    try constant(rt, m, "SQRT2", .{ .number = std.math.sqrt2 });
+
+    try method(rt, m, "abs", &math_abs);
+    try method(rt, m, "floor", &math_floor);
+    try method(rt, m, "ceil", &math_ceil);
+    try method(rt, m, "round", &math_round);
+    try method(rt, m, "trunc", &math_trunc);
+    try method(rt, m, "min", &math_min);
+    try method(rt, m, "max", &math_max);
+    try method(rt, m, "pow", &math_pow);
+    try method(rt, m, "sqrt", &math_sqrt);
+    try method(rt, m, "sin", &math_sin);
+    try method(rt, m, "cos", &math_cos);
+    try method(rt, m, "tan", &math_tan);
+    try method(rt, m, "asin", &math_asin);
+    try method(rt, m, "acos", &math_acos);
+    try method(rt, m, "atan", &math_atan);
+    try method(rt, m, "atan2", &math_atan2);
+    try method(rt, m, "log", &math_log);
+    try method(rt, m, "exp", &math_exp);
+    try method(rt, m, "sign", &math_sign);
+    try method(rt, m, "clz32", &math_clz32);
+    try method(rt, m, "imul", &math_imul);
+    try method(rt, m, "fround", &math_fround);
+    try method(rt, m, "hypot", &math_hypot);
+    try method(rt, m, "random", &math_random);
+}
+
+const math_abs: Native = .{ .name = "abs", .call = mathAbs };
+const math_floor: Native = .{ .name = "floor", .call = mathFloor };
+const math_ceil: Native = .{ .name = "ceil", .call = mathCeil };
+const math_round: Native = .{ .name = "round", .call = mathRound };
+const math_trunc: Native = .{ .name = "trunc", .call = mathTrunc };
+const math_min: Native = .{ .name = "min", .call = mathMin };
+const math_max: Native = .{ .name = "max", .call = mathMax };
+const math_pow: Native = .{ .name = "pow", .call = mathPow };
+const math_sqrt: Native = .{ .name = "sqrt", .call = mathSqrt };
+const math_sin: Native = .{ .name = "sin", .call = mathSin };
+const math_cos: Native = .{ .name = "cos", .call = mathCos };
+const math_tan: Native = .{ .name = "tan", .call = mathTan };
+const math_asin: Native = .{ .name = "asin", .call = mathAsin };
+const math_acos: Native = .{ .name = "acos", .call = mathAcos };
+const math_atan: Native = .{ .name = "atan", .call = mathAtan };
+const math_atan2: Native = .{ .name = "atan2", .call = mathAtan2 };
+const math_log: Native = .{ .name = "log", .call = mathLog };
+const math_exp: Native = .{ .name = "exp", .call = mathExp };
+const math_sign: Native = .{ .name = "sign", .call = mathSign };
+const math_clz32: Native = .{ .name = "clz32", .call = mathClz32 };
+const math_imul: Native = .{ .name = "imul", .call = mathImul };
+const math_fround: Native = .{ .name = "fround", .call = mathFround };
+const math_hypot: Native = .{ .name = "hypot", .call = mathHypot };
+const math_random: Native = .{ .name = "random", .call = mathRandom };
+
+fn mathAbs(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = @abs(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathFloor(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = @floor(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathCeil(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = @ceil(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathTrunc(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = @trunc(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathRound(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, arg(args, 0));
+    if (!std.math.isFinite(x) or x == 0.0) return .{ .number = x };
+    if (x >= -0.5 and x < 0.0) return .{ .number = -0.0 };
+    if (@abs(x) >= 4503599627370496.0) return .{ .number = x };
+    const f = @floor(x);
+    return .{ .number = if (x - f >= 0.5) f + 1.0 else f };
+}
+
+fn mathMin(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    var best = std.math.inf(f64);
+    var saw_nan = false;
+    for (args) |a| {
+        const v = try ops.toNumber(rt, a);
+        if (std.math.isNan(v)) {
+            saw_nan = true;
+        } else if (!saw_nan) {
+            if (v < best or (v == 0.0 and best == 0.0 and std.math.signbit(v))) best = v;
+        }
+    }
+    return .{ .number = if (saw_nan) std.math.nan(f64) else best };
+}
+
+fn mathMax(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    var best = -std.math.inf(f64);
+    var saw_nan = false;
+    for (args) |a| {
+        const v = try ops.toNumber(rt, a);
+        if (std.math.isNan(v)) {
+            saw_nan = true;
+        } else if (!saw_nan) {
+            if (v > best or (v == 0.0 and best == 0.0 and !std.math.signbit(v))) best = v;
+        }
+    }
+    return .{ .number = if (saw_nan) std.math.nan(f64) else best };
+}
+
+fn mathPow(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const base = try ops.toNumber(rt, arg(args, 0));
+    const exp = try ops.toNumber(rt, arg(args, 1));
+    return .{ .number = ops.pow(base, exp) };
+}
+
+fn mathSqrt(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = std.math.sqrt(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathSin(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = std.math.sin(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathCos(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = std.math.cos(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathTan(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = std.math.tan(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathAsin(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = std.math.asin(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathAcos(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = std.math.acos(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathAtan(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = std.math.atan(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathAtan2(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const y = try ops.toNumber(rt, arg(args, 0));
+    const x = try ops.toNumber(rt, arg(args, 1));
+    return .{ .number = std.math.atan2(y, x) };
+}
+
+fn mathLog(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = @log(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathExp(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = @exp(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn mathSign(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, arg(args, 0));
+    if (std.math.isNan(x) or x == 0.0) return .{ .number = x };
+    return .{ .number = if (x > 0.0) 1.0 else -1.0 };
+}
+
+fn toUint32(n: f64) u32 {
+    if (!std.math.isFinite(n) or n == 0.0) return 0;
+    const rem = @mod(@trunc(n), 4294967296.0);
+    return @intFromFloat(rem);
+}
+
+fn mathClz32(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const u = toUint32(try ops.toNumber(rt, arg(args, 0)));
+    return .{ .number = @floatFromInt(@clz(u)) };
+}
+
+fn mathImul(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const a: i32 = @bitCast(toUint32(try ops.toNumber(rt, arg(args, 0))));
+    const b: i32 = @bitCast(toUint32(try ops.toNumber(rt, arg(args, 1))));
+    return .{ .number = @floatFromInt(a *% b) };
+}
+
+fn mathFround(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, arg(args, 0));
+    if (!std.math.isFinite(x) or x == 0.0) return .{ .number = x };
+    return .{ .number = @as(f64, @floatCast(@as(f32, @floatCast(x)))) };
+}
+
+fn mathHypot(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    var max_abs: f64 = 0.0;
+    var saw_inf = false;
+    var saw_nan = false;
+    for (args) |a| {
+        const v = try ops.toNumber(rt, a);
+        if (std.math.isInf(v)) {
+            saw_inf = true;
+        } else if (std.math.isNan(v)) {
+            saw_nan = true;
+        } else {
+            const av = @abs(v);
+            if (av > max_abs) max_abs = av;
+        }
+    }
+    if (saw_inf) return .{ .number = std.math.inf(f64) };
+    if (saw_nan) return .{ .number = std.math.nan(f64) };
+    if (max_abs == 0.0) return .{ .number = 0.0 };
+    var sum: f64 = 0.0;
+    for (args) |a| {
+        const v = try ops.toNumber(rt, a);
+        const s = v / max_abs;
+        sum += s * s;
+    }
+    return .{ .number = max_abs * std.math.sqrt(sum) };
+}
+
+fn mathRandom(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return .{ .number = rt.nextRandom() };
 }

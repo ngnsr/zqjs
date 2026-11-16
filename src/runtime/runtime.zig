@@ -201,6 +201,19 @@ pub const Runtime = struct {
     /// What the first defensive check that failed said (a static string; never
     /// allocated). Only for the host's report; the failure's text stays fixed (E10).
     internal_reason: ?[]const u8 = null,
+    /// Per-runtime PRNG state for `Math.random()` (M11.3: deterministic by default).
+    rng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(default_random_seed),
+
+    pub const default_random_seed: u64 = 0x9e3779b97f4a7c15;
+
+    pub fn setRandomSeed(rt: *Runtime, seed: u64) void {
+        rt.rng = std.Random.DefaultPrng.init(seed);
+    }
+
+    /// Uniform f64 in [0, 1) with 53 bits of precision.
+    pub fn nextRandom(rt: *Runtime) f64 {
+        return @as(f64, @floatFromInt(rt.rng.next() >> 11)) * 0x1.0p-53;
+    }
 
     pub fn init(gpa: Allocator, limits: Limits, out: *std.Io.Writer) Runtime {
         return .{

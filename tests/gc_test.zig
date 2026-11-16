@@ -380,7 +380,7 @@ test "the exception message and the unsupported name are roots" {
     const gpa = testing.allocator;
     for ([_]struct { []const u8, []const u8 }{
         .{ "let o = {}; o.a.b;", "Cannot read properties of undefined (reading 'b')" },
-        .{ "Math.PI;", "Math" },
+        .{ "JSON.parse;", "JSON" },
     }) |case| {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();

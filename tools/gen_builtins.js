@@ -28,6 +28,7 @@ const objects = vm.runInNewContext(`({
   function_prototype: Function.prototype,
   object_constructor: Object,
   array_constructor: Array,
+  math: Math,
 })`);
 
 const lines = [

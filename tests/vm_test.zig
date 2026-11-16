@@ -1202,3 +1202,59 @@ test "M11.2: JS->native->JS exception propagation, uncatchable LimitExceeded, an
     var f3: api.Failure = .{};
     try testing.expectError(error.LimitExceeded, rt.run(lim, &f3));
 }
+
+test "M11.3a: Math.random is deterministic per runtime seed and unimplemented Math members report Unsupported" {
+    const src =
+        \\for (let i = 0; i < 5; i++) {
+        \\  let r = Math.random();
+        \\  if (!(r >= 0 && r < 1)) throw 'out of range';
+        \\  print(r);
+        \\}
+    ;
+
+    // 1. Two runtimes with default seed produce identical sequences.
+    var out1: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out1.deinit();
+    var rt1 = try api.Runtime.create(testing.allocator, .{ .output = &out1.writer });
+    defer rt1.destroy();
+    const p1 = try rt1.compile("rand1.js", src, null);
+    defer p1.destroy();
+    try rt1.run(p1, null);
+
+    var out2: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out2.deinit();
+    var rt2 = try api.Runtime.create(testing.allocator, .{ .output = &out2.writer });
+    defer rt2.destroy();
+    const p2 = try rt2.compile("rand2.js", src, null);
+    defer p2.destroy();
+    try rt2.run(p2, null);
+
+    try testing.expectEqualStrings(out1.writer.buffered(), out2.writer.buffered());
+
+    // 2. Two runtimes with the same explicit seed match, and a different seed diverges.
+    var out3: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out3.deinit();
+    var rt3 = try api.Runtime.create(testing.allocator, .{ .output = &out3.writer, .random_seed = 42 });
+    defer rt3.destroy();
+    const p3 = try rt3.compile("rand3.js", src, null);
+    defer p3.destroy();
+    try rt3.run(p3, null);
+
+    var out4: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out4.deinit();
+    var rt4 = try api.Runtime.create(testing.allocator, .{ .output = &out4.writer, .random_seed = 42 });
+    defer rt4.destroy();
+    const p4 = try rt4.compile("rand4.js", src, null);
+    defer p4.destroy();
+    try rt4.run(p4, null);
+
+    try testing.expectEqualStrings(out3.writer.buffered(), out4.writer.buffered());
+    try testing.expect(!std.mem.eql(u8, out1.writer.buffered(), out3.writer.buffered()));
+
+    // 3. Unimplemented Math member (e.g. Math.cosh) raises Unsupported(builtin).
+    const unsup = try rt1.compile("unsup.js", "Math.cosh;", null);
+    defer unsup.destroy();
+    var f: api.Failure = .{};
+    try testing.expectError(error.Unsupported, rt1.run(unsup, &f));
+    try testing.expect(std.mem.indexOf(u8, f.message(), "cosh") != null);
+}

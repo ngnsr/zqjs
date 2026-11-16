@@ -68,9 +68,18 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.object_prototype, "valueOf", &object_value_of);
     try method(rt, r.array_prototype, "push", &array_push);
     try method(rt, r.array_prototype, "pop", &array_pop);
+    try method(rt, r.array_prototype, "slice", &array_slice);
+    try method(rt, r.array_prototype, "indexOf", &array_index_of);
+    try method(rt, r.array_prototype, "includes", &array_includes);
     try method(rt, r.array_prototype, "join", &array_join);
     try method(rt, r.array_prototype, "toString", &array_to_string);
+    try method(rt, r.string_prototype, "charAt", &string_char_at);
     try method(rt, r.string_prototype, "charCodeAt", &string_char_code_at);
+    try method(rt, r.string_prototype, "slice", &string_slice);
+    try method(rt, r.string_prototype, "indexOf", &string_index_of);
+    try method(rt, r.string_prototype, "includes", &string_includes);
+    try method(rt, r.string_prototype, "toLowerCase", &string_to_lower_case);
+    try method(rt, r.string_prototype, "toUpperCase", &string_to_upper_case);
     try method(rt, r.object_namespace, "keys", &object_keys);
     try method(rt, r.object_namespace, "create", &object_create);
     try method(rt, r.object_namespace, "getPrototypeOf", &object_get_prototype_of);
@@ -194,8 +203,36 @@ fn objectValueOf(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 
 const array_push: Native = .{ .name = "push", .call = arrayPush };
 const array_pop: Native = .{ .name = "pop", .call = arrayPop };
+const array_slice: Native = .{ .name = "slice", .call = arraySlice };
+const array_index_of: Native = .{ .name = "indexOf", .call = arrayIndexOf };
+const array_includes: Native = .{ .name = "includes", .call = arrayIncludes };
 const array_join: Native = .{ .name = "join", .call = arrayJoin };
 const array_to_string: Native = .{ .name = "toString", .call = arrayToString };
+
+fn toIntegerOrInfinity(rt: *Runtime, v: Value) Error!f64 {
+    const n = try ops.toNumber(rt, v);
+    if (std.math.isNan(n) or n == 0) return 0;
+    return @trunc(n);
+}
+
+fn resolveRelativeIndex(n: f64, len: usize) usize {
+    const len_f: f64 = @floatFromInt(len);
+    const k = if (n < 0) @max(len_f + n, 0) else @min(n, len_f);
+    return @intFromFloat(k);
+}
+
+fn resolveSearchStart(n: f64, len: usize) ?usize {
+    const len_f: f64 = @floatFromInt(len);
+    if (n >= len_f) return null;
+    if (n >= 0) return @intFromFloat(n);
+    const k = len_f + n;
+    return if (k < 0) 0 else @intFromFloat(k);
+}
+
+fn sameValueZero(a: Value, b: Value) bool {
+    if (a == .number and b == .number and std.math.isNan(a.number) and std.math.isNan(b.number)) return true;
+    return ops.strictEquals(a, b);
+}
 
 fn thisArray(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
     if (this == .object and this.object.kind == .array) return this.object;
@@ -211,6 +248,45 @@ fn arrayPush(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 fn arrayPop(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     const a = try thisArray(rt, this, "pop");
     return rt.heap.popElement(a) orelse .undefined;
+}
+
+/// ZQJS arrays are always dense (D13), so `slice()` always returns a dense array;
+/// sparse-array hole preservation is not supported because holes are rejected at creation.
+fn arraySlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "slice");
+    const items = a.kind.array.items;
+    const start = if (arg(args, 0) == .undefined) 0 else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 0)), items.len);
+    const end = if (arg(args, 1) == .undefined) items.len else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 1)), items.len);
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    if (start < end) try rt.heap.appendElements(out, items[start..end]);
+    return .{ .object = out };
+}
+
+fn arrayIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "indexOf");
+    const items = a.kind.array.items;
+    if (items.len == 0) return .{ .number = -1 };
+    const needle = arg(args, 0);
+    const from_n = if (args.len >= 2) try toIntegerOrInfinity(rt, args[1]) else 0;
+    const start = resolveSearchStart(from_n, items.len) orelse return .{ .number = -1 };
+    for (items[start..], start..) |item, i| {
+        if (ops.strictEquals(item, needle)) return .{ .number = @floatFromInt(i) };
+    }
+    return .{ .number = -1 };
+}
+
+fn arrayIncludes(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "includes");
+    const items = a.kind.array.items;
+    if (items.len == 0) return .{ .boolean = false };
+    const needle = arg(args, 0);
+    const from_n = if (args.len >= 2) try toIntegerOrInfinity(rt, args[1]) else 0;
+    const start = resolveSearchStart(from_n, items.len) orelse return .{ .boolean = false };
+    for (items[start..]) |item| {
+        if (sameValueZero(item, needle)) return .{ .boolean = true };
+    }
+    return .{ .boolean = false };
 }
 
 fn arrayJoin(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -236,17 +312,103 @@ fn arrayToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 
 // ---------------------------------------------------------------- String.prototype
 
+const string_char_at: Native = .{ .name = "charAt", .call = stringCharAt };
 const string_char_code_at: Native = .{ .name = "charCodeAt", .call = stringCharCodeAt };
+const string_slice: Native = .{ .name = "slice", .call = stringSlice };
+const string_index_of: Native = .{ .name = "indexOf", .call = stringIndexOf };
+const string_includes: Native = .{ .name = "includes", .call = stringIncludes };
+const string_to_lower_case: Native = .{ .name = "toLowerCase", .call = stringToLowerCase };
+const string_to_upper_case: Native = .{ .name = "toUpperCase", .call = stringToUpperCase };
+
+fn thisString(rt: *Runtime, this: Value, name: []const u8) Error!*const heap_mod.String {
+    return switch (this) {
+        .string => |s| s,
+        else => unsupportedReceiver(rt, name),
+    };
+}
+
+fn toStringUnits(rt: *Runtime, v: Value) Error![]const u16 {
+    if (v == .string) return v.string.units;
+    var buf: ops.NumberBuf = undefined;
+    const piece = try ops.toPiece(rt, v, &buf);
+    return switch (piece) {
+        .utf16 => |u| u,
+        .ascii => (try rt.heap.newString(&.{piece})).units,
+    };
+}
+
+fn stringCharAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "charAt");
+    const pos = try toIntegerOrInfinity(rt, arg(args, 0));
+    if (pos < 0 or pos >= @as(f64, @floatFromInt(s.units.len))) {
+        return .{ .string = try rt.heap.newString(&.{}) };
+    }
+    const i: usize = @intFromFloat(pos);
+    return .{ .string = try rt.heap.newString(&.{.{ .utf16 = s.units[i .. i + 1] }}) };
+}
 
 fn stringCharCodeAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = switch (this) {
-        .string => |s| s,
-        else => return unsupportedReceiver(rt, "charCodeAt"),
-    };
-    const n = try ops.toNumber(rt, arg(args, 0));
-    const pos = if (std.math.isNan(n)) 0 else @trunc(n); // ToIntegerOrInfinity
+    const s = try thisString(rt, this, "charCodeAt");
+    const pos = try toIntegerOrInfinity(rt, arg(args, 0));
     if (pos < 0 or pos >= @as(f64, @floatFromInt(s.units.len))) return .{ .number = std.math.nan(f64) };
     return .{ .number = @floatFromInt(s.units[@intFromFloat(pos)]) }; // a UTF-16 code unit
+}
+
+fn stringSlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "slice");
+    const len = s.units.len;
+    const from = if (arg(args, 0) == .undefined) 0 else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 0)), len);
+    const to = if (arg(args, 1) == .undefined) len else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 1)), len);
+    if (from >= to) return .{ .string = try rt.heap.newString(&.{}) };
+    return .{ .string = try rt.heap.newString(&.{.{ .utf16 = s.units[from..to] }}) };
+}
+
+fn stringIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "indexOf");
+    const search = try toStringUnits(rt, arg(args, 0));
+    const pos = try toIntegerOrInfinity(rt, arg(args, 1));
+    const len = s.units.len;
+    const start: usize = if (pos <= 0) 0 else if (pos >= @as(f64, @floatFromInt(len))) len else @intFromFloat(pos);
+    if (search.len == 0) return .{ .number = @floatFromInt(start) };
+    if (std.mem.indexOfPos(u16, s.units, start, search)) |idx| return .{ .number = @floatFromInt(idx) };
+    return .{ .number = -1 };
+}
+
+fn stringIncludes(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "includes");
+    const search = try toStringUnits(rt, arg(args, 0));
+    const pos = try toIntegerOrInfinity(rt, arg(args, 1));
+    const len = s.units.len;
+    const start: usize = if (pos <= 0) 0 else if (pos >= @as(f64, @floatFromInt(len))) len else @intFromFloat(pos);
+    if (search.len == 0) return .{ .boolean = true };
+    return .{ .boolean = std.mem.indexOfPos(u16, s.units, start, search) != null };
+}
+
+/// Compatibility restriction: JavaScript case conversion is Unicode-aware, whereas
+/// ZQJS currently implements ASCII-only case conversion and reports `Unsupported(builtin)`
+/// for non-ASCII code units (`>= 0x80`) rather than silently diverging from JS.
+fn asciiCase(rt: *Runtime, s: *const heap_mod.String, name: []const u8, comptime upper: bool) Error!Value {
+    var stack_buf: [256]u16 = undefined;
+    const heap_buf: []u16 = if (s.units.len > stack_buf.len) try rt.gpa.alloc(u16, s.units.len) else &.{};
+    defer if (heap_buf.len > 0) rt.gpa.free(heap_buf);
+    const out = if (s.units.len > stack_buf.len) heap_buf else stack_buf[0..s.units.len];
+    for (s.units, 0..) |u, i| {
+        if (u >= 0x80) return unsupportedReceiver(rt, name);
+        out[i] = if (upper)
+            if (u >= 'a' and u <= 'z') u - 32 else u
+        else if (u >= 'A' and u <= 'Z') u + 32 else u;
+    }
+    return .{ .string = try rt.heap.newString(&.{.{ .utf16 = out }}) };
+}
+
+fn stringToLowerCase(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const s = try thisString(rt, this, "toLowerCase");
+    return asciiCase(rt, s, "toLowerCase", false);
+}
+
+fn stringToUpperCase(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const s = try thisString(rt, this, "toUpperCase");
+    return asciiCase(rt, s, "toUpperCase", true);
 }
 
 // ---------------------------------------------------------------- Object, Array

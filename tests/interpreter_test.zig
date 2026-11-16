@@ -296,7 +296,7 @@ test "built-ins: known to node but not implemented is Unsupported, naming the me
     try expectUnsupported("print(JSON === undefined);", "", "Unsupported(builtin): a built-in node has that ZQJS doesn't implement yet ('JSON')");
     try expectUnsupported("print([1].length); [1].map;", "1\n", "Unsupported(builtin)");
     try expectUnsupported("[1].map;", "", "('map')");
-    try expectUnsupported("'abc'.toUpperCase;", "", "('toUpperCase')");
+    try expectUnsupported("'abc'.trim;", "", "('trim')");
     try expectUnsupported("(1).toFixed;", "", "('toFixed')");
     try expectUnsupported("Object.assign;", "", "('assign')");
     try expectUnsupported("Object.name;", "", "('name')");
@@ -340,4 +340,16 @@ test "object limits: heap, string length of a join, conversion depth" {
     try expectLimit("let o = {}; let i = 0; while (true) { o['k' + i] = i; i++; }", .{ .max_heap_bytes = 1 << 20 }, .heap_bytes);
     try expectLimit("let a = ['abcdefgh']; while (true) { a.push(a.join()); }", .{ .max_string_length = 1000 }, .string_length);
     try expectLimit("let d = [1]; for (let i = 0; i < 2000; i++) { d = [d]; } '' + d;", .{}, .conversion_depth);
+}
+
+test "M11.3b: Array/String unimplemented methods, non-matching receivers, and non-ASCII case report Unsupported" {
+    try expectUnsupported("[1].forEach;", "", "('forEach')");
+    try expectUnsupported("let o = { length: 1, slice: [].slice }; o.slice();", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { length: 1, indexOf: [].indexOf }; o.indexOf(1);", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { length: 1, includes: [].includes }; o.includes(1);", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { charAt: ''.charAt }; o.charAt(0);", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { slice: ''.slice }; o.slice(0);", "", "Unsupported(builtin)");
+    try expectUnsupported("'\\u00e9'.toLowerCase();", "", "('toLowerCase')");
+    try expectUnsupported("'\\u00e9'.toUpperCase();", "", "('toUpperCase')");
+    try expectUnsupported("[1, , 3].slice();", "", "Unsupported(sparse_array)");
 }

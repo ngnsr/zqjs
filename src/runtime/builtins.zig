@@ -89,6 +89,10 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.array_prototype, "keys", &array_keys);
     try method(rt, r.array_prototype, "values", &array_values);
     try method(rt, r.array_prototype, "entries", &array_entries);
+    try method(rt, r.array_prototype, "forEach", &array_for_each);
+    try method(rt, r.array_prototype, "map", &array_map);
+    try method(rt, r.array_prototype, "filter", &array_filter);
+    try method(rt, r.array_prototype, "reduce", &array_reduce);
     try method(rt, r.string_prototype, "charAt", &string_char_at);
     try method(rt, r.string_prototype, "charCodeAt", &string_char_code_at);
     try method(rt, r.string_prototype, "slice", &string_slice);
@@ -108,6 +112,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.map_prototype, "keys", &map_keys);
     try method(rt, r.map_prototype, "values", &map_values);
     try method(rt, r.map_prototype, "entries", &map_entries);
+    try method(rt, r.map_prototype, "forEach", &map_for_each);
     try method(rt, r.set_prototype, "add", &set_add);
     try method(rt, r.set_prototype, "has", &set_has);
     try method(rt, r.set_prototype, "delete", &set_delete);
@@ -115,6 +120,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.set_prototype, "keys", &set_values);
     try method(rt, r.set_prototype, "values", &set_values);
     try method(rt, r.set_prototype, "entries", &set_entries);
+    try method(rt, r.set_prototype, "forEach", &set_for_each);
     try method(rt, r.iterator_prototype, "next", &iterator_next);
     try registerMath(rt, r.math);
     try method(rt, r.json, "parse", &json.parse_native);
@@ -270,6 +276,17 @@ const array_to_string: Native = .{ .name = "toString", .call = arrayToString };
 const array_keys: Native = .{ .name = "keys", .call = arrayKeys };
 const array_values: Native = .{ .name = "values", .call = arrayValues };
 const array_entries: Native = .{ .name = "entries", .call = arrayEntries };
+const array_for_each: Native = .{ .name = "forEach", .call = arrayForEach };
+const array_map: Native = .{ .name = "map", .call = arrayMap };
+const array_filter: Native = .{ .name = "filter", .call = arrayFilter };
+const array_reduce: Native = .{ .name = "reduce", .call = arrayReduce };
+
+fn requireCallable(rt: *Runtime, v: Value) Error!Value {
+    return switch (v) {
+        .native, .closure => v,
+        else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
+    };
+}
 
 fn toIntegerOrInfinity(rt: *Runtime, v: Value) Error!f64 {
     const n = try ops.toNumber(rt, v);
@@ -385,6 +402,95 @@ fn arrayValues(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 fn arrayEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     _ = try thisArray(rt, this, "entries");
     return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .array_entries) };
+}
+
+fn arrayForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "forEach");
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    const len = a.kind.array.items.len;
+    var root_buf = [_]Value{ this, cb, this_arg };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    for (0..len) |i| {
+        if (i >= a.kind.array.items.len) continue;
+        const elem = a.kind.array.items[i];
+        _ = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
+    }
+    return .undefined;
+}
+
+fn arrayMap(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "map");
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    const len = a.kind.array.items.len;
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ this, cb, this_arg, .{ .object = out }, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    for (0..len) |i| {
+        if (i >= a.kind.array.items.len) return rt.fail(.sparse_array);
+        const elem = a.kind.array.items[i];
+        root_buf[4] = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
+        try rt.heap.appendElement(out, root_buf[4]);
+        root_buf[4] = .undefined;
+    }
+    return .{ .object = out };
+}
+
+fn arrayFilter(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "filter");
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    const len = a.kind.array.items.len;
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ this, cb, this_arg, .{ .object = out }, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    for (0..len) |i| {
+        if (i >= a.kind.array.items.len) continue;
+        const elem = a.kind.array.items[i];
+        root_buf[4] = elem;
+        const keep = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
+        if (ops.toBoolean(keep)) try rt.heap.appendElement(out, root_buf[4]);
+        root_buf[4] = .undefined;
+    }
+    return .{ .object = out };
+}
+
+fn arrayReduce(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "reduce");
+    const cb = try requireCallable(rt, arg(args, 0));
+    const len = a.kind.array.items.len;
+    var start: usize = 0;
+    var acc: Value = undefined;
+    if (args.len >= 2) {
+        acc = args[1];
+    } else {
+        if (len == 0) return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty array with no initial value" }});
+        acc = a.kind.array.items[0];
+        start = 1;
+    }
+    var root_buf = [_]Value{ this, cb, acc };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    for (start..len) |i| {
+        if (i >= a.kind.array.items.len) continue;
+        const elem = a.kind.array.items[i];
+        root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, .{ .number = @floatFromInt(i) }, this });
+    }
+    return root_buf[2];
 }
 
 // ---------------------------------------------------------------- String.prototype
@@ -787,6 +893,7 @@ const map_clear: Native = .{ .name = "clear", .call = mapClear };
 const map_keys: Native = .{ .name = "keys", .call = mapKeys };
 const map_values: Native = .{ .name = "values", .call = mapValues };
 const map_entries: Native = .{ .name = "entries", .call = mapEntries };
+const map_for_each: Native = .{ .name = "forEach", .call = mapForEach };
 
 fn mapWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
     return rt.throw(.TypeError, &.{.{ .ascii = "Constructor Map requires 'new'" }});
@@ -856,6 +963,28 @@ fn mapEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .map_entries) };
 }
 
+fn mapForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const m = try thisMap(rt, this, "forEach");
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    var root_buf = [_]Value{ this, cb, this_arg, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var i: usize = 0;
+    while (i < m.kind.map.entries.items.len) : (i += 1) {
+        const e = m.kind.map.entries.items[i];
+        if (!e.alive) continue;
+        root_buf[3] = e.key;
+        root_buf[4] = e.value;
+        _ = try rt.callCallable(cb, this_arg, &.{ e.value, e.key, this });
+        root_buf[3] = .undefined;
+        root_buf[4] = .undefined;
+    }
+    return .undefined;
+}
+
 // ---------------------------------------------------------------- Set
 
 const set_add: Native = .{ .name = "add", .call = setAdd };
@@ -864,6 +993,7 @@ const set_delete: Native = .{ .name = "delete", .call = setDelete };
 const set_clear: Native = .{ .name = "clear", .call = setClear };
 const set_values: Native = .{ .name = "values", .call = setValues };
 const set_entries: Native = .{ .name = "entries", .call = setEntries };
+const set_for_each: Native = .{ .name = "forEach", .call = setForEach };
 
 fn setWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
     return rt.throw(.TypeError, &.{.{ .ascii = "Constructor Set requires 'new'" }});
@@ -916,6 +1046,26 @@ fn setValues(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 fn setEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     _ = try thisSet(rt, this, "entries");
     return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .set_entries) };
+}
+
+fn setForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisSet(rt, this, "forEach");
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    var root_buf = [_]Value{ this, cb, this_arg, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var i: usize = 0;
+    while (i < s.kind.set.entries.items.len) : (i += 1) {
+        const e = s.kind.set.entries.items[i];
+        if (!e.alive) continue;
+        root_buf[3] = e.key;
+        _ = try rt.callCallable(cb, this_arg, &.{ e.key, e.key, this });
+        root_buf[3] = .undefined;
+    }
+    return .undefined;
 }
 
 // ---------------------------------------------------------------- Iterators (M14.4)

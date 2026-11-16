@@ -1,0 +1,18 @@
+undefined 20:0:true,40:1:true,60:2:true
+110,121,132
+2,4 6,8
+2 1 3 true
+40
+10
+99 false
+emptyReduce TypeError
+grow 1,2,3 5
+shrinkFE 1,2,3
+shrinkFilt 1,2,3
+shrinkRed 30
+caught stop-map
+undefined M:NaN=nan:true|M:0=zero:true|M:a=1:true
+mMut a:1,c:30,d:4,a:10
+mClr x:1,z:3
+undefined sMut a:true:true,c:true:true,d:true:true,a:true:true
+sClr 1,99

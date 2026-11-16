@@ -1519,3 +1519,60 @@ test "M15.2: JSON.stringify and parse round-trips under GC pressure" {
         try testing.expectEqualStrings("0,100,200,300\n", r.out);
     }
 }
+
+test "M16.2: Array/Map/Set callbacks keep result arrays, accumulators, and elements rooted across GC" {
+    const src =
+        \\const srcArr = [];
+        \\for (let i = 0; i < 40; i++) srcArr.push({ id: i });
+        \\const mapped = srcArr.map(function (item) {
+        \\    for (let j = 0; j < 40; j++) { let garbage = { j: j }; }
+        \\    return { v: item.id * 2 };
+        \\});
+        \\const filtered = mapped.filter(function (item) {
+        \\    for (let j = 0; j < 40; j++) { let garbage = { j: j }; }
+        \\    return item.v % 20 === 0;
+        \\});
+        \\const reduced = filtered.reduce(function (acc, item) {
+        \\    for (let j = 0; j < 40; j++) { let garbage = { j: j }; }
+        \\    return { sum: acc.sum + item.v };
+        \\}, { sum: 0 });
+        \\const m = new Map([[{ k: 1 }, { v: 10 }], [{ k: 2 }, { v: 20 }]]);
+        \\let mSum = 0;
+        \\m.forEach(function (val, key) {
+        \\    for (let j = 0; j < 40; j++) { let garbage = { j: j }; }
+        \\    mSum += key.k + val.v;
+        \\});
+        \\const s = new Set([{ x: 3 }, { x: 4 }]);
+        \\let sSum = 0;
+        \\s.forEach(function (val) {
+        \\    for (let j = 0; j < 40; j++) { let garbage = { j: j }; }
+        \\    sSum += val.x;
+        \\});
+        \\print(filtered.length, reduced.sum, mSum, sSum);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("4 120 33 7\n", r.out);
+    }
+}
+
+test "M16.2: Array.prototype.map keeps returned fresh objects alive during result growth under GC" {
+    const src =
+        \\const base = [];
+        \\for (let i = 0; i < 300; i++) base.push(i);
+        \\const res = base.map(function (n) {
+        \\    return { id: n, tag: "item-" + n, nested: { sq: n * n } };
+        \\});
+        \\let ok = res.length === 300;
+        \\for (let i = 0; i < res.length; i++) {
+        \\    if (res[i].id !== i || res[i].nested.sq !== i * i) ok = false;
+        \\}
+        \\print(ok, res[0].tag, res[299].tag);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("true item-0 item-299\n", r.out);
+    }
+}

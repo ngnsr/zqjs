@@ -294,8 +294,8 @@ test "holes are Unsupported: arrays stay dense" {
 
 test "built-ins: known to node but not implemented is Unsupported, naming the member" {
     try expectUnsupported("print(Reflect === undefined);", "", "Unsupported(builtin): a built-in node has that ZQJS doesn't implement yet ('Reflect')");
-    try expectUnsupported("print([1].length); [1].map;", "1\n", "Unsupported(builtin)");
-    try expectUnsupported("[1].map;", "", "('map')");
+    try expectUnsupported("print([1].length); [1].find;", "1\n", "Unsupported(builtin)");
+    try expectUnsupported("[1].find;", "", "('find')");
     try expectUnsupported("'abc'.trim;", "", "('trim')");
     try expectUnsupported("(1).toFixed;", "", "('toFixed')");
     try expectUnsupported("Object.assign;", "", "('assign')");
@@ -343,7 +343,7 @@ test "object limits: heap, string length of a join, conversion depth" {
 }
 
 test "M11.3b: Array/String unimplemented methods, non-matching receivers, and non-ASCII case report Unsupported" {
-    try expectUnsupported("[1].forEach;", "", "('forEach')");
+    try expectUnsupported("[1].find;", "", "('find')");
     try expectUnsupported("let o = { length: 1, slice: [].slice }; o.slice();", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { length: 1, indexOf: [].indexOf }; o.indexOf(1);", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { length: 1, includes: [].includes }; o.includes(1);", "", "Unsupported(builtin)");
@@ -355,7 +355,7 @@ test "M11.3b: Array/String unimplemented methods, non-matching receivers, and no
 }
 
 test "M14.2: Map unsupported methods, non-Map receivers, and non-Map new() targets" {
-    try expectUnsupported("new Map().forEach;", "", "('forEach')");
+    try expectUnsupported("new Map().constructor;", "", "('constructor')");
     try expectUnsupported("let o = { get: new Map().get }; o.get('x');", "", "Unsupported(builtin)");
     try expectUnsupported("new Object();", "", "Unsupported(builtin)");
     try expectUnsupported("new Array();", "", "Unsupported(builtin)");
@@ -364,7 +364,7 @@ test "M14.2: Map unsupported methods, non-Map receivers, and non-Map new() targe
 }
 
 test "M14.3: Set unsupported methods, non-Set receivers, and non-array iterables" {
-    try expectUnsupported("new Set().forEach;", "", "('forEach')");
+    try expectUnsupported("new Set().constructor;", "", "('constructor')");
     try expectUnsupported("let o = { has: new Set().has }; o.has('x');", "", "Unsupported(builtin)");
     try expectUnsupported("new Set({});", "", "Unsupported(builtin)");
 }
@@ -533,6 +533,37 @@ test "M16.1: ClosureCaller, callCallable, ValueRoots, exception propagation, dep
             defer rt.deinit();
             try Helper.addGlobal(&rt, alloc);
             if (try runScript(arena.allocator(), &rt, "__test_invoke_twice(function (x) { return x + 1; });", .vm)) |e| return e;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
+}
+
+test "M16.2: Array/Map/Set callback receivers, map shrink deviation, limits, and OOM" {
+    // Intentional dense-array deviation: shrinking the array during map() reports Unsupported(sparse_array)
+    try expectUnsupported("[1, 2, 3].map(function (v, i, a) { if (i === 0) a.pop(); return v; });", "", "Unsupported(sparse_array)");
+
+    // Non-matching receivers
+    try expectUnsupported("let o = { length: 1, forEach: [].forEach }; o.forEach(function () {});", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { length: 1, map: [].map }; o.map(function () {});", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { length: 1, filter: [].filter }; o.filter(function () {});", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { length: 1, reduce: [].reduce }; o.reduce(function () {});", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { forEach: new Map().forEach }; o.forEach(function () {});", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { forEach: new Set().forEach }; o.forEach(function () {});", "", "Unsupported(builtin)");
+
+    for (support.engines) |engine| {
+        var r_depth = try support.run(testing.allocator, "function f(x) { return [x].map(f); } f(1);", .{ .max_call_depth = 4 }, engine, .normal);
+        defer r_depth.deinit(testing.allocator);
+        try testing.expect(std.mem.indexOf(u8, r_depth.err, "LimitExceeded(call_depth)") != null);
+
+        var r_steps = try support.run(testing.allocator, "[1, 2, 3, 4, 5].reduce(function (a, b) { let s = 0; for (let i = 0; i < 50; i++) s += i; return a + b + s; }, 0);", .{ .max_steps = 30 }, engine, .normal);
+        defer r_steps.deinit(testing.allocator);
+        try testing.expect(std.mem.indexOf(u8, r_steps.err, "LimitExceeded(steps)") != null);
+    }
+
+    const OomCtx = struct {
+        fn runOnce(alloc: Allocator) !void {
+            var r = try support.run(alloc, "const a = [1, 2].map(function (x) { return x + 1; }).filter(function (x) { return x > 2; }).reduce(function (a, b) { return a + b; }, 0); new Map([['a', a]]).forEach(function () {}); new Set([a]).forEach(function () {});", .{}, .vm, .normal);
+            defer r.deinit(alloc);
         }
     };
     try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});

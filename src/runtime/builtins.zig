@@ -38,14 +38,16 @@ pub const Realm = struct {
     number_prototype: *Object,
     boolean_prototype: *Object,
     function_prototype: *Object,
-    /// Static members of the `Object` and `Array` globals.
+    map_prototype: *Object,
+    /// Static members of the `Object`, `Array`, and `Map` globals.
     object_namespace: *Object,
     array_namespace: *Object,
+    map_namespace: *Object,
     math: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [9]*Object {
-        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.object_namespace, r.array_namespace, r.math };
+    pub fn objects(r: *const Realm) [11]*Object {
+        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.map_prototype, r.object_namespace, r.array_namespace, r.map_namespace, r.math };
     }
 };
 
@@ -60,8 +62,10 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .number_prototype = try builtin(h, object_prototype, .number_prototype),
         .boolean_prototype = try builtin(h, object_prototype, .boolean_prototype),
         .function_prototype = try builtin(h, object_prototype, .function_prototype),
+        .map_prototype = try builtin(h, object_prototype, .map_prototype),
         .object_namespace = try builtin(h, null, .object_constructor),
         .array_namespace = try builtin(h, null, .array_constructor),
+        .map_namespace = try builtin(h, null, .map_constructor),
         .math = try builtin(h, object_prototype, .math),
     };
     try method(rt, r.object_prototype, "toString", &object_to_string);
@@ -84,6 +88,11 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.object_namespace, "create", &object_create);
     try method(rt, r.object_namespace, "getPrototypeOf", &object_get_prototype_of);
     try method(rt, r.array_namespace, "isArray", &array_is_array);
+    try method(rt, r.map_prototype, "get", &map_get);
+    try method(rt, r.map_prototype, "set", &map_set);
+    try method(rt, r.map_prototype, "has", &map_has);
+    try method(rt, r.map_prototype, "delete", &map_delete);
+    try method(rt, r.map_prototype, "clear", &map_clear);
     try registerMath(rt, r.math);
     _ = &r;
     rt.realm = r;
@@ -116,6 +125,7 @@ pub fn isConversion(n: *const Native) bool {
 pub const print: Native = .{ .name = "print", .call = printImpl };
 pub const object_global: Native = .{ .name = "Object", .call = notCallable, .namespace = .object };
 pub const array_global: Native = .{ .name = "Array", .call = notCallable, .namespace = .array };
+pub const map_global: Native = .{ .name = "Map", .call = mapWithoutNew, .construct = mapConstruct, .namespace = .map };
 
 /// A global read: implemented, host-registered (M9.1, D53), known to node (Unsupported),
 /// or a ReferenceError.
@@ -126,6 +136,7 @@ pub fn global(rt: *Runtime, name: []const u8) Error!Value {
     if (std.mem.eql(u8, name, "print")) return .{ .native = &print };
     if (std.mem.eql(u8, name, "Object")) return .{ .native = &object_global };
     if (std.mem.eql(u8, name, "Array")) return .{ .native = &array_global };
+    if (std.mem.eql(u8, name, "Map")) return .{ .native = &map_global };
     if (std.mem.eql(u8, name, "Math")) return .{ .object = (try realm(rt)).math };
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return .{ .native = n };
     if (names.has(.global, name)) {
@@ -145,6 +156,15 @@ fn notCallable(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     _ = this;
     _ = args;
     return rt.fail(.builtin); // Object(…) / Array(…): the constructors themselves
+}
+
+/// Evaluates `new callee(args...)` for built-in constructors (M14).
+pub fn construct(rt: *Runtime, callee: Value, args: []const Value) Error!Value {
+    return switch (callee) {
+        .native => |n| if (n.construct) |c| c(rt, args) else rt.fail(.builtin),
+        .closure => rt.fail(.builtin),
+        else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }}),
+    };
 }
 
 /// `print(a, b, …)` writes `String(a) + " " + String(b) + … + "\n"`. The node test
@@ -187,7 +207,11 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
         .number => "Number",
         .string => "String",
         .native, .closure => "Function",
-        .object => |o| if (o.kind == .array) "Array" else "Object",
+        .object => |o| switch (o.kind) {
+            .array => "Array",
+            .map => "Map",
+            .ordinary => "Object",
+        },
     };
     return .{ .string = try rt.heap.newString(&.{ .{ .ascii = "[object " }, .{ .ascii = tag }, .{ .ascii = "]" } }) };
 }
@@ -698,4 +722,68 @@ fn mathHypot(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 
 fn mathRandom(rt: *Runtime, _: Value, _: []const Value) Error!Value {
     return .{ .number = rt.nextRandom() };
+}
+
+// ---------------------------------------------------------------- Map
+
+const map_get: Native = .{ .name = "get", .call = mapGet };
+const map_set: Native = .{ .name = "set", .call = mapSet };
+const map_has: Native = .{ .name = "has", .call = mapHas };
+const map_delete: Native = .{ .name = "delete", .call = mapDelete };
+const map_clear: Native = .{ .name = "clear", .call = mapClear };
+
+fn mapWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "Constructor Map requires 'new'" }});
+}
+
+fn mapConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    const m = try rt.heap.newMap(r.map_prototype);
+    const iterable = arg(args, 0);
+    if (iterable == .undefined or iterable == .null) return .{ .object = m };
+    if (iterable == .object and iterable.object.kind == .array) {
+        for (iterable.object.kind.array.items) |entry| {
+            if (entry != .object) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "Iterator value is not an entry object" }});
+            }
+            const k = try object.get(rt, entry, .{ .index = 0 });
+            const v = try object.get(rt, entry, .{ .index = 1 });
+            try rt.heap.mapSet(m, k, v);
+        }
+        return .{ .object = m };
+    }
+    if (iterable == .object or iterable == .string) return unsupportedReceiver(rt, "Map"); // M14.4 adds general iterables
+    return rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }});
+}
+
+fn thisMap(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
+    if (this == .object and this.object.kind == .map) return this.object;
+    return unsupportedReceiver(rt, name);
+}
+
+fn mapGet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const m = try thisMap(rt, this, "get");
+    return heap_mod.Heap.mapGet(m, arg(args, 0)) orelse .undefined;
+}
+
+fn mapSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const m = try thisMap(rt, this, "set");
+    try rt.heap.mapSet(m, arg(args, 0), arg(args, 1));
+    return this;
+}
+
+fn mapHas(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const m = try thisMap(rt, this, "has");
+    return .{ .boolean = heap_mod.Heap.mapHas(m, arg(args, 0)) };
+}
+
+fn mapDelete(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const m = try thisMap(rt, this, "delete");
+    return .{ .boolean = heap_mod.Heap.mapDelete(m, arg(args, 0)) };
+}
+
+fn mapClear(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const m = try thisMap(rt, this, "clear");
+    heap_mod.Heap.mapClear(m);
+    return .undefined;
 }

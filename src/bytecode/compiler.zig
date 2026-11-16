@@ -652,6 +652,11 @@ const Compiler = struct {
                 for (call.args) |arg| try c.expr(arg);
                 try c.emit(if (method) .call_method else .call, &.{@intCast(call.args.len)}); // args.len < source size
             },
+            .new_call => |nc| {
+                try c.expr(nc.callee);
+                for (nc.args) |arg| try c.expr(arg);
+                try c.emit(.new_call, &.{@intCast(nc.args.len)});
+            },
         }
     }
 

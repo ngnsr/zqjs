@@ -104,6 +104,8 @@ pub const Expr = struct {
     depth: u16,
     data: Data,
 
+    pub const Call = struct { callee: *const Expr, args: []const *const Expr };
+
     pub const Data = union(enum) {
         number: f64,
         /// UTF-16 code units, possibly containing lone surrogates (DESIGN_DECISIONS D6).
@@ -117,7 +119,9 @@ pub const Expr = struct {
         /// `target = value` (op null) or `target op= value`.
         assign: struct { op: ?BinaryOp, target: Target, value: *const Expr },
         /// `callee(args)`. A member callee (`o.f(…)`) is a method call: `this` is `o`.
-        call: struct { callee: *const Expr, args: []const *const Expr },
+        call: Call,
+        /// `new callee(args)` or `new callee`.
+        new_call: Call,
         /// `++x`, `--x`, `x++`, `x--`.
         update: struct { op: enum { inc, dec }, prefix: bool, target: Target },
         member: Member,
@@ -166,6 +170,8 @@ pub const Declaration = struct {
 pub const Stmt = struct {
     span: Span,
     data: Data,
+
+    pub const Call = struct { callee: *const Expr, args: []const *const Expr };
 
     pub const Data = union(enum) {
         empty,

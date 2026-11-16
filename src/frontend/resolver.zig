@@ -309,7 +309,7 @@ const Resolver = struct {
             },
             .array => |items| for (items) |item| try r.expr(item),
             .this => {},
-            .call => |c| {
+            .call, .new_call => |c| {
                 try r.expr(c.callee);
                 for (c.args) |arg| try r.expr(arg);
             },

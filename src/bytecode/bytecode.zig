@@ -167,6 +167,8 @@ pub const Op = enum(u8) {
     /// Stack: [receiver, callee, arg0 … arg(argc-1)] → [result]: a method call `o.f(…)`;
     /// `this` is the receiver (D41). Otherwise exactly like `call`.
     call_method,
+    /// Stack: [callee, arg0 … arg(argc-1)] → [result]: `new callee(args...)`.
+    new_call,
     /// Pop the return value, leave the frame, and push the value in place of the
     /// callee and arguments in the caller. Function protos only; the stack must hold
     /// exactly the return value.
@@ -237,7 +239,7 @@ pub const Op = enum(u8) {
             .neg, .to_number, .not, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .jump => .{ .operands = &.{.target}, .pops = 0, .pushes = 0 },
             .jump_if_false, .jump_if_true => .{ .operands = &.{.target}, .pops = 1, .pushes = 0 },
-            .call => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
+            .call, .new_call => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
             .halt => .{ .operands = &.{}, .pops = 0, .pushes = 0 },
             .throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
         };
@@ -247,7 +249,7 @@ pub const Op = enum(u8) {
     /// `call_method` and `new_array` pop their arguments too.
     pub fn popsWith(op: Op, argc: u32) u64 {
         const extra: u64 = switch (op) {
-            .call, .call_method, .new_array => argc,
+            .call, .call_method, .new_call, .new_array => argc,
             else => 0,
         };
         return op.info().pops + extra;

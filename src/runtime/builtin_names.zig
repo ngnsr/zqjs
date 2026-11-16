@@ -13,6 +13,8 @@ pub const Builtin = enum {
     function_prototype,
     object_constructor,
     array_constructor,
+    map_constructor,
+    map_prototype,
     math,
 };
 
@@ -28,6 +30,8 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .function_prototype => function_prototype.has(name),
         .object_constructor => object_constructor.has(name),
         .array_constructor => array_constructor.has(name),
+        .map_constructor => map_constructor.has(name),
+        .map_prototype => map_prototype.has(name),
         .math => math.has(name),
     };
 }
@@ -281,6 +285,29 @@ const array_constructor = std.StaticStringMap(void).initComptime(.{
     .{"name"},
     .{"of"},
     .{"prototype"},
+});
+
+const map_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"groupBy"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const map_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"clear"},
+    .{"constructor"},
+    .{"delete"},
+    .{"entries"},
+    .{"forEach"},
+    .{"get"},
+    .{"getOrInsert"},
+    .{"getOrInsertComputed"},
+    .{"has"},
+    .{"keys"},
+    .{"set"},
+    .{"size"},
+    .{"values"},
 });
 
 const math = std.StaticStringMap(void).initComptime(.{

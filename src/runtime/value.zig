@@ -40,6 +40,8 @@ pub const Native = struct {
         call: *const HostCallFn,
         ctx: ?*anyopaque,
     } = null,
-    /// For the namespace globals (`Object`, `Array`): where their static members live.
-    namespace: ?enum { object, array } = null,
+    /// For built-in constructors (`Map`, `Set`): called by `new` instead of `call`.
+    construct: ?*const fn (rt: *Runtime, args: []const Value) Error!Value = null,
+    /// For the namespace globals (`Object`, `Array`, `Map`): where their static members live.
+    namespace: ?enum { object, array, map } = null,
 };

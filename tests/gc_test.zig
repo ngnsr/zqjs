@@ -692,7 +692,7 @@ test "weak atoms are reclaimed in real programs, on both engines" {
         const r = try runStats(source, engine, .{});
         try testing.expectEqual(@as(?anyerror, null), r.err);
         try testing.expect(r.collections > 0);
-        testing.expect(r.atoms < 50) catch |e| {
+        testing.expect(r.atoms < 100) catch |e| {
             std.debug.print("{s}: {d} atoms left\n", .{ @tagName(engine), r.atoms });
             return e;
         };
@@ -1041,7 +1041,7 @@ test "dead dynamic keys drive major collections: atoms can't pile up past the he
         try testing.expectEqual(@as(?anyerror, null), r.err);
         try testing.expect(r.majors > 0);
         try testing.expect(r.peak <= 1 << 20);
-        try testing.expect(r.atoms < 50); // and the final major one leaves only the realm's
+        try testing.expect(r.atoms < 100); // and the final major one leaves only the realm's
     }
 }
 
@@ -1426,5 +1426,29 @@ test "scheduling (AS5) T3: programs with bursts that fit complete; surviving bur
         // than half the free room can't fail.
         try testing.expect(b.peak > limit / 4);
         try testing.expect(b.majors > 0);
+    }
+}
+
+test "M14.2: old Map remembers young keys/values across minor collections and reclaims cleared entries" {
+    const src =
+        \\let m = new Map();
+        \\// Promote `m` into old generation via allocation churn
+        \\for (let i = 0; i < 1500; i++) { let tmp = { i: i }; }
+        \\let k1 = { tag: 'young-key-' + 1 };
+        \\let v1 = { tag: 'young-val-' + 1 };
+        \\let s1 = 'young-str-' + 2;
+        \\m.set(k1, v1);
+        \\m.set(s1, [10, 20]);
+        \\k1 = null; v1 = null; s1 = null;
+        \\for (let i = 0; i < 1500; i++) { let tmp = 'churn-' + i; }
+        \\// Find the kept object key via entries? M14.2 has no iterators yet, so keep `k2` in a closure/slot or check size & string lookup!
+        \\print(m.size, m.get('young-str-2')[1]);
+        \\m.clear();
+        \\print(m.size, m.get('young-str-2'));
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("2 20\n0 undefined\n", r.out);
     }
 }

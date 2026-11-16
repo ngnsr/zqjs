@@ -136,6 +136,133 @@ pub const Property = struct {
     enumerable: bool = true,
 };
 
+/// Insertion-ordered hash table with SameValueZero key equality, shared by Map and Set (M14).
+pub const OrderedTable = struct {
+    pub const Entry = struct {
+        key: Value,
+        value: Value,
+        alive: bool,
+    };
+
+    const IndexContext = struct {
+        entries: []const Entry,
+        pub fn hash(ctx: @This(), idx: usize) u64 {
+            return hashValue(ctx.entries[idx].key);
+        }
+        pub fn eql(ctx: @This(), a: usize, b: usize) bool {
+            return sameValueZero(ctx.entries[a].key, ctx.entries[b].key);
+        }
+    };
+
+    const LookupContext = struct {
+        entries: []const Entry,
+        pub fn hash(_: @This(), k: Value) u64 {
+            return hashValue(k);
+        }
+        pub fn eql(ctx: @This(), k: Value, idx: usize) bool {
+            return sameValueZero(k, ctx.entries[idx].key);
+        }
+    };
+
+    entries: std.ArrayList(Entry) = .empty,
+    index: std.HashMapUnmanaged(usize, void, IndexContext, std.hash_map.default_max_load_percentage) = .empty,
+    live_count: usize = 0,
+
+    pub fn deinit(t: *OrderedTable, alloc: Allocator) void {
+        t.entries.deinit(alloc);
+        t.index.deinit(alloc);
+        t.* = .{};
+    }
+
+    pub fn get(t: *const OrderedTable, k: Value) ?Value {
+        const idx = t.index.getKeyAdapted(k, LookupContext{ .entries = t.entries.items }) orelse return null;
+        return t.entries.items[idx].value;
+    }
+
+    pub fn has(t: *const OrderedTable, k: Value) bool {
+        return t.index.getKeyAdapted(k, LookupContext{ .entries = t.entries.items }) != null;
+    }
+
+    pub fn set(t: *OrderedTable, h: *Heap, owner: *Object, k_in: Value, v: Value) Error!void {
+        const k = if (k_in == .number and k_in.number == 0) Value{ .number = 0.0 } else k_in;
+        if (t.index.getKeyAdapted(k, LookupContext{ .entries = t.entries.items })) |idx| {
+            h.barrier(&owner.obj, t.entries.items[idx].value, v);
+            t.entries.items[idx].value = v;
+            return;
+        }
+        const idx = t.entries.items.len;
+        const alloc = h.allocator();
+        t.entries.append(alloc, .{ .key = k, .value = v, .alive = true }) catch |e| return h.failed(e);
+        errdefer _ = t.entries.pop();
+        t.index.putContext(alloc, idx, {}, IndexContext{ .entries = t.entries.items }) catch |e| return h.failed(e);
+        t.live_count += 1;
+        h.barrier(&owner.obj, null, k);
+        h.barrier(&owner.obj, null, v);
+    }
+
+    pub fn delete(t: *OrderedTable, k: Value) bool {
+        const idx = t.index.getKeyAdapted(k, LookupContext{ .entries = t.entries.items }) orelse return false;
+        _ = t.index.removeAdapted(k, LookupContext{ .entries = t.entries.items });
+        t.entries.items[idx] = .{ .key = .undefined, .value = .undefined, .alive = false };
+        t.live_count -= 1;
+        return true;
+    }
+
+    pub fn clear(t: *OrderedTable) void {
+        t.index.clearRetainingCapacity();
+        // Preserve `entries.items.len` with dead tombstones so active iterators keep their
+        // cursor and can still visit entries inserted after `clear()`.
+        for (t.entries.items) |*e| e.* = .{ .key = .undefined, .value = .undefined, .alive = false };
+        t.live_count = 0;
+    }
+};
+
+pub fn sameValueZero(a: Value, b: Value) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .undefined, .null => true,
+        .boolean => |x| x == b.boolean,
+        .number => |x| (x == b.number) or (std.math.isNan(x) and std.math.isNan(b.number)),
+        .string => |x| std.mem.eql(u16, x.units, b.string.units),
+        .native => |x| x == b.native,
+        .closure => |x| x == b.closure,
+        .object => |x| x == b.object,
+    };
+}
+
+pub fn hashValue(v: Value) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    const tag: u8 = @backingInt(std.meta.activeTag(v));
+    hasher.update(&.{tag});
+    switch (v) {
+        .undefined, .null => {},
+        .boolean => |b| hasher.update(&.{@intFromBool(b)}),
+        .number => |n| {
+            const bits: u64 = if (std.math.isNan(n))
+                0x7ff8_0000_0000_0000
+            else if (n == 0)
+                0
+            else
+                @bitCast(n);
+            hasher.update(std.mem.asBytes(&bits));
+        },
+        .string => |s| hasher.update(std.mem.sliceAsBytes(s.units)),
+        .native => |n| {
+            const p: usize = @intFromPtr(n);
+            hasher.update(std.mem.asBytes(&p));
+        },
+        .closure => |c| {
+            const p: usize = @intFromPtr(c);
+            hasher.update(std.mem.asBytes(&p));
+        },
+        .object => |o| {
+            const p: usize = @intFromPtr(o);
+            hasher.update(std.mem.asBytes(&p));
+        },
+    }
+    return hasher.final();
+}
+
 /// An ordinary object or an array (DESIGN_DECISIONS D13).
 pub const Object = struct {
     obj: Obj,
@@ -149,6 +276,8 @@ pub const Object = struct {
         ordinary,
         /// Dense elements 0 … len-1: no holes, ever (D13).
         array: std.ArrayList(Value),
+        /// Insertion-ordered collection storage shared by Map and Set (M14).
+        map: OrderedTable,
     } = .ordinary,
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
@@ -474,6 +603,11 @@ pub const Heap = struct {
                 .array => |elements| if (h.cards.get(o)) |words| {
                     scanDirty(words, elements.items.len, &scan, o, RememberedScan.elements);
                 } else scan.elements(o, 0, elements.items.len),
+                .map => |table| for (table.entries.items) |e| {
+                    if (!e.alive) continue;
+                    visitValue(e.key, &scan, RememberedScan.child);
+                    visitValue(e.value, &scan, RememberedScan.child);
+                },
             }
         }
     }
@@ -692,6 +826,32 @@ pub const Heap = struct {
         return o;
     }
 
+    pub fn newMap(h: *Heap, proto: ?*Object) Error!*Object {
+        const o = try h.newObject(proto);
+        o.kind = .{ .map = .{} };
+        return o;
+    }
+
+    pub fn mapGet(o: *const Object, key: Value) ?Value {
+        return o.kind.map.get(key);
+    }
+
+    pub fn mapHas(o: *const Object, key: Value) bool {
+        return o.kind.map.has(key);
+    }
+
+    pub fn mapSet(h: *Heap, o: *Object, key: Value, val: Value) Error!void {
+        try o.kind.map.set(h, o, key, val);
+    }
+
+    pub fn mapDelete(o: *Object, key: Value) bool {
+        return o.kind.map.delete(key);
+    }
+
+    pub fn mapClear(o: *Object) void {
+        o.kind.map.clear();
+    }
+
     // ---- the store API (GC_DESIGN §7, I3)
     //
     // After construction, every reference written into a heap object goes through one of
@@ -907,7 +1067,7 @@ pub const Heap = struct {
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
         return switch (arr.kind) {
             .array => |*elements| elements,
-            .ordinary => unreachable, // only arrays have elements
+            .ordinary, .map => unreachable, // only arrays have elements
         };
     }
 
@@ -1124,6 +1284,7 @@ pub const Heap = struct {
                         elements.deinit(h.allocator());
                         if (h.cards.fetchRemove(o)) |kv| h.allocator().free(kv.value);
                     },
+                    .map => |*table| table.deinit(h.allocator()),
                 }
                 o.kind = .ordinary;
                 o.proto = null;
@@ -1241,6 +1402,11 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
             switch (o.kind) {
                 .ordinary => {},
                 .array => |elements| for (elements.items) |v| visitValue(v, ctx, visit),
+                .map => |table| for (table.entries.items) |e| {
+                    if (!e.alive) continue;
+                    visitValue(e.key, ctx, visit);
+                    visitValue(e.value, ctx, visit);
+                },
             }
         },
     }

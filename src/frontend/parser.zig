@@ -603,17 +603,13 @@ const Parser = struct {
     /// `f() = 1` and `f()++` are *runtime* ReferenceErrors in node (a web-compatibility
     /// rule), not SyntaxErrors, so for calls we must not claim a SyntaxError.
     fn invalidTarget(p: *Parser, e: *const ast.Expr, msg: []const u8) Error {
-        if (e.data == .call) return p.failAt(.{ .unsupported = .syntax }, e.span.start, e.span.end);
+        if (e.data == .call or e.data == .new_call) return p.failAt(.{ .unsupported = .syntax }, e.span.start, e.span.end);
         return p.failAt(.{ .syntax_error = msg }, e.span.start, e.span.end);
     }
 
-    /// `callee(args)`, `object.name`, `object[key]`, chained. Unlike `++`, these may
-    /// continue on the next line: `x\n(2)` calls x, `x\n[0]` indexes it.
-    fn calls(p: *Parser, callee_in: *const ast.Expr) Error!*const ast.Expr {
-        var callee = callee_in;
-        while (true) switch (p.tok.tag) {
-            .l_paren => callee = try p.callArgs(callee),
-            .dot => {
+    fn memberStep(p: *Parser, callee: *const ast.Expr) Error!?*const ast.Expr {
+        return switch (p.tok.tag) {
+            .dot => blk: {
                 try p.advance();
                 const name = p.tok;
                 // Any identifier or keyword names a property: `o.if`, `o.this`. A literal,
@@ -623,18 +619,55 @@ const Parser = struct {
                     else => p.fail(.{ .unsupported = .syntax }, name),
                 };
                 try p.advance();
-                callee = try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = name.text(p.source()) } } }, callee.depth);
+                break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = name.text(p.source()) } } }, callee.depth);
             },
-            .l_bracket => {
+            .l_bracket => blk: {
                 try p.advance();
                 const k = try p.nested();
                 const close = p.tok;
                 try p.expectAfterExpression(.r_bracket);
-                callee = try p.node(.{ .start = callee.span.start, .end = close.end }, .{ .member = .{ .object = callee, .key = .{ .computed = k } } }, @max(callee.depth, k.depth));
+                break :blk try p.node(.{ .start = callee.span.start, .end = close.end }, .{ .member = .{ .object = callee, .key = .{ .computed = k } } }, @max(callee.depth, k.depth));
             },
-            .question_dot => return p.fail(.{ .unsupported = .syntax }, p.tok), // optional chaining
-            else => return callee,
+            .question_dot => p.fail(.{ .unsupported = .syntax }, p.tok), // optional chaining
+            else => null,
         };
+    }
+
+    fn members(p: *Parser, callee_in: *const ast.Expr) Error!*const ast.Expr {
+        var callee = callee_in;
+        while (try p.memberStep(callee)) |next| callee = next;
+        return callee;
+    }
+
+    /// `callee(args)`, `object.name`, `object[key]`, chained. Unlike `++`, these may
+    /// continue on the next line: `x\n(2)` calls x, `x\n[0]` indexes it.
+    fn calls(p: *Parser, callee_in: *const ast.Expr) Error!*const ast.Expr {
+        var callee = callee_in;
+        while (true) {
+            if (p.tok.tag == .l_paren) {
+                callee = try p.callArgs(callee);
+            } else if (try p.memberStep(callee)) |next| {
+                callee = next;
+            } else return callee;
+        }
+    }
+
+    fn newExpr(p: *Parser) Error!*const ast.Expr {
+        const start = p.tok.start;
+        try p.advance();
+        if (p.depth >= p.limits.max_nesting_depth) return p.limitExceeded(p.tok.start, p.tok.end);
+        p.depth += 1;
+        defer p.depth -= 1;
+        const target = if (p.tok.tag == .identifier and std.mem.eql(u8, p.tok.text(p.source()), "new"))
+            try p.newExpr()
+        else
+            try p.members(try p.primary());
+        if (p.tok.tag == .l_paren) {
+            const call_node = try p.callArgs(target);
+            const c = call_node.data.call;
+            return p.node(.{ .start = start, .end = call_node.span.end }, .{ .new_call = .{ .callee = c.callee, .args = c.args } }, call_node.depth);
+        }
+        return p.node(.{ .start = start, .end = target.span.end }, .{ .new_call = .{ .callee = target, .args = &.{} } }, target.depth);
     }
 
     fn callArgs(p: *Parser, callee: *const ast.Expr) Error!*const ast.Expr {
@@ -802,6 +835,9 @@ const Parser = struct {
                 if (std.mem.eql(u8, name, "function")) {
                     const f = try p.function(.expression);
                     return p.node(f.span, .{ .function = f }, 0);
+                }
+                if (std.mem.eql(u8, name, "new")) {
+                    return p.newExpr();
                 }
                 // Inside a function, `arguments` is the arguments object.
                 if (std.mem.eql(u8, name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);

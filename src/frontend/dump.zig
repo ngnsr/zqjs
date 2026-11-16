@@ -235,8 +235,8 @@ const Dumper = struct {
                 try d.expr(a.value);
                 try w.writeByte(')');
             },
-            .call => |c| {
-                try w.writeAll("(call ");
+            .call, .new_call => |c| {
+                try w.writeAll(if (e.data == .new_call) "(new " else "(call ");
                 try d.expr(c.callee);
                 for (c.args) |arg| {
                     try w.writeByte(' ');

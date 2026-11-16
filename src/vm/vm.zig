@@ -655,6 +655,17 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
                 if (truthy == (op == .jump_if_true)) next = try cache.target(vm);
             },
+            .new_call => {
+                const argc = cache.operand(0);
+                const group = argc + 1;
+                if (group > cache.sp - cache.stack_base) return vm.bug("stack underflow");
+                const base = cache.sp - group;
+                const args = cache.sp - argc;
+                cache.syncSp(vm);
+                const result = try builtins.construct(rt, vm.stack[base], vm.stack[args..cache.sp]);
+                vm.stack[base] = result;
+                cache.sp = base + 1;
+            },
             .call, .call_method => {
                 // Stack: [callee, args…] or [receiver, callee, args…], arguments in source
                 // order. The result replaces the whole group, from `base`.

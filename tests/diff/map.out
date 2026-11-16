@@ -1,0 +1,17 @@
+0 undefined false false
+2 10 2 true false
+2
+true nan-val
+true zero-val
+num str bool null undef
+77
+first second fn-val false
+true false 12
+0 false false false
+2 30 20
+0 0
+42
+TypeError
+TypeError
+TypeError
+TypeError

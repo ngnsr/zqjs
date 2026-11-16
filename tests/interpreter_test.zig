@@ -353,3 +353,12 @@ test "M11.3b: Array/String unimplemented methods, non-matching receivers, and no
     try expectUnsupported("'\\u00e9'.toUpperCase();", "", "('toUpperCase')");
     try expectUnsupported("[1, , 3].slice();", "", "Unsupported(sparse_array)");
 }
+
+test "M14.2: Map unsupported methods, non-Map receivers, and non-Map new() targets" {
+    try expectUnsupported("new Map().forEach;", "", "('forEach')");
+    try expectUnsupported("let o = { get: new Map().get }; o.get('x');", "", "Unsupported(builtin)");
+    try expectUnsupported("new Object();", "", "Unsupported(builtin)");
+    try expectUnsupported("new Array();", "", "Unsupported(builtin)");
+    try expectUnsupported("function F() {} new F();", "", "Unsupported(builtin)");
+    try expectUnsupported("new Map(new Map());", "", "Unsupported(builtin)");
+}

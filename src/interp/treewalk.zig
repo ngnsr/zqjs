@@ -374,6 +374,7 @@ const Interpreter = struct {
             .object => |props| return it.evalObject(props),
             .function => |f| return it.evalFunction(f),
             .call => |c| return it.evalCall(c),
+            .new_call => |nc| return it.evalNewCall(nc),
         }
     }
 
@@ -524,6 +525,19 @@ const Interpreter = struct {
             .closure => |cl| it.call(cl, if (receiver) |r| (if (r == .object) r else null) else null, args),
             else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
         };
+    }
+
+    fn evalNewCall(it: *Interpreter, nc: @FieldType(ast.Expr.Data, "new_call")) Error!Value {
+        const rt = it.rt;
+        const callee = try it.eval(nc.callee);
+        try it.hold(callee);
+        const args = try rt.gpa.alloc(Value, nc.args.len);
+        defer rt.gpa.free(args);
+        for (nc.args, args) |arg, *slot| {
+            slot.* = try it.eval(arg);
+            try it.hold(slot.*);
+        }
+        return builtins.construct(rt, callee, args);
     }
 
     /// A member's key as evaluated but not yet converted.

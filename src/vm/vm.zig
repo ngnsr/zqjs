@@ -188,15 +188,34 @@ pub const Vm = struct {
         return vm.runLoop(true, steps);
     }
 
-    /// Loop-local cache of the active frame's `proto`, `code`, and `pc`.
+    /// Loop-local cache of the active frame's `proto`, `code`, `pc`, and frame-constant
+    /// stack/local bounds (`locals_base` is stored as an index into `vm.locals`, never
+    /// as a slice/pointer, so stack/local growth in `enter()` cannot dangle).
     /// Invariants: `vm.pc` is still written on every committed instruction so helpers,
     /// errors, host calls, GC, and suspended slices always observe an exact PC; any
     /// opcode that pushes or pops a frame (currently `.call`/`.call_method` on a
-    /// closure and `.@"return"`) must refresh all three fields from `vm.proto()`.
+    /// closure and `.@"return"`) must refresh the cache via `FrameCache.fromVm`.
     const FrameCache = struct {
         p: *const Proto,
         code: []const u8,
         pc: u32,
+        stack_base: u32,
+        stack_limit: u32,
+        locals_base: u32,
+
+        fn fromVm(vm: *const Vm, pc: u32) FrameCache {
+            const f = vm.frame();
+            const p = f.proto;
+            const limit = @min(@as(usize, f.stack_base) + p.max_stack, vm.stack.len);
+            return .{
+                .p = p,
+                .code = p.code,
+                .pc = pc,
+                .stack_base = f.stack_base,
+                .stack_limit = @intCast(limit),
+                .locals_base = f.locals_base,
+            };
+        }
 
         inline fn operand(self: FrameCache, i: usize) u32 {
             return bc.readU32(self.code, self.pc + 1 + 4 * i); // instruction bounds checked in execute
@@ -207,6 +226,52 @@ pub const Vm = struct {
             if (t >= self.code.len) return vm.bug("jump target outside the code");
             return t;
         }
+
+        fn slot(self: FrameCache, vm: *Vm, i: u32) Error!*Slot {
+            if (i >= self.p.slot_count) return vm.bug("slot index out of range");
+            return &vm.locals[self.locals_base + i];
+        }
+
+        fn value(self: FrameCache, vm: *Vm, i: u32) Error!*?Value {
+            return switch ((try self.slot(vm, i)).*) {
+                .value => |*v| v,
+                .cell => return vm.bug("value access to a cell slot"),
+            };
+        }
+
+        fn cellAt(self: FrameCache, vm: *Vm, i: u32) Error!*Cell {
+            return vm.cellIn(try self.slot(vm, i));
+        }
+
+        fn ensurePush(self: FrameCache, vm: *const Vm) Error!void {
+            if (vm.sp >= self.stack_limit) return vm.bug("stack overflow");
+        }
+
+        fn ensurePush2(self: FrameCache, vm: *const Vm) Error!void {
+            if (vm.sp + 1 >= self.stack_limit) return vm.bug("stack overflow");
+        }
+
+        fn push(self: FrameCache, vm: *Vm, v: Value) Error!void {
+            try self.ensurePush(vm);
+            const sp = vm.sp;
+            vm.stack[sp] = v;
+            vm.sp = sp + 1;
+        }
+
+        fn peek(self: FrameCache, vm: *const Vm, depth: u32) Error!Value {
+            if (depth >= vm.sp - self.stack_base) return vm.bug("stack underflow");
+            return vm.stack[vm.sp - 1 - depth];
+        }
+
+        fn top(self: FrameCache, vm: *Vm) Error!*Value {
+            if (vm.sp == self.stack_base) return vm.bug("stack underflow");
+            return &vm.stack[vm.sp - 1];
+        }
+
+        fn drop(self: FrameCache, vm: *Vm, n: u32) Error!void {
+            if (n > vm.sp - self.stack_base) return vm.bug("stack underflow");
+            vm.sp -= n;
+        }
     };
 
     inline fn runLoop(vm: *Vm, comptime bounded: bool, steps: u64) Error!State {
@@ -215,8 +280,7 @@ pub const Vm = struct {
         const rt = vm.rt;
         const h = &rt.heap;
         if (!vm.nested) rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
-        const p0 = vm.proto();
-        var cache: FrameCache = .{ .p = p0, .code = p0.code, .pc = vm.pc };
+        var cache = FrameCache.fromVm(vm, vm.pc);
         var n: u64 = 0;
         while (!bounded or n < steps) {
             if (h.collect_requested or h.collect_always) {
@@ -301,8 +365,7 @@ pub const Vm = struct {
             if (!vm.nested) vm.rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
             vm.rt.collect();
         }
-        const p0 = vm.proto();
-        var cache: FrameCache = .{ .p = p0, .code = p0.code, .pc = vm.pc };
+        var cache = FrameCache.fromVm(vm, vm.pc);
         return vm.execute(&cache) catch |e| {
             vm.fault = e;
             return e;
@@ -325,44 +388,44 @@ pub const Vm = struct {
         var next: u32 = pc + op.size();
 
         switch (op) {
-            .push_undefined => try vm.push(.undefined),
-            .push_null => try vm.push(.null),
-            .push_true => try vm.push(.{ .boolean = true }),
-            .push_false => try vm.push(.{ .boolean = false }),
+            .push_undefined => try cache.push(vm, .undefined),
+            .push_null => try cache.push(vm, .null),
+            .push_true => try cache.push(vm, .{ .boolean = true }),
+            .push_false => try cache.push(vm, .{ .boolean = false }),
             .push_const => {
                 const k = cache.operand(0);
                 if (k >= p.consts.len) return vm.bug("constant index out of range");
-                try vm.push(p.consts[k]);
+                try cache.push(vm, p.consts[k]);
             },
 
             .get_local => {
-                const v = (try vm.value(cache.operand(0))).* orelse return vm.tdz(cache.operand(1));
-                try vm.push(v);
+                const v = (try cache.value(vm, cache.operand(0))).* orelse return vm.tdz(cache.operand(1));
+                try cache.push(vm, v);
             },
             .set_local => {
-                const s = try vm.value(cache.operand(0));
+                const s = try cache.value(vm, cache.operand(0));
                 if (s.* == null) return vm.tdz(cache.operand(1));
-                s.* = try vm.peek(0); // the assignment's value stays on the stack
+                s.* = try cache.peek(vm, 0); // the assignment's value stays on the stack
             },
             .init_local => {
-                (try vm.slot(cache.operand(0))).* = .{ .value = try vm.peek(0) };
-                try vm.drop(1);
+                (try cache.slot(vm, cache.operand(0))).* = .{ .value = try cache.peek(vm, 0) };
+                try cache.drop(vm, 1);
             },
-            .clear_local => (try vm.slot(cache.operand(0))).* = .{ .value = null },
+            .clear_local => (try cache.slot(vm, cache.operand(0))).* = .{ .value = null },
             .assign_const => {
-                if ((try vm.value(cache.operand(0))).* == null) return vm.tdz(cache.operand(1));
+                if ((try cache.value(vm, cache.operand(0))).* == null) return vm.tdz(cache.operand(1));
                 return vm.constAssignment();
             },
             .get_global => {
-                try vm.ensurePush();
-                try vm.push(try builtins.global(rt, try vm.name(cache.operand(0))));
+                try cache.ensurePush(vm);
+                try cache.push(vm, try builtins.global(rt, try vm.name(cache.operand(0))));
             },
 
             .new_cell => {
-                (try vm.slot(cache.operand(0))).* = .{ .cell = try rt.heap.newCell(null) };
+                (try cache.slot(vm, cache.operand(0))).* = .{ .cell = try rt.heap.newCell(null) };
             },
             .box_local => {
-                const s = try vm.slot(cache.operand(0));
+                const s = try cache.slot(vm, cache.operand(0));
                 const v: Value = switch (s.*) {
                     .value => |v| v orelse return vm.bug("boxing a slot in the TDZ"),
                     .cell => return vm.bug("boxing a cell"),
@@ -370,35 +433,35 @@ pub const Vm = struct {
                 s.* = .{ .cell = try rt.heap.newCell(v) };
             },
             .fresh_cell => {
-                const s = try vm.slot(cache.operand(0));
+                const s = try cache.slot(vm, cache.operand(0));
                 const old = try vm.cellIn(s);
                 s.* = .{ .cell = try rt.heap.newCell(old.value) };
             },
             .get_cell => {
-                const v = (try vm.cellAt(cache.operand(0))).value orelse return vm.tdz(cache.operand(1));
-                try vm.push(v);
+                const v = (try cache.cellAt(vm, cache.operand(0))).value orelse return vm.tdz(cache.operand(1));
+                try cache.push(vm, v);
             },
             .set_cell => {
-                const c = try vm.cellAt(cache.operand(0));
+                const c = try cache.cellAt(vm, cache.operand(0));
                 if (c.value == null) return vm.tdz(cache.operand(1));
-                rt.heap.storeCell(c, try vm.peek(0));
+                rt.heap.storeCell(c, try cache.peek(vm, 0));
             },
             .init_cell => {
-                rt.heap.storeCell(try vm.cellAt(cache.operand(0)), try vm.peek(0));
-                try vm.drop(1);
+                rt.heap.storeCell(try cache.cellAt(vm, cache.operand(0)), try cache.peek(vm, 0));
+                try cache.drop(vm, 1);
             },
             .assign_const_cell => {
-                if ((try vm.cellAt(cache.operand(0))).value == null) return vm.tdz(cache.operand(1));
+                if ((try cache.cellAt(vm, cache.operand(0))).value == null) return vm.tdz(cache.operand(1));
                 return vm.constAssignment();
             },
             .get_capture => {
                 const v = (try vm.capture(cache.operand(0))).value orelse return vm.tdz(cache.operand(1));
-                try vm.push(v);
+                try cache.push(vm, v);
             },
             .set_capture => {
                 const c = try vm.capture(cache.operand(0));
                 if (c.value == null) return vm.tdz(cache.operand(1));
-                rt.heap.storeCell(c, try vm.peek(0));
+                rt.heap.storeCell(c, try cache.peek(vm, 0));
             },
             .assign_const_capture => {
                 if ((try vm.capture(cache.operand(0))).value == null) return vm.tdz(cache.operand(1));
@@ -409,34 +472,34 @@ pub const Vm = struct {
                 const f = cache.operand(0);
                 if (f >= p.functions.len) return vm.bug("function index out of range");
                 const child = &p.functions[f];
-                try vm.ensurePush();
+                try cache.ensurePush(vm);
                 const c = try rt.heap.newVmClosure(child, child.captures.len);
                 // Fills the captures. These accessors fail only on a bug (a real failure
                 // would leave an incomplete closure on the heap, collected, never reachable).
                 for (child.captures, c.impl.vm.captures) |desc, *dst| dst.* = switch (desc.from) {
-                    .parent_slot => try vm.cellAt(desc.index),
+                    .parent_slot => try cache.cellAt(vm, desc.index),
                     .parent_capture => try vm.capture(desc.index),
                 };
-                try vm.push(.{ .closure = c });
+                try cache.push(vm, .{ .closure = c });
             },
             .push_callee => {
                 const c = vm.frame().closure orelse return vm.bug("push_callee in the script");
-                try vm.push(.{ .closure = c });
+                try cache.push(vm, .{ .closure = c });
             },
 
-            .pop => try vm.drop(1),
-            .dup => try vm.push(try vm.peek(0)),
+            .pop => try cache.drop(vm, 1),
+            .dup => try cache.push(vm, try cache.peek(vm, 0)),
             .dup2 => {
-                const a = try vm.peek(1);
-                const b = try vm.peek(0);
-                try vm.ensurePush2();
-                try vm.push(a);
-                try vm.push(b);
+                const a = try cache.peek(vm, 1);
+                const b = try cache.peek(vm, 0);
+                try cache.ensurePush2(vm);
+                try cache.push(vm, a);
+                try cache.push(vm, b);
             },
             .rot3, .rot4 => {
                 const n: u32 = if (op == .rot3) 3 else 4;
-                const t = try vm.peek(0);
-                _ = try vm.peek(n - 1); // underflow check
+                const t = try cache.peek(vm, 0);
+                _ = try cache.peek(vm, n - 1); // underflow check
                 const at = vm.sp - n;
                 std.mem.copyBackwards(Value, vm.stack[at + 1 .. vm.sp], vm.stack[at .. vm.sp - 1]);
                 vm.stack[at] = t;
@@ -444,74 +507,74 @@ pub const Vm = struct {
 
             // ---- objects: compute first (any of these can fail), then commit
             .new_object => {
-                try vm.ensurePush();
+                try cache.ensurePush(vm);
                 const o = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
-                try vm.push(.{ .object = o });
+                try cache.push(vm, .{ .object = o });
             },
             .new_array => {
                 const n = cache.operand(0);
-                if (n > vm.sp - vm.frame().stack_base) return vm.bug("stack underflow");
+                if (n > vm.sp - cache.stack_base) return vm.bug("stack underflow");
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
                 try rt.heap.appendElements(arr, vm.stack[vm.sp - n .. vm.sp]);
                 vm.sp -= n;
-                try vm.push(.{ .object = arr });
+                try cache.push(vm, .{ .object = arr });
             },
             .define_prop => {
-                const o = try vm.peek(1);
+                const o = try cache.peek(vm, 1);
                 if (o != .object) return vm.bug("define on a non-object");
-                try object.define(rt, o.object, try vm.nameKey(cache.operand(0)), try vm.peek(0));
-                try vm.drop(1);
+                try object.define(rt, o.object, try vm.nameKey(cache.operand(0)), try cache.peek(vm, 0));
+                try cache.drop(vm, 1);
             },
             .define_elem => {
-                const o = try vm.peek(2);
+                const o = try cache.peek(vm, 2);
                 if (o != .object) return vm.bug("define on a non-object");
-                try object.define(rt, o.object, try object.key(rt, try vm.peek(1)), try vm.peek(0));
-                try vm.drop(2);
+                try object.define(rt, o.object, try object.key(rt, try cache.peek(vm, 1)), try cache.peek(vm, 0));
+                try cache.drop(vm, 2);
             },
             .get_prop => {
-                const r = try object.get(rt, try vm.peek(0), try vm.nameKey(cache.operand(0)));
-                (try vm.top()).* = r;
+                const r = try object.get(rt, try cache.peek(vm, 0), try vm.nameKey(cache.operand(0)));
+                (try cache.top(vm)).* = r;
             },
             .get_elem => {
-                const k = try object.key(rt, try vm.peek(0));
-                const r = try object.get(rt, try vm.peek(1), k);
-                try vm.drop(1);
-                (try vm.top()).* = r;
+                const k = try object.key(rt, try cache.peek(vm, 0));
+                const r = try object.get(rt, try cache.peek(vm, 1), k);
+                try cache.drop(vm, 1);
+                (try cache.top(vm)).* = r;
             },
             .set_prop => {
-                const v = try vm.peek(0);
-                try object.set(rt, try vm.peek(1), try vm.nameKey(cache.operand(0)), v);
-                try vm.drop(1);
-                (try vm.top()).* = v;
+                const v = try cache.peek(vm, 0);
+                try object.set(rt, try cache.peek(vm, 1), try vm.nameKey(cache.operand(0)), v);
+                try cache.drop(vm, 1);
+                (try cache.top(vm)).* = v;
             },
             .set_elem => {
-                const v = try vm.peek(0);
-                const k = try object.key(rt, try vm.peek(1)); // after the value: JS's order for `=`
-                try object.set(rt, try vm.peek(2), k, v);
-                try vm.drop(2);
-                (try vm.top()).* = v;
+                const v = try cache.peek(vm, 0);
+                const k = try object.key(rt, try cache.peek(vm, 1)); // after the value: JS's order for `=`
+                try object.set(rt, try cache.peek(vm, 2), k, v);
+                try cache.drop(vm, 2);
+                (try cache.top(vm)).* = v;
             },
             .delete_prop => {
-                const r = try object.delete(rt, try vm.peek(0), try vm.nameKey(cache.operand(0)));
-                (try vm.top()).* = .{ .boolean = r };
+                const r = try object.delete(rt, try cache.peek(vm, 0), try vm.nameKey(cache.operand(0)));
+                (try cache.top(vm)).* = .{ .boolean = r };
             },
             .delete_elem => {
-                const k = try object.key(rt, try vm.peek(0));
-                const r = try object.delete(rt, try vm.peek(1), k);
-                try vm.drop(1);
-                (try vm.top()).* = .{ .boolean = r };
+                const k = try object.key(rt, try cache.peek(vm, 0));
+                const r = try object.delete(rt, try cache.peek(vm, 1), k);
+                try cache.drop(vm, 1);
+                (try cache.top(vm)).* = .{ .boolean = r };
             },
             .push_this => {
-                try vm.ensurePush();
-                try vm.push(vm.frame().this orelse return rt.fail(.sloppy_this));
+                try cache.ensurePush(vm);
+                try cache.push(vm, vm.frame().this orelse return rt.fail(.sloppy_this));
             },
 
             .add, .sub, .mul, .div, .mod, .pow, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in => {
                 // M10.2b/M10.2c: fast path when both operands are already `.number` (`f64`),
                 // matching IEEE-754 / JS semantics for NaN, infinities, and -0. All mixed or
                 // out-of-domain cases fall back to `ops.binary`.
-                const lhs = try vm.peek(1);
-                const rhs = try vm.peek(0);
+                const lhs = try cache.peek(vm, 1);
+                const rhs = try cache.peek(vm, 0);
                 const r: Value = if (lhs == .number and rhs == .number) switch (op) {
                     .add => .{ .number = lhs.number + rhs.number },
                     .sub => .{ .number = lhs.number - rhs.number },
@@ -534,25 +597,25 @@ pub const Vm = struct {
             // be wrong: Zig builds the union in place, so the slot's tag changes *before*
             // f reads the old value through peek (result-location aliasing).
             .neg, .to_number, .not => {
-                const v = try vm.peek(0);
+                const v = try cache.peek(vm, 0);
                 const r: Value = switch (op) {
                     .neg => .{ .number = if (v == .number) -v.number else -(try ops.toNumber(rt, v)) },
                     .to_number => if (v == .number) v else .{ .number = try ops.toNumber(rt, v) },
                     .not => .{ .boolean = !ops.toBoolean(v) },
                     else => unreachable,
                 };
-                (try vm.top()).* = r;
+                (try cache.top(vm)).* = r;
             },
             .inc, .dec => {
-                const t = try vm.top();
+                const t = try cache.top(vm);
                 if (t.* != .number) return vm.bug("inc/dec on a non-number"); // always after to_number
                 t.number += if (op == .inc) 1 else -1;
             },
 
             .jump => next = try cache.target(vm),
             .jump_if_false, .jump_if_true => {
-                const truthy = ops.toBoolean(try vm.peek(0));
-                try vm.drop(1);
+                const truthy = ops.toBoolean(try cache.peek(vm, 0));
+                try cache.drop(vm, 1);
                 if (truthy == (op == .jump_if_true)) next = try cache.target(vm);
             },
             .call, .call_method => {
@@ -560,7 +623,7 @@ pub const Vm = struct {
                 // order. The result replaces the whole group, from `base`.
                 const argc = cache.operand(0);
                 const group = argc + @as(u32, if (op == .call_method) 2 else 1);
-                if (group > vm.sp - vm.frame().stack_base) return vm.bug("stack underflow");
+                if (group > vm.sp - cache.stack_base) return vm.bug("stack underflow");
                 const base = vm.sp - group;
                 const args = vm.sp - argc;
                 const receiver: ?Value = if (op == .call_method) vm.stack[base] else null;
@@ -588,8 +651,7 @@ pub const Vm = struct {
                         // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
                         const this: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
                         try vm.enter(c, base, args, argc, next, this);
-                        const np = vm.proto();
-                        cache.* = .{ .p = np, .code = np.code, .pc = 0 };
+                        cache.* = FrameCache.fromVm(vm, 0);
                         return .running; // pc is the callee's 0
                     },
                     else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
@@ -600,14 +662,14 @@ pub const Vm = struct {
                     // A nested call's body returned (D51): the value is the call's
                     // result, and the call ends here — no caller frame to unwind to.
                     if (vm.nested and vm.frames.items.len == 1) {
-                        const v = try vm.peek(0);
+                        const v = try cache.peek(vm, 0);
                         vm.nested_result = v;
                         vm.halted = true;
                         return .halted;
                     }
                     return vm.bug("return in the script");
                 }
-                const v = try vm.peek(0);
+                const v = try cache.peek(vm, 0);
                 const f = vm.frames.pop().?;
                 if (vm.chain) |cx| cx.call_depth -= 1; // the frame died (D51 #2)
                 vm.locals_len = f.locals_base;
@@ -616,8 +678,7 @@ pub const Vm = struct {
                 vm.stack[vm.sp] = v; // replaces the callee (and receiver); arguments and callee operands are gone
                 vm.sp += 1;
                 vm.pc = f.return_pc;
-                const np = vm.proto();
-                cache.* = .{ .p = np, .code = np.code, .pc = f.return_pc };
+                cache.* = FrameCache.fromVm(vm, f.return_pc);
                 return .running;
             },
             .halt => {
@@ -721,19 +782,6 @@ pub const Vm = struct {
     // result or, on a failed check, poisons the runtime and returns `error.Internal`
     // before anything it guards was touched (D35, D49).
 
-    fn slot(vm: *Vm, i: u32) Error!*Slot {
-        if (i >= vm.proto().slot_count) return vm.bug("slot index out of range");
-        return &vm.locals[vm.frame().locals_base + i];
-    }
-
-    /// A plain (uncaptured) slot's value.
-    fn value(vm: *Vm, i: u32) Error!*?Value {
-        return switch ((try vm.slot(i)).*) {
-            .value => |*v| v,
-            .cell => return vm.bug("value access to a cell slot"),
-        };
-    }
-
     fn cellIn(vm: *const Vm, s: *const Slot) Error!*Cell {
         return switch (s.*) {
             .cell => |c| blk: {
@@ -742,10 +790,6 @@ pub const Vm = struct {
             },
             .value => return vm.bug("cell access to a value slot"),
         };
-    }
-
-    fn cellAt(vm: *Vm, i: u32) Error!*Cell {
-        return vm.cellIn(try vm.slot(i));
     }
 
     fn capture(vm: *const Vm, i: u32) Error!*Cell {
@@ -767,37 +811,6 @@ pub const Vm = struct {
         return object.named(vm.rt, try vm.name(i));
     }
 
-    /// Stack room for one more operand in the current frame.
-    fn ensurePush(vm: *const Vm) Error!void {
-        if (vm.sp >= vm.frame().stack_base + vm.proto().max_stack or vm.sp >= vm.stack.len) return vm.bug("stack overflow");
-    }
-
-    fn ensurePush2(vm: *const Vm) Error!void {
-        if (vm.sp + 1 >= vm.frame().stack_base + vm.proto().max_stack or vm.sp + 1 >= vm.stack.len) return vm.bug("stack overflow");
-    }
-
-    fn push(vm: *Vm, v: Value) Error!void {
-        try vm.ensurePush();
-        vm.stack[vm.sp] = v;
-        vm.sp += 1;
-    }
-
-    /// The value `depth` places below the top (0 = top), within the current frame.
-    fn peek(vm: *const Vm, depth: u32) Error!Value {
-        if (depth >= vm.sp - vm.frame().stack_base) return vm.bug("stack underflow");
-        return vm.stack[vm.sp - 1 - depth];
-    }
-
-    fn top(vm: *Vm) Error!*Value {
-        if (vm.sp == vm.frame().stack_base) return vm.bug("stack underflow");
-        return &vm.stack[vm.sp - 1];
-    }
-
-    fn drop(vm: *Vm, n: u32) Error!void {
-        if (n > vm.sp - vm.frame().stack_base) return vm.bug("stack underflow");
-        vm.sp -= n;
-    }
-
     fn tdz(vm: *Vm, name_index: u32) Error {
         return vm.rt.throw(.ReferenceError, &.{ .{ .ascii = "Cannot access '" }, .{ .ascii = try vm.name(name_index) }, .{ .ascii = "' before initialization" } });
     }
@@ -808,7 +821,8 @@ pub const Vm = struct {
 
     /// A defensive check failed (D49): poison the runtime and return `error.Internal`.
     /// The compare that called this has run; nothing else has changed.
-    fn bug(vm: *const Vm, comptime what: []const u8) Error {
+    noinline fn bug(vm: *const Vm, comptime what: []const u8) Error {
+        @branchHint(.cold);
         return vm.rt.bug(what);
     }
 };

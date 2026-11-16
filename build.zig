@@ -269,6 +269,45 @@ pub fn build(b: *std.Build) void {
     gc_report.addPassthruArgs();
     b.step("gc-report", "GC pauses, allocation rate and GC share for bench/ and bench/gc/ (ReleaseFast)").dependOn(&gc_report.step);
 
+    // Optional Raylib C-ABI embedding demo (M11.4). Kept off `zig build` and `zig build test`
+    // so the core suite never depends on Raylib being installed.
+    const raylib_prefix = b.option([]const u8, "raylib-prefix", "Prefix with include/ and lib/ for Raylib (optional)");
+    const raylib_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    raylib_mod.addIncludePath(b.path("include"));
+    if (raylib_prefix) |prefix| {
+        raylib_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{prefix}) });
+        raylib_mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
+        raylib_mod.linkSystemLibrary("raylib", .{});
+    } else if (target.result.os.tag == .macos) {
+        if (std.Io.Dir.cwd().access(b.graph.io, "/opt/homebrew/opt/raylib/include", .{})) |_| {
+            raylib_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/raylib/include" });
+            raylib_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/raylib/lib" });
+        } else |_| {}
+        raylib_mod.linkSystemLibrary("raylib", .{});
+    } else {
+        raylib_mod.linkSystemLibrary("raylib", .{ .use_pkg_config = .yes });
+    }
+    raylib_mod.addCSourceFile(.{
+        .file = b.path("examples/raylib_c_demo.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    raylib_mod.linkLibrary(libzqjs);
+    const raylib_exe = b.addExecutable(.{
+        .name = "raylib_c_demo",
+        .root_module = raylib_mod,
+    });
+    const run_raylib = b.addRunArtifact(raylib_exe);
+    run_raylib.addPassthruArgs();
+    b.step("raylib-demo", "Build and run the Raylib C-ABI demo (requires Raylib)").dependOn(&run_raylib.step);
+
+    const run_raylib_smoke = b.addRunArtifact(raylib_exe);
+    run_raylib_smoke.addArgs(&.{ "--frames", "60", "--verify-errors" });
+    b.step("raylib-smoke", "Run the headless Raylib C-ABI smoke test (requires Raylib)").dependOn(&run_raylib_smoke.step);
+
     // Generated test data: node (goldens, syntax contract), Python stdlib (pow reference),
     // and the pow tables generated from musl. Dev-time only; `zig build test` needs none.
     const check = b.step("check-goldens", "Check syntax cases against node; generated files up to date");

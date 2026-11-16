@@ -66,6 +66,11 @@ pub fn keyUnits(rt: *Runtime, units: []const u16) Error!Key {
 /// The key named by ASCII source text (`o.name`, `{name: …}`).
 pub fn named(rt: *Runtime, text: []const u8) Error!Key {
     const a = try rt.heap.internAscii(text);
+    return namedAtom(a);
+}
+
+/// Converts a pre-interned atom into a property `Key` without hashing/lookup.
+pub fn namedAtom(a: *String) Key {
     return if (a.atom.?.index) |i| .{ .index = i } else .{ .atom = a };
 }
 

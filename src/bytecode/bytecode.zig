@@ -32,6 +32,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = @import("../runtime/value.zig").Value;
+const heap = @import("../runtime/heap.zig");
 
 pub const Operand = enum { slot, @"const", name, target, argc, function, capture };
 
@@ -295,6 +296,9 @@ pub const Proto = struct {
     consts: []const Value,
     /// Variable names (source text, ASCII), copied out of the source.
     names: []const []const u8,
+    /// Pre-interned weak atoms parallel to `names` (M10.4b); marked by `Vm.markProto`
+    /// while the Proto is rooted, and swept by major GC once the Proto is gone.
+    name_atoms: []const *heap.String = &.{},
     slot_count: u32,
     max_stack: u32,
     /// Parameters occupy slots param_slot … param_slot+param_count-1, filled by the call.
@@ -318,6 +322,7 @@ pub const Proto = struct {
         gpa.free(p.consts);
         for (p.names) |n| gpa.free(n);
         gpa.free(p.names);
+        gpa.free(p.name_atoms);
         p.* = undefined;
     }
 };

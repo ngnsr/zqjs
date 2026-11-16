@@ -149,6 +149,14 @@ const Compiler = struct {
         errdefer gpa.free(consts);
         const names = try gpa.dupe([]const u8, c.names.items);
         errdefer gpa.free(names);
+        const name_atoms = try gpa.alloc(*@import("../runtime/heap.zig").String, c.names.items.len);
+        errdefer gpa.free(name_atoms);
+        for (c.names.items, 0..) |n, i| {
+            name_atoms[i] = c.s.heap.internAscii(n) catch |e| switch (e) {
+                error.LimitExceeded => return c.limit(c.s.heap.limit_hit.?),
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        }
         const functions = try gpa.dupe(Proto, c.functions.items);
         // Ownership of names and nested Protos has moved: don't free them twice.
         c.names.clearRetainingCapacity();
@@ -159,6 +167,7 @@ const Compiler = struct {
             .code = code,
             .consts = consts,
             .names = names,
+            .name_atoms = name_atoms,
             .slot_count = info.slot_count,
             .max_stack = c.max_stack,
             .param_count = info.param_count,

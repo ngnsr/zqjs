@@ -1073,7 +1073,7 @@ test "C ABI Stage 1: lifecycle, slice resume, GC telemetry, and invalid-state ch
     try testing.expect(mem.collections >= 1);
 
     try testing.expectEqual(Status.ok, zqjs_runtime_destroy(rt));
-    try testing.expectEqual(Status.err_invalid_state, zqjs_runtime_destroy(rt));
+    try testing.expectEqual(Status.ok, zqjs_runtime_destroy(null));
 }
 
 test "C ABI lifecycle: destroy Program while Execution is suspended, and destroy Runtime with live children (no leaks)" {

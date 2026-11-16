@@ -395,6 +395,7 @@ pub const Heap = struct {
                     if (str.atom != null) h.atoms.putAssumeCapacityNoClobber(str, {});
                 }
             }
+            if (h.atoms.count() == 0) h.atoms.clearAndFree(h.allocator());
         }
         const before = h.bytes;
         if (h.observer) |o| sweep_start = o.clock(o.ctx);
@@ -664,10 +665,14 @@ pub const Heap = struct {
     pub fn rollback(h: *Heap, m: ?*Obj) void {
         while (h.young != m) {
             const obj = h.young.?; // `m` must be in the list
-            if (obj.kind == .string) std.debug.assert(@as(*String, @fieldParentPtr("obj", obj)).atom == null); // the table would dangle
+            if (obj.kind == .string) {
+                const str: *String = @fieldParentPtr("obj", obj);
+                if (str.atom != null) _ = h.atoms.remove(str);
+            }
             h.young = obj.next;
             h.destroy(obj);
         }
+        if (h.atoms.count() == 0) h.atoms.clearAndFree(h.allocator());
     }
 
     // ---- objects (M7)

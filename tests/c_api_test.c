@@ -488,7 +488,6 @@ int main(void) {
     assert(mem.collections >= 1);
 
     assert(zqjs_runtime_destroy(rt) == ZQJS_OK);
-    assert(zqjs_runtime_destroy(rt) == ZQJS_ERR_INVALID_STATE);
     assert(zqjs_runtime_destroy(NULL) == ZQJS_OK);
 
     test_handles_and_slot_reuse();

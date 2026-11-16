@@ -1025,3 +1025,64 @@ test "M10.2c: integer remainder fast path matches JS semantics for signs, -0, Na
         "1 -1 1 0 0 NaN 0 NaN\n";
     try testing.expectEqualStrings(expected, out.buffered());
 }
+
+test "M10.4b: Proto.name_atoms stay rooted across major GC (parent + nested), reuse on recompile, and sweep after destroy" {
+    const rt = try api.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+
+    // Obtain internal runtime via a temporary handle to inspect weak `h.atoms` directly.
+    const probe = try rt.newBoolean(false);
+    const irt: *zqjs.Runtime = @ptrCast(@alignCast(probe.owner));
+    probe.release();
+
+    const base_atoms = irt.heap.atoms.count();
+    const base_bytes = rt.memory().bytes;
+
+    // 1. Pre-existing atom before compile; failed compile reuses it and rolls back new atoms.
+    const kept_atom = try irt.heap.internAscii("preExistingAtom");
+    const pre_fail_atoms = irt.heap.atoms.count();
+    const pre_fail_bytes = rt.memory().bytes;
+    var diag: api.Diagnostic = .{};
+    try testing.expectError(error.Source, rt.compile("bad.js", "let o = { preExistingAtom: 1, brandNewFailAtom: ; };", &diag));
+    try testing.expectEqual(pre_fail_atoms, irt.heap.atoms.count());
+    try testing.expectEqual(pre_fail_bytes, rt.memory().bytes);
+    try testing.expect(irt.heap.atoms.contains(kept_atom));
+
+    // Sweep the unrooted `kept_atom` before measuring `p1`'s Proto-rooted atoms.
+    rt.collectGarbage();
+    try testing.expectEqual(base_atoms, irt.heap.atoms.count());
+
+    // 2. Compile parent + nested function with unique property names; verify major GC keeps them rooted.
+    const src =
+        \\function makeBox() {
+        \\  return { nestedPropAlpha: 10, nestedPropBeta: 20 };
+        \\}
+        \\let outerObj = { outerPropGamma: 30 };
+        \\let res = makeBox().nestedPropAlpha + outerObj.outerPropGamma;
+    ;
+    const p1 = try rt.compile("atoms1.js", src, null);
+    const after_p1_atoms = irt.heap.atoms.count();
+    try testing.expect(after_p1_atoms > base_atoms);
+
+    // Major GC while Program is live keeps parent + nested Proto atoms alive.
+    rt.collectGarbage();
+    try testing.expectEqual(after_p1_atoms, irt.heap.atoms.count());
+
+    // 3. Repeated compilation of identical source reuses existing atoms without growing `h.atoms`.
+    const p2 = try rt.compile("atoms2.js", src, null);
+    try testing.expectEqual(after_p1_atoms, irt.heap.atoms.count());
+
+    // 4. Start an Execution, destroy both Programs, verify suspended Execution keeps Proto atoms alive across major GC.
+    const ex = try rt.start(p1);
+    p1.destroy();
+    p2.destroy();
+    try testing.expectEqual(api.Status.suspended, try ex.@"resume"(1, null));
+    rt.collectGarbage();
+    try testing.expectEqual(after_p1_atoms, irt.heap.atoms.count());
+
+    // 5. Destroy Execution and run major GC: weak atom table sweeps all Proto-only atoms back to baseline.
+    ex.destroy();
+    rt.collectGarbage();
+    try testing.expectEqual(base_atoms, irt.heap.atoms.count());
+    try testing.expectEqual(base_bytes, rt.memory().bytes);
+}

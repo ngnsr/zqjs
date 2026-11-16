@@ -244,6 +244,7 @@ pub const Vm = struct {
 
     fn markProto(h: *heap.Heap, p: *const Proto) void {
         for (p.consts) |k| h.markValue(k);
+        for (p.name_atoms) |a| h.markObj(&a.obj);
         for (p.functions) |*f| markProto(h, f); // nesting depth is bounded by the AST's
     }
 
@@ -431,7 +432,7 @@ pub const Vm = struct {
             .define_prop => {
                 const o = try vm.peek(1);
                 if (o != .object) return vm.bug("define on a non-object");
-                try object.define(rt, o.object, try object.named(rt, try vm.name(vm.operand(0))), try vm.peek(0));
+                try object.define(rt, o.object, try vm.nameKey(vm.operand(0)), try vm.peek(0));
                 try vm.drop(1);
             },
             .define_elem => {
@@ -441,7 +442,7 @@ pub const Vm = struct {
                 try vm.drop(2);
             },
             .get_prop => {
-                const r = try object.get(rt, try vm.peek(0), try object.named(rt, try vm.name(vm.operand(0))));
+                const r = try object.get(rt, try vm.peek(0), try vm.nameKey(vm.operand(0)));
                 (try vm.top()).* = r;
             },
             .get_elem => {
@@ -452,7 +453,7 @@ pub const Vm = struct {
             },
             .set_prop => {
                 const v = try vm.peek(0);
-                try object.set(rt, try vm.peek(1), try object.named(rt, try vm.name(vm.operand(0))), v);
+                try object.set(rt, try vm.peek(1), try vm.nameKey(vm.operand(0)), v);
                 try vm.drop(1);
                 (try vm.top()).* = v;
             },
@@ -464,7 +465,7 @@ pub const Vm = struct {
                 (try vm.top()).* = v;
             },
             .delete_prop => {
-                const r = try object.delete(rt, try vm.peek(0), try object.named(rt, try vm.name(vm.operand(0))));
+                const r = try object.delete(rt, try vm.peek(0), try vm.nameKey(vm.operand(0)));
                 (try vm.top()).* = .{ .boolean = r };
             },
             .delete_elem => {
@@ -736,6 +737,12 @@ pub const Vm = struct {
     fn name(vm: *const Vm, i: u32) Error![]const u8 {
         if (i >= vm.proto().names.len) return vm.bug("name index out of range");
         return vm.proto().names[i];
+    }
+
+    fn nameKey(vm: *const Vm, i: u32) Error!object.Key {
+        const p = vm.proto();
+        if (i < p.name_atoms.len) return object.namedAtom(p.name_atoms[i]);
+        return object.named(vm.rt, try vm.name(i));
     }
 
     /// Stack room for one more operand in the current frame.

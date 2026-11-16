@@ -139,6 +139,26 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(c_test_exe).step);
 
+    // M13: Multi-plugin cooperative C11 host (zero external dependencies)
+    const plugin_host_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    plugin_host_mod.addIncludePath(b.path("include"));
+    plugin_host_mod.addCSourceFile(.{
+        .file = b.path("examples/plugin_host.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    plugin_host_mod.linkLibrary(libzqjs);
+    const plugin_host_exe = b.addExecutable(.{
+        .name = "plugin_host",
+        .root_module = plugin_host_mod,
+    });
+    const run_plugin_host = b.addRunArtifact(plugin_host_exe);
+    test_step.dependOn(&run_plugin_host.step);
+    b.step("plugin-host", "Build and run the M13 multi-plugin C11 host").dependOn(&run_plugin_host.step);
+
     // The broken builds (M8.1): for each heap.Mutation, the `mutation:` tests under
     // -Dgc-stress, which pass only if the verifier catches that mutant.
     const mutants = b.step("gc-mutants", "Prove the heap verifier catches each deliberately broken GC piece");

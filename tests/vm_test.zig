@@ -1086,3 +1086,38 @@ test "M10.4b: Proto.name_atoms stay rooted across major GC (parent + nested), re
     try testing.expectEqual(base_atoms, irt.heap.atoms.count());
     try testing.expectEqual(base_bytes, rt.memory().bytes);
 }
+
+test "M10.5b: initLocals handles zero params, missing/extra args, TDZ, and extra locals" {
+    var out_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\function zero() { let a = 1; let b = 2; return a + b; }
+        \\function three(a, b, c) {
+        \\  let x = 10;
+        \\  return '' + a + ',' + b + ',' + c + ',' + x;
+        \\}
+        \\print(zero(7, 8, 9), three(1), three(1, 2, 3, 4, 5));
+    ;
+    const p1 = try rt.compile("init_locals.js", src, null);
+    defer p1.destroy();
+    try rt.run(p1, null);
+    try testing.expectEqualStrings("3 1,undefined,undefined,10 1,2,3,10\n", out.buffered());
+
+    // Parameter + TDZ local before initialization.
+    const tdz_src =
+        \\function tdzCheck(p) {
+        \\  let v = inner;
+        \\  let inner = 99;
+        \\  return p + v;
+        \\}
+        \\tdzCheck(1);
+    ;
+    const p2 = try rt.compile("init_locals_tdz.js", tdz_src, null);
+    defer p2.destroy();
+    var fail: api.Failure = .{};
+    try testing.expectError(error.Thrown, rt.run(p2, &fail));
+    try testing.expect(std.mem.indexOf(u8, fail.message(), "Cannot access 'inner' before initialization") != null);
+}

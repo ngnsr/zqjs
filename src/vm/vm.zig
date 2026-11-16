@@ -715,8 +715,12 @@ pub const Vm = struct {
         } else if (vm.frames.items.len >= limits.max_call_depth) return vm.rt.limit(.call_depth);
         if (vm.reserved + callee.slot_count + callee.max_stack > limits.max_stack_slots) return vm.rt.limit(.stack_slots);
         // 2. capacity (may move the stacks: fine, everything is an index)
-        try vm.frames.ensureUnusedCapacity(vm.rt.gpa, 1);
-        try vm.reserve(callee);
+        if (vm.frames.items.len == vm.frames.capacity) try vm.growFrames();
+        const need_locals = @as(usize, vm.locals_len) + callee.slot_count;
+        const need_stack: usize = vm.stackEnd(callee);
+        if (build_options.stack_stress or need_locals > vm.locals.len or need_stack > vm.stack.len) {
+            try vm.reserve(callee);
+        }
         // 3. the callee's locals, above locals_len (not live yet, so nothing visible changes)
         vm.initLocals(callee, vm.stack[args..][0..argc]);
         // 4. commit
@@ -736,11 +740,17 @@ pub const Vm = struct {
         if (vm.chain) |cx| cx.call_depth += 1; // the frame is live now (D51 #2)
     }
 
+    noinline fn growFrames(vm: *Vm) Error!void {
+        @branchHint(.cold);
+        try vm.frames.ensureUnusedCapacity(vm.rt.gpa, 1);
+    }
+
     /// Makes room for a frame of `p` above the current locals and operands. Grows
     /// geometrically; on failure the old stacks are untouched. With -Dstack-stress, moves
     /// both stacks to fresh allocations every time, so stale indices or slices would
     /// show up at once.
-    fn reserve(vm: *Vm, p: *const Proto) Error!void {
+    noinline fn reserve(vm: *Vm, p: *const Proto) Error!void {
+        @branchHint(.cold);
         const gpa = vm.rt.gpa;
         const need_locals = @as(usize, vm.locals_len) + p.slot_count;
         const need_stack: usize = vm.stackEnd(p);
@@ -772,10 +782,15 @@ pub const Vm = struct {
     /// param_slot…) from `args` (missing ones are undefined, extra ones ignored),
     /// everything else in the TDZ.
     fn initLocals(vm: *Vm, p: *const Proto, args: []const Value) void {
-        for (vm.locals[vm.locals_len..][0..p.slot_count], 0..) |*s, n| {
-            const i = @as(i64, @intCast(n)) - p.param_slot; // parameter number
-            s.* = .{ .value = if (i >= 0 and i < p.param_count) (if (i < args.len) args[@intCast(i)] else .undefined) else null };
-        }
+        std.debug.assert(@as(u64, p.param_slot) + p.param_count <= p.slot_count);
+        const dst = vm.locals[vm.locals_len..][0..p.slot_count];
+        const ps = p.param_slot;
+        const pe = ps + p.param_count;
+        const copy_n = @min(p.param_count, args.len);
+        @memset(dst[0..ps], .{ .value = null });
+        for (dst[ps..][0..copy_n], args[0..copy_n]) |*s, arg| s.* = .{ .value = arg };
+        @memset(dst[ps + copy_n .. pe], .{ .value = .undefined });
+        @memset(dst[pe..], .{ .value = null });
     }
 
     // ---- checked accessors (see "Defensive checks"). Every one either returns its

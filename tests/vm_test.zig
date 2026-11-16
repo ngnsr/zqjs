@@ -1121,3 +1121,30 @@ test "M10.5b: initLocals handles zero params, missing/extra args, TDZ, and extra
     try testing.expectError(error.Thrown, rt.run(p2, &fail));
     try testing.expect(std.mem.indexOf(u8, fail.message(), "Cannot access 'inner' before initialization") != null);
 }
+
+test "M10.5c: fastArrayGet matches generic get_elem for -0, bounds, fractions, NaN, Inf, non-numbers, and non-arrays" {
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\let a = [10, 20, 30];
+        \\print(a[0], a[-0], a[2], a[3], a[-1], a[1.5], a[NaN], a[Infinity], a[-Infinity]);
+        \\print(a['1'], a['length'], ({ 0: 99 })[0], 'xyz'[1]);
+    ;
+    const p1 = try rt.compile("fast_array_get.js", src, null);
+    defer p1.destroy();
+    try rt.run(p1, null);
+    try testing.expectEqualStrings(
+        "10 10 30 undefined undefined undefined undefined undefined undefined\n20 3 99 y\n",
+        out.buffered(),
+    );
+
+    const err_src = "let x = null; x[0];";
+    const p2 = try rt.compile("fast_array_get_err.js", err_src, null);
+    defer p2.destroy();
+    var fail: api.Failure = .{};
+    try testing.expectError(error.Thrown, rt.run(p2, &fail));
+    try testing.expect(std.mem.indexOf(u8, fail.message(), "TypeError") != null);
+}

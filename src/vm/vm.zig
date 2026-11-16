@@ -536,8 +536,12 @@ pub const Vm = struct {
                 (try cache.top(vm)).* = r;
             },
             .get_elem => {
-                const k = try object.key(rt, try cache.peek(vm, 0));
-                const r = try object.get(rt, try cache.peek(vm, 1), k);
+                const idx = try cache.peek(vm, 0);
+                const base = try cache.peek(vm, 1);
+                const r: Value = if (fastArrayGet(base, idx)) |v| v else blk: {
+                    const k = try object.key(rt, idx);
+                    break :blk try object.get(rt, base, k);
+                };
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = r;
             },
@@ -841,6 +845,19 @@ pub const Vm = struct {
         return vm.rt.bug(what);
     }
 };
+
+fn fastArrayGet(base: Value, idx: Value) ?Value {
+    if (base != .object or idx != .number) return null;
+    const o = base.object;
+    if (o.kind != .array) return null;
+    const n = idx.number;
+    const elems = o.kind.array.items;
+    if (!(n >= 0 and n < @as(f64, @floatFromInt(elems.len)) and @floor(n) == n)) return null;
+    o.obj.checkLive();
+    const r = elems[@intFromFloat(n)];
+    heap.checkValue(r);
+    return r;
+}
 
 fn binaryOp(op: Op) BinaryOp {
     return switch (op) {

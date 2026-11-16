@@ -128,7 +128,6 @@ fn keyPiece(k: Key, buf: *[10]u8) Piece {
 /// `base[k]` / `base.k`.
 pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
     heap_mod.checkValue(base);
-    const r = try builtins.realm(rt);
     switch (base) {
         .undefined, .null => {
             var buf: [10]u8 = undefined;
@@ -139,12 +138,14 @@ pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
                 .index => |i| if (i < s.units.len) return .{ .string = try rt.heap.newString(&.{.{ .utf16 = s.units[i..][0..1] }}) },
                 .atom => if (isNamed(k, "length")) return .{ .number = @floatFromInt(s.units.len) },
             }
+            const r = try builtins.realm(rt);
             return getFrom(rt, r.string_prototype, k);
         },
-        .number => return getFrom(rt, r.number_prototype, k),
-        .boolean => return getFrom(rt, r.boolean_prototype, k),
+        .number => return getFrom(rt, (try builtins.realm(rt)).number_prototype, k),
+        .boolean => return getFrom(rt, (try builtins.realm(rt)).boolean_prototype, k),
         .object => |o| return getFrom(rt, o, k),
         .native => |n| {
+            const r = try builtins.realm(rt);
             const ns = switch (n.namespace orelse return rt.fail(.function_properties)) {
                 .object => r.object_namespace,
                 .array => r.array_namespace,

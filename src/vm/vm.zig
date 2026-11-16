@@ -199,6 +199,7 @@ pub const Vm = struct {
         p: *const Proto,
         code: []const u8,
         pc: u32,
+        sp: u32,
         stack_base: u32,
         stack_limit: u32,
         locals_base: u32,
@@ -211,10 +212,15 @@ pub const Vm = struct {
                 .p = p,
                 .code = p.code,
                 .pc = pc,
+                .sp = vm.sp,
                 .stack_base = f.stack_base,
                 .stack_limit = @intCast(limit),
                 .locals_base = f.locals_base,
             };
+        }
+
+        inline fn syncSp(self: FrameCache, vm: *Vm) void {
+            vm.sp = self.sp;
         }
 
         inline fn operand(self: FrameCache, i: usize) u32 {
@@ -244,33 +250,33 @@ pub const Vm = struct {
         }
 
         fn ensurePush(self: FrameCache, vm: *const Vm) Error!void {
-            if (vm.sp >= self.stack_limit) return vm.bug("stack overflow");
+            if (self.sp >= self.stack_limit) return vm.bug("stack overflow");
         }
 
         fn ensurePush2(self: FrameCache, vm: *const Vm) Error!void {
-            if (vm.sp + 1 >= self.stack_limit) return vm.bug("stack overflow");
+            if (self.sp + 1 >= self.stack_limit) return vm.bug("stack overflow");
         }
 
-        fn push(self: FrameCache, vm: *Vm, v: Value) Error!void {
+        fn push(self: *FrameCache, vm: *Vm, v: Value) Error!void {
             try self.ensurePush(vm);
-            const sp = vm.sp;
+            const sp = self.sp;
             vm.stack[sp] = v;
-            vm.sp = sp + 1;
+            self.sp = sp + 1;
         }
 
         fn peek(self: FrameCache, vm: *const Vm, depth: u32) Error!Value {
-            if (depth >= vm.sp - self.stack_base) return vm.bug("stack underflow");
-            return vm.stack[vm.sp - 1 - depth];
+            if (depth >= self.sp - self.stack_base) return vm.bug("stack underflow");
+            return vm.stack[self.sp - 1 - depth];
         }
 
         fn top(self: FrameCache, vm: *Vm) Error!*Value {
-            if (vm.sp == self.stack_base) return vm.bug("stack underflow");
-            return &vm.stack[vm.sp - 1];
+            if (self.sp == self.stack_base) return vm.bug("stack underflow");
+            return &vm.stack[self.sp - 1];
         }
 
-        fn drop(self: FrameCache, vm: *Vm, n: u32) Error!void {
-            if (n > vm.sp - self.stack_base) return vm.bug("stack underflow");
-            vm.sp -= n;
+        fn drop(self: *FrameCache, vm: *const Vm, n: u32) Error!void {
+            if (n > self.sp - self.stack_base) return vm.bug("stack underflow");
+            self.sp -= n;
         }
     };
 
@@ -284,15 +290,21 @@ pub const Vm = struct {
         var n: u64 = 0;
         while (!bounded or n < steps) {
             if (h.collect_requested or h.collect_always) {
+                cache.syncSp(vm);
                 rt.collect();
             }
             const state = @call(.always_inline, execute, .{ vm, &cache }) catch |e| {
+                cache.syncSp(vm);
                 vm.fault = e;
                 return e;
             };
-            if (state == .halted) return .halted;
+            if (state == .halted) {
+                cache.syncSp(vm);
+                return .halted;
+            }
             if (bounded) n += 1;
         }
+        cache.syncSp(vm);
         return if (vm.halted) .halted else .running;
     }
 
@@ -366,10 +378,13 @@ pub const Vm = struct {
             vm.rt.collect();
         }
         var cache = FrameCache.fromVm(vm, vm.pc);
-        return vm.execute(&cache) catch |e| {
+        const state = vm.execute(&cache) catch |e| {
+            cache.syncSp(vm);
             vm.fault = e;
             return e;
         };
+        cache.syncSp(vm);
+        return state;
     }
 
     /// One instruction. Every path either fails before changing VM state, or commits
@@ -500,8 +515,8 @@ pub const Vm = struct {
                 const n: u32 = if (op == .rot3) 3 else 4;
                 const t = try cache.peek(vm, 0);
                 _ = try cache.peek(vm, n - 1); // underflow check
-                const at = vm.sp - n;
-                std.mem.copyBackwards(Value, vm.stack[at + 1 .. vm.sp], vm.stack[at .. vm.sp - 1]);
+                const at = cache.sp - n;
+                std.mem.copyBackwards(Value, vm.stack[at + 1 .. cache.sp], vm.stack[at .. cache.sp - 1]);
                 vm.stack[at] = t;
             },
 
@@ -513,10 +528,10 @@ pub const Vm = struct {
             },
             .new_array => {
                 const n = cache.operand(0);
-                if (n > vm.sp - cache.stack_base) return vm.bug("stack underflow");
+                if (n > cache.sp - cache.stack_base) return vm.bug("stack underflow");
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
-                try rt.heap.appendElements(arr, vm.stack[vm.sp - n .. vm.sp]);
-                vm.sp -= n;
+                try rt.heap.appendElements(arr, vm.stack[cache.sp - n .. cache.sp]);
+                cache.sp -= n;
                 try cache.push(vm, .{ .object = arr });
             },
             .define_prop => {
@@ -594,8 +609,8 @@ pub const Vm = struct {
                     .pow, .in => try ops.binary(rt, binaryOp(op), lhs, rhs),
                     else => unreachable,
                 } else try ops.binary(rt, binaryOp(op), lhs, rhs);
-                vm.sp -= 1;
-                vm.stack[vm.sp - 1] = r;
+                cache.sp -= 1;
+                vm.stack[cache.sp - 1] = r;
             },
             // Compute into a local, then store. `top().* = .{ .number = f(peek(0)) }` would
             // be wrong: Zig builds the union in place, so the slot's tag changes *before*
@@ -627,9 +642,9 @@ pub const Vm = struct {
                 // order. The result replaces the whole group, from `base`.
                 const argc = cache.operand(0);
                 const group = argc + @as(u32, if (op == .call_method) 2 else 1);
-                if (group > vm.sp - cache.stack_base) return vm.bug("stack underflow");
-                const base = vm.sp - group;
-                const args = vm.sp - argc;
+                if (group > cache.sp - cache.stack_base) return vm.bug("stack underflow");
+                const base = cache.sp - group;
+                const args = cache.sp - argc;
                 const receiver: ?Value = if (op == .call_method) vm.stack[base] else null;
                 switch (vm.stack[args - 1]) {
                     // A built-in native *borrows* the argument slice: valid only during the call; it
@@ -637,11 +652,12 @@ pub const Vm = struct {
                     // (D53) receives temporary handles owned by its native-call record. If either
                     // fails, nothing has been popped: the stack is still a valid pre-call state (D35).
                     .native => |n| {
+                        cache.syncSp(vm);
                         const this_obj: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
                         const result = (if (n.host) |h|
-                            h.call(rt, h.ctx, this_obj, vm.stack[args..vm.sp])
+                            h.call(rt, h.ctx, this_obj, vm.stack[args..cache.sp])
                         else
-                            n.call(rt, receiver orelse .undefined, vm.stack[args..vm.sp])) catch |e| {
+                            n.call(rt, receiver orelse .undefined, vm.stack[args..cache.sp])) catch |e| {
                             if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
                                 return rt.limit(.steps);
                             return e;
@@ -649,11 +665,12 @@ pub const Vm = struct {
                         if (rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
                             return rt.limit(.steps);
                         vm.stack[base] = result;
-                        vm.sp = base + 1;
+                        cache.sp = base + 1;
                     },
                     .closure => |c| {
                         // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
                         const this: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
+                        cache.syncSp(vm);
                         try vm.enter(c, base, args, argc, next, this);
                         cache.* = FrameCache.fromVm(vm, 0);
                         return .running; // pc is the callee's 0
@@ -667,6 +684,7 @@ pub const Vm = struct {
                     // result, and the call ends here — no caller frame to unwind to.
                     if (vm.nested and vm.frames.items.len == 1) {
                         const v = try cache.peek(vm, 0);
+                        cache.syncSp(vm);
                         vm.nested_result = v;
                         vm.halted = true;
                         return .halted;
@@ -687,7 +705,7 @@ pub const Vm = struct {
             },
             .halt => {
                 if (vm.frames.items.len != 1) return vm.bug("halt in a function");
-                if (vm.sp != 0) return vm.bug("stack not empty at halt");
+                if (cache.sp != 0) return vm.bug("stack not empty at halt");
                 vm.halted = true;
                 return .halted; // pc stays on `halt`
             },

@@ -2335,3 +2335,26 @@ test "M9.1: Memory reports minor/major GC counts and last/max pause durations wi
     try testing.expect(after_major.last_gc_pause_ns < prev_max);
     try testing.expectEqual(prev_max, after_major.max_gc_pause_ns);
 }
+
+fn nativeInvokeFirstArg(rt: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+    out.result = rt.call(args[0], null, &.{}, null) catch |e| switch (e) {
+        error.OutputFailed => return error.HostError,
+        else => |err| return err,
+    };
+}
+
+fn checkNestedCallAllocFailOnce(gpa: std.mem.Allocator) !void {
+    const rt = try zqjs.Runtime.create(gpa, .{});
+    defer rt.destroy();
+    try rt.defineGlobalFunction("invoke", &nativeInvokeFirstArg, null);
+    const p = try rt.compile("nested_call_oom.js", "function cb() { return 42; } invoke(cb);", null);
+    defer p.destroy();
+    rt.run(p, null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return e,
+    };
+}
+
+test "nested rt.call allocation failures unwind call_depth without panicking" {
+    try testing.checkAllAllocationFailures(testing.allocator, checkNestedCallAllocFailOnce, .{});
+}

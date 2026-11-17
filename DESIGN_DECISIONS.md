@@ -275,8 +275,11 @@ with `version: 0.17.1`. Upgrades are deliberate commits.
 ## D18. Number literals are validated by our lexer, not by `std.fmt.parseFloat`
 `parseFloat` accepts `1_0`, `inf` and `0x10`, none of which mean the same in JS. The lexer
 accepts only `digits [. digits] [e[+-]digits]` and hands exactly that text to `parseFloat`
-(which rounds correctly). Out-of-subset forms (`017`, `1_000`, `0x10`, `10n`) are
-`Unsupported`. Malformed ones (`1e`, `3in`) are `SyntaxError`.
+(which rounds correctly). Out-of-subset forms (`017`, `10n`) are `Unsupported`. Malformed ones
+(`1e`, `3in`, `1__0`) are `SyntaxError`. M21.1 added `0x`/`0o`/`0b` and `_` separators: the
+lexer still validates the shape; `frontend/number.zig` strips `_` before `parseFloat` and
+converts radix integers itself (`parseFloat` truncates long hex mantissas), sharing that code
+with `Number("0x…")` in `ops.zig`.
 
 ## D19. Memory-safety tooling
 Verified on Zig 0.17.1 / macOS arm64: Zig has **no AddressSanitizer for Zig code**

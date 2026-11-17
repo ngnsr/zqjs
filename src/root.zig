@@ -38,6 +38,7 @@ pub const Native = @import("runtime/value.zig").Native;
 test {
     _ = @import("frontend/token.zig");
     _ = @import("frontend/lexer.zig");
+    _ = @import("frontend/number.zig");
     _ = @import("frontend/diag.zig");
     _ = @import("frontend/parser.zig");
     _ = @import("frontend/resolver.zig");

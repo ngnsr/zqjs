@@ -6,6 +6,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ast = @import("../frontend/ast.zig");
+const number = @import("../frontend/number.zig");
 const heap = @import("heap.zig");
 const Piece = heap.Piece;
 const Value = @import("value.zig").Value;
@@ -67,7 +68,7 @@ pub fn stringToNumber(gpa: Allocator, units_in: []const u16) Allocator.Error!f64
             'b', 'B' => 2,
             else => 0,
         };
-        if (radix != 0) return radixToNumber(s[2..], radix);
+        if (radix != 0) return number.radixToNumber(s[2..], radix, false);
     }
     const negative = s[0] == '-';
     const body = if (s[0] == '-' or s[0] == '+') s[1..] else s;
@@ -96,46 +97,6 @@ fn isDecimalLiteral(s: []const u8) bool {
         if (i == exp_start) return false;
     }
     return i == s.len;
-}
-
-/// Correctly rounded value of an unsigned integer in radix 2, 8 or 16.
-/// These radixes map digits to whole bits, so we stream the bits MSB first, keep the
-/// first 64 significant ones in `top`, count the rest in `shift` and OR them into
-/// `sticky`. Folding `sticky` into the lowest bit of `top` (far below f64's 53-bit
-/// precision) makes `@floatFromInt` round exactly as if it had seen every bit.
-/// (`std.fmt.parseFloat` truncates hex mantissas longer than 64 bits, so it can't be used.)
-fn radixToNumber(digits: []const u8, radix: u8) f64 {
-    if (digits.len == 0) return std.math.nan(f64);
-    const bits_per_digit: u3 = switch (radix) {
-        2 => 1,
-        8 => 3,
-        16 => 4,
-        else => unreachable,
-    };
-    var top: u64 = 0;
-    var top_bits: u7 = 0; // significant bits stored in `top`
-    var shift: usize = 0; // significant bits beyond the first 64
-    var sticky = false;
-    for (digits) |c| {
-        const d = std.fmt.charToDigit(c, radix) catch return std.math.nan(f64);
-        var b: u3 = bits_per_digit;
-        while (b > 0) {
-            b -= 1;
-            const bit: u1 = @intCast((d >> b) & 1);
-            if (top_bits == 0 and bit == 0) continue; // leading zeros
-            if (top_bits < 64) {
-                top = (top << 1) | bit;
-                top_bits += 1;
-            } else {
-                shift += 1;
-                sticky = sticky or bit == 1;
-            }
-        }
-    }
-    if (sticky) top |= 1;
-    const value: f64 = @floatFromInt(top);
-    if (shift > 2048) return if (top == 0) 0 else std.math.inf(f64);
-    return std.math.ldexp(value, @intCast(shift));
 }
 
 fn isJsWhitespace(u: u16) bool {

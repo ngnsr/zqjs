@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 const Lexer = @import("lexer.zig").Lexer;
+const number = @import("number.zig");
 const token = @import("token.zig");
 const Token = token.Token;
 const Tag = token.Tag;
@@ -942,7 +943,7 @@ const Parser = struct {
                     break :blk .{ .string = units };
                 },
                 .number => blk: {
-                    const n = std.fmt.parseFloat(f64, t.text(p.source())) catch unreachable;
+                    const n = try number.literalValue(p.arena, t.text(p.source()));
                     try p.advance();
                     break :blk .{ .number = n };
                 },
@@ -1011,8 +1012,7 @@ const Parser = struct {
         const s = span(t, t);
         switch (t.tag) {
             .number => {
-                // The lexer only lets `[0-9.eE+-]` through, in JS DecimalLiteral shape.
-                const value = std.fmt.parseFloat(f64, t.text(p.source())) catch unreachable;
+                const value = try number.literalValue(p.arena, t.text(p.source()));
                 try p.advance();
                 return p.node(s, .{ .number = value }, 0);
             },

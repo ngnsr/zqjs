@@ -105,36 +105,59 @@ pub const Lexer = struct {
         return newline;
     }
 
-    /// DecimalLiteral only: `digits [. digits] [e [+-] digits]` or `. digits [exponent]`.
+    /// `digits [. digits] [e [+-] digits]`, `. digits [exponent]`, or `0x`/`0o`/`0b` digits;
+    /// `_` separators only between two digits. The value comes from `number.zig`.
     fn number(l: *Lexer) Error!void {
         const start = l.pos;
         if (l.source[start] == '0') {
-            switch (l.peekAt(start + 1)) {
-                'x', 'X', 'o', 'O', 'b', 'B' => return l.fail(.{ .unsupported = .non_decimal_literal }, start, start + 2),
+            const radix: u8 = switch (l.peekAt(start + 1)) {
+                'x', 'X' => 16,
+                'o', 'O' => 8,
+                'b', 'B' => 2,
                 '0'...'9' => return l.fail(.{ .unsupported = .legacy_octal }, start, start + 2),
-                else => {},
+                '_' => return l.fail(.{ .syntax_error = "numeric separator after a leading 0" }, start + 1, start + 2),
+                else => 10,
+            };
+            if (radix != 10) {
+                l.pos = start + 2;
+                if (!isRadixDigit(l.peekAt(l.pos), radix)) return l.fail(.{ .syntax_error = "missing digits after the radix prefix" }, start, l.pos);
+                try l.digits(radix);
+                return l.numberEnd(start);
             }
         }
-        l.digits();
+        try l.digits(10);
         if (l.peekAt(l.pos) == '.') {
             l.pos += 1;
-            l.digits();
+            try l.digits(10);
         }
         if (l.peekAt(l.pos) == 'e' or l.peekAt(l.pos) == 'E') {
             l.pos += 1;
             if (l.peekAt(l.pos) == '+' or l.peekAt(l.pos) == '-') l.pos += 1;
-            if (l.peekAt(l.pos) == '_') return l.fail(.{ .unsupported = .numeric_separator }, l.pos, l.pos + 1);
             if (!isDigit(l.peekAt(l.pos))) return l.fail(.{ .syntax_error = "missing digits in exponent" }, start, l.pos);
-            l.digits();
+            try l.digits(10);
         }
+        return l.numberEnd(start);
+    }
+
+    fn numberEnd(l: *Lexer, start: usize) Error!void {
         const after = l.peekAt(l.pos);
-        if (after == '_') return l.fail(.{ .unsupported = .numeric_separator }, l.pos, l.pos + 1);
         if (after == 'n') return l.fail(.{ .unsupported = .bigint }, start, l.pos + 1);
         if (isIdentPart(after)) return l.fail(.{ .syntax_error = "identifier or digit directly after a number" }, l.pos, l.pos + 1);
     }
 
-    fn digits(l: *Lexer) void {
-        while (isDigit(l.peekAt(l.pos))) l.pos += 1;
+    /// A run of digits, possibly empty; each `_` must sit between two digits.
+    fn digits(l: *Lexer, radix: u8) Error!void {
+        while (true) {
+            const c = l.peekAt(l.pos);
+            if (isRadixDigit(c, radix)) {
+                l.pos += 1;
+            } else if (c == '_') {
+                const prev_digit = l.pos > 0 and isRadixDigit(l.source[l.pos - 1], radix);
+                if (!prev_digit or !isRadixDigit(l.peekAt(l.pos + 1), radix))
+                    return l.fail(.{ .syntax_error = "numeric separator must be between digits" }, l.pos, l.pos + 1);
+                l.pos += 1;
+            } else return;
+        }
     }
 
     /// Finds the closing quote. An escaped character is skipped without interpretation;
@@ -207,6 +230,11 @@ fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
 
+fn isRadixDigit(c: u8, radix: u8) bool {
+    const d = std.fmt.charToDigit(c, radix) catch return false;
+    return d < radix;
+}
+
 fn isIdentStart(c: u8) bool {
     return std.ascii.isAlphabetic(c) or c == '_' or c == '$';
 }
@@ -253,10 +281,20 @@ test "numbers" {
     try expectTags("1..x", &.{ .number, .dot, .identifier });
     try expectFailure("017", error.Unsupported, .{ .unsupported = .legacy_octal });
     try expectFailure("09", error.Unsupported, .{ .unsupported = .legacy_octal });
-    try expectFailure("0x10", error.Unsupported, .{ .unsupported = .non_decimal_literal });
-    try expectFailure("1_000", error.Unsupported, .{ .unsupported = .numeric_separator });
-    try expectFailure("1e_1", error.Unsupported, .{ .unsupported = .numeric_separator });
+    try expectTags("0x1F 0XaB 0o17 0O7 0b101 0B1 1_000 1_0.0_1e1_0 0x1_f 0b1_0 0.0_1", &.{ .number, .number, .number, .number, .number, .number, .number, .number, .number, .number, .number });
+    const sep = "numeric separator must be between digits";
+    for ([_][]const u8{ "1__0", "1_", "1_.5", "1._5", "1e1_", "0x1_", "0x1__2", "1_e5" }) |s|
+        try expectFailure(s, error.SyntaxError, .{ .syntax_error = sep });
+    try expectFailure("1e_1", error.SyntaxError, .{ .syntax_error = "missing digits in exponent" });
+    try expectFailure("0_1", error.SyntaxError, .{ .syntax_error = "numeric separator after a leading 0" });
+    try expectFailure("0x_1", error.SyntaxError, .{ .syntax_error = "missing digits after the radix prefix" });
+    try expectFailure("0x", error.SyntaxError, .{ .syntax_error = "missing digits after the radix prefix" });
+    try expectFailure("0b2", error.SyntaxError, .{ .syntax_error = "missing digits after the radix prefix" });
+    try expectFailure("0b12", error.SyntaxError, .{ .syntax_error = "identifier or digit directly after a number" });
+    try expectFailure("0o8", error.SyntaxError, .{ .syntax_error = "missing digits after the radix prefix" });
+    try expectFailure("0x1g", error.SyntaxError, .{ .syntax_error = "identifier or digit directly after a number" });
     try expectFailure("10n", error.Unsupported, .{ .unsupported = .bigint });
+    try expectFailure("0x10n", error.Unsupported, .{ .unsupported = .bigint });
     try expectFailure("1e", error.SyntaxError, .{ .syntax_error = "missing digits in exponent" });
     try expectFailure("1e+", error.SyntaxError, .{ .syntax_error = "missing digits in exponent" });
     try expectFailure("3in", error.SyntaxError, .{ .syntax_error = "identifier or digit directly after a number" });

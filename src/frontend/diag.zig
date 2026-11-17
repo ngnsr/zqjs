@@ -11,8 +11,6 @@ pub const Feature = enum {
     legacy_octal,
     non_ascii_source,
     invalid_utf8,
-    numeric_separator,
-    non_decimal_literal,
     bigint,
     labels,
     global_assignment,
@@ -53,8 +51,6 @@ pub const Feature = enum {
             .legacy_octal => "legacy octal literal or escape",
             .non_ascii_source => "non-ASCII character outside a string or comment",
             .invalid_utf8 => "source is not valid UTF-8",
-            .numeric_separator => "numeric separators ('_')",
-            .non_decimal_literal => "hexadecimal, octal and binary literals",
             .bigint => "BigInt literals",
             .syntax => "this syntax is not part of ZQJS yet",
         };

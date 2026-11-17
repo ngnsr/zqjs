@@ -65,8 +65,6 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `legacy_octal` | restriction | `017`, `09`, `'\1'`, `'\08'` | sloppy-mode legacy syntax |
 | `non_ascii_source` | restriction | `é = 1`, NBSP outside strings | identifiers and whitespace are ASCII only. Non-ASCII is fine inside strings and comments |
 | `invalid_utf8` | restriction | malformed bytes in the source file | source must be valid UTF-8 |
-| `numeric_separator` | not yet | `1_000` | |
-| `non_decimal_literal` | not yet | `0x10`, `0o7`, `0b1` | |
 | `bigint` | not yet | `10n` | |
 | `global_assignment` | restriction (revisit at M9) | `y = 1`, `undefined = 1`, `y++` with no declaration of `y` | sloppy JS silently creates (or ignores writes to) globals; ZQJS has no writable globals yet |
 | `function_to_string` | not yet | `print(print)`, `'' + f`, `f < 'a'`, `f < g` | JS converts a function to its source text; ZQJS has none to show or compare |
@@ -90,11 +88,14 @@ Each `Unsupported` diagnostic names one of these stable ids.
 - **Source**: UTF-8 bytes, at most `Limits.max_source_bytes` (default 16 MiB).
 - **Whitespace**: space, tab, `\v`, `\f`, `\n`, `\r`.
 - **Comments**: `// …` to end of line; `/* … */` (unterminated → SyntaxError).
-- **Numbers**: `DecimalDigits [. DecimalDigits?] [ (e|E) [+|-] DecimalDigits ]` or
-  `. DecimalDigits [exponent]`. Leading `0` followed by a digit → `Unsupported(legacy_octal)`.
-  `e` without digits → SyntaxError. A number immediately followed by an identifier character or
-  digit → SyntaxError (`3in`, `1.5.3`), except `n` (`bigint`) and `_` (`numeric_separator`).
-  Values are IEEE-754 doubles, correctly rounded; overflow gives `Infinity`.
+- **Numbers**: `DecimalDigits [. DecimalDigits?] [ (e|E) [+|-] DecimalDigits ]`,
+  `. DecimalDigits [exponent]`, or `0x`/`0X` hex, `0o`/`0O` octal and `0b`/`0B` binary integers
+  (M21.1). `_` separators are allowed only between two digits (`1_000`, `0xff_ff`, `1e1_0`;
+  `1__0`, `1_`, `1_.5`, `0_1`, `0x_1` → SyntaxError). Leading `0` followed by a digit →
+  `Unsupported(legacy_octal)` (a SyntaxError in strict-mode JS too). `e` or a radix prefix
+  without digits → SyntaxError. A number immediately followed by an identifier character or
+  digit → SyntaxError (`3in`, `1.5.3`, `0b12`), except `n` (`bigint`). Values are IEEE-754
+  doubles, correctly rounded (radix integers longer than 53 bits too); overflow gives `Infinity`.
 - **Strings**: `'…'` or `"…"`, decoded to **UTF-16 code units**. A raw line feed or carriage
   return inside the literal → SyntaxError. Escapes:
 

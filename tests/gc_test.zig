@@ -1642,3 +1642,30 @@ test "M18.2: Promise.then/catch chains survive minor and major GC during microta
         try testing.expectEqualStrings("50\n", r.out);
     }
 }
+
+test "M19: Promise.all and finally survive GC stress and explicit collections" {
+    const src =
+        \\let total = 0;
+        \\const resolvers = [];
+        \\const promises = [];
+        \\for (let i = 0; i < 60; i++) {
+        \\    promises.push(new Promise(function (res) { resolvers.push(res); }));
+        \\}
+        \\Promise.all(promises).finally(function () {
+        \\    for (let j = 0; j < 200; j++) { let tmp = { j: j }; }
+        \\    return Promise.resolve("ignored");
+        \\}).then(function (vals) {
+        \\    for (let i = 0; i < vals.length; i++) total += vals[i].n;
+        \\    print(total);
+        \\});
+        \\for (let i = 0; i < resolvers.length; i++) {
+        \\    for (let j = 0; j < 50; j++) { let tmp = { j: j }; }
+        \\    resolvers[i]({ n: i + 1 });
+        \\}
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("1830\n", r.out);
+    }
+}

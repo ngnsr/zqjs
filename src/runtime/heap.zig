@@ -107,6 +107,8 @@ pub const Closure = struct {
         tree: struct { func: *const anyopaque, env: ?*Env },
         /// Native Promise resolve/reject capability (M18).
         promise_cap: struct { promise: *Object, is_reject: bool },
+        /// Native closure with a bound environment object (M19).
+        native_closure: struct { func: *const anyopaque, env: *Object },
     },
 };
 
@@ -1288,6 +1290,15 @@ pub const Heap = struct {
         return c;
     }
 
+    pub fn newNativeClosure(h: *Heap, func: *const anyopaque, env: *Object) Error!*Closure {
+        const charge = try h.reserve(@sizeOf(Closure), 0, 2);
+        errdefer h.bytes -= charge;
+        const c = try h.gpa.create(Closure);
+        c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .native_closure = .{ .func = func, .env = env } } };
+        h.young = &c.obj;
+        return c;
+    }
+
     /// An environment record with `len` bindings, all in the TDZ.
     pub fn newEnv(h: *Heap, parent: ?*Env, scope: u32, len: usize) Error!*Env {
         const payload = std.math.mul(usize, len, @sizeOf(?Value)) catch return h.exceeded(.heap_bytes);
@@ -1331,7 +1342,7 @@ pub const Heap = struct {
             .cell => @sizeOf(Cell) + per_allocation_overhead,
             .closure => switch (@as(*const Closure, @alignCast(@fieldParentPtr("obj", obj))).impl) {
                 .vm => |v| @sizeOf(Closure) + v.captures.len * @sizeOf(*Cell) + 2 * per_allocation_overhead,
-                .tree, .promise_cap => @sizeOf(Closure) + 2 * per_allocation_overhead,
+                .tree, .promise_cap, .native_closure => @sizeOf(Closure) + 2 * per_allocation_overhead,
             },
             .env => @sizeOf(Env) + @as(*const Env, @alignCast(@fieldParentPtr("obj", obj))).values.len * @sizeOf(?Value) + 2 * per_allocation_overhead,
             .object => @sizeOf(Object) + per_allocation_overhead,
@@ -1359,7 +1370,7 @@ pub const Heap = struct {
                         v.captures = &.{};
                     },
                     .tree => |*t| t.env = null,
-                    .promise_cap => {},
+                    .promise_cap, .native_closure => {},
                 }
             },
             .env => {
@@ -1483,6 +1494,7 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                 .vm => |v| for (v.captures) |cell| visit(ctx, &cell.obj),
                 .tree => |t| if (t.env) |e| visit(ctx, &e.obj),
                 .promise_cap => |pc| visit(ctx, &pc.promise.obj),
+                .native_closure => |nc| visit(ctx, &nc.env.obj),
             }
         },
         .env => {

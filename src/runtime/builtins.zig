@@ -127,8 +127,13 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.set_prototype, "forEach", &set_for_each);
     try method(rt, r.promise_prototype, "then", &promise_then);
     try method(rt, r.promise_prototype, "catch", &promise_catch);
+    try method(rt, r.promise_prototype, "finally", &promise_finally);
     try method(rt, r.promise_namespace, "resolve", &promise_resolve_static);
     try method(rt, r.promise_namespace, "reject", &promise_reject_static);
+    try method(rt, r.promise_namespace, "all", &promise_all_static);
+    try method(rt, r.promise_namespace, "allSettled", &promise_all_settled_static);
+    try method(rt, r.promise_namespace, "race", &promise_race_static);
+    try method(rt, r.promise_namespace, "any", &promise_any_static);
     try method(rt, r.iterator_prototype, "next", &iterator_next);
     try registerMath(rt, r.math);
     try method(rt, r.json, "parse", &json.parse_native);
@@ -1083,8 +1088,13 @@ fn setForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 
 const promise_resolve_static: Native = .{ .name = "resolve", .call = promiseResolveStatic };
 const promise_reject_static: Native = .{ .name = "reject", .call = promiseRejectStatic };
+const promise_all_static: Native = .{ .name = "all", .call = promiseAllStatic };
+const promise_all_settled_static: Native = .{ .name = "allSettled", .call = promiseAllSettledStatic };
+const promise_race_static: Native = .{ .name = "race", .call = promiseRaceStatic };
+const promise_any_static: Native = .{ .name = "any", .call = promiseAnyStatic };
 const promise_then: Native = .{ .name = "then", .call = promiseThen };
 const promise_catch: Native = .{ .name = "catch", .call = promiseCatch };
+const promise_finally: Native = .{ .name = "finally", .call = promiseFinally };
 
 fn thisPromise(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
     if (this == .object and this.object.kind == .promise) return this.object;
@@ -1139,6 +1149,68 @@ fn promiseCatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return promiseThen(rt, this, &.{ .undefined, arg(args, 0) });
 }
 
+fn promiseFinally(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const p_obj = try thisPromise(rt, this, "finally");
+    const raw_f = arg(args, 0);
+    if (raw_f != .native and raw_f != .closure) {
+        return promiseThen(rt, this, &.{ raw_f, raw_f });
+    }
+
+    var root_buf = [_]Value{ .{ .object = p_obj }, raw_f, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const env = try rt.heap.newArray(null);
+    root_buf[2] = .{ .object = env };
+    try rt.heap.appendElements(env, &.{raw_f});
+
+    const then_fn = try rt.heap.newNativeClosure(&finallyThenCb, env);
+    root_buf[3] = .{ .closure = then_fn };
+    const catch_fn = try rt.heap.newNativeClosure(&finallyCatchCb, env);
+    root_buf[4] = .{ .closure = catch_fn };
+
+    return promiseThen(rt, .{ .object = p_obj }, &.{ root_buf[3], root_buf[4] });
+}
+
+fn finallyThenCb(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
+    return finallyRunCb(rt, env, arg(args, 0), false);
+}
+
+fn finallyCatchCb(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
+    return finallyRunCb(rt, env, arg(args, 0), true);
+}
+
+fn finallyRunCb(rt: *Runtime, env: *Object, val: Value, is_catch: bool) Error!Value {
+    var root_buf = [_]Value{ .{ .object = env }, val, .undefined, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const on_finally = env.kind.array.items[0];
+    const res = try rt.callCallable(on_finally, .undefined, &.{});
+    root_buf[2] = res;
+    const p_val = try resolveToPromise(rt, res);
+    root_buf[3] = p_val;
+
+    const env2 = try rt.heap.newArray(null);
+    root_buf[4] = .{ .object = env2 };
+    try rt.heap.appendElements(env2, &.{val});
+
+    const cb_ptr: *const anyopaque = if (is_catch) &finallyThrower else &finallyValueThunk;
+    const cb = try rt.heap.newNativeClosure(cb_ptr, env2);
+    root_buf[5] = .{ .closure = cb };
+    return promiseThen(rt, p_val, &.{root_buf[5]});
+}
+
+fn finallyValueThunk(_: *Runtime, env: *Object, _: []const Value) Error!Value {
+    return env.kind.array.items[0];
+}
+
+fn finallyThrower(rt: *Runtime, env: *Object, _: []const Value) Error!Value {
+    return rt.throwValue(env.kind.array.items[0]);
+}
+
 fn promiseWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
     return rt.throw(.TypeError, &.{.{ .ascii = "Constructor Promise requires 'new'" }});
 }
@@ -1168,8 +1240,7 @@ fn promiseConstruct(rt: *Runtime, args: []const Value) Error!Value {
     return p_val;
 }
 
-fn promiseResolveStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
-    const x = arg(args, 0);
+fn resolveToPromise(rt: *Runtime, x: Value) Error!Value {
     const r = try realm(rt);
     if (x == .object and x.object.kind == .promise and x.object.proto == r.promise_prototype) {
         return x;
@@ -1183,12 +1254,238 @@ fn promiseResolveStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value
     return .{ .object = p };
 }
 
+fn promiseResolveStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return resolveToPromise(rt, arg(args, 0));
+}
+
 fn promiseRejectStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const reason = arg(args, 0);
     const r = try realm(rt);
     const p = try rt.heap.newPromise(r.promise_prototype);
     try settlePromiseFromJob(rt, p, true, reason);
     return .{ .object = p };
+}
+
+const CombinatorKind = enum { all, all_settled, race, any };
+
+fn promiseAllStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return promiseCombinator(rt, .all, arg(args, 0));
+}
+
+fn promiseAllSettledStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return promiseCombinator(rt, .all_settled, arg(args, 0));
+}
+
+fn promiseRaceStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return promiseCombinator(rt, .race, arg(args, 0));
+}
+
+fn promiseAnyStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return promiseCombinator(rt, .any, arg(args, 0));
+}
+
+fn promiseCombinator(rt: *Runtime, comptime kind: CombinatorKind, iterable: Value) Error!Value {
+    const r = try realm(rt);
+    const p_out = try rt.heap.newPromise(r.promise_prototype);
+
+    var root_buf = [_]Value{
+        .{ .object = p_out },
+        iterable,
+        .undefined, // [2] iter
+        .undefined, // [3] results_arr
+        .undefined, // [4] state_arr: [p_out, results_arr, remaining]
+        .undefined, // [5] res_cap
+        .undefined, // [6] rej_cap
+        .undefined, // [7] elem
+        .undefined, // [8] next_p
+        .undefined, // [9] elem_env: [state_arr, index]
+        .undefined, // [10] cb_f
+        .undefined, // [11] cb_r
+    };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const iter = getIterator(rt, iterable) catch |e| {
+        if (e != error.Thrown) return e;
+        const err_val = try rt.catchValue();
+        try settlePromiseFromJob(rt, p_out, true, err_val);
+        return .{ .object = p_out };
+    };
+    root_buf[2] = .{ .object = iter };
+
+    if (kind != .race) {
+        const results_arr = try rt.heap.newArray(r.array_prototype);
+        root_buf[3] = .{ .object = results_arr };
+        const state_arr = try rt.heap.newArray(null);
+        root_buf[4] = .{ .object = state_arr };
+        try rt.heap.appendElements(state_arr, &.{ .{ .object = p_out }, .{ .object = results_arr }, .{ .number = 0 } });
+    }
+    if (kind == .race or kind == .any) {
+        const res_cap = try rt.heap.newPromiseCapability(p_out, false);
+        root_buf[5] = .{ .closure = res_cap };
+    }
+    if (kind == .all or kind == .race) {
+        const rej_cap = try rt.heap.newPromiseCapability(p_out, true);
+        root_buf[6] = .{ .closure = rej_cap };
+    }
+
+    var count: usize = 0;
+    while (true) {
+        const maybe_elem = iteratorNextVal(rt, iter) catch |e| {
+            if (e != error.Thrown) return e;
+            const err_val = try rt.catchValue();
+            try settlePromiseFromJob(rt, p_out, true, err_val);
+            return .{ .object = p_out };
+        };
+        const elem = maybe_elem orelse break;
+        root_buf[7] = elem;
+
+        const next_p = try resolveToPromise(rt, elem);
+        root_buf[8] = next_p;
+
+        if (kind != .race) {
+            try rt.heap.appendElements(root_buf[3].object, &.{.undefined});
+            const elem_env = try rt.heap.newArray(null);
+            root_buf[9] = .{ .object = elem_env };
+            try rt.heap.appendElements(elem_env, &.{ root_buf[4], .{ .number = @floatFromInt(count) } });
+        }
+
+        const cb_f: Value = switch (kind) {
+            .all => .{ .closure = try rt.heap.newNativeClosure(&allFulfillCb, root_buf[9].object) },
+            .all_settled => .{ .closure = try rt.heap.newNativeClosure(&allSettledFulfillCb, root_buf[9].object) },
+            .race, .any => root_buf[5],
+        };
+        root_buf[10] = cb_f;
+
+        const cb_r: Value = switch (kind) {
+            .all, .race => root_buf[6],
+            .all_settled => .{ .closure = try rt.heap.newNativeClosure(&allSettledRejectCb, root_buf[9].object) },
+            .any => .{ .closure = try rt.heap.newNativeClosure(&anyRejectCb, root_buf[9].object) },
+        };
+        root_buf[11] = cb_r;
+
+        _ = try promiseThen(rt, next_p, &.{ cb_f, cb_r });
+        count += 1;
+    }
+
+    if (count == 0) {
+        switch (kind) {
+            .all, .all_settled => try settlePromiseFromJob(rt, p_out, false, root_buf[3]),
+            .race => {},
+            .any => {
+                const agg = try makeAggregateError(rt, root_buf[3]);
+                root_buf[7] = agg;
+                try settlePromiseFromJob(rt, p_out, true, agg);
+            },
+        }
+    } else if (kind != .race) {
+        // Set remaining count after iteration so reactions (queued via microtasks) see final count.
+        rt.heap.storeElement(root_buf[4].object, 2, .{ .number = @floatFromInt(count) });
+    }
+
+    return .{ .object = p_out };
+}
+
+fn allFulfillCb(rt: *Runtime, elem_env: *Object, args: []const Value) Error!Value {
+    const state_arr = elem_env.kind.array.items[0].object;
+    const idx: usize = @intFromFloat(elem_env.kind.array.items[1].number);
+    const p_out = state_arr.kind.array.items[0].object;
+    if (p_out.kind.promise.already_resolved) return .undefined;
+
+    const results_arr = state_arr.kind.array.items[1].object;
+    rt.heap.storeElement(results_arr, idx, arg(args, 0));
+
+    const rem: usize = @intFromFloat(state_arr.kind.array.items[2].number);
+    const next_rem = rem - 1;
+    rt.heap.storeElement(state_arr, 2, .{ .number = @floatFromInt(next_rem) });
+    if (next_rem == 0) {
+        try settlePromiseFromJob(rt, p_out, false, .{ .object = results_arr });
+    }
+    return .undefined;
+}
+
+fn allSettledFulfillCb(rt: *Runtime, elem_env: *Object, args: []const Value) Error!Value {
+    return allSettledCb(rt, elem_env, arg(args, 0), false);
+}
+
+fn allSettledRejectCb(rt: *Runtime, elem_env: *Object, args: []const Value) Error!Value {
+    return allSettledCb(rt, elem_env, arg(args, 0), true);
+}
+
+fn allSettledCb(rt: *Runtime, elem_env: *Object, val: Value, is_rejected: bool) Error!Value {
+    // An iteration fault rejects p_out with `remaining` still 0; late reactions must not underflow it.
+    if (elem_env.kind.array.items[0].object.kind.array.items[0].object.kind.promise.already_resolved) return .undefined;
+    var root_buf = [_]Value{ .{ .object = elem_env }, val, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const r = try realm(rt);
+    const obj = try rt.heap.newObject(r.object_prototype);
+    root_buf[2] = .{ .object = obj };
+    const status_str = try rt.heap.newString(&.{.{ .ascii = if (is_rejected) "rejected" else "fulfilled" }});
+    root_buf[3] = .{ .string = status_str };
+    try object.define(rt, obj, try object.named(rt, "status"), root_buf[3]);
+    try object.define(rt, obj, try object.named(rt, if (is_rejected) "reason" else "value"), val);
+
+    const state_arr = elem_env.kind.array.items[0].object;
+    const idx: usize = @intFromFloat(elem_env.kind.array.items[1].number);
+    const p_out = state_arr.kind.array.items[0].object;
+    const results_arr = state_arr.kind.array.items[1].object;
+
+    rt.heap.storeElement(results_arr, idx, root_buf[2]);
+    const rem: usize = @intFromFloat(state_arr.kind.array.items[2].number);
+    const next_rem = rem - 1;
+    rt.heap.storeElement(state_arr, 2, .{ .number = @floatFromInt(next_rem) });
+    if (next_rem == 0) {
+        try settlePromiseFromJob(rt, p_out, false, .{ .object = results_arr });
+    }
+    return .undefined;
+}
+
+fn anyRejectCb(rt: *Runtime, elem_env: *Object, args: []const Value) Error!Value {
+    const state_arr = elem_env.kind.array.items[0].object;
+    const p_out = state_arr.kind.array.items[0].object;
+    if (p_out.kind.promise.already_resolved) return .undefined;
+
+    const idx: usize = @intFromFloat(elem_env.kind.array.items[1].number);
+    const errors_arr = state_arr.kind.array.items[1].object;
+    rt.heap.storeElement(errors_arr, idx, arg(args, 0));
+
+    const rem: usize = @intFromFloat(state_arr.kind.array.items[2].number);
+    const next_rem = rem - 1;
+    rt.heap.storeElement(state_arr, 2, .{ .number = @floatFromInt(next_rem) });
+    if (next_rem == 0) {
+        var root_buf = [_]Value{ .{ .object = p_out }, .{ .object = errors_arr }, .undefined };
+        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+        try roots.register(rt);
+        defer roots.unregister(rt);
+
+        const agg = try makeAggregateError(rt, .{ .object = errors_arr });
+        root_buf[2] = agg;
+        try settlePromiseFromJob(rt, p_out, true, agg);
+    }
+    return .undefined;
+}
+
+fn makeAggregateError(rt: *Runtime, errors_arr_val: Value) Error!Value {
+    const r = try realm(rt);
+    var root_buf = [_]Value{ errors_arr_val, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const err_obj = try rt.heap.newObject(r.object_prototype);
+    root_buf[1] = .{ .object = err_obj };
+    const name_str = try rt.heap.newString(&.{.{ .ascii = "AggregateError" }});
+    root_buf[2] = .{ .string = name_str };
+    const msg_str = try rt.heap.newString(&.{.{ .ascii = "All promises were rejected" }});
+    root_buf[3] = .{ .string = msg_str };
+    try object.define(rt, err_obj, try object.named(rt, "name"), root_buf[2]);
+    try object.define(rt, err_obj, try object.named(rt, "message"), root_buf[3]);
+    try object.define(rt, err_obj, try object.named(rt, "errors"), errors_arr_val);
+    return root_buf[1];
 }
 
 pub fn callPromiseCapability(rt: *Runtime, p_obj: *Object, is_reject: bool, args: []const Value) Error!Value {

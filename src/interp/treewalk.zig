@@ -623,6 +623,10 @@ const Interpreter = struct {
         closure.obj.checkLive();
         const t = switch (closure.impl) {
             .promise_cap => |pc| return builtins.callPromiseCapability(it.rt, pc.promise, pc.is_reject, args),
+            .native_closure => |nc| {
+                const f: *const fn (*Runtime, *heap.Object, []const Value) Error!Value = @ptrCast(@alignCast(nc.func));
+                return f(it.rt, nc.env, args);
+            },
             .tree => |t| t,
             .vm => return it.rt.bug("a non-tree-walker closure in the tree-walker"),
         };

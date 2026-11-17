@@ -1,0 +1,1 @@
+all_empty:0|settled_empty:0|any_empty:AggregateError:0|all_nonit:TypeError|settled_nonit:TypeError|race_nonit:TypeError|any_nonit:TypeError|tick1|all_ok:one,99,two|all_rej:boom|settled:R:err1,F:lit,F:ok2|race_rej:fast_err|race_nonp:7|any_win:winner|any_all_rej:AggregateError:first_err,second_err|all_set:10,20|all_str:a,b|tick2|tick3|race_empty_settled=false

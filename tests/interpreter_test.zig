@@ -589,8 +589,8 @@ test "M17.1: documented ZQJS deviations on callback thisArg and detached receive
 }
 
 test "M18.1: Promise state, self-resolution, native adoption, queue fault preservation, and OOM" {
-    try expectUnsupported("Promise.all;", "", "('all')");
-    try expectUnsupported("Promise.resolve(1).finally;", "", "('finally')");
+    try expectUnsupported("Promise.withResolvers;", "", "('withResolvers')");
+    try expectUnsupported("Promise.try;", "", "('try')");
 
     for (support.engines) |engine| {
         // 1. Rejection, executor throw, self-resolution, and pending/settled native adoption
@@ -707,6 +707,29 @@ test "M18.2: Promise.prototype.then/catch receivers, microtask limits, and OOM" 
             var run_res = try support.run(
                 alloc,
                 "let res; const p = new Promise(function (r) { res = r; }); p.then(function (x) { return x + 1; }).catch(function () { return 0; }); res(41);",
+                .{},
+                .vm,
+                .normal,
+            );
+            defer run_res.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
+}
+
+test "M19: Promise.all, allSettled, race, any, and finally OOM safety" {
+    const OomCtx = struct {
+        fn runOnce(alloc: Allocator) !void {
+            var run_res = try support.run(
+                alloc,
+                \\let r1;
+                \\const p1 = new Promise(function (r) { r1 = r; });
+                \\Promise.all([p1, 2]).finally(function () { return Promise.resolve(9); });
+                \\Promise.allSettled([Promise.resolve(1), Promise.reject("x")]);
+                \\Promise.race([Promise.resolve(3), p1]);
+                \\Promise.any([Promise.reject("a"), Promise.reject("b")]);
+                \\r1(1);
+            ,
                 .{},
                 .vm,
                 .normal,

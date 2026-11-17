@@ -443,6 +443,10 @@ pub const Runtime = struct {
             .closure => |c| {
                 switch (c.impl) {
                     .promise_cap => |pc| return builtins_mod.callPromiseCapability(rt, pc.promise, pc.is_reject, args),
+                    .native_closure => |nc| {
+                        const f: *const fn (*Runtime, *heap_mod.Object, []const Value) Error!Value = @ptrCast(@alignCast(nc.func));
+                        return f(rt, nc.env, args);
+                    },
                     .vm, .tree => {
                         const cc = rt.closure_caller orelse return rt.bug("closure called without an active engine");
                         return cc.call(cc.ctx, c, if (this_val == .object) this_val else null, args);

@@ -149,7 +149,7 @@ pub const Vm = struct {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
-            .tree, .promise_cap => return rt.bug("a non-VM closure in a nested call"),
+            .tree, .promise_cap, .native_closure => return rt.bug("a non-VM closure in a nested call"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
         const argc: u32 = @intCast(args.len);
@@ -780,6 +780,12 @@ pub const Vm = struct {
                             vm.stack[base] = try @import("../runtime/builtins.zig").callPromiseCapability(rt, cap.promise, cap.is_reject, vm.stack[args..cache.sp]);
                             cache.sp = base + 1;
                         },
+                        .native_closure => |nc| {
+                            cache.syncSp(vm);
+                            const f: *const fn (*Runtime, *heap.Object, []const Value) Error!Value = @ptrCast(@alignCast(nc.func));
+                            vm.stack[base] = try f(rt, nc.env, vm.stack[args..cache.sp]);
+                            cache.sp = base + 1;
+                        },
                         .vm, .tree => {
                             // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
                             const this: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
@@ -843,7 +849,7 @@ pub const Vm = struct {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
-            .tree, .promise_cap => return vm.bug("a non-VM closure in the VM"),
+            .tree, .promise_cap, .native_closure => return vm.bug("a non-VM closure in the VM"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
         const limits = vm.rt.limits;

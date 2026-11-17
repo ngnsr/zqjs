@@ -64,7 +64,8 @@ function* randomDoubles(n) {
   const special = [0, -0, NaN, Infinity, -Infinity, 1, -1, 0.1, 0.2, 0.1 + 0.2, 1 / 3, 2 / 3, 100, 1e21, 1e20,
     999999999999999900000, 1e-6, 1e-7, 1.5e-7, 0.000001234, 123456789012345680000, 5e-324, 2.2250738585072014e-308,
     1.7976931348623157e308, 2 ** 53, 2 ** 53 + 2, 123.456, -1.5, 1e300, 1.5e300, 4.35, 0.5, 1e-5, 12345e-10];
-  for (let e = -30; e <= 30; e++) special.push(10 ** e, 1.25 * 10 ** e, -(7 * 10 ** e));
+  // Parsed, not `10 ** e`: node's `**` changed in the last bit between versions (22 vs 26).
+  for (let e = -30; e <= 30; e++) special.push(Number(`1e${e}`), Number(`1.25e${e}`), -Number(`7e${e}`));
   const lines = [...special, ...randomDoubles(3000)].map((x) => JSON.stringify([bits(x), String(x)]));
   emit('ops/number_to_string.jsonl', lines.join('\n') + '\n');
 }
@@ -145,7 +146,7 @@ function runInNode(source) {
   let out = '';
   const print = (...args) => { out += args.map(String).join(' ') + '\n'; };
   try {
-    vm.runInNewContext(source, { print }, { timeout: 5000 });
+    vm.runInNewContext(source, { print }, { timeout: 5000, microtaskMode: 'afterEvaluate' }); // drain promise jobs like ZQJS's end-of-run checkpoint
   } catch (e) {
     out += `Uncaught ${e.name}\n`; // names only: messages are never compared
   }

@@ -172,6 +172,7 @@ const Compiler = struct {
         c.functions.clearRetainingCapacity();
         return .{
             .kind = kind,
+            .is_arrow = if (f) |func| func.is_arrow else false,
             .name = name_copy,
             .code = code,
             .consts = consts,

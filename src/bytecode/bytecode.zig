@@ -300,6 +300,7 @@ pub fn readU32(code: []const u8, pos: usize) u32 {
 /// (`Heap.rollback`), so a failed compile leaves the heap as it found it.
 pub const Proto = struct {
     kind: enum { script, function } = .script,
+    is_arrow: bool = false,
     /// The function's name, for listings and traces ("" if anonymous or the script).
     name: []const u8 = "",
     code: []const u8,

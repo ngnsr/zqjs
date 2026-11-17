@@ -418,6 +418,24 @@ const Parser = struct {
     fn functionRest(p: *Parser, start: u32, kind: @FieldType(ast.Function, "kind"), name: ?ast.Declarator) Error!*const ast.Function {
         const id = p.function_count;
         p.function_count += 1;
+        const params = try p.parseParams();
+
+        if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{'" }, p.tok);
+        const outer_loops = p.loop_depth;
+        p.loop_depth = 0;
+        p.function_depth += 1;
+        defer {
+            p.loop_depth = outer_loops;
+            p.function_depth -= 1;
+        }
+        const parsed_body = try p.parseFunctionBody();
+
+        const f = try p.arena.create(ast.Function);
+        f.* = .{ .span = .{ .start = start, .end = parsed_body.end }, .id = id, .kind = kind, .name = name, .params = params, .body = parsed_body.body };
+        return f;
+    }
+
+    fn parseParams(p: *Parser) Error![]const ast.Declarator {
         if (p.tok.tag != .l_paren) return p.fail(.{ .syntax_error = "expected '('" }, p.tok);
         try p.advance();
         var params: std.ArrayList(ast.Declarator) = .empty;
@@ -430,17 +448,15 @@ const Parser = struct {
             try p.advance(); // a trailing comma is allowed: `function f(a,) {}`
         }
         try p.expectAfterExpression(.r_paren);
+        return params.items;
+    }
 
-        if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{'" }, p.tok);
+    fn parseFunctionBody(p: *Parser) Error!struct { body: []const ast.Stmt, end: u32 } {
         const open = p.tok;
         try p.advance();
-        const outer_loops = p.loop_depth;
-        p.loop_depth = 0;
-        p.function_depth += 1;
-        defer {
-            p.loop_depth = outer_loops;
-            p.function_depth -= 1;
-        }
+        const saved_no_in = p.no_in;
+        p.no_in = false;
+        defer p.no_in = saved_no_in;
         var body: std.ArrayList(ast.Stmt) = .empty;
         while (p.tok.tag != .r_brace) {
             if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated function body" }, open);
@@ -448,10 +464,7 @@ const Parser = struct {
         }
         const close = p.tok;
         try p.advance();
-
-        const f = try p.arena.create(ast.Function);
-        f.* = .{ .span = .{ .start = start, .end = close.end }, .id = id, .kind = kind, .name = name, .params = params.items, .body = body.items };
-        return f;
+        return .{ .body = body.items, .end = close.end };
     }
 
     /// A function or parameter name. Reserved words are SyntaxErrors; `let` is a legal
@@ -494,7 +507,11 @@ const Parser = struct {
     fn expression(p: *Parser) Error!*const ast.Expr {
         try p.enter();
         defer p.depth -= 1;
+        if (p.isArrowStart()) return p.arrowFunction();
+        const paren_start = p.tok.tag == .l_paren;
         const lhs = try p.conditional();
+        // `(a = 1) =>`, `([a]) =>`: valid JS parameter lists that isArrowStart doesn't accept.
+        if (paren_start and p.tok.tag == .arrow) return p.fail(.{ .unsupported = .syntax }, p.tok);
         const op = assignOp(p.tok.tag) orelse return lhs;
         // Parentheses are transparent, so `(x) = 1` arrives here as a plain identifier, as in JS.
         const target = try p.assignTarget(lhs, "invalid assignment target");
@@ -505,6 +522,86 @@ const Parser = struct {
             .{ .assign = .{ .op = op, .target = target, .value = value } },
             @max(lhs.depth, value.depth),
         );
+    }
+
+    fn isArrowStart(p: *Parser) bool {
+        if (p.tok.tag == .identifier) {
+            var look = p.lexer;
+            const next_tok = look.next() catch return false;
+            return next_tok.tag == .arrow;
+        }
+        if (p.tok.tag == .l_paren) {
+            // Only `(ident, ident,)` can be supported parameters, so stop at the first other
+            // token: scanning to the matching `)` made nested parentheses quadratic.
+            var look = p.lexer;
+            while (true) {
+                const t = look.next() catch return false;
+                switch (t.tag) {
+                    .identifier, .comma => {},
+                    .r_paren => break,
+                    else => return false,
+                }
+            }
+            const after = look.next() catch return false;
+            return after.tag == .arrow;
+        }
+        return false;
+    }
+
+    fn arrowFunction(p: *Parser) Error!*const ast.Expr {
+        try p.enter();
+        defer p.depth -= 1;
+        const start = p.tok.start;
+        const id = p.function_count;
+        p.function_count += 1;
+
+        var params: []const ast.Declarator = &.{};
+        if (p.tok.tag == .l_paren) {
+            params = try p.parseParams();
+        } else {
+            const single = try p.bindingName();
+            const buf = try p.arena.alloc(ast.Declarator, 1);
+            buf[0] = single;
+            params = buf;
+        }
+
+        if (p.tok.tag != .arrow) return p.fail(.{ .syntax_error = "expected '=>'" }, p.tok);
+        if (p.tok.newline_before) return p.fail(.{ .syntax_error = "line terminator before '=>'" }, p.tok);
+        try p.advance(); // `=>`
+
+        const outer_loops = p.loop_depth;
+        p.loop_depth = 0;
+        p.function_depth += 1;
+        defer {
+            p.loop_depth = outer_loops;
+            p.function_depth -= 1;
+        }
+
+        var body: []const ast.Stmt = undefined;
+        var end: u32 = undefined;
+        if (p.tok.tag == .l_brace) {
+            const parsed_body = try p.parseFunctionBody();
+            body = parsed_body.body;
+            end = parsed_body.end;
+        } else {
+            const expr = try p.expression();
+            const stmts = try p.arena.alloc(ast.Stmt, 1);
+            stmts[0] = .{ .span = expr.span, .data = .{ .@"return" = expr } };
+            body = stmts;
+            end = expr.span.end;
+        }
+
+        const f = try p.arena.create(ast.Function);
+        f.* = .{
+            .span = .{ .start = start, .end = end },
+            .id = id,
+            .kind = .expression,
+            .is_arrow = true,
+            .name = null,
+            .params = params,
+            .body = body,
+        };
+        return p.node(f.span, .{ .function = f }, 0);
     }
 
     /// ConditionalExpression := LogicalORExpression (`?` AssignmentExpression `:` AssignmentExpression)?
@@ -875,7 +972,8 @@ const Parser = struct {
             .l_paren => {
                 try p.advance();
                 // `()` is only valid as an arrow-function parameter list.
-                if (p.tok.tag == .r_paren) return p.fail(.{ .unsupported = .syntax }, p.tok);
+                if (p.tok.tag == .r_paren) return p.fail(.{ .syntax_error = "unexpected token ')'" }, p.tok);
+                if (p.tok.tag == .ellipsis) return p.fail(.{ .unsupported = .syntax }, p.tok); // `(...a) =>`
                 const inner = try p.nested();
                 try p.expectAfterExpression(.r_paren);
                 return inner;

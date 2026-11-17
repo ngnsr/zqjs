@@ -740,7 +740,12 @@ pub const Vm = struct {
                 const base = cache.sp - group;
                 const args = cache.sp - argc;
                 cache.syncSp(vm);
-                const result = try builtins.construct(rt, vm.stack[base], vm.stack[args..cache.sp]);
+                const callee = vm.stack[base];
+                if (callee == .closure and callee.closure.impl == .vm) {
+                    const callee_proto: *const Proto = @ptrCast(@alignCast(callee.closure.impl.vm.proto));
+                    if (callee_proto.is_arrow) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+                }
+                const result = try builtins.construct(rt, callee, vm.stack[args..cache.sp]);
                 vm.stack[base] = result;
                 cache.sp = base + 1;
             },

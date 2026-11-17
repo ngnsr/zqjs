@@ -583,6 +583,10 @@ const Interpreter = struct {
             slot.* = try it.eval(arg);
             try it.hold(slot.*);
         }
+        if (callee == .closure and callee.closure.impl == .tree) {
+            const f: *const ast.Function = @ptrCast(@alignCast(callee.closure.impl.tree.func));
+            if (f.is_arrow) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+        }
         return builtins.construct(rt, callee, args);
     }
 

@@ -2798,3 +2798,44 @@ test "M18.3: Host -> JS -> Promise -> microtask, reentrancy, GC, and fault recov
     try step_rt.run(resume_prog, null);
     try testing.expectEqualStrings("ok\nresumed:2\n", fault_out.buffered());
 }
+
+test "M20: host calls JS arrow returned from script via Runtime.call" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+
+    const Cap = struct {
+        arrow: ?zqjs.Handle = null,
+
+        fn register(_: *zqjs.Runtime, ctx: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, _: *zqjs.NativeOut) !void {
+            const cap: *@This() = @ptrCast(@alignCast(ctx.?));
+            cap.arrow = try args[0].dup();
+        }
+    };
+    var cap: Cap = .{};
+    defer if (cap.arrow) |h| h.release();
+
+    try rt.defineGlobalFunction("registerArrow", Cap.register, &cap);
+
+    const prog = try rt.compile("m20_arrow.js",
+        \\let base = 10;
+        \\registerArrow((a, b) => {
+        \\    base += 1;
+        \\    return base + a * b;
+        \\});
+    , null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+
+    const a = try rt.newNumber(3);
+    defer a.release();
+    const b = try rt.newNumber(4);
+    defer b.release();
+
+    const r1 = try rt.call(cap.arrow.?, null, &.{ a, b }, null);
+    defer r1.release();
+    try testing.expectEqual(@as(f64, 23), r1.number().?);
+
+    const r2 = try rt.call(cap.arrow.?, null, &.{ a, b }, null);
+    defer r2.release();
+    try testing.expectEqual(@as(f64, 24), r2.number().?);
+}

@@ -132,9 +132,13 @@ const Dumper = struct {
 
     fn function(d: Dumper, f: *const ast.Function) Error!void {
         const w = d.w;
-        try w.writeAll("(function ");
-        if (f.name) |n| try d.binding(n) else try w.writeByte('_');
-        try w.writeAll(" (");
+        if (f.is_arrow) {
+            try w.writeAll("(arrow (");
+        } else {
+            try w.writeAll("(function ");
+            if (f.name) |n| try d.binding(n) else try w.writeByte('_');
+            try w.writeAll(" (");
+        }
         for (f.params, 0..) |p, i| {
             if (i > 0) try w.writeByte(' ');
             try d.binding(p);

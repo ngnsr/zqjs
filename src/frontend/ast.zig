@@ -144,6 +144,7 @@ pub const Function = struct {
     /// Index into `Resolution.functions`; 0 is the script itself, so functions count from 1.
     id: u32,
     kind: enum { declaration, expression },
+    is_arrow: bool = false,
     /// Required for declarations (bound in the enclosing scope); optional for
     /// expressions (bound only inside the function, DESIGN_DECISIONS D36).
     name: ?Declarator,

@@ -79,10 +79,11 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `sparse_array` | restriction (revisit) | `[1,,2]`, `delete a[0]`, `a[a.length + 1] = x`, `a.length = 10` | arrays have no holes |
 | `user_conversion` | not yet | `print({ toString() { return 'x'; } })`, `o.valueOf = …; o + 1` | converting an object through a user-defined toString/valueOf/join (D40) |
 | `sloppy_this` | restriction | `this` at script level, `const f = o.m; f()` where `m` reads `this` | sloppy JS uses the global object (or boxes a primitive receiver) |
+| `arrow_this` | not yet | `() => this`, `function f() { return () => this; }` | lexical `this` inside arrow functions |
 | `function_properties` | not yet | `f.x`, `f.length`, `print.name` | functions aren't objects yet |
 | `primitive_write` | restriction | `'s'.x = 1`, `delete 'ab'.length` | sloppy JS silently ignores these |
 | `labels` | not yet | `foo: while (…)`, `break foo;` | |
-| `syntax` | not yet | `?:`, `,`, `~`, `&&=`, `var`, `do`, destructuring, `for…of/in`, `let` used as a variable name, arrow functions, default/rest parameters, generators, `async`, `this`, `new`, regexes … | any JS token or construct not yet in the grammar below |
+| `syntax` | not yet | `?:`, `,`, `~`, `&&=`, `var`, `do`, destructuring, `for…of/in`, `let` used as a variable name, default/rest parameters, generators, `async`, `this`, `new`, regexes … | any JS token or construct not yet in the grammar below |
 
 ## 3. Lexical grammar (M1)
 
@@ -136,7 +137,8 @@ Statement         := ';'                                   (empty statement)
                    | 'return' Expression? ';'              (only inside a function)
                    | Expression ';'
 ForInit           := ('let' | 'const') Declarator (',' Declarator)* | Expression
-Expression        := Identifier AssignOp Expression | Logical   (right-associative)
+Expression        := Identifier AssignOp Expression | ArrowFunction | Logical   (right-associative)
+ArrowFunction     := (Identifier | Params) '=>' (Body | Expression)   (no line break before '=>')
 AssignOp          := '=' | '+=' | '-=' | '*=' | '/=' | '%=' | '**='
 Logical           := Logical ('||' | '&&') Logical          (&& binds tighter than ||)
                    | Equality
@@ -211,6 +213,14 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
 - **Values:** functions compare by identity (`===`), are truthy, and convert to NaN. Converting
   one to a string, or comparing it with a string or another function, needs its source text:
   `Unsupported(function_to_string)`.
+- **Arrow functions (M20):** `x => expr`, `(x) => expr`, `() => expr`, `(a, b) => expr`,
+  `x => { body }`, `(a, b) => { body }`, and `x => ({ a: 1 })` (parenthesised object-literal
+  bodies). An expression body returns its value; a block body returns `undefined` unless
+  `return` executes. A line terminator before `=>` is a SyntaxError. Arrow functions share
+  closure and parameter rules with function expressions (`duplicate_parameter`,
+  `Unsupported(syntax)` for defaults/rest/destructuring), throw `TypeError` on `new`, and
+  fail at resolve time with `Unsupported(arrow_this)` if `this` is read inside an arrow body
+  (outside a nested regular `function`).
 - **Limits:** more than `Limits.max_call_depth` (default 10,000) active calls →
   `LimitExceeded(call_depth)` (node: RangeError at about 11,000). The VM also limits the stack
   slots reserved by all active frames (`max_stack_slots`), the tree-walker its native recursion

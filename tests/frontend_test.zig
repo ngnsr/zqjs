@@ -41,6 +41,35 @@ test "error paths: every allocation failing once leaks nothing" {
     for (sources) |src| try testing.checkAllAllocationFailures(testing.allocator, frontendOnce, .{ src, Limits{} });
 }
 
+fn parseNanos(source: []const u8) !i96 {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: Diagnostic = .{};
+    const start = std.Io.Timestamp.now(testing.io, .awake);
+    _ = try parse(arena.allocator(), source, .{}, &d);
+    return start.durationTo(std.Io.Timestamp.now(testing.io, .awake)).toNanoseconds();
+}
+
+test "M20: the arrow lookahead keeps nested parentheses linear" {
+    // Scanning to the matching `)` at every level made this ~200x the flat parse.
+    const depth = 200;
+    var flat: std.ArrayList(u8) = .empty;
+    defer flat.deinit(testing.allocator);
+    try flat.append(testing.allocator, '[');
+    for (0..20_000) |_| try flat.appendSlice(testing.allocator, "1,");
+    try flat.append(testing.allocator, ']');
+    var nested: std.ArrayList(u8) = .empty;
+    defer nested.deinit(testing.allocator);
+    try nested.appendNTimes(testing.allocator, '(', depth);
+    try nested.appendSlice(testing.allocator, flat.items);
+    try nested.appendNTimes(testing.allocator, ')', depth);
+    try flat.append(testing.allocator, ';');
+    try nested.append(testing.allocator, ';');
+    const t_flat = @max(try parseNanos(flat.items), 1);
+    const t_nested = try parseNanos(nested.items);
+    try testing.expect(t_nested < 20 * t_flat);
+}
+
 fn fuzzOne(_: void, smith: *testing.Smith) anyerror!void {
     var buf: [1024]u8 = undefined;
     try frontendOnce(testing.allocator, buf[0..smith.slice(&buf)], .{ .max_nesting_depth = 64 });

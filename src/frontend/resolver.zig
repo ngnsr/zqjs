@@ -134,6 +134,7 @@ const Live = struct { name: []const u8, binding: u32 };
 /// A function being resolved (innermost last in `Resolver.fns`).
 const FnState = struct {
     id: u32,
+    is_arrow: bool = false,
     /// Index in `live` where this function's bindings start (its slot 0).
     live_start: usize,
     max_slots: u32 = 0,
@@ -283,7 +284,7 @@ const Resolver = struct {
     /// one for the parameters and the body's declarations (a body `let` may not reuse a
     /// parameter's name, so they share a scope).
     fn function(r: *Resolver, f: *const ast.Function) Error!void {
-        try r.fns.append(r.arena, .{ .id = f.id, .live_start = r.live.items.len });
+        try r.fns.append(r.arena, .{ .id = f.id, .is_arrow = f.is_arrow, .live_start = r.live.items.len });
         const name_scope: ?Saved = if (f.kind == .expression and f.name != null) try r.enterScope() else null;
         if (name_scope != null) try r.declare(f.name.?, .function_name, false);
         const saved = try r.enterScope();
@@ -321,7 +322,7 @@ const Resolver = struct {
                 try r.expr(prop.value);
             },
             .array => |items| for (items) |item| try r.expr(item),
-            .this => {},
+            .this => if (r.current().is_arrow) return r.fail(.{ .unsupported = .arrow_this }, e.span),
             .call, .new_call => |c| {
                 try r.expr(c.callee);
                 for (c.args) |arg| try r.expr(arg);

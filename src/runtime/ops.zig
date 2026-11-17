@@ -319,6 +319,20 @@ pub fn binary(rt: *Runtime, op: ast.BinaryOp, a_in: Value, b_in: Value) Error!Va
     };
 }
 
+/// JS `typeof`: returns the type tag string for any value.
+pub fn typeOf(rt: *Runtime, v: Value) Error!Value {
+    const s: []const u8 = switch (v) {
+        .undefined => "undefined",
+        .null => "object",
+        .boolean => "boolean",
+        .number => "number",
+        .string => "string",
+        .native, .closure => "function",
+        .object => "object",
+    };
+    return .{ .string = try rt.heap.ascii(s) };
+}
+
 // ------------------------------------------------------------ tests (golden tables in tests/ops)
 
 const testing = std.testing;

@@ -13,12 +13,14 @@ pub const UnaryOp = enum {
     neg,
     plus,
     not,
+    typeof,
 
     pub fn symbol(op: UnaryOp) []const u8 {
         return switch (op) {
             .neg => "-",
             .plus => "+",
             .not => "!",
+            .typeof => "typeof",
         };
     }
 };
@@ -105,11 +107,17 @@ pub const Expr = struct {
     data: Data,
 
     pub const Call = struct { callee: *const Expr, args: []const *const Expr };
+    pub const Template = struct {
+        /// `quasis.len == exprs.len + 1`.
+        quasis: []const []const u16,
+        exprs: []const *const Expr,
+    };
 
     pub const Data = union(enum) {
         number: f64,
         /// UTF-16 code units, possibly containing lone surrogates (DESIGN_DECISIONS D6).
         string: []const u16,
+        template: Template,
         boolean: bool,
         null,
         identifier: Ref,
@@ -181,6 +189,8 @@ pub const Stmt = struct {
         block: []const Stmt,
         @"if": struct { cond: *const Expr, then: *const Stmt, @"else": ?*const Stmt },
         @"while": struct { cond: *const Expr, body: *const Stmt },
+        do_while: struct { body: *const Stmt, cond: *const Expr },
+        @"switch": struct { discriminant: *const Expr, cases: []const SwitchCase },
         /// The head declaration (if any) lives in its own scope around the body. Its
         /// bindings are the ones the spec copies per iteration (DESIGN_DECISIONS D22).
         @"for": struct { init: ?ForInit, cond: ?*const Expr, update: ?*const Expr, body: *const Stmt },
@@ -198,6 +208,12 @@ pub const Stmt = struct {
             catch_body: []const Stmt,
         },
     };
+};
+
+pub const SwitchCase = struct {
+    /// null for `default:`.
+    test_expr: ?*const Expr,
+    body: []const Stmt,
 };
 
 pub const ForInit = union(enum) {

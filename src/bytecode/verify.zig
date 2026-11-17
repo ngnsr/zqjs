@@ -268,6 +268,9 @@ test "every rule rejects malformed code" {
     try expectInvalid(enc(.{ .push_const, 1, .pop, .halt }), 1, "constant index out of range");
     try expectInvalid(enc(.{ .get_local, 1, 0, .pop, .halt }), 1, "slot out of range");
     try expectInvalid(enc(.{ .get_global, 1, .pop, .halt }), 1, "name index out of range");
+    try expectInvalid(enc(.{ .get_global_or_undefined, 1, .pop, .halt }), 1, "name index out of range");
+    try expectInvalid(enc(.{ .get_global_or_undefined, 0, .typeof, .pop, .halt }), 0, "stack deeper than max_stack");
+    try expectInvalid(enc(.{ .typeof, .halt }), 0, "stack underflow");
     try expectInvalid(enc(.{ .jump, 100 }), 0, "jump target out of range");
     try expectInvalid(enc(.{ .jump, 2, .halt }), 0, "jump target inside an instruction");
     try expectInvalid(enc(.{ .pop, .halt }), 0, "stack underflow");

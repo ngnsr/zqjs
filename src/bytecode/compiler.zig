@@ -113,7 +113,10 @@ const Compiler = struct {
     max_stack: u32 = 0,
     temp_depth: u32 = 0,
     max_temp: u32 = 0,
+    /// Active loop for `continue` (and `break` when not inside a `switch`).
     loop: ?*Loop = null,
+    /// Active break target list (innermost loop or `switch`).
+    breaks: ?*std.ArrayList(u32) = null,
     /// Span of the statement being compiled, for limit diagnostics.
     span: ast.Span = .{ .start = 0, .end = 0 },
 
@@ -404,6 +407,21 @@ const Compiler = struct {
                 for (loop.breaks.items) |j| c.patch(j, c.here());
                 return true; // the condition can be false
             },
+            .do_while => |dw| {
+                // top: body; cont: cond; jump_if_true top; end:
+                var loop: Loop = .{};
+                defer c.deinitLoop(&loop);
+                const top = c.here();
+                const body_completes = try c.loopBody(&loop, dw.body.*);
+                if (body_completes or loop.continues.items.len > 0) {
+                    for (loop.continues.items) |j| c.patch(j, c.here());
+                    try c.expr(dw.cond);
+                    try c.emit(.jump_if_true, &.{top});
+                }
+                for (loop.breaks.items) |j| c.patch(j, c.here());
+                return body_completes or loop.continues.items.len > 0 or loop.breaks.items.len > 0;
+            },
+            .@"switch" => |sw| return c.compileSwitch(sw),
             .@"for" => |f| {
                 // init; [copy]; top: [cond; jump_if_false end]; body;
                 // cont: [copy]; [update; pop]; jump top; end:
@@ -492,10 +510,10 @@ const Compiler = struct {
                 try c.emit(.clear_local, &.{iter_slot});
                 return true;
             },
-            // The parser guarantees break/continue only occur inside loops.
+            // The parser guarantees break/continue only occur inside loops (or switch for break).
             .@"break" => {
                 const j = try c.jumpForward(.jump);
-                try c.loop.?.breaks.append(c.s.gpa, j);
+                try c.breaks.?.append(c.s.gpa, j);
                 return false;
             },
             .@"continue" => {
@@ -507,14 +525,73 @@ const Compiler = struct {
         return true;
     }
 
+    fn compileSwitch(c: *Compiler, sw: @FieldType(ast.Stmt.Data, "switch")) Error!bool {
+        try c.expr(sw.discriminant);
+        for (sw.cases) |cs| {
+            for (cs.body) |s| switch (s.data) {
+                .declaration => |d| for (d.declarators) |decl| try c.enterBinding(decl.binding),
+                else => {},
+            };
+        }
+
+        const case_jumps = try c.s.gpa.alloc(u32, sw.cases.len);
+        defer c.s.gpa.free(case_jumps);
+
+        var default_idx: ?usize = null;
+        for (sw.cases, 0..) |cs, i| {
+            if (cs.test_expr) |te| {
+                try c.emit(.dup, &.{});
+                try c.expr(te);
+                try c.emit(.strict_eq, &.{});
+                const to_next = try c.jumpForward(.jump_if_false);
+                try c.emit(.pop, &.{});
+                case_jumps[i] = try c.jumpForward(.jump);
+                c.patch(to_next, c.here());
+                c.depth += 1; // `to_next` bypassed `pop`, so `disc` is still on the stack
+            } else {
+                default_idx = i;
+            }
+        }
+        try c.emit(.pop, &.{});
+        const no_match_jump = try c.jumpForward(.jump);
+
+        var switch_breaks: std.ArrayList(u32) = .empty;
+        defer switch_breaks.deinit(c.s.gpa);
+        const outer_breaks = c.breaks;
+        c.breaks = &switch_breaks;
+        defer c.breaks = outer_breaks;
+
+        var last_completes = true;
+        for (sw.cases, 0..) |cs, i| {
+            if (cs.test_expr != null) {
+                c.patch(case_jumps[i], c.here());
+            } else {
+                c.patch(no_match_jump, c.here());
+            }
+            var clause_completes = true;
+            for (cs.body) |s| {
+                if (clause_completes) clause_completes = try c.stmt(s);
+            }
+            last_completes = clause_completes;
+        }
+        if (default_idx == null) c.patch(no_match_jump, c.here());
+        for (switch_breaks.items) |j| c.patch(j, c.here());
+        return (default_idx == null) or (switch_breaks.items.len > 0) or last_completes;
+    }
+
     fn perIteration(c: *Compiler, head: []const ast.Declarator) Error!void {
         for (head) |d| if (c.binding(d.binding).captured) try c.emit(.fresh_cell, &.{c.slotOf(d.binding)});
     }
 
     fn loopBody(c: *Compiler, loop: *Loop, body: ast.Stmt) Error!bool {
-        const outer = c.loop;
+        const outer_loop = c.loop;
+        const outer_breaks = c.breaks;
         c.loop = loop;
-        defer c.loop = outer;
+        c.breaks = &loop.breaks;
+        defer {
+            c.loop = outer_loop;
+            c.breaks = outer_breaks;
+        }
         return c.stmt(body);
     }
 
@@ -529,16 +606,36 @@ const Compiler = struct {
         switch (e.data) {
             .number => |n| try c.emit(.push_const, &.{try c.number(n)}),
             .string => |units| try c.emit(.push_const, &.{try c.string(units)}),
+            .template => |t| {
+                try c.emit(.push_const, &.{try c.string(t.quasis[0])});
+                for (t.exprs, 0..) |ex, i| {
+                    try c.expr(ex);
+                    try c.emit(.add, &.{});
+                    if (t.quasis[i + 1].len > 0) {
+                        try c.emit(.push_const, &.{try c.string(t.quasis[i + 1])});
+                        try c.emit(.add, &.{});
+                    }
+                }
+            },
             .boolean => |b| try c.emit(if (b) .push_true else .push_false, &.{}),
             .null => try c.emit(.push_null, &.{}),
             .identifier => |ref| try c.read(ref),
             .function => |f| try c.closure(f),
             .unary => |u| {
+                if (u.op == .typeof and u.operand.data == .identifier) {
+                    const ref = u.operand.data.identifier;
+                    if (c.s.res.refs[ref.id] == .global) {
+                        try c.emit(.get_global_or_undefined, &.{try c.name(ref.name)});
+                        try c.emit(.typeof, &.{});
+                        return;
+                    }
+                }
                 try c.expr(u.operand);
                 try c.emit(switch (u.op) {
                     .neg => .neg,
                     .plus => .to_number,
                     .not => .not,
+                    .typeof => .typeof,
                 }, &.{});
             },
             .binary => |b| switch (b.op) {

@@ -517,6 +517,10 @@ pub const Vm = struct {
                 try cache.ensurePush(vm);
                 try cache.push(vm, try builtins.global(rt, try vm.name(cache.operand(0))));
             },
+            .get_global_or_undefined => {
+                try cache.ensurePush(vm);
+                try cache.push(vm, try builtins.tryGlobal(rt, try vm.name(cache.operand(0))));
+            },
 
             .new_cell => {
                 (try cache.slot(vm, cache.operand(0))).* = .{ .cell = try rt.heap.newCell(null) };
@@ -697,12 +701,13 @@ pub const Vm = struct {
             // Compute into a local, then store. `top().* = .{ .number = f(peek(0)) }` would
             // be wrong: Zig builds the union in place, so the slot's tag changes *before*
             // f reads the old value through peek (result-location aliasing).
-            .neg, .to_number, .not => {
+            .neg, .to_number, .not, .typeof => {
                 const v = try cache.peek(vm, 0);
                 const r: Value = switch (op) {
                     .neg => .{ .number = if (v == .number) -v.number else -(try ops.toNumber(rt, v)) },
                     .to_number => if (v == .number) v else .{ .number = try ops.toNumber(rt, v) },
                     .not => .{ .boolean = !ops.toBoolean(v) },
+                    .typeof => try ops.typeOf(rt, v),
                     else => unreachable,
                 };
                 (try cache.top(vm)).* = r;

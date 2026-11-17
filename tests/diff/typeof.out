@@ -1,0 +1,22 @@
+undefined
+object
+boolean boolean
+number number number number number
+string string
+object object
+object object
+object
+object
+function function
+function function object object
+undefined
+undefined
+ReferenceError
+tdz: ReferenceError
+after: number
+closure tdz: ReferenceError
+closure after: number
+number2
+false false
+string
+number boolean

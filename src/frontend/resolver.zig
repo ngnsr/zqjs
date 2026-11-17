@@ -248,6 +248,26 @@ const Resolver = struct {
                 try r.expr(w.cond);
                 try r.stmt(w.body.*);
             },
+            .do_while => |dw| {
+                try r.stmt(dw.body.*);
+                try r.expr(dw.cond);
+            },
+            .@"switch" => |sw| {
+                try r.expr(sw.discriminant);
+                const saved = try r.enterScope();
+                defer r.exitScope(saved);
+                // All case clauses share one lexical scope (TDZ across cases).
+                for (sw.cases) |c| {
+                    for (c.body) |st| switch (st.data) {
+                        .declaration => |d| for (d.declarators) |decl| try r.declare(decl, if (d.kind == .let) .let else .@"const", false),
+                        else => {},
+                    };
+                }
+                for (sw.cases) |c| {
+                    if (c.test_expr) |te| try r.expr(te);
+                    for (c.body) |st| try r.stmt(st);
+                }
+            },
             .@"for" => |f| {
                 // The head declaration gets its own scope, enclosing the body (whose
                 // block, if any, is one more scope), so `for (let i;;) { let i; }` is legal.
@@ -300,6 +320,7 @@ const Resolver = struct {
     fn expr(r: *Resolver, e: *const ast.Expr) Error!void {
         switch (e.data) {
             .number, .string, .boolean, .null => {},
+            .template => |t| for (t.exprs) |ex| try r.expr(ex),
             .identifier => |ref| r.refs[ref.id] = try r.lookup(ref.name),
             .unary => |u| try r.expr(u.operand),
             .binary => |b| {

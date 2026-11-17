@@ -84,6 +84,9 @@ const Parser = struct {
     /// Number of enclosing loops *in the current function*; `break`/`continue` are
     /// legal only when > 0 (they cannot cross a function boundary).
     loop_depth: u32 = 0,
+    /// Number of enclosing `switch` statements *in the current function*; `break` is
+    /// legal when `loop_depth > 0 or switch_depth > 0`.
+    switch_depth: u32 = 0,
     /// Number of enclosing functions; `return` is legal only when > 0.
     function_depth: u32 = 0,
     /// Inside a `for (…;` head: `in` is not an operator there (`for (x in o)` is for-in).
@@ -167,6 +170,8 @@ const Parser = struct {
         if (p.isText(t, "return")) return p.returnStatement();
         if (p.isText(t, "throw")) return p.throwStatement();
         if (p.isText(t, "try")) return p.tryStatement();
+        if (p.isText(t, "do")) return p.doWhileStatement();
+        if (p.isText(t, "switch")) return p.switchStatement();
         if (p.isText(t, "let")) {
             const next = try p.peek();
             // `if (c) let x` is an error, but `if (c) let\nx` may be ASI + two statements.
@@ -332,10 +337,79 @@ const Parser = struct {
         const t = p.tok;
         try p.advance();
         if (p.tok.tag == .identifier and !p.tok.newline_before) return p.fail(.{ .unsupported = .labels }, p.tok);
-        if (p.loop_depth == 0) return p.fail(.{ .syntax_error = if (t.tag == .kw_break) "'break' outside a loop" else "'continue' outside a loop" }, t);
+        if (t.tag == .kw_break) {
+            if (p.loop_depth == 0 and p.switch_depth == 0)
+                return p.fail(.{ .syntax_error = "'break' outside a loop or switch" }, t);
+        } else if (p.loop_depth == 0) {
+            return p.fail(.{ .syntax_error = "'continue' outside a loop" }, t);
+        }
         const end = p.tok;
         try p.endStatement();
         return .{ .span = span(t, end), .data = if (t.tag == .kw_break) .@"break" else .@"continue" };
+    }
+
+    fn doWhileStatement(p: *Parser) Error!ast.Stmt {
+        const start = p.tok.start;
+        try p.advance(); // `do`
+        const body = try p.loopBody();
+        if (p.tok.tag != .kw_while) return p.fail(.{ .syntax_error = "expected 'while'" }, p.tok);
+        try p.advance(); // `while`
+        const cond = try p.condition();
+        const end = p.tok;
+        // ES6+ unconditionally inserts `;` after `do ... while (cond)` even without a
+        // newline, so only tokens that cannot start a statement are SyntaxErrors.
+        if (p.tok.tag == .semicolon) {
+            try p.advance();
+        } else {
+            const certain = switch (p.tok.tag) {
+                .r_paren, .r_bracket, .comma, .colon, .eq, .star, .star_star, .percent, .eq3, .neq3, .eq2, .neq2, .lt, .le, .gt, .ge, .amp_amp, .pipe_pipe, .question2, .question, .question_dot, .arrow, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .star_star_eq, .shl_eq, .shr_eq, .ushr_eq, .amp_eq, .pipe_eq, .caret_eq, .amp_amp_eq, .pipe_pipe_eq, .question2_eq => true,
+                else => false,
+            };
+            if (certain) return p.fail(.{ .syntax_error = "unexpected token after do-while" }, p.tok);
+            return p.fail(.{ .unsupported = .asi }, p.tok);
+        }
+        return .{ .span = .{ .start = start, .end = end.end }, .data = .{ .do_while = .{ .body = body, .cond = cond } } };
+    }
+
+    fn switchStatement(p: *Parser) Error!ast.Stmt {
+        const start = p.tok.start;
+        try p.advance(); // `switch`
+        const discriminant = try p.condition();
+        const open = p.tok;
+        if (open.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{'" }, open);
+        try p.advance();
+
+        p.switch_depth += 1;
+        defer p.switch_depth -= 1;
+
+        var cases: std.ArrayList(ast.SwitchCase) = .empty;
+        var has_default = false;
+        while (p.tok.tag != .r_brace) {
+            if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated switch statement" }, open);
+            var test_expr: ?*const ast.Expr = null;
+            if (p.isText(p.tok, "case")) {
+                try p.advance();
+                test_expr = try p.expression();
+                if (p.tok.tag != .colon) return p.fail(.{ .syntax_error = "expected ':'" }, p.tok);
+                try p.advance();
+            } else if (p.isText(p.tok, "default")) {
+                if (has_default) return p.fail(.{ .syntax_error = "more than one default clause in switch" }, p.tok);
+                has_default = true;
+                try p.advance();
+                if (p.tok.tag != .colon) return p.fail(.{ .syntax_error = "expected ':'" }, p.tok);
+                try p.advance();
+            } else {
+                return p.fail(.{ .syntax_error = "expected 'case' or 'default'" }, p.tok);
+            }
+            var body: std.ArrayList(ast.Stmt) = .empty;
+            while (p.tok.tag != .r_brace and p.tok.tag != .eof and !p.isText(p.tok, "case") and !p.isText(p.tok, "default")) {
+                try body.append(p.arena, try p.statementListItem(.block));
+            }
+            try cases.append(p.arena, .{ .test_expr = test_expr, .body = body.items });
+        }
+        const close = p.tok;
+        try p.advance();
+        return .{ .span = .{ .start = start, .end = close.end }, .data = .{ .@"switch" = .{ .discriminant = discriminant, .cases = cases.items } } };
     }
 
     /// `return;` / `return value;`. A line break after `return` means ASI (`return;`),
@@ -422,10 +496,13 @@ const Parser = struct {
 
         if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{'" }, p.tok);
         const outer_loops = p.loop_depth;
+        const outer_switches = p.switch_depth;
         p.loop_depth = 0;
+        p.switch_depth = 0;
         p.function_depth += 1;
         defer {
             p.loop_depth = outer_loops;
+            p.switch_depth = outer_switches;
             p.function_depth -= 1;
         }
         const parsed_body = try p.parseFunctionBody();
@@ -570,10 +647,13 @@ const Parser = struct {
         try p.advance(); // `=>`
 
         const outer_loops = p.loop_depth;
+        const outer_switches = p.switch_depth;
         p.loop_depth = 0;
+        p.switch_depth = 0;
         p.function_depth += 1;
         defer {
             p.loop_depth = outer_loops;
+            p.switch_depth = outer_switches;
             p.function_depth -= 1;
         }
 
@@ -696,6 +776,12 @@ const Parser = struct {
                 // only member deletion is part of ZQJS.
                 if (operand.data != .member) return p.fail(.{ .unsupported = .syntax }, t);
                 return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .delete = operand.data.member }, operand.depth);
+            } else if (p.isText(t, "typeof")) {
+                try p.advance();
+                const operand = try p.binary(unary_bp);
+                if (p.tok.tag == .star_star)
+                    return p.fail(.{ .syntax_error = "unary operator before '**' needs parentheses" }, t);
+                return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .unary = .{ .op = .typeof, .operand = operand } }, operand.depth);
             } else return p.postfix(try p.calls(try p.primary())),
             else => return p.postfix(try p.calls(try p.primary())),
         }
@@ -767,6 +853,8 @@ const Parser = struct {
                 callee = try p.callArgs(callee);
             } else if (try p.memberStep(callee)) |next| {
                 callee = next;
+            } else if (p.tok.tag == .template_no_sub or p.tok.tag == .template_head) {
+                return p.fail(.{ .unsupported = .syntax }, p.tok); // tagged template
             } else return callee;
         }
     }
@@ -933,6 +1021,7 @@ const Parser = struct {
                 try p.advance();
                 return p.node(s, .{ .string = units }, 0);
             },
+            .template_no_sub, .template_head => return p.templateLiteral(),
             .kw_true, .kw_false => {
                 try p.advance();
                 return p.node(s, .{ .boolean = t.tag == .kw_true }, 0);
@@ -1024,11 +1113,55 @@ const Parser = struct {
         return p.failAt(.{ .limit_exceeded = .nesting_depth }, start, end);
     }
 
+    fn templateLiteral(p: *Parser) Error!*const ast.Expr {
+        try p.enter();
+        defer p.depth -= 1;
+
+        const start = p.tok.start;
+        var quasis: std.ArrayList([]const u16) = .empty;
+        var exprs: std.ArrayList(*const ast.Expr) = .empty;
+        var max_depth: u16 = 0;
+
+        if (p.tok.tag == .template_no_sub) {
+            const t = p.tok;
+            try quasis.append(p.arena, try p.decodeEscapes(p.source()[t.start + 1 .. t.end - 1], t.start + 1, true));
+            try p.advance();
+            return p.node(span(t, t), .{ .template = .{ .quasis = quasis.items, .exprs = exprs.items } }, 0);
+        }
+
+        // `.template_head`: ends with `${`
+        const head = p.tok;
+        try quasis.append(p.arena, try p.decodeEscapes(p.source()[head.start + 1 .. head.end - 2], head.start + 1, true));
+        try p.advance();
+
+        while (true) {
+            const expr = try p.nested();
+            max_depth = @max(max_depth, expr.depth);
+            try exprs.append(p.arena, expr);
+
+            if (p.tok.tag != .r_brace) return p.unexpectedAfterExpression(p.tok);
+            // Lex the rest of the template starting right after `}`, before advancing.
+            p.tok = try p.lexer.nextTemplatePart();
+            const part = p.tok;
+            if (part.tag == .template_tail) {
+                try quasis.append(p.arena, try p.decodeEscapes(p.source()[part.start .. part.end - 1], part.start, true));
+                try p.advance();
+                return p.node(.{ .start = start, .end = part.end }, .{ .template = .{ .quasis = quasis.items, .exprs = exprs.items } }, max_depth);
+            }
+            // `.template_middle`: ends with `${`
+            try quasis.append(p.arena, try p.decodeEscapes(p.source()[part.start .. part.end - 2], part.start, true));
+            try p.advance();
+        }
+    }
+
     /// Decodes a string literal token (quotes included) to UTF-16 code units
     /// (LANGUAGE.md §3). The lexer has already found the closing quote.
     fn decodeString(p: *Parser, t: Token) Error![]const u16 {
         const base = t.start + 1;
-        const s = p.source()[base .. t.end - 1];
+        return p.decodeEscapes(p.source()[base .. t.end - 1], base, false);
+    }
+
+    fn decodeEscapes(p: *Parser, s: []const u8, base: u32, is_template: bool) Error![]const u16 {
         var out: std.ArrayList(u16) = .empty;
         // Every source byte yields at most one code unit (a 4-byte UTF-8 sequence or a
         // `\u{…}` escape yields two), so one allocation suffices.
@@ -1041,6 +1174,12 @@ const Parser = struct {
                 const cp, const len = try p.decodeUtf8(s, i, base);
                 appendCodePoint(&out, cp);
                 i += len;
+                continue;
+            }
+            if (is_template and c == '\r') {
+                // JS template TV normalizes raw CR and CRLF to LF.
+                out.appendAssumeCapacity('\n');
+                i += if (i + 1 < s.len and s[i + 1] == '\n') 2 else 1;
                 continue;
             }
             if (c != '\\') {

@@ -83,7 +83,7 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `function_properties` | not yet | `f.x`, `f.length`, `print.name` | functions aren't objects yet |
 | `primitive_write` | restriction | `'s'.x = 1`, `delete 'ab'.length` | sloppy JS silently ignores these |
 | `labels` | not yet | `foo: while (…)`, `break foo;` | |
-| `syntax` | not yet | `?:`, `,`, `~`, `&&=`, `var`, `do`, destructuring, `for…of/in`, `let` used as a variable name, default/rest parameters, generators, `async`, `this`, `new`, regexes … | any JS token or construct not yet in the grammar below |
+| `syntax` | not yet | `,`, `~`, `&&=`, `var`, destructuring, `for…in`, `let` used as a variable name, default/rest parameters, tagged templates, generators, `async`, regexes … | any JS token or construct not yet in the grammar below |
 
 ## 3. Lexical grammar (M1)
 
@@ -132,10 +132,13 @@ Statement         := ';'                                   (empty statement)
                    | '{' StatementListItem* '}'            (block)
                    | 'if' '(' Expression ')' Statement ('else' Statement)?
                    | 'while' '(' Expression ')' Statement
+                   | 'do' Statement 'while' '(' Expression ')' ';'
+                   | 'switch' '(' Expression ')' '{' CaseClause* '}'
                    | 'for' '(' ForInit? ';' Expression? ';' Expression? ')' Statement
-                   | 'break' ';' | 'continue' ';'          (only inside a loop of the same function)
+                   | 'break' ';' | 'continue' ';'          (break in loop/switch; continue in loop)
                    | 'return' Expression? ';'              (only inside a function)
                    | Expression ';'
+CaseClause        := ('case' Expression | 'default') ':' StatementListItem*
 ForInit           := ('let' | 'const') Declarator (',' Declarator)* | Expression
 Expression        := Identifier AssignOp Expression | ArrowFunction | Logical   (right-associative)
 ArrowFunction     := (Identifier | Params) '=>' (Body | Expression)   (no line break before '=>')
@@ -147,9 +150,9 @@ Relational        := Relational ('<' | '<=' | '>' | '>=') Additive | Additive
 Additive          := Additive ('+' | '-') Mult | Mult
 Mult              := Mult ('*' | '/' | '%') Exp | Exp
 Exp               := Unary | Postfix '**' Exp               (right-associative)
-Unary             := ('-' | '+' | '!') Unary | ('++' | '--') Unary | 'delete' Member | Postfix
+Unary             := ('-' | '+' | '!' | 'typeof') Unary | ('++' | '--') Unary | 'delete' Member | Postfix
 Postfix           := Primary ('++' | '--')?                 (no line break before ++/--)
-Primary           := Number | String | 'true' | 'false' | 'null' | Identifier
+Primary           := Number | String | Template | 'true' | 'false' | 'null' | Identifier
                    | '[' (Expression (',' Expression)* ','?)? ']'      (array, no holes)
                    | '{' (PropDef (',' PropDef)* ','?)? '}'            (object)
                    | 'this'                                (only inside functions)

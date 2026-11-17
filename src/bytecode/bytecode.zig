@@ -65,6 +65,8 @@ pub const Op = enum(u8) {
 
     /// Push the global `name`; ReferenceError if there is none.
     get_global,
+    /// Push the global `name`, or `undefined` if there is none (for `typeof undeclared`).
+    get_global_or_undefined,
 
     // ---- cells: slots holding captured bindings (same checks as the *_local forms)
     /// Put a fresh cell (in the TDZ) into slot s: emitted on scope entry, so every
@@ -149,6 +151,7 @@ pub const Op = enum(u8) {
     /// ToNumber: unary `+`, and the first step of `++`/`--`.
     to_number,
     not,
+    typeof,
     /// Number + 1 / number - 1. The operand is always the result of `to_number`.
     inc,
     dec,
@@ -213,7 +216,7 @@ pub const Op = enum(u8) {
             .set_local, .assign_const => .{ .operands = &.{ .slot, .name }, .pops = 1, .pushes = 1 },
             .init_local => .{ .operands = &.{.slot}, .pops = 1, .pushes = 0 },
             .clear_local => .{ .operands = &.{.slot}, .pops = 0, .pushes = 0 },
-            .get_global => .{ .operands = &.{.name}, .pops = 0, .pushes = 1 },
+            .get_global, .get_global_or_undefined => .{ .operands = &.{.name}, .pops = 0, .pushes = 1 },
             .new_cell, .box_local, .fresh_cell => .{ .operands = &.{.slot}, .pops = 0, .pushes = 0 },
             .get_cell => .{ .operands = &.{ .slot, .name }, .pops = 0, .pushes = 1 },
             .set_cell, .assign_const_cell => .{ .operands = &.{ .slot, .name }, .pops = 1, .pushes = 1 },
@@ -240,7 +243,7 @@ pub const Op = enum(u8) {
             .push_this => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
             .call_method => .{ .operands = &.{.argc}, .pops = 2, .pushes = 1 },
             .add, .sub, .mul, .div, .mod, .pow, .lt, .le, .gt, .ge, .strict_eq, .strict_ne => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
-            .neg, .to_number, .not, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .neg, .to_number, .not, .typeof, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .jump => .{ .operands = &.{.target}, .pops = 0, .pushes = 0 },
             .jump_if_false, .jump_if_true => .{ .operands = &.{.target}, .pops = 1, .pushes = 0 },
             .get_iter => .{ .operands = &.{}, .pops = 1, .pushes = 1 },

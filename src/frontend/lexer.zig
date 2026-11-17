@@ -42,6 +42,9 @@ pub const Lexer = struct {
             try l.string(c);
             return l.make(.string, start, newline_before);
         }
+        if (c == '`') {
+            return l.templatePart(start, newline_before, false);
+        }
         if (c >= 0x80) {
             const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
             return l.fail(.{ .unsupported = .non_ascii_source }, start, @min(start + len, l.source.len));
@@ -155,6 +158,33 @@ pub const Lexer = struct {
             l.pos += 1;
         }
     }
+
+    /// Scans the rest of a template literal starting right after `${...}`'s `}`.
+    pub fn nextTemplatePart(l: *Lexer) Error!Token {
+        return l.templatePart(l.pos, false, true);
+    }
+
+    fn templatePart(l: *Lexer, start: u32, newline_before: bool, is_continuation: bool) Error!Token {
+        if (!is_continuation) l.pos += 1; // skip opening `` ` ``
+        while (true) {
+            if (l.pos >= l.source.len) return l.fail(.{ .syntax_error = "unterminated template literal" }, start, l.pos);
+            const c = l.source[l.pos];
+            if (c == '`') {
+                l.pos += 1;
+                return l.make(if (is_continuation) .template_tail else .template_no_sub, start, newline_before);
+            }
+            if (c == '$' and l.peekAt(l.pos + 1) == '{') {
+                l.pos += 2;
+                return l.make(if (is_continuation) .template_middle else .template_head, start, newline_before);
+            }
+            if (c == '\\') {
+                l.pos += 1;
+                if (l.pos >= l.source.len) continue;
+                if (l.source[l.pos] == '\r' and l.peekAt(l.pos + 1) == '\n') l.pos += 1;
+            }
+            l.pos += 1;
+        }
+    }
 };
 
 fn keyword(s: []const u8) Tag {
@@ -214,7 +244,8 @@ test "longest match" {
     try expectTags("1 === 2 !== 3 == 4", &.{ .number, .eq3, .number, .neq3, .number, .eq2, .number });
     try expectTags(">>>= >>> >> >", &.{ .ushr_eq, .ushr, .shr, .gt });
     try expectTags("<!-- x", &.{ .unknown, .identifier });
-    try expectTags("# @ ` \\", &.{ .unknown, .unknown, .unknown, .unknown });
+    try expectTags("# @ \\", &.{ .unknown, .unknown, .unknown });
+    try expectTags("`a`", &.{.template_no_sub});
 }
 
 test "numbers" {

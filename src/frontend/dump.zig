@@ -89,6 +89,31 @@ const Dumper = struct {
                 try d.stmt(wh.body.*);
                 try w.writeByte(')');
             },
+            .do_while => |dw| {
+                try w.writeAll("(do-while ");
+                try d.stmt(dw.body.*);
+                try w.writeByte(' ');
+                try d.expr(dw.cond);
+                try w.writeByte(')');
+            },
+            .@"switch" => |sw| {
+                try w.writeAll("(switch ");
+                try d.expr(sw.discriminant);
+                for (sw.cases) |c| {
+                    if (c.test_expr) |te| {
+                        try w.writeAll(" (case ");
+                        try d.expr(te);
+                    } else {
+                        try w.writeAll(" (default");
+                    }
+                    for (c.body) |st| {
+                        try w.writeByte(' ');
+                        try d.stmt(st);
+                    }
+                    try w.writeByte(')');
+                }
+                try w.writeByte(')');
+            },
             .@"for" => |f| {
                 try w.writeAll("(for ");
                 if (f.init) |init| switch (init) {
@@ -227,6 +252,17 @@ const Dumper = struct {
         switch (e.data) {
             .number => |n| try w.print("{d}", .{n}),
             .string => |units| try d.string(units),
+            .template => |t| {
+                try w.writeAll("(template ");
+                try d.string(t.quasis[0]);
+                for (t.exprs, 0..) |ex, i| {
+                    try w.writeByte(' ');
+                    try d.expr(ex);
+                    try w.writeByte(' ');
+                    try d.string(t.quasis[i + 1]);
+                }
+                try w.writeByte(')');
+            },
             .boolean => |b| try w.writeAll(if (b) "true" else "false"),
             .null => try w.writeAll("null"),
             .identifier => |r| try d.ref(r),

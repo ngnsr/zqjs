@@ -176,6 +176,16 @@ pub const promise_global: Native = .{ .name = "Promise", .call = promiseWithoutN
 /// A global read: implemented, host-registered (M9.1, D53), known to node (Unsupported),
 /// or a ReferenceError.
 pub fn global(rt: *Runtime, name: []const u8) Error!Value {
+    return (try lookupGlobal(rt, name)) orelse
+        rt.throw(.ReferenceError, &.{ .{ .ascii = name }, .{ .ascii = " is not defined" } });
+}
+
+/// Non-throwing global lookup for `typeof undeclared`: returns `undefined` if unknown.
+pub fn tryGlobal(rt: *Runtime, name: []const u8) Error!Value {
+    return (try lookupGlobal(rt, name)) orelse .undefined;
+}
+
+fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "undefined")) return .undefined;
     if (std.mem.eql(u8, name, "NaN")) return .{ .number = std.math.nan(f64) };
     if (std.mem.eql(u8, name, "Infinity")) return .{ .number = std.math.inf(f64) };
@@ -192,7 +202,7 @@ pub fn global(rt: *Runtime, name: []const u8) Error!Value {
         rt.unsupported_name = try rt.heap.internAscii(name);
         return rt.fail(.builtin);
     }
-    return rt.throw(.ReferenceError, &.{ .{ .ascii = name }, .{ .ascii = " is not defined" } });
+    return null;
 }
 
 /// Whether `name` is already a built-in or node-known global name (D53: duplicate

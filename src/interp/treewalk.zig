@@ -280,12 +280,65 @@ const Interpreter = struct {
                     .@"return" => return .@"return",
                 }
             },
+            .do_while => |dw| while (true) {
+                try it.rt.step();
+                switch (try it.exec(dw.body.*)) {
+                    .normal, .@"continue" => {},
+                    .@"break" => break,
+                    .@"return" => return .@"return",
+                }
+                if (!ops.toBoolean(try it.eval(dw.cond))) break;
+            },
+            .@"switch" => |sw| return it.execSwitch(sw),
             .@"for" => |f| return it.execFor(f),
             .for_of => |f| return it.execForOf(f),
             .@"break" => return .@"break",
             .@"continue" => return .@"continue",
             .throw => |e| return it.rt.throwValue(try it.eval(e)),
             .@"try" => |t| return it.execTry(t),
+        }
+        return .normal;
+    }
+
+    fn execSwitch(it: *Interpreter, sw: @FieldType(ast.Stmt.Data, "switch")) Error!Completion {
+        const balanced = it.mark();
+        defer it.release(balanced);
+        const disc = try it.eval(sw.discriminant);
+        try it.hold(disc);
+
+        const saved = it.env;
+        defer it.env = saved;
+        var scope: ?u32 = null;
+        for (sw.cases) |c| {
+            if (it.scopeOf(c.body)) |sc| {
+                scope = sc;
+                break;
+            }
+        }
+        try it.pushScope(scope);
+
+        var match_idx: ?usize = null;
+        var default_idx: ?usize = null;
+        for (sw.cases, 0..) |c, i| {
+            if (c.test_expr) |te| {
+                if (ops.strictEquals(disc, try it.eval(te))) {
+                    match_idx = i;
+                    break;
+                }
+            } else {
+                default_idx = i;
+            }
+        }
+        const start_idx = match_idx orelse default_idx orelse return .normal;
+        for (sw.cases[start_idx..]) |c| {
+            for (c.body) |s| {
+                switch (try it.exec(s)) {
+                    .normal => {},
+                    .@"break" => return .normal,
+                    .@"continue" => return .@"continue",
+                    .@"return" => return .@"return",
+                }
+            }
         }
         return .normal;
     }
@@ -390,15 +443,38 @@ const Interpreter = struct {
             // shortcut: allocates a new string on every evaluation (D30); the VM's constant
             // pool creates each literal once.
             .string => |units| return .{ .string = try rt.heap.newString(&.{.{ .utf16 = units }}) },
+            .template => |t| {
+                var acc: Value = .{ .string = try rt.heap.newString(&.{.{ .utf16 = t.quasis[0] }}) };
+                try it.hold(acc);
+                for (t.exprs, 0..) |ex, i| {
+                    const v = try it.eval(ex);
+                    acc = try ops.binary(rt, .add, acc, v);
+                    try it.hold(acc);
+                    if (t.quasis[i + 1].len > 0) {
+                        const q: Value = .{ .string = try rt.heap.newString(&.{.{ .utf16 = t.quasis[i + 1] }}) };
+                        try it.hold(q);
+                        acc = try ops.binary(rt, .add, acc, q);
+                        try it.hold(acc);
+                    }
+                }
+                return acc;
+            },
             .boolean => |b| return .{ .boolean = b },
             .null => return .null,
             .identifier => |ref| return it.read(ref),
             .unary => |u| {
+                if (u.op == .typeof and u.operand.data == .identifier) {
+                    const ref = u.operand.data.identifier;
+                    if (it.res.refs[ref.id] == .global) {
+                        return ops.typeOf(rt, try builtins.tryGlobal(rt, ref.name));
+                    }
+                }
                 const v = try it.eval(u.operand);
                 return switch (u.op) {
                     .neg => .{ .number = -(try ops.toNumber(rt, v)) },
                     .plus => .{ .number = try ops.toNumber(rt, v) },
                     .not => .{ .boolean = !ops.toBoolean(v) },
+                    .typeof => ops.typeOf(rt, v),
                 };
             },
             .binary => |b| return it.evalBinary(b),

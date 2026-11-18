@@ -1222,7 +1222,8 @@ Stable across `map`, `forEach`, `sort` comparators and callbacks with more local
 **14×** with the build mode and **7×** between engines, and the stack available varies with the
 host's thread (8 MiB main thread, 512 KiB macOS pthread default, 1 MiB Windows, 16 MiB
 `std.Thread` default). An 8 MiB stack holds ~110 crossings in Debug on the tree-walker.
-Async coroutine starts were not measured: M28b isn't written yet (`m28b-async` == `main`).
+Async coroutine starts weren't measured separately; `async function f(n) { return f(n + 1); }`
+overflowed the same way before this entry.
 
 **Decision: a byte budget, checked against the real stack pointer.**
 - New limit `max_native_stack_bytes`, default **4 MiB**, and `Limit.native_stack`.
@@ -1230,7 +1231,8 @@ Async coroutine starts were not measured: M28b isn't written yet (`m28b-async` =
   `rt.stack_base = @frameAddress()`.
 - One helper, `rt.checkNativeStack()`, runs at every crossing before it nests:
   `rt.callCallable` (the one funnel to both engines' `callFromBuiltin` and `callStandalone`),
-  the nested path of the API's `rt.call`, and, from M28b, the coroutine start/resume. It faults with `LimitExceeded(native_stack)` when
+  the nested path of the API's `rt.call`, and the async coroutine's `start`/`resumeCoroutine`
+  (`src/runtime/coroutine.zig`; a fault on resume leaves the coroutine suspended). It faults with `LimitExceeded(native_stack)` when
   `stack_base - @frameAddress() > max_native_stack_bytes`. The fault is uncatchable like the
   other limits and unwinds the same way `call_depth` does today, so nothing new is needed.
 - Engine- and mode-independent: bytes are bytes, so no per-engine constant to keep measured.
@@ -1244,8 +1246,8 @@ Async coroutine starts were not measured: M28b isn't written yet (`m28b-async` =
   ~1 100. Deep recursion *through callbacks* is rare in real code; Node allows ~11k but does
   not nest native frames per crossing like model B does.
 - Test: `tests/interpreter_test.zig` "native→JS recursion stops cleanly even when the host
-  thread has a tiny stack": 256 KiB thread, budget 128 KiB, both engines expect
-  `LimitExceeded(native_stack)`. Before this entry it crashed the `interpreter_test` binary.
+  thread has a tiny stack": 256 KiB thread, budget 128 KiB, `map` and plain `async`
+  recursion, both engines expect `LimitExceeded(native_stack)`. Before this entry it crashed the `interpreter_test` binary.
 - C API: `ZQJS_LIMIT_NATIVE_STACK` (12) reports the fault, but `zqjs_limits` gets no field:
   it is embedded in the versioned `zqjs_options` before trailing fields, so a new field would
   move them. C hosts get the default until the options struct is versioned for it.

@@ -1093,9 +1093,100 @@ EMBEDDING.md must state explicitly:
 C API version: `ZQJS_ABI_VERSION` 1.2.0 (additive). Tests: a C host that runs a 60-frame loop
 where scripts `await` frame timers, with leaks and handle counts checked after teardown.
 
-## D58. Milestone order for D55–D57
+## D58. Milestone order for D55–D57 *(revised by D59: M28 splits into M28a, the tree-walker rewrite, and M28b, async on both engines)*
 M27 `try…finally` (both engines), M28 `async`/`await` (VM; tree-walker per D56's decision),
 M29 host promises. M27 is independent and can start immediately; M28 depends on M27 (an
 `await` inside `finally` must keep the pending record) and on D56's review; M29 depends on M28.
 `class` waits for functions as objects (`.prototype`, `new` on user functions, `this` binding
 in constructors), which gets its own design entry after M29.
+
+## D59. The tree-walker on an explicit work stack *(M28a; approved 2026-11-18; replaces D37's "Native recursion" and pays its debt)*
+**Why now.** D37 made every JS construct a Zig call, so the tree-walker needs a dedicated 64 MiB
+thread (~14.5 MB of native stack in Debug at the depth limit), and it can't suspend in the
+middle of an evaluation. D56 needs suspension for `await`; generators and the M11 debugger
+stepping the oracle would need it too. D56's "VM-only" fallback would make `async` the first
+feature the oracle can't check. Decision (2026-11-18): rewrite the tree-walker first, so both
+engines implement M28's `async`.
+
+**What stays (the oracle stays independent of the VM, D16/D37).** It still evaluates the AST
+directly, still keeps spec environment records (`heap.Env`) and per-iteration copies, and still
+ignores the resolver's capture analysis. Exception messages and the M25 error objects are
+unchanged, and the shared `ops.zig`/`object.zig`/`builtins.zig` semantics too. The rewrite
+changes *how* the walk is driven, not what it computes.
+
+**Decision: a machine with two explicit stacks.**
+- `tasks: ArrayList(Task)`: each `Task` is a tagged union naming an AST node plus the small
+  state needed to continue it, for example `eval { expr }`, `binary_rhs { expr }` (the lhs
+  value is already on `values`), `call_args { expr, next }`, `block { stmts, next }`,
+  `loop_test { stmt }`, `scope_exit { saved_env }`, `call_return { saved_env, saved_this,
+  call_marker }`, `try_region`/`finally_dispatch` (D55's semantics), `barrier`.
+- `values: ArrayList(Value)`: intermediate results, like the VM's operand stack.
+
+The run loop pops a task, does a bounded amount of work, and pushes follow-up tasks. A JS→JS
+call pushes a `call_return` task and the body's tasks. **No JS construct nests a Zig call**, so
+native stack use is constant per JS nesting level.
+
+**Abrupt completions.** D29's `Completion` becomes an *unwind*: `break`/`continue` pop tasks to
+the matching loop or `switch` task, `return` to the nearest `call_return`, and `throw` to the
+nearest `try_region` (catch). D55's `finally` keeps its semantics: a `finally` task on the way
+holds the pending completion in its own fields (rooted, see below), runs the `finally` body,
+then re-performs the completion or lets the body's own abrupt completion win. Uncatchable
+faults (`LimitExceeded`, `OutOfMemory`, `Unsupported`, `Internal`) are still Zig errors: they
+abandon the machine's stacks entirely, as today.
+
+**Natives that call JS (M16) and host calls (D51).** `callFromBuiltin` pushes a `barrier` task
+and the call's tasks onto the **same** machine, then runs a nested loop until the barrier is
+popped. Unwinding never crosses a barrier: a `throw` that reaches one returns `error.Thrown` to
+the native, a `return` at the barrier is the call's result. Native → JS → native chains nest
+one Zig frame of the run loop per native crossing, which is the same shape as the VM's model B
+(D51) and bounded by `max_call_depth`.
+
+**Limits and step counts stay identical.** `rt.step()` is charged exactly where the recursive
+interpreter charges it: once per statement and per expression evaluation it starts. So step
+counts are unchanged, and every existing step-limit test passes unchanged. `depth` (for
+`max_interpreter_depth`) counts the same nesting the recursion counted: it goes up when an
+`eval`/`exec`/`call` task starts and down when its continuation finishes. `interpreter_depth`
+faults happen at the same programs as before (`tests/interpreter_test.zig:255` unchanged).
+Since depth no longer costs native stack, the default could rise later; that's a separate,
+documented change.
+
+**GC.** The machine is an `EngineRoots` root set: every Value on `values`, every Value, Env or
+object held in a `Task`, the current `env`, `this` and the pending completion values. The
+shadow stack (`hold`/`release`, D10) goes away for the walk itself, because nothing lives in
+Zig locals across a safepoint any more. Safepoints stay at task boundaries, exactly where
+`safepoint()` runs now.
+
+**The thread goes away.** `runOnOwnStack` and `stack_bytes` are deleted; the tree-walker runs
+on the caller's thread. Existing test, kept: worst-case recursion from a 256 KiB host thread on
+both engines. New test: native stack use measured at depth 10 and at depth
+`max_interpreter_depth` differs by less than a fixed bound (a few KiB, the nested-loop frame).
+The D37 stack-measurement test is replaced by this one.
+
+**Suspension (what M28b uses).** An async call runs on its own `Machine` (mirroring D56's
+coroutine VM): the coroutine heap object owns it, `await` returns from the run loop with
+`.awaiting`, and resume pushes the value or starts an unwind at the `await`'s task. D56's five
+invariants apply word for word, with "VM" read as "machine" (`Machine.ownedBytes()` covers
+`tasks` and `values`).
+
+**Performance budget.** The tree-walker is the oracle, not the shipped engine, so it may be
+slower, but not by more than 1.5x on `bench/` (closures, fib, loop, objects, scopes, strings),
+measured against the recursive version before it is deleted. More than that blocks the merge
+until profiled.
+
+**How it is built (M28a).** The new interpreter is written in a new file,
+`src/interp/machine.zig`, while `treewalk.zig` stays as the reference. `Engine.treewalk`
+switches to it only when **the entire existing suite passes unchanged** on it: every diff,
+syntax, GC, stress and API test, the same step counts and the same limit faults. Then
+`treewalk.zig` is deleted in the same milestone, so there is never a second oracle to keep in
+sync. D37's "Native recursion" paragraph and ROADMAP's technical-debt row are closed by this
+entry.
+
+*Alternatives considered.* (1) **VM-only `async`** (D56's original fallback): fastest, but the
+oracle stops covering the newest features exactly where bugs are most likely. (2) **A native
+stack per pending async call** (threads or context switching): no general rewrite, but
+platform-specific, heavy per call, and it keeps the 64 MiB recursion. (3) **CPS-converting the
+recursive interpreter with Zig closures:** Zig has no closures, so it ends up as this task
+union written less directly.
+
+**M-order (D58 revised):** M28a explicit-stack tree-walker → M28b `async`/`await` on both
+engines (D56) → M29 host promises (D57).

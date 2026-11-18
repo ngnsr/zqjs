@@ -1,0 +1,54 @@
+a1: 0 0
+eval:a2
+a2: 42 42
+b1: 5 5
+eval:b2
+b2: ok ok
+c1: 0 0
+c2: false false
+c3:  
+eval:c4
+c4: from-null from-null
+eval:c5
+c5: from-undef from-undef
+chain: 7 7 7 7
+obj:1
+m1: 0 0
+obj:2
+eval:m2
+m2: 2 2
+obj:3
+m3: 2 2
+obj:4
+key:5
+eval:m4
+m4: 4 4
+obj:6
+key:7
+m5: 4 4
+obj:8
+key:9
+eval:m6
+m6: 6 6
+obj:10
+eval:m7
+m7: 7 7
+key:11
+arr0: 0 0
+key:12
+arr1: 1 1
+key:13
+eval:arr2
+arr2: 33 33
+const-ok: 0 1 false
+eval:w1-rhs
+w1: TypeError
+eval:w2-rhs
+w2: TypeError
+eval:w3-rhs
+w3: TypeError
+tdz: ReferenceError
+bad: TypeError
+eval:init-v
+cap1: 100 100
+cap2: 0

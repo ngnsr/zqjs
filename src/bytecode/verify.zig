@@ -287,6 +287,14 @@ test "every rule rejects malformed code" {
     try expectInvalid(enc(.{ .new_object, .get_prop, 1, .pop, .halt }), 1, "name index out of range");
     // Two paths reach offset 7 (`halt`), one with an extra value on the stack.
     try expectInvalid(enc(.{ .push_true, .jump_if_false, 7, .push_null, .halt }), 1, "inconsistent stack depth where paths meet");
+    // M22: bitwise opcodes pop 2 / 1 and push 1.
+    try expectInvalid(enc(.{ .push_null, .shl, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .push_null, .shr, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .push_null, .ushr, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .push_null, .bit_and, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .push_null, .bit_xor, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .push_null, .bit_or, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .bit_not, .pop, .halt }), 1, "stack underflow");
 }
 
 test "limits are checked again, and constants must be numbers or strings" {

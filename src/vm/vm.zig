@@ -674,7 +674,7 @@ pub const Vm = struct {
                 try cache.push(vm, vm.frame().this orelse return rt.fail(.sloppy_this));
             },
 
-            .add, .sub, .mul, .div, .mod, .pow, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in => {
+            .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in => {
                 // M10.2b/M10.2c: fast path when both operands are already `.number` (`f64`),
                 // matching IEEE-754 / JS semantics for NaN, infinities, and -0. All mixed or
                 // out-of-domain cases fall back to `ops.binary`.
@@ -686,6 +686,12 @@ pub const Vm = struct {
                     .mul => .{ .number = lhs.number * rhs.number },
                     .div => .{ .number = lhs.number / rhs.number },
                     .mod => .{ .number = fastRemainder(lhs.number, rhs.number) },
+                    .shl => .{ .number = ops.bitShl(lhs.number, rhs.number) },
+                    .shr => .{ .number = ops.bitShr(lhs.number, rhs.number) },
+                    .ushr => .{ .number = ops.bitUshr(lhs.number, rhs.number) },
+                    .bit_and => .{ .number = ops.bitAnd(lhs.number, rhs.number) },
+                    .bit_xor => .{ .number = ops.bitXor(lhs.number, rhs.number) },
+                    .bit_or => .{ .number = ops.bitOr(lhs.number, rhs.number) },
                     .lt => .{ .boolean = lhs.number < rhs.number },
                     .le => .{ .boolean = lhs.number <= rhs.number },
                     .gt => .{ .boolean = lhs.number > rhs.number },
@@ -701,12 +707,13 @@ pub const Vm = struct {
             // Compute into a local, then store. `top().* = .{ .number = f(peek(0)) }` would
             // be wrong: Zig builds the union in place, so the slot's tag changes *before*
             // f reads the old value through peek (result-location aliasing).
-            .neg, .to_number, .not, .typeof => {
+            .neg, .to_number, .not, .bit_not, .typeof => {
                 const v = try cache.peek(vm, 0);
                 const r: Value = switch (op) {
                     .neg => .{ .number = if (v == .number) -v.number else -(try ops.toNumber(rt, v)) },
                     .to_number => if (v == .number) v else .{ .number = try ops.toNumber(rt, v) },
                     .not => .{ .boolean = !ops.toBoolean(v) },
+                    .bit_not => .{ .number = ops.bitNot(if (v == .number) v.number else try ops.toNumber(rt, v)) },
                     .typeof => try ops.typeOf(rt, v),
                     else => unreachable,
                 };
@@ -1059,6 +1066,12 @@ fn binaryOp(op: Op) BinaryOp {
         .div => .div,
         .mod => .mod,
         .pow => .pow,
+        .shl => .shl,
+        .shr => .shr,
+        .ushr => .ushr,
+        .bit_and => .bit_and,
+        .bit_xor => .bit_xor,
+        .bit_or => .bit_or,
         .lt => .lt,
         .le => .le,
         .gt => .gt,

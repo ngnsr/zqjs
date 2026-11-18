@@ -81,7 +81,7 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `function_properties` | not yet | `f.x`, `f.length`, `print.name` | functions aren't objects yet |
 | `primitive_write` | restriction | `'s'.x = 1`, `delete 'ab'.length` | sloppy JS silently ignores these |
 | `labels` | not yet | `foo: while (…)`, `break foo;` | |
-| `syntax` | not yet | `,`, `~`, `&&=`, `var`, destructuring, `for…in`, `let` used as a variable name, default/rest parameters, tagged templates, generators, `async`, regexes … | any JS token or construct not yet in the grammar below |
+| `syntax` | not yet | `,`, `??`, `var`, destructuring, `for…in`, `let` used as a variable name, default/rest parameters, tagged templates, generators, `async`, regexes … | any JS token or construct not yet in the grammar below |
 
 ## 3. Lexical grammar (M1)
 
@@ -144,14 +144,19 @@ ForInit           := ('let' | 'const') Declarator (',' Declarator)* | Expression
 Expression        := Identifier AssignOp Expression | ArrowFunction | Logical   (right-associative)
 ArrowFunction     := (Identifier | Params) '=>' (Body | Expression)   (no line break before '=>')
 AssignOp          := '=' | '+=' | '-=' | '*=' | '/=' | '%=' | '**='
+                   | '<<=' | '>>=' | '>>>=' | '&=' | '^=' | '|=' | '&&=' | '||=' | '??='
 Logical           := Logical ('||' | '&&') Logical          (&& binds tighter than ||)
-                   | Equality
+                   | BitOr
+BitOr             := BitOr '|' BitXor | BitXor
+BitXor            := BitXor '^' BitAnd | BitAnd
+BitAnd            := BitAnd '&' Equality | Equality
 Equality          := Equality ('===' | '!==') Relational | Relational
-Relational        := Relational ('<' | '<=' | '>' | '>=') Additive | Additive
+Relational        := Relational ('<' | '<=' | '>' | '>=' | 'in') Shift | Shift
+Shift             := Shift ('<<' | '>>' | '>>>') Additive | Additive
 Additive          := Additive ('+' | '-') Mult | Mult
 Mult              := Mult ('*' | '/' | '%') Exp | Exp
 Exp               := Unary | Postfix '**' Exp               (right-associative)
-Unary             := ('-' | '+' | '!' | 'typeof') Unary | ('++' | '--') Unary | 'delete' Member | Postfix
+Unary             := ('-' | '+' | '!' | '~' | 'typeof') Unary | ('++' | '--') Unary | 'delete' Member | Postfix
 Postfix           := Primary ('++' | '--')?                 (no line break before ++/--)
 Primary           := Number | String | Template | 'true' | 'false' | 'null' | Identifier
                    | '[' (Expression (',' Expression)* ','?)? ']'      (array, no holes)
@@ -167,7 +172,7 @@ PropDef           := (IdentifierName | String | Number | '[' Expression ']') ':'
 
 Notable rules, all matching JavaScript:
 - `2 ** 3 ** 2` is `2 ** (3 ** 2)` = 512. `1 < 2 < 3` is legal (left-associative).
-- `-`, `+` or `!` directly before `**` is a **SyntaxError** (`-2 ** 2`, `2 ** -2 ** 2`);
+- `-`, `+`, `!` or `~` directly before `**` is a **SyntaxError** (`-2 ** 2`, `~2 ** 2`, `2 ** -2 ** 2`);
   `(-2) ** 2`, `2 ** -2`, `++x ** 2` and `x++ ** 2` are fine.
 - Assignment and `++`/`--` targets must be identifiers, possibly parenthesised (`(x) = 1`);
   `1 = 2`, `x + 1 = 2`, `++1`, `(x + 1)++` are SyntaxErrors.

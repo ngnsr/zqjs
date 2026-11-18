@@ -635,6 +635,7 @@ const Compiler = struct {
                     .neg => .neg,
                     .plus => .to_number,
                     .not => .not,
+                    .bit_not => .bit_not,
                     .typeof => .typeof,
                 }, &.{});
             },
@@ -667,43 +668,82 @@ const Compiler = struct {
                 c.patch(to_end, c.here());
             },
             .assign => |a| switch (a.target) {
-                .ref => |ref| {
-                    if (a.op) |op| {
+                .ref => |ref| switch (a.op) {
+                    .plain => {
+                        // x = e: evaluate e first; the TDZ and const checks happen on the write.
+                        try c.expr(a.value);
+                        try c.write(ref);
+                    },
+                    .compound => |op| {
                         // x op= e: read x (TDZ), evaluate e, apply op, then write (const check).
                         try c.read(ref);
                         try c.expr(a.value);
                         try c.emit(binaryOp(op), &.{});
-                    } else {
-                        // x = e: evaluate e first; the TDZ and const checks happen on the write.
+                        try c.write(ref);
+                    },
+                    .logical_and, .logical_or, .nullish => {
+                        try c.read(ref);
+                        const to_short = try c.jumpIfLogicalAssignShortCircuit(a.op);
+                        try c.emit(.pop, &.{});
                         try c.expr(a.value);
-                    }
-                    try c.write(ref);
+                        try c.write(ref);
+                        c.patch(to_short, c.here());
+                    },
                 },
                 // Base and key exactly once, before the right-hand side (dup/dup2 keep them
                 // for the write). `op=` reads before evaluating the right-hand side.
                 .member => |m| {
                     try c.expr(m.object);
-                    switch (m.key) {
-                        .name => |n| {
-                            if (a.op) |op| {
-                                try c.emit(.dup, &.{});
-                                try c.emit(.get_prop, &.{try c.name(n)});
-                                try c.expr(a.value);
-                                try c.emit(binaryOp(op), &.{});
-                            } else try c.expr(a.value);
-                            try c.emit(.set_prop, &.{try c.name(n)});
-                        },
-                        .computed => |k| {
+                    const named = switch (m.key) {
+                        .name => |n| n,
+                        .computed => |k| blk: {
                             try c.expr(k);
-                            if (a.op) |op| {
-                                try c.emit(.dup2, &.{});
-                                try c.emit(.get_elem, &.{});
-                                try c.expr(a.value);
-                                try c.emit(binaryOp(op), &.{});
-                            } else try c.expr(a.value);
-                            try c.emit(.set_elem, &.{});
+                            break :blk null;
                         },
                         .string, .number => unreachable, // only in literals
+                    };
+                    switch (a.op) {
+                        .plain => {
+                            try c.expr(a.value);
+                            if (named) |n| try c.emit(.set_prop, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
+                        },
+                        .compound => |op| {
+                            if (named) |n| {
+                                try c.emit(.dup, &.{});
+                                try c.emit(.get_prop, &.{try c.name(n)});
+                            } else {
+                                try c.emit(.dup2, &.{});
+                                try c.emit(.get_elem, &.{});
+                            }
+                            try c.expr(a.value);
+                            try c.emit(binaryOp(op), &.{});
+                            if (named) |n| try c.emit(.set_prop, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
+                        },
+                        .logical_and, .logical_or, .nullish => {
+                            const computed = named == null;
+                            if (named) |n| {
+                                try c.emit(.dup, &.{});
+                                try c.emit(.get_prop, &.{try c.name(n)});
+                            } else {
+                                try c.emit(.dup2, &.{});
+                                try c.emit(.get_elem, &.{});
+                            }
+                            const to_short = try c.jumpIfLogicalAssignShortCircuit(a.op);
+                            try c.emit(.pop, &.{});
+                            try c.expr(a.value);
+                            if (named) |n| try c.emit(.set_prop, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
+                            const to_end = try c.jumpForward(.jump);
+                            // Short-circuit path arrives with [o, old] or [o, k, old]; move `old`
+                            // below the kept target parts and pop them.
+                            c.depth += if (computed) 2 else 1;
+                            c.patch(to_short, c.here());
+                            try c.emit(.dup, &.{});
+                            try c.emit(if (computed) .rot4 else .rot3, &.{});
+                            try c.emit(.pop, &.{});
+                            try c.emit(.pop, &.{});
+                            if (computed) try c.emit(.pop, &.{});
+                            c.patch(to_end, c.here());
+                        },
                     }
                 },
             },
@@ -848,6 +888,35 @@ const Compiler = struct {
             .global => unreachable,
         }
     }
+
+    /// Expects `[..., old]` on the stack. Emits a test that jumps to the returned
+    /// target if the logical assignment should short-circuit (keeping `old`), or
+    /// falls through (still with `[..., old]`) when the right-hand side should run.
+    fn jumpIfLogicalAssignShortCircuit(c: *Compiler, op: ast.AssignOp) Error!u32 {
+        switch (op) {
+            .logical_and => {
+                try c.emit(.dup, &.{});
+                return c.jumpForward(.jump_if_false);
+            },
+            .logical_or => {
+                try c.emit(.dup, &.{});
+                return c.jumpForward(.jump_if_true);
+            },
+            .nullish => {
+                try c.emit(.dup, &.{});
+                try c.emit(.push_null, &.{});
+                try c.emit(.strict_eq, &.{});
+                const to_assign = try c.jumpForward(.jump_if_true);
+                try c.emit(.dup, &.{});
+                try c.emit(.push_undefined, &.{});
+                try c.emit(.strict_eq, &.{});
+                const to_short = try c.jumpForward(.jump_if_false);
+                c.patch(to_assign, c.here());
+                return to_short;
+            },
+            .plain, .compound => unreachable,
+        }
+    }
 };
 
 fn binaryOp(op: ast.BinaryOp) Op {
@@ -858,6 +927,12 @@ fn binaryOp(op: ast.BinaryOp) Op {
         .div => .div,
         .mod => .mod,
         .pow => .pow,
+        .shl => .shl,
+        .shr => .shr,
+        .ushr => .ushr,
+        .bit_and => .bit_and,
+        .bit_xor => .bit_xor,
+        .bit_or => .bit_or,
         .lt => .lt,
         .le => .le,
         .gt => .gt,

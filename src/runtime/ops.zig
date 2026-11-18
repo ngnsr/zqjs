@@ -269,6 +269,12 @@ pub fn binary(rt: *Runtime, op: ast.BinaryOp, a_in: Value, b_in: Value) Error!Va
         .div => .{ .number = try toNumber(rt, a) / try toNumber(rt, b) },
         .mod => .{ .number = remainder(try toNumber(rt, a), try toNumber(rt, b)) },
         .pow => .{ .number = pow(try toNumber(rt, a), try toNumber(rt, b)) },
+        .shl => .{ .number = bitShl(try toNumber(rt, a), try toNumber(rt, b)) },
+        .shr => .{ .number = bitShr(try toNumber(rt, a), try toNumber(rt, b)) },
+        .ushr => .{ .number = bitUshr(try toNumber(rt, a), try toNumber(rt, b)) },
+        .bit_and => .{ .number = bitAnd(try toNumber(rt, a), try toNumber(rt, b)) },
+        .bit_xor => .{ .number = bitXor(try toNumber(rt, a), try toNumber(rt, b)) },
+        .bit_or => .{ .number = bitOr(try toNumber(rt, a), try toNumber(rt, b)) },
         .in => .{ .boolean = try object.has(rt, try object.key(rt, a), b) },
         .lt => .{ .boolean = (try lessThan(rt, a, b)) orelse false },
         .gt => .{ .boolean = (try lessThan(rt, b, a)) orelse false },
@@ -292,6 +298,49 @@ pub fn typeOf(rt: *Runtime, v: Value) Error!Value {
         .object => "object",
     };
     return .{ .string = try rt.heap.ascii(s) };
+}
+
+// ------------------------------------------------------------ Bitwise / ToInt32 / ToUint32
+
+pub fn toUint32(n: f64) u32 {
+    if (!std.math.isFinite(n) or n == 0.0) return 0;
+    const rem = @mod(@trunc(n), 4294967296.0);
+    return @intFromFloat(rem);
+}
+
+pub fn toInt32(n: f64) i32 {
+    return @bitCast(toUint32(n));
+}
+
+pub fn bitNot(n: f64) f64 {
+    return @floatFromInt(~toInt32(n));
+}
+
+pub fn bitAnd(a: f64, b: f64) f64 {
+    return @floatFromInt(toInt32(a) & toInt32(b));
+}
+
+pub fn bitXor(a: f64, b: f64) f64 {
+    return @floatFromInt(toInt32(a) ^ toInt32(b));
+}
+
+pub fn bitOr(a: f64, b: f64) f64 {
+    return @floatFromInt(toInt32(a) | toInt32(b));
+}
+
+pub fn bitShl(a: f64, b: f64) f64 {
+    const shift: u5 = @truncate(toUint32(b));
+    return @floatFromInt(toInt32(a) << shift);
+}
+
+pub fn bitShr(a: f64, b: f64) f64 {
+    const shift: u5 = @truncate(toUint32(b));
+    return @floatFromInt(toInt32(a) >> shift);
+}
+
+pub fn bitUshr(a: f64, b: f64) f64 {
+    const shift: u5 = @truncate(toUint32(b));
+    return @floatFromInt(toUint32(a) >> shift);
 }
 
 // ------------------------------------------------------------ tests (golden tables in tests/ops)

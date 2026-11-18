@@ -288,7 +288,13 @@ const Dumper = struct {
                 try w.writeByte(')');
             },
             .assign => |a| {
-                if (a.op) |op| try w.print("({s}= ", .{op.symbol()}) else try w.writeAll("(= ");
+                switch (a.op) {
+                    .plain => try w.writeAll("(= "),
+                    .compound => |op| try w.print("({s}= ", .{op.symbol()}),
+                    .logical_and => try w.writeAll("(&&= "),
+                    .logical_or => try w.writeAll("(||= "),
+                    .nullish => try w.writeAll("(??= "),
+                }
                 try d.target(a.target);
                 try w.writeByte(' ');
                 try d.expr(a.value);

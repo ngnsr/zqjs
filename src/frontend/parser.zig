@@ -36,7 +36,7 @@ pub fn parse(arena: Allocator, source: []const u8, limits: Limits, diag: *Diagno
     return .{ .statements = statements.items, .ref_count = p.ref_count, .binding_count = p.binding_count, .function_count = p.function_count };
 }
 
-const unary_bp = 8;
+const unary_bp = 12;
 
 const Infix = struct { op: ast.BinaryOp, bp: u8, right_assoc: bool = false };
 
@@ -45,32 +45,47 @@ fn infix(tag: Tag) ?Infix {
     return switch (tag) {
         .pipe_pipe => .{ .op = .logical_or, .bp = 1 },
         .amp_amp => .{ .op = .logical_and, .bp = 2 },
-        .eq3 => .{ .op = .strict_eq, .bp = 3 },
-        .neq3 => .{ .op = .strict_ne, .bp = 3 },
-        .lt => .{ .op = .lt, .bp = 4 },
-        .le => .{ .op = .le, .bp = 4 },
-        .gt => .{ .op = .gt, .bp = 4 },
-        .ge => .{ .op = .ge, .bp = 4 },
-        .plus => .{ .op = .add, .bp = 5 },
-        .minus => .{ .op = .sub, .bp = 5 },
-        .star => .{ .op = .mul, .bp = 6 },
-        .slash => .{ .op = .div, .bp = 6 },
-        .percent => .{ .op = .mod, .bp = 6 },
-        .star_star => .{ .op = .pow, .bp = 7, .right_assoc = true },
+        .pipe => .{ .op = .bit_or, .bp = 3 },
+        .caret => .{ .op = .bit_xor, .bp = 4 },
+        .amp => .{ .op = .bit_and, .bp = 5 },
+        .eq3 => .{ .op = .strict_eq, .bp = 6 },
+        .neq3 => .{ .op = .strict_ne, .bp = 6 },
+        .lt => .{ .op = .lt, .bp = 7 },
+        .le => .{ .op = .le, .bp = 7 },
+        .gt => .{ .op = .gt, .bp = 7 },
+        .ge => .{ .op = .ge, .bp = 7 },
+        .shl => .{ .op = .shl, .bp = 8 },
+        .shr => .{ .op = .shr, .bp = 8 },
+        .ushr => .{ .op = .ushr, .bp = 8 },
+        .plus => .{ .op = .add, .bp = 9 },
+        .minus => .{ .op = .sub, .bp = 9 },
+        .star => .{ .op = .mul, .bp = 10 },
+        .slash => .{ .op = .div, .bp = 10 },
+        .percent => .{ .op = .mod, .bp = 10 },
+        .star_star => .{ .op = .pow, .bp = 11, .right_assoc = true },
         else => null,
     };
 }
 
-/// `=` gives null (plain assignment); compound operators give their binary op.
-fn assignOp(tag: Tag) ?(?ast.BinaryOp) {
+/// `=` gives `.plain`; compound and logical assignment operators give their kind.
+fn assignOp(tag: Tag) ?ast.AssignOp {
     return switch (tag) {
-        .eq => @as(?ast.BinaryOp, null),
-        .plus_eq => .add,
-        .minus_eq => .sub,
-        .star_eq => .mul,
-        .slash_eq => .div,
-        .percent_eq => .mod,
-        .star_star_eq => .pow,
+        .eq => .plain,
+        .plus_eq => .{ .compound = .add },
+        .minus_eq => .{ .compound = .sub },
+        .star_eq => .{ .compound = .mul },
+        .slash_eq => .{ .compound = .div },
+        .percent_eq => .{ .compound = .mod },
+        .star_star_eq => .{ .compound = .pow },
+        .shl_eq => .{ .compound = .shl },
+        .shr_eq => .{ .compound = .shr },
+        .ushr_eq => .{ .compound = .ushr },
+        .amp_eq => .{ .compound = .bit_and },
+        .caret_eq => .{ .compound = .bit_xor },
+        .pipe_eq => .{ .compound = .bit_or },
+        .amp_amp_eq => .logical_and,
+        .pipe_pipe_eq => .logical_or,
+        .question2_eq => .nullish,
         else => null,
     };
 }
@@ -728,7 +743,7 @@ const Parser = struct {
         var lhs = try p.prefix();
         while (true) {
             if (p.tok.tag == .eq2 or p.tok.tag == .neq2) return p.fail(.{ .unsupported = .loose_equality }, p.tok);
-            const info: Infix = if (!p.no_in and p.isText(p.tok, "in")) .{ .op = .in, .bp = 4 } else infix(p.tok.tag) orelse break;
+            const info: Infix = if (!p.no_in and p.isText(p.tok, "in")) .{ .op = .in, .bp = 7 } else infix(p.tok.tag) orelse break;
             if (info.bp < min_bp) break;
             try p.advance();
             const rhs = try p.binary(if (info.right_assoc) info.bp else info.bp + 1);
@@ -744,7 +759,7 @@ const Parser = struct {
     fn prefix(p: *Parser) Error!*const ast.Expr {
         const t = p.tok;
         switch (t.tag) {
-            .minus, .plus, .bang => {
+            .minus, .plus, .bang, .tilde => {
                 try p.advance();
                 const operand = try p.binary(unary_bp);
                 // JS forbids `-a ** b`: it is ambiguous whether `-` applies before or after `**`.
@@ -754,7 +769,8 @@ const Parser = struct {
                 const op: ast.UnaryOp = switch (t.tag) {
                     .minus => .neg,
                     .plus => .plus,
-                    else => .not,
+                    .bang => .not,
+                    else => .bit_not,
                 };
                 return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .unary = .{ .op = op, .operand = operand } }, operand.depth);
             },
@@ -1068,8 +1084,8 @@ const Parser = struct {
                 return inner;
             },
             // Tokens that cannot begin an expression in any JavaScript.
-            .eof, .semicolon, .r_paren, .r_bracket, .r_brace, .comma, .star, .star_star, .percent, .eq3, .neq3, .eq2, .neq2, .lt, .le, .gt, .ge, .amp_amp, .pipe_pipe, .question2, .question, .question_dot, .colon, .eq, .arrow => return p.fail(.{ .syntax_error = "unexpected token" }, t),
-            // `[`, `{`, `/` (regex), `~`, `...`, keywords, … may start valid JS.
+            .eof, .semicolon, .r_paren, .r_bracket, .r_brace, .comma, .star, .star_star, .percent, .eq3, .neq3, .eq2, .neq2, .lt, .le, .gt, .ge, .shl, .shr, .ushr, .amp, .pipe, .caret, .amp_amp, .pipe_pipe, .question2, .question, .question_dot, .colon, .eq, .arrow, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .star_star_eq, .shl_eq, .shr_eq, .ushr_eq, .amp_eq, .pipe_eq, .caret_eq, .amp_amp_eq, .pipe_pipe_eq, .question2_eq => return p.fail(.{ .syntax_error = "unexpected token" }, t),
+            // `[`, `{`, `/` (regex), `...`, keywords, … may start valid JS.
             else => return p.fail(.{ .unsupported = .syntax }, t),
         }
     }

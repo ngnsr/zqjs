@@ -13,6 +13,7 @@ pub const UnaryOp = enum {
     neg,
     plus,
     not,
+    bit_not,
     typeof,
 
     pub fn symbol(op: UnaryOp) []const u8 {
@@ -20,6 +21,7 @@ pub const UnaryOp = enum {
             .neg => "-",
             .plus => "+",
             .not => "!",
+            .bit_not => "~",
             .typeof => "typeof",
         };
     }
@@ -32,6 +34,12 @@ pub const BinaryOp = enum {
     div,
     mod,
     pow,
+    shl,
+    shr,
+    ushr,
+    bit_and,
+    bit_xor,
+    bit_or,
     lt,
     le,
     gt,
@@ -52,6 +60,12 @@ pub const BinaryOp = enum {
             .div => "/",
             .mod => "%",
             .pow => "**",
+            .shl => "<<",
+            .shr => ">>",
+            .ushr => ">>>",
+            .bit_and => "&",
+            .bit_xor => "^",
+            .bit_or => "|",
             .lt => "<",
             .le => "<=",
             .gt => ">",
@@ -63,6 +77,14 @@ pub const BinaryOp = enum {
             .logical_or => "||",
         };
     }
+};
+
+pub const AssignOp = union(enum) {
+    plain,
+    compound: BinaryOp,
+    logical_and,
+    logical_or,
+    nullish,
 };
 
 /// A use of a variable name. `id` indexes `Resolution.refs` (resolver.zig).
@@ -124,8 +146,8 @@ pub const Expr = struct {
         unary: struct { op: UnaryOp, operand: *const Expr },
         binary: struct { op: BinaryOp, lhs: *const Expr, rhs: *const Expr },
         conditional: struct { cond: *const Expr, then_expr: *const Expr, else_expr: *const Expr },
-        /// `target = value` (op null) or `target op= value`.
-        assign: struct { op: ?BinaryOp, target: Target, value: *const Expr },
+        /// `target = value` (`plain`), `target op= value` (`compound`), or logical assignment.
+        assign: struct { op: AssignOp, target: Target, value: *const Expr },
         /// `callee(args)`. A member callee (`o.f(…)`) is a method call: `this` is `o`.
         call: Call,
         /// `new callee(args)` or `new callee`.

@@ -855,20 +855,14 @@ fn mathSign(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     return .{ .number = if (x > 0.0) 1.0 else -1.0 };
 }
 
-fn toUint32(n: f64) u32 {
-    if (!std.math.isFinite(n) or n == 0.0) return 0;
-    const rem = @mod(@trunc(n), 4294967296.0);
-    return @intFromFloat(rem);
-}
-
 fn mathClz32(rt: *Runtime, _: Value, args: []const Value) Error!Value {
-    const u = toUint32(try ops.toNumber(rt, arg(args, 0)));
+    const u = ops.toUint32(try ops.toNumber(rt, arg(args, 0)));
     return .{ .number = @floatFromInt(@clz(u)) };
 }
 
 fn mathImul(rt: *Runtime, _: Value, args: []const Value) Error!Value {
-    const a: i32 = @bitCast(toUint32(try ops.toNumber(rt, arg(args, 0))));
-    const b: i32 = @bitCast(toUint32(try ops.toNumber(rt, arg(args, 1))));
+    const a: i32 = @bitCast(ops.toUint32(try ops.toNumber(rt, arg(args, 0))));
+    const b: i32 = @bitCast(ops.toUint32(try ops.toNumber(rt, arg(args, 1))));
     return .{ .number = @floatFromInt(a *% b) };
 }
 

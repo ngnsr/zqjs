@@ -96,6 +96,19 @@ function* randomDoubles(n) {
   });
 }
 
+// ---- tests/ops/bitwise.jsonl: [op, a bits, b bits, result bits]
+{
+  const vals = [0, -0, 1, -1, 0.5, -0.5, 31, 32, 33, -1.5, 2 ** 31 - 1, 2 ** 31, -(2 ** 31), -(2 ** 31) - 1,
+    2 ** 32 - 1, 2 ** 32, -(2 ** 32), 4294967295.5, 1e21, -1e21, 1e308, NaN, Infinity, -Infinity, 5e-324, -5e-324];
+  const ops = { '&': (a, b) => a & b, '|': (a, b) => a | b, '^': (a, b) => a ^ b,
+    '<<': (a, b) => a << b, '>>': (a, b) => a >> b, '>>>': (a, b) => a >>> b };
+  const lines = [];
+  for (const a of vals) lines.push(JSON.stringify(['~', bits(a), bits(0), resultBits(~a)]));
+  for (const [op, f] of Object.entries(ops)) for (const a of vals) for (const b of vals)
+    lines.push(JSON.stringify([op, bits(a), bits(b), resultBits(f(a, b))]));
+  emit('ops/bitwise.jsonl', lines.join('\n') + '\n');
+}
+
 // ---- tests/ops/pow.jsonl: [base bits, exponent bits, result bits] for x ** y.
 // Special-value grid plus ~8,000 pseudo-random cases aimed at the hard regions.
 // The inputs are frozen: some are computed with `**` and Math.log, which are not bit-portable, and

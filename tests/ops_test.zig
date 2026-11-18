@@ -88,6 +88,33 @@ test "arithmetic operators match node, including -0, NaN and Infinity" {
     try testing.expectEqual(@as(usize, 0), failures);
 }
 
+test "bitwise operators match node, including 2^31/2^32 wrap, NaN, -0, and Infinity" {
+    var failures: usize = 0;
+    var it = lines("ops/bitwise.jsonl");
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice([4][]const u8, testing.allocator, line, .{});
+        defer parsed.deinit();
+        const op = parsed.value[0];
+        const a = try fromBits(parsed.value[1]);
+        const b = try fromBits(parsed.value[2]);
+        const expected = try fromBits(parsed.value[3]);
+        const got: f64 = if (std.mem.eql(u8, op, "~")) ops.bitNot(a) //
+            else if (std.mem.eql(u8, op, "&")) ops.bitAnd(a, b) //
+            else if (std.mem.eql(u8, op, "|")) ops.bitOr(a, b) //
+            else if (std.mem.eql(u8, op, "^")) ops.bitXor(a, b) //
+            else if (std.mem.eql(u8, op, "<<")) ops.bitShl(a, b) //
+            else if (std.mem.eql(u8, op, ">>")) ops.bitShr(a, b) //
+            else if (std.mem.eql(u8, op, ">>>")) ops.bitUshr(a, b) //
+            else return error.InvalidTestOperator;
+        if (!sameNumber(got, expected)) {
+            if (failures < 20) std.debug.print("{d} {s} {d}: expected {d}, got {d}\n", .{ a, op, b, expected, got });
+            failures += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), failures);
+}
+
 /// Cases where the spec fixes the result or the true value is exactly representable,
 /// so any pow with < 1 ulp error must return it bit for bit: NaN/±Infinity/±0 operands,
 /// and integer ** non-negative integer with |result| < 2^53.

@@ -474,6 +474,7 @@ const Interpreter = struct {
                     .neg => .{ .number = -(try ops.toNumber(rt, v)) },
                     .plus => .{ .number = try ops.toNumber(rt, v) },
                     .not => .{ .boolean = !ops.toBoolean(v) },
+                    .bit_not => .{ .number = ops.bitNot(try ops.toNumber(rt, v)) },
                     .typeof => ops.typeOf(rt, v),
                 };
             },
@@ -518,22 +519,40 @@ const Interpreter = struct {
         }
     }
 
+    fn logicalAssignShouldWrite(op: ast.AssignOp, old: Value) bool {
+        return switch (op) {
+            .logical_and => ops.toBoolean(old),
+            .logical_or => !ops.toBoolean(old),
+            .nullish => old == .null or old == .undefined,
+            .plain, .compound => unreachable,
+        };
+    }
+
     fn evalAssign(it: *Interpreter, a: @FieldType(ast.Expr.Data, "assign")) Error!Value {
         const rt = it.rt;
         switch (a.target) {
-            .ref => |ref| {
-                if (a.op) |op| {
+            .ref => |ref| switch (a.op) {
+                .plain => {
+                    // x = e: evaluate e first; the TDZ and const checks happen on the write.
+                    const v = try it.eval(a.value);
+                    try it.write(ref, v);
+                    return v;
+                },
+                .compound => |op| {
                     // x op= e: read x first (TDZ), then evaluate e, then write (const check).
                     const old = try it.read(ref);
                     try it.hold(old);
                     const v = try ops.binary(rt, op, old, try it.eval(a.value));
                     try it.write(ref, v);
                     return v;
-                }
-                // x = e: evaluate e first; the TDZ and const checks happen on the write.
-                const v = try it.eval(a.value);
-                try it.write(ref, v);
-                return v;
+                },
+                .logical_and, .logical_or, .nullish => {
+                    const old = try it.read(ref);
+                    if (!logicalAssignShouldWrite(a.op, old)) return old;
+                    const v = try it.eval(a.value);
+                    try it.write(ref, v);
+                    return v;
+                },
             },
             .member => |m| {
                 // Base and key expression are evaluated exactly once, before the right-hand
@@ -543,18 +562,31 @@ const Interpreter = struct {
                 try it.hold(base);
                 const kv = try it.keyValue(m);
                 if (kv == .value) try it.hold(kv.value);
-                if (a.op) |op| {
-                    const k = try it.toKey(kv);
-                    try it.holdKey(k);
-                    const old = try object.get(rt, base, k);
-                    try it.hold(old);
-                    const v = try ops.binary(rt, op, old, try it.eval(a.value));
-                    try object.set(rt, base, k, v);
-                    return v;
+                switch (a.op) {
+                    .plain => {
+                        const v = try it.eval(a.value);
+                        try object.set(rt, base, try it.toKey(kv), v);
+                        return v;
+                    },
+                    .compound => |op| {
+                        const k = try it.toKey(kv);
+                        try it.holdKey(k);
+                        const old = try object.get(rt, base, k);
+                        try it.hold(old);
+                        const v = try ops.binary(rt, op, old, try it.eval(a.value));
+                        try object.set(rt, base, k, v);
+                        return v;
+                    },
+                    .logical_and, .logical_or, .nullish => {
+                        const k = try it.toKey(kv);
+                        try it.holdKey(k);
+                        const old = try object.get(rt, base, k);
+                        if (!logicalAssignShouldWrite(a.op, old)) return old;
+                        const v = try it.eval(a.value);
+                        try object.set(rt, base, k, v);
+                        return v;
+                    },
                 }
-                const v = try it.eval(a.value);
-                try object.set(rt, base, try it.toKey(kv), v);
-                return v;
             },
         }
     }

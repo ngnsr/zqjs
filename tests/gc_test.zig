@@ -684,6 +684,14 @@ fn runStats(source: []const u8, engine: zqjs.Engine, limits: zqjs.Limits) !Engin
     return .{ .atoms = rt.heap.atoms.count(), .collections = rt.heap.stats.collections, .peak = rt.heap.peak, .live = rt.heap.bytes, .err = err, .majors = majors, .limit = rt.limitHit() };
 }
 
+/// Atoms a run keeps when its program leaves nothing behind: the realm's built-in names
+/// (they grow with every built-in, so tests compare against this, not a fixed number).
+fn realmAtoms(engine: zqjs.Engine) !usize {
+    const r = try runStats("let o = {}; o.fixed = 1;", engine, .{});
+    try testing.expectEqual(@as(?anyerror, null), r.err);
+    return r.atoms;
+}
+
 test "weak atoms are reclaimed in real programs, on both engines" {
     // 20 000 distinct keys, each on an object dropped at once: without weak atoms the table
     // would end with 20 000 entries; with them, only the realm's names survive.
@@ -692,8 +700,9 @@ test "weak atoms are reclaimed in real programs, on both engines" {
         const r = try runStats(source, engine, .{});
         try testing.expectEqual(@as(?anyerror, null), r.err);
         try testing.expect(r.collections > 0);
-        testing.expect(r.atoms < 100) catch |e| {
-            std.debug.print("{s}: {d} atoms left\n", .{ @tagName(engine), r.atoms });
+        const base = try realmAtoms(engine);
+        testing.expect(r.atoms <= base + 10) catch |e| {
+            std.debug.print("{s}: {d} atoms left, {d} for the realm alone\n", .{ @tagName(engine), r.atoms, base });
             return e;
         };
     }
@@ -1041,7 +1050,7 @@ test "dead dynamic keys drive major collections: atoms can't pile up past the he
         try testing.expectEqual(@as(?anyerror, null), r.err);
         try testing.expect(r.majors > 0);
         try testing.expect(r.peak <= 1 << 20);
-        try testing.expect(r.atoms < 100); // and the final major one leaves only the realm's
+        try testing.expect(r.atoms <= try realmAtoms(engine) + 10); // and the final major one leaves only the realm's
     }
 }
 
@@ -1667,5 +1676,25 @@ test "M19: Promise.all and finally survive GC stress and explicit collections" {
         var r = try support.run(testing.allocator, src, .{}, engine, .normal);
         defer r.deinit(testing.allocator);
         try testing.expectEqualStrings("1830\n", r.out);
+    }
+}
+
+test "M23: Array.prototype.sort with allocating comparator survives GC stress" {
+    const src =
+        \\const arr = [];
+        \\for (let i = 0; i < 40; i++) {
+        \\    arr.push({ k: (i * 17) % 13, tag: "v" + String(i) });
+        \\}
+        \\arr.sort(function (a, b) {
+        \\    let trash = [];
+        \\    for (let j = 0; j < 40; j++) trash.push({ x: j, s: "pad" + String(j) });
+        \\    return a.k - b.k;
+        \\});
+        \\print(arr.length, arr[0].k, arr[arr.length - 1].k);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("40 0 12\n", r.out);
     }
 }

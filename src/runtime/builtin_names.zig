@@ -13,6 +13,8 @@ pub const Builtin = enum {
     function_prototype,
     object_constructor,
     array_constructor,
+    string_constructor,
+    number_constructor,
     map_constructor,
     map_prototype,
     set_constructor,
@@ -36,6 +38,8 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .function_prototype => function_prototype.has(name),
         .object_constructor => object_constructor.has(name),
         .array_constructor => array_constructor.has(name),
+        .string_constructor => string_constructor.has(name),
+        .number_constructor => number_constructor.has(name),
         .map_constructor => map_constructor.has(name),
         .map_prototype => map_prototype.has(name),
         .set_constructor => set_constructor.has(name),
@@ -296,6 +300,35 @@ const array_constructor = std.StaticStringMap(void).initComptime(.{
     .{"length"},
     .{"name"},
     .{"of"},
+    .{"prototype"},
+});
+
+const string_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"fromCharCode"},
+    .{"fromCodePoint"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+    .{"raw"},
+});
+
+const number_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"EPSILON"},
+    .{"MAX_SAFE_INTEGER"},
+    .{"MAX_VALUE"},
+    .{"MIN_SAFE_INTEGER"},
+    .{"MIN_VALUE"},
+    .{"NEGATIVE_INFINITY"},
+    .{"NaN"},
+    .{"POSITIVE_INFINITY"},
+    .{"isFinite"},
+    .{"isInteger"},
+    .{"isNaN"},
+    .{"isSafeInteger"},
+    .{"length"},
+    .{"name"},
+    .{"parseFloat"},
+    .{"parseInt"},
     .{"prototype"},
 });
 

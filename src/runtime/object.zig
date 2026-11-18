@@ -149,6 +149,8 @@ pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
             const ns = switch (n.namespace orelse return rt.fail(.function_properties)) {
                 .object => r.object_namespace,
                 .array => r.array_namespace,
+                .string => r.string_namespace,
+                .number => r.number_namespace,
                 .map => r.map_namespace,
                 .set => r.set_namespace,
                 .promise => r.promise_namespace,

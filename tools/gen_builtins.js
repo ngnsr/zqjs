@@ -28,6 +28,8 @@ const objects = vm.runInNewContext(`({
   function_prototype: Function.prototype,
   object_constructor: Object,
   array_constructor: Array,
+  string_constructor: String,
+  number_constructor: Number,
   map_constructor: Map,
   map_prototype: Map.prototype,
   set_constructor: Set,

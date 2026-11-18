@@ -1,0 +1,31 @@
+["zero","one",2,1]
+[["0","zero"],["1","one"],["b",2],["a",1]]
+["h","i"] [["0","h"],["1","i"]]
+[] []
+[10,20] [["0",10],["1",20]]
+[] []
+true {"0":"x","1":"y","a":1,"b":20,"c":30}
+TypeError
+TypeError
+"" "123" "0" "null" "undefined"
+0 -42.5 16 0 0 NaN 1
+31 31 -12 1 483
+5 1295 10 NaN NaN
+0 16 0 -Infinity
+NaN NaN 0
+5 -3.14 1 1
+Infinity -Infinity 0 NaN
+-Infinity
+true false false
+true true true false
+true false false false
+true false true true
+true true false false false
+true false true false false
+9007199254740991 -9007199254740991 true true true
+Infinity -Infinity true
+[] [1,"a",true]
+["a","😀","b"]
+[10,20,30]
+[101,103,105]
+["k=v"]

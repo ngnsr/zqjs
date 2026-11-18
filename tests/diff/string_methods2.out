@@ -1,0 +1,46 @@
+[""]
+[]
+[""]
+["a","b","c"]
+["a","b",""]
+["","a",""]
+["a","b","c"]
+[]
+["a","b"]
+["a","b","c"]
+["a","b","c"]
+[]
+["a,b,c"]
+["\ud83d","\ude00","a","\ud83d","\ude00"]
+["","a",""]
+"hi" "hi \t\n\r\u000b\f        　﻿" " \t\n\r\u000b\f        　﻿hi"
+"" ""
+true true false
+true true true
+true true false
+true true false
+"" "ababab" "" ""
+RangeError
+RangeError
+RangeError
+"005" "  5" "5"
+"123abc" "abc"
+"500" "5  " "5"
+"abc123" "abc"
+"a" "a"
+"bcd" "bcd"
+"ab" "cdef"
+"abc" "def"
+3 1 -1
+-1 2 5
+3 -1
+"a" "c" undefined undefined
+"\ud83d" "\ude00" "a" undefined
+"baz bar foo"
+"baz bar baz"
+"foo" "foo"
+"-ab" "-a-b-" "-"
+"a$-b-$-a-c-$-c"
+"a$1-$x-$c"
+"aa[b:aa:b:$][b:aab::$]"
+"hello! world" "|a|b|" [["o",4,"hello world"],["",0,"ab"],["",1,"ab"],["",2,"ab"]]

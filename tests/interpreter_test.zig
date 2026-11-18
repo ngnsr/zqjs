@@ -294,11 +294,11 @@ test "holes are Unsupported: arrays stay dense" {
 
 test "built-ins: known to node but not implemented is Unsupported, naming the member" {
     try expectUnsupported("print(Reflect === undefined);", "", "Unsupported(builtin): a built-in node has that ZQJS doesn't implement yet ('Reflect')");
-    try expectUnsupported("print([1].length); [1].find;", "1\n", "Unsupported(builtin)");
-    try expectUnsupported("[1].find;", "", "('find')");
-    try expectUnsupported("'abc'.trim;", "", "('trim')");
+    try expectUnsupported("print([1].length); [1].flat;", "1\n", "Unsupported(builtin)");
+    try expectUnsupported("[1].flat;", "", "('flat')");
+    try expectUnsupported("'abc'.match;", "", "('match')");
     try expectUnsupported("(1).toFixed;", "", "('toFixed')");
-    try expectUnsupported("Object.assign;", "", "('assign')");
+    try expectUnsupported("Object.freeze;", "", "('freeze')");
     try expectUnsupported("Object.name;", "", "('name')");
     try expectUnsupported("({}).hasOwnProperty;", "", "('hasOwnProperty')");
     try expectUnsupported("({}).constructor;", "", "('constructor')");
@@ -343,7 +343,7 @@ test "object limits: heap, string length of a join, conversion depth" {
 }
 
 test "M11.3b: Array/String unimplemented methods, non-matching receivers, and non-ASCII case report Unsupported" {
-    try expectUnsupported("[1].find;", "", "('find')");
+    try expectUnsupported("[1].flat;", "", "('flat')");
     try expectUnsupported("let o = { length: 1, slice: [].slice }; o.slice();", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { length: 1, indexOf: [].indexOf }; o.indexOf(1);", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { length: 1, includes: [].includes }; o.includes(1);", "", "Unsupported(builtin)");
@@ -729,6 +729,29 @@ test "M19: Promise.all, allSettled, race, any, and finally OOM safety" {
                 \\Promise.race([Promise.resolve(3), p1]);
                 \\Promise.any([Promise.reject("a"), Promise.reject("b")]);
                 \\r1(1);
+            ,
+                .{},
+                .vm,
+                .normal,
+            );
+            defer run_res.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
+}
+
+test "M23: split, replace, splice, sort, concat, and Object.entries OOM safety" {
+    const OomCtx = struct {
+        fn runOnce(alloc: Allocator) !void {
+            var run_res = try support.run(
+                alloc,
+                \\const parts = "a,b,c".split(",");
+                \\const rep = "foo bar foo".replaceAll("foo", (m) => m + "!");
+                \\const arr = [3, 1, 2];
+                \\const removed = arr.splice(1, 1, 9, 8);
+                \\arr.sort((a, b) => a - b);
+                \\const cat = arr.concat(parts, removed);
+                \\Object.entries({ x: 1, y: rep, z: cat });
             ,
                 .{},
                 .vm,

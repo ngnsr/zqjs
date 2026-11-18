@@ -43,9 +43,11 @@ pub const Realm = struct {
     set_prototype: *Object,
     promise_prototype: *Object,
     iterator_prototype: *Object,
-    /// Static members of the `Object`, `Array`, `Map`, `Set`, and `Promise` globals.
+    /// Static members of the `Object`, `Array`, `String`, `Number`, `Map`, `Set`, and `Promise` globals.
     object_namespace: *Object,
     array_namespace: *Object,
+    string_namespace: *Object,
+    number_namespace: *Object,
     map_namespace: *Object,
     set_namespace: *Object,
     promise_namespace: *Object,
@@ -53,8 +55,8 @@ pub const Realm = struct {
     json: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [17]*Object {
-        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.map_prototype, r.set_prototype, r.promise_prototype, r.iterator_prototype, r.object_namespace, r.array_namespace, r.map_namespace, r.set_namespace, r.promise_namespace, r.math, r.json };
+    pub fn objects(r: *const Realm) [19]*Object {
+        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.map_prototype, r.set_prototype, r.promise_prototype, r.iterator_prototype, r.object_namespace, r.array_namespace, r.string_namespace, r.number_namespace, r.map_namespace, r.set_namespace, r.promise_namespace, r.math, r.json };
     }
 };
 
@@ -75,6 +77,8 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .iterator_prototype = try builtin(h, object_prototype, .iterator_prototype),
         .object_namespace = try builtin(h, null, .object_constructor),
         .array_namespace = try builtin(h, null, .array_constructor),
+        .string_namespace = try builtin(h, null, .string_constructor),
+        .number_namespace = try builtin(h, null, .number_constructor),
         .map_namespace = try builtin(h, null, .map_constructor),
         .set_namespace = try builtin(h, null, .set_constructor),
         .promise_namespace = try builtin(h, null, .promise_constructor),
@@ -97,6 +101,21 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.array_prototype, "map", &array_map);
     try method(rt, r.array_prototype, "filter", &array_filter);
     try method(rt, r.array_prototype, "reduce", &array_reduce);
+    try method(rt, r.array_prototype, "find", &array_find);
+    try method(rt, r.array_prototype, "findIndex", &array_find_index);
+    try method(rt, r.array_prototype, "findLast", &array_find_last);
+    try method(rt, r.array_prototype, "findLastIndex", &array_find_last_index);
+    try method(rt, r.array_prototype, "some", &array_some);
+    try method(rt, r.array_prototype, "every", &array_every);
+    try method(rt, r.array_prototype, "concat", &array_concat);
+    try method(rt, r.array_prototype, "reverse", &array_reverse);
+    try method(rt, r.array_prototype, "at", &array_at);
+    try method(rt, r.array_prototype, "lastIndexOf", &array_last_index_of);
+    try method(rt, r.array_prototype, "fill", &array_fill);
+    try method(rt, r.array_prototype, "shift", &array_shift);
+    try method(rt, r.array_prototype, "unshift", &array_unshift);
+    try method(rt, r.array_prototype, "splice", &array_splice);
+    try method(rt, r.array_prototype, "sort", &array_sort);
     try method(rt, r.string_prototype, "charAt", &string_char_at);
     try method(rt, r.string_prototype, "charCodeAt", &string_char_code_at);
     try method(rt, r.string_prototype, "slice", &string_slice);
@@ -104,10 +123,41 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.string_prototype, "includes", &string_includes);
     try method(rt, r.string_prototype, "toLowerCase", &string_to_lower_case);
     try method(rt, r.string_prototype, "toUpperCase", &string_to_upper_case);
+    try method(rt, r.string_prototype, "split", &string_split);
+    try method(rt, r.string_prototype, "trim", &string_trim);
+    try method(rt, r.string_prototype, "trimStart", &string_trim_start);
+    try method(rt, r.string_prototype, "trimEnd", &string_trim_end);
+    try method(rt, r.string_prototype, "startsWith", &string_starts_with);
+    try method(rt, r.string_prototype, "endsWith", &string_ends_with);
+    try method(rt, r.string_prototype, "repeat", &string_repeat);
+    try method(rt, r.string_prototype, "padStart", &string_pad_start);
+    try method(rt, r.string_prototype, "padEnd", &string_pad_end);
+    try method(rt, r.string_prototype, "substring", &string_substring);
+    try method(rt, r.string_prototype, "lastIndexOf", &string_last_index_of);
+    try method(rt, r.string_prototype, "at", &string_at);
+    try method(rt, r.string_prototype, "replace", &string_replace);
+    try method(rt, r.string_prototype, "replaceAll", &string_replace_all);
     try method(rt, r.object_namespace, "keys", &object_keys);
+    try method(rt, r.object_namespace, "values", &object_values);
+    try method(rt, r.object_namespace, "entries", &object_entries);
+    try method(rt, r.object_namespace, "assign", &object_assign);
     try method(rt, r.object_namespace, "create", &object_create);
     try method(rt, r.object_namespace, "getPrototypeOf", &object_get_prototype_of);
     try method(rt, r.array_namespace, "isArray", &array_is_array);
+    try method(rt, r.array_namespace, "from", &array_from);
+    try method(rt, r.array_namespace, "of", &array_of);
+    try method(rt, r.number_namespace, "isInteger", &number_is_integer);
+    try method(rt, r.number_namespace, "isFinite", &number_is_finite);
+    try method(rt, r.number_namespace, "isNaN", &number_is_nan);
+    try method(rt, r.number_namespace, "isSafeInteger", &number_is_safe_integer);
+    try constant(rt, r.number_namespace, "MAX_SAFE_INTEGER", .{ .number = 9007199254740991.0 });
+    try constant(rt, r.number_namespace, "MIN_SAFE_INTEGER", .{ .number = -9007199254740991.0 });
+    try constant(rt, r.number_namespace, "EPSILON", .{ .number = std.math.floatEps(f64) });
+    try constant(rt, r.number_namespace, "MAX_VALUE", .{ .number = std.math.floatMax(f64) });
+    try constant(rt, r.number_namespace, "MIN_VALUE", .{ .number = std.math.floatTrueMin(f64) });
+    try constant(rt, r.number_namespace, "POSITIVE_INFINITY", .{ .number = std.math.inf(f64) });
+    try constant(rt, r.number_namespace, "NEGATIVE_INFINITY", .{ .number = -std.math.inf(f64) });
+    try constant(rt, r.number_namespace, "NaN", .{ .number = std.math.nan(f64) });
     try method(rt, r.map_prototype, "get", &map_get);
     try method(rt, r.map_prototype, "set", &map_set);
     try method(rt, r.map_prototype, "has", &map_has);
@@ -169,6 +219,12 @@ pub fn isConversion(n: *const Native) bool {
 pub const print: Native = .{ .name = "print", .call = printImpl };
 pub const object_global: Native = .{ .name = "Object", .call = notCallable, .namespace = .object };
 pub const array_global: Native = .{ .name = "Array", .call = notCallable, .namespace = .array };
+pub const string_global: Native = .{ .name = "String", .call = stringCall, .namespace = .string };
+pub const number_global: Native = .{ .name = "Number", .call = numberCall, .namespace = .number };
+pub const parse_int_global: Native = .{ .name = "parseInt", .call = parseIntImpl };
+pub const parse_float_global: Native = .{ .name = "parseFloat", .call = parseFloatImpl };
+pub const is_nan_global: Native = .{ .name = "isNaN", .call = globalIsNaN };
+pub const is_finite_global: Native = .{ .name = "isFinite", .call = globalIsFinite };
 pub const map_global: Native = .{ .name = "Map", .call = mapWithoutNew, .construct = mapConstruct, .namespace = .map };
 pub const set_global: Native = .{ .name = "Set", .call = setWithoutNew, .construct = setConstruct, .namespace = .set };
 pub const promise_global: Native = .{ .name = "Promise", .call = promiseWithoutNew, .construct = promiseConstruct, .namespace = .promise };
@@ -192,6 +248,12 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "print")) return .{ .native = &print };
     if (std.mem.eql(u8, name, "Object")) return .{ .native = &object_global };
     if (std.mem.eql(u8, name, "Array")) return .{ .native = &array_global };
+    if (std.mem.eql(u8, name, "String")) return .{ .native = &string_global };
+    if (std.mem.eql(u8, name, "Number")) return .{ .native = &number_global };
+    if (std.mem.eql(u8, name, "parseInt")) return .{ .native = &parse_int_global };
+    if (std.mem.eql(u8, name, "parseFloat")) return .{ .native = &parse_float_global };
+    if (std.mem.eql(u8, name, "isNaN")) return .{ .native = &is_nan_global };
+    if (std.mem.eql(u8, name, "isFinite")) return .{ .native = &is_finite_global };
     if (std.mem.eql(u8, name, "Map")) return .{ .native = &map_global };
     if (std.mem.eql(u8, name, "Set")) return .{ .native = &set_global };
     if (std.mem.eql(u8, name, "Promise")) return .{ .native = &promise_global };
@@ -306,6 +368,21 @@ const array_for_each: Native = .{ .name = "forEach", .call = arrayForEach };
 const array_map: Native = .{ .name = "map", .call = arrayMap };
 const array_filter: Native = .{ .name = "filter", .call = arrayFilter };
 const array_reduce: Native = .{ .name = "reduce", .call = arrayReduce };
+const array_find: Native = .{ .name = "find", .call = arrayFind };
+const array_find_index: Native = .{ .name = "findIndex", .call = arrayFindIndex };
+const array_find_last: Native = .{ .name = "findLast", .call = arrayFindLast };
+const array_find_last_index: Native = .{ .name = "findLastIndex", .call = arrayFindLastIndex };
+const array_some: Native = .{ .name = "some", .call = arraySome };
+const array_every: Native = .{ .name = "every", .call = arrayEvery };
+const array_concat: Native = .{ .name = "concat", .call = arrayConcat };
+const array_reverse: Native = .{ .name = "reverse", .call = arrayReverse };
+const array_at: Native = .{ .name = "at", .call = arrayAt };
+const array_last_index_of: Native = .{ .name = "lastIndexOf", .call = arrayLastIndexOf };
+const array_fill: Native = .{ .name = "fill", .call = arrayFill };
+const array_shift: Native = .{ .name = "shift", .call = arrayShift };
+const array_unshift: Native = .{ .name = "unshift", .call = arrayUnshift };
+const array_splice: Native = .{ .name = "splice", .call = arraySplice };
+const array_sort: Native = .{ .name = "sort", .call = arraySort };
 
 fn requireCallable(rt: *Runtime, v: Value) Error!Value {
     return switch (v) {
@@ -519,6 +596,327 @@ fn arrayReduce(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return root_buf[2];
 }
 
+const FindMode = enum { find, find_index, find_last, find_last_index };
+
+fn arrayFindImpl(rt: *Runtime, this: Value, args: []const Value, name: []const u8, comptime mode: FindMode) Error!Value {
+    const a = try thisArray(rt, this, name);
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    const len = a.kind.array.items.len;
+    var root_buf = [_]Value{ this, cb, this_arg, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const reverse = (mode == .find_last or mode == .find_last_index);
+    for (0..len) |step| {
+        const i = if (reverse) len - 1 - step else step;
+        const elem = if (i < a.kind.array.items.len) a.kind.array.items[i] else Value.undefined;
+        root_buf[3] = elem;
+        const res = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
+        if (ops.toBoolean(res)) {
+            return switch (mode) {
+                .find, .find_last => root_buf[3],
+                .find_index, .find_last_index => .{ .number = @floatFromInt(i) },
+            };
+        }
+        root_buf[3] = .undefined;
+    }
+    return switch (mode) {
+        .find, .find_last => .undefined,
+        .find_index, .find_last_index => .{ .number = -1 },
+    };
+}
+
+fn arrayFind(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return arrayFindImpl(rt, this, args, "find", .find);
+}
+
+fn arrayFindIndex(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return arrayFindImpl(rt, this, args, "findIndex", .find_index);
+}
+
+fn arrayFindLast(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return arrayFindImpl(rt, this, args, "findLast", .find_last);
+}
+
+fn arrayFindLastIndex(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return arrayFindImpl(rt, this, args, "findLastIndex", .find_last_index);
+}
+
+fn arraySomeEveryImpl(rt: *Runtime, this: Value, args: []const Value, name: []const u8, comptime is_every: bool) Error!Value {
+    const a = try thisArray(rt, this, name);
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    const len = a.kind.array.items.len;
+    var root_buf = [_]Value{ this, cb, this_arg };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    for (0..len) |i| {
+        if (i >= a.kind.array.items.len) continue;
+        const elem = a.kind.array.items[i];
+        const res = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
+        const b = ops.toBoolean(res);
+        if (is_every and !b) return .{ .boolean = false };
+        if (!is_every and b) return .{ .boolean = true };
+    }
+    return .{ .boolean = is_every };
+}
+
+fn arraySome(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return arraySomeEveryImpl(rt, this, args, "some", false);
+}
+
+fn arrayEvery(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return arraySomeEveryImpl(rt, this, args, "every", true);
+}
+
+fn arrayConcat(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "concat");
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ this, .{ .object = out } };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    try rt.heap.appendElements(out, a.kind.array.items);
+    for (args) |v| {
+        if (v == .object and v.object.kind == .array) {
+            try rt.heap.appendElements(out, v.object.kind.array.items);
+        } else {
+            try rt.heap.appendElement(out, v);
+        }
+    }
+    return .{ .object = out };
+}
+
+fn arrayReverse(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "reverse");
+    const len = a.kind.array.items.len;
+    var lo: usize = 0;
+    while (lo < len / 2) : (lo += 1) {
+        const hi = len - 1 - lo;
+        const tmp = a.kind.array.items[lo];
+        rt.heap.storeElement(a, lo, a.kind.array.items[hi]);
+        rt.heap.storeElement(a, hi, tmp);
+    }
+    return this;
+}
+
+fn arrayAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "at");
+    const len = a.kind.array.items.len;
+    const rel = try toIntegerOrInfinity(rt, arg(args, 0));
+    const k = if (rel >= 0) rel else @as(f64, @floatFromInt(len)) + rel;
+    if (k < 0 or k >= @as(f64, @floatFromInt(len))) return .undefined;
+    return a.kind.array.items[@intFromFloat(k)];
+}
+
+fn arrayLastIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "lastIndexOf");
+    const items = a.kind.array.items;
+    if (items.len == 0) return .{ .number = -1 };
+    const needle = arg(args, 0);
+    const len_f: f64 = @floatFromInt(items.len);
+    const n = if (args.len >= 2) try toIntegerOrInfinity(rt, args[1]) else len_f - 1;
+    const k_f = if (n >= 0) @min(n, len_f - 1) else len_f + n;
+    if (k_f < 0) return .{ .number = -1 };
+    var k: usize = @intFromFloat(k_f);
+    while (true) : (k -= 1) {
+        if (ops.strictEquals(items[k], needle)) return .{ .number = @floatFromInt(k) };
+        if (k == 0) break;
+    }
+    return .{ .number = -1 };
+}
+
+fn arrayFill(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "fill");
+    const val = arg(args, 0);
+    const len = a.kind.array.items.len;
+    const start = if (arg(args, 1) == .undefined) 0 else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 1)), len);
+    const end = if (arg(args, 2) == .undefined) len else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 2)), len);
+    for (start..end) |i| rt.heap.storeElement(a, i, val);
+    return this;
+}
+
+fn arrayShift(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "shift");
+    const items = a.kind.array.items;
+    if (items.len == 0) return .undefined;
+    const first = items[0];
+    for (1..items.len) |i| rt.heap.storeElement(a, i - 1, items[i]);
+    rt.heap.shrinkElements(a, items.len - 1);
+    return first;
+}
+
+fn arrayUnshift(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "unshift");
+    const old_len = a.kind.array.items.len;
+    const ins_len = args.len;
+    if (ins_len > 0) {
+        // Grow upfront so OOM leaves the array untouched.
+        try rt.heap.appendElements(a, args);
+        var i: usize = old_len;
+        while (i > 0) {
+            i -= 1;
+            rt.heap.storeElement(a, i + ins_len, a.kind.array.items[i]);
+        }
+        for (args, 0..) |v, j| rt.heap.storeElement(a, j, v);
+    }
+    return .{ .number = @floatFromInt(a.kind.array.items.len) };
+}
+
+fn arraySplice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "splice");
+    const len = a.kind.array.items.len;
+    const actual_start: usize = if (args.len == 0) 0 else resolveRelativeIndex(try toIntegerOrInfinity(rt, args[0]), len);
+    const actual_delete: usize = if (args.len == 0)
+        0
+    else if (args.len == 1)
+        len - actual_start
+    else blk: {
+        const dc = try toIntegerOrInfinity(rt, args[1]);
+        const max_dc: f64 = @floatFromInt(len - actual_start);
+        break :blk @intFromFloat(@min(@max(dc, 0), max_dc));
+    };
+    const insert_items = if (args.len > 2) args[2..] else &[_]Value{};
+    const insert_count = insert_items.len;
+
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ this, .{ .object = out } };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    try rt.heap.appendElements(out, a.kind.array.items[actual_start .. actual_start + actual_delete]);
+
+    if (insert_count > actual_delete) {
+        const delta = insert_count - actual_delete;
+        // Grow upfront with the new items slice so OOM leaves `a` untouched.
+        try rt.heap.appendElements(a, insert_items[0..delta]);
+        var i: usize = len;
+        while (i > actual_start + actual_delete) {
+            i -= 1;
+            rt.heap.storeElement(a, i + delta, a.kind.array.items[i]);
+        }
+    } else if (insert_count < actual_delete) {
+        const tail_start = actual_start + actual_delete;
+        for (tail_start..len) |i| {
+            rt.heap.storeElement(a, i - actual_delete + insert_count, a.kind.array.items[i]);
+        }
+        rt.heap.shrinkElements(a, len - actual_delete + insert_count);
+    }
+
+    for (insert_items, 0..) |v, j| {
+        rt.heap.storeElement(a, actual_start + j, v);
+    }
+    return .{ .object = out };
+}
+
+fn arraySort(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const a = try thisArray(rt, this, "sort");
+    const cb: ?Value = if (args.len >= 1 and args[0] != .undefined) try requireCallable(rt, args[0]) else null;
+    const len = a.kind.array.items.len;
+    if (len <= 1) return this;
+
+    const snap = try rt.heap.newArray(null);
+    const tmp = try rt.heap.newArray(null);
+    var root_buf = [_]Value{ this, cb orelse .undefined, .{ .object = snap }, .{ .object = tmp }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    for (a.kind.array.items) |v| {
+        if (v != .undefined) try rt.heap.appendElement(snap, v);
+    }
+    const defined_count = snap.kind.array.items.len;
+    if (defined_count > 1) {
+        try rt.heap.appendElements(tmp, snap.kind.array.items);
+        try mergeSortRange(rt, cb, snap, tmp, 0, defined_count, &root_buf[4], &root_buf[5]);
+    }
+
+    // Write back to `a` only after all comparisons succeed, handling comparator mutations safely.
+    const cur_len = a.kind.array.items.len;
+    const write_len = @min(len, cur_len);
+    for (0..write_len) |i| {
+        const v = if (i < defined_count) snap.kind.array.items[i] else Value.undefined;
+        rt.heap.storeElement(a, i, v);
+    }
+    if (cur_len < len) {
+        for (cur_len..len) |i| {
+            const v = if (i < defined_count) snap.kind.array.items[i] else Value.undefined;
+            try rt.heap.appendElement(a, v);
+        }
+    }
+    return this;
+}
+
+fn mergeSortRange(
+    rt: *Runtime,
+    cb: ?Value,
+    snap: *Object,
+    tmp: *Object,
+    lo: usize,
+    hi: usize,
+    root_a: *Value,
+    root_b: *Value,
+) Error!void {
+    if (hi - lo <= 1) return;
+    const mid = lo + (hi - lo) / 2;
+    try mergeSortRange(rt, cb, snap, tmp, lo, mid, root_a, root_b);
+    try mergeSortRange(rt, cb, snap, tmp, mid, hi, root_a, root_b);
+
+    for (lo..hi) |k| rt.heap.storeElement(tmp, k, snap.kind.array.items[k]);
+
+    var i = lo;
+    var j = mid;
+    var k = lo;
+    while (i < mid and j < hi) : (k += 1) {
+        const left_v = tmp.kind.array.items[i];
+        const right_v = tmp.kind.array.items[j];
+        const cmp = try sortCompare(rt, cb, left_v, right_v, root_a, root_b);
+        if (cmp <= 0) {
+            rt.heap.storeElement(snap, k, left_v);
+            i += 1;
+        } else {
+            rt.heap.storeElement(snap, k, right_v);
+            j += 1;
+        }
+    }
+    while (i < mid) : ({
+        i += 1;
+        k += 1;
+    }) rt.heap.storeElement(snap, k, tmp.kind.array.items[i]);
+    while (j < hi) : ({
+        j += 1;
+        k += 1;
+    }) rt.heap.storeElement(snap, k, tmp.kind.array.items[j]);
+}
+
+fn sortCompare(rt: *Runtime, cb: ?Value, x: Value, y: Value, root_a: *Value, root_b: *Value) Error!f64 {
+    if (cb) |f| {
+        const res = try rt.callCallable(f, .undefined, &.{ x, y });
+        const v = try ops.toNumber(rt, res);
+        return if (std.math.isNan(v)) 0 else v;
+    }
+    const xs = try toStringObj(rt, x);
+    root_a.* = .{ .string = xs };
+    const ys = try toStringObj(rt, y);
+    root_b.* = .{ .string = ys };
+    const ord = std.mem.order(u16, xs.units, ys.units);
+    root_a.* = .undefined;
+    root_b.* = .undefined;
+    return switch (ord) {
+        .lt => -1,
+        .eq => 0,
+        .gt => 1,
+    };
+}
+
 // ---------------------------------------------------------------- String.prototype
 
 const string_char_at: Native = .{ .name = "charAt", .call = stringCharAt };
@@ -528,6 +926,20 @@ const string_index_of: Native = .{ .name = "indexOf", .call = stringIndexOf };
 const string_includes: Native = .{ .name = "includes", .call = stringIncludes };
 const string_to_lower_case: Native = .{ .name = "toLowerCase", .call = stringToLowerCase };
 const string_to_upper_case: Native = .{ .name = "toUpperCase", .call = stringToUpperCase };
+const string_split: Native = .{ .name = "split", .call = stringSplit };
+const string_trim: Native = .{ .name = "trim", .call = stringTrim };
+const string_trim_start: Native = .{ .name = "trimStart", .call = stringTrimStart };
+const string_trim_end: Native = .{ .name = "trimEnd", .call = stringTrimEnd };
+const string_starts_with: Native = .{ .name = "startsWith", .call = stringStartsWith };
+const string_ends_with: Native = .{ .name = "endsWith", .call = stringEndsWith };
+const string_repeat: Native = .{ .name = "repeat", .call = stringRepeat };
+const string_pad_start: Native = .{ .name = "padStart", .call = stringPadStart };
+const string_pad_end: Native = .{ .name = "padEnd", .call = stringPadEnd };
+const string_substring: Native = .{ .name = "substring", .call = stringSubstring };
+const string_last_index_of: Native = .{ .name = "lastIndexOf", .call = stringLastIndexOf };
+const string_at: Native = .{ .name = "at", .call = stringAt };
+const string_replace: Native = .{ .name = "replace", .call = stringReplace };
+const string_replace_all: Native = .{ .name = "replaceAll", .call = stringReplaceAll };
 
 fn thisString(rt: *Runtime, this: Value, name: []const u8) Error!*const heap_mod.String {
     return switch (this) {
@@ -536,13 +948,21 @@ fn thisString(rt: *Runtime, this: Value, name: []const u8) Error!*const heap_mod
     };
 }
 
-fn toStringUnits(rt: *Runtime, v: Value) Error![]const u16 {
-    if (v == .string) return v.string.units;
+fn toStringObj(rt: *Runtime, v: Value) Error!*const heap_mod.String {
+    if (v == .string) return v.string;
     var buf: ops.NumberBuf = undefined;
     const piece = try ops.toPiece(rt, v, &buf);
-    return switch (piece) {
-        .utf16 => |u| u,
-        .ascii => (try rt.heap.newString(&.{piece})).units,
+    return rt.heap.newString(&.{piece});
+}
+
+fn toStringUnits(rt: *Runtime, v: Value) Error![]const u16 {
+    return (try toStringObj(rt, v)).units;
+}
+
+fn isJsWhitespace(u: u16) bool {
+    return switch (u) {
+        0x09...0x0D, 0x20, 0xA0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF => true,
+        else => false,
     };
 }
 
@@ -620,12 +1040,346 @@ fn stringToUpperCase(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     return asciiCase(rt, s, "toUpperCase", true);
 }
 
+fn stringAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "at");
+    const len = s.units.len;
+    const rel = try toIntegerOrInfinity(rt, arg(args, 0));
+    const k = if (rel >= 0) rel else @as(f64, @floatFromInt(len)) + rel;
+    if (k < 0 or k >= @as(f64, @floatFromInt(len))) return .undefined;
+    const i: usize = @intFromFloat(k);
+    return .{ .string = try rt.heap.newString(&.{.{ .utf16 = s.units[i .. i + 1] }}) };
+}
+
+fn stringSubstring(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "substring");
+    const len_f: f64 = @floatFromInt(s.units.len);
+    const int_start = try toIntegerOrInfinity(rt, arg(args, 0));
+    const int_end = if (arg(args, 1) == .undefined) len_f else try toIntegerOrInfinity(rt, arg(args, 1));
+    const final_start = @min(@max(int_start, 0), len_f);
+    const final_end = @min(@max(int_end, 0), len_f);
+    const from: usize = @intFromFloat(@min(final_start, final_end));
+    const to: usize = @intFromFloat(@max(final_start, final_end));
+    return .{ .string = try rt.heap.newString(&.{.{ .utf16 = s.units[from..to] }}) };
+}
+
+fn stringLastIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "lastIndexOf");
+    const search = try toStringUnits(rt, arg(args, 0));
+    const num_pos = if (args.len < 2) std.math.nan(f64) else try ops.toNumber(rt, args[1]);
+    const pos = if (std.math.isNan(num_pos)) std.math.inf(f64) else if (num_pos == 0) 0 else @trunc(num_pos);
+    const start: usize = @intFromFloat(@min(@max(pos, 0), @as(f64, @floatFromInt(s.units.len))));
+    if (search.len == 0) return .{ .number = @floatFromInt(start) };
+    if (search.len > s.units.len) return .{ .number = -1 };
+    var k: usize = @min(start, s.units.len - search.len);
+    while (true) : (k -= 1) {
+        if (std.mem.eql(u16, s.units[k .. k + search.len], search)) return .{ .number = @floatFromInt(k) };
+        if (k == 0) break;
+    }
+    return .{ .number = -1 };
+}
+
+fn stringStartsWith(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "startsWith");
+    const search = try toStringUnits(rt, arg(args, 0));
+    const pos = try toIntegerOrInfinity(rt, arg(args, 1));
+    const start: usize = @intFromFloat(@min(@max(pos, 0), @as(f64, @floatFromInt(s.units.len))));
+    if (search.len == 0) return .{ .boolean = true };
+    if (s.units.len - start < search.len) return .{ .boolean = false };
+    return .{ .boolean = std.mem.eql(u16, s.units[start .. start + search.len], search) };
+}
+
+fn stringEndsWith(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "endsWith");
+    const search = try toStringUnits(rt, arg(args, 0));
+    const len_f: f64 = @floatFromInt(s.units.len);
+    const pos = if (arg(args, 1) == .undefined) len_f else try toIntegerOrInfinity(rt, arg(args, 1));
+    const end: usize = @intFromFloat(@min(@max(pos, 0), len_f));
+    if (search.len > end) return .{ .boolean = false };
+    return .{ .boolean = std.mem.eql(u16, s.units[end - search.len .. end], search) };
+}
+
+fn stringTrimImpl(rt: *Runtime, this: Value, name: []const u8, trim_start: bool, trim_end: bool) Error!Value {
+    const s = try thisString(rt, this, name);
+    var start: usize = 0;
+    var end: usize = s.units.len;
+    if (trim_start) while (start < end and isJsWhitespace(s.units[start])) {
+        start += 1;
+    };
+    if (trim_end) while (end > start and isJsWhitespace(s.units[end - 1])) {
+        end -= 1;
+    };
+    return .{ .string = try rt.heap.newString(&.{.{ .utf16 = s.units[start..end] }}) };
+}
+
+fn stringTrim(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return stringTrimImpl(rt, this, "trim", true, true);
+}
+
+fn stringTrimStart(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return stringTrimImpl(rt, this, "trimStart", true, false);
+}
+
+fn stringTrimEnd(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return stringTrimImpl(rt, this, "trimEnd", false, true);
+}
+
+fn stringRepeat(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "repeat");
+    const n = try toIntegerOrInfinity(rt, arg(args, 0));
+    if (n < 0 or n == std.math.inf(f64)) return rt.throw(.RangeError, &.{.{ .ascii = "Invalid count value" }});
+    if (n == 0 or s.units.len == 0) return .{ .string = try rt.heap.newString(&.{}) };
+    const max_len = rt.heap.max_string_length;
+    if (n > @as(f64, @floatFromInt(max_len))) return rt.limit(.string_length);
+    const count: usize = @intFromFloat(n);
+    const total = std.math.mul(usize, s.units.len, count) catch return rt.limit(.string_length);
+    if (total > max_len) return rt.limit(.string_length);
+
+    const buf = try rt.gpa.alloc(u16, total);
+    defer rt.gpa.free(buf);
+    for (0..count) |i| {
+        @memcpy(buf[i * s.units.len ..][0..s.units.len], s.units);
+    }
+    return .{ .string = try rt.heap.newString(&.{.{ .utf16 = buf }}) };
+}
+
+fn stringPadImpl(rt: *Runtime, this: Value, args: []const Value, name: []const u8, comptime is_start: bool) Error!Value {
+    const s = try thisString(rt, this, name);
+    const max_len_f = try toIntegerOrInfinity(rt, arg(args, 0));
+    if (max_len_f <= @as(f64, @floatFromInt(s.units.len))) return this;
+    const filler: []const u16 = if (arg(args, 1) == .undefined)
+        &.{' '}
+    else
+        try toStringUnits(rt, arg(args, 1));
+    if (filler.len == 0) return this;
+    const max_str = rt.heap.max_string_length;
+    if (max_len_f > @as(f64, @floatFromInt(max_str))) return rt.limit(.string_length);
+    const target_len: usize = @intFromFloat(max_len_f);
+    const pad_len = target_len - s.units.len;
+
+    const pad_buf = try rt.gpa.alloc(u16, pad_len);
+    defer rt.gpa.free(pad_buf);
+    var filled: usize = 0;
+    while (filled < pad_len) {
+        const chunk = @min(filler.len, pad_len - filled);
+        @memcpy(pad_buf[filled..][0..chunk], filler[0..chunk]);
+        filled += chunk;
+    }
+    const pad_piece: heap_mod.Piece = .{ .utf16 = pad_buf };
+    const orig_piece: heap_mod.Piece = .{ .utf16 = s.units };
+    return .{ .string = try rt.heap.newString(if (is_start) &.{ pad_piece, orig_piece } else &.{ orig_piece, pad_piece }) };
+}
+
+fn stringPadStart(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return stringPadImpl(rt, this, args, "padStart", true);
+}
+
+fn stringPadEnd(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return stringPadImpl(rt, this, args, "padEnd", false);
+}
+
+fn stringSplit(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "split");
+    const sep_arg = arg(args, 0);
+    const lim: u32 = if (arg(args, 1) == .undefined) std.math.maxInt(u32) else ops.toUint32(try ops.toNumber(rt, arg(args, 1)));
+    const r = try realm(rt);
+
+    if (sep_arg == .undefined) {
+        const out = try rt.heap.newArray(r.array_prototype);
+        if (lim == 0) return .{ .object = out };
+        var root_buf = [_]Value{ this, .{ .object = out } };
+        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+        try roots.register(rt);
+        defer roots.unregister(rt);
+        try rt.heap.appendElement(out, this);
+        return .{ .object = out };
+    }
+
+    const sep = try toStringObj(rt, sep_arg);
+    var root_buf = [_]Value{ this, .{ .string = sep }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const out = try rt.heap.newArray(r.array_prototype);
+    root_buf[2] = .{ .object = out };
+    if (lim == 0) return .{ .object = out };
+
+    if (sep.units.len == 0) {
+        const count = @min(s.units.len, lim);
+        for (0..count) |i| {
+            const ch = try rt.heap.newString(&.{.{ .utf16 = s.units[i .. i + 1] }});
+            root_buf[3] = .{ .string = ch };
+            try rt.heap.appendElement(out, root_buf[3]);
+            root_buf[3] = .undefined;
+        }
+        return .{ .object = out };
+    }
+
+    if (s.units.len == 0) {
+        try rt.heap.appendElement(out, this);
+        return .{ .object = out };
+    }
+
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u16, s.units, pos, sep.units)) |idx| {
+        const part = try rt.heap.newString(&.{.{ .utf16 = s.units[pos..idx] }});
+        root_buf[3] = .{ .string = part };
+        try rt.heap.appendElement(out, root_buf[3]);
+        root_buf[3] = .undefined;
+        if (out.kind.array.items.len == lim) return .{ .object = out };
+        pos = idx + sep.units.len;
+    }
+    const tail = try rt.heap.newString(&.{.{ .utf16 = s.units[pos..] }});
+    root_buf[3] = .{ .string = tail };
+    try rt.heap.appendElement(out, root_buf[3]);
+    return .{ .object = out };
+}
+
+fn appendUnits(rt: *Runtime, out: *std.ArrayList(u16), units: []const u16) Error!void {
+    const max_len = rt.heap.max_string_length;
+    if (units.len > max_len or out.items.len > max_len - units.len) return rt.limit(.string_length);
+    try out.appendSlice(rt.gpa, units);
+}
+
+fn expandReplacement(
+    rt: *Runtime,
+    out: *std.ArrayList(u16),
+    s_units: []const u16,
+    pos: usize,
+    match_len: usize,
+    repl_units: []const u16,
+) Error!void {
+    var i: usize = 0;
+    while (i < repl_units.len) {
+        if (repl_units[i] == '$' and i + 1 < repl_units.len) {
+            switch (repl_units[i + 1]) {
+                '$' => {
+                    try appendUnits(rt, out, &.{'$'});
+                    i += 2;
+                    continue;
+                },
+                '&' => {
+                    try appendUnits(rt, out, s_units[pos .. pos + match_len]);
+                    i += 2;
+                    continue;
+                },
+                '`' => {
+                    try appendUnits(rt, out, s_units[0..pos]);
+                    i += 2;
+                    continue;
+                },
+                '\'' => {
+                    try appendUnits(rt, out, s_units[pos + match_len ..]);
+                    i += 2;
+                    continue;
+                },
+                else => {},
+            }
+        }
+        try appendUnits(rt, out, repl_units[i .. i + 1]);
+        i += 1;
+    }
+}
+
+fn stringReplaceImpl(rt: *Runtime, this: Value, args: []const Value, name: []const u8, comptime is_all: bool) Error!Value {
+    const s = try thisString(rt, this, name);
+    const search = try toStringObj(rt, arg(args, 0));
+    const repl_arg = arg(args, 1);
+    const is_func = repl_arg == .native or repl_arg == .closure;
+
+    var root_buf = [_]Value{ this, .{ .string = search }, repl_arg, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const repl_str: ?*const heap_mod.String = if (!is_func) blk: {
+        const rs = try toStringObj(rt, repl_arg);
+        root_buf[3] = .{ .string = rs };
+        break :blk rs;
+    } else null;
+
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(rt.gpa);
+
+    if (!is_all) {
+        const pos = if (search.units.len == 0) 0 else std.mem.indexOf(u16, s.units, search.units) orelse return this;
+        try appendUnits(rt, &out, s.units[0..pos]);
+        if (is_func) {
+            const matched = try rt.heap.newString(&.{.{ .utf16 = s.units[pos .. pos + search.units.len] }});
+            root_buf[4] = .{ .string = matched };
+            const res = try rt.callCallable(repl_arg, .undefined, &.{ .{ .string = matched }, .{ .number = @floatFromInt(pos) }, this });
+            const rs = try toStringObj(rt, res);
+            root_buf[4] = .{ .string = rs };
+            try appendUnits(rt, &out, rs.units);
+        } else {
+            try expandReplacement(rt, &out, s.units, pos, search.units.len, repl_str.?.units);
+        }
+        try appendUnits(rt, &out, s.units[pos + search.units.len ..]);
+        return .{ .string = try rt.heap.newString(&.{.{ .utf16 = out.items }}) };
+    }
+
+    if (search.units.len == 0) {
+        const empty_s: ?*const heap_mod.String = if (is_func) blk: {
+            const es = try rt.heap.newString(&.{});
+            root_buf[3] = .{ .string = es };
+            break :blk es;
+        } else null;
+        for (0..s.units.len + 1) |pos| {
+            if (pos > 0) try appendUnits(rt, &out, s.units[pos - 1 .. pos]);
+            if (is_func) {
+                const res = try rt.callCallable(repl_arg, .undefined, &.{ .{ .string = empty_s.? }, .{ .number = @floatFromInt(pos) }, this });
+                const rs = try toStringObj(rt, res);
+                root_buf[4] = .{ .string = rs };
+                try appendUnits(rt, &out, rs.units);
+            } else {
+                try expandReplacement(rt, &out, s.units, pos, 0, repl_str.?.units);
+            }
+        }
+        return .{ .string = try rt.heap.newString(&.{.{ .utf16 = out.items }}) };
+    }
+
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u16, s.units, pos, search.units)) |idx| {
+        try appendUnits(rt, &out, s.units[pos..idx]);
+        if (is_func) {
+            const matched = try rt.heap.newString(&.{.{ .utf16 = s.units[idx .. idx + search.units.len] }});
+            root_buf[4] = .{ .string = matched };
+            const res = try rt.callCallable(repl_arg, .undefined, &.{ .{ .string = matched }, .{ .number = @floatFromInt(idx) }, this });
+            const rs = try toStringObj(rt, res);
+            root_buf[4] = .{ .string = rs };
+            try appendUnits(rt, &out, rs.units);
+        } else {
+            try expandReplacement(rt, &out, s.units, idx, search.units.len, repl_str.?.units);
+        }
+        pos = idx + search.units.len;
+    }
+    try appendUnits(rt, &out, s.units[pos..]);
+    return .{ .string = try rt.heap.newString(&.{.{ .utf16 = out.items }}) };
+}
+
+fn stringReplace(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return stringReplaceImpl(rt, this, args, "replace", false);
+}
+
+fn stringReplaceAll(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return stringReplaceImpl(rt, this, args, "replaceAll", true);
+}
+
 // ---------------------------------------------------------------- Object, Array
 
 const object_keys: Native = .{ .name = "keys", .call = objectKeys };
+const object_values: Native = .{ .name = "values", .call = objectValues };
+const object_entries: Native = .{ .name = "entries", .call = objectEntries };
+const object_assign: Native = .{ .name = "assign", .call = objectAssign };
 const object_create: Native = .{ .name = "create", .call = objectCreate };
 const object_get_prototype_of: Native = .{ .name = "getPrototypeOf", .call = objectGetPrototypeOf };
 const array_is_array: Native = .{ .name = "isArray", .call = arrayIsArray };
+const array_from: Native = .{ .name = "from", .call = arrayFrom };
+const array_of: Native = .{ .name = "of", .call = arrayOf };
+const number_is_integer: Native = .{ .name = "isInteger", .call = numberIsInteger };
+const number_is_finite: Native = .{ .name = "isFinite", .call = numberIsFinite };
+const number_is_nan: Native = .{ .name = "isNaN", .call = numberIsNaN };
+const number_is_safe_integer: Native = .{ .name = "isSafeInteger", .call = numberIsSafeInteger };
 
 fn objectKeys(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const r = try realm(rt);
@@ -683,6 +1437,311 @@ fn objectGetPrototypeOf(rt: *Runtime, _: Value, args: []const Value) Error!Value
 fn arrayIsArray(_: *Runtime, _: Value, args: []const Value) Error!Value {
     const v = arg(args, 0);
     return .{ .boolean = v == .object and v.object.kind == .array };
+}
+
+fn keyToString(rt: *Runtime, k: object.Key) Error!*heap_mod.String {
+    return switch (k) {
+        .atom => |a| a,
+        .index => |i| blk: {
+            var buf: [10]u8 = undefined;
+            break :blk try rt.heap.ascii(std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
+        },
+    };
+}
+
+fn ownKeyValue(rt: *Runtime, o: *Object, k: object.Key) Error!Value {
+    if (o.kind == .array and k == .index) return o.kind.array.items[k.index];
+    return object.get(rt, .{ .object = o }, k);
+}
+
+fn objectValuesEntriesImpl(rt: *Runtime, args: []const Value, comptime is_entries: bool) Error!Value {
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ arg(args, 0), .{ .object = out }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    switch (arg(args, 0)) {
+        .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
+        .boolean, .number => {},
+        .native, .closure => return rt.fail(.function_properties),
+        .string => |s| for (0..s.units.len) |i| {
+            const ch = try rt.heap.newString(&.{.{ .utf16 = s.units[i .. i + 1] }});
+            root_buf[2] = .{ .string = ch };
+            if (is_entries) {
+                const key_s = try keyToString(rt, .{ .index = @intCast(i) });
+                root_buf[3] = .{ .string = key_s };
+                const pair = try makePairArray(rt, root_buf[3], root_buf[2]);
+                root_buf[2] = pair;
+                try rt.heap.appendElement(out, pair);
+            } else {
+                try rt.heap.appendElement(out, root_buf[2]);
+            }
+            root_buf[2] = .undefined;
+            root_buf[3] = .undefined;
+        },
+        .object => |o| {
+            const keys = try object.ownKeys(rt, o);
+            defer rt.gpa.free(keys);
+            for (keys) |k| {
+                const val = try ownKeyValue(rt, o, k);
+                if (is_entries) {
+                    const key_s = try keyToString(rt, k);
+                    root_buf[2] = .{ .string = key_s };
+                    root_buf[3] = val;
+                    const pair = try makePairArray(rt, root_buf[2], val);
+                    root_buf[2] = pair;
+                    try rt.heap.appendElement(out, pair);
+                    root_buf[2] = .undefined;
+                    root_buf[3] = .undefined;
+                } else {
+                    try rt.heap.appendElement(out, val);
+                }
+            }
+        },
+    }
+    return .{ .object = out };
+}
+
+fn objectValues(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return objectValuesEntriesImpl(rt, args, false);
+}
+
+fn objectEntries(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return objectValuesEntriesImpl(rt, args, true);
+}
+
+fn objectAssign(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = arg(args, 0);
+    switch (target) {
+        .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
+        .boolean, .number, .string => return unsupportedReceiver(rt, "assign"),
+        .native, .closure => return rt.fail(.function_properties),
+        .object => {},
+    }
+    if (args.len <= 1) return target;
+
+    var root_buf = [_]Value{ target, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    for (args[1..]) |src| {
+        switch (src) {
+            .undefined, .null, .boolean, .number => {},
+            .native, .closure => return rt.fail(.function_properties),
+            .string => |s| for (0..s.units.len) |i| {
+                const ch = try rt.heap.newString(&.{.{ .utf16 = s.units[i .. i + 1] }});
+                root_buf[1] = .{ .string = ch };
+                try object.set(rt, target, .{ .index = @intCast(i) }, root_buf[1]);
+                root_buf[1] = .undefined;
+            },
+            .object => |src_obj| {
+                const keys = try object.ownKeys(rt, src_obj);
+                defer rt.gpa.free(keys);
+                for (keys) |k| {
+                    try object.set(rt, target, k, try ownKeyValue(rt, src_obj, k));
+                }
+            },
+        }
+    }
+    return target;
+}
+
+fn arrayOf(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    try rt.heap.appendElements(out, args);
+    return .{ .object = out };
+}
+
+fn arrayFrom(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const items = arg(args, 0);
+    const has_map = args.len >= 2 and args[1] != .undefined;
+    const map_fn: Value = if (has_map) try requireCallable(rt, args[1]) else .undefined;
+    const this_arg = arg(args, 2);
+
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ items, map_fn, this_arg, .{ .object = out }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const iter = try getIterator(rt, items);
+    root_buf[4] = .{ .object = iter };
+
+    var k: usize = 0;
+    while (try iteratorNextVal(rt, iter)) |elem| : (k += 1) {
+        root_buf[5] = elem;
+        const val = if (has_map)
+            try rt.callCallable(map_fn, this_arg, &.{ root_buf[5], .{ .number = @floatFromInt(k) } })
+        else
+            elem;
+        root_buf[5] = val;
+        try rt.heap.appendElement(out, val);
+        root_buf[5] = .undefined;
+    }
+    return .{ .object = out };
+}
+
+fn stringCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    if (args.len == 0) return .{ .string = try rt.heap.newString(&.{}) };
+    return .{ .string = try toStringObj(rt, args[0]) };
+}
+
+fn numberCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    if (args.len == 0) return .{ .number = 0 };
+    return .{ .number = try ops.toNumber(rt, args[0]) };
+}
+
+fn numberIsNaN(_: *Runtime, _: Value, args: []const Value) Error!Value {
+    const v = arg(args, 0);
+    return .{ .boolean = v == .number and std.math.isNan(v.number) };
+}
+
+fn numberIsFinite(_: *Runtime, _: Value, args: []const Value) Error!Value {
+    const v = arg(args, 0);
+    return .{ .boolean = v == .number and std.math.isFinite(v.number) };
+}
+
+fn numberIsInteger(_: *Runtime, _: Value, args: []const Value) Error!Value {
+    const v = arg(args, 0);
+    if (v != .number) return .{ .boolean = false };
+    const n = v.number;
+    return .{ .boolean = std.math.isFinite(n) and @trunc(n) == n };
+}
+
+fn numberIsSafeInteger(_: *Runtime, _: Value, args: []const Value) Error!Value {
+    const v = arg(args, 0);
+    if (v != .number) return .{ .boolean = false };
+    const n = v.number;
+    return .{ .boolean = std.math.isFinite(n) and @trunc(n) == n and @abs(n) <= 9007199254740991.0 };
+}
+
+fn globalIsNaN(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .boolean = std.math.isNan(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn globalIsFinite(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .boolean = std.math.isFinite(try ops.toNumber(rt, arg(args, 0))) };
+}
+
+fn parseFloatImpl(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const s = try toStringObj(rt, arg(args, 0));
+    var units = s.units;
+    var start: usize = 0;
+    while (start < units.len and isJsWhitespace(units[start])) start += 1;
+    units = units[start..];
+    if (units.len == 0) return .{ .number = std.math.nan(f64) };
+
+    var negative = false;
+    var i: usize = 0;
+    if (units[0] == '-') {
+        negative = true;
+        i = 1;
+    } else if (units[0] == '+') {
+        i = 1;
+    }
+    const body = units[i..];
+    const inf_lit = "Infinity";
+    if (body.len >= inf_lit.len) {
+        var is_inf = true;
+        for (inf_lit, 0..) |c, j| {
+            if (body[j] != c) {
+                is_inf = false;
+                break;
+            }
+        }
+        if (is_inf) return .{ .number = if (negative) -std.math.inf(f64) else std.math.inf(f64) };
+    }
+
+    var p: usize = 0;
+    var digits: usize = 0;
+    while (p < body.len and body[p] >= '0' and body[p] <= '9') : (p += 1) digits += 1;
+    if (p < body.len and body[p] == '.') {
+        p += 1;
+        while (p < body.len and body[p] >= '0' and body[p] <= '9') : (p += 1) digits += 1;
+    }
+    if (digits == 0) return .{ .number = std.math.nan(f64) };
+
+    if (p < body.len and (body[p] == 'e' or body[p] == 'E')) {
+        var ep = p + 1;
+        if (ep < body.len and (body[ep] == '+' or body[ep] == '-')) ep += 1;
+        const exp_digits_start = ep;
+        while (ep < body.len and body[ep] >= '0' and body[ep] <= '9') ep += 1;
+        if (ep > exp_digits_start) p = ep;
+    }
+
+    var stack_buf: [128]u8 = undefined;
+    const heap_buf: []u8 = if (p > stack_buf.len) try rt.gpa.alloc(u8, p) else &.{};
+    defer if (heap_buf.len > 0) rt.gpa.free(heap_buf);
+    const ascii_buf = if (p > stack_buf.len) heap_buf else stack_buf[0..p];
+    for (body[0..p], ascii_buf) |u, *c| c.* = @intCast(u);
+
+    const v = std.fmt.parseFloat(f64, ascii_buf) catch unreachable;
+    return .{ .number = if (negative) -v else v };
+}
+
+fn digitVal(c: u8, radix: u8) ?u8 {
+    const v: u8 = switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'z' => c - 'a' + 10,
+        'A'...'Z' => c - 'A' + 10,
+        else => return null,
+    };
+    return if (v < radix) v else null;
+}
+
+fn parseIntImpl(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const s = try toStringObj(rt, arg(args, 0));
+    var root_buf = [_]Value{.{ .string = s }};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var r: i32 = @bitCast(ops.toUint32(try ops.toNumber(rt, arg(args, 1))));
+    var units = s.units;
+    var start: usize = 0;
+    while (start < units.len and isJsWhitespace(units[start])) start += 1;
+    units = units[start..];
+
+    var negative = false;
+    if (units.len > 0) {
+        if (units[0] == '-') {
+            negative = true;
+            units = units[1..];
+        } else if (units[0] == '+') {
+            units = units[1..];
+        }
+    }
+
+    var strip_prefix = true;
+    if (r != 0) {
+        if (r < 2 or r > 36) return .{ .number = std.math.nan(f64) };
+        if (r != 16) strip_prefix = false;
+    } else {
+        r = 10;
+    }
+
+    if (strip_prefix and units.len >= 2 and units[0] == '0' and (units[1] == 'x' or units[1] == 'X')) {
+        units = units[2..];
+        r = 16;
+    }
+
+    const radix: u8 = @intCast(r);
+    const radix_f: f64 = @floatFromInt(radix);
+    var count: usize = 0;
+    var acc: f64 = 0;
+    for (units) |u| {
+        if (u > 0x7F) break;
+        const d = digitVal(@intCast(u), radix) orelse break;
+        acc = acc * radix_f + @as(f64, @floatFromInt(d));
+        count += 1;
+    }
+    if (count == 0) return .{ .number = std.math.nan(f64) };
+    return .{ .number = if (negative) -acc else acc };
 }
 
 // ---------------------------------------------------------------- Math (M11.3)

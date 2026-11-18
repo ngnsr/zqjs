@@ -1,0 +1,6 @@
+syncThrow returned promise
+syncThrow caught: sync_boom
+uncaughtTypeError: TypeError
+catchRejected: caught:bad
+catchPendingReject: pending_caught:later
+rethrowAsync: e2:e1

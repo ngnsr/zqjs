@@ -81,7 +81,7 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `function_properties` | not yet | `f.x`, `f.length`, `print.name`, `o instanceof F` | functions aren't objects yet (no `.prototype` property on user functions) |
 | `primitive_write` | restriction | `'s'.x = 1`, `delete 'ab'.length` | sloppy JS silently ignores these |
 | `labels` | not yet | `foo: while (…)`, `break foo;` | |
-| `syntax` | not yet | `,`, `var`, `for…in`, `let` used as a variable name, tagged templates, generators, `async`, regexes … | any JS token or construct not yet in the grammar below |
+| `syntax` | not yet | `,`, `var`, `for…in`, `let` used as a variable name, tagged templates, generators (including `async function*`), `for await`, top-level `await`, regexes … | any JS token or construct not yet in the grammar below |
 
 ## 3. Lexical grammar (M1)
 
@@ -123,7 +123,7 @@ Each `Unsupported` diagnostic names one of these stable ids.
 ```
 Script            := BodyItem*
 BodyItem          := FunctionDeclaration | StatementListItem   (script and function bodies)
-FunctionDeclaration := 'function' Identifier Params Body   (hoisted; not inside blocks)
+FunctionDeclaration := 'async'? 'function' Identifier Params Body   (hoisted; not inside blocks; no line break after 'async')
 Params            := '(' (Param (',' Param)* ','?)? ')'
 Param             := '...' BindingPattern | BindingPattern ('=' Expression)?
 Body              := '{' BodyItem* '}'
@@ -150,7 +150,7 @@ Statement         := ';'                                   (empty statement)
 CaseClause        := ('case' Expression | 'default') ':' StatementListItem*
 ForInit           := ('let' | 'const') Declarator (',' Declarator)* | Expression
 Expression        := Target AssignOp Expression | Pattern '=' Expression | ArrowFunction | Logical   (right-associative)
-ArrowFunction     := (Identifier | Params) '=>' (Body | Expression)   (no line break before '=>')
+ArrowFunction     := 'async'? (Identifier | Params) '=>' (Body | Expression)   (no line break before '=>' or after 'async')
 AssignOp          := '=' | '+=' | '-=' | '*=' | '/=' | '%=' | '**='
                    | '<<=' | '>>=' | '>>>=' | '&=' | '^=' | '|=' | '&&=' | '||=' | '??='
 Logical           := Logical ('||' | '&&') Logical          (&& binds tighter than ||; cannot mix with ??)
@@ -165,13 +165,13 @@ Shift             := Shift ('<<' | '>>' | '>>>') Additive | Additive
 Additive          := Additive ('+' | '-') Mult | Mult
 Mult              := Mult ('*' | '/' | '%') Exp | Exp
 Exp               := Unary | Postfix '**' Exp               (right-associative)
-Unary             := ('-' | '+' | '!' | '~' | 'typeof') Unary | ('++' | '--') Unary | 'delete' Member | Postfix
+Unary             := ('-' | '+' | '!' | '~' | 'typeof') Unary | 'await' Unary (only in an async function body) | ('++' | '--') Unary | 'delete' Member | Postfix
 Postfix           := Primary ('++' | '--')?                 (no line break before ++/--)
 Primary           := Number | String | Template | 'true' | 'false' | 'null' | Identifier
                    | '[' (ArgItem (',' ArgItem)* ','?)? ']'             (array, no holes)
                    | '{' (PropDef (',' PropDef)* ','?)? '}'            (object)
                    | 'this'                                (only inside functions)
-                   | 'function' Identifier? Params Body    (function expression)
+                   | 'async'? 'function' Identifier? Params Body    (function expression)
                    | '(' Expression ')'
                    | Primary '(' (ArgItem (',' ArgItem)* ','?)? ')'   (call)
                    | Primary '.' IdentifierName | Primary '[' Expression ']'   (member)
@@ -314,7 +314,13 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
   - `resolve`/`reject` capabilities share an `already_resolved` guard; synchronous exceptions thrown by `executor` reject the Promise if not already resolved.
   - **Native-only adoption (intentional limitation):** resolving with a native ZQJS `Promise` adopts its state via microtasks. Arbitrary thenables (objects with a `.then` property or accessor) are **not** inspected or assimilated and fulfill directly with that value.
   - **Microtask checkpoints & fault semantics:** `Runtime.microtasks` drains in FIFO order at the end of each outermost `run`/`call` turn (nested/reentrant calls do not drain early). Caught JS exceptions inside reactions reject the child Promise. Uncatchable runtime faults (`LimitExceeded`, `OutOfMemory`, etc.) consume the active microtask without retry (leaving its child Promise pending), preserve remaining queued microtasks, and propagate cleanly so a later valid checkpoint can resume draining.
-  - **Deferred / out of scope:** `Promise.withResolvers`, `Promise.try`, unhandled-rejection tracking, `Symbol.species` subclassing, and `async`/`await`.
+  - **Deferred / out of scope:** `Promise.withResolvers`, `Promise.try`, unhandled-rejection tracking, and `Symbol.species` subclassing.
+- **`async` / `await` (M28b, both engines, D56/D59):**
+  - `async function` declarations and expressions, async arrows (`async x => …`, `async (a, b) => …`, every parameter form), and async methods in object literals (`{ async m() {} }`). `async` stays an ordinary identifier elsewhere; a line break after `async` makes it the plain identifier.
+  - `await e` (precedence of `typeof`) only directly inside an async function's body. `await` in an async function's parameters, or `await` as a binding name inside one, is a `SyntaxError`; `await` outside async functions (script top level, non-async functions), async generators and `for await` are `Unsupported(syntax)`.
+  - Calling an async function returns a native `Promise`: the body runs synchronously up to its first `await`; a `return` resolves the promise (adopting a returned native promise in two extra ticks, as in node), and an uncaught exception, including one thrown before any `await`, rejects it. `new` on an async function throws `TypeError`.
+  - `await v` converts `v` with `Promise.resolve` (native-only adoption, as above) and resumes in exactly one microtask once it settles; a rejection is thrown at the `await`, so `try`/`catch`/`finally` around it work, including a pending `return` held across an `await` inside `finally`'s region.
+  - Limits: step, call-depth and interpreter-depth limits apply to async calls and to resumed ones; each pending async call's suspended state is charged to `max_heap_bytes`. An uncatchable fault inside an async call leaves its promise pending (as for reactions).
 
 ### Bindings
 

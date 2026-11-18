@@ -2441,7 +2441,7 @@ fn promiseConstruct(rt: *Runtime, args: []const Value) Error!Value {
     return p_val;
 }
 
-fn resolveToPromise(rt: *Runtime, x: Value) Error!Value {
+pub fn resolveToPromise(rt: *Runtime, x: Value) Error!Value {
     const r = try realm(rt);
     if (x == .object and x.object.kind == .promise and x.object.proto == r.promise_prototype) {
         return x;
@@ -2767,6 +2767,15 @@ pub fn settlePromiseFromJob(rt: *Runtime, p_obj: *Object, is_rejected: bool, val
     pr.result = val;
 
     for (pr.reactions.items) |rx| {
+        if (rx.coroutine) |co| {
+            rt.microtasks.appendAssumeCapacity(.{
+                .kind = .await_resume,
+                .coroutine = co,
+                .arg = val,
+                .adopt_rejected = is_rejected,
+            });
+            continue;
+        }
         const cb = if (is_rejected) rx.on_rejected else rx.on_fulfilled;
         const is_adopt = (cb != .native and cb != .closure);
         rt.microtasks.appendAssumeCapacity(.{

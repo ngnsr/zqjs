@@ -247,6 +247,7 @@ const Compiler = struct {
         return .{
             .kind = kind,
             .is_arrow = if (f) |func| func.is_arrow else false,
+            .is_async = if (f) |func| func.is_async else false,
             .name = name_copy,
             .code = code,
             .consts = consts,
@@ -951,6 +952,10 @@ const Compiler = struct {
             .null => try c.emit(.push_null, &.{}),
             .identifier => |ref| try c.read(ref),
             .function => |f| try c.closure(f),
+            .await => |inner| {
+                try c.expr(inner);
+                try c.emit(.await, &.{});
+            },
             .unary => |u| {
                 if (u.op == .typeof and u.operand.data == .identifier) {
                     const ref = u.operand.data.identifier;

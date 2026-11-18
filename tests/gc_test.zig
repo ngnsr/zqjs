@@ -1810,3 +1810,71 @@ test "M28a: GC stress during deep unwind through several finally tasks" {
         try testing.expectEqualStrings("ret1 err42 f1,f2,f3,f4,t1,t2,t3\n", got);
     }
 }
+
+test "M28b: await in a loop with collections forced between resumptions (both engines)" {
+    const src =
+        \\async function loopAwait() {
+        \\    let sum = 0;
+        \\    for (let i = 0; i < 20; i++) {
+        \\        let obj = { v: i };
+        \\        sum += (await Promise.resolve(obj)).v;
+        \\    }
+        \\    return sum;
+        \\}
+        \\loopAwait().then(s => print(s));
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("190\n", got);
+    }
+}
+
+test "M28b: suspended old coroutine holding young values survives minor GC (barrier)" {
+    const src =
+        \\let res1 = null;
+        \\let res2 = null;
+        \\const p1 = new Promise(r => { res1 = r; });
+        \\const p2 = new Promise(r => { res2 = r; });
+        \\async function coro() {
+        \\    await p1;
+        \\    let youngObj = { tag: "young" + 42 };
+        \\    await p2;
+        \\    return youngObj.tag;
+        \\}
+        \\coro().then(v => print(v));
+        \\// Allocate garbage to trigger minor GC while coro is suspended on p1 (promotes coro to old)
+        \\for (let i = 0; i < 200; i++) { let g = { a: i, b: "x" + i }; }
+        \\res1(1);
+        \\Promise.resolve().then(() => {
+        \\    for (let i = 0; i < 200; i++) { let g = { a: i, b: "y" + i }; }
+        \\    res2(2);
+        \\});
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("young42\n", got);
+    }
+}
+
+test "M28b: unreachable coroutine awaiting never-settled promise is collected with no leak" {
+    const src =
+        \\function spawn() {
+        \\    async function never() {
+        \\        let local = { x: 123 };
+        \\        await new Promise(() => {});
+        \\        return local;
+        \\    }
+        \\    never();
+        \\}
+        \\spawn();
+        \\for (let i = 0; i < 100; i++) { let g = { k: i }; }
+        \\print("ok");
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("ok\n", got);
+    }
+}

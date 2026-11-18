@@ -71,6 +71,7 @@ pub const Obj = struct {
         closure,
         env,
         object,
+        coroutine,
         /// A tombstone (stress builds): a collected object kept so any later use of it is a
         /// deterministic panic naming what it was, instead of a read of freed memory.
         dead,
@@ -288,10 +289,28 @@ pub const IteratorState = struct {
 
 pub const PromiseStateTag = enum { pending, fulfilled, rejected };
 
+pub const CoroutineVTable = struct {
+    trace: *const fn (engine: *anyopaque, visit_ctx: *anyopaque, visit: *const fn (*anyopaque, *Obj) void) void,
+    ownedBytes: *const fn (engine: *anyopaque) usize,
+    shrink: *const fn (engine: *anyopaque) void,
+    destroy: *const fn (engine: *anyopaque) void,
+    @"resume": *const anyopaque,
+};
+
+pub const Coroutine = struct {
+    obj: Obj,
+    promise: *Object,
+    state: enum { starting, running, suspended, done } = .starting,
+    engine: ?*anyopaque = null,
+    vtable: *const CoroutineVTable,
+    charge: usize = 0,
+};
+
 pub const PromiseReaction = struct {
     child: ?*Object,
     on_fulfilled: Value,
     on_rejected: Value,
+    coroutine: ?*Coroutine = null,
 };
 
 pub const PromiseState = struct {
@@ -656,6 +675,7 @@ pub const Heap = struct {
                     visitValue(pr.result, &scan, RememberedScan.child);
                     for (pr.reactions.items) |rx| {
                         if (rx.child) |ch| RememberedScan.child(&scan, &ch.obj);
+                        if (rx.coroutine) |co| RememberedScan.child(&scan, &co.obj);
                         visitValue(rx.on_fulfilled, &scan, RememberedScan.child);
                         visitValue(rx.on_rejected, &scan, RememberedScan.child);
                     }
@@ -756,6 +776,9 @@ pub const Heap = struct {
                 if (obj.old != old) return error.WrongGenerationList;
                 if (obj.remembered) remembered += 1;
                 sum += fixedCharge(obj);
+                if (obj.kind == .coroutine) {
+                    sum += @as(*const Coroutine, @alignCast(@fieldParentPtr("obj", obj))).charge;
+                }
                 var c: Check = .{};
                 forEachChild(obj, &c, Check.edge);
                 if (c.bad) return error.EdgeToCollectedObject;
@@ -1135,7 +1158,7 @@ pub const Heap = struct {
     }
 
     /// Puts an old object on the remembered list, once (the bit makes it idempotent).
-    fn remember(h: *Heap, owner: *Obj) void {
+    pub fn remember(h: *Heap, owner: *Obj) void {
         if (owner.remembered) return;
         owner.remembered = true;
         owner.gray_next = h.remembered;
@@ -1313,6 +1336,45 @@ pub const Heap = struct {
         return e;
     }
 
+    pub fn newCoroutine(h: *Heap, promise: *Object, vtable: *const CoroutineVTable) Error!*Coroutine {
+        const charge = try h.reserve(@sizeOf(Coroutine), 0, 1);
+        errdefer h.bytes -= charge;
+        const co = try h.gpa.create(Coroutine);
+        co.* = .{
+            .obj = h.newHeader(.coroutine),
+            .promise = promise,
+            .vtable = vtable,
+        };
+        h.young = &co.obj;
+        return co;
+    }
+
+    /// Updates an externally owned byte charge (e.g. a suspended coroutine's engine
+    /// memory) against `max_bytes`, failing before mutating `h.bytes` or `charge`.
+    pub fn adjustCharge(h: *Heap, charge: *usize, new_charge: usize) Error!void {
+        const old = charge.*;
+        if (new_charge > old) {
+            const delta = new_charge - old;
+            const total = std.math.add(usize, h.bytes, delta) catch return h.exceeded(.heap_bytes);
+            if (total > h.max_bytes) return h.exceeded(.heap_bytes);
+            h.bytes = total;
+            if (total > h.next_gc) h.collect_requested = true;
+            h.peak = @max(h.peak, total);
+            h.allocated += delta;
+            charge.* = new_charge;
+        } else if (new_charge < old) {
+            h.bytes -= old - new_charge;
+            charge.* = new_charge;
+        }
+    }
+
+    pub fn releaseExternalCharge(h: *Heap, charge: *usize) void {
+        if (charge.* > 0) {
+            h.bytes -= charge.*;
+            charge.* = 0;
+        }
+    }
+
     /// Frees one object and gives its charge back.
     fn destroy(h: *Heap, obj: *Obj) void {
         const kind = obj.kind;
@@ -1346,6 +1408,7 @@ pub const Heap = struct {
             },
             .env => @sizeOf(Env) + @as(*const Env, @alignCast(@fieldParentPtr("obj", obj))).values.len * @sizeOf(?Value) + 2 * per_allocation_overhead,
             .object => @sizeOf(Object) + per_allocation_overhead,
+            .coroutine => @sizeOf(Coroutine) + per_allocation_overhead,
             .dead => 0,
         };
     }
@@ -1397,6 +1460,15 @@ pub const Heap = struct {
                 o.kind = .ordinary;
                 o.proto = null;
             },
+            .coroutine => {
+                const co: *Coroutine = @fieldParentPtr("obj", obj);
+                if (co.engine) |eng| {
+                    co.vtable.destroy(eng);
+                    co.engine = null;
+                }
+                h.releaseExternalCharge(&co.charge);
+                co.state = .done;
+            },
             .dead => unreachable, // tombstones are never released twice
         }
     }
@@ -1408,6 +1480,7 @@ pub const Heap = struct {
             .closure => h.gpa.destroy(@as(*Closure, @fieldParentPtr("obj", obj))),
             .env => h.gpa.destroy(@as(*Env, @fieldParentPtr("obj", obj))),
             .object => h.gpa.destroy(@as(*Object, @fieldParentPtr("obj", obj))),
+            .coroutine => h.gpa.destroy(@as(*Coroutine, @fieldParentPtr("obj", obj))),
             .dead => unreachable,
         }
     }
@@ -1522,10 +1595,28 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                     visitValue(pr.result, ctx, visit);
                     for (pr.reactions.items) |rx| {
                         if (rx.child) |ch| visit(ctx, &ch.obj);
+                        if (rx.coroutine) |co| visit(ctx, &co.obj);
                         visitValue(rx.on_fulfilled, ctx, visit);
                         visitValue(rx.on_rejected, ctx, visit);
                     }
                 },
+            }
+        },
+        .coroutine => {
+            const co: *Coroutine = @fieldParentPtr("obj", obj);
+            visit(ctx, &co.promise.obj);
+            if (co.state == .suspended) {
+                if (co.engine) |eng| {
+                    const Ctx = @TypeOf(ctx);
+                    var c = ctx;
+                    const Thunk = struct {
+                        fn call(raw: *anyopaque, child: *Obj) void {
+                            const ptr: *Ctx = @ptrCast(@alignCast(raw));
+                            visit(ptr.*, child);
+                        }
+                    };
+                    co.vtable.trace(eng, @ptrCast(&c), Thunk.call);
+                }
             }
         },
     }

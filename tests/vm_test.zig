@@ -1258,3 +1258,174 @@ test "M11.3a: Math.random is deterministic per runtime seed and unimplemented Ma
     try testing.expectError(error.Unsupported, rt1.run(unsup, &f));
     try testing.expect(std.mem.indexOf(u8, f.message(), "cosh") != null);
 }
+
+const CountingAllocator = struct {
+    child: Allocator,
+    live_bytes: usize = 0,
+
+    fn allocator(self: *CountingAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live_bytes += len;
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(buf, alignment, new_len, ret_addr)) return false;
+        self.live_bytes = self.live_bytes - buf.len + new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawRemap(buf, alignment, new_len, ret_addr) orelse return null;
+        self.live_bytes = self.live_bytes - buf.len + new_len;
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(buf, alignment, ret_addr);
+        self.live_bytes -= buf.len;
+    }
+};
+
+fn findSuspendedCoroutine(h: *const zqjs.heap.Heap) ?*zqjs.heap.Coroutine {
+    var cur = h.young;
+    while (cur) |obj| : (cur = obj.next) {
+        if (obj.kind == .coroutine) {
+            const co: *zqjs.heap.Coroutine = @fieldParentPtr("obj", obj);
+            if (co.state == .suspended) return co;
+        }
+    }
+    cur = h.old;
+    while (cur) |obj| : (cur = obj.next) {
+        if (obj.kind == .coroutine) {
+            const co: *zqjs.heap.Coroutine = @fieldParentPtr("obj", obj);
+            if (co.state == .suspended) return co;
+        }
+    }
+    return null;
+}
+
+test "M28b VM: suspended coroutine ownedBytes matches counting allocator and charge" {
+    var counter: CountingAllocator = .{ .child = testing.allocator };
+    const alloc = counter.allocator();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: zqjs.Diagnostic = .{};
+    const src =
+        \\async function hang(a, b) {
+        \\    let x = a + b;
+        \\    let y = x * 2;
+        \\    await new Promise(() => {});
+        \\    return y;
+        \\}
+        \\const p = hang(3, 4);
+    ;
+    const script = try zqjs.parse(arena.allocator(), src, .{}, &d);
+    const res = try zqjs.resolve(arena.allocator(), script, &d);
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var rt = zqjs.Runtime.init(alloc, .{}, &discard.writer);
+    defer rt.deinit();
+    var proto = try zqjs.compile(testing.allocator, &rt.heap, script, res, .{}, &d);
+    defer proto.deinit(testing.allocator);
+    var f: zqjs.verify.Failure = .{};
+    _ = try zqjs.verify.verify(testing.allocator, &proto, .{}, &f);
+
+    var vm = try zqjs.Vm.init(&rt, &proto);
+    defer vm.deinit();
+    try vm.run();
+
+    const co = findSuspendedCoroutine(&rt.heap) orelse return error.TestUnexpectedResult;
+    const reported = co.vtable.ownedBytes(co.engine.?);
+    try testing.expectEqual(reported, co.charge);
+
+    const before = counter.live_bytes;
+    co.vtable.destroy(co.engine.?);
+    co.engine = null;
+    const freed = before - counter.live_bytes;
+    try testing.expectEqual(reported, freed);
+}
+
+test "M28b VM: checkAllAllocationFailures over async program" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: zqjs.Diagnostic = .{};
+    const src =
+        \\async function add1(x) {
+        \\    return await Promise.resolve(x + 1);
+        \\}
+        \\add1(41).then(v => print(v));
+    ;
+    const script = try zqjs.parse(arena.allocator(), src, .{}, &d);
+    const res = try zqjs.resolve(arena.allocator(), script, &d);
+
+    const Ctx = struct {
+        script: zqjs.ast.Script,
+        res: zqjs.Resolution,
+
+        fn runOnce(alloc: Allocator, ctx: @This()) !void {
+            var discard: std.Io.Writer.Discarding = .init(&.{});
+            var rt = zqjs.Runtime.init(alloc, .{}, &discard.writer);
+            defer rt.deinit();
+            var diag: zqjs.Diagnostic = .{};
+            var proto = try zqjs.compile(alloc, &rt.heap, ctx.script, ctx.res, .{}, &diag);
+            defer proto.deinit(alloc);
+            var f: zqjs.verify.Failure = .{};
+            _ = try zqjs.verify.verify(alloc, &proto, .{}, &f);
+            var vm = try zqjs.Vm.init(&rt, &proto);
+            defer vm.deinit();
+            try vm.run();
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Ctx.runOnce, .{Ctx{ .script = script, .res = res }});
+}
+
+test "M28b VM: uncatchable fault during resume leaves promise pending" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: zqjs.Diagnostic = .{};
+    const src =
+        \\async function inf() {
+        \\    await 1;
+        \\    while (true) {}
+        \\}
+        \\const p = inf();
+    ;
+    const script = try zqjs.parse(arena.allocator(), src, .{}, &d);
+    const res = try zqjs.resolve(arena.allocator(), script, &d);
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var rt = zqjs.Runtime.init(testing.allocator, .{ .max_steps = 50 }, &discard.writer);
+    defer rt.deinit();
+    var proto = try zqjs.compile(testing.allocator, &rt.heap, script, res, .{ .max_steps = 50 }, &d);
+    defer proto.deinit(testing.allocator);
+    var f: zqjs.verify.Failure = .{};
+    _ = try zqjs.verify.verify(testing.allocator, &proto, .{ .max_steps = 50 }, &f);
+
+    var vm = try zqjs.Vm.init(&rt, &proto);
+    defer vm.deinit();
+    try testing.expectError(error.LimitExceeded, vm.run());
+    try testing.expectEqual(zqjs.Limit.steps, rt.limitHit().?);
+
+    // `inf` is in script slot 0, `p` is in script slot 1; `p` must still be pending.
+    const p_val = vm.locals[1].value.?;
+    try testing.expect(p_val == .object and p_val.object.kind == .promise);
+    try testing.expectEqual(zqjs.heap.PromiseStateTag.pending, p_val.object.kind.promise.state);
+}

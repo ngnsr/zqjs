@@ -115,6 +115,11 @@ const Parser = struct {
     last_was_paren: bool = false,
     cover_init_span: ast.Span = .{ .start = 0, .end = 0 },
     hole_span: ast.Span = .{ .start = 0, .end = 0 },
+    async_ctx: enum { none, params, body } = .none,
+    await_count: u32 = 0,
+    /// When probing `async (...)` at `.none`, defer `await` identifier error until we know if `=>` follows.
+    in_async_paren: bool = false,
+    async_paren_await_span: ?ast.Span = null,
 
     fn advance(p: *Parser) Error!void {
         p.tok = try p.lexer.next();
@@ -149,8 +154,18 @@ const Parser = struct {
         if (p.isText(p.tok, "function")) {
             if (context == .block) return p.fail(.{ .unsupported = .block_function }, p.tok);
             const t = p.tok;
-            const f = try p.function(.declaration);
+            const f = try p.function(.declaration, false, t.start);
             return .{ .span = .{ .start = t.start, .end = f.span.end }, .data = .{ .function = f } };
+        }
+        if (p.isText(p.tok, "async")) {
+            const next = try p.peek();
+            if (!next.newline_before and p.isText(next, "function")) {
+                if (context == .block) return p.fail(.{ .unsupported = .block_function }, p.tok);
+                const t = p.tok;
+                try p.advance(); // `async`
+                const f = try p.function(.declaration, true, t.start);
+                return .{ .span = .{ .start = t.start, .end = f.span.end }, .data = .{ .function = f } };
+            }
         }
         if (p.tok.tag == .kw_const) return p.declarationStatement(.@"const");
         if (p.isText(p.tok, "let") and try p.letStartsDeclaration()) return p.declarationStatement(.let);
@@ -188,6 +203,11 @@ const Parser = struct {
         }
         // `if (c) function f() {}` is legal sloppy JS (Annex B).
         if (p.isText(t, "function")) return p.fail(.{ .unsupported = .block_function }, t);
+        if (p.isText(t, "async")) {
+            const next = try p.peek();
+            if (!next.newline_before and p.isText(next, "function"))
+                return p.fail(.{ .syntax_error = "async function declarations cannot appear in a single-statement context" }, t);
+        }
         if (p.isText(t, "return")) return p.returnStatement();
         if (p.isText(t, "throw")) return p.throwStatement();
         if (p.isText(t, "try")) return p.tryStatement();
@@ -507,12 +527,15 @@ const Parser = struct {
     }
 
     /// `function [name](a, b, …) { body }`, starting at `function`.
-    fn function(p: *Parser, kind: @FieldType(ast.Function, "kind")) Error!*const ast.Function {
+    fn function(p: *Parser, kind: @FieldType(ast.Function, "kind"), is_async: bool, start: u32) Error!*const ast.Function {
         try p.enter();
         defer p.depth -= 1;
-        const start = p.tok.start;
         try p.advance(); // `function`
         if (p.tok.tag == .star) return p.fail(.{ .unsupported = .syntax }, p.tok); // generator
+
+        const outer_async_ctx = p.async_ctx;
+        defer p.async_ctx = outer_async_ctx;
+        if (is_async and kind == .expression) p.async_ctx = .params;
 
         var name: ?ast.Declarator = null;
         if (p.tok.tag != .l_paren) {
@@ -520,14 +543,19 @@ const Parser = struct {
         } else if (kind == .declaration) {
             return p.fail(.{ .syntax_error = "function declaration needs a name" }, p.tok);
         }
-        return p.functionRest(start, kind, name);
+        return p.functionRest(start, kind, name, is_async);
     }
 
     /// From the parameter list on: shared by `function` and object-literal methods
     /// (`{ f(a) { … } }`, an anonymous function expression whose name is not bound).
-    fn functionRest(p: *Parser, start: u32, kind: @FieldType(ast.Function, "kind"), name: ?ast.Declarator) Error!*const ast.Function {
+    fn functionRest(p: *Parser, start: u32, kind: @FieldType(ast.Function, "kind"), name: ?ast.Declarator, is_async: bool) Error!*const ast.Function {
         const id = p.function_count;
         p.function_count += 1;
+
+        const outer_async_ctx = p.async_ctx;
+        p.async_ctx = if (is_async) .params else .none;
+        defer p.async_ctx = outer_async_ctx;
+
         const params = try p.parseParams();
 
         if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{'" }, p.tok);
@@ -536,6 +564,7 @@ const Parser = struct {
         p.loop_depth = 0;
         p.switch_depth = 0;
         p.function_depth += 1;
+        p.async_ctx = if (is_async) .body else .none;
         defer {
             p.loop_depth = outer_loops;
             p.switch_depth = outer_switches;
@@ -544,7 +573,7 @@ const Parser = struct {
         const parsed_body = try p.parseFunctionBody();
 
         const f = try p.arena.create(ast.Function);
-        f.* = .{ .span = .{ .start = start, .end = parsed_body.end }, .id = id, .kind = kind, .name = name, .params = params, .body = parsed_body.body };
+        f.* = .{ .span = .{ .start = start, .end = parsed_body.end }, .id = id, .kind = kind, .is_async = is_async, .name = name, .params = params, .body = parsed_body.body };
         return f;
     }
 
@@ -607,6 +636,12 @@ const Parser = struct {
             return p.fail(.{ .unsupported = .syntax }, t);
         }
         if (std.mem.eql(u8, name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
+        if (std.mem.eql(u8, name, "await")) {
+            return switch (p.async_ctx) {
+                .none => p.fail(.{ .unsupported = .syntax }, t),
+                .params, .body => p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t),
+            };
+        }
         try p.advance();
         const d: ast.Declarator = .{ .name = name, .span = span(t, t), .binding = p.binding_count, .init = null };
         p.binding_count += 1;
@@ -735,6 +770,12 @@ const Parser = struct {
                     return p.fail(.{ .unsupported = .syntax }, t);
                 }
                 if (std.mem.eql(u8, name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
+                if (std.mem.eql(u8, name, "await")) {
+                    return switch (p.async_ctx) {
+                        .none => p.fail(.{ .unsupported = .syntax }, t),
+                        .params, .body => p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t),
+                    };
+                }
                 const d: ast.Declarator = .{ .name = name, .span = span(t, t), .binding = p.binding_count, .init = null };
                 p.binding_count += 1;
                 const pat = try p.patNode(d.span, .{ .binding = d }, 0);
@@ -791,15 +832,58 @@ const Parser = struct {
         defer p.depth -= 1;
         p.last_was_paren = false;
         if (p.tok.tag == .identifier) {
-            const next = try p.peek();
-            if (next.tag == .arrow) return p.arrowSingle();
+            if (p.isText(p.tok, "async")) {
+                var copy = p.lexer;
+                const t1 = try copy.next();
+                if (t1.tag == .arrow) return p.arrowSingle(false, p.tok.start);
+                if (!t1.newline_before and t1.tag == .identifier and !p.isText(t1, "function")) {
+                    const t2 = try copy.next();
+                    if (t2.tag == .arrow and !t2.newline_before) {
+                        const async_start = p.tok.start;
+                        try p.advance(); // `async`
+                        return p.arrowSingle(true, async_start);
+                    }
+                }
+                if (!t1.newline_before and t1.tag == .l_paren) {
+                    const async_tok = p.tok;
+                    try p.advance(); // `async`
+                    const await_before = p.await_count;
+                    const saved_in_async_paren = p.in_async_paren;
+                    const saved_await_span = p.async_paren_await_span;
+                    p.in_async_paren = (p.async_ctx == .none);
+                    p.async_paren_await_span = null;
+                    defer {
+                        p.in_async_paren = saved_in_async_paren;
+                        p.async_paren_await_span = saved_await_span;
+                    }
+                    const res = try p.parseParenList();
+                    const paren_await = p.async_paren_await_span;
+                    p.in_async_paren = saved_in_async_paren;
+                    p.async_paren_await_span = saved_await_span;
+                    if (p.tok.tag == .arrow) {
+                        if (p.tok.newline_before) return p.fail(.{ .syntax_error = "line terminator before '=>'" }, p.tok);
+                        if (p.await_count != await_before or paren_await != null)
+                            return p.failAt(.{ .syntax_error = "await is not valid in async arrow parameters" }, res.start, res.end);
+                        return p.arrowFromParenList(res, true, async_tok.start);
+                    }
+                    if (paren_await) |sp| return p.failAt(.{ .unsupported = .syntax }, sp.start, sp.end);
+                    const call_node = try p.finishAsyncCall(async_tok, res);
+                    const full = try p.conditionalFromPrimary(call_node);
+                    return p.finishAssignment(full, false);
+                }
+            } else {
+                const next = try p.peek();
+                if (next.tag == .arrow) return p.arrowSingle(false, p.tok.start);
+            }
         }
         var lhs_was_paren = false;
         const lhs = if (p.tok.tag == .l_paren) blk: {
+            const await_before = p.await_count;
             const res = try p.parseParenList();
             if (p.tok.tag == .arrow) {
                 if (p.tok.newline_before) return p.fail(.{ .syntax_error = "line terminator before '=>'" }, p.tok);
-                return p.arrowFromParenList(res);
+                if (p.await_count != await_before) return p.failAt(.{ .syntax_error = "await is not valid in arrow parameters" }, res.start, res.end);
+                return p.arrowFromParenList(res, false, res.start);
             }
             const inner = try p.finishParenAsExpr(res);
             p.last_was_paren = true;
@@ -808,6 +892,10 @@ const Parser = struct {
             break :blk full;
         } else try p.conditional();
 
+        return p.finishAssignment(lhs, lhs_was_paren);
+    }
+
+    fn finishAssignment(p: *Parser, lhs: *const ast.Expr, lhs_was_paren: bool) Error!*const ast.Expr {
         const op = assignOp(p.tok.tag) orelse return lhs;
         if (op == .plain and (lhs.data == .array or lhs.data == .object)) {
             if (lhs_was_paren) return p.failAt(.{ .syntax_error = "invalid assignment target" }, lhs.span.start, lhs.span.end);
@@ -834,6 +922,28 @@ const Parser = struct {
         );
     }
 
+    fn finishAsyncCall(p: *Parser, async_tok: Token, res: ParenList) Error!*const ast.Expr {
+        const id = p.ref_count;
+        p.ref_count += 1;
+        const async_span = span(async_tok, async_tok);
+        const callee = try p.node(async_span, .{ .identifier = .{ .name = async_tok.text(p.source()), .span = async_span, .id = id } }, 0);
+        var args: std.ArrayList(*const ast.Expr) = .empty;
+        var depth: u16 = 0;
+        for (res.items) |it| {
+            try p.rejectCoverExpr(it.expr);
+            if (it.is_rest) {
+                const sp = try p.node(it.span, .{ .spread = it.expr }, it.expr.depth);
+                try args.append(p.arena, sp);
+                depth = @max(depth, sp.depth);
+            } else {
+                try args.append(p.arena, it.expr);
+                depth = @max(depth, it.expr.depth);
+            }
+        }
+        p.last_was_paren = false;
+        return p.node(.{ .start = async_tok.start, .end = res.end }, .{ .call = .{ .callee = callee, .args = args.items } }, depth);
+    }
+
     const ParenItem = struct {
         expr: *const ast.Expr,
         is_rest: bool,
@@ -843,9 +953,11 @@ const Parser = struct {
 
     const ParenList = struct {
         start: u32,
+        end: u32,
         items: []const ParenItem,
         has_trailing_comma: bool,
         has_rest_trailing_comma: bool,
+        has_non_last_rest: bool,
     };
 
     fn parseParenList(p: *Parser) Error!ParenList {
@@ -856,6 +968,7 @@ const Parser = struct {
         var items: std.ArrayList(ParenItem) = .empty;
         var has_trailing_comma = false;
         var has_rest_trailing_comma = false;
+        var has_non_last_rest = false;
         while (p.tok.tag != .r_paren) {
             if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated parenthesised expression" }, open);
             const item_start = p.tok.start;
@@ -874,7 +987,9 @@ const Parser = struct {
                         try p.advance();
                         break;
                     }
-                    return p.fail(.{ .syntax_error = "rest parameter must be last formal parameter" }, p.tok);
+                    has_non_last_rest = true;
+                    try p.advance();
+                    continue;
                 }
                 break;
             }
@@ -890,12 +1005,15 @@ const Parser = struct {
                 break;
             }
         }
+        const close = p.tok;
         try p.expectAfterExpression(.r_paren);
         return .{
             .start = open.start,
+            .end = close.end,
             .items = items.items,
             .has_trailing_comma = has_trailing_comma,
             .has_rest_trailing_comma = has_rest_trailing_comma,
+            .has_non_last_rest = has_non_last_rest,
         };
     }
 
@@ -912,27 +1030,35 @@ const Parser = struct {
         return res.items[0].expr;
     }
 
-    fn arrowSingle(p: *Parser) Error!*const ast.Expr {
+    fn arrowSingle(p: *Parser, is_async: bool, start: u32) Error!*const ast.Expr {
         try p.enter();
         defer p.depth -= 1;
-        const start = p.tok.start;
         const id = p.function_count;
         p.function_count += 1;
+
+        const outer_async_ctx = p.async_ctx;
+        p.async_ctx = if (is_async) .params else .none;
+        defer p.async_ctx = outer_async_ctx;
 
         const single = try p.bindingName(false);
         const pat = try p.patNode(single.span, .{ .binding = single }, 0);
         const buf = try p.arena.alloc(ast.Param, 1);
         buf[0] = .{ .pattern = pat, .default = null, .is_rest = false, .span = single.span };
-        return p.arrowBody(start, id, buf);
+        return p.arrowBody(start, id, buf, is_async);
     }
 
-    fn arrowFromParenList(p: *Parser, res: ParenList) Error!*const ast.Expr {
+    fn arrowFromParenList(p: *Parser, res: ParenList, is_async: bool, start: u32) Error!*const ast.Expr {
         try p.enter();
         defer p.depth -= 1;
         const id = p.function_count;
         p.function_count += 1;
 
-        if (res.has_rest_trailing_comma) return p.fail(.{ .syntax_error = "rest parameter must be last formal parameter" }, p.tok);
+        const outer_async_ctx = p.async_ctx;
+        p.async_ctx = if (is_async) .params else .none;
+        defer p.async_ctx = outer_async_ctx;
+
+        if (res.has_non_last_rest or res.has_rest_trailing_comma)
+            return p.fail(.{ .syntax_error = "rest parameter must be last formal parameter" }, p.tok);
         var params: std.ArrayList(ast.Param) = .empty;
         for (res.items) |it| {
             if (it.was_paren) return p.failAt(.{ .syntax_error = "invalid arrow function parameter" }, it.span.start, it.span.end);
@@ -946,23 +1072,26 @@ const Parser = struct {
                 try params.append(p.arena, param);
             }
         }
-        return p.arrowBody(res.start, id, params.items);
+        return p.arrowBody(start, id, params.items, is_async);
     }
 
-    fn arrowBody(p: *Parser, start: u32, id: u32, params: []const ast.Param) Error!*const ast.Expr {
+    fn arrowBody(p: *Parser, start: u32, id: u32, params: []const ast.Param, is_async: bool) Error!*const ast.Expr {
         if (p.tok.tag != .arrow) return p.fail(.{ .syntax_error = "expected '=>'" }, p.tok);
         if (p.tok.newline_before) return p.fail(.{ .syntax_error = "line terminator before '=>'" }, p.tok);
         try p.advance(); // `=>`
 
         const outer_loops = p.loop_depth;
         const outer_switches = p.switch_depth;
+        const outer_async_ctx = p.async_ctx;
         p.loop_depth = 0;
         p.switch_depth = 0;
         p.function_depth += 1;
+        p.async_ctx = if (is_async) .body else .none;
         defer {
             p.loop_depth = outer_loops;
             p.switch_depth = outer_switches;
             p.function_depth -= 1;
+            p.async_ctx = outer_async_ctx;
         }
 
         var body: []const ast.Stmt = undefined;
@@ -985,6 +1114,7 @@ const Parser = struct {
             .id = id,
             .kind = .expression,
             .is_arrow = true,
+            .is_async = is_async,
             .name = null,
             .params = params,
             .body = body,
@@ -1146,6 +1276,26 @@ const Parser = struct {
                 if (p.tok.tag == .star_star)
                     return p.fail(.{ .syntax_error = "unary operator before '**' needs parentheses" }, t);
                 return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .unary = .{ .op = .typeof, .operand = operand } }, operand.depth);
+            } else if (p.isText(t, "await")) {
+                switch (p.async_ctx) {
+                    .none => {
+                        if (p.in_async_paren) {
+                            if (p.async_paren_await_span == null) p.async_paren_await_span = span(t, t);
+                            return p.postfix(try p.calls(try p.primary()));
+                        }
+                        return p.fail(.{ .unsupported = .syntax }, t);
+                    },
+                    .params => return p.fail(.{ .syntax_error = "await is not valid in async function parameters" }, t),
+                    .body => {
+                        try p.advance();
+                        const operand = try p.binary(unary_bp);
+                        try p.rejectCoverExpr(operand);
+                        if (p.tok.tag == .star_star)
+                            return p.fail(.{ .syntax_error = "unary operator before '**' needs parentheses" }, t);
+                        p.await_count += 1;
+                        return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .await = operand }, operand.depth);
+                    },
+                }
             } else return p.postfix(try p.calls(try p.primary())),
             else => return p.postfix(try p.calls(try p.primary())),
         }
@@ -1426,38 +1576,51 @@ const Parser = struct {
                 }
                 continue;
             }
+            var is_async_method = false;
             const k: ast.PropertyKey = switch (t.tag) {
-                .l_bracket => blk: {
-                    try p.advance();
-                    const e = try p.nested();
-                    try p.expectAfterExpression(.r_bracket);
-                    break :blk .{ .computed = e };
-                },
-                .string => blk: {
-                    const units = try p.decodeString(t);
-                    try p.advance();
-                    break :blk .{ .string = units };
-                },
-                .number => blk: {
-                    const n = try number.literalValue(p.arena, t.text(p.source()));
-                    try p.advance();
-                    break :blk .{ .number = n };
-                },
+                .l_bracket => try p.computedPropertyKey(),
+                .string => try p.stringPropertyKey(t),
+                .number => try p.numberPropertyKey(t),
                 else => blk: {
                     if (t.tag != .identifier and !token.isKeyword(t.tag)) return p.fail(.{ .unsupported = .syntax }, t);
                     const name = t.text(p.source());
-                    // `get x() {}`, `set x(v) {}`, `async f() {}`: accessors and async methods.
-                    if (std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "set") or std.mem.eql(u8, name, "async")) {
+                    if (std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "set")) {
                         const next = try p.peek();
                         switch (next.tag) {
                             .colon, .l_paren, .comma, .r_brace, .eq => {},
                             else => return p.fail(.{ .unsupported = .syntax }, t),
+                        }
+                    } else if (std.mem.eql(u8, name, "async")) {
+                        const next = try p.peek();
+                        switch (next.tag) {
+                            .colon, .l_paren, .comma, .r_brace, .eq => {},
+                            else => {
+                                if (next.newline_before) return p.fail(.{ .syntax_error = "unexpected token in object literal" }, next);
+                                if (next.tag == .star) return p.fail(.{ .unsupported = .syntax }, next);
+                                is_async_method = true;
+                                try p.advance(); // `async`
+                                const kt = p.tok;
+                                break :blk switch (kt.tag) {
+                                    .l_bracket => try p.computedPropertyKey(),
+                                    .string => try p.stringPropertyKey(kt),
+                                    .number => try p.numberPropertyKey(kt),
+                                    else => kblk: {
+                                        if (kt.tag != .identifier and !token.isKeyword(kt.tag))
+                                            return p.fail(.{ .syntax_error = "expected method name after 'async'" }, kt);
+                                        try p.advance();
+                                        break :kblk .{ .name = kt.text(p.source()) };
+                                    },
+                                };
+                            },
                         }
                     }
                     try p.advance();
                     break :blk .{ .name = name };
                 },
             };
+            if (is_async_method and p.tok.tag != .l_paren) {
+                return p.fail(.{ .syntax_error = "expected '(' after async method name" }, p.tok);
+            }
             switch (p.tok.tag) {
                 .colon => {
                     if (isProtoKey(k)) return p.fail(.{ .unsupported = .builtin }, t); // sets the prototype
@@ -1469,7 +1632,7 @@ const Parser = struct {
                     depth = @max(depth, value.depth);
                 },
                 .l_paren => {
-                    const f = try p.functionRest(t.start, .expression, null);
+                    const f = try p.functionRest(t.start, .expression, null, is_async_method);
                     const value = try p.node(f.span, .{ .function = f }, 0);
                     try props.append(p.arena, .{ .prop = .{ .key = k, .value = value, .shorthand = false, .span = .{ .start = t.start, .end = value.span.end } } });
                 },
@@ -1479,6 +1642,12 @@ const Parser = struct {
                     if (token.reserved_identifiers.has(k.name)) return p.fail(.{ .syntax_error = "reserved word as shorthand property" }, t);
                     if (std.mem.eql(u8, k.name, "let")) return p.fail(.{ .unsupported = .syntax }, t);
                     if (std.mem.eql(u8, k.name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
+                    if (std.mem.eql(u8, k.name, "await")) {
+                        return switch (p.async_ctx) {
+                            .none => p.fail(.{ .unsupported = .syntax }, t),
+                            .params, .body => p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t),
+                        };
+                    }
                     const id = p.ref_count;
                     p.ref_count += 1;
                     const value = try p.node(span(t, t), .{ .identifier = .{ .name = k.name, .span = span(t, t), .id = id } }, 0);
@@ -1490,6 +1659,12 @@ const Parser = struct {
                     if (token.reserved_identifiers.has(k.name)) return p.fail(.{ .syntax_error = "reserved word as shorthand property" }, t);
                     if (std.mem.eql(u8, k.name, "let")) return p.fail(.{ .unsupported = .syntax }, t);
                     if (std.mem.eql(u8, k.name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
+                    if (std.mem.eql(u8, k.name, "await")) {
+                        return switch (p.async_ctx) {
+                            .none => p.fail(.{ .unsupported = .syntax }, t),
+                            .params, .body => p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t),
+                        };
+                    }
                     const eq_tok = p.tok;
                     try p.advance();
                     const def = try p.nested();
@@ -1518,6 +1693,25 @@ const Parser = struct {
             mut.has_rest_trailing_comma = has_rest_trailing_comma;
         }
         return obj;
+    }
+
+    fn computedPropertyKey(p: *Parser) Error!ast.PropertyKey {
+        try p.advance();
+        const e = try p.nested();
+        try p.expectAfterExpression(.r_bracket);
+        return .{ .computed = e };
+    }
+
+    fn stringPropertyKey(p: *Parser, t: Token) Error!ast.PropertyKey {
+        const units = try p.decodeString(t);
+        try p.advance();
+        return .{ .string = units };
+    }
+
+    fn numberPropertyKey(p: *Parser, t: Token) Error!ast.PropertyKey {
+        const n = try number.literalValue(p.arena, t.text(p.source()));
+        try p.advance();
+        return .{ .number = n };
     }
 
     /// The literal key `__proto__:` (not computed, not shorthand) sets the prototype.
@@ -1563,14 +1757,28 @@ const Parser = struct {
                     return p.node(s, .this, 0);
                 }
                 if (std.mem.eql(u8, name, "function")) {
-                    const f = try p.function(.expression);
+                    const f = try p.function(.expression, false, t.start);
                     return p.node(f.span, .{ .function = f }, 0);
+                }
+                if (std.mem.eql(u8, name, "async")) {
+                    const next = try p.peek();
+                    if (!next.newline_before and p.isText(next, "function")) {
+                        try p.advance(); // `async`
+                        const f = try p.function(.expression, true, t.start);
+                        return p.node(f.span, .{ .function = f }, 0);
+                    }
                 }
                 if (std.mem.eql(u8, name, "new")) {
                     return p.newExpr();
                 }
                 // Inside a function, `arguments` is the arguments object.
                 if (std.mem.eql(u8, name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
+                if (std.mem.eql(u8, name, "await")) {
+                    switch (p.async_ctx) {
+                        .none => if (!p.in_async_paren) return p.fail(.{ .unsupported = .syntax }, t),
+                        .params, .body => return p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t),
+                    }
+                }
                 // `this`, `new`, `typeof`, `function`, … start constructs ZQJS lacks;
                 // `let` as a variable name is legal sloppy JS we choose not to support.
                 if (std.mem.eql(u8, name, "finally"))
@@ -1598,7 +1806,7 @@ const Parser = struct {
     /// expression with this token (and, at statement level, ASI does not apply).
     fn unexpectedAfterExpression(p: *Parser, t: Token) Error {
         const certain = switch (t.tag) {
-            .number, .string, .kw_true, .kw_false, .kw_null, .r_paren, .r_bracket, .r_brace, .semicolon, .eof => true,
+            .number, .string, .kw_true, .kw_false, .kw_null, .r_paren, .r_bracket, .r_brace, .semicolon, .eof, .arrow => true,
             // `in` and `instanceof` are binary operators; `async function` is valid JS.
             .identifier => !p.isText(t, "in") and !p.isText(t, "instanceof") and !p.isText(t, "function"),
             else => false,

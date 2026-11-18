@@ -104,6 +104,7 @@ const Verifier = struct {
                 .@"return" => if (p.kind != .function) return v.fail(p, at, "return outside a function"),
                 .push_callee => if (p.kind != .function) return v.fail(p, at, "push_callee outside a function"),
                 .get_arg, .rest_array => if (p.kind != .function) return v.fail(p, at, "function-only instruction outside a function"),
+                .await => if (p.kind != .function or !p.is_async) return v.fail(p, at, "await outside an async function"),
                 else => {},
             }
             starts.set(pc);

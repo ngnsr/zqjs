@@ -37,6 +37,7 @@ test "error paths: every allocation failing once leaks nothing" {
         "((1 + 2) * 'x') === null && !true || 2 ** 3 ** 2;",
         "let a = 1, b; { const c = a; b = c ** 2; } for (let i = 0; i < 3; i++) { if (i) continue; else break; }",
         "let x = 1; while (x < 9) { x += 2; x++; } let x;", // fails in the resolver
+        "async function f(a, b = 1) { return await a + b; } let g = async x => await x;",
     };
     for (sources) |src| try testing.checkAllAllocationFailures(testing.allocator, frontendOnce, .{ src, Limits{} });
 }

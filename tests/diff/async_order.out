@@ -1,0 +1,1 @@
+f1:start|f2:start|sync:end|f1:after1:1|tick1|f1:after2:2|tick2|then:f1:f1:done|then:f2:adopted|tick3|tick4

@@ -1076,12 +1076,36 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
             }
             // Model B (D51): a fresh VM, frame 0 the callee; `this` binds by the VM's
             // sloppy rule (object receivers only, D41). Its `return` ends the call.
+            const this_obj: ?internal.Value = if (this_v == .object) this_v else null;
+            if (c.impl == .vm) {
+                const callee_proto: *const internal.bytecode.Proto = @ptrCast(@alignCast(c.impl.vm.proto));
+                if (callee_proto.is_async) {
+                    const result = internal.Vm.callStandalone(rt, c, this_obj, argv) catch |e| {
+                        const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                        const fo = faultOf(rt, err);
+                        if (failure) |out| out.* = fo.failure;
+                        return fo.err;
+                    };
+                    if (top_level) {
+                        const prev_caller = rt.closure_caller;
+                        rt.closure_caller = .{ .ctx = rt, .call = internal.Vm.callStandalone };
+                        defer rt.closure_caller = prev_caller;
+                        rt.drainMicrotasks() catch |e| {
+                            const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                            const fo = faultOf(rt, err);
+                            if (failure) |out| out.* = fo.failure;
+                            return fo.err;
+                        };
+                    }
+                    return mintHandle(r, result, failure);
+                }
+            }
             if (rt.exec_ctx.call_depth >= rt.limits.max_call_depth) {
                 const fo = faultOf(rt, rt.limit(.call_depth));
                 if (failure) |out| out.* = fo.failure;
                 return fo.err;
             }
-            var vm = internal.Vm.initCall(rt, c, if (this_v == .object) this_v else null, argv) catch |e| {
+            var vm = internal.Vm.initCall(rt, c, this_obj, argv) catch |e| {
                 const fo = faultOf(rt, e);
                 if (failure) |out| out.* = fo.failure;
                 return fo.err;

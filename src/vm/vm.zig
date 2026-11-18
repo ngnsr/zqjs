@@ -49,6 +49,7 @@ const Error = rt_mod.Error;
 const ops = @import("../runtime/ops.zig");
 const object = @import("../runtime/object.zig");
 const builtins = @import("../runtime/builtins.zig");
+const coroutine = @import("../runtime/coroutine.zig");
 const BinaryOp = @import("../frontend/ast.zig").BinaryOp;
 const bc = @import("../bytecode/bytecode.zig");
 const Op = bc.Op;
@@ -84,7 +85,7 @@ pub const Frame = struct {
 };
 
 pub const Vm = struct {
-    pub const State = enum { running, halted };
+    pub const State = enum { running, halted, awaiting };
 
     rt: *Runtime,
     frames: std.ArrayList(Frame) = .empty,
@@ -105,6 +106,8 @@ pub const Vm = struct {
     /// The nested call's result, set when its frame 0 returns. Null until then; a halt
     /// without one is an engine bug (a function's proto always ends in `return`).
     nested_result: ?Value = null,
+    /// The value passed to `await` when this VM is suspended in `.awaiting` (D56).
+    awaited: Value = .undefined,
     /// The execution context this VM charges (M9.1, D51): set while a chain runs it —
     /// the embedding API's resume, or a nested call — so frames check the chain's shared
     /// `call_depth` instead of a per-VM limit. Null for a chain-less VM (the CLI's),
@@ -184,21 +187,41 @@ pub const Vm = struct {
     /// Invokes a VM closure from inside a built-in native via Model B nested VM execution (M16.1).
     fn callFromBuiltin(ctx: *anyopaque, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
         const vm: *Vm = @ptrCast(@alignCast(ctx));
-        const rt = vm.rt;
+        return callNested(vm.rt, vm, c, this, args);
+    }
+
+    /// Invokes a VM closure from a top-level microtask checkpoint outside any outer VM (M18).
+    pub fn callStandalone(ctx: *anyopaque, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
+        const rt: *Runtime = @ptrCast(@alignCast(ctx));
+        return callNested(rt, null, c, this, args);
+    }
+
+    fn callNested(rt: *Runtime, caller_vm: ?*Vm, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
+        c.obj.checkLive();
+        const v = switch (c.impl) {
+            .vm => |v| v,
+            .tree, .promise_cap, .native_closure => return rt.bug("a non-VM closure in a nested call"),
+        };
+        const callee: *const Proto = @ptrCast(@alignCast(v.proto));
+        if (callee.is_async) return startAsync(rt, caller_vm, c, this, args);
 
         const own_chain = !rt.exec_ctx.active;
         const saved_max_steps = rt.max_steps;
         if (own_chain) {
-            std.debug.assert(vm.chain == null);
-            rt.beginChain(rt.steps, saved_max_steps);
-            rt.exec_ctx.call_depth = @intCast(vm.frames.items.len);
-            vm.chain = &rt.exec_ctx;
+            if (caller_vm) |cv| {
+                std.debug.assert(cv.chain == null);
+                rt.beginChain(rt.steps, saved_max_steps);
+                rt.exec_ctx.call_depth = @intCast(cv.frames.items.len);
+                cv.chain = &rt.exec_ctx;
+            } else {
+                rt.beginChain(rt.steps, saved_max_steps);
+            }
         }
         const depth_before = rt.exec_ctx.call_depth;
         defer {
             std.debug.assert(rt.exec_ctx.call_depth == depth_before);
             if (own_chain) {
-                vm.chain = null;
+                if (caller_vm) |cv| cv.chain = null;
                 _ = rt.endChain();
                 rt.max_steps = saved_max_steps;
             }
@@ -218,23 +241,177 @@ pub const Vm = struct {
         return nested.nested_result orelse rt.bug("a nested call ended without a result");
     }
 
-    /// Invokes a VM closure from a top-level microtask checkpoint outside any outer VM (M18).
-    pub fn callStandalone(ctx: *anyopaque, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
-        const rt: *Runtime = @ptrCast(@alignCast(ctx));
+    const StartAsyncCtx = struct {
+        rt: *Runtime,
+        caller_vm: ?*Vm,
+        c: *const Closure,
+        this: ?Value,
+        args: []const Value,
+    };
+
+    const CoroAction = union(enum) {
+        start,
+        @"resume": struct { val: Value, rejected: bool },
+    };
+
+    noinline fn startAsyncFromVm(vm: *Vm, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
+        @branchHint(.cold);
+        return startAsync(vm.rt, vm, c, this, args);
+    }
+
+    noinline fn startAsync(rt: *Runtime, caller_vm: ?*Vm, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
+        @branchHint(.cold);
+        const ctx: StartAsyncCtx = .{ .rt = rt, .caller_vm = caller_vm, .c = c, .this = this, .args = args };
+        return coroutine.start(rt, &coro_vtable, ctx, createAndRunCoro);
+    }
+
+    fn createAndRunCoro(ctx: StartAsyncCtx, co: *heap.Coroutine) Error!coroutine.Outcome {
+        const rt = ctx.rt;
+        const vm_ptr = try rt.gpa.create(Vm);
+        vm_ptr.* = Vm.initCall(rt, ctx.c, ctx.this, ctx.args) catch |e| {
+            rt.gpa.destroy(vm_ptr);
+            return e;
+        };
+        co.engine = vm_ptr;
+        co.state = .running;
+        return runCoroVm(vm_ptr, ctx.caller_vm, .start);
+    }
+
+    fn runCoroVm(vm: *Vm, caller_vm: ?*Vm, action: CoroAction) Error!coroutine.Outcome {
+        const rt = vm.rt;
+        const own_chain = !rt.exec_ctx.active;
+        const saved_max_steps = rt.max_steps;
+        if (own_chain) {
+            if (caller_vm) |cv| {
+                std.debug.assert(cv.chain == null);
+                rt.beginChain(rt.steps, saved_max_steps);
+                rt.exec_ctx.call_depth = @intCast(cv.frames.items.len);
+                cv.chain = &rt.exec_ctx;
+            } else {
+                rt.beginChain(rt.steps, saved_max_steps);
+            }
+        }
+        const depth_before = rt.exec_ctx.call_depth;
+        defer {
+            std.debug.assert(rt.exec_ctx.call_depth == depth_before);
+            if (own_chain) {
+                if (caller_vm) |cv| cv.chain = null;
+                _ = rt.endChain();
+                rt.max_steps = saved_max_steps;
+            }
+        }
         if (rt.exec_ctx.budget_fault != null) return rt.limit(.steps);
         if (rt.exec_ctx.call_depth >= rt.limits.max_call_depth) return rt.limit(.call_depth);
 
-        var nested = try Vm.initCall(rt, c, this, args);
-        defer nested.deinit();
-        nested.chain = &rt.exec_ctx;
-        rt.exec_ctx.call_depth += 1;
-        try rt.exec_ctx.vms.append(rt.gpa, nested.roots());
-        defer rt.exec_ctx.removeVm(&nested);
+        vm.chain = &rt.exec_ctx;
+        rt.exec_ctx.call_depth += @intCast(vm.frames.items.len);
+        defer {
+            if (vm.chain) |cx| {
+                if (cx.active) cx.call_depth -= @intCast(vm.frames.items.len);
+                vm.chain = null;
+            }
+        }
+        try rt.exec_ctx.vms.append(rt.gpa, vm.roots());
+        defer rt.exec_ctx.removeVm(vm);
 
-        try nested.run();
+        switch (action) {
+            .start => {},
+            .@"resume" => |res| {
+                vm.awaited = .undefined;
+                if (res.rejected) {
+                    _ = rt.throwValue(res.val) catch {};
+                    vm.unwind(vm.pc) catch |ue| {
+                        if (ue == error.Thrown) return .threw;
+                        return ue;
+                    };
+                } else {
+                    if (vm.sp >= vm.stack.len) return vm.bug("stack overflow on await resume");
+                    vm.stack[vm.sp] = res.val;
+                    vm.sp += 1;
+                    vm.pc += Op.await.size();
+                }
+            },
+        }
+
+        const state = vm.runLoop(false, 0) catch |e| {
+            if (e != error.Internal and rt.exec_ctx.budget_fault != null) return rt.limit(.steps);
+            if (e == error.Thrown) return .threw;
+            return e;
+        };
         if (rt.exec_ctx.budget_fault != null) return rt.limit(.steps);
-        return nested.nested_result orelse rt.bug("a nested call ended without a result");
+        return switch (state) {
+            .halted => .{ .returned = vm.nested_result orelse return rt.bug("a nested call ended without a result") },
+            .awaiting => .{ .awaiting = vm.awaited },
+            .running => unreachable,
+        };
     }
+
+    fn coroResume(eng: *anyopaque, val: Value, rejected: bool) Error!coroutine.Outcome {
+        const vm: *Vm = @ptrCast(@alignCast(eng));
+        return runCoroVm(vm, null, .{ .@"resume" = .{ .val = val, .rejected = rejected } });
+    }
+
+    fn coroTrace(eng: *anyopaque, visit_ctx: *anyopaque, visit: *const fn (*anyopaque, *heap.Obj) void) void {
+        const vm: *const Vm = @ptrCast(@alignCast(eng));
+        const Ctx = struct { ctx: *anyopaque, visit: *const fn (*anyopaque, *heap.Obj) void };
+        const thunk = struct {
+            fn call(c: Ctx, o: *heap.Obj) void {
+                c.visit(c.ctx, o);
+            }
+        }.call;
+        visitRoots(vm, Ctx{ .ctx = visit_ctx, .visit = visit }, thunk);
+    }
+
+    pub fn ownedBytes(vm: *const Vm) usize {
+        return @sizeOf(Vm) +
+            vm.frames.capacity * @sizeOf(Frame) +
+            vm.locals.len * @sizeOf(Slot) +
+            vm.stack.len * @sizeOf(Value);
+    }
+
+    fn coroOwnedBytes(eng: *anyopaque) usize {
+        const vm: *const Vm = @ptrCast(@alignCast(eng));
+        return vm.ownedBytes();
+    }
+
+    pub fn shrink(vm: *Vm) void {
+        if (vm.frames.items.len != 1) return;
+        const gpa = vm.rt.gpa;
+        const f = vm.frames.items[0];
+        if (vm.frames.capacity > 1) vm.frames.shrinkAndFree(gpa, 1);
+        const need_locals = f.proto.slot_count;
+        if (vm.locals.len > need_locals) {
+            if (gpa.realloc(vm.locals, need_locals)) |new_locals| {
+                vm.locals = new_locals;
+            } else |_| {}
+        }
+        const need_stack = @max(vm.sp, f.argc + f.proto.max_stack);
+        if (vm.stack.len > need_stack) {
+            if (gpa.realloc(vm.stack, need_stack)) |new_stack| {
+                vm.stack = new_stack;
+            } else |_| {}
+        }
+    }
+
+    fn coroShrink(eng: *anyopaque) void {
+        const vm: *Vm = @ptrCast(@alignCast(eng));
+        vm.shrink();
+    }
+
+    fn coroDestroy(eng: *anyopaque) void {
+        const vm: *Vm = @ptrCast(@alignCast(eng));
+        const gpa = vm.rt.gpa;
+        vm.deinit();
+        gpa.destroy(vm);
+    }
+
+    const coro_vtable: heap.CoroutineVTable = .{
+        .trace = coroTrace,
+        .ownedBytes = coroOwnedBytes,
+        .shrink = coroShrink,
+        .destroy = coroDestroy,
+        .@"resume" = &coroResume,
+    };
 
     /// Runs to `halt` or the first error (M10.2a: dedicated continuous loop preserving
     /// `Vm.step()` unchanged for sliced execution and debugging, with exact `rt.step()`
@@ -373,15 +550,18 @@ pub const Vm = struct {
                 vm.fault = e;
                 return e;
             };
-            if (state == .halted) {
+            if (state != .running) {
                 cache.syncSp(vm);
-                if (!vm.nested) {
-                    rt.drainMicrotasks() catch |e| {
-                        vm.fault = e;
-                        return e;
-                    };
+                if (state == .halted) {
+                    if (!vm.nested) {
+                        rt.drainMicrotasks() catch |e| {
+                            vm.fault = e;
+                            return e;
+                        };
+                    }
+                    return .halted;
                 }
-                return .halted;
+                return .awaiting;
             }
             if (bounded) n += 1;
         }
@@ -409,23 +589,45 @@ pub const Vm = struct {
     }
 
     fn markRoots(ctx: *anyopaque, h: *heap.Heap) void {
-        const vm: *Vm = @ptrCast(@alignCast(ctx));
-        for (vm.stack[0..vm.sp]) |v| h.markValue(v);
-        for (vm.locals[0..vm.locals_len]) |s| switch (s) {
-            .value => |v| if (v) |x| h.markValue(x),
-            .cell => |c| h.markObj(&c.obj),
-        };
-        for (vm.frames.items) |f| {
-            if (f.closure) |c| h.markObj(@constCast(&c.obj));
-            if (f.this) |t| h.markValue(t);
-        }
+        const vm: *const Vm = @ptrCast(@alignCast(ctx));
+        const mark_obj = struct {
+            fn call(hh: *heap.Heap, o: *heap.Obj) void {
+                hh.markObj(o);
+            }
+        }.call;
+        visitRoots(vm, h, mark_obj);
         markProto(h, vm.frames.items[0].proto);
     }
 
+    /// The VM's own live state, shared by `markRoots` and a suspended coroutine's trace.
+    /// The Proto's constants are not included: they belong to the program (or the script
+    /// VM), and a coroutine trace must not read a Proto whose program may already be gone.
+    fn visitRoots(vm: *const Vm, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *heap.Obj) void) void {
+        for (vm.stack[0..vm.sp]) |v| heap.visitValue(v, ctx, visit);
+        for (vm.locals[0..vm.locals_len]) |s| switch (s) {
+            .value => |v| if (v) |x| heap.visitValue(x, ctx, visit),
+            .cell => |c| visit(ctx, &c.obj),
+        };
+        for (vm.frames.items) |f| {
+            if (f.closure) |c| visit(ctx, @constCast(&c.obj));
+            if (f.this) |t| heap.visitValue(t, ctx, visit);
+        }
+        heap.visitValue(vm.awaited, ctx, visit);
+    }
+
+    fn visitProto(p: *const Proto, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *heap.Obj) void) void {
+        for (p.consts) |k| heap.visitValue(k, ctx, visit);
+        for (p.name_atoms) |a| visit(ctx, &a.obj);
+        for (p.functions) |*f| visitProto(f, ctx, visit); // nesting depth is bounded by the AST's
+    }
+
     fn markProto(h: *heap.Heap, p: *const Proto) void {
-        for (p.consts) |k| h.markValue(k);
-        for (p.name_atoms) |a| h.markObj(&a.obj);
-        for (p.functions) |*f| markProto(h, f); // nesting depth is bounded by the AST's
+        const mark_obj = struct {
+            fn call(hh: *heap.Heap, o: *heap.Obj) void {
+                hh.markObj(o);
+            }
+        }.call;
+        visitProto(p, h, mark_obj);
     }
 
     /// The Proto this VM runs (the one `init` was given), for tests.
@@ -765,7 +967,7 @@ pub const Vm = struct {
                 cache.syncSp(vm);
                 if (callee == .closure and callee.closure.impl == .vm) {
                     const callee_proto: *const Proto = @ptrCast(@alignCast(callee.closure.impl.vm.proto));
-                    if (callee_proto.is_arrow) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+                    if (callee_proto.is_arrow or callee_proto.is_async) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
                 }
                 const result = try builtins.construct(rt, callee, args_v.object.kind.array.items);
                 vm.stack[base] = result;
@@ -810,13 +1012,20 @@ pub const Vm = struct {
                             vm.stack[base] = try f(rt, nc.env, args_slice);
                             cache.sp = base + 1;
                         },
-                        .vm, .tree => {
+                        .vm => |v_impl| {
                             const this: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
                             cache.syncSp(vm);
-                            try vm.enterSpread(c, base, args_v.object, next, this);
-                            cache.* = FrameCache.fromVm(vm, 0);
-                            return .running;
+                            const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
+                            if (callee_proto.is_async) {
+                                vm.stack[base] = try vm.startAsyncFromVm(c, this, args_slice);
+                                cache.sp = base + 1;
+                            } else {
+                                try vm.enterSpread(c, base, args_v.object, next, this);
+                                cache.* = FrameCache.fromVm(vm, 0);
+                                return .running;
+                            }
                         },
+                        .tree => return vm.bug("a non-VM closure in the VM"),
                     },
                     else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
                 }
@@ -903,7 +1112,7 @@ pub const Vm = struct {
                 const callee = vm.stack[base];
                 if (callee == .closure and callee.closure.impl == .vm) {
                     const callee_proto: *const Proto = @ptrCast(@alignCast(callee.closure.impl.vm.proto));
-                    if (callee_proto.is_arrow) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+                    if (callee_proto.is_arrow or callee_proto.is_async) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
                 }
                 const result = try builtins.construct(rt, callee, vm.stack[args..cache.sp]);
                 vm.stack[base] = result;
@@ -951,14 +1160,21 @@ pub const Vm = struct {
                             vm.stack[base] = try f(rt, nc.env, vm.stack[args..cache.sp]);
                             cache.sp = base + 1;
                         },
-                        .vm, .tree => {
+                        .vm => |v_impl| {
                             // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
                             const this: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
                             cache.syncSp(vm);
-                            try vm.enter(c, base, args, argc, next, this);
-                            cache.* = FrameCache.fromVm(vm, 0);
-                            return .running; // pc is the callee's 0
+                            const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
+                            if (callee_proto.is_async) {
+                                vm.stack[base] = try vm.startAsyncFromVm(c, this, vm.stack[args..cache.sp]);
+                                cache.sp = base + 1;
+                            } else {
+                                try vm.enter(c, base, args, argc, next, this);
+                                cache.* = FrameCache.fromVm(vm, 0);
+                                return .running; // pc is the callee's 0
+                            }
                         },
+                        .tree => return vm.bug("a non-VM closure in the VM"),
                     },
                     else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
                 }
@@ -993,6 +1209,14 @@ pub const Vm = struct {
                 if (cache.sp != 0) return vm.bug("stack not empty at halt");
                 vm.halted = true;
                 return .halted; // pc stays on `halt`
+            },
+            .await => {
+                const v = try cache.peek(vm, 0);
+                cache.sp -= 1;
+                cache.syncSp(vm);
+                vm.pc = pc;
+                vm.awaited = v;
+                return .awaiting;
             },
             .throw => {
                 const v = try cache.peek(vm, 0);

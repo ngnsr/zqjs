@@ -2858,3 +2858,23 @@ test "M25: uncaught engine error still reports same name and message to host" {
     try testing.expectEqual(zqjs.Failure.Kind.thrown, f2.kind);
     try testing.expectEqualStrings("ReferenceError: undeclared_m25 is not defined", f2.message());
 }
+
+test "M28b: a pending async call from a destroyed program does not break the next collection" {
+    const S = struct {
+        var held: ?zqjs.Handle = null;
+        fn hold(_: *zqjs.Runtime, _: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, _: *zqjs.NativeOut) zqjs.NativeError!void {
+            held = try args[0].dup();
+        }
+    };
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+    try rt.defineGlobalFunction("hold", S.hold, null);
+    // `never` keeps the suspended coroutine reachable after its program is gone.
+    const p = try rt.compile("a.js", "let never = new Promise(() => {}); async function f() { const s = 'a constant'; await never; return s; } f(); hold(never);", null);
+    try rt.run(p, null);
+    p.destroy();
+    rt.collectGarbage(); // traces the suspended VM: it must not read the freed Proto
+    S.held.?.release();
+    S.held = null;
+    rt.collectGarbage();
+}

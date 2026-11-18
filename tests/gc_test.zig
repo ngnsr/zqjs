@@ -1895,3 +1895,25 @@ test "M30: old RegExp storing a young lastIndex value survives minor GC (barrier
         try testing.expectEqualStrings("3 cd 5\n", got);
     }
 }
+
+test "M31: old closure storing young property and lazy prototype survives minor GC (barrier)" {
+    const src =
+        \\function F(v) { this.v = v; }
+        \\// Trigger minor GC so `F` is promoted to the old generation.
+        \\for (let i = 0; i < 200; i++) { let g = { a: i, s: "p" + i }; }
+        \\// Lazily materialize F.prototype and attach a young property + young prototype.
+        \\F.tag = { label: "young-" + 42 };
+        \\F.prototype.getV = function () { return this.v; };
+        \\for (let i = 0; i < 200; i++) { let g = { a: i, s: "q" + i }; }
+        \\const inst = new F(77);
+        \\F.prototype = { tag: "new-" + 99 };
+        \\for (let i = 0; i < 200; i++) { let g = { a: i, s: "r" + i }; }
+        \\const inst2 = new F(88);
+        \\print(F.tag.label, inst.getV(), inst2.tag, inst2.v);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("young-42 77 new-99 88\n", got);
+    }
+}

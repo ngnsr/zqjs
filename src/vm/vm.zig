@@ -82,6 +82,8 @@ pub const Frame = struct {
     /// Where this call's arguments start on `vm.stack`, and how many were passed.
     args_start: u32,
     argc: u32,
+    /// True when entered via `new` (returns `this` unless body returns an object-like value).
+    is_construct: bool = false,
 };
 
 pub const Vm = struct {
@@ -155,9 +157,10 @@ pub const Vm = struct {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
-            .tree, .promise_cap, .native_closure => return rt.bug("a non-VM closure in a nested call"),
+            .tree, .promise_cap, .native_closure, .bound => return rt.bug("a non-VM closure in a nested call"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
+        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else this;
         const argc: u32 = @intCast(args.len);
         if (@as(u64, argc) + callee.slot_count + callee.max_stack > rt.limits.max_stack_slots) return rt.limit(.stack_slots);
         var vm: Vm = .{ .rt = rt, .nested = true };
@@ -174,7 +177,7 @@ pub const Vm = struct {
             .locals_base = 0,
             .stack_base = argc,
             .result_index = 0,
-            .this = this,
+            .this = effective_this,
             .stack_end = argc + callee.max_stack,
             .args_start = 0,
             .argc = argc,
@@ -200,7 +203,7 @@ pub const Vm = struct {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
-            .tree, .promise_cap, .native_closure => return rt.bug("a non-VM closure in a nested call"),
+            .tree, .promise_cap, .native_closure, .bound => return rt.bug("a non-VM closure in a nested call"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
         if (callee.is_async) return startAsync(rt, caller_vm, c, this, args);
@@ -790,6 +793,9 @@ pub const Vm = struct {
                     .parent_slot => try cache.cellAt(vm, desc.index),
                     .parent_capture => try vm.capture(desc.index),
                 };
+                if (child.is_arrow) {
+                    if (vm.frame().this) |t| try rt.heap.storeClosureLexicalThis(c, t);
+                }
                 try cache.push(vm, .{ .closure = c });
             },
             .push_callee => {
@@ -976,13 +982,9 @@ pub const Vm = struct {
                 if (args_v != .object or args_v.object.kind != .array) return vm.bug("new_call_spread args not array");
                 const base = cache.sp - 2;
                 cache.syncSp(vm);
-                if (callee == .closure and callee.closure.impl == .vm) {
-                    const callee_proto: *const Proto = @ptrCast(@alignCast(callee.closure.impl.vm.proto));
-                    if (callee_proto.is_arrow or callee_proto.is_async) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+                if (try vm.callConstruct(cache, base, callee, 0, args_v.object.kind.array.items, true, next)) {
+                    return .running;
                 }
-                const result = try builtins.construct(rt, callee, args_v.object.kind.array.items);
-                vm.stack[base] = result;
-                cache.sp = base + 1;
             },
             .call_spread, .call_method_spread => {
                 const is_method = op == .call_method_spread;
@@ -997,7 +999,7 @@ pub const Vm = struct {
                 switch (callee) {
                     .native => |n| {
                         cache.syncSp(vm);
-                        const this_obj: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
+                        const this_obj: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
                         const result = (if (n.host) |h|
                             h.call(rt, h.ctx, this_obj, args_slice)
                         else
@@ -1023,15 +1025,19 @@ pub const Vm = struct {
                             vm.stack[base] = try f(rt, nc.env, args_slice);
                             cache.sp = base + 1;
                         },
+                        .bound => |b| {
+                            cache.syncSp(vm);
+                            if (try vm.callBound(cache, b, base, args_slice, next)) return .running;
+                        },
                         .vm => |v_impl| {
-                            const this: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
+                            const this: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
                             cache.syncSp(vm);
                             const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
                             if (callee_proto.is_async) {
                                 vm.stack[base] = try vm.startAsyncFromVm(c, this, args_slice);
                                 cache.sp = base + 1;
                             } else {
-                                try vm.enterSpread(c, base, args_v.object, next, this);
+                                try vm.enterSlice(c, base, args_slice, next, this, false);
                                 cache.* = FrameCache.fromVm(vm, 0);
                                 return .running;
                             }
@@ -1121,13 +1127,9 @@ pub const Vm = struct {
                 const args = cache.sp - argc;
                 cache.syncSp(vm);
                 const callee = vm.stack[base];
-                if (callee == .closure and callee.closure.impl == .vm) {
-                    const callee_proto: *const Proto = @ptrCast(@alignCast(callee.closure.impl.vm.proto));
-                    if (callee_proto.is_arrow or callee_proto.is_async) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+                if (try vm.callConstruct(cache, base, callee, args, vm.stack[args..cache.sp], false, next)) {
+                    return .running;
                 }
-                const result = try builtins.construct(rt, callee, vm.stack[args..cache.sp]);
-                vm.stack[base] = result;
-                cache.sp = base + 1;
             },
             .call, .call_method => {
                 // Stack: [callee, args…] or [receiver, callee, args…], arguments in source
@@ -1145,7 +1147,7 @@ pub const Vm = struct {
                     // fails, nothing has been popped: the stack is still a valid pre-call state (D35).
                     .native => |n| {
                         cache.syncSp(vm);
-                        const this_obj: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
+                        const this_obj: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
                         const result = (if (n.host) |h|
                             h.call(rt, h.ctx, this_obj, vm.stack[args..cache.sp])
                         else
@@ -1171,16 +1173,20 @@ pub const Vm = struct {
                             vm.stack[base] = try f(rt, nc.env, vm.stack[args..cache.sp]);
                             cache.sp = base + 1;
                         },
+                        .bound => |b| {
+                            cache.syncSp(vm);
+                            if (try vm.callBound(cache, b, base, vm.stack[args..cache.sp], next)) return .running;
+                        },
                         .vm => |v_impl| {
                             // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
-                            const this: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
+                            const this: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
                             cache.syncSp(vm);
                             const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
                             if (callee_proto.is_async) {
                                 vm.stack[base] = try vm.startAsyncFromVm(c, this, vm.stack[args..cache.sp]);
                                 cache.sp = base + 1;
                             } else {
-                                try vm.enter(c, base, args, argc, next, this);
+                                try vm.enter(c, base, args, argc, next, this, false);
                                 cache.* = FrameCache.fromVm(vm, 0);
                                 return .running; // pc is the callee's 0
                             }
@@ -1195,16 +1201,18 @@ pub const Vm = struct {
                     // A nested call's body returned (D51): the value is the call's
                     // result, and the call ends here — no caller frame to unwind to.
                     if (vm.nested and vm.frames.items.len == 1) {
-                        const v = try cache.peek(vm, 0);
+                        const ret_v = try cache.peek(vm, 0);
+                        const f = vm.frame();
                         cache.syncSp(vm);
-                        vm.nested_result = v;
+                        vm.nested_result = if (f.is_construct and !ret_v.isObjectLike()) f.this.? else ret_v;
                         vm.halted = true;
                         return .halted;
                     }
                     return vm.bug("return in the script");
                 }
-                const v = try cache.peek(vm, 0);
+                const ret_v = try cache.peek(vm, 0);
                 const f = vm.frames.pop().?;
+                const v = if (f.is_construct and !ret_v.isObjectLike()) f.this.? else ret_v;
                 if (vm.chain) |cx| cx.call_depth -= 1; // the frame died (D51 #2)
                 vm.locals_len = f.locals_base;
                 vm.reserved -= f.proto.slot_count + f.proto.max_stack;
@@ -1242,16 +1250,111 @@ pub const Vm = struct {
 
     // ---- calls
 
+    fn callBound(vm: *Vm, cache: *FrameCache, b: *const heap.BoundClosure, base: u32, call_args: []const Value, next: u32) Error!bool {
+        const rt = vm.rt;
+        const combined = try rt.gpa.alloc(Value, b.bound_args.len + call_args.len);
+        defer rt.gpa.free(combined);
+        @memcpy(combined[0..b.bound_args.len], b.bound_args);
+        @memcpy(combined[b.bound_args.len..], call_args);
+
+        switch (b.target) {
+            .native => |n| {
+                const this_obj: ?Value = if (b.bound_this.isObjectLike()) b.bound_this else null;
+                const result = (if (n.host) |h|
+                    h.call(rt, h.ctx, this_obj, combined)
+                else
+                    n.call(rt, b.bound_this, combined)) catch |e| {
+                    if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
+                        return rt.limit(.steps);
+                    return e;
+                };
+                if (rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
+                    return rt.limit(.steps);
+                vm.stack[base] = result;
+                cache.sp = base + 1;
+                return false;
+            },
+            .closure => |tc| switch (tc.impl) {
+                .promise_cap => |cap| {
+                    vm.stack[base] = try builtins.callPromiseCapability(rt, cap.promise, cap.is_reject, combined);
+                    cache.sp = base + 1;
+                    return false;
+                },
+                .native_closure => |nc| {
+                    const f: *const fn (*Runtime, *heap.Object, []const Value) Error!Value = @ptrCast(@alignCast(nc.func));
+                    vm.stack[base] = try f(rt, nc.env, combined);
+                    cache.sp = base + 1;
+                    return false;
+                },
+                .vm => |v_impl| {
+                    const this: ?Value = if (b.bound_this.isObjectLike()) b.bound_this else null;
+                    const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
+                    if (callee_proto.is_async) {
+                        vm.stack[base] = try vm.startAsyncFromVm(tc, this, combined);
+                        cache.sp = base + 1;
+                        return false;
+                    }
+                    try vm.enterSlice(tc, base, combined, next, this, false);
+                    cache.* = FrameCache.fromVm(vm, 0);
+                    return true;
+                },
+                .tree, .bound => return vm.bug("invalid bound target in the VM"),
+            },
+            else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
+        }
+    }
+
+    fn callConstruct(vm: *Vm, cache: *FrameCache, base: u32, callee: Value, args_start: u32, args_slice: []const Value, is_spread: bool, next: u32) Error!bool {
+        const rt = vm.rt;
+        var target = callee;
+        var is_bound = false;
+        var combined: []Value = &.{};
+        defer if (combined.len > 0) rt.gpa.free(combined);
+
+        if (callee == .closure and callee.closure.impl == .bound) {
+            is_bound = true;
+            const b = callee.closure.impl.bound;
+            target = b.target;
+            if (b.bound_args.len > 0) {
+                combined = try rt.gpa.alloc(Value, b.bound_args.len + args_slice.len);
+                @memcpy(combined[0..b.bound_args.len], b.bound_args);
+                @memcpy(combined[b.bound_args.len..], args_slice);
+            }
+        }
+        const effective_args = if (combined.len > 0) combined else args_slice;
+        if (!builtins.isConstructor(target)) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+        }
+        if (target == .native) {
+            const result = try builtins.construct(rt, target, effective_args);
+            vm.stack[base] = result;
+            cache.sp = base + 1;
+            return false;
+        }
+        const tc = target.closure;
+        const proto_val = try object.get(rt, target, try object.named(rt, "prototype"));
+        const r = try builtins.realm(rt);
+        const instance = try rt.heap.newObject(if (proto_val == .object) proto_val.object else r.object_prototype);
+        if (!is_spread and !is_bound) {
+            try vm.enter(tc, base, args_start, @intCast(args_slice.len), next, .{ .object = instance }, true);
+        } else {
+            try vm.enterSlice(tc, base, effective_args, next, .{ .object = instance }, true);
+        }
+        cache.* = FrameCache.fromVm(vm, 0);
+        return true;
+    }
+
     /// Enters closure `c`: its `argc` arguments start at `stack[args]`, and the result will
     /// replace everything from `stack[base]`. Transactional: everything that can fail
     /// happens before anything is committed.
-    fn enter(vm: *Vm, c: *const Closure, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value) Error!void {
+    fn enter(vm: *Vm, c: *const Closure, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value, is_construct: bool) Error!void {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
-            .tree, .promise_cap, .native_closure => return vm.bug("a non-VM closure in the VM"),
+            .tree, .promise_cap, .native_closure, .bound => return vm.bug("a non-VM closure in the VM"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
+        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else this;
         const limits = vm.rt.limits;
         // 1. limits — a chained VM checks the chain's shared depth (D51 #2: every VM's
         // frames plus every native record, one `max_call_depth` across the chain); a
@@ -1277,10 +1380,11 @@ pub const Vm = struct {
             .locals_base = vm.locals_len,
             .stack_base = vm.sp,
             .result_index = base,
-            .this = this,
+            .this = effective_this,
             .stack_end = vm.stackEnd(callee),
             .args_start = args,
             .argc = argc,
+            .is_construct = is_construct,
         });
         vm.locals_len += callee.slot_count;
         vm.reserved += callee.slot_count + callee.max_stack;
@@ -1288,18 +1392,18 @@ pub const Vm = struct {
         if (vm.chain) |cx| cx.call_depth += 1; // the frame is live now (D51 #2)
     }
 
-    fn enterSpread(vm: *Vm, c: *const Closure, base: u32, args_arr: *heap.Object, return_pc: u32, this: ?Value) Error!void {
+    fn enterSlice(vm: *Vm, c: *const Closure, base: u32, args_slice: []const Value, return_pc: u32, this: ?Value, is_construct: bool) Error!void {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
-            .tree, .promise_cap, .native_closure => return vm.bug("a non-VM closure in the VM"),
+            .tree, .promise_cap, .native_closure, .bound => return vm.bug("a non-VM closure in the VM"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
+        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else this;
         const limits = vm.rt.limits;
         if (vm.chain) |cx| {
             if (cx.call_depth >= limits.max_call_depth) return vm.rt.limit(.call_depth);
         } else if (vm.frames.items.len >= limits.max_call_depth) return vm.rt.limit(.call_depth);
-        const args_slice = args_arr.kind.array.items;
         const argc: u32 = @intCast(args_slice.len);
         if (vm.reserved + callee.slot_count + callee.max_stack > limits.max_stack_slots) return vm.rt.limit(.stack_slots);
         if (vm.frames.items.len == vm.frames.capacity) try vm.growFrames();
@@ -1319,10 +1423,11 @@ pub const Vm = struct {
             .locals_base = vm.locals_len,
             .stack_base = vm.sp,
             .result_index = base,
-            .this = this,
+            .this = effective_this,
             .stack_end = vm.stackEnd(callee),
             .args_start = args_start,
             .argc = argc,
+            .is_construct = is_construct,
         });
         vm.locals_len += callee.slot_count;
         vm.reserved += callee.slot_count + callee.max_stack;
@@ -1510,7 +1615,16 @@ fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []c
                 try object.define(rt, dst, k, v);
             }
         },
-        .undefined, .null, .boolean, .number, .native, .closure => {},
+        .closure => |c| {
+            const keys = try object.ownKeysClosure(rt, c);
+            defer rt.gpa.free(keys);
+            for (keys) |k| {
+                if (keyIn(k, excluded)) continue;
+                const v = try object.get(rt, src, k);
+                try object.define(rt, dst, k, v);
+            }
+        },
+        .undefined, .null, .boolean, .number, .native => {},
     }
 }
 

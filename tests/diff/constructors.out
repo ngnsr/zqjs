@@ -1,0 +1,28 @@
+p1: 3 4 7
+p2: 10 20 30
+proto: true
+ctor: true
+inst: true true false
+retPrim: true true
+retPrim: true true
+retPrim: true true
+retPrim: true true
+retPrim: true true
+retObj: 99 undefined false
+retFn: fn true false
+replaced: false true custom true
+nullProtoInst: true 3
+badProtoInstanceof: TypeError
+badProtoInstanceof: TypeError
+badProtoInstanceof: TypeError
+boundCtor: 5 6 11 true true
+nonCtor: TypeError
+nonCtor: TypeError
+nonCtor: TypeError
+nonCtor: TypeError
+nonCtor: TypeError
+nonCtor: TypeError
+nonCtor: TypeError
+nonCtor: TypeError
+nonCtor: TypeError
+nonCtor: TypeError

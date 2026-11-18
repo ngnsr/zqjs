@@ -448,7 +448,7 @@ pub const Runtime = struct {
     pub fn callCallable(rt: *Runtime, callee: Value, this_val: Value, args: []const Value) Error!Value {
         return switch (callee) {
             .native => |n| if (n.host) |h|
-                h.call(rt, h.ctx, if (this_val == .object) this_val else null, args)
+                h.call(rt, h.ctx, if (this_val.isObjectLike()) this_val else null, args)
             else
                 n.call(rt, this_val, args),
             .closure => |c| {
@@ -458,10 +458,19 @@ pub const Runtime = struct {
                         const f: *const fn (*Runtime, *heap_mod.Object, []const Value) Error!Value = @ptrCast(@alignCast(nc.func));
                         return f(rt, nc.env, args);
                     },
+                    .bound => |b| {
+                        try rt.checkNativeStack();
+                        if (b.bound_args.len == 0) return rt.callCallable(b.target, b.bound_this, args);
+                        const combined = try rt.gpa.alloc(Value, b.bound_args.len + args.len);
+                        defer rt.gpa.free(combined);
+                        @memcpy(combined[0..b.bound_args.len], b.bound_args);
+                        @memcpy(combined[b.bound_args.len..], args);
+                        return rt.callCallable(b.target, b.bound_this, combined);
+                    },
                     .vm, .tree => {
                         try rt.checkNativeStack();
                         const cc = rt.closure_caller orelse return rt.bug("closure called without an active engine");
-                        return cc.call(cc.ctx, c, if (this_val == .object) this_val else null, args);
+                        return cc.call(cc.ctx, c, if (this_val.isObjectLike()) this_val else null, args);
                     },
                 }
             },

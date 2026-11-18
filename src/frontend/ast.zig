@@ -280,9 +280,15 @@ pub const Function = struct {
     kind: enum { declaration, expression },
     is_arrow: bool = false,
     is_async: bool = false,
+    /// Concise object-literal method (`{ m() {} }`): not constructable and has no `.prototype` (D62).
+    is_method: bool = false,
+    /// Number of parameters before the first default or rest parameter (`F.length`, D62).
+    length: u16 = 0,
     /// Required for declarations (bound in the enclosing scope); optional for
     /// expressions (bound only inside the function, DESIGN_DECISIONS D36).
     name: ?Declarator,
+    /// Contextually inferred `.name` for anonymous functions/arrows/methods (D62).
+    inferred_name: []const u8 = "",
     params: []const Param,
     body: []const Stmt,
 };

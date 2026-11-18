@@ -311,7 +311,6 @@ test "this: decided by the call; an unbound call or a primitive receiver is Unsu
     try expectUnsupported("function outer() { function inner() { return this; } return inner(); } print(1); outer();", "1\n", "Unsupported(sloppy_this)");
     // Not lexical: a nested function called plainly gets no receiver, even inside a method.
     try expectUnsupported("const o = { m() { const f = function () { return this; }; return f(); } }; o.m();", "", "Unsupported(sloppy_this)");
-    try expectUnsupported("const s = { f() { return this; } }; let g = s.f; g.call;", "", "Unsupported(function_properties)");
     try expectUnsupported("let o = { f() { return this; } }; let p = 'str'; p.f = o.f;", "", "Unsupported(primitive_write)");
 }
 
@@ -328,7 +327,6 @@ test "built-ins: known to node but not implemented is Unsupported, naming the me
     try expectUnsupported("'abc'.matchAll;", "", "('matchAll')");
     try expectUnsupported("(1).toFixed;", "", "('toFixed')");
     try expectUnsupported("Object.freeze;", "", "('freeze')");
-    try expectUnsupported("Object.name;", "", "('name')");
     try expectUnsupported("({}).hasOwnProperty;", "", "('hasOwnProperty')");
     try expectUnsupported("({}).constructor;", "", "('constructor')");
     try expectUnsupported("console;", "", "('console')");
@@ -360,8 +358,7 @@ test "conversions call only the built-in methods" {
     try expectUnsupported("let o = { valueOf() { return 1; } }; o + 1;", "", "Unsupported(user_conversion)");
     try expectUnsupported("let a = [1]; a.join = function () { return 'j'; }; '' + a;", "", "Unsupported(user_conversion)");
     try expectUnsupported("let o = { toString: print }; '' + o;", "", "Unsupported(user_conversion)");
-    try expectUnsupported("let f = function () {}; f.x = 1;", "", "Unsupported(function_properties)");
-    try expectUnsupported("print.name;", "", "Unsupported(function_properties)");
+    try expectUnsupported("print.x = 1;", "", "Unsupported(function_properties)");
 }
 
 test "object limits: heap, string length of a join, conversion depth" {
@@ -388,7 +385,6 @@ test "M14.2: Map unsupported methods, non-Map receivers, and non-Map new() targe
     try expectUnsupported("let o = { get: new Map().get }; o.get('x');", "", "Unsupported(builtin)");
     try expectUnsupported("new Object();", "", "Unsupported(builtin)");
     try expectUnsupported("new Array();", "", "Unsupported(builtin)");
-    try expectUnsupported("function F() {} new F();", "", "Unsupported(builtin)");
     try expectUnsupported("new Map({});", "", "Unsupported(builtin)");
 }
 
@@ -822,9 +818,8 @@ test "M25: Error construction, AggregateError, and instanceof OOM safety" {
     try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{OomCtx{ .script = script, .res = res }});
 }
 
-test "M25: instanceof user-defined function fails with Unsupported(function_properties)" {
-    try expectUnsupported("function F() {} ({}) instanceof F;", "", "Unsupported(function_properties)");
-    try expectUnsupported("const F = () => {}; ({}) instanceof F;", "", "Unsupported(function_properties)");
+test "M31: arrow lexical this when enclosing function has no receiver reports sloppy_this" {
+    try expectUnsupported("function f() { return () => this; } f()();", "", "Unsupported(sloppy_this)");
 }
 
 test "M27: LimitExceeded(steps) skips finally on both engines" {
@@ -1167,6 +1162,25 @@ test "M30: checkAllAllocationFailures over RegExp construction, exec, match, rep
         \\const s = "a1 b2".replace(r, (full, w, d) => w + ":" + d);
         \\const parts = s.split(/(:)/);
         \\print(m[0], parts.join("|"), "a1 b2".match(r).length, "a1 b2".search(/\d/));
+    ;
+    for (support.engines) |engine| {
+        var sa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+        try std.testing.checkAllAllocationFailures(sa.allocator(), runOnce, .{ src, engine });
+        try testing.expectEqual(@as(usize, 0), sa.deinit());
+    }
+}
+
+test "M31: checkAllAllocationFailures over functions as objects, constructors, call/apply/bind, and arrow this" {
+    const src =
+        \\function Counter(n) {
+        \\    this.n = n;
+        \\    this.inc = () => ++this.n;
+        \\}
+        \\Counter.tag = "ctr";
+        \\Counter.prototype.get = function (d) { return this.n + d; };
+        \\const c = new Counter(10);
+        \\const bound = c.get.bind(c, 5);
+        \\print(c.inc(), c.get.call(c, 2), c.get.apply(c, [3]), bound(), Object.keys(Counter).join(","));
     ;
     for (support.engines) |engine| {
         var sa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });

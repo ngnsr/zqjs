@@ -33,6 +33,8 @@ const names = @import("builtin_names.zig");
 const json = @import("json.zig");
 const regex = @import("../regex.zig");
 const Feature = @import("../frontend/diag.zig").Feature;
+const ast = @import("../frontend/ast.zig");
+const bytecode = @import("../bytecode/bytecode.zig");
 
 pub const Realm = struct {
     object_prototype: *Object,
@@ -41,6 +43,7 @@ pub const Realm = struct {
     number_prototype: *Object,
     boolean_prototype: *Object,
     function_prototype: *Object,
+    function_namespace: *Object,
     map_prototype: *Object,
     set_prototype: *Object,
     promise_prototype: *Object,
@@ -75,7 +78,7 @@ pub const Realm = struct {
     json: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [37]*Object {
+    pub fn objects(r: *const Realm) [38]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -83,6 +86,7 @@ pub const Realm = struct {
             r.number_prototype,
             r.boolean_prototype,
             r.function_prototype,
+            r.function_namespace,
             r.map_prototype,
             r.set_prototype,
             r.promise_prototype,
@@ -130,6 +134,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .number_prototype = try builtin(h, object_prototype, .number_prototype),
         .boolean_prototype = try builtin(h, object_prototype, .boolean_prototype),
         .function_prototype = try builtin(h, object_prototype, .function_prototype),
+        .function_namespace = try builtin(h, null, .function_constructor),
         .map_prototype = try builtin(h, object_prototype, .map_prototype),
         .set_prototype = try builtin(h, object_prototype, .set_prototype),
         .promise_prototype = try builtin(h, object_prototype, .promise_prototype),
@@ -281,6 +286,18 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.regexp_prototype, "exec", &regexp_exec);
     try method(rt, r.regexp_prototype, "test", &regexp_test);
     try method(rt, r.regexp_prototype, "toString", &regexp_to_string);
+    try constant(rt, r.function_namespace, "prototype", .{ .object = r.function_prototype });
+    try constant(rt, r.function_prototype, "constructor", .{ .native = &function_global });
+    try constant(rt, r.object_namespace, "prototype", .{ .object = r.object_prototype });
+    try constant(rt, r.array_namespace, "prototype", .{ .object = r.array_prototype });
+    try constant(rt, r.string_namespace, "prototype", .{ .object = r.string_prototype });
+    try constant(rt, r.number_namespace, "prototype", .{ .object = r.number_prototype });
+    try constant(rt, r.map_namespace, "prototype", .{ .object = r.map_prototype });
+    try constant(rt, r.set_namespace, "prototype", .{ .object = r.set_prototype });
+    try constant(rt, r.promise_namespace, "prototype", .{ .object = r.promise_prototype });
+    try method(rt, r.function_prototype, "call", &function_call);
+    try method(rt, r.function_prototype, "apply", &function_apply);
+    try method(rt, r.function_prototype, "bind", &function_bind);
     _ = &r;
     rt.realm = r;
     return &rt.realm.?;
@@ -315,6 +332,7 @@ pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
         .array => r.array_namespace,
         .string => r.string_namespace,
         .number => r.number_namespace,
+        .function => r.function_namespace,
         .map => r.map_namespace,
         .set => r.set_namespace,
         .promise => r.promise_namespace,
@@ -338,6 +356,7 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
         .array => r.array_prototype,
         .string => r.string_prototype,
         .number => r.number_prototype,
+        .function => r.function_prototype,
         .map => r.map_prototype,
         .set => r.set_prototype,
         .promise => r.promise_prototype,
@@ -360,7 +379,8 @@ pub const object_global: Native = .{ .name = "Object", .call = notCallable, .nam
 pub const array_global: Native = .{ .name = "Array", .call = notCallable, .namespace = .array };
 pub const string_global: Native = .{ .name = "String", .call = stringCall, .namespace = .string };
 pub const number_global: Native = .{ .name = "Number", .call = numberCall, .namespace = .number };
-pub const parse_int_global: Native = .{ .name = "parseInt", .call = parseIntImpl };
+pub const function_global: Native = .{ .name = "Function", .length = 1, .call = notCallable, .namespace = .function };
+pub const parse_int_global: Native = .{ .name = "parseInt", .length = 2, .call = parseIntImpl };
 pub const parse_float_global: Native = .{ .name = "parseFloat", .call = parseFloatImpl };
 pub const is_nan_global: Native = .{ .name = "isNaN", .call = globalIsNaN };
 pub const is_finite_global: Native = .{ .name = "isFinite", .call = globalIsFinite };
@@ -398,6 +418,7 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "Array")) return .{ .native = &array_global };
     if (std.mem.eql(u8, name, "String")) return .{ .native = &string_global };
     if (std.mem.eql(u8, name, "Number")) return .{ .native = &number_global };
+    if (std.mem.eql(u8, name, "Function")) return .{ .native = &function_global };
     if (std.mem.eql(u8, name, "parseInt")) return .{ .native = &parse_int_global };
     if (std.mem.eql(u8, name, "parseFloat")) return .{ .native = &parse_float_global };
     if (std.mem.eql(u8, name, "isNaN")) return .{ .native = &is_nan_global };
@@ -439,10 +460,162 @@ fn notCallable(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 /// Evaluates `new callee(args...)` for built-in constructors (M14).
 pub fn construct(rt: *Runtime, callee: Value, args: []const Value) Error!Value {
     return switch (callee) {
-        .native => |n| if (n.construct) |c| c(rt, args) else rt.fail(.builtin),
+        .native => |n| if (n.construct) |c| c(rt, args) else if (n.namespace != null) rt.fail(.builtin) else rt.throw(.TypeError, &.{ .{ .ascii = n.name }, .{ .ascii = " is not a constructor" } }),
         .closure => rt.fail(.builtin),
         else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }}),
     };
+}
+
+// ---------------------------------------------------------------- Functions (M31, D62)
+
+pub fn hasAutoPrototype(c: *const heap_mod.Closure) bool {
+    return switch (c.impl) {
+        .vm => |v| blk: {
+            const p: *const bytecode.Proto = @ptrCast(@alignCast(v.proto));
+            break :blk !p.is_arrow and !p.is_async and !p.is_method;
+        },
+        .tree => |t| blk: {
+            const f: *const ast.Function = @ptrCast(@alignCast(t.func));
+            break :blk !f.is_arrow and !f.is_async and !f.is_method;
+        },
+        .promise_cap, .native_closure, .bound => false,
+    };
+}
+
+pub fn isConstructor(v: Value) bool {
+    return switch (v) {
+        .native => |n| n.construct != null or n.namespace != null,
+        .closure => |c| switch (c.impl) {
+            .vm, .tree => hasAutoPrototype(c),
+            .bound => |b| isConstructor(b.target),
+            .promise_cap, .native_closure => false,
+        },
+        else => false,
+    };
+}
+
+pub fn closureName(rt: *Runtime, c: *const heap_mod.Closure) Error!*const heap_mod.String {
+    const raw: []const u8 = switch (c.impl) {
+        .vm => |v| blk: {
+            const p: *const bytecode.Proto = @ptrCast(@alignCast(v.proto));
+            break :blk if (p.name.len > 0) p.name else p.inferred_name;
+        },
+        .tree => |t| blk: {
+            const f: *const ast.Function = @ptrCast(@alignCast(t.func));
+            break :blk if (f.name) |n| n.name else f.inferred_name;
+        },
+        .bound => |b| return b.name,
+        .promise_cap, .native_closure => "",
+    };
+    return rt.heap.ascii(raw);
+}
+
+pub fn closureLength(c: *const heap_mod.Closure) u16 {
+    return switch (c.impl) {
+        .vm => |v| @as(*const bytecode.Proto, @ptrCast(@alignCast(v.proto))).length,
+        .tree => |t| @as(*const ast.Function, @ptrCast(@alignCast(t.func))).length,
+        .bound => |b| b.length,
+        .promise_cap, .native_closure => 0,
+    };
+}
+
+pub fn materializeClosurePrototype(rt: *Runtime, c: *heap_mod.Closure) Error!*Object {
+    const r = try realm(rt);
+    const proto_obj = try rt.heap.newObject(r.object_prototype);
+    const ctor_key = try rt.heap.internAscii("constructor");
+    try rt.heap.defineProperty(proto_obj, ctor_key, .{ .value = .{ .closure = c }, .enumerable = false });
+    try rt.heap.storeClosurePrototype(c, .{ .object = proto_obj });
+    return proto_obj;
+}
+
+const function_call: Native = .{ .name = "call", .length = 1, .call = functionCall };
+const function_apply: Native = .{ .name = "apply", .length = 2, .call = functionApply };
+const function_bind: Native = .{ .name = "bind", .length = 1, .call = functionBind };
+
+fn functionCall(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isFunction()) return rt.throw(.TypeError, &.{.{ .ascii = "Function.prototype.call called on non-function" }});
+    const this_arg = arg(args, 0);
+    const call_args = if (args.len > 1) args[1..] else &[_]Value{};
+    return rt.callCallable(this, this_arg, call_args);
+}
+
+fn functionApply(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isFunction()) return rt.throw(.TypeError, &.{.{ .ascii = "Function.prototype.apply called on non-function" }});
+    const this_arg = arg(args, 0);
+    const arg_array = arg(args, 1);
+    if (arg_array == .undefined or arg_array == .null) {
+        return rt.callCallable(this, this_arg, &.{});
+    }
+    if (arg_array != .object) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "CreateListFromArrayLike called on non-object" }});
+    }
+    if (arg_array.object.kind == .array) {
+        const items = arg_array.object.kind.array.items;
+        const copy = try rt.gpa.dupe(Value, items);
+        defer rt.gpa.free(copy);
+        var root_buf = [_]Value{ this, this_arg };
+        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+        try roots.register(rt);
+        defer roots.unregister(rt);
+        // Keep copied args rooted? They are in `copy` on Zig heap, wait: if GC runs inside callCallable,
+        // `rt.callCallable` copies them to VM stack or Machine values immediately before any safepoint.
+        return rt.callCallable(this, this_arg, copy);
+    }
+    const len_val = try object.get(rt, arg_array, try object.named(rt, "length"));
+    const len_n = try toIntegerOrInfinity(rt, len_val);
+    const len: usize = if (len_n <= 0) 0 else @intFromFloat(@min(len_n, @as(f64, @floatFromInt(rt.limits.max_stack_slots))));
+    const list = try rt.gpa.alloc(Value, len);
+    defer rt.gpa.free(list);
+    for (0..len) |i| {
+        list[i] = try object.get(rt, arg_array, .{ .index = @intCast(i) });
+    }
+    return rt.callCallable(this, this_arg, list);
+}
+
+fn functionBind(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isFunction()) return rt.throw(.TypeError, &.{.{ .ascii = "Bind must be called on a function" }});
+    const this_arg = arg(args, 0);
+    const new_bound_args = if (args.len > 1) args[1..] else &[_]Value{};
+
+    var target: Value = this;
+    var effective_this: Value = this_arg;
+    var prev_args: []const Value = &.{};
+    var target_len: u16 = 0;
+    var target_name: []const u8 = "";
+    var target_name_str: ?*const heap_mod.String = null;
+
+    if (this == .closure and this.closure.impl == .bound) {
+        const prev = this.closure.impl.bound;
+        target = prev.target;
+        effective_this = prev.bound_this;
+        prev_args = prev.bound_args;
+        target_len = prev.length;
+        target_name_str = prev.name;
+    } else switch (this) {
+        .native => |n| {
+            target_len = n.length;
+            target_name = n.name;
+        },
+        .closure => |c| {
+            target_len = closureLength(c);
+            target_name_str = try closureName(rt, c);
+        },
+        else => unreachable,
+    }
+
+    const combined = try rt.gpa.alloc(Value, prev_args.len + new_bound_args.len);
+    defer rt.gpa.free(combined);
+    @memcpy(combined[0..prev_args.len], prev_args);
+    @memcpy(combined[prev_args.len..], new_bound_args);
+
+    const bound_len: u16 = target_len -| @as(u16, @intCast(@min(target_len, new_bound_args.len)));
+    const name_str = if (target_name_str) |s|
+        try rt.heap.newString(&.{ .{ .ascii = "bound " }, .{ .utf16 = s.units } })
+    else
+        try rt.heap.newString(&.{ .{ .ascii = "bound " }, .{ .ascii = target_name } });
+
+    const bound_c = try rt.heap.newBoundClosure(target, effective_this, combined, name_str, bound_len);
+    return .{ .closure = bound_c };
 }
 
 /// `print(a, b, …)` writes `String(a) + " " + String(b) + … + "\n"`. The node test
@@ -1556,8 +1729,12 @@ fn objectKeys(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const out = try rt.heap.newArray(r.array_prototype);
     switch (arg(args, 0)) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .boolean, .number => {},
-        .native, .closure => return rt.fail(.function_properties),
+        .boolean, .number, .native => {},
+        .closure => |c| {
+            const keys = try object.ownKeysClosure(rt, c);
+            defer rt.gpa.free(keys);
+            for (keys) |k| try pushKey(rt, out, k);
+        },
         .string => |s| for (0..s.units.len) |i| try pushKey(rt, out, .{ .index = @intCast(i) }),
         .object => |o| {
             const keys = try object.ownKeys(rt, o);
@@ -1634,8 +1811,26 @@ fn objectValuesEntriesImpl(rt: *Runtime, args: []const Value, comptime is_entrie
 
     switch (arg(args, 0)) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .boolean, .number => {},
-        .native, .closure => return rt.fail(.function_properties),
+        .boolean, .number, .native => {},
+        .closure => |c| {
+            const keys = try object.ownKeysClosure(rt, c);
+            defer rt.gpa.free(keys);
+            for (keys) |k| {
+                const val = try object.get(rt, arg(args, 0), k);
+                if (is_entries) {
+                    const key_s = try keyToString(rt, k);
+                    root_buf[2] = .{ .string = key_s };
+                    root_buf[3] = val;
+                    const pair = try makePairArray(rt, root_buf[2], val);
+                    root_buf[2] = pair;
+                    try rt.heap.appendElement(out, pair);
+                    root_buf[2] = .undefined;
+                    root_buf[3] = .undefined;
+                } else {
+                    try rt.heap.appendElement(out, val);
+                }
+            }
+        },
         .string => |s| for (0..s.units.len) |i| {
             const ch = try rt.heap.newString(&.{.{ .utf16 = s.units[i .. i + 1] }});
             root_buf[2] = .{ .string = ch };
@@ -1687,8 +1882,8 @@ fn objectAssign(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     switch (target) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
         .boolean, .number, .string => return unsupportedReceiver(rt, "assign"),
-        .native, .closure => return rt.fail(.function_properties),
-        .object => {},
+        .native => return rt.fail(.function_properties),
+        .object, .closure => {},
     }
     if (args.len <= 1) return target;
 
@@ -1699,8 +1894,14 @@ fn objectAssign(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 
     for (args[1..]) |src| {
         switch (src) {
-            .undefined, .null, .boolean, .number => {},
-            .native, .closure => return rt.fail(.function_properties),
+            .undefined, .null, .boolean, .number, .native => {},
+            .closure => |c| {
+                const keys = try object.ownKeysClosure(rt, c);
+                defer rt.gpa.free(keys);
+                for (keys) |k| {
+                    try object.set(rt, target, k, try object.get(rt, src, k));
+                }
+            },
             .string => |s| for (0..s.units.len) |i| {
                 const ch = try rt.heap.newString(&.{.{ .utf16 = s.units[i .. i + 1] }});
                 root_buf[1] = .{ .string = ch };

@@ -220,6 +220,9 @@ const Compiler = struct {
         const fn_name: []const u8 = if (f) |func| (if (func.name) |n| n.name else "") else "";
         const name_copy = try gpa.dupe(u8, fn_name);
         errdefer gpa.free(name_copy);
+        const inferred_src: []const u8 = if (f) |func| func.inferred_name else "";
+        const inferred_copy: []const u8 = if (inferred_src.len > 0) try gpa.dupe(u8, inferred_src) else "";
+        errdefer if (inferred_copy.len > 0) gpa.free(inferred_copy);
         // Exact-size slices, allocated before anything is moved out of the lists.
         const code = try gpa.dupe(u8, c.code.items);
         errdefer gpa.free(code);
@@ -248,7 +251,10 @@ const Compiler = struct {
             .kind = kind,
             .is_arrow = if (f) |func| func.is_arrow else false,
             .is_async = if (f) |func| func.is_async else false,
+            .is_method = if (f) |func| func.is_method else false,
+            .length = if (f) |func| func.length else 0,
             .name = name_copy,
+            .inferred_name = inferred_copy,
             .code = code,
             .consts = consts,
             .names = names,

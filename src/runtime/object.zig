@@ -145,12 +145,28 @@ pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
         .boolean => return getFrom(rt, (try builtins.realm(rt)).boolean_prototype, k),
         .object => |o| return getFrom(rt, o, k),
         .native => |n| {
-            const ns = (try builtins.namespaceObject(rt, n)) orelse return rt.fail(.function_properties);
-            if (own(ns, k)) |v| return v;
-            if (nodeHas(ns.builtin.?, k) or nodeHas(.function_prototype, k)) return unsupportedBuiltin(rt, k);
-            return .undefined;
+            if (isNamed(k, "name")) return .{ .string = try rt.heap.ascii(n.name) };
+            if (isNamed(k, "length")) return .{ .number = @floatFromInt(n.length) };
+            if (try builtins.namespaceObject(rt, n)) |ns| {
+                if (try ownGet(rt, ns, k)) |v| return v;
+                if (nodeHas(ns.builtin.?, k)) return unsupportedBuiltin(rt, k);
+            }
+            return getFrom(rt, (try builtins.realm(rt)).function_prototype, k);
         },
-        .closure => return rt.fail(.function_properties),
+        .closure => |c| {
+            if (isNamed(k, "name")) return .{ .string = try builtins.closureName(rt, c) };
+            if (isNamed(k, "length")) return .{ .number = @floatFromInt(builtins.closureLength(c)) };
+            if (isNamed(k, "prototype")) {
+                if (c.meta) |m| if (m.prototype) |p| return p;
+                if (builtins.hasAutoPrototype(c)) {
+                    return .{ .object = try builtins.materializeClosurePrototype(rt, @constCast(c)) };
+                }
+            }
+            if (c.meta) |m| if (m.props.count() > 0) {
+                if (m.props.get(try atomOf(rt, k))) |p| return p.value;
+            };
+            return getFrom(rt, (try builtins.realm(rt)).function_prototype, k);
+        },
     }
 }
 
@@ -220,7 +236,21 @@ pub fn set(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
             return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot set properties of " }, .{ .ascii = @tagName(base) }, .{ .ascii = " (setting '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
         },
         .string, .number, .boolean => return rt.fail(.primitive_write), // sloppy JS ignores these
-        .native, .closure => return rt.fail(.function_properties),
+        .native => {
+            if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
+            if (isNamed(k, "name") or isNamed(k, "length")) return;
+            return rt.fail(.function_properties);
+        },
+        .closure => |c| {
+            if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
+            if (isNamed(k, "name") or isNamed(k, "length")) return;
+            if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) {
+                try rt.heap.storeClosurePrototype(@constCast(c), v);
+                return;
+            }
+            try rt.heap.storeClosureProperty(@constCast(c), try atomOf(rt, k), v);
+            return;
+        },
         .object => |o| o,
     };
     if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
@@ -274,7 +304,14 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
     const o = switch (base) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
         .string, .number, .boolean => return rt.fail(.primitive_write),
-        .native, .closure => return rt.fail(.function_properties),
+        .native => return rt.fail(.function_properties),
+        .closure => |c| {
+            if (isNamed(k, "name") or isNamed(k, "length")) return true;
+            if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return false;
+            if (c.meta == null or c.meta.?.props.count() == 0) return true;
+            rt.heap.removeClosureProperty(@constCast(c), try atomOf(rt, k));
+            return true;
+        },
         .object => |o| o,
     };
     switch (o.kind) {
@@ -294,14 +331,31 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
 /// `k in base`.
 pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
     heap_mod.checkValue(base);
-    const start = switch (base) {
+    const start: *Object = switch (base) {
         .object => |o| o,
-        .native, .closure => return rt.fail(.function_properties),
+        .native => |n| {
+            if (isNamed(k, "name") or isNamed(k, "length")) return true;
+            if (try builtins.namespaceObject(rt, n)) |ns| {
+                if (try ownGet(rt, ns, k) != null) return true;
+                if (nodeHas(ns.builtin.?, k)) return true;
+            }
+            return hasInChain(rt, (try builtins.realm(rt)).function_prototype, k);
+        },
+        .closure => |c| {
+            if (isNamed(k, "name") or isNamed(k, "length")) return true;
+            if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return true;
+            if (c.meta) |m| if (m.props.count() > 0) if (m.props.contains(try atomOf(rt, k))) return true;
+            return hasInChain(rt, (try builtins.realm(rt)).function_prototype, k);
+        },
         else => {
             var buf: [10]u8 = undefined;
             return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot use 'in' operator to search for '" }, keyPiece(k, &buf), .{ .ascii = "' in a non-object" } });
         },
     };
+    return hasInChain(rt, start, k);
+}
+
+fn hasInChain(rt: *Runtime, start: *Object, k: Key) Error!bool {
     var o: ?*Object = start;
     while (o) |cur| : (o = cur.proto) {
         if (try ownGet(rt, cur, k) != null) return true;
@@ -311,27 +365,52 @@ pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
     return false;
 }
 
-/// `lhs instanceof rhs` (M25).
+/// `lhs instanceof rhs` (M25, M31 D62).
 pub fn instanceOf(rt: *Runtime, lhs: Value, rhs: Value) Error!bool {
     heap_mod.checkValue(lhs);
     heap_mod.checkValue(rhs);
-    const rhs_native = switch (rhs) {
-        .native => |n| n,
-        .closure => return rt.fail(.function_properties),
-        else => return rt.throw(.TypeError, &.{.{ .ascii = "Right-hand side of 'instanceof' is not callable" }}),
-    };
+    var target = rhs;
+    if (!target.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Right-hand side of 'instanceof' is not callable" }});
+    }
     var cur: ?*Object = switch (lhs) {
         .object => |o| o.proto,
         .native, .closure => (try builtins.realm(rt)).function_prototype,
         else => return false,
     };
-    const target_proto = (try builtins.constructorPrototype(rt, rhs_native)) orelse
-        return rt.throw(.TypeError, &.{.{ .ascii = "Function has non-object prototype 'undefined' in instanceof check" }});
+    while (target == .closure and target.closure.impl == .bound) {
+        target = target.closure.impl.bound.target;
+    }
+    const target_proto: *Object = switch (target) {
+        .native => |n| (try builtins.constructorPrototype(rt, n)) orelse
+            return rt.throw(.TypeError, &.{.{ .ascii = "Function has non-object prototype 'undefined' in instanceof check" }}),
+        .closure => blk: {
+            const proto_val = try get(rt, target, try named(rt, "prototype"));
+            if (proto_val != .object) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "Function has non-object prototype in instanceof check" }});
+            }
+            break :blk proto_val.object;
+        },
+        else => unreachable,
+    };
     while (cur) |o| : (cur = o.proto) {
         o.obj.checkLive();
         if (o == target_proto) return true;
     }
     return false;
+}
+
+/// Own enumerable keys of a closure in spec order (Object.keys(fn)).
+pub fn ownKeysClosure(rt: *Runtime, c: *const heap_mod.Closure) Error![]Key {
+    const m = c.meta orelse return &.{};
+    if (m.props.count() == 0) return &.{};
+    var out: std.ArrayList(Key) = .empty;
+    errdefer out.deinit(rt.gpa);
+    for (m.props.keys(), m.props.values()) |a, p| {
+        if (!p.enumerable) continue;
+        if (a.atom.?.index) |i| try out.insert(rt.gpa, indexPosition(out.items, i), .{ .index = i }) else try out.append(rt.gpa, .{ .atom = a });
+    }
+    return out.toOwnedSlice(rt.gpa);
 }
 
 /// Own enumerable keys in spec order: array indices ascending, then the rest in

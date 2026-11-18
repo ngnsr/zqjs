@@ -10,6 +10,7 @@ pub const Builtin = enum {
     string_prototype,
     number_prototype,
     boolean_prototype,
+    function_constructor,
     function_prototype,
     object_constructor,
     array_constructor,
@@ -53,6 +54,7 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .string_prototype => string_prototype.has(name),
         .number_prototype => number_prototype.has(name),
         .boolean_prototype => boolean_prototype.has(name),
+        .function_constructor => function_constructor.has(name),
         .function_prototype => function_prototype.has(name),
         .object_constructor => object_constructor.has(name),
         .array_constructor => array_constructor.has(name),
@@ -286,6 +288,12 @@ const boolean_prototype = std.StaticStringMap(void).initComptime(.{
     .{"constructor"},
     .{"toString"},
     .{"valueOf"},
+});
+
+const function_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
 });
 
 const function_prototype = std.StaticStringMap(void).initComptime(.{

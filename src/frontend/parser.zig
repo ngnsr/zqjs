@@ -255,6 +255,7 @@ const Parser = struct {
             if (p.tok.tag == .eq) {
                 try p.advance();
                 init = try p.expression();
+                if (pat.data == .binding) inferExprName(init.?, pat.data.binding.name);
             } else if (kind == .@"const") {
                 return p.fail(.{ .syntax_error = "missing initializer in const declaration" }, start_tok);
             } else if (pat.data != .binding) {
@@ -574,7 +575,16 @@ const Parser = struct {
         const parsed_body = try p.parseFunctionBody();
 
         const f = try p.arena.create(ast.Function);
-        f.* = .{ .span = .{ .start = start, .end = parsed_body.end }, .id = id, .kind = kind, .is_async = is_async, .name = name, .params = params, .body = parsed_body.body };
+        f.* = .{
+            .span = .{ .start = start, .end = parsed_body.end },
+            .id = id,
+            .kind = kind,
+            .is_async = is_async,
+            .length = paramLength(params),
+            .name = name,
+            .params = params,
+            .body = parsed_body.body,
+        };
         return f;
     }
 
@@ -597,6 +607,7 @@ const Parser = struct {
             if (p.tok.tag == .eq) {
                 try p.advance();
                 default = try p.nested();
+                if (pat.data == .binding) inferExprName(default.?, pat.data.binding.name);
             }
             const p_end = if (default) |d| d.span.end else pat.span.end;
             try params.append(p.arena, .{ .pattern = pat, .default = default, .is_rest = false, .span = .{ .start = p_start, .end = p_end } });
@@ -692,6 +703,7 @@ const Parser = struct {
                 try p.advance();
                 default = try p.nested();
                 max_depth = @max(max_depth, default.?.depth);
+                if (pat.data == .binding) inferExprName(default.?, pat.data.binding.name);
             }
             const end_pos = if (default) |d| d.span.end else pat.span.end;
             try elems.append(p.arena, .{ .pattern = pat, .default = default, .span = .{ .start = pat.span.start, .end = end_pos } });
@@ -759,6 +771,7 @@ const Parser = struct {
                     try p.advance();
                     default = try p.nested();
                     max_depth = @max(max_depth, default.?.depth);
+                    if (pat.data == .binding) inferExprName(default.?, pat.data.binding.name);
                 }
                 const end_pos = if (default) |d| d.span.end else pat.span.end;
                 try props.append(p.arena, .{ .key = k, .pattern = pat, .default = default, .shorthand = false, .span = .{ .start = t.start, .end = end_pos } });
@@ -785,6 +798,7 @@ const Parser = struct {
                     try p.advance();
                     default = try p.nested();
                     max_depth = @max(max_depth, default.?.depth);
+                    inferExprName(default.?, name);
                 }
                 const end_pos = if (default) |def| def.span.end else t.end;
                 try props.append(p.arena, .{ .key = k, .pattern = pat, .default = default, .shorthand = true, .span = .{ .start = t.start, .end = end_pos } });
@@ -915,6 +929,7 @@ const Parser = struct {
         const target = try p.assignTarget(lhs, "invalid assignment target");
         try p.advance();
         const value = try p.expression();
+        if (op == .plain and target == .ref) inferExprName(value, target.ref.name);
         p.last_was_paren = false;
         return p.node(
             .{ .start = lhs.span.start, .end = value.span.end },
@@ -1116,6 +1131,7 @@ const Parser = struct {
             .kind = .expression,
             .is_arrow = true,
             .is_async = is_async,
+            .length = paramLength(params),
             .name = null,
             .params = params,
             .body = body,
@@ -1629,11 +1645,15 @@ const Parser = struct {
                     const value = try p.nestedRaw();
                     if (value.has_cover_init) has_cover_init = true;
                     if (value.has_hole) has_hole = true;
+                    if (try p.keyInferredName(k)) |inferred| inferExprName(value, inferred);
                     try props.append(p.arena, .{ .prop = .{ .key = k, .value = value, .shorthand = false, .span = .{ .start = t.start, .end = value.span.end } } });
                     depth = @max(depth, value.depth);
                 },
                 .l_paren => {
                     const f = try p.functionRest(t.start, .expression, null, is_async_method);
+                    const mut_f = @constCast(f);
+                    mut_f.is_method = true;
+                    if (try p.keyInferredName(k)) |inferred| mut_f.inferred_name = inferred;
                     const value = try p.node(f.span, .{ .function = f }, 0);
                     try props.append(p.arena, .{ .prop = .{ .key = k, .value = value, .shorthand = false, .span = .{ .start = t.start, .end = value.span.end } } });
                 },
@@ -1721,6 +1741,19 @@ const Parser = struct {
             .name => |n| std.mem.eql(u8, n, "__proto__"),
             .string => |u| std.mem.eql(u16, u, std.unicode.utf8ToUtf16LeStringLiteral("__proto__")),
             else => false,
+        };
+    }
+
+    fn keyInferredName(p: *Parser, k: ast.PropertyKey) Error!?[]const u8 {
+        return switch (k) {
+            .name => |n| n,
+            .string => |units| blk: {
+                for (units) |u| if (u >= 0x80) break :blk null;
+                const buf = try p.arena.alloc(u8, units.len);
+                for (units, buf) |u, *b| b.* = @intCast(u);
+                break :blk buf;
+            },
+            else => null,
         };
     }
 
@@ -1903,6 +1936,7 @@ const Parser = struct {
                             rest = r;
                         },
                         .cover_init => |ci| {
+                            inferExprName(ci.default, ci.ref.name);
                             const pat = try p.patNode(ci.ref.span, .{ .target = .{ .ref = ci.ref } }, 0);
                             try out.append(p.arena, .{ .key = .{ .name = ci.ref.name }, .pattern = pat, .default = ci.default, .shorthand = true, .span = ci.span });
                         },
@@ -1967,6 +2001,7 @@ const Parser = struct {
                         continue;
                     };
                     const sub = try p.targetPatternToBindingPattern(el.pattern);
+                    if (el.default) |def| if (sub.data == .binding) inferExprName(def, sub.data.binding.name);
                     max_depth = @max(max_depth, sub.depth);
                     try elems.append(p.arena, .{ .pattern = sub, .default = el.default, .span = el.span });
                 }
@@ -1982,6 +2017,7 @@ const Parser = struct {
                 var max_depth: u16 = 0;
                 for (obj.props) |pr| {
                     const sub = try p.targetPatternToBindingPattern(pr.pattern);
+                    if (pr.default) |def| if (sub.data == .binding) inferExprName(def, sub.data.binding.name);
                     max_depth = @max(max_depth, sub.depth);
                     try props.append(p.arena, .{ .key = pr.key, .pattern = sub, .default = pr.default, .shorthand = pr.shorthand, .span = pr.span });
                 }
@@ -2008,6 +2044,7 @@ const Parser = struct {
                 if (a.op != .plain or a.target != .ref)
                     return p.failAt(.{ .syntax_error = "invalid arrow function parameter" }, item_span.start, item_span.end);
                 const d = try p.refToDeclarator(a.target.ref);
+                inferExprName(a.value, d.name);
                 const pat = try p.patNode(d.span, .{ .binding = d }, 0);
                 return .{ .pattern = pat, .default = a.value, .is_rest = false, .span = item_span };
             },
@@ -2235,6 +2272,22 @@ const Parser = struct {
 
 fn span(first: Token, last: Token) ast.Span {
     return .{ .start = first.start, .end = last.end };
+}
+
+fn paramLength(params: []const ast.Param) u16 {
+    for (params, 0..) |param, i| {
+        if (param.default != null or param.is_rest) return @intCast(i);
+    }
+    return @intCast(params.len);
+}
+
+fn inferExprName(e: *const ast.Expr, name: []const u8) void {
+    if (e.data == .function) {
+        const f = e.data.function;
+        if (f.name == null and f.inferred_name.len == 0) {
+            @constCast(f).inferred_name = name;
+        }
+    }
 }
 
 fn hexAt(s: []const u8, i: usize) ?u16 {

@@ -1,0 +1,8 @@
+counter: 11 12 17 17
+deep: outer
+default: outer
+map: 111,112,113
+call: outer
+apply: outer
+bind: outer
+innerThis: innerObj

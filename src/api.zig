@@ -1119,9 +1119,58 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
             return mintHandle(r, result, failure);
         },
         .closure => |c| {
-            if (c.impl == .promise_cap) {
-                const pc = c.impl.promise_cap;
-                const result = internal.builtins.callPromiseCapability(rt, pc.promise, pc.is_reject, argv) catch |e| {
+            var target_closure = c;
+            var call_this = this_v;
+            var bound_combined: ?[]internal.Value = null;
+            defer if (bound_combined) |bc| rt.gpa.free(bc);
+            var call_argv: []const internal.Value = argv;
+
+            if (c.impl == .bound) {
+                const b = c.impl.bound;
+                call_this = b.bound_this;
+                if (b.bound_args.len > 0) {
+                    const buf = rt.gpa.alloc(internal.Value, b.bound_args.len + argv.len) catch |e| {
+                        const fo = faultOf(rt, e);
+                        if (failure) |out| out.* = fo.failure;
+                        return fo.err;
+                    };
+                    @memcpy(buf[0..b.bound_args.len], b.bound_args);
+                    @memcpy(buf[b.bound_args.len..], argv);
+                    bound_combined = buf;
+                    call_argv = buf;
+                }
+                if (b.target == .native) {
+                    const n = b.target.native;
+                    const this_obj: ?internal.Value = if (call_this.isObjectLike()) call_this else null;
+                    const result = (if (n.host) |h|
+                        h.call(rt, h.ctx, this_obj, call_argv)
+                    else
+                        n.call(rt, call_this, call_argv)) catch |e| {
+                        const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                        const fo = faultOf(rt, err);
+                        if (failure) |out| out.* = fo.failure;
+                        return fo.err;
+                    };
+                    if (rt.exec_ctx.budget_fault != null) {
+                        const fo = faultOf(rt, rt.limit(.steps));
+                        if (failure) |out| out.* = fo.failure;
+                        return fo.err;
+                    }
+                    if (top_level) {
+                        drainTopLevelMicrotasks(rt, result) catch |e| {
+                            const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                            const fo = faultOf(rt, err);
+                            if (failure) |out| out.* = fo.failure;
+                            return fo.err;
+                        };
+                    }
+                    return mintHandle(r, result, failure);
+                }
+                target_closure = b.target.closure;
+            }
+            if (target_closure.impl == .promise_cap) {
+                const pc = target_closure.impl.promise_cap;
+                const result = internal.builtins.callPromiseCapability(rt, pc.promise, pc.is_reject, call_argv) catch |e| {
                     const fo = faultOf(rt, e);
                     if (failure) |out| out.* = fo.failure;
                     return fo.err;
@@ -1136,10 +1185,10 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
                 }
                 return mintHandle(r, result, failure);
             }
-            if (c.impl == .native_closure) {
-                const nc = c.impl.native_closure;
+            if (target_closure.impl == .native_closure) {
+                const nc = target_closure.impl.native_closure;
                 const func: *const fn (*IRuntime, *internal.heap.Object, []const internal.Value) internal.runtime.Error!internal.Value = @ptrCast(@alignCast(nc.func));
-                const result = func(rt, nc.env, argv) catch |e| {
+                const result = func(rt, nc.env, call_argv) catch |e| {
                     const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
                     const fo = faultOf(rt, err);
                     if (failure) |out| out.* = fo.failure;
@@ -1157,11 +1206,11 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
             }
             // Model B (D51): a fresh VM, frame 0 the callee; `this` binds by the VM's
             // sloppy rule (object receivers only, D41). Its `return` ends the call.
-            const this_obj: ?internal.Value = if (this_v == .object) this_v else null;
-            if (c.impl == .vm) {
-                const callee_proto: *const internal.bytecode.Proto = @ptrCast(@alignCast(c.impl.vm.proto));
+            const this_obj: ?internal.Value = if (call_this.isObjectLike()) call_this else null;
+            if (target_closure.impl == .vm) {
+                const callee_proto: *const internal.bytecode.Proto = @ptrCast(@alignCast(target_closure.impl.vm.proto));
                 if (callee_proto.is_async) {
-                    const result = internal.Vm.callStandalone(rt, c, this_obj, argv) catch |e| {
+                    const result = internal.Vm.callStandalone(rt, target_closure, this_obj, call_argv) catch |e| {
                         const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
                         const fo = faultOf(rt, err);
                         if (failure) |out| out.* = fo.failure;
@@ -1188,7 +1237,7 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
                 if (failure) |out| out.* = fo.failure;
                 return fo.err;
             };
-            var vm = internal.Vm.initCall(rt, c, this_obj, argv) catch |e| {
+            var vm = internal.Vm.initCall(rt, target_closure, this_obj, call_argv) catch |e| {
                 const fo = faultOf(rt, e);
                 if (failure) |out| out.* = fo.failure;
                 return fo.err;

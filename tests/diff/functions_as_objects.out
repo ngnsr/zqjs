@@ -1,0 +1,35 @@
+names: namedDecl inferredExpr inferredArrow reassigned
+objNames: concise asyncConcise propArrow strKey
+anonName:   cb
+lengths: 2 1 2 3 1
+native: print parseInt 2 Function 1
+readonly: namedDecl 2
+keys-fresh: []
+props: fnTag zero 123
+in: true true true true true false
+keys: ["0","tag","extra"]
+values: ["zero","fnTag",123]
+entries: [["0","zero"],["tag","fnTag"],["extra",123]]
+spread: {"0":"zero","tag":"fnTag","extra":123}
+delete: true false false true
+assigned: true ["0","extra","assigned"]
+proto: true
+nativeProto: true
+fnProtoCtor: true
+instanceof: true true
+nativeInstanceof: true true
+ctorProto: true
+ctorProtoProto: true
+customProto: 7
+nonCtorProto: undefined undefined undefined
+nonCtorIn: false false false
+arrowAssignProto: 123 true undefined
+call: hi:world!
+apply: hello:world?
+applyNull: , ,
+applyErr: TypeError
+boundMeta: bound greet 1 undefined false
+boundCall: yo:world~
+bound2Meta: bound bound greet 0
+bound2Call: yo:worldend
+boundNative: bound max 30

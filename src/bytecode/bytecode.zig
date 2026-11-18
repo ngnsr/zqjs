@@ -350,8 +350,12 @@ pub const Proto = struct {
     kind: enum { script, function } = .script,
     is_arrow: bool = false,
     is_async: bool = false,
+    is_method: bool = false,
+    length: u16 = 0,
     /// The function's name, for listings and traces ("" if anonymous or the script).
     name: []const u8 = "",
+    /// Contextually inferred `.name` for anonymous functions/arrows/methods (D62).
+    inferred_name: []const u8 = "",
     code: []const u8,
     /// Numbers and strings only.
     consts: []const Value,
@@ -390,6 +394,7 @@ pub const Proto = struct {
         gpa.free(p.handlers);
         gpa.free(p.captures);
         gpa.free(p.name);
+        if (p.inferred_name.len > 0) gpa.free(p.inferred_name);
         gpa.free(p.code);
         gpa.free(p.consts);
         for (p.names) |n| gpa.free(n);

@@ -12,14 +12,17 @@ pub const Value = union(enum) {
     string: *const heap.String,
     /// A function implemented in Zig. Becomes a function object in M7.
     native: *const Native,
-    /// A function defined in the script (M6). Not an object yet: property access on it
-    /// is Unsupported(function_properties) (M7).
+    /// A function defined in the script (M6, M31 D62).
     closure: *const heap.Closure,
     /// An ordinary object or an array (M7).
     object: *heap.Object,
 
     pub fn isFunction(v: Value) bool {
         return v == .native or v == .closure;
+    }
+
+    pub fn isObjectLike(v: Value) bool {
+        return v == .object or v == .closure or v == .native;
     }
 };
 
@@ -30,6 +33,7 @@ pub const HostCallFn = fn (rt: *Runtime, ctx: ?*anyopaque, this: ?Value, args: [
 
 pub const Native = struct {
     name: []const u8,
+    length: u16 = 0,
     /// `this` is the call's receiver (`.undefined` for a plain call); `args` is a temporary
     /// slice owned by the caller, valid only during the call. A built-in native never calls
     /// back into JS (M7: conversions that would need to are Unsupported, D40).
@@ -48,6 +52,7 @@ pub const Native = struct {
         array,
         string,
         number,
+        function,
         map,
         set,
         promise,

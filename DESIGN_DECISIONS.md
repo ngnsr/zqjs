@@ -1368,3 +1368,94 @@ backtracking matcher. M30 wires it into the language, object model, and limits:
     captured groups (`undefined` if unmatched) into the result array and handling empty-match
     advancement and `limit`.
   - `matchAll`: remains `Unsupported(builtin)`.
+
+## D62. Functions as objects, constructors (`new F()`), and lexical arrow `this` *(M31; approved 2026-11-18)*
+M31 turns functions (`.closure` and `.native`) into first-class objects inheriting from
+`Function.prototype` → `Object.prototype`, implements user-defined constructors (`new F(...)`),
+`x instanceof F`, `Function.prototype.{call, apply, bind}`, and lexical `this` inside arrow
+functions — the foundation required for `class` in M32.
+
+**1. Lazy property & prototype storage on `Closure` (`src/runtime/heap.zig`, `src/runtime/object.zig`).**
+- Most closures (arrows, callbacks, `async` functions) never have properties attached or
+  `.prototype` read. `Closure` stays lightweight by holding `meta: ?*ClosureMeta = null`,
+  allocated on demand through `rt.heap.allocator()` (charged to `buffer_bytes` and `max_heap_bytes`,
+  freed in `Heap.release`, and traced in `forEachChild` / `scanRemembered`):
+  - `props: std.AutoArrayHashMapUnmanaged(*String, Property) = .empty` for user-defined own
+    properties (`f.k = v`, `delete f.k`, `Object.keys(f)`).
+  - `prototype: ?Value = null` for a constructable user closure's `.prototype` slot (`null` until
+    lazily materialized on first read/construct or overwritten via `F.prototype = v`).
+- All mutations of `Closure.meta` (`storeClosurePrototype`, `storeClosureProperty`,
+  `removeClosureProperty`) go through the heap store API and invoke `h.barrier(&c.obj, old, new)`
+  so an old closure storing a young `.prototype` or property joins the remembered set.
+- Constructability (`hasLazyPrototype` / `isConstructor`):
+  - Plain `function` declarations and `function` expressions are constructors.
+  - Arrow functions (`is_arrow`), `async` functions (`is_async`), concise object-literal methods
+    (`{ m() {} }`: `is_method: bool = false` on `ast.Function` and `bytecode.Proto`), and built-in
+    non-constructors (`parseInt`, `Math.*`, prototype methods) are not constructors (`new` throws
+    `TypeError`).
+  - On a constructable user `Closure`, reading `F.prototype` before it is overwritten lazily
+    allocates a fresh ordinary `Object` (inheriting from `Object.prototype`) with a non-enumerable
+    `constructor: F` property and caches it in `F.meta.prototype`. `F.prototype` is writable and
+    non-configurable (`delete F.prototype` returns `false`). Non-constructable closures have no
+    automatic `.prototype` property (`f.prototype` is `undefined` unless assigned as an own
+    property).
+- `F.name` and `F.length`:
+  - Synthesized as read-only, non-enumerable own properties on `.closure` and `.native` (writes
+    are ignored in sloppy mode; `Object.keys(f)` excludes `name`, `length`, and `prototype`).
+  - `length: u16` (parameter count before the first default or rest parameter) is stored on
+    `ast.Function`, `bytecode.Proto`, and `Native`.
+  - `name` uses the declared or inferred function name (`inferred_name` from variable declarators,
+    plain assignments, default initializers, and object-literal properties/methods), or `""` when
+    anonymous.
+- Prototype chain & built-in operations:
+  - Property lookups on `.closure` and `.native` check own properties (and `.prototype` / `.name` /
+    `.length`), then walk `Function.prototype` → `Object.prototype`.
+  - Global `Function` constructor is exposed with `Function.prototype = r.function_prototype` and
+    `Function.prototype.constructor = Function` (calling `Function(...)` or `new Function(...)`
+    remains `Unsupported(builtin)`).
+  - `Object.keys`, `Object.values`, `Object.entries`, `Object.assign`, `{ ...f }`, and
+    `Object.getPrototypeOf` (`=== Function.prototype`) all support `.closure` and `.native`.
+
+**2. User constructors (`new F(args)`, `new F(...args)`) & `instanceof` (`src/vm/vm.zig`, `src/interp/machine.zig`, `src/runtime/object.zig`).**
+- `new F(...)` on a constructable user `Closure`:
+  1. Reads `proto_val = try object.get(rt, callee, "prototype")` (lazily materializing
+     `F.prototype` if untouched).
+  2. Allocates `instance = try rt.heap.newObject(if (proto_val == .object) proto_val.object else r.object_prototype)`.
+  3. Invokes `F` with `this = .{ .object = instance }` and the call arguments.
+  4. On normal return with `ret`: if `ret == .object or ret == .closure or ret == .native`, the
+     `new` expression evaluates to `ret`; otherwise (primitive / `undefined` / `null`) it
+     evaluates to `.{ .object = instance }`.
+- Both `.new_call` and `.new_call_spread` on the VM push a frame with `is_construct = true` and
+  apply the `this` fallback in `.@"return"`, and `Machine` records `construct_instance` in
+  `Task.call_return`, so user construction never nests a Zig call (preserving D59/D60).
+- `x instanceof F`: when RHS `F` is a `.closure` (unwrapping bound functions to their target),
+  checks whether `lhs` is an object or function (returning `false` for primitives), reads
+  `proto_val = try object.get(rt, target, "prototype")`, throws `TypeError` if `proto_val` is not
+  an object/function, and walks `lhs`'s prototype chain (`o.proto`, or `Function.prototype` →
+  `Object.prototype` when `lhs` is `.closure` / `.native`) checking `cur == proto_val.object`.
+
+**3. `Function.prototype.{call, apply, bind}` (`src/runtime/builtins.zig`).**
+- `f.call(thisArg, ...args)` and `f.apply(thisArg, argsArray)` invoke `f` with receiver `thisArg`
+  (binding `this = thisArg` for object/function receivers and leaving `this = null` for
+  `null`/`undefined`/primitives per D41). `apply` accepts `null`/`undefined` as 0 arguments, or an
+  array/array-like object (throwing `TypeError` on primitives).
+- `f.bind(thisArg, ...boundArgs)` allocates a `Closure.impl.bound` (`*BoundClosure` via
+  `rt.heap.allocator()`) capturing `(target, bound_this, bound_args, name, length)`, flattening
+  chained `bind` calls so `target` is always the underlying callable. Calling a bound function
+  prepends `bound_args` and uses `bound_this`; constructing a bound function (`new`) prepends
+  `bound_args` and constructs `target` (ignoring `bound_this`, or throwing `TypeError` if `target`
+  is not constructable).
+
+**4. Lexical `this` in arrow functions (`src/frontend/resolver.zig`, `src/vm/vm.zig`, `src/interp/machine.zig`).**
+- Since `this` in JS is immutable per call frame, an arrow function's lexical `this` is the `this`
+  of its enclosing non-arrow function at the moment the arrow closure is created.
+- At resolve time, `this` inside an arrow function at script level (no enclosing non-arrow
+  function) reports `Unsupported(sloppy_this)` (replacing `Unsupported(arrow_this)`). Inside a
+  non-arrow function, `this` inside arrows (including arbitrarily nested arrows and default
+  parameters) is accepted.
+- At runtime, creating an arrow closure (`make_closure` in the VM, `evalFunction` in `Machine`)
+  captures the current frame's `this` into `Closure.lexical_this` (traced by GC). Entering an arrow
+  closure binds the arrow frame's `this` to `c.lexical_this` (ignoring any caller-supplied
+  receiver). If the enclosing non-arrow function was called without an object receiver
+  (`c.lexical_this == null`), reading `this` inside the arrow reports `Unsupported(sloppy_this)`
+  at the point of use, matching D41.

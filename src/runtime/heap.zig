@@ -98,10 +98,30 @@ pub const Cell = struct {
     value: ?Value,
 };
 
+/// Lazily allocated own-property table, `.prototype` box, and lexical `this` for `Closure` (M31, D62).
+pub const ClosureMeta = struct {
+    props: std.AutoArrayHashMapUnmanaged(*String, Property) = .empty,
+    /// On a constructable user closure: null until `.prototype` is lazily materialized
+    /// or explicitly overwritten (`F.prototype = v`).
+    prototype: ?Value = null,
+    /// Lexical `this` captured when an arrow function closure is created inside a method/ctor.
+    lexical_this: ?Value = null,
+};
+
+/// Bound function payload created by `Function.prototype.bind` (M31, D62).
+pub const BoundClosure = struct {
+    target: Value,
+    bound_this: Value,
+    bound_args: []Value,
+    name: *const String,
+    length: u16,
+};
+
 /// A function value. Each engine creates and reads only its own variant; the payload
 /// pointers are opaque here so the heap does not depend on the AST or the bytecode.
 pub const Closure = struct {
     obj: Obj,
+    meta: ?*ClosureMeta = null,
     impl: union(enum) {
         /// `proto: *const bytecode.Proto`; `captures` filled by `make_closure`.
         vm: struct { proto: *const anyopaque, captures: []*Cell },
@@ -111,6 +131,8 @@ pub const Closure = struct {
         promise_cap: struct { promise: *Object, is_reject: bool },
         /// Native closure with a bound environment object (M19).
         native_closure: struct { func: *const anyopaque, env: *Object },
+        /// Bound function created by `Function.prototype.bind` (M31, D62).
+        bound: *BoundClosure,
     },
 };
 
@@ -1190,6 +1212,47 @@ pub const Heap = struct {
         h.barrier(&e.obj, old, value);
     }
 
+    pub fn ensureClosureMeta(h: *Heap, c: *Closure) Error!*ClosureMeta {
+        c.obj.checkLive();
+        if (c.meta) |m| return m;
+        const m = h.allocator().create(ClosureMeta) catch |e| return h.failed(e);
+        m.* = .{};
+        c.meta = m;
+        return m;
+    }
+
+    pub fn storeClosurePrototype(h: *Heap, c: *Closure, value: Value) Error!void {
+        const m = try h.ensureClosureMeta(c);
+        const old = m.prototype;
+        m.prototype = value;
+        h.barrier(&c.obj, old, value);
+    }
+
+    pub fn storeClosureProperty(h: *Heap, c: *Closure, key: *String, value: Value) Error!void {
+        const m = try h.ensureClosureMeta(c);
+        const gop = m.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
+        const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
+        if (gop.found_existing) gop.value_ptr.value = value else gop.value_ptr.* = .{ .value = value };
+        if (!gop.found_existing) h.barrier(&c.obj, null, .{ .string = key });
+        h.barrier(&c.obj, old, value);
+    }
+
+    pub fn removeClosureProperty(h: *Heap, c: *Closure, key: *String) void {
+        c.obj.checkLive();
+        const m = c.meta orelse return;
+        const index = m.props.getIndex(key) orelse return;
+        const old = m.props.values()[index];
+        m.props.orderedRemoveAt(index);
+        h.barrier(&c.obj, old.value, null);
+    }
+
+    pub fn storeClosureLexicalThis(h: *Heap, c: *Closure, this: Value) Error!void {
+        const m = try h.ensureClosureMeta(c);
+        const old = m.lexical_this;
+        m.lexical_this = this;
+        h.barrier(&c.obj, old, this);
+    }
+
     /// The write barrier: `owner` now holds `new` where it held `old` (GC_DESIGN §7). M8.1:
     /// an old owner storing a young reference joins the remembered set. It records owners,
     /// not edges, so a reference overwritten later keeps nothing alive. Never allocates.
@@ -1368,6 +1431,33 @@ pub const Heap = struct {
         return c;
     }
 
+    pub fn newBoundClosure(
+        h: *Heap,
+        target: Value,
+        bound_this: Value,
+        bound_args: []const Value,
+        name: *const String,
+        length: u16,
+    ) Error!*Closure {
+        const args_copy = h.allocator().dupe(Value, bound_args) catch |e| return h.failed(e);
+        errdefer h.allocator().free(args_copy);
+        const b = h.allocator().create(BoundClosure) catch |e| return h.failed(e);
+        errdefer h.allocator().destroy(b);
+        const charge = try h.reserve(@sizeOf(Closure), 0, 2);
+        errdefer h.bytes -= charge;
+        const c = try h.gpa.create(Closure);
+        b.* = .{
+            .target = target,
+            .bound_this = bound_this,
+            .bound_args = args_copy,
+            .name = name,
+            .length = length,
+        };
+        c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .bound = b } };
+        h.young = &c.obj;
+        return c;
+    }
+
     /// An environment record with `len` bindings, all in the TDZ.
     pub fn newEnv(h: *Heap, parent: ?*Env, scope: u32, len: usize) Error!*Env {
         const payload = std.math.mul(usize, len, @sizeOf(?Value)) catch return h.exceeded(.heap_bytes);
@@ -1450,7 +1540,7 @@ pub const Heap = struct {
             .cell => @sizeOf(Cell) + per_allocation_overhead,
             .closure => switch (@as(*const Closure, @alignCast(@fieldParentPtr("obj", obj))).impl) {
                 .vm => |v| @sizeOf(Closure) + v.captures.len * @sizeOf(*Cell) + 2 * per_allocation_overhead,
-                .tree, .promise_cap, .native_closure => @sizeOf(Closure) + 2 * per_allocation_overhead,
+                .tree, .promise_cap, .native_closure, .bound => @sizeOf(Closure) + 2 * per_allocation_overhead,
             },
             .env => @sizeOf(Env) + @as(*const Env, @alignCast(@fieldParentPtr("obj", obj))).values.len * @sizeOf(?Value) + 2 * per_allocation_overhead,
             .object => @sizeOf(Object) + per_allocation_overhead,
@@ -1473,6 +1563,11 @@ pub const Heap = struct {
             .cell => @as(*Cell, @fieldParentPtr("obj", obj)).value = null,
             .closure => {
                 const c: *Closure = @fieldParentPtr("obj", obj);
+                if (c.meta) |m| {
+                    m.props.deinit(h.allocator());
+                    h.allocator().destroy(m);
+                    c.meta = null;
+                }
                 switch (c.impl) {
                     .vm => |*v| {
                         h.gpa.free(v.captures);
@@ -1480,6 +1575,10 @@ pub const Heap = struct {
                     },
                     .tree => |*t| t.env = null,
                     .promise_cap, .native_closure => {},
+                    .bound => |b| {
+                        h.allocator().free(b.bound_args);
+                        h.allocator().destroy(b);
+                    },
                 }
             },
             .env => {
@@ -1612,12 +1711,26 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
         },
         .closure => {
             const c: *Closure = @fieldParentPtr("obj", obj);
+            if (c.meta) |m| {
+                if (m.prototype) |p| visitValue(p, ctx, visit);
+                if (m.lexical_this) |lt| visitValue(lt, ctx, visit);
+                for (m.props.keys(), m.props.values()) |k, p| {
+                    visit(ctx, &k.obj);
+                    visitValue(p.value, ctx, visit);
+                }
+            }
             switch (c.impl) {
                 // The Proto (and its string constants) is not a heap object yet; M8 roots it.
                 .vm => |v| for (v.captures) |cell| visit(ctx, &cell.obj),
                 .tree => |t| if (t.env) |e| visit(ctx, &e.obj),
                 .promise_cap => |pc| visit(ctx, &pc.promise.obj),
                 .native_closure => |nc| visit(ctx, &nc.env.obj),
+                .bound => |b| {
+                    visitValue(b.target, ctx, visit);
+                    visitValue(b.bound_this, ctx, visit);
+                    for (b.bound_args) |arg| visitValue(arg, ctx, visit);
+                    visit(ctx, @constCast(&b.name.obj));
+                },
             }
         },
         .env => {

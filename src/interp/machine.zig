@@ -170,7 +170,7 @@ const Task = union(enum) {
     // ---- Calls & barriers
     call_bind_param: struct { func: *const ast.Function, idx: u32, args_base: u32, argc: u32 },
     call_enter_body: struct { func: *const ast.Function, args_base: u32 },
-    call_return: struct { saved_env: ?*Env, saved_this: Value, has_this: bool, values_base: u32 },
+    call_return: struct { saved_env: ?*Env, saved_this: Value, has_this: bool, values_base: u32, construct_instance: ?*heap.Object = null },
     barrier: u32,
     await_suspend,
 
@@ -271,6 +271,7 @@ const Machine = struct {
             .call_return => |cr| {
                 if (cr.saved_env) |e| visit(ctx, &e.obj);
                 if (cr.has_this) heap.visitValue(cr.saved_this, ctx, visit);
+                if (cr.construct_instance) |inst| visit(ctx, &inst.obj);
             },
             else => {},
         };
@@ -466,7 +467,11 @@ const Machine = struct {
                     if (kind == .@"return") {
                         const rv = m.ret;
                         m.ret = .undefined;
-                        try m.pushVal(rv);
+                        const out_v: Value = if (cr.construct_instance) |inst|
+                            (if (rv.isObjectLike()) rv else .{ .object = inst })
+                        else
+                            rv;
+                        try m.pushVal(out_v);
                         return;
                     }
                 },
@@ -1278,14 +1283,30 @@ const Machine = struct {
             },
             .invoke_new_call => |args_base| {
                 const callee = m.values.items[args_base - 1];
-                const args = m.values.items[args_base..];
-                if (callee == .closure and callee.closure.impl == .tree) {
-                    const f: *const ast.Function = @ptrCast(@alignCast(callee.closure.impl.tree.func));
-                    if (f.is_arrow or f.is_async) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+                var target = callee;
+                if (callee == .closure and callee.closure.impl == .bound) {
+                    const b = callee.closure.impl.bound;
+                    target = b.target;
+                    if (b.bound_args.len > 0) {
+                        try m.values.insertSlice(rt.gpa, args_base, b.bound_args);
+                    }
                 }
-                const res_v = try builtins.construct(rt, callee, args);
-                m.values.shrinkRetainingCapacity(args_base - 1);
-                try m.pushVal(res_v);
+                if (!builtins.isConstructor(target)) {
+                    return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+                }
+                if (target == .native) {
+                    const res_v = try builtins.construct(rt, target, m.values.items[args_base..]);
+                    m.values.shrinkRetainingCapacity(args_base - 1);
+                    try m.pushVal(res_v);
+                    return null;
+                }
+                const tc = target.closure;
+                const t = tc.impl.tree;
+                const f: *const ast.Function = @ptrCast(@alignCast(t.func));
+                const proto_val = try object.get(rt, target, try object.named(rt, "prototype"));
+                const r = try builtins.realm(rt);
+                const instance = try rt.heap.newObject(if (proto_val == .object) proto_val.object else r.object_prototype);
+                try m.pushClosureCallSync(tc, f, t.env, .{ .object = instance }, args_base, args_base - 1, instance);
             },
 
             // ---- Calls
@@ -1328,7 +1349,8 @@ const Machine = struct {
                 m.calls -= 1;
                 m.depth -= 1;
                 m.values.shrinkRetainingCapacity(cr.values_base);
-                try m.pushVal(.undefined);
+                const out_v: Value = if (cr.construct_instance) |inst| .{ .object = inst } else .undefined;
+                try m.pushVal(out_v);
             },
 
             // ---- Patterns
@@ -1981,17 +2003,27 @@ const Machine = struct {
 
     fn evalFunction(m: *Machine, f: *const ast.Function) Error!Value {
         const rt = m.rt;
-        if (f.name) |n| {
+        const c = if (f.name) |n| blk: {
             const own = try rt.heap.newEnv(m.env, m.res.bindings[n.binding].scope, 1);
-            const c = try rt.heap.newTreeClosure(f, own);
-            rt.heap.storeEnv(own, 0, .{ .closure = c });
-            return .{ .closure = c };
+            const cl = try rt.heap.newTreeClosure(f, own);
+            rt.heap.storeEnv(own, 0, .{ .closure = cl });
+            break :blk cl;
+        } else try rt.heap.newTreeClosure(f, m.env);
+        if (f.is_arrow) {
+            if (m.this) |t| try rt.heap.storeClosureLexicalThis(c, t);
         }
-        return .{ .closure = try rt.heap.newTreeClosure(f, m.env) };
+        return .{ .closure = c };
     }
 
     fn invokeCallable(m: *Machine, callee: Value, receiver: ?Value, args_base: usize, result_base: usize) Error!void {
         const rt = m.rt;
+        if (callee == .closure and callee.closure.impl == .bound) {
+            const b = callee.closure.impl.bound;
+            if (b.bound_args.len > 0) {
+                try m.values.insertSlice(rt.gpa, args_base, b.bound_args);
+            }
+            return m.invokeCallable(b.target, b.bound_this, args_base, result_base);
+        }
         const args = m.values.items[args_base..];
         switch (callee) {
             .native => |n| {
@@ -2000,7 +2032,7 @@ const Machine = struct {
                 try m.pushVal(res_v);
             },
             .closure => |cl| {
-                const this_val: ?Value = if (receiver) |r| (if (r == .object) r else null) else null;
+                const this_val: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
                 try m.pushClosureCall(cl, this_val, args_base, result_base);
             },
             else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
@@ -2024,7 +2056,7 @@ const Machine = struct {
                 return;
             },
             .tree => |t| t,
-            .vm => return m.rt.bug("a non-tree-walker closure in the tree-walker"),
+            .vm, .bound => return m.rt.bug("a non-tree-walker closure in the tree-walker"),
         };
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
         if (f.is_async) {
@@ -2033,10 +2065,10 @@ const Machine = struct {
             try m.pushVal(p);
             return;
         }
-        return m.pushClosureCallSync(f, t.env, this, args_base, result_base);
+        return m.pushClosureCallSync(closure, f, t.env, this, args_base, result_base, null);
     }
 
-    fn pushClosureCallSync(m: *Machine, f: *const ast.Function, env: ?*Env, this: ?Value, args_base: usize, result_base: usize) Error!void {
+    fn pushClosureCallSync(m: *Machine, closure: *const heap.Closure, f: *const ast.Function, env: ?*Env, this: ?Value, args_base: usize, result_base: usize, construct_instance: ?*heap.Object) Error!void {
         if (m.calls >= m.rt.limits.max_call_depth) return m.rt.limit(.call_depth);
         try m.enter();
         m.calls += 1;
@@ -2048,10 +2080,11 @@ const Machine = struct {
             .saved_this = saved_this orelse .undefined,
             .has_this = saved_this != null,
             .values_base = @intCast(result_base),
+            .construct_instance = construct_instance,
         } });
 
         m.env = env;
-        m.this = this;
+        m.this = if (f.is_arrow) (if (closure.meta) |meta| meta.lexical_this else null) else this;
         if (m.res.functions[f.id].param_scope) |ps| {
             if (m.res.scopes[ps].len > 0) _ = try m.pushScope(ps);
         }
@@ -2073,7 +2106,7 @@ const Machine = struct {
                 return f(m.rt, nc.env, args);
             },
             .tree => |t| t,
-            .vm => return m.rt.bug("a non-tree-walker closure in the tree-walker"),
+            .vm, .bound => return m.rt.bug("a non-tree-walker closure in the tree-walker"),
         };
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
         if (f.is_async) return startAsync(m.rt, m, closure, this, args);
@@ -2087,7 +2120,7 @@ const Machine = struct {
         try m.pushTask(.{ .barrier = @intCast(values_base) });
         const args_base = m.values.items.len;
         try m.values.appendSlice(m.rt.gpa, args);
-        try m.pushClosureCallSync(f, t.env, this, args_base, values_base);
+        try m.pushClosureCallSync(closure, f, t.env, this, args_base, values_base, null);
         // Run until `.barrier` is reached (either via normal return from `call_return`
         // or via `unwind` hitting `.barrier`).
         _ = try m.runLoop(stop_len);
@@ -2133,7 +2166,7 @@ const Machine = struct {
         const t = ctx.closure.impl.tree;
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
         try m_ptr.values.appendSlice(rt.gpa, ctx.args);
-        try m_ptr.pushClosureCallSync(f, t.env, ctx.this, 0, 0);
+        try m_ptr.pushClosureCallSync(ctx.closure, f, t.env, ctx.this, 0, 0, null);
         co.engine = m_ptr;
         co.state = .running;
         return runCoroMachine(m_ptr, ctx.caller.calls, ctx.caller.depth, .start);
@@ -2405,7 +2438,16 @@ fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []c
                 try object.define(rt, dst, k, v);
             }
         },
-        .undefined, .null, .boolean, .number, .native, .closure => {},
+        .closure => |c| {
+            const keys = try object.ownKeysClosure(rt, c);
+            defer rt.gpa.free(keys);
+            for (keys) |k| {
+                if (keyIn(k, excluded)) continue;
+                const v = try object.get(rt, src, k);
+                try object.define(rt, dst, k, v);
+            }
+        },
+        .undefined, .null, .boolean, .number, .native => {},
     }
 }
 

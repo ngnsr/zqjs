@@ -455,7 +455,11 @@ const Resolver = struct {
                 .cover_init => unreachable,
             },
             .array => |items| for (items) |item| try r.expr(item),
-            .this => if (r.current().is_arrow) return r.fail(.{ .unsupported = .arrow_this }, e.span),
+            .this => {
+                for (r.fns.items[1..]) |fn_state| {
+                    if (!fn_state.is_arrow) break;
+                } else return r.fail(.{ .unsupported = .sloppy_this }, e.span);
+            },
             .await => |inner| try r.expr(inner),
             .call, .new_call => |c| {
                 try r.expr(c.callee);

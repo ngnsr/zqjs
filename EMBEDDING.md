@@ -216,7 +216,7 @@ Every C ABI function returns `zqjs_status` rather than panicking or unwinding ac
 
 #### Opaque Types, Destruction & Invalidation Semantics
 - **`zqjs_runtime`:** created with `zqjs_runtime_create(opts, &rt)` (`opts == NULL` uses `zqjs_options_default()`); destroyed with `zqjs_runtime_destroy(rt)`. Destroying `rt` invalidates all remaining child `zqjs_program`s, `zqjs_execution`s, and `zqjs_handle`s owned by `rt`.
-- **`zqjs_program`:** compiled with `zqjs_runtime_compile(...)`; destroyed with `zqjs_program_destroy(prog)`. Destroying `prog` invalidates `prog` immediately (`ZQJS_ERR_INVALID_STATE` on reuse), while any active `zqjs_execution`s keep the underlying compiled bytecode alive until they or `rt` are destroyed. Keep `prog` alive while closures compiled in it may still be invoked via `zqjs_runtime_call`.
+- **`zqjs_program`:** compiled with `zqjs_runtime_compile(...)`; destroyed with `zqjs_program_destroy(prog)`. Destroying `prog` invalidates `prog` immediately (`ZQJS_ERR_INVALID_STATE` on reuse), while any active `zqjs_execution`s keep the underlying compiled bytecode alive until they or `rt` are destroyed. Keep `prog` alive while closures compiled in it may still be invoked via `zqjs_runtime_call`, and while async calls started from it are still pending (settling the promise they await resumes the program's code).
 - **`zqjs_execution`:** created with `zqjs_runtime_start(rt, prog, &exec)`, stepped via `zqjs_execution_resume(exec, steps, &fail)` (`ZQJS_STATUS_SUSPENDED` or `ZQJS_STATUS_FINISHED`), and freed with `zqjs_execution_destroy(exec)`.
 - **`*_destroy(NULL)`** is a no-op returning `ZQJS_OK`; destroying an already-destroyed wrapper returns `ZQJS_ERR_INVALID_STATE`.
 

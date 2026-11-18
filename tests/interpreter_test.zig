@@ -914,3 +914,185 @@ test "M28a: native->JS->native->JS chain throws across barrier with exact step c
     try testing.expectError(error.LimitExceeded, zqjs.interpret(&rt2, script, res));
     try testing.expectEqual(zqjs.Limit.steps, rt2.limitHit().?);
 }
+
+const CountingAllocator = struct {
+    child: Allocator,
+    live_bytes: usize = 0,
+
+    fn allocator(self: *CountingAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live_bytes += len;
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(buf, alignment, new_len, ret_addr)) return false;
+        self.live_bytes = self.live_bytes - buf.len + new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawRemap(buf, alignment, new_len, ret_addr) orelse return null;
+        self.live_bytes = self.live_bytes - buf.len + new_len;
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(buf, alignment, ret_addr);
+        self.live_bytes -= buf.len;
+    }
+};
+
+fn findSuspendedCoroutine(h: *const zqjs.heap.Heap) ?*zqjs.heap.Coroutine {
+    var cur = h.young;
+    while (cur) |obj| : (cur = obj.next) {
+        if (obj.kind == .coroutine) {
+            const co: *zqjs.heap.Coroutine = @fieldParentPtr("obj", obj);
+            if (co.state == .suspended) return co;
+        }
+    }
+    cur = h.old;
+    while (cur) |obj| : (cur = obj.next) {
+        if (obj.kind == .coroutine) {
+            const co: *zqjs.heap.Coroutine = @fieldParentPtr("obj", obj);
+            if (co.state == .suspended) return co;
+        }
+    }
+    return null;
+}
+
+test "M28b Machine: suspended coroutine ownedBytes matches counting allocator and charge" {
+    var counter: CountingAllocator = .{ .child = testing.allocator };
+    const alloc = counter.allocator();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: Diagnostic = .{};
+    const src =
+        \\async function hang(a, b) {
+        \\    let x = a + b;
+        \\    let y = x * 2;
+        \\    await new Promise(() => {});
+        \\    return y;
+        \\}
+        \\const p = hang(3, 4);
+    ;
+    const script = try zqjs.parse(arena.allocator(), src, .{}, &d);
+    const res = try zqjs.resolve(arena.allocator(), script, &d);
+
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var rt = Runtime.init(alloc, .{}, &discard.writer);
+    defer rt.deinit();
+    try zqjs.interpret(&rt, script, res);
+
+    const co = findSuspendedCoroutine(&rt.heap) orelse return error.TestUnexpectedResult;
+    const reported = co.vtable.ownedBytes(co.engine.?);
+    try testing.expectEqual(reported, co.charge);
+
+    const before = counter.live_bytes;
+    co.vtable.destroy(co.engine.?);
+    co.engine = null;
+    const freed = before - counter.live_bytes;
+    try testing.expectEqual(reported, freed);
+}
+
+test "M28b: LimitExceeded(steps) inside coroutine and during resume (both engines)" {
+    const inside_src =
+        \\async function spin() {
+        \\    let i = 0;
+        \\    while (true) { i++; }
+        \\}
+        \\spin();
+    ;
+    const resume_src =
+        \\async function spinAfter() {
+        \\    await 1;
+        \\    let i = 0;
+        \\    while (true) { i++; }
+        \\}
+        \\spinAfter();
+    ;
+    for ([_][]const u8{ inside_src, resume_src }) |src| {
+        for (support.engines) |engine| {
+            var r = try support.run(testing.allocator, src, .{ .max_steps = 200 }, engine, .normal);
+            defer r.deinit(testing.allocator);
+            try testing.expect(std.mem.indexOf(u8, r.err, "LimitExceeded(steps)") != null);
+        }
+    }
+}
+
+test "M28b: max_heap_bytes reached by many pending async calls with no leak (both engines)" {
+    const src =
+        \\const ps = [];
+        \\async function hang(i) {
+        \\    let x = i + 1;
+        \\    await new Promise(() => {});
+        \\    return x;
+        \\}
+        \\for (let i = 0; i < 500; i++) {
+        \\    ps.push(hang(i));
+        \\}
+    ;
+    for (support.engines) |engine| {
+        var dbg: support.ProgramAllocator = .init;
+        defer support.endProgram(&dbg);
+        var r = try support.run(dbg.allocator(), src, .{ .max_heap_bytes = 64 * 1024 }, engine, .normal);
+        defer r.deinit(dbg.allocator());
+        try testing.expect(std.mem.indexOf(u8, r.err, "LimitExceeded(heap_bytes)") != null);
+    }
+}
+
+test "M28b: async recursion hits call_depth limit on both engines" {
+    const src =
+        \\async function f(n) { return f(n + 1); }
+        \\f(0);
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{ .max_call_depth = 16 }, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expect(std.mem.indexOf(u8, r.err, "LimitExceeded(call_depth)") != null);
+    }
+}
+
+test "M28b Machine: checkAllAllocationFailures over async program" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: Diagnostic = .{};
+    const src =
+        \\async function add1(x) {
+        \\    return await Promise.resolve(x + 1);
+        \\}
+        \\add1(41).then(v => print(v));
+    ;
+    const script = try zqjs.parse(arena.allocator(), src, .{}, &d);
+    const res = try zqjs.resolve(arena.allocator(), script, &d);
+
+    const Ctx = struct {
+        script: zqjs.ast.Script,
+        res: zqjs.Resolution,
+
+        fn runOnce(alloc: Allocator, ctx: @This()) !void {
+            var discard: std.Io.Writer.Discarding = .init(&.{});
+            var rt = Runtime.init(alloc, .{}, &discard.writer);
+            defer rt.deinit();
+            try zqjs.interpret(&rt, ctx.script, ctx.res);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing.allocator, Ctx.runOnce, .{Ctx{ .script = script, .res = res }});
+}

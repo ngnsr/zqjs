@@ -220,9 +220,9 @@ const Dumper = struct {
     fn function(d: Dumper, f: *const ast.Function) Error!void {
         const w = d.w;
         if (f.is_arrow) {
-            try w.writeAll("(arrow (");
+            try w.writeAll(if (f.is_async) "(async-arrow (" else "(arrow (");
         } else {
-            try w.writeAll("(function ");
+            try w.writeAll(if (f.is_async) "(async-function " else "(function ");
             if (f.name) |n| try d.binding(n) else try w.writeByte('_');
             try w.writeAll(" (");
         }
@@ -426,6 +426,11 @@ const Dumper = struct {
             },
             .function => |f| try d.function(f),
             .this => try w.writeAll("this"),
+            .await => |inner| {
+                try w.writeAll("(await ");
+                try d.expr(inner);
+                try w.writeByte(')');
+            },
             .member => |m| try d.member(m),
             .optional_chain => |oc| try d.optionalChain(oc),
             .delete => |m| {

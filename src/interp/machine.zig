@@ -32,6 +32,7 @@ const Error = rt_mod.Error;
 const ops = @import("../runtime/ops.zig");
 const object = @import("../runtime/object.zig");
 const builtins = @import("../runtime/builtins.zig");
+const coroutine = @import("../runtime/coroutine.zig");
 
 /// Runs a resolved script. On error.Thrown, `rt.exception` or `rt.thrown_value`
 /// describes the exception.
@@ -52,12 +53,15 @@ fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUs
         u.* = .{ .depth = m.max_depth, .bytes = m.stack_top - m.lowest_frame };
     };
     defer m.deinit();
+    const prev_roots = rt.engine_roots;
+    rt.engine_roots = m.roots();
+    defer rt.engine_roots = prev_roots;
     const prev_caller = rt.closure_caller;
     rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin };
     defer rt.closure_caller = prev_caller;
 
     try m.pushBlock(script.statements);
-    try m.runLoop(0);
+    _ = try m.runLoop(0);
     try rt.drainMicrotasks();
 }
 
@@ -168,6 +172,7 @@ const Task = union(enum) {
     call_enter_body: struct { func: *const ast.Function, args_base: u32 },
     call_return: struct { saved_env: ?*Env, saved_this: Value, has_this: bool, values_base: u32 },
     barrier: u32,
+    await_suspend,
 
     // ---- Patterns
     bind_pattern: struct { pat: *const ast.Pattern, mode: BindMode },
@@ -198,6 +203,8 @@ const Machine = struct {
     calls: u32 = 0,
     ret: Value = .undefined,
     this: ?Value = null,
+    is_coroutine: bool = false,
+    awaited: Value = .undefined,
     tasks: std.ArrayList(Task) = .empty,
     values: std.ArrayList(Value) = .empty,
     stack_top: usize = 0,
@@ -224,32 +231,46 @@ const Machine = struct {
     fn safepoint(m: *Machine) void {
         const h = &m.rt.heap;
         if (!h.collect_requested and !h.collect_always) return;
-        m.rt.engine_roots = .{ .ctx = m, .mark = markRoots };
+        if (!m.is_coroutine) m.rt.engine_roots = .{ .ctx = m, .mark = markRoots };
         m.rt.collect();
     }
 
+    fn roots(m: *Machine) rt_mod.EngineRoots {
+        return .{ .ctx = m, .mark = markRoots };
+    }
+
     fn markRoots(ctx: *anyopaque, h: *heap.Heap) void {
-        const m: *Machine = @ptrCast(@alignCast(ctx));
-        for (m.values.items) |v| h.markValue(v);
-        if (m.env) |e| h.markObj(&e.obj);
-        if (m.this) |t| h.markValue(t);
-        h.markValue(m.ret);
+        const m: *const Machine = @ptrCast(@alignCast(ctx));
+        const mark_obj = struct {
+            fn call(hh: *heap.Heap, o: *heap.Obj) void {
+                hh.markObj(o);
+            }
+        }.call;
+        visitRoots(m, h, mark_obj);
+    }
+
+    fn visitRoots(m: *const Machine, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *heap.Obj) void) void {
+        for (m.values.items) |v| heap.visitValue(v, ctx, visit);
+        if (m.env) |e| visit(ctx, &e.obj);
+        if (m.this) |t| heap.visitValue(t, ctx, visit);
+        heap.visitValue(m.ret, ctx, visit);
+        heap.visitValue(m.awaited, ctx, visit);
         for (m.tasks.items) |t| switch (t) {
-            .scope_exit, .scope_exit_depth => |e| if (e) |rec| h.markObj(&rec.obj),
-            .for_of_iter => |f| h.markObj(&f.iter.obj),
-            .try_catch => |tc| if (tc.saved_env) |e| h.markObj(&e.obj),
-            .try_finally => |tf| if (tf.saved_env) |e| h.markObj(&e.obj),
+            .scope_exit, .scope_exit_depth => |e| if (e) |rec| visit(ctx, &rec.obj),
+            .for_of_iter => |f| visit(ctx, &f.iter.obj),
+            .try_catch => |tc| if (tc.saved_env) |e| visit(ctx, &e.obj),
+            .try_finally => |tf| if (tf.saved_env) |e| visit(ctx, &e.obj),
             .finally_resume => |p| switch (p) {
-                .@"return" => |v| h.markValue(v),
-                .throw => |v| h.markValue(v),
+                .@"return" => |v| heap.visitValue(v, ctx, visit),
+                .throw => |v| heap.visitValue(v, ctx, visit),
                 else => {},
             },
-            .assign_member_plain_finish_key => |k| if (k == .atom) h.markObj(@constCast(&k.atom.obj)),
-            .assign_member_compound_finish => |c| if (c.key == .atom) h.markObj(@constCast(&c.key.atom.obj)),
-            .object_prop_val => |o| if (o.key == .atom) h.markObj(@constCast(&o.key.atom.obj)),
+            .assign_member_plain_finish_key => |k| if (k == .atom) visit(ctx, @constCast(&k.atom.obj)),
+            .assign_member_compound_finish => |c| if (c.key == .atom) visit(ctx, @constCast(&c.key.atom.obj)),
+            .object_prop_val => |o| if (o.key == .atom) visit(ctx, @constCast(&o.key.atom.obj)),
             .call_return => |cr| {
-                if (cr.saved_env) |e| h.markObj(&e.obj);
-                if (cr.has_this) h.markValue(cr.saved_this);
+                if (cr.saved_env) |e| visit(ctx, &e.obj);
+                if (cr.has_this) heap.visitValue(cr.saved_this, ctx, visit);
             },
             else => {},
         };
@@ -373,10 +394,18 @@ const Machine = struct {
 
     // ---- Main run loop & unwinding
 
-    fn runLoop(m: *Machine, stop_len: usize) Error!void {
+    fn runLoop(m: *Machine, stop_len: usize) Error!bool {
         while (m.tasks.items.len > stop_len) {
             const task = m.tasks.pop().?;
-            if (task == .barrier) return;
+            switch (task) {
+                .barrier => return false,
+                .await_suspend => {
+                    m.awaited = m.popVal();
+                    m.depth -= 1;
+                    return true;
+                },
+                else => {},
+            }
             const maybe_unwind = m.stepTask(task) catch |err| switch (err) {
                 error.Thrown => UnwindKind.throw,
                 else => return err,
@@ -385,6 +414,7 @@ const Machine = struct {
                 try m.unwind(kind, stop_len);
             }
         }
+        return false;
     }
 
     fn unwind(m: *Machine, kind: UnwindKind, stop_len: usize) Error!void {
@@ -615,7 +645,7 @@ const Machine = struct {
                 m.depth -= 1;
             },
             .pop_value => _ = m.popVal(),
-            .barrier => unreachable, // handled in runLoop
+            .barrier, .await_suspend => unreachable, // handled in runLoop
             .exec => |s| return m.execStmt(s),
             .stmt_list => |sl| {
                 if (sl.idx + 1 < sl.stmts.len) {
@@ -1251,7 +1281,7 @@ const Machine = struct {
                 const args = m.values.items[args_base..];
                 if (callee == .closure and callee.closure.impl == .tree) {
                     const f: *const ast.Function = @ptrCast(@alignCast(callee.closure.impl.tree.func));
-                    if (f.is_arrow) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+                    if (f.is_arrow or f.is_async) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
                 }
                 const res_v = try builtins.construct(rt, callee, args);
                 m.values.shrinkRetainingCapacity(args_base - 1);
@@ -1789,6 +1819,10 @@ const Machine = struct {
                 m.depth -= 1;
                 try m.pushVal(try m.evalFunction(f));
             },
+            .await => |inner| {
+                try m.pushTask(.await_suspend);
+                try m.pushEval(inner);
+            },
             .template => |t| {
                 const first: Value = .{ .string = try rt.heap.newString(&.{.{ .utf16 = t.quasis[0] }}) };
                 try m.pushVal(first);
@@ -1989,6 +2023,16 @@ const Machine = struct {
             .vm => return m.rt.bug("a non-tree-walker closure in the tree-walker"),
         };
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
+        if (f.is_async) {
+            const p = try startAsync(m.rt, m, closure, this, m.values.items[args_base..]);
+            m.values.shrinkRetainingCapacity(result_base);
+            try m.pushVal(p);
+            return;
+        }
+        return m.pushClosureCallSync(f, t.env, this, args_base, result_base);
+    }
+
+    fn pushClosureCallSync(m: *Machine, f: *const ast.Function, env: ?*Env, this: ?Value, args_base: usize, result_base: usize) Error!void {
         if (m.calls >= m.rt.limits.max_call_depth) return m.rt.limit(.call_depth);
         try m.enter();
         m.calls += 1;
@@ -2002,7 +2046,7 @@ const Machine = struct {
             .values_base = @intCast(result_base),
         } });
 
-        m.env = t.env;
+        m.env = env;
         m.this = this;
         if (m.res.functions[f.id].param_scope) |ps| {
             if (m.res.scopes[ps].len > 0) _ = try m.pushScope(ps);
@@ -2018,15 +2062,18 @@ const Machine = struct {
     fn callFromBuiltin(ctx: *anyopaque, closure: *const heap.Closure, this: ?Value, args: []const Value) Error!Value {
         const m: *Machine = @ptrCast(@alignCast(ctx));
         closure.obj.checkLive();
-        switch (closure.impl) {
+        const t = switch (closure.impl) {
             .promise_cap => |pc| return builtins.callPromiseCapability(m.rt, pc.promise, pc.is_reject, args),
             .native_closure => |nc| {
                 const f: *const fn (*Runtime, *heap.Object, []const Value) Error!Value = @ptrCast(@alignCast(nc.func));
                 return f(m.rt, nc.env, args);
             },
-            .tree => {},
+            .tree => |t| t,
             .vm => return m.rt.bug("a non-tree-walker closure in the tree-walker"),
-        }
+        };
+        const f: *const ast.Function = @ptrCast(@alignCast(t.func));
+        if (f.is_async) return startAsync(m.rt, m, closure, this, args);
+
         const values_base = m.values.items.len;
         const stop_len = m.tasks.items.len;
         errdefer {
@@ -2036,12 +2083,147 @@ const Machine = struct {
         try m.pushTask(.{ .barrier = @intCast(values_base) });
         const args_base = m.values.items.len;
         try m.values.appendSlice(m.rt.gpa, args);
-        try m.pushClosureCall(closure, this, args_base, values_base);
+        try m.pushClosureCallSync(f, t.env, this, args_base, values_base);
         // Run until `.barrier` is reached (either via normal return from `call_return`
         // or via `unwind` hitting `.barrier`).
-        try m.runLoop(stop_len);
+        _ = try m.runLoop(stop_len);
         return m.popVal();
     }
+
+    const StartAsyncCtx = struct {
+        rt: *Runtime,
+        caller: *Machine,
+        closure: *const heap.Closure,
+        this: ?Value,
+        args: []const Value,
+    };
+
+    const CoroAction = union(enum) {
+        start,
+        @"resume": struct { val: Value, rejected: bool },
+    };
+
+    fn startAsync(rt: *Runtime, caller: *Machine, closure: *const heap.Closure, this: ?Value, args: []const Value) Error!Value {
+        const ctx: StartAsyncCtx = .{ .rt = rt, .caller = caller, .closure = closure, .this = this, .args = args };
+        return coroutine.start(rt, &coro_vtable, ctx, createAndRunCoro);
+    }
+
+    fn createAndRunCoro(ctx: StartAsyncCtx, co: *heap.Coroutine) Error!coroutine.Outcome {
+        const rt = ctx.rt;
+        const m_ptr = try rt.gpa.create(Machine);
+        m_ptr.* = .{
+            .rt = rt,
+            .res = ctx.caller.res,
+            .is_coroutine = true,
+            .calls = ctx.caller.calls,
+            .depth = ctx.caller.depth,
+            .stack_top = if (builtin.is_test) @frameAddress() else 0,
+            .lowest_frame = if (builtin.is_test) @frameAddress() else 0,
+        };
+        errdefer {
+            if (co.engine == null) {
+                m_ptr.deinit();
+                rt.gpa.destroy(m_ptr);
+            }
+        }
+        const t = ctx.closure.impl.tree;
+        const f: *const ast.Function = @ptrCast(@alignCast(t.func));
+        try m_ptr.values.appendSlice(rt.gpa, ctx.args);
+        try m_ptr.pushClosureCallSync(f, t.env, ctx.this, 0, 0);
+        co.engine = m_ptr;
+        co.state = .running;
+        return runCoroMachine(m_ptr, ctx.caller.calls, ctx.caller.depth, .start);
+    }
+
+    fn runCoroMachine(m: *Machine, caller_calls: u32, caller_depth: u32, action: CoroAction) Error!coroutine.Outcome {
+        const rt = m.rt;
+        const prev_caller = rt.closure_caller;
+        rt.closure_caller = .{ .ctx = m, .call = Machine.callFromBuiltin };
+        defer rt.closure_caller = prev_caller;
+
+        try rt.addRoots(m.roots());
+        defer rt.removeRoots(m);
+
+        switch (action) {
+            .start => {},
+            .@"resume" => |res| {
+                m.awaited = .undefined;
+                if (res.rejected) {
+                    _ = rt.throwValue(res.val) catch {};
+                    m.unwind(.throw, 0) catch |ue| {
+                        if (ue == error.Thrown) return .threw;
+                        return ue;
+                    };
+                } else {
+                    try m.pushVal(res.val);
+                }
+            },
+        }
+
+        const awaiting = m.runLoop(0) catch |e| {
+            if (e == error.Thrown) return .threw;
+            return e;
+        };
+        if (awaiting) {
+            m.calls -= caller_calls;
+            m.depth -= caller_depth;
+            return .{ .awaiting = m.awaited };
+        }
+        return .{ .returned = m.popVal() };
+    }
+
+    fn coroResume(eng: *anyopaque, val: Value, rejected: bool) Error!coroutine.Outcome {
+        const m: *Machine = @ptrCast(@alignCast(eng));
+        return runCoroMachine(m, 0, 0, .{ .@"resume" = .{ .val = val, .rejected = rejected } });
+    }
+
+    fn coroTrace(eng: *anyopaque, visit_ctx: *anyopaque, visit: *const fn (*anyopaque, *heap.Obj) void) void {
+        const m: *const Machine = @ptrCast(@alignCast(eng));
+        const Ctx = struct { ctx: *anyopaque, visit: *const fn (*anyopaque, *heap.Obj) void };
+        const thunk = struct {
+            fn call(c: Ctx, o: *heap.Obj) void {
+                c.visit(c.ctx, o);
+            }
+        }.call;
+        visitRoots(m, Ctx{ .ctx = visit_ctx, .visit = visit }, thunk);
+    }
+
+    pub fn ownedBytes(m: *const Machine) usize {
+        return @sizeOf(Machine) +
+            m.tasks.capacity * @sizeOf(Task) +
+            m.values.capacity * @sizeOf(Value);
+    }
+
+    fn coroOwnedBytes(eng: *anyopaque) usize {
+        const m: *const Machine = @ptrCast(@alignCast(eng));
+        return m.ownedBytes();
+    }
+
+    pub fn shrink(m: *Machine) void {
+        const gpa = m.rt.gpa;
+        m.tasks.shrinkAndFree(gpa, m.tasks.items.len);
+        m.values.shrinkAndFree(gpa, m.values.items.len);
+    }
+
+    fn coroShrink(eng: *anyopaque) void {
+        const m: *Machine = @ptrCast(@alignCast(eng));
+        m.shrink();
+    }
+
+    fn coroDestroy(eng: *anyopaque) void {
+        const m: *Machine = @ptrCast(@alignCast(eng));
+        const gpa = m.rt.gpa;
+        m.deinit();
+        gpa.destroy(m);
+    }
+
+    const coro_vtable: heap.CoroutineVTable = .{
+        .trace = coroTrace,
+        .ownedBytes = coroOwnedBytes,
+        .shrink = coroShrink,
+        .destroy = coroDestroy,
+        .@"resume" = &coroResume,
+    };
 
     fn stepBindPattern(m: *Machine, pat: *const ast.Pattern, val: Value, mode: BindMode) Error!void {
         const rt = m.rt;

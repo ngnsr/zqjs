@@ -1069,6 +1069,12 @@ JS). Deferred: async generators, `for await`, top-level `await`, unhandled-rejec
    `async function f() { try { return await Promise.resolve(1); } finally { cleanup(); } }`
    (D55 × D56: the pending `return` record survives a suspension inside `finally`'s region).
 
+**Clarification (M28b review, 2026-11-18).** A suspended coroutine's trace marks the VM's live
+state exactly as `Vm.markRoots` does *except* the Proto's constants: those belong to the program
+(`protoRoots`) or the script VM running it, and a coroutine can outlive a destroyed `Program`, so
+its trace must never read the Proto. Resuming such a coroutine is the same host bug as calling a
+closure of a destroyed program (EMBEDDING.md); merely collecting is safe.
+
 ## D57. Host-side promises *(M29; approved conceptually 2026-11-18)*
 For a game host, the point of `async` is `await host.waitFrames(3)` or `await host.load(…)`:
 JS awaits a promise that the **host** settles later, from its own loop. So the embedding API

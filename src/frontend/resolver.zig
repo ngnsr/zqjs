@@ -456,6 +456,7 @@ const Resolver = struct {
             },
             .array => |items| for (items) |item| try r.expr(item),
             .this => if (r.current().is_arrow) return r.fail(.{ .unsupported = .arrow_this }, e.span),
+            .await => |inner| try r.expr(inner),
             .call, .new_call => |c| {
                 try r.expr(c.callee);
                 for (c.args) |arg| try r.expr(arg);

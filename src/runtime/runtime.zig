@@ -75,11 +75,12 @@ pub const ValueRoots = struct {
 
 /// Queued Promise reaction or adoption microtask (M18).
 pub const Microtask = struct {
-    kind: enum { reaction, adopt, resolve_promise },
+    kind: enum { reaction, adopt, resolve_promise, await_resume },
     child: ?*heap_mod.Object = null,
     cb: Value = .undefined,
     arg: Value = .undefined,
     adopt_rejected: bool = false,
+    coroutine: ?*heap_mod.Coroutine = null,
 };
 
 /// A host native call in flight (M9.1, D53): the engine's record of the crossing —
@@ -227,6 +228,8 @@ pub const Runtime = struct {
     /// Pending microtasks drained at the outermost turn checkpoint (M18).
     microtasks: std.ArrayList(Microtask) = .empty,
     microtask_head: usize = 0,
+    /// Currently executing microtask job (traced by markRoots, D56 invariant 2).
+    active_job: ?Microtask = null,
     /// More root sets, marked by every collection (M9.0): the embedding API registers each
     /// live program (its constants) and execution (its VM, suspended or not) here.
     extra_roots: std.ArrayList(EngineRoots) = .empty,
@@ -408,12 +411,16 @@ pub const Runtime = struct {
         // inside a native callback keeps a suspended VM's stacks and everything they
         // reference. Empty outside a chain.
         for (rt.exec_ctx.vms.items) |e| e.mark(e.ctx, h);
-        for (rt.microtasks.items[rt.microtask_head..]) |mt| {
-            if (mt.child) |ch| h.markObj(&ch.obj);
-            h.markValue(mt.cb);
-            h.markValue(mt.arg);
-        }
+        for (rt.microtasks.items[rt.microtask_head..]) |mt| markMicrotask(h, mt);
+        if (rt.active_job) |mt| markMicrotask(h, mt);
         rt.handles.mark(h); // host handles (M9.1, D50): slots with a reference
+    }
+
+    fn markMicrotask(h: *Heap, mt: Microtask) void {
+        if (mt.child) |ch| h.markObj(&ch.obj);
+        if (mt.coroutine) |co| h.markObj(&co.obj);
+        h.markValue(mt.cb);
+        h.markValue(mt.arg);
     }
 
     /// Adds a root set every collection marks, until `removeRoots` (M9.0).
@@ -460,41 +467,48 @@ pub const Runtime = struct {
         while (rt.microtask_head < rt.microtasks.items.len) {
             const job = rt.microtasks.items[rt.microtask_head];
             rt.microtask_head += 1;
-
-            const child_val: Value = if (job.child) |ch| .{ .object = ch } else .undefined;
-            var root_buf = [_]Value{ child_val, job.cb, job.arg };
-            var roots: ValueRoots = .{ .values = &root_buf };
-            try roots.register(rt);
-            defer roots.unregister(rt);
-
-            switch (job.kind) {
-                .adopt => {
-                    if (job.child) |ch| {
-                        try builtins_mod.settlePromiseFromJob(rt, ch, job.adopt_rejected, job.arg);
-                    }
-                },
-                .resolve_promise => {
-                    if (job.child) |ch| {
-                        try builtins_mod.adoptPromiseNow(rt, ch, job.arg.object);
-                    }
-                },
-                .reaction => {
-                    if (job.cb == .native or job.cb == .closure) {
-                        if (rt.callCallable(job.cb, .undefined, &.{job.arg})) |ret| {
-                            if (job.child) |ch| try builtins_mod.resolvePromiseValue(rt, ch, ret);
-                        } else |e| {
-                            if (e != error.Thrown) return e;
-                            const err_val = try rt.catchValue();
-                            if (job.child) |ch| try builtins_mod.settlePromiseFromJob(rt, ch, true, err_val);
-                        }
-                    } else if (job.child) |ch| {
-                        try builtins_mod.settlePromiseFromJob(rt, ch, job.adopt_rejected, job.arg);
-                    }
-                },
-            }
+            try rt.runMicrotask(job);
         }
         rt.microtasks.clearRetainingCapacity();
         rt.microtask_head = 0;
+    }
+
+    fn runMicrotask(rt: *Runtime, job: Microtask) Error!void {
+        // Restore, not clear: a host call inside a job may drain a nested checkpoint (D57).
+        const prev = rt.active_job;
+        rt.active_job = job;
+        defer rt.active_job = prev;
+
+        switch (job.kind) {
+            .adopt => {
+                if (job.child) |ch| {
+                    try builtins_mod.settlePromiseFromJob(rt, ch, job.adopt_rejected, job.arg);
+                }
+            },
+            .resolve_promise => {
+                if (job.child) |ch| {
+                    try builtins_mod.adoptPromiseNow(rt, ch, job.arg.object);
+                }
+            },
+            .reaction => {
+                if (job.cb == .native or job.cb == .closure) {
+                    if (rt.callCallable(job.cb, .undefined, &.{job.arg})) |ret| {
+                        if (job.child) |ch| try builtins_mod.resolvePromiseValue(rt, ch, ret);
+                    } else |e| {
+                        if (e != error.Thrown) return e;
+                        const err_val = try rt.catchValue();
+                        if (job.child) |ch| try builtins_mod.settlePromiseFromJob(rt, ch, true, err_val);
+                    }
+                } else if (job.child) |ch| {
+                    try builtins_mod.settlePromiseFromJob(rt, ch, job.adopt_rejected, job.arg);
+                }
+            },
+            .await_resume => {
+                if (job.coroutine) |co| {
+                    try @import("coroutine.zig").resumeCoroutine(rt, co, job.arg, job.adopt_rejected);
+                }
+            },
+        }
     }
 
     pub fn limitHit(rt: *const Runtime) ?Limit {

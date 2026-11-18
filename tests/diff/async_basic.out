@@ -1,0 +1,7 @@
+new: TypeError
+method: 123
+map: 10,20,30
+nonPromise: 42:ok:undefined
+settled: 30
+arrows: 11,7,99,7,15
+fact: 120

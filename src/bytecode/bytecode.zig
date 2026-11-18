@@ -215,6 +215,8 @@ pub const Op = enum(u8) {
     @"return",
     /// End of the script. The stack must be empty. Script proto only.
     halt,
+    /// [val] → [resumed_val]: suspend the async coroutine awaiting `val` (D56).
+    await,
 
     pub const Info = struct {
         operands: []const Operand,
@@ -289,6 +291,7 @@ pub const Op = enum(u8) {
             .iter_next => .{ .operands = &.{}, .pops = 1, .pushes = 2 },
             .call, .new_call => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
             .halt => .{ .operands = &.{}, .pops = 0, .pushes = 0 },
+            .await => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
         };
     }
@@ -343,6 +346,7 @@ pub fn readU32(code: []const u8, pos: usize) u32 {
 pub const Proto = struct {
     kind: enum { script, function } = .script,
     is_arrow: bool = false,
+    is_async: bool = false,
     /// The function's name, for listings and traces ("" if anonymous or the script).
     name: []const u8 = "",
     code: []const u8,

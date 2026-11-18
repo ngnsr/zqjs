@@ -255,6 +255,8 @@ pub const Expr = struct {
         delete_optional: OptionalChain,
         /// `this`, only inside functions (at script level: Unsupported).
         this,
+        /// `await operand` inside an async function body (M28).
+        await: *const Expr,
         /// `function [name](params) { body }` as an expression.
         function: *const Function,
     };
@@ -275,6 +277,7 @@ pub const Function = struct {
     id: u32,
     kind: enum { declaration, expression },
     is_arrow: bool = false,
+    is_async: bool = false,
     /// Required for declarations (bound in the enclosing scope); optional for
     /// expressions (bound only inside the function, DESIGN_DECISIONS D36).
     name: ?Declarator,

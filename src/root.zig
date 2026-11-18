@@ -7,6 +7,7 @@ pub const Feature = @import("frontend/diag.zig").Feature;
 pub const Limits = @import("limits.zig").Limits;
 pub const Limit = @import("limits.zig").Limit;
 pub const limits = @import("limits.zig");
+pub const regex = @import("regex.zig");
 pub const parse = @import("frontend/parser.zig").parse;
 pub const resolve = @import("frontend/resolver.zig").resolve;
 pub const Resolution = @import("frontend/resolver.zig").Resolution;

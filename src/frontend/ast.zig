@@ -222,6 +222,8 @@ pub const Expr = struct {
         number: f64,
         /// UTF-16 code units, possibly containing lone surrogates (DESIGN_DECISIONS D6).
         string: []const u16,
+        /// `/pattern/flags` literal (M30, D61).
+        regexp: struct { pattern: []const u16, flags: []const u8 },
         template: Template,
         boolean: bool,
         null,

@@ -16,6 +16,7 @@ const diag_mod = @import("diag.zig");
 const Diagnostic = diag_mod.Diagnostic;
 const Feature = diag_mod.Feature;
 const Limits = @import("../limits.zig").Limits;
+const regex = @import("../regex.zig");
 
 pub const Error = error{ SyntaxError, Unsupported, LimitExceeded, OutOfMemory };
 
@@ -405,7 +406,7 @@ const Parser = struct {
             try p.advance();
         } else {
             const certain = switch (p.tok.tag) {
-                .r_paren, .r_bracket, .comma, .colon, .eq, .star, .star_star, .percent, .eq3, .neq3, .eq2, .neq2, .lt, .le, .gt, .ge, .amp_amp, .pipe_pipe, .question2, .question, .question_dot, .arrow, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .star_star_eq, .shl_eq, .shr_eq, .ushr_eq, .amp_eq, .pipe_eq, .caret_eq, .amp_amp_eq, .pipe_pipe_eq, .question2_eq => true,
+                .r_paren, .r_bracket, .comma, .colon, .eq, .star, .star_star, .percent, .eq3, .neq3, .eq2, .neq2, .lt, .le, .gt, .ge, .amp_amp, .pipe_pipe, .question2, .question, .question_dot, .arrow, .plus_eq, .minus_eq, .star_eq, .percent_eq, .star_star_eq, .shl_eq, .shr_eq, .ushr_eq, .amp_eq, .pipe_eq, .caret_eq, .amp_amp_eq, .pipe_pipe_eq, .question2_eq => true,
                 else => false,
             };
             if (certain) return p.fail(.{ .syntax_error = "unexpected token after do-while" }, p.tok);
@@ -1794,9 +1795,10 @@ const Parser = struct {
                 const res = try p.parseParenList();
                 return p.finishParenAsExpr(res);
             },
+            .slash, .slash_eq => return p.regexpLiteral(),
             // Tokens that cannot begin an expression in any JavaScript.
-            .eof, .semicolon, .r_paren, .r_bracket, .r_brace, .comma, .star, .star_star, .percent, .eq3, .neq3, .eq2, .neq2, .lt, .le, .gt, .ge, .shl, .shr, .ushr, .amp, .pipe, .caret, .amp_amp, .pipe_pipe, .question2, .question, .question_dot, .colon, .eq, .arrow, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .star_star_eq, .shl_eq, .shr_eq, .ushr_eq, .amp_eq, .pipe_eq, .caret_eq, .amp_amp_eq, .pipe_pipe_eq, .question2_eq => return p.fail(.{ .syntax_error = "unexpected token" }, t),
-            // `[`, `{`, `/` (regex), `...`, keywords, … may start valid JS.
+            .eof, .semicolon, .r_paren, .r_bracket, .r_brace, .comma, .star, .star_star, .percent, .eq3, .neq3, .eq2, .neq2, .lt, .le, .gt, .ge, .shl, .shr, .ushr, .amp, .pipe, .caret, .amp_amp, .pipe_pipe, .question2, .question, .question_dot, .colon, .eq, .arrow, .plus_eq, .minus_eq, .star_eq, .percent_eq, .star_star_eq, .shl_eq, .shr_eq, .ushr_eq, .amp_eq, .pipe_eq, .caret_eq, .amp_amp_eq, .pipe_pipe_eq, .question2_eq => return p.fail(.{ .syntax_error = "unexpected token" }, t),
+            // `[`, `{`, `...`, keywords, … may start valid JS.
             else => return p.fail(.{ .unsupported = .syntax }, t),
         }
     }
@@ -2035,6 +2037,54 @@ const Parser = struct {
 
     fn limitExceeded(p: *Parser, start: u32, end: u32) Error {
         return p.failAt(.{ .limit_exceeded = .nesting_depth }, start, end);
+    }
+
+    fn regexpLiteral(p: *Parser) Error!*const ast.Expr {
+        const start = p.tok.start;
+        const scanned = try p.lexer.scanRegExp(start);
+        const s: ast.Span = .{ .start = start, .end = scanned.end };
+
+        var out: std.ArrayList(u16) = .empty;
+        try out.ensureTotalCapacityPrecise(p.arena, scanned.pattern.len);
+        var i: usize = 0;
+        while (i < scanned.pattern.len) {
+            const c = scanned.pattern[i];
+            if (c < 0x80) {
+                out.appendAssumeCapacity(c);
+                i += 1;
+            } else {
+                const cp, const len = try p.decodeUtf8(scanned.pattern, i, start + 1);
+                appendCodePoint(&out, cp);
+                i += len;
+            }
+        }
+
+        var rx_diag: regex.Diagnostic = .{};
+        const parsed_flags = regex.parseFlagsAscii(scanned.flags, &rx_diag) catch |err| {
+            return p.failRegExp(err, rx_diag, s);
+        };
+        var prog = regex.compileWithDepth(p.arena, out.items, parsed_flags.flags, p.limits.max_nesting_depth, &rx_diag) catch |err| {
+            return p.failRegExp(err, rx_diag, s);
+        };
+        prog.deinit(p.arena);
+
+        try p.advance();
+        return p.node(s, .{ .regexp = .{ .pattern = out.items, .flags = scanned.flags } }, 0);
+    }
+
+    fn failRegExp(p: *Parser, err: regex.CompileError, rx_diag: regex.Diagnostic, s: ast.Span) Error {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.SyntaxError => p.failAt(.{ .syntax_error = rx_diag.message }, s.start, s.end),
+            error.TooComplex => p.failAt(.{ .limit_exceeded = rx_diag.limit }, s.start, s.end),
+            error.Unsupported => {
+                const feat = if (rx_diag.feature) |f_name|
+                    std.meta.stringToEnum(Feature, f_name) orelse .syntax
+                else
+                    .syntax;
+                return p.failAt(.{ .unsupported = feat }, s.start, s.end);
+            },
+        };
     }
 
     fn templateLiteral(p: *Parser) Error!*const ast.Expr {

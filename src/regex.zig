@@ -6,35 +6,37 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const limits = @import("limits.zig");
+const Limit = limits.Limit;
 
 /// Maximum group/lookahead nesting depth during parsing. Prevents pathological patterns
 /// from consuming excessive compile-time stack memory and satisfies the spec requirement.
-pub const max_depth: u16 = 512;
+pub const max_depth: u16 = limits.regex_max_depth;
 
 /// Maximum number of compiled bytecode instructions in a single regex `Program`.
 /// Quantifiers with finite bounds (`{n,m}`) are compiled using counted loop registers
 /// rather than unrolling, so legitimate patterns stay well below this bound while huge
 /// patterns fail cleanly with `error.TooComplex` instead of exhausting heap memory.
-pub const max_program_insts: u32 = 65_536;
+pub const max_program_insts: u32 = limits.regex_max_program_insts;
 
 /// Maximum number of character-class range items across all `[...]` classes in a program.
 /// Prevents a single pattern with thousands of ranges from growing unboundedly.
-pub const max_class_items: u32 = 65_536;
+pub const max_class_items: u32 = limits.regex_max_class_items;
 
 /// Maximum number of loop counters (`{n,m}` / `*` / `+` / `?` repetitions) in a program.
-pub const max_loops: u16 = 4_096;
+pub const max_loops: u16 = limits.regex_max_loops;
 
 /// Maximum number of capturing groups in a single pattern.
-pub const max_captures: u16 = 4_096;
+pub const max_captures: u16 = limits.regex_max_captures;
 
 /// Maximum quantifier repetition bound (`{n,m}`). Exceeding this returns `error.TooComplex`.
-pub const max_quantifier_bound: u32 = 65_535;
+pub const max_quantifier_bound: u32 = limits.regex_max_quantifier_bound;
 
 /// Index ceilings for the matcher's backtrack stack, not policy limits: a greedy loop
 /// saves one state per iteration, so a small cap would reject `.*` over long input.
 /// The caller's `steps` budget and allocator bound the real work and memory.
-pub const max_backtrack_states: u32 = std.math.maxInt(u32) - 1;
-pub const max_backtrack_cells: u32 = std.math.maxInt(u32) - @as(u32, max_captures) * 2;
+pub const max_backtrack_states: u32 = limits.regex_max_backtrack_states;
+pub const max_backtrack_cells: u32 = limits.regex_max_backtrack_cells;
 
 pub const Flags = struct {
     ignore_case: bool = false,
@@ -42,6 +44,184 @@ pub const Flags = struct {
     dot_all: bool = false,
     sticky: bool = false,
 };
+
+pub const ParsedFlags = struct {
+    flags: Flags = .{},
+    global: bool = false,
+    canonical_buf: [5]u8 = undefined,
+    canonical_len: u8 = 0,
+
+    pub fn canonical(self: *const ParsedFlags) []const u8 {
+        return self.canonical_buf[0..self.canonical_len];
+    }
+};
+
+pub fn parseFlagsUtf16(units: []const u16, diag: *Diagnostic) CompileError!ParsedFlags {
+    diag.* = .{};
+    var seen_d = false;
+    var seen_g = false;
+    var seen_i = false;
+    var seen_m = false;
+    var seen_s = false;
+    var seen_u = false;
+    var seen_v = false;
+    var seen_y = false;
+
+    for (units) |u| {
+        const dup = switch (u) {
+            'd' => blk: {
+                const prev = seen_d;
+                seen_d = true;
+                break :blk prev;
+            },
+            'g' => blk: {
+                const prev = seen_g;
+                seen_g = true;
+                break :blk prev;
+            },
+            'i' => blk: {
+                const prev = seen_i;
+                seen_i = true;
+                break :blk prev;
+            },
+            'm' => blk: {
+                const prev = seen_m;
+                seen_m = true;
+                break :blk prev;
+            },
+            's' => blk: {
+                const prev = seen_s;
+                seen_s = true;
+                break :blk prev;
+            },
+            'u' => blk: {
+                const prev = seen_u;
+                seen_u = true;
+                break :blk prev;
+            },
+            'v' => blk: {
+                const prev = seen_v;
+                seen_v = true;
+                break :blk prev;
+            },
+            'y' => blk: {
+                const prev = seen_y;
+                seen_y = true;
+                break :blk prev;
+            },
+            else => {
+                diag.* = .{ .message = "invalid regular expression flag" };
+                return error.SyntaxError;
+            },
+        };
+        if (dup) {
+            diag.* = .{ .message = "duplicate regular expression flag" };
+            return error.SyntaxError;
+        }
+    }
+    if (seen_u and seen_v) {
+        diag.* = .{ .message = "incompatible 'u' and 'v' regular expression flags" };
+        return error.SyntaxError;
+    }
+    if (seen_d or seen_u or seen_v) {
+        diag.* = .{ .message = "unsupported regular expression flag", .feature = "regex_flags" };
+        return error.Unsupported;
+    }
+
+    var out: ParsedFlags = .{
+        .flags = .{
+            .ignore_case = seen_i,
+            .multiline = seen_m,
+            .dot_all = seen_s,
+            .sticky = seen_y,
+        },
+        .global = seen_g,
+    };
+    if (seen_g) {
+        out.canonical_buf[out.canonical_len] = 'g';
+        out.canonical_len += 1;
+    }
+    if (seen_i) {
+        out.canonical_buf[out.canonical_len] = 'i';
+        out.canonical_len += 1;
+    }
+    if (seen_m) {
+        out.canonical_buf[out.canonical_len] = 'm';
+        out.canonical_len += 1;
+    }
+    if (seen_s) {
+        out.canonical_buf[out.canonical_len] = 's';
+        out.canonical_len += 1;
+    }
+    if (seen_y) {
+        out.canonical_buf[out.canonical_len] = 'y';
+        out.canonical_len += 1;
+    }
+    return out;
+}
+
+pub fn parseFlagsAscii(bytes: []const u8, diag: *Diagnostic) CompileError!ParsedFlags {
+    var stack_buf: [16]u16 = undefined;
+    if (bytes.len > stack_buf.len) {
+        // Any flag string > 8 chars either has a duplicate or an invalid char; scan prefix+offending char.
+        for (bytes, 0..) |b, idx| {
+            if (idx < stack_buf.len) stack_buf[idx] = b;
+        }
+        return parseFlagsUtf16(stack_buf[0..stack_buf.len], diag);
+    }
+    for (bytes, 0..) |b, idx| stack_buf[idx] = b;
+    return parseFlagsUtf16(stack_buf[0..bytes.len], diag);
+}
+
+/// ECMAScript `EscapeRegExpPattern`: produces the UTF-16 `.source` text for a compiled pattern.
+pub fn escapePattern(gpa: Allocator, pattern: []const u16) error{OutOfMemory}![]u16 {
+    if (pattern.len == 0) {
+        return gpa.dupe(u16, &[_]u16{ '(', '?', ':', ')' });
+    }
+    var out: std.ArrayList(u16) = .empty;
+    errdefer out.deinit(gpa);
+    try out.ensureTotalCapacity(gpa, pattern.len);
+
+    var in_class = false;
+    var i: usize = 0;
+    while (i < pattern.len) {
+        const c = pattern[i];
+        if (c == '\\' and i + 1 < pattern.len) {
+            try out.append(gpa, '\\');
+            const next = pattern[i + 1];
+            switch (next) {
+                0x000A => try out.append(gpa, 'n'),
+                0x000D => try out.append(gpa, 'r'),
+                0x2028 => try out.appendSlice(gpa, &[_]u16{ 'u', '2', '0', '2', '8' }),
+                0x2029 => try out.appendSlice(gpa, &[_]u16{ 'u', '2', '0', '2', '9' }),
+                else => try out.append(gpa, next),
+            }
+            i += 2;
+            continue;
+        }
+        switch (c) {
+            '[' => {
+                in_class = true;
+                try out.append(gpa, '[');
+            },
+            ']' => {
+                in_class = false;
+                try out.append(gpa, ']');
+            },
+            '/' => {
+                if (!in_class) try out.append(gpa, '\\');
+                try out.append(gpa, '/');
+            },
+            0x000A => try out.appendSlice(gpa, &[_]u16{ '\\', 'n' }),
+            0x000D => try out.appendSlice(gpa, &[_]u16{ '\\', 'r' }),
+            0x2028 => try out.appendSlice(gpa, &[_]u16{ '\\', 'u', '2', '0', '2', '8' }),
+            0x2029 => try out.appendSlice(gpa, &[_]u16{ '\\', 'u', '2', '0', '2', '9' }),
+            else => try out.append(gpa, c),
+        }
+        i += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
 
 pub const Range = struct {
     start: u32,
@@ -58,6 +238,7 @@ pub const CompileError = error{
 pub const Diagnostic = struct {
     message: []const u8 = "",
     feature: ?[]const u8 = null,
+    limit: Limit = .code_bytes,
 };
 
 pub const ExecError = error{
@@ -147,6 +328,32 @@ pub const Program = struct {
         gpa.free(self.class_items);
         gpa.free(self.loops);
         self.* = undefined;
+    }
+
+    pub fn ownedBytes(self: *const Program) usize {
+        return self.insts.len * @sizeOf(Inst) +
+            self.classes.len * @sizeOf(ClassDef) +
+            self.class_items.len * @sizeOf(ClassItem) +
+            self.loops.len * @sizeOf(LoopInfo);
+    }
+
+    pub fn clone(self: *const Program, gpa: Allocator) error{OutOfMemory}!Program {
+        const insts = try gpa.dupe(Inst, self.insts);
+        errdefer gpa.free(insts);
+        const classes = try gpa.dupe(ClassDef, self.classes);
+        errdefer gpa.free(classes);
+        const class_items = try gpa.dupe(ClassItem, self.class_items);
+        errdefer gpa.free(class_items);
+        const loops = try gpa.dupe(LoopInfo, self.loops);
+        return .{
+            .insts = insts,
+            .classes = classes,
+            .class_items = class_items,
+            .loops = loops,
+            .capture_count = self.capture_count,
+            .loop_count = self.loop_count,
+            .flags = self.flags,
+        };
     }
 };
 
@@ -248,6 +455,7 @@ const Compiler = struct {
     pattern: []const u16,
     pos: usize = 0,
     flags: Flags,
+    max_depth: u16 = max_depth,
     diag: *Diagnostic,
     total_captures: u16 = 0,
     next_capture: u16 = 0,
@@ -284,7 +492,12 @@ const Compiler = struct {
     }
 
     fn failComplex(self: *Compiler, msg: []const u8) CompileError {
-        self.diag.* = .{ .message = msg, .feature = null };
+        self.diag.* = .{ .message = msg, .feature = null, .limit = .code_bytes };
+        return error.TooComplex;
+    }
+
+    fn failDepth(self: *Compiler, msg: []const u8) CompileError {
+        self.diag.* = .{ .message = msg, .feature = null, .limit = .nesting_depth };
         return error.TooComplex;
     }
 
@@ -655,8 +868,8 @@ const Compiler = struct {
     }
 
     fn openGroup(self: *Compiler) CompileError!void {
-        if (self.groups.items.len >= max_depth) {
-            return self.failComplex("regex nesting exceeds max_depth");
+        if (self.groups.items.len >= self.max_depth) {
+            return self.failDepth("regex nesting exceeds max_depth");
         }
         var kind: GroupKind = .capturing;
         var cap_idx: u16 = 0;
@@ -946,11 +1159,16 @@ const Compiler = struct {
 };
 
 pub fn compile(gpa: Allocator, pattern: []const u16, flags: Flags, diag: *Diagnostic) CompileError!Program {
+    return compileWithDepth(gpa, pattern, flags, max_depth, diag);
+}
+
+pub fn compileWithDepth(gpa: Allocator, pattern: []const u16, flags: Flags, depth_limit: u16, diag: *Diagnostic) CompileError!Program {
     diag.* = .{};
     var compiler: Compiler = .{
         .gpa = gpa,
         .pattern = pattern,
         .flags = flags,
+        .max_depth = @min(depth_limit, max_depth),
         .diag = diag,
     };
     defer compiler.deinit();

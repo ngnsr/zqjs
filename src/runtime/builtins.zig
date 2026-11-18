@@ -31,6 +31,8 @@ const ops = @import("ops.zig");
 const object = @import("object.zig");
 const names = @import("builtin_names.zig");
 const json = @import("json.zig");
+const regex = @import("../regex.zig");
+const Feature = @import("../frontend/diag.zig").Feature;
 
 pub const Realm = struct {
     object_prototype: *Object,
@@ -51,7 +53,8 @@ pub const Realm = struct {
     eval_error_prototype: *Object,
     uri_error_prototype: *Object,
     aggregate_error_prototype: *Object,
-    /// Static members of the `Object`, `Array`, `String`, `Number`, `Map`, `Set`, `Promise`, and `Error` globals.
+    regexp_prototype: *Object,
+    /// Static members of the `Object`, `Array`, `String`, `Number`, `Map`, `Set`, `Promise`, `Error`, and `RegExp` globals.
     object_namespace: *Object,
     array_namespace: *Object,
     string_namespace: *Object,
@@ -67,11 +70,12 @@ pub const Realm = struct {
     eval_error_namespace: *Object,
     uri_error_namespace: *Object,
     aggregate_error_namespace: *Object,
+    regexp_namespace: *Object,
     math: *Object,
     json: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [35]*Object {
+    pub fn objects(r: *const Realm) [37]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -91,6 +95,7 @@ pub const Realm = struct {
             r.eval_error_prototype,
             r.uri_error_prototype,
             r.aggregate_error_prototype,
+            r.regexp_prototype,
             r.object_namespace,
             r.array_namespace,
             r.string_namespace,
@@ -106,6 +111,7 @@ pub const Realm = struct {
             r.eval_error_namespace,
             r.uri_error_namespace,
             r.aggregate_error_namespace,
+            r.regexp_namespace,
             r.math,
             r.json,
         };
@@ -136,6 +142,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .eval_error_prototype = try builtin(h, error_prototype, .eval_error_prototype),
         .uri_error_prototype = try builtin(h, error_prototype, .uri_error_prototype),
         .aggregate_error_prototype = try builtin(h, error_prototype, .aggregate_error_prototype),
+        .regexp_prototype = try builtin(h, object_prototype, .regexp_prototype),
         .object_namespace = try builtin(h, null, .object_constructor),
         .array_namespace = try builtin(h, null, .array_constructor),
         .string_namespace = try builtin(h, null, .string_constructor),
@@ -151,6 +158,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .eval_error_namespace = try builtin(h, null, .eval_error_constructor),
         .uri_error_namespace = try builtin(h, null, .uri_error_constructor),
         .aggregate_error_namespace = try builtin(h, null, .aggregate_error_constructor),
+        .regexp_namespace = try builtin(h, null, .regexp_constructor),
         .math = try builtin(h, object_prototype, .math),
         .json = try builtin(h, object_prototype, .json),
     };
@@ -206,6 +214,8 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.string_prototype, "at", &string_at);
     try method(rt, r.string_prototype, "replace", &string_replace);
     try method(rt, r.string_prototype, "replaceAll", &string_replace_all);
+    try method(rt, r.string_prototype, "match", &string_match);
+    try method(rt, r.string_prototype, "search", &string_search);
     try method(rt, r.object_namespace, "keys", &object_keys);
     try method(rt, r.object_namespace, "values", &object_values);
     try method(rt, r.object_namespace, "entries", &object_entries);
@@ -266,6 +276,11 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try initErrorProto(rt, r.eval_error_prototype, r.eval_error_namespace, "EvalError", &eval_error_global);
     try initErrorProto(rt, r.uri_error_prototype, r.uri_error_namespace, "URIError", &uri_error_global);
     try initErrorProto(rt, r.aggregate_error_prototype, r.aggregate_error_namespace, "AggregateError", &aggregate_error_global);
+    try constant(rt, r.regexp_namespace, "prototype", .{ .object = r.regexp_prototype });
+    try constant(rt, r.regexp_prototype, "constructor", .{ .native = &regexp_global });
+    try method(rt, r.regexp_prototype, "exec", &regexp_exec);
+    try method(rt, r.regexp_prototype, "test", &regexp_test);
+    try method(rt, r.regexp_prototype, "toString", &regexp_to_string);
     _ = &r;
     rt.realm = r;
     return &rt.realm.?;
@@ -289,7 +304,7 @@ fn constant(rt: *Runtime, o: *Object, name: []const u8, v: Value) Error!void {
 
 /// The natives ToPrimitive may call (D40); anything else found there is user code.
 pub fn isConversion(n: *const Native) bool {
-    return n == &object_to_string or n == &object_value_of or n == &array_to_string or n == &error_to_string;
+    return n == &object_to_string or n == &object_value_of or n == &array_to_string or n == &error_to_string or n == &regexp_to_string;
 }
 
 pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
@@ -311,6 +326,7 @@ pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
         .eval_error => r.eval_error_namespace,
         .uri_error => r.uri_error_namespace,
         .aggregate_error => r.aggregate_error_namespace,
+        .regexp => r.regexp_namespace,
     };
 }
 
@@ -333,6 +349,7 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
         .eval_error => r.eval_error_prototype,
         .uri_error => r.uri_error_prototype,
         .aggregate_error => r.aggregate_error_prototype,
+        .regexp => r.regexp_prototype,
     };
 }
 
@@ -358,6 +375,7 @@ pub const reference_error_global: Native = .{ .name = "ReferenceError", .call = 
 pub const eval_error_global: Native = .{ .name = "EvalError", .call = evalErrorCall, .construct = evalErrorConstruct, .namespace = .eval_error };
 pub const uri_error_global: Native = .{ .name = "URIError", .call = uriErrorCall, .construct = uriErrorConstruct, .namespace = .uri_error };
 pub const aggregate_error_global: Native = .{ .name = "AggregateError", .call = aggregateErrorCall, .construct = aggregateErrorConstruct, .namespace = .aggregate_error };
+pub const regexp_global: Native = .{ .name = "RegExp", .call = regexpCall, .construct = regexpConstruct, .namespace = .regexp };
 
 /// A global read: implemented, host-registered (M9.1, D53), known to node (Unsupported),
 /// or a ReferenceError.
@@ -395,6 +413,7 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "EvalError")) return .{ .native = &eval_error_global };
     if (std.mem.eql(u8, name, "URIError")) return .{ .native = &uri_error_global };
     if (std.mem.eql(u8, name, "AggregateError")) return .{ .native = &aggregate_error_global };
+    if (std.mem.eql(u8, name, "RegExp")) return .{ .native = &regexp_global };
     if (std.mem.eql(u8, name, "Math")) return .{ .object = (try realm(rt)).math };
     if (std.mem.eql(u8, name, "JSON")) return .{ .object = (try realm(rt)).json };
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return .{ .native = n };
@@ -477,6 +496,7 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
                 .string_chars => "String Iterator",
             },
             .promise => "Promise",
+            .regexp => "RegExp",
             .ordinary => "Object",
         },
     };
@@ -1078,6 +1098,8 @@ const string_last_index_of: Native = .{ .name = "lastIndexOf", .call = stringLas
 const string_at: Native = .{ .name = "at", .call = stringAt };
 const string_replace: Native = .{ .name = "replace", .call = stringReplace };
 const string_replace_all: Native = .{ .name = "replaceAll", .call = stringReplaceAll };
+const string_match: Native = .{ .name = "match", .call = stringMatch };
+const string_search: Native = .{ .name = "search", .call = stringSearch };
 
 fn thisString(rt: *Runtime, this: Value, name: []const u8) Error!*const heap_mod.String {
     return switch (this) {
@@ -1318,6 +1340,9 @@ fn stringPadEnd(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 fn stringSplit(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const s = try thisString(rt, this, "split");
     const sep_arg = arg(args, 0);
+    if (sep_arg == .object and sep_arg.object.kind == .regexp) {
+        return stringSplitRegExp(rt, this, s, sep_arg.object, arg(args, 1));
+    }
     const lim: u32 = if (arg(args, 1) == .undefined) std.math.maxInt(u32) else ops.toUint32(try ops.toNumber(rt, arg(args, 1)));
     const r = try realm(rt);
 
@@ -1421,7 +1446,14 @@ fn expandReplacement(
 
 fn stringReplaceImpl(rt: *Runtime, this: Value, args: []const Value, name: []const u8, comptime is_all: bool) Error!Value {
     const s = try thisString(rt, this, name);
-    const search = try toStringObj(rt, arg(args, 0));
+    const search_arg = arg(args, 0);
+    if (search_arg == .object and search_arg.object.kind == .regexp) {
+        if (is_all and !search_arg.object.kind.regexp.global) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype.replaceAll called with a non-global RegExp argument" }});
+        }
+        return stringReplaceRegExp(rt, this, s, search_arg.object, arg(args, 1));
+    }
+    const search = try toStringObj(rt, search_arg);
     const repl_arg = arg(args, 1);
     const is_func = repl_arg == .native or repl_arg == .closure;
 
@@ -2801,7 +2833,7 @@ pub fn getIterator(rt: *Runtime, iterable: Value) Error!*Object {
             .set => rt.heap.newIterator(r.iterator_prototype, iterable, .set_values),
             .array => rt.heap.newIterator(r.iterator_prototype, iterable, .array_values),
             .iterator => o,
-            .ordinary, .promise => unsupportedReceiver(rt, "Symbol.iterator"),
+            .ordinary, .promise, .regexp => unsupportedReceiver(rt, "Symbol.iterator"),
         },
         .string => rt.heap.newIterator(r.iterator_prototype, iterable, .string_chars),
         else => rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }}),
@@ -3054,4 +3086,544 @@ fn aggregateErrorConstruct(rt: *Runtime, args: []const Value) Error!Value {
 
     try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("errors"), .{ .value = root_buf[4], .enumerable = false });
     return root_buf[3];
+}
+
+// ---------------------------------------------------------------- RegExp (M30, D61)
+
+const regexp_exec: Native = .{ .name = "exec", .call = regexpExec };
+const regexp_test: Native = .{ .name = "test", .call = regexpTest };
+const regexp_to_string: Native = .{ .name = "toString", .call = regexpToString };
+
+fn thisRegExp(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
+    if (this == .object and this.object.kind == .regexp) return this.object;
+    return unsupportedReceiver(rt, name);
+}
+
+fn failRuntimeRegExp(rt: *Runtime, err: regex.CompileError, rx_diag: regex.Diagnostic) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.SyntaxError => rt.throw(.SyntaxError, &.{.{ .ascii = rx_diag.message }}),
+        error.TooComplex => rt.limit(rx_diag.limit),
+        error.Unsupported => {
+            const feat = if (rx_diag.feature) |f_name|
+                std.meta.stringToEnum(Feature, f_name) orelse .syntax
+            else
+                .syntax;
+            return rt.fail(feat);
+        },
+    };
+}
+
+pub fn createRegExp(rt: *Runtime, pattern_units: []const u16, flags_units: []const u16) Error!Value {
+    var rx_diag: regex.Diagnostic = .{};
+    const parsed_flags = regex.parseFlagsUtf16(flags_units, &rx_diag) catch |err| {
+        return failRuntimeRegExp(rt, err, rx_diag);
+    };
+    var prog = regex.compileWithDepth(
+        rt.heap.allocator(),
+        pattern_units,
+        parsed_flags.flags,
+        rt.limits.max_nesting_depth,
+        &rx_diag,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return rt.heap.failed(error.OutOfMemory);
+        return failRuntimeRegExp(rt, err, rx_diag);
+    };
+    var prog_owned = true;
+    errdefer if (prog_owned) prog.deinit(rt.heap.allocator());
+
+    const escaped = try regex.escapePattern(rt.gpa, pattern_units);
+    defer rt.gpa.free(escaped);
+
+    const r = try realm(rt);
+    var root_buf = [_]Value{ .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const src_str = try rt.heap.newString(&.{.{ .utf16 = escaped }});
+    root_buf[0] = .{ .string = src_str };
+    const flags_str = try rt.heap.ascii(parsed_flags.canonical());
+    root_buf[1] = .{ .string = flags_str };
+    const obj = try rt.heap.newRegExp(r.regexp_prototype, prog, src_str, flags_str, parsed_flags.global);
+    prog_owned = false;
+    return .{ .object = obj };
+}
+
+pub fn newRegExpFromStrings(rt: *Runtime, pattern: *const heap_mod.String, flags: *const heap_mod.String) Error!Value {
+    return createRegExp(rt, pattern.units, flags.units);
+}
+
+pub fn newRegExpFromLiteral(rt: *Runtime, pattern_units: []const u16, flags_ascii: []const u8) Error!Value {
+    var flags_u16: [8]u16 = undefined;
+    for (flags_ascii, 0..) |b, i| flags_u16[i] = b;
+    return createRegExp(rt, pattern_units, flags_u16[0..flags_ascii.len]);
+}
+
+fn regexpBuild(rt: *Runtime, args: []const Value, is_new: bool) Error!Value {
+    const p_arg = arg(args, 0);
+    const f_arg = arg(args, 1);
+
+    if (p_arg == .object and p_arg.object.kind == .regexp) {
+        if (f_arg == .undefined) {
+            if (!is_new) return p_arg;
+            const re = p_arg.object.kind.regexp;
+            const r = try realm(rt);
+            var root_buf = [_]Value{p_arg};
+            var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+
+            var cloned_prog = re.program.clone(rt.heap.allocator()) catch |e| return rt.heap.failed(e);
+            errdefer cloned_prog.deinit(rt.heap.allocator());
+            const obj = try rt.heap.newRegExp(r.regexp_prototype, cloned_prog, re.source, re.flags, re.global);
+            return .{ .object = obj };
+        }
+        var root_buf = [_]Value{ p_arg, f_arg, .undefined };
+        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+        try roots.register(rt);
+        defer roots.unregister(rt);
+
+        const flags_str = try toStringObj(rt, f_arg);
+        root_buf[2] = .{ .string = flags_str };
+        return createRegExp(rt, p_arg.object.kind.regexp.source.units, flags_str.units);
+    }
+
+    var root_buf = [_]Value{ p_arg, f_arg, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const pat_units: []const u16 = if (p_arg == .undefined) &.{} else blk: {
+        const ps = try toStringObj(rt, p_arg);
+        root_buf[2] = .{ .string = ps };
+        break :blk ps.units;
+    };
+    const flag_units: []const u16 = if (f_arg == .undefined) &.{} else blk: {
+        const fs = try toStringObj(rt, f_arg);
+        root_buf[3] = .{ .string = fs };
+        break :blk fs.units;
+    };
+    return createRegExp(rt, pat_units, flag_units);
+}
+
+fn regexpCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return regexpBuild(rt, args, false);
+}
+
+fn regexpConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    return regexpBuild(rt, args, true);
+}
+
+fn toLength(rt: *Runtime, v: Value) Error!f64 {
+    const len = try toIntegerOrInfinity(rt, v);
+    if (len <= 0) return 0;
+    return @min(len, 9007199254740991.0);
+}
+
+fn runRegExpMatcher(
+    rt: *Runtime,
+    prog: *const regex.Program,
+    input: []const u16,
+    start: u32,
+    captures: []?regex.Range,
+) Error!bool {
+    const initial_left: u64 = rt.max_steps -| rt.steps;
+    var steps_left: u64 = initial_left;
+    const matched = regex.exec(rt.heap.allocator(), prog, input, start, &steps_left, captures) catch |err| {
+        const used = initial_left - steps_left;
+        rt.steps += used;
+        if (rt.exec_ctx.active) rt.exec_ctx.used = rt.steps;
+        return switch (err) {
+            error.StepLimit => {
+                try rt.step();
+                unreachable;
+            },
+            error.OutOfMemory => rt.heap.failed(error.OutOfMemory),
+        };
+    };
+    const used = initial_left - steps_left;
+    rt.steps += used;
+    if (rt.exec_ctx.active) rt.exec_ctx.used = rt.steps;
+    return matched;
+}
+
+/// Runs ECMAScript `RegExpBuiltinExec` into caller-allocated `captures` (`len == capture_count + 1`),
+/// updating `rx_obj.lastIndex` when `global` or `sticky` is set.
+fn regexpExecInto(
+    rt: *Runtime,
+    rx_obj: *Object,
+    s: *const heap_mod.String,
+    captures: []?regex.Range,
+) Error!bool {
+    var last_idx = try toLength(rt, rx_obj.kind.regexp.last_index);
+    const re = rx_obj.kind.regexp;
+    const global_or_sticky = re.global or re.program.flags.sticky;
+    if (!global_or_sticky) {
+        last_idx = 0;
+    }
+    if (last_idx > @as(f64, @floatFromInt(s.units.len))) {
+        if (global_or_sticky) rt.heap.storeRegExpLastIndex(rx_obj, .{ .number = 0 });
+        return false;
+    }
+    const start: u32 = @intFromFloat(last_idx);
+    const matched = try runRegExpMatcher(rt, &re.program, s.units, start, captures);
+    if (!matched) {
+        if (global_or_sticky) rt.heap.storeRegExpLastIndex(rx_obj, .{ .number = 0 });
+        return false;
+    }
+    if (global_or_sticky) {
+        rt.heap.storeRegExpLastIndex(rx_obj, .{ .number = @floatFromInt(captures[0].?.end) });
+    }
+    return true;
+}
+
+fn regexpExecImpl(rt: *Runtime, rx_obj: *Object, s: *const heap_mod.String) Error!Value {
+    var root_buf = [_]Value{ .{ .object = rx_obj }, .{ .string = s }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const cap_len = @as(usize, rx_obj.kind.regexp.program.capture_count) + 1;
+    const captures = try rt.gpa.alloc(?regex.Range, cap_len);
+    defer rt.gpa.free(captures);
+
+    if (!try regexpExecInto(rt, rx_obj, s, captures)) return .null;
+
+    const r = try realm(rt);
+    const arr = try rt.heap.newArray(r.array_prototype);
+    root_buf[2] = .{ .object = arr };
+
+    for (captures) |maybe_range| {
+        if (maybe_range) |rng| {
+            const sub = try rt.heap.newString(&.{.{ .utf16 = s.units[rng.start..rng.end] }});
+            root_buf[3] = .{ .string = sub };
+            try rt.heap.appendElement(arr, root_buf[3]);
+            root_buf[3] = .undefined;
+        } else {
+            try rt.heap.appendElement(arr, .undefined);
+        }
+    }
+    try object.define(rt, arr, try object.named(rt, "index"), .{ .number = @floatFromInt(captures[0].?.start) });
+    try object.define(rt, arr, try object.named(rt, "input"), .{ .string = s });
+    return .{ .object = arr };
+}
+
+fn regexpExec(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const rx_obj = try thisRegExp(rt, this, "exec");
+    var root_buf = [_]Value{ .{ .object = rx_obj }, arg(args, 0) };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const s = try toStringObj(rt, root_buf[1]);
+    return regexpExecImpl(rt, rx_obj, s);
+}
+
+fn regexpTest(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const rx_obj = try thisRegExp(rt, this, "test");
+    var root_buf = [_]Value{ .{ .object = rx_obj }, arg(args, 0), .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const s = try toStringObj(rt, root_buf[1]);
+    root_buf[2] = .{ .string = s };
+
+    const cap_len = @as(usize, rx_obj.kind.regexp.program.capture_count) + 1;
+    const captures = try rt.gpa.alloc(?regex.Range, cap_len);
+    defer rt.gpa.free(captures);
+
+    return .{ .boolean = try regexpExecInto(rt, rx_obj, s, captures) };
+}
+
+fn regexpToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const rx_obj = try thisRegExp(rt, this, "toString");
+    const re = rx_obj.kind.regexp;
+    return .{ .string = try rt.heap.newString(&.{
+        .{ .ascii = "/" },
+        .{ .utf16 = re.source.units },
+        .{ .ascii = "/" },
+        .{ .utf16 = re.flags.units },
+    }) };
+}
+
+fn coerceToRegExp(rt: *Runtime, v: Value) Error!*Object {
+    if (v == .object and v.object.kind == .regexp) return v.object;
+    const created = try regexpBuild(rt, &.{v}, true);
+    return created.object;
+}
+
+fn stringMatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "match");
+    var root_buf = [_]Value{ this, arg(args, 0), .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const rx_obj = try coerceToRegExp(rt, root_buf[1]);
+    root_buf[2] = .{ .object = rx_obj };
+
+    if (!rx_obj.kind.regexp.global) {
+        return regexpExecImpl(rt, rx_obj, s);
+    }
+
+    rt.heap.storeRegExpLastIndex(rx_obj, .{ .number = 0 });
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    root_buf[3] = .{ .object = out };
+
+    const cap_len = @as(usize, rx_obj.kind.regexp.program.capture_count) + 1;
+    const captures = try rt.gpa.alloc(?regex.Range, cap_len);
+    defer rt.gpa.free(captures);
+
+    while (try regexpExecInto(rt, rx_obj, s, captures)) {
+        const rng = captures[0].?;
+        const sub = try rt.heap.newString(&.{.{ .utf16 = s.units[rng.start..rng.end] }});
+        root_buf[4] = .{ .string = sub };
+        try rt.heap.appendElement(out, root_buf[4]);
+        root_buf[4] = .undefined;
+        if (rng.start == rng.end) {
+            const this_idx = try toLength(rt, rx_obj.kind.regexp.last_index);
+            rt.heap.storeRegExpLastIndex(rx_obj, .{ .number = this_idx + 1 });
+        }
+    }
+    if (out.kind.array.items.len == 0) return .null;
+    return .{ .object = out };
+}
+
+fn stringSearch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try thisString(rt, this, "search");
+    var root_buf = [_]Value{ this, arg(args, 0), .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const rx_obj = try coerceToRegExp(rt, root_buf[1]);
+    root_buf[2] = .{ .object = rx_obj };
+
+    const cap_len = @as(usize, rx_obj.kind.regexp.program.capture_count) + 1;
+    const captures = try rt.gpa.alloc(?regex.Range, cap_len);
+    defer rt.gpa.free(captures);
+
+    if (try runRegExpMatcher(rt, &rx_obj.kind.regexp.program, s.units, 0, captures)) {
+        return .{ .number = @floatFromInt(captures[0].?.start) };
+    }
+    return .{ .number = -1 };
+}
+
+fn expandRegExpReplacement(
+    rt: *Runtime,
+    out: *std.ArrayList(u16),
+    s_units: []const u16,
+    captures: []const ?regex.Range,
+    repl_units: []const u16,
+) Error!void {
+    const full = captures[0].?;
+    const m = captures.len - 1;
+    var i: usize = 0;
+    while (i < repl_units.len) {
+        if (repl_units[i] == '$' and i + 1 < repl_units.len) {
+            const next = repl_units[i + 1];
+            switch (next) {
+                '$' => {
+                    try appendUnits(rt, out, &.{'$'});
+                    i += 2;
+                    continue;
+                },
+                '&' => {
+                    try appendUnits(rt, out, s_units[full.start..full.end]);
+                    i += 2;
+                    continue;
+                },
+                '`' => {
+                    try appendUnits(rt, out, s_units[0..full.start]);
+                    i += 2;
+                    continue;
+                },
+                '\'' => {
+                    try appendUnits(rt, out, s_units[full.end..]);
+                    i += 2;
+                    continue;
+                },
+                '0'...'9' => {
+                    const d1: usize = next - '0';
+                    if (i + 2 < repl_units.len and repl_units[i + 2] >= '0' and repl_units[i + 2] <= '9') {
+                        const d2: usize = repl_units[i + 2] - '0';
+                        const nn = d1 * 10 + d2;
+                        if (nn >= 1 and nn <= m) {
+                            if (captures[nn]) |rng| try appendUnits(rt, out, s_units[rng.start..rng.end]);
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    if (d1 >= 1 and d1 <= m) {
+                        if (captures[d1]) |rng| try appendUnits(rt, out, s_units[rng.start..rng.end]);
+                        i += 2;
+                        continue;
+                    }
+                },
+                else => {},
+            }
+        }
+        try appendUnits(rt, out, repl_units[i .. i + 1]);
+        i += 1;
+    }
+}
+
+fn stringReplaceRegExp(
+    rt: *Runtime,
+    this: Value,
+    s: *const heap_mod.String,
+    rx_obj: *Object,
+    repl_arg: Value,
+) Error!Value {
+    const is_func = repl_arg == .native or repl_arg == .closure;
+    var root_buf = [_]Value{ this, .{ .object = rx_obj }, repl_arg, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const repl_str: ?*const heap_mod.String = if (!is_func) blk: {
+        const rs = try toStringObj(rt, repl_arg);
+        root_buf[3] = .{ .string = rs };
+        break :blk rs;
+    } else null;
+
+    const is_global = rx_obj.kind.regexp.global;
+    if (is_global) {
+        rt.heap.storeRegExpLastIndex(rx_obj, .{ .number = 0 });
+    }
+
+    const cap_len = @as(usize, rx_obj.kind.regexp.program.capture_count) + 1;
+    var all_matches: std.ArrayList([]?regex.Range) = .empty;
+    defer {
+        for (all_matches.items) |m_slice| rt.gpa.free(m_slice);
+        all_matches.deinit(rt.gpa);
+    }
+
+    while (true) {
+        const caps = try rt.gpa.alloc(?regex.Range, cap_len);
+        errdefer rt.gpa.free(caps);
+        if (!try regexpExecInto(rt, rx_obj, s, caps)) {
+            rt.gpa.free(caps);
+            break;
+        }
+        try all_matches.append(rt.gpa, caps);
+        if (!is_global) break;
+        const rng = caps[0].?;
+        if (rng.start == rng.end) {
+            const this_idx = try toLength(rt, rx_obj.kind.regexp.last_index);
+            rt.heap.storeRegExpLastIndex(rx_obj, .{ .number = this_idx + 1 });
+        }
+    }
+
+    if (all_matches.items.len == 0) return this;
+
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(rt.gpa);
+
+    const cb_args: []Value = if (is_func) try rt.gpa.alloc(Value, cap_len + 2) else &.{};
+    defer if (is_func) rt.gpa.free(cb_args);
+    @memset(cb_args, .undefined);
+    var cb_roots: rt_mod.ValueRoots = .{ .values = cb_args };
+    if (is_func) try cb_roots.register(rt);
+    defer if (is_func) cb_roots.unregister(rt);
+
+    var next_src_pos: usize = 0;
+    for (all_matches.items) |caps| {
+        const full = caps[0].?;
+        if (full.start < next_src_pos) continue;
+        try appendUnits(rt, &out, s.units[next_src_pos..full.start]);
+        if (is_func) {
+            @memset(cb_args, .undefined);
+            for (caps, 0..) |maybe_rng, idx| {
+                if (maybe_rng) |r| {
+                    cb_args[idx] = .{ .string = try rt.heap.newString(&.{.{ .utf16 = s.units[r.start..r.end] }}) };
+                } else {
+                    cb_args[idx] = .undefined;
+                }
+            }
+            cb_args[cap_len] = .{ .number = @floatFromInt(full.start) };
+            cb_args[cap_len + 1] = this;
+            const res = try rt.callCallable(repl_arg, .undefined, cb_args);
+            root_buf[4] = res;
+            const rs = try toStringObj(rt, res);
+            root_buf[4] = .{ .string = rs };
+            try appendUnits(rt, &out, rs.units);
+        } else {
+            try expandRegExpReplacement(rt, &out, s.units, caps, repl_str.?.units);
+        }
+        next_src_pos = full.end;
+    }
+    try appendUnits(rt, &out, s.units[next_src_pos..]);
+    return .{ .string = try rt.heap.newString(&.{.{ .utf16 = out.items }}) };
+}
+
+fn stringSplitRegExp(
+    rt: *Runtime,
+    this: Value,
+    s: *const heap_mod.String,
+    rx_obj: *Object,
+    limit_arg: Value,
+) Error!Value {
+    var root_buf = [_]Value{ this, .{ .object = rx_obj }, limit_arg, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const lim: u32 = if (limit_arg == .undefined) std.math.maxInt(u32) else ops.toUint32(try ops.toNumber(rt, limit_arg));
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    root_buf[3] = .{ .object = out };
+    if (lim == 0) return .{ .object = out };
+
+    var p_split = rx_obj.kind.regexp.program;
+    p_split.flags.sticky = false;
+    const cap_len = @as(usize, p_split.capture_count) + 1;
+    const captures = try rt.gpa.alloc(?regex.Range, cap_len);
+    defer rt.gpa.free(captures);
+
+    if (s.units.len == 0) {
+        if (!try runRegExpMatcher(rt, &p_split, s.units, 0, captures)) {
+            try rt.heap.appendElement(out, this);
+        }
+        return .{ .object = out };
+    }
+
+    const size: u32 = @intCast(s.units.len);
+    var p: u32 = 0;
+    var q: u32 = 0;
+    while (q < size) {
+        if (!try runRegExpMatcher(rt, &p_split, s.units, q, captures)) break;
+        const full = captures[0].?;
+        if (full.end == p) {
+            q = full.start + 1;
+            continue;
+        }
+        const seg = try rt.heap.newString(&.{.{ .utf16 = s.units[p..full.start] }});
+        root_buf[4] = .{ .string = seg };
+        try rt.heap.appendElement(out, root_buf[4]);
+        root_buf[4] = .undefined;
+        if (out.kind.array.items.len == lim) return .{ .object = out };
+
+        for (captures[1..]) |maybe_cap| {
+            if (maybe_cap) |rng| {
+                const cap_str = try rt.heap.newString(&.{.{ .utf16 = s.units[rng.start..rng.end] }});
+                root_buf[4] = .{ .string = cap_str };
+                try rt.heap.appendElement(out, root_buf[4]);
+                root_buf[4] = .undefined;
+            } else {
+                try rt.heap.appendElement(out, .undefined);
+            }
+            if (out.kind.array.items.len == lim) return .{ .object = out };
+        }
+        p = full.end;
+        q = p;
+    }
+
+    const tail = try rt.heap.newString(&.{.{ .utf16 = s.units[p..] }});
+    root_buf[4] = .{ .string = tail };
+    try rt.heap.appendElement(out, root_buf[4]);
+    return .{ .object = out };
 }

@@ -105,6 +105,14 @@ const Verifier = struct {
                 .push_callee => if (p.kind != .function) return v.fail(p, at, "push_callee outside a function"),
                 .get_arg, .rest_array => if (p.kind != .function) return v.fail(p, at, "function-only instruction outside a function"),
                 .await => if (p.kind != .function or !p.is_async) return v.fail(p, at, "await outside an async function"),
+                .new_regexp => {
+                    const k0 = bc.readU32(p.code, pc + 1);
+                    const k1 = bc.readU32(p.code, pc + 5);
+                    if (k0 < p.consts.len and k1 < p.consts.len) {
+                        if (p.consts[k0] != .string or p.consts[k1] != .string)
+                            return v.fail(p, at, "new_regexp operand is not a string constant");
+                    }
+                },
                 else => {},
             }
             starts.set(pc);
@@ -433,4 +441,31 @@ test "M26: new opcodes verification rules" {
     try testing.expectEqual(@as(u32, 3), info.max_stack);
     try testing.expectEqual(@as(u32, 0), info.unreachable_instructions);
     try testing.expectEqual(@as(u32, 0), info.inexact_max_stack);
+}
+
+test "M30: new_regexp requires two string constant operands" {
+    const heap = @import("../runtime/heap.zig");
+    var s0: heap.String = .{ .obj = .{ .kind = .string, .next = null }, .units = &.{'a'} };
+    var s1: heap.String = .{ .obj = .{ .kind = .string, .next = null }, .units = &.{'g'} };
+    const ok: Proto = .{
+        .code = enc(.{ .new_regexp, 0, 1, .pop, .halt }),
+        .consts = &.{ .{ .string = &s0 }, .{ .string = &s1 } },
+        .names = &.{},
+        .slot_count = 0,
+        .max_stack = 1,
+    };
+    var f: Failure = .{};
+    try testing.expectEqual(@as(u32, 1), (try verify(testing.allocator, &ok, .{}, &f)).max_stack);
+
+    try expectInvalid(enc(.{ .new_regexp, 0, 2, .pop, .halt }), 1, "constant index out of range");
+
+    const bad_type: Proto = .{
+        .code = enc(.{ .new_regexp, 0, 1, .pop, .halt }),
+        .consts = &.{ .{ .string = &s0 }, .{ .number = 1 } },
+        .names = &.{},
+        .slot_count = 0,
+        .max_stack = 1,
+    };
+    try testing.expectError(error.InvalidBytecode, verify(testing.allocator, &bad_type, .{}, &f));
+    try testing.expectEqualStrings("new_regexp operand is not a string constant", f.reason);
 }

@@ -105,7 +105,11 @@ pub fn value(v: Value, w: *Writer) Writer.Error!void {
         .boolean => |b| try w.writeAll(if (b) "true" else "false"),
         .native => |n| try w.print("<native {s}>", .{n.name}),
         .closure => try w.writeAll("<function>"),
-        .object => |o| try w.writeAll(if (o.kind == .array) "<array>" else "<object>"),
+        .object => |o| try w.writeAll(switch (o.kind) {
+            .array => "<array>",
+            .regexp => "<regexp>",
+            else => "<object>",
+        }),
         .number => |n| {
             var buf: ops.NumberBuf = undefined;
             if (n == 0 and std.math.signbit(n)) try w.writeAll("-0") else try w.writeAll(ops.formatNumber(&buf, n));

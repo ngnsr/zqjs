@@ -55,6 +55,8 @@ const objects = vm.runInNewContext(`({
   uri_error_prototype: URIError.prototype,
   aggregate_error_constructor: AggregateError,
   aggregate_error_prototype: AggregateError.prototype,
+  regexp_constructor: RegExp,
+  regexp_prototype: RegExp.prototype,
 })`);
 
 const lines = [

@@ -70,6 +70,18 @@ pub const Limits = struct {
 /// per card, so a minor collection rescans only the dirty cards, not the whole array.
 pub const card_elements = 512;
 
+/// Compile-time and structural ceilings for a single RegExp pattern (D61).
+/// Group/lookahead nesting is checked against `Limits.max_nesting_depth` (default 512);
+/// exceeding the structural ceilings below reports `LimitExceeded(code_bytes)`.
+pub const regex_max_depth: u16 = 512;
+pub const regex_max_program_insts: u32 = 65_536;
+pub const regex_max_class_items: u32 = 65_536;
+pub const regex_max_loops: u16 = 4_096;
+pub const regex_max_captures: u16 = 4_096;
+pub const regex_max_quantifier_bound: u32 = 65_535;
+pub const regex_max_backtrack_states: u32 = std.math.maxInt(u32) - 1;
+pub const regex_max_backtrack_cells: u32 = std.math.maxInt(u32) - @as(u32, regex_max_captures) * 2;
+
 pub const Limit = enum {
     source_bytes,
     nesting_depth,

@@ -1277,3 +1277,94 @@ overflowed the same way before this entry.
 *Follow-up, independent of the bound:* the Debug VM run loop frame (~47 KB) and the
 tree-walker's ReleaseFast frame (~25 KB, 7× the VM's) are large; moving cold opcode/task arms
 out of line would raise the number of crossings any budget allows.
+
+## D61. RegExp in the runtime *(M30; approved 2026-11-18)*
+`src/regex.zig` already implements the standalone UTF-16 regex compiler and non-recursive
+backtracking matcher. M30 wires it into the language, object model, and limits:
+
+**1. Limits & step/heap accounting (`src/limits.zig`, `src/regex.zig`).**
+- The compile-time pattern bounds in `src/regex.zig` (`regex_max_depth`,
+  `regex_max_program_insts`, `regex_max_class_items`, `regex_max_loops`, `regex_max_captures`,
+  `regex_max_quantifier_bound`, `regex_max_backtrack_states`, `regex_max_backtrack_cells`) move
+  into `src/limits.zig` so every bound lives in one file.
+- `regex.compile` checks group/lookahead nesting against `Limits.max_nesting_depth`
+  (`LimitExceeded(nesting_depth)`) and instruction/capture/loop/class/quantifier ceilings against
+  `limits.zig` (`LimitExceeded(code_bytes)`), keeping `Limit` and C ABI 1.2.0 `zqjs_limit`
+  unchanged.
+- At runtime, `regex.exec` allocates its backtracking scratch state through `rt.heap.allocator()`
+  (counting against `max_heap_bytes` and faulting with `LimitExceeded(heap_bytes)`) and charges
+  every matcher step against the runtime's step budget (`LimitExceeded(steps)`).
+
+**2. Flags & `Unsupported` classification.**
+- Supported flags: `g` (`global`), `i` (`ignoreCase`, ASCII-only per `regex.zig`),
+  `m` (`multiline`), `s` (`dotAll`), `y` (`sticky`).
+- Duplicate flags (`gg`) or invalid flag characters (`z`) are `SyntaxError` (at parse time for
+  `/pattern/flags` literals; a catchable `SyntaxError` exception at runtime for `RegExp(p, f)`).
+- Valid JS regex flags or pattern features not implemented by `src/regex.zig` (`u`, `v`, `d`
+  flags; lookbehind, named groups, `\p{...}`, `\c`, Annex B escapes, non-ASCII `i`) report
+  `Unsupported` with a specific `Feature` tag both at parse time (literals) and at runtime
+  (`RegExp` constructor).
+
+**3. Heap representation, properties & GC (`Object.kind.regexp`).**
+- `Object.kind` gains `regexp: RegExpState`:
+  - `program: regex.Program` (owned slices allocated via `rt.heap.allocator()`, included in
+    `Heap.accountedSize` and freed in `Heap.free`),
+  - `source: *const String` (escaped pattern text, `"(?:)"` for empty pattern, per
+    `EscapeRegExpPattern`),
+  - `flags: *const String` (canonical alphabetically sorted flags in `"gimsy"` order),
+  - `global: bool` (alongside `program.flags.{ignore_case, multiline, dot_all, sticky}`),
+  - `last_index: Value = .{ .number = 0 }`.
+- Instance properties are intercepted on `Object.kind.regexp` in `src/runtime/object.zig` (like
+  `array.length` and `map.size`), so constructing a `RegExp` does zero property-table
+  allocations and `Object.keys(re)` is `[]`:
+  - `lastIndex` is writable (updated through `rt.heap.storeRegExpLastIndex(o, v)`) and
+    non-configurable (`delete re.lastIndex` returns `false`, like `delete arr.length`).
+  - `source`, `flags`, `global`, `ignoreCase`, `multiline`, `dotAll`, `sticky` are read-only
+    getters (writes are ignored like `map.size = x`, `delete re.source` returns `true`, and
+    `'source' in re` is `true`).
+- `forEachChild` traces `source`, `flags`, and `last_index`.
+
+**4. Frontend (`/pattern/flags` literals) & bytecode (`new_regexp`).**
+- In a Pratt parser, `/` or `/=` at the start of `Parser.prefix` is always a regex literal in
+  valid JS. The parser calls `lexer.scanRegExp(tok.start)` to scan the body (handling `\`
+  escapes and `[...]` character classes where `/` is not a delimiter, rejecting line
+  terminators) and trailing flags.
+- The parser validates the pattern and flags at parse time via `regex.compile` on the arena, so
+  early `SyntaxError`, `Unsupported`, and `LimitExceeded` diagnostics work identically in
+  `parse`/`compile` and `tests/syntax/cases.jsonl`.
+- AST node: `Expr.regexp: struct { pattern: []const u16, flags: []const u8 }`, dumped as
+  `(regexp "/pattern/flags")`.
+- Bytecode: one new opcode `new_regexp` (`operands = &.{ .@"const", .@"const" }`, `pops = 0,
+  pushes = 1`; verifier checks both constants are strings). Every evaluation creates a fresh
+  `RegExp` instance with `lastIndex = 0`.
+
+**5. `RegExp` constructor, `RegExp.prototype`, and `String.prototype` methods.**
+- `new RegExp(pattern, flags)` and `RegExp(pattern, flags)`:
+  - When `pattern` is a `RegExp` and `flags === undefined`, `RegExp(re)` returns `re` unchanged
+    while `new RegExp(re)` returns a fresh clone with `lastIndex = 0`. When `flags !== undefined`,
+    recompiles `re.source` with the new flags.
+  - Otherwise converts `pattern` (`undefined` → `""`) and `flags` (`undefined` → `""`) with
+    `ToString`.
+- `RegExp.prototype`:
+  - `exec(str)`: coerces `str` via `ToString` and `lastIndex` via `ToLength`. Without `g`/`y`,
+    matches from `0` without writing `lastIndex`. With `g`/`y`, resets `lastIndex = 0` and
+    returns `null` on out-of-bounds or mismatch, or updates `lastIndex = match_end` on match.
+    Returns a dense `Array` `[full, cap1, …]` (`undefined` for unmatched groups) with own
+    properties `index` and `input`.
+  - `test(str)`: runs the same match and `lastIndex` update without allocating the match result
+    array.
+  - `toString()`: returns `"/" + source + "/" + flags`.
+- `String.prototype`:
+  - `match(regexp)`: coerces non-`RegExp` via `new RegExp(arg)`. If not `g`, delegates to
+    `re.exec(this)`. If `g`, sets `re.lastIndex = 0` and collects all full-match strings
+    (advancing by 1 UTF-16 code unit on empty matches), returning `null` if none matched.
+  - `search(regexp)`: coerces non-`RegExp` via `new RegExp(arg)`, matches from index `0` without
+    mutating `re.lastIndex`, and returns the match start index or `-1`.
+  - `replace(search, repl)` and `replaceAll(search, repl)`: extended for `RegExp` `search`
+    (`replaceAll` throws `TypeError` on non-`g` `RegExp`), supporting `$&`, `` $` ``, `$'`,
+    `$$`, `$1`..`$9` / `$nn` capture substitutions, callable `repl(match, p1, …, offset, str)`,
+    and `lastIndex = 0` reset + empty-match advancement on global regexes.
+  - `split(sep, limit)`: extended for `RegExp` `sep` without mutating `sep.lastIndex`, splicing
+    captured groups (`undefined` if unmatched) into the result array and handling empty-match
+    advancement and `limit`.
+  - `matchAll`: remains `Unsupported(builtin)`.

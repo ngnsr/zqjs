@@ -3,7 +3,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const regex = @import("regex");
+const regex = @import("zqjs_internal").regex;
 const support = @import("support.zig");
 
 test "watchdog: this binary fails, instead of hanging, if a test gets stuck" {

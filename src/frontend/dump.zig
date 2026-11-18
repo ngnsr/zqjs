@@ -354,6 +354,11 @@ const Dumper = struct {
         switch (e.data) {
             .number => |n| try w.print("{d}", .{n}),
             .string => |units| try d.string(units),
+            .regexp => |rx| {
+                try w.writeAll("(regexp ");
+                try d.string(rx.pattern);
+                try w.print(" \"{s}\")", .{rx.flags});
+            },
             .template => |t| {
                 try w.writeAll("(template ");
                 try d.string(t.quasis[0]);

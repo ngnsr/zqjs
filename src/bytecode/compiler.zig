@@ -950,6 +950,13 @@ const Compiler = struct {
             },
             .boolean => |b| try c.emit(if (b) .push_true else .push_false, &.{}),
             .null => try c.emit(.push_null, &.{}),
+            .regexp => |rx| {
+                var flags_u16: [8]u16 = undefined;
+                for (rx.flags, 0..) |b, i| flags_u16[i] = b;
+                const k_pat = try c.string(rx.pattern);
+                const k_flags = try c.string(flags_u16[0..rx.flags.len]);
+                try c.emit(.new_regexp, &.{ k_pat, k_flags });
+            },
             .identifier => |ref| try c.read(ref),
             .function => |f| try c.closure(f),
             .await => |inner| {

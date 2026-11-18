@@ -1878,3 +1878,20 @@ test "M28b: unreachable coroutine awaiting never-settled promise is collected wi
         try testing.expectEqualStrings("ok\n", got);
     }
 }
+
+test "M30: old RegExp storing a young lastIndex value survives minor GC (barrier)" {
+    const src =
+        \\const re = /\w+/g;
+        \\// Trigger minor GC so `re` is promoted to the old generation.
+        \\for (let i = 0; i < 200; i++) { let g = { a: i, s: "p" + i }; }
+        \\// Store a freshly allocated young string into `re.lastIndex`.
+        \\re.lastIndex = "" + 3;
+        \\for (let i = 0; i < 200; i++) { let g = { a: i, s: "q" + i }; }
+        \\print(re.lastIndex, re.exec("ab cd")[0], re.lastIndex);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("3 cd 5\n", got);
+    }
+}

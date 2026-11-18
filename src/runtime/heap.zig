@@ -43,6 +43,7 @@ const Limit = limits_mod.Limit;
 const card_elements = limits_mod.card_elements;
 const Value = @import("value.zig").Value;
 const Builtin = @import("builtin_names.zig").Builtin;
+const regex = @import("../regex.zig");
 
 pub const Error = error{ LimitExceeded, OutOfMemory };
 
@@ -320,6 +321,14 @@ pub const PromiseState = struct {
     reactions: std.ArrayList(PromiseReaction) = .empty,
 };
 
+pub const RegExpState = struct {
+    program: regex.Program,
+    source: *const String,
+    flags: *const String,
+    global: bool = false,
+    last_index: Value = .{ .number = 0 },
+};
+
 /// An ordinary object or an array (DESIGN_DECISIONS D13).
 pub const Object = struct {
     obj: Obj,
@@ -340,6 +349,8 @@ pub const Object = struct {
         iterator: IteratorState,
         /// Native Promise state (M18).
         promise: PromiseState,
+        /// Compiled RegExp state (M30, D61); boxed so `Object` stays small.
+        regexp: *RegExpState,
     } = .ordinary,
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
@@ -680,6 +691,11 @@ pub const Heap = struct {
                         visitValue(rx.on_rejected, &scan, RememberedScan.child);
                     }
                 },
+                .regexp => |re| {
+                    RememberedScan.child(&scan, @constCast(&re.source.obj));
+                    RememberedScan.child(&scan, @constCast(&re.flags.obj));
+                    visitValue(re.last_index, &scan, RememberedScan.child);
+                },
             }
         }
     }
@@ -962,6 +978,36 @@ pub const Heap = struct {
         return o;
     }
 
+    pub fn newRegExp(
+        h: *Heap,
+        proto: ?*Object,
+        program: regex.Program,
+        source: *const String,
+        flags: *const String,
+        global: bool,
+    ) Error!*Object {
+        const state = h.allocator().create(RegExpState) catch |e| return h.failed(e);
+        errdefer h.allocator().destroy(state);
+        const o = try h.newObject(proto);
+        state.* = .{
+            .program = program,
+            .source = source,
+            .flags = flags,
+            .global = global,
+            .last_index = .{ .number = 0 },
+        };
+        o.kind = .{ .regexp = state };
+        h.barrier(&o.obj, null, .{ .string = source });
+        h.barrier(&o.obj, null, .{ .string = flags });
+        return o;
+    }
+
+    pub fn storeRegExpLastIndex(h: *Heap, o: *Object, val: Value) void {
+        const old = o.kind.regexp.last_index;
+        o.kind.regexp.last_index = val;
+        h.barrier(&o.obj, old, val);
+    }
+
     // ---- the store API (GC_DESIGN §7, I3)
     //
     // After construction, every reference written into a heap object goes through one of
@@ -1177,7 +1223,7 @@ pub const Heap = struct {
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
         return switch (arr.kind) {
             .array => |*elements| elements,
-            .ordinary, .map, .set, .iterator, .promise => unreachable, // only arrays have elements
+            .ordinary, .map, .set, .iterator, .promise, .regexp => unreachable, // only arrays have elements
         };
     }
 
@@ -1456,6 +1502,10 @@ pub const Heap = struct {
                     .map, .set => |*table| table.deinit(h.allocator()),
                     .iterator => {},
                     .promise => |*pr| pr.reactions.deinit(h.allocator()),
+                    .regexp => |re| {
+                        re.program.deinit(h.allocator());
+                        h.allocator().destroy(re);
+                    },
                 }
                 o.kind = .ordinary;
                 o.proto = null;
@@ -1599,6 +1649,11 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                         visitValue(rx.on_fulfilled, ctx, visit);
                         visitValue(rx.on_rejected, ctx, visit);
                     }
+                },
+                .regexp => |re| {
+                    visit(ctx, @constCast(&re.source.obj));
+                    visit(ctx, @constCast(&re.flags.obj));
+                    visitValue(re.last_index, ctx, visit);
                 },
             }
         },
@@ -1767,6 +1822,15 @@ test "forEachChild enumerates every reference edge (what the M8 GC will mark)" {
     try Collect.expect(&env2.obj, &.{&env.obj}); // parent
     try Collect.expect(&env.obj, &.{&str.obj});
     try Collect.expect(&str.obj, &.{});
+
+    var rx_diag: regex.Diagnostic = .{};
+    const rx_prog = try regex.compile(h.allocator(), &.{ 'a', 'b' }, .{}, &rx_diag);
+    const rx_src = try h.ascii("ab");
+    const rx_flags = try h.ascii("g");
+    const rx_last = try h.ascii("0");
+    const rx = try h.newRegExp(proto, rx_prog, rx_src, rx_flags, true);
+    h.storeRegExpLastIndex(rx, .{ .string = rx_last });
+    try Collect.expect(&rx.obj, &.{ &proto.obj, &rx_src.obj, &rx_flags.obj, &rx_last.obj });
 }
 
 test "strings are built from pieces and freed by deinit" {

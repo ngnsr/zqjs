@@ -90,6 +90,7 @@ pub fn build(b: *std.Build) void {
         "syntax_test", // syntax/cases.jsonl: outcome + resolved dump for each source
         "ops_test", // ops/*.jsonl: conversions and operators vs node, bit for bit
         "frontend_test", // allocation-failure paths and fuzzing of parse, resolve, dump
+        "regex_test", // regex/cases.jsonl: standalone regex compiler and matcher vs node
     }) |name| {
         const integration = b.addRunArtifact(b.addTest(.{ .name = name, .filters = filters, .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("tests/{s}.zig", .{name})),
@@ -100,19 +101,6 @@ pub fn build(b: *std.Build) void {
         integration.setCwd(b.path(".")); // diff_test reads tests/diff at runtime
         test_step.dependOn(&integration.step);
     }
-    const regex_mod = b.createModule(.{
-        .root_source_file = b.path("src/regex.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const regex_tests = b.addRunArtifact(b.addTest(.{ .name = "regex_test", .filters = filters, .root_module = b.createModule(.{
-        .root_source_file = b.path("tests/regex_test.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{ .{ .name = "regex", .module = regex_mod }, .{ .name = "zqjs_internal", .module = mod }, .{ .name = "zqjs", .module = api } },
-    }) }));
-    regex_tests.setCwd(b.path("."));
-    test_step.dependOn(&regex_tests.step);
 
     // The embedding API's tests see only `zqjs`, as an embedder does: an import of
     // `zqjs_internal` there fails to build.

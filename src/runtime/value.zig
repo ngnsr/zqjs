@@ -59,5 +59,6 @@ pub const Native = struct {
         eval_error,
         uri_error,
         aggregate_error,
+        regexp,
     } = null,
 };

@@ -1799,6 +1799,10 @@ const Machine = struct {
                 m.depth -= 1;
                 try m.pushVal(.{ .string = try rt.heap.newString(&.{.{ .utf16 = units }}) });
             },
+            .regexp => |rx| {
+                m.depth -= 1;
+                try m.pushVal(try builtins.newRegExpFromLiteral(rt, rx.pattern, rx.flags));
+            },
             .boolean => |b| {
                 m.depth -= 1;
                 try m.pushVal(.{ .boolean = b });

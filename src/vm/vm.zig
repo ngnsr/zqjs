@@ -829,6 +829,17 @@ pub const Vm = struct {
                 cache.sp -= n;
                 try cache.push(vm, .{ .object = arr });
             },
+            .new_regexp => {
+                const k_pat = cache.operand(0);
+                const k_flags = cache.operand(1);
+                if (k_pat >= p.consts.len or k_flags >= p.consts.len) return vm.bug("constant index out of range");
+                const pat_val = p.consts[k_pat];
+                const flags_val = p.consts[k_flags];
+                if (pat_val != .string or flags_val != .string) return vm.bug("new_regexp operand is not a string");
+                try cache.ensurePush(vm);
+                const re = try builtins.newRegExpFromStrings(rt, pat_val.string, flags_val.string);
+                try cache.push(vm, re);
+            },
             .define_prop => {
                 const o = try cache.peek(vm, 1);
                 if (o != .object) return vm.bug("define on a non-object");

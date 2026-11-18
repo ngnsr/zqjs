@@ -325,7 +325,7 @@ test "built-ins: known to node but not implemented is Unsupported, naming the me
     try expectUnsupported("print(Reflect === undefined);", "", "Unsupported(builtin): a built-in node has that ZQJS doesn't implement yet ('Reflect')");
     try expectUnsupported("print([1].length); [1].flat;", "1\n", "Unsupported(builtin)");
     try expectUnsupported("[1].flat;", "", "('flat')");
-    try expectUnsupported("'abc'.match;", "", "('match')");
+    try expectUnsupported("'abc'.matchAll;", "", "('matchAll')");
     try expectUnsupported("(1).toFixed;", "", "('toFixed')");
     try expectUnsupported("Object.freeze;", "", "('freeze')");
     try expectUnsupported("Object.name;", "", "('name')");
@@ -1128,4 +1128,49 @@ test "M28b Machine: checkAllAllocationFailures over async program" {
         }
     };
     try std.testing.checkAllAllocationFailures(testing.allocator, Ctx.runOnce, .{Ctx{ .script = script, .res = res }});
+}
+
+test "M30: catastrophic regex backtracking hits LimitExceeded(steps) on both engines" {
+    const src =
+        \\/(a+)+b/.exec("aaaaaaaaaaaaaaaaaaaaaaaaac");
+    ;
+    try expectLimit(src, .{ .max_steps = 5_000 }, .steps);
+}
+
+test "M30: RegExp pattern nesting limit and runtime Unsupported features (both engines)" {
+    try expectLimit("new RegExp('(((((a)))))');", .{ .max_nesting_depth = 4 }, .nesting_depth);
+
+    const cases = [_]struct { src: []const u8, feat: zqjs.Feature }{
+        .{ .src = "new RegExp('a', 'u');", .feat = .regex_flags },
+        .{ .src = "new RegExp('a', 'd');", .feat = .regex_flags },
+        .{ .src = "new RegExp('(?<=a)b');", .feat = .regex_lookbehind },
+        .{ .src = "new RegExp('(?<n>a)');", .feat = .regex_named_groups },
+        .{ .src = "new RegExp('\\\\p{ASCII}');", .feat = .regex_unicode_property },
+    };
+    for (cases) |c| {
+        for (support.engines) |engine| {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            var discard: std.Io.Writer.Discarding = .init(&.{});
+            var rt = Runtime.init(testing.allocator, .{}, &discard.writer);
+            defer rt.deinit();
+            try testing.expectEqual(@as(?anyerror, error.Unsupported), try runScript(arena.allocator(), &rt, c.src, engine));
+            try testing.expectEqual(c.feat, rt.unsupported.?);
+        }
+    }
+}
+
+test "M30: checkAllAllocationFailures over RegExp construction, exec, match, replace, and split" {
+    const src =
+        \\const r = new RegExp("([a-z]+)(\\d+)", "gi");
+        \\const m = r.exec("a1 b2");
+        \\const s = "a1 b2".replace(r, (full, w, d) => w + ":" + d);
+        \\const parts = s.split(/(:)/);
+        \\print(m[0], parts.join("|"), "a1 b2".match(r).length, "a1 b2".search(/\d/));
+    ;
+    for (support.engines) |engine| {
+        var sa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+        try std.testing.checkAllAllocationFailures(sa.allocator(), runOnce, .{ src, engine });
+        try testing.expectEqual(@as(usize, 0), sa.deinit());
+    }
 }

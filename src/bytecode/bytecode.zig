@@ -111,6 +111,8 @@ pub const Op = enum(u8) {
     new_object,
     /// [e0 … e(n-1)] → [array].
     new_array,
+    /// Push a new RegExp object compiled from consts[k_pattern] and consts[k_flags] (M30, D61).
+    new_regexp,
     /// [obj, value] → [obj]: define obj.name (an object literal's `name: value`).
     define_prop,
     /// [obj, key, value] → [obj]: the same with a computed or literal key.
@@ -268,6 +270,7 @@ pub const Op = enum(u8) {
             .rot4 => .{ .operands = &.{}, .pops = 4, .pushes = 4 },
             .new_object => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
             .new_array => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
+            .new_regexp => .{ .operands = &.{ .@"const", .@"const" }, .pops = 0, .pushes = 1 },
             .define_prop => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
             .define_elem => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
             .get_prop, .delete_prop => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },

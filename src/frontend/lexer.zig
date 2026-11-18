@@ -190,6 +190,65 @@ pub const Lexer = struct {
         return l.templatePart(l.pos, false, true);
     }
 
+    pub const ScannedRegExp = struct {
+        pattern: []const u8,
+        flags: []const u8,
+        end: u32,
+    };
+
+    /// Re-scans from `start` (the opening `/` of a `.slash` or `.slash_eq` token) as a
+    /// `/pattern/flags` literal when the parser is in prefix expression position (D61).
+    pub fn scanRegExp(l: *Lexer, start: u32) Error!ScannedRegExp {
+        var i: usize = start + 1;
+        var in_class = false;
+        const body_end: usize = while (i < l.source.len) {
+            const c = l.source[i];
+            if (isLineTerminatorAt(l.source, i)) {
+                return l.fail(.{ .syntax_error = "unterminated regular expression literal" }, start, i);
+            }
+            if (c == '\\') {
+                i += 1;
+                if (i >= l.source.len or isLineTerminatorAt(l.source, i)) {
+                    return l.fail(.{ .syntax_error = "unterminated regular expression literal" }, start, i);
+                }
+                i += 1;
+                continue;
+            }
+            if (c == '[') {
+                in_class = true;
+                i += 1;
+                continue;
+            }
+            if (c == ']') {
+                in_class = false;
+                i += 1;
+                continue;
+            }
+            if (c == '/' and !in_class) break i;
+            i += 1;
+        } else return l.fail(.{ .syntax_error = "unterminated regular expression literal" }, start, i);
+
+        i += 1; // closing `/`
+        const flags_start = i;
+        while (i < l.source.len and isIdentPart(l.source[i])) i += 1;
+        if (i < l.source.len and l.source[i] == '\\') {
+            return l.fail(.{ .syntax_error = "invalid regular expression flag" }, flags_start, i + 1);
+        }
+        l.pos = @intCast(i);
+        return .{
+            .pattern = l.source[start + 1 .. body_end],
+            .flags = l.source[flags_start..i],
+            .end = @intCast(i),
+        };
+    }
+
+    fn isLineTerminatorAt(s: []const u8, i: usize) bool {
+        const c = s[i];
+        if (c == '\n' or c == '\r') return true;
+        if (c == 0xE2 and i + 2 < s.len and s[i + 1] == 0x80 and (s[i + 2] == 0xA8 or s[i + 2] == 0xA9)) return true;
+        return false;
+    }
+
     fn templatePart(l: *Lexer, start: u32, newline_before: bool, is_continuation: bool) Error!Token {
         if (!is_continuation) l.pos += 1; // skip opening `` ` ``
         while (true) {

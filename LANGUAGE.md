@@ -80,8 +80,18 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `arrow_this` | not yet | `() => this`, `function f() { return () => this; }` | lexical `this` inside arrow functions |
 | `function_properties` | not yet | `f.x`, `f.length`, `print.name`, `o instanceof F` | functions aren't objects yet (no `.prototype` property on user functions) |
 | `primitive_write` | restriction | `'s'.x = 1`, `delete 'ab'.length` | sloppy JS silently ignores these |
+| `regex_flags` | not yet | `/a/u`, `/a/v`, `/a/d`, `new RegExp('a', 'u')` | RegExp unicode (`u`/`v`) and indices (`d`) flags |
+| `regex_ignore_case_unicode` | not yet | `/\u00e9/i` | non-ASCII characters with the RegExp `i` flag |
+| `regex_annex_b` | restriction | `/{/`, `/(?=a)*/`, `/\8/` | Annex B web-reality RegExp syntax |
+| `regex_unicode_escape_braced` | not yet | `/\u{41}/` | `\u{...}` RegExp escapes without unicode mode |
+| `regex_control_escape` | not yet | `/\cA/` | `\c` RegExp control escapes |
+| `regex_unicode_property` | not yet | `/\p{ASCII}/` | `\p{...}` and `\P{...}` RegExp unicode property escapes |
+| `regex_named_groups` | not yet | `/(?<n>a)/`, `/\k<n>/` | named RegExp capturing groups and backreferences |
+| `regex_backref_gt9` | not yet | `/(a)...(j)\10/` | RegExp backreferences above `\9` |
+| `regex_lookbehind` | not yet | `/(?<=a)b/`, `/(?<!a)b/` | RegExp lookbehind assertions |
+| `regex_modifiers` | not yet | `/(?i:a)/` | inline RegExp flag modifiers |
 | `labels` | not yet | `foo: while (…)`, `break foo;` | |
-| `syntax` | not yet | `,`, `var`, `for…in`, `let` used as a variable name, tagged templates, generators (including `async function*`), `for await`, top-level `await`, regexes … | any JS token or construct not yet in the grammar below |
+| `syntax` | not yet | `,`, `var`, `for…in`, `let` used as a variable name, tagged templates, generators (including `async function*`), `for await`, top-level `await` … | any JS token or construct not yet in the grammar below |
 
 ## 3. Lexical grammar (M1)
 
@@ -321,6 +331,13 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
   - Calling an async function returns a native `Promise`: the body runs synchronously up to its first `await`; a `return` resolves the promise (adopting a returned native promise in two extra ticks, as in node), and an uncaught exception, including one thrown before any `await`, rejects it. `new` on an async function throws `TypeError`.
   - `await v` converts `v` with `Promise.resolve` (native-only adoption, as above) and resumes in exactly one microtask once it settles; a rejection is thrown at the `await`, so `try`/`catch`/`finally` around it work, including a pending `return` held across an `await` inside `finally`'s region.
   - Limits: step, call-depth and interpreter-depth limits apply to async calls and to resumed ones; each pending async call's suspended state is charged to `max_heap_bytes`. An uncatchable fault inside an async call leaves its promise pending (as for reactions).
+- **`RegExp` (M30, both engines, D61):**
+  - Literals (`/pattern/flags`) and `RegExp(pattern[, flags])` / `new RegExp(pattern[, flags])`: every literal evaluation creates a fresh `RegExp` object with `lastIndex = 0`; `RegExp(re)` returns `re` unchanged when `flags === undefined`, while `new RegExp(re)` clones it and `RegExp(re, flags)` recompiles with new flags. Empty pattern has `.source === "(?:)"`.
+  - Flags: `g` (`global`), `i` (`ignoreCase`, ASCII-only), `m` (`multiline`), `s` (`dotAll`), `y` (`sticky`). Duplicate or unknown flags raise `SyntaxError` (early for literals, thrown `SyntaxError` for `RegExp(...)`); `u`, `v`, and `d` report `Unsupported(regex_flags)`.
+  - Pattern features: character classes, `\d`/`\D`/`\w`/`\W`/`\s`/`\S`, `.`, `^`, `$`, `\b`/`\B`, greedy and lazy `*`/`+`/`?`/`{n,m}`, capturing `(…)` and non-capturing `(?:…)` groups, backreferences `\1`..`\9`, and lookahead `(?=…)` / `(?!…)`. Lookbehind, named groups, `\p{…}`, `\c`, inline modifiers, and Annex B regex syntax report `Unsupported(regex_*)`.
+  - Instance properties & methods: writable `lastIndex` (non-configurable, `delete re.lastIndex === false`), read-only `source`, `flags` (sorted `"gimsy"`), `global`, `ignoreCase`, `multiline`, `dotAll`, `sticky` (`Object.keys(re)` is `[]`), `re instanceof RegExp`, `RegExp.prototype.exec(str)` (returns `[full, cap1, …]` with `.index` and `.input`, or `null`, updating `lastIndex` on `g`/`y`), `RegExp.prototype.test(str)`, and `RegExp.prototype.toString()` (allowed under D40 for `String(re)`, `"" + re`, `` `${re}` ``, `print(re)`).
+  - `String.prototype`: `match(regexp)`, `search(regexp)`, `replace(regexp, repl)` and `replaceAll(regexp, repl)` (`TypeError` on non-`g` `RegExp`; supports `$$`, `$&`, `` $` ``, `$'`, `$1`..`$9`/`$nn`, and callback `(match, p1, …, offset, str)`), and `split(regexp[, limit])` (splices captured groups without mutating `regexp.lastIndex`). `matchAll` remains `Unsupported(builtin)`.
+  - Limits: pattern group nesting is bounded by `Limits.max_nesting_depth` (`LimitExceeded(nesting_depth)`), structural pattern ceilings in `src/limits.zig` report `LimitExceeded(code_bytes)`, matcher backtracking steps charge `rt.steps` (`LimitExceeded(steps)`), and matcher allocations charge `rt.heap` (`LimitExceeded(heap_bytes)`).
 
 ### Bindings
 

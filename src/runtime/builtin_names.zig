@@ -40,6 +40,8 @@ pub const Builtin = enum {
     uri_error_prototype,
     aggregate_error_constructor,
     aggregate_error_prototype,
+    regexp_constructor,
+    regexp_prototype,
 };
 
 /// Whether node gives `b` an own property called `name`.
@@ -81,6 +83,8 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .uri_error_prototype => uri_error_prototype.has(name),
         .aggregate_error_constructor => aggregate_error_constructor.has(name),
         .aggregate_error_prototype => aggregate_error_prototype.has(name),
+        .regexp_constructor => regexp_constructor.has(name),
+        .regexp_prototype => regexp_prototype.has(name),
     };
 }
 
@@ -601,4 +605,48 @@ const aggregate_error_prototype = std.StaticStringMap(void).initComptime(.{
     .{"constructor"},
     .{"message"},
     .{"name"},
+});
+
+const regexp_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"$&"},
+    .{"$'"},
+    .{"$+"},
+    .{"$1"},
+    .{"$2"},
+    .{"$3"},
+    .{"$4"},
+    .{"$5"},
+    .{"$6"},
+    .{"$7"},
+    .{"$8"},
+    .{"$9"},
+    .{"$_"},
+    .{"$`"},
+    .{"escape"},
+    .{"input"},
+    .{"lastMatch"},
+    .{"lastParen"},
+    .{"leftContext"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+    .{"rightContext"},
+});
+
+const regexp_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"compile"},
+    .{"constructor"},
+    .{"dotAll"},
+    .{"exec"},
+    .{"flags"},
+    .{"global"},
+    .{"hasIndices"},
+    .{"ignoreCase"},
+    .{"multiline"},
+    .{"source"},
+    .{"sticky"},
+    .{"test"},
+    .{"toString"},
+    .{"unicode"},
+    .{"unicodeSets"},
 });

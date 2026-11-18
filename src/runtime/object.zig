@@ -172,11 +172,31 @@ fn ownGet(rt: *Runtime, o: *Object, k: Key) Error!?Value {
             .atom => if (isNamed(k, "length")) return .{ .number = @floatFromInt(elements.items.len) },
         },
         .map, .set => |table| if (isNamed(k, "size")) return .{ .number = @floatFromInt(table.live_count) },
+        .regexp => |re| {
+            if (isNamed(k, "lastIndex")) return re.last_index;
+            if (isNamed(k, "source")) return .{ .string = re.source };
+            if (isNamed(k, "flags")) return .{ .string = re.flags };
+            if (isNamed(k, "global")) return .{ .boolean = re.global };
+            if (isNamed(k, "ignoreCase")) return .{ .boolean = re.program.flags.ignore_case };
+            if (isNamed(k, "multiline")) return .{ .boolean = re.program.flags.multiline };
+            if (isNamed(k, "dotAll")) return .{ .boolean = re.program.flags.dot_all };
+            if (isNamed(k, "sticky")) return .{ .boolean = re.program.flags.sticky };
+        },
         .ordinary, .iterator, .promise => {},
     }
     if (o.props.count() == 0) return null; // don't intern index keys just to miss
     const p = o.props.get(try atomOf(rt, k)) orelse return null;
     return p.value;
+}
+
+fn isRegExpGetter(k: Key) bool {
+    return isNamed(k, "source") or
+        isNamed(k, "flags") or
+        isNamed(k, "global") or
+        isNamed(k, "ignoreCase") or
+        isNamed(k, "multiline") or
+        isNamed(k, "dotAll") or
+        isNamed(k, "sticky");
 }
 
 /// Own lookup that never allocates (atoms only; for built-in tables).
@@ -217,6 +237,13 @@ pub fn set(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
             .atom => if (isNamed(k, "length")) return setLength(rt, o, v),
         },
         .map, .set => if (isNamed(k, "size")) return, // Map/Set size is a read-only getter
+        .regexp => {
+            if (isNamed(k, "lastIndex")) {
+                rt.heap.storeRegExpLastIndex(o, v);
+                return;
+            }
+            if (isRegExpGetter(k)) return;
+        },
         .ordinary, .iterator, .promise => {},
     }
     try putOwn(rt, o, k, v);
@@ -256,6 +283,7 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
             .index => |i| return if (i < elements.items.len) rt.fail(.sparse_array) else true,
             .atom => if (isNamed(k, "length")) return false, // non-configurable
         },
+        .regexp => if (isNamed(k, "lastIndex")) return false, // non-configurable
         .ordinary, .map, .set, .iterator, .promise => {},
     }
     if (o.props.count() == 0) return true;
@@ -313,7 +341,7 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
         .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
-        .ordinary, .map, .set, .iterator, .promise => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp => {},
     }
     const first_named = out.items.len;
     for (o.props.keys(), o.props.values()) |a, p| {

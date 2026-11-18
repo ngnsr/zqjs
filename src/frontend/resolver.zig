@@ -420,7 +420,7 @@ const Resolver = struct {
 
     fn expr(r: *Resolver, e: *const ast.Expr) Error!void {
         switch (e.data) {
-            .number, .string, .boolean, .null => {},
+            .number, .string, .regexp, .boolean, .null => {},
             .template => |t| for (t.exprs) |ex| try r.expr(ex),
             .identifier => |ref| r.refs[ref.id] = try r.lookup(ref.name),
             .unary => |u| try r.expr(u.operand),

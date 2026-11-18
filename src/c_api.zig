@@ -125,6 +125,12 @@ pub const CHandleKind = enum(c_int) {
     array = 7,
 };
 
+pub const CPromiseState = enum(c_int) {
+    pending = 0,
+    fulfilled = 1,
+    rejected = 2,
+};
+
 pub const CLimits = extern struct {
     max_source_bytes: u32,
     max_nesting_depth: u16,
@@ -180,7 +186,7 @@ pub const CLimits = extern struct {
 pub const OutputFn = *const fn (ctx: ?*anyopaque, bytes: [*c]const u8, len: usize) callconv(.c) bool;
 pub const ClockFn = *const fn (ctx: ?*anyopaque) callconv(.c) u64;
 
-pub const abi_version: u32 = (1 << 16) | (1 << 8) | 0;
+pub const abi_version: u32 = (1 << 16) | (2 << 8) | 0;
 
 pub const COptions = extern struct {
     struct_size: u32,
@@ -191,6 +197,7 @@ pub const COptions = extern struct {
     clock_fn: ?ClockFn,
     clock_ctx: ?*anyopaque,
     random_seed: u64,
+    max_native_stack_bytes: usize,
 };
 
 const min_options_size: usize = @offsetOf(COptions, "clock_ctx") + @sizeOf(?*anyopaque);
@@ -430,8 +437,10 @@ fn createRuntimeWithAllocator(gpa: Allocator, opts_opt: ?*const COptions, out_rt
         .clock_ctx = opts.clock_ctx,
     };
 
+    var zig_limits = opts.limits.toZig();
+    zig_limits.max_native_stack_bytes = opts.max_native_stack_bytes;
     const zig_opts: zqjs.Options = .{
-        .limits = opts.limits.toZig(),
+        .limits = zig_limits,
         .output = if (opts.output_fn != null) &cr.writer else null,
         .clock = if (opts.clock_fn != null) CRuntime.clockAdapter else null,
         .clock_ctx = if (opts.clock_fn != null) cr else null,
@@ -475,6 +484,7 @@ pub export fn zqjs_options_default() callconv(.c) COptions {
         .clock_fn = null,
         .clock_ctx = null,
         .random_seed = internal.Runtime.default_random_seed,
+        .max_native_stack_bytes = (zqjs.Limits{}).max_native_stack_bytes,
     };
 }
 
@@ -783,6 +793,63 @@ pub export fn zqjs_new_array(raw_rt: ?*anyopaque, out_handle: ?*ZqjsHandle) call
     const zh = cr.rt.newArray() catch |err| return mapHandleError(err);
     out.* = ZqjsHandle.fromZig(zh);
     return .ok;
+}
+
+pub export fn zqjs_new_promise(
+    raw_rt: ?*anyopaque,
+    out_promise: ?*ZqjsHandle,
+    out_resolve: ?*ZqjsHandle,
+    out_reject: ?*ZqjsHandle,
+) callconv(.c) Status {
+    if (out_promise) |op| op.* = .{};
+    if (out_resolve) |ors| ors.* = .{};
+    if (out_reject) |orj| orj.* = .{};
+    const p_out = out_promise orelse return .err_invalid_arg;
+    const res_out = out_resolve orelse return .err_invalid_arg;
+    const rej_out = out_reject orelse return .err_invalid_arg;
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkReentrantEntry()) |st| return st;
+
+    const cap = cr.rt.newPromise() catch |err| return mapHandleError(err);
+    p_out.* = ZqjsHandle.fromZig(cap.promise);
+    res_out.* = ZqjsHandle.fromZig(cap.resolve);
+    rej_out.* = ZqjsHandle.fromZig(cap.reject);
+    return .ok;
+}
+
+pub export fn zqjs_handle_promise_state(
+    raw_rt: ?*anyopaque,
+    h: ZqjsHandle,
+    out_state: ?*CPromiseState,
+    opt_out_value: ?*ZqjsHandle,
+) callconv(.c) Status {
+    if (opt_out_value) |ov| ov.* = .{};
+    const st_out = out_state orelse return .err_invalid_arg;
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkReentrantEntry()) |st| return st;
+    const zh = switch (validateHandle(cr, h)) {
+        .ok => |v| v,
+        .err => |st| return st,
+    };
+
+    const st_opt = cr.rt.promiseState(zh) catch |err| return mapHandleError(err);
+    const st = st_opt orelse return .err_type;
+    switch (st) {
+        .pending => {
+            st_out.* = .pending;
+            return .ok;
+        },
+        .fulfilled => |vh| {
+            st_out.* = .fulfilled;
+            if (opt_out_value) |ov| ov.* = ZqjsHandle.fromZig(vh) else vh.release();
+            return .ok;
+        },
+        .rejected => |vh| {
+            st_out.* = .rejected;
+            if (opt_out_value) |ov| ov.* = ZqjsHandle.fromZig(vh) else vh.release();
+            return .ok;
+        },
+    }
 }
 
 pub export fn zqjs_runtime_get_global(
@@ -1324,4 +1391,130 @@ test "C ABI lifecycle: destroy Program while Execution is suspended, and destroy
 
         try testing.expectEqual(Status.ok, zqjs_runtime_destroy(rt));
     }
+}
+
+test "C ABI M29: 60-frame host promise loop with testing.allocator (zero leaks)" {
+    const Timer = struct {
+        active: bool = false,
+        due_frame: u32 = 0,
+        resolve: ZqjsHandle = .{},
+        reject: ZqjsHandle = .{},
+    };
+    const Host = struct {
+        frame: u32 = 0,
+        timers: [16]Timer = @splat(.{}),
+        result_promise: ZqjsHandle = .{},
+
+        fn waitFrames(
+            raw_rt: ?*anyopaque,
+            raw_ctx: ?*anyopaque,
+            _: ?*const ZqjsHandle,
+            args: ?[*]const ZqjsHandle,
+            argc: usize,
+            out: *CNativeOut,
+        ) callconv(.c) Status {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            var n: f64 = 1;
+            if (argc >= 1) {
+                const st = zqjs_handle_number(raw_rt, args.?[0], &n);
+                if (st != .ok) return st;
+            }
+            for (&self.timers) |*t| {
+                if (!t.active) {
+                    var p: ZqjsHandle = .{};
+                    var res: ZqjsHandle = .{};
+                    var rej: ZqjsHandle = .{};
+                    const st = zqjs_new_promise(raw_rt, &p, &res, &rej);
+                    if (st != .ok) return st;
+                    t.* = .{
+                        .active = true,
+                        .due_frame = self.frame + @as(u32, @intFromFloat(n)),
+                        .resolve = res,
+                        .reject = rej,
+                    };
+                    out.has_result = true;
+                    out.result = p;
+                    return .ok;
+                }
+            }
+            return .err_host;
+        }
+
+        fn savePromise(
+            raw_rt: ?*anyopaque,
+            raw_ctx: ?*anyopaque,
+            _: ?*const ZqjsHandle,
+            args: ?[*]const ZqjsHandle,
+            argc: usize,
+            _: *CNativeOut,
+        ) callconv(.c) Status {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            if (argc < 1) return .err_host;
+            return zqjs_handle_dup(raw_rt, args.?[0], &self.result_promise);
+        }
+    };
+
+    var host: Host = .{};
+    var opts = zqjs_options_default();
+    opts.limits.max_handles = 12;
+
+    var rt: ?*anyopaque = null;
+    try testing.expectEqual(Status.ok, createRuntimeWithAllocator(testing.allocator, &opts, &rt));
+    defer _ = zqjs_runtime_destroy(rt);
+
+    try testing.expectEqual(Status.ok, zqjs_runtime_define_global_function(rt, "waitFrames", 10, Host.waitFrames, &host));
+    try testing.expectEqual(Status.ok, zqjs_runtime_define_global_function(rt, "savePromise", 11, Host.savePromise, &host));
+
+    const src =
+        \\async function run60() {
+        \\    let acc = 0;
+        \\    for (let i = 0; i < 20; i++) {
+        \\        acc += await waitFrames(3);
+        \\    }
+        \\    return acc;
+        \\}
+        \\savePromise(run60());
+    ;
+    var diag: CDiagnostic = undefined;
+    var prog: ?*anyopaque = null;
+    try testing.expectEqual(Status.ok, zqjs_runtime_compile(rt, "f60.js", 6, src.ptr, src.len, &diag, &prog));
+    var fail: CFailure = undefined;
+    try testing.expectEqual(Status.ok, zqjs_runtime_run(rt, prog, &fail));
+
+    var st: CPromiseState = .fulfilled;
+    try testing.expectEqual(Status.ok, zqjs_handle_promise_state(rt, host.result_promise, &st, null));
+    try testing.expectEqual(CPromiseState.pending, st);
+
+    for (1..61) |f| {
+        host.frame = @intCast(f);
+        for (&host.timers) |*t| {
+            if (t.active and t.due_frame == host.frame) {
+                t.active = false;
+                const res = t.resolve;
+                const rej = t.reject;
+                t.resolve = .{};
+                t.reject = .{};
+                var num: ZqjsHandle = .{};
+                var call_ret: ZqjsHandle = .{};
+                try testing.expectEqual(Status.ok, zqjs_new_number(rt, @floatFromInt(f), &num));
+                try testing.expectEqual(Status.ok, zqjs_runtime_call(rt, res, null, @ptrCast(&num), 1, &fail, &call_ret));
+                try testing.expectEqual(Status.ok, zqjs_handle_release(rt, call_ret));
+                try testing.expectEqual(Status.ok, zqjs_handle_release(rt, num));
+                try testing.expectEqual(Status.ok, zqjs_handle_release(rt, res));
+                try testing.expectEqual(Status.ok, zqjs_handle_release(rt, rej));
+            }
+        }
+    }
+
+    var val_h: ZqjsHandle = .{};
+    try testing.expectEqual(Status.ok, zqjs_handle_promise_state(rt, host.result_promise, &st, &val_h));
+    try testing.expectEqual(CPromiseState.fulfilled, st);
+    var total: f64 = 0;
+    try testing.expectEqual(Status.ok, zqjs_handle_number(rt, val_h, &total));
+    try testing.expectEqual(@as(f64, 630), total);
+
+    try testing.expectEqual(Status.ok, zqjs_handle_release(rt, val_h));
+    try testing.expectEqual(Status.ok, zqjs_handle_release(rt, host.result_promise));
+    try testing.expectEqual(Status.ok, zqjs_program_destroy(prog));
+    try testing.expectEqual(Status.ok, zqjs_runtime_collect_garbage(rt));
 }

@@ -373,6 +373,54 @@ pub const Runtime = opaque {
         return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .object = arr }));
     }
 
+    /// Creates a pending JS Promise along with its `resolve` and `reject` capability
+    /// functions (`{ promise, resolve, reject }`, M29, D57). All three handles are owned
+    /// by the caller; settle the promise by passing `resolve` or `reject` to `rt.call`.
+    /// On error (`OutOfMemory`, `LimitExceeded(heap_bytes | handles)`, `Internal`), no
+    /// handle slots remain allocated.
+    pub fn newPromise(rt: *Runtime) HandleError!PromiseCapability {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) return error.Internal;
+        r.rt.limit_hit = null;
+        r.rt.heap.limit_hit = null;
+        const realm = internal.builtins.realm(&r.rt) catch |e| return mapHandleInternalError(e);
+        const p = r.rt.heap.newPromise(realm.promise_prototype) catch |e| return mapHandleInternalError(e);
+        const res_cap = r.rt.heap.newPromiseCapability(p, false) catch |e| return mapHandleInternalError(e);
+        const rej_cap = r.rt.heap.newPromiseCapability(p, true) catch |e| return mapHandleInternalError(e);
+        const p_tok = try handles.Table.mint(&r.rt, .{ .object = p });
+        errdefer p_tok.release();
+        const res_tok = try handles.Table.mint(&r.rt, .{ .closure = res_cap });
+        errdefer res_tok.release();
+        const rej_tok = try handles.Table.mint(&r.rt, .{ .closure = rej_cap });
+        return .{
+            .promise = Handle.fromToken(p_tok),
+            .resolve = Handle.fromToken(res_tok),
+            .reject = Handle.fromToken(rej_tok),
+        };
+    }
+
+    /// Inspects the state of the Promise `h` names (M29, D57).
+    /// - Returns `null` if `h` is not a Promise object.
+    /// - Returns `.pending` without allocating or minting a handle when pending.
+    /// - Returns `.{ .fulfilled = val }` or `.{ .rejected = reason }` with a newly minted
+    ///   owned `Handle` when settled (`h` itself is borrowed and never consumed).
+    pub fn promiseState(rt: *Runtime, h: Handle) HandleError!?PromiseState {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        const v = handles.Token.checkedValue(&r.rt, h.tok());
+        if (r.rt.poisoned) return error.Internal;
+        if (v != .object or v.object.kind != .promise) return null;
+        const pr = &v.object.kind.promise;
+        return switch (pr.state) {
+            .pending => .pending,
+            .fulfilled => .{ .fulfilled = Handle.fromToken(try handles.Table.mint(&r.rt, pr.result)) },
+            .rejected => .{ .rejected = Handle.fromToken(try handles.Table.mint(&r.rt, pr.result)) },
+        };
+    }
+
     /// Reads a runtime global (`Math`, `Object`, `Array`, host-registered natives,
     /// `undefined`, `NaN`, `Infinity`) and mints an owned handle (E3: script top-level
     /// bindings are per-execution and are not stored here).
@@ -502,6 +550,23 @@ pub const Runtime = opaque {
 };
 
 pub const HandleError = error{ OutOfMemory, LimitExceeded, Internal };
+
+/// A host-created Promise and its settlement capabilities (`Runtime.newPromise`, M29, D57).
+/// All three handles are independently owned by the caller and must each be `release`d.
+pub const PromiseCapability = struct {
+    promise: Handle,
+    resolve: Handle,
+    reject: Handle,
+};
+
+/// State of a Promise inspected via `Runtime.promiseState` (M29, D57).
+/// For `.fulfilled` and `.rejected`, the associated `Handle` is newly minted and owned
+/// by the caller (must be `release`d). `.pending` never allocates or mints a handle.
+pub const PromiseState = union(enum) {
+    pending,
+    fulfilled: Handle,
+    rejected: Handle,
+};
 
 /// A GC-safe reference to one JS value (M9.1, D50): a value token `{ owner, slot,
 /// generation }` naming a reusable slot in the runtime's handle table. Independent
@@ -1044,10 +1109,7 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
                 return fo.err;
             }
             if (top_level) {
-                const prev_caller = rt.closure_caller;
-                rt.closure_caller = .{ .ctx = rt, .call = internal.Vm.callStandalone };
-                defer rt.closure_caller = prev_caller;
-                rt.drainMicrotasks() catch |e| {
+                drainTopLevelMicrotasks(rt, result) catch |e| {
                     const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
                     const fo = faultOf(rt, err);
                     if (failure) |out| out.* = fo.failure;
@@ -1065,10 +1127,26 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
                     return fo.err;
                 };
                 if (top_level) {
-                    const prev_caller = rt.closure_caller;
-                    rt.closure_caller = .{ .ctx = rt, .call = internal.Vm.callStandalone };
-                    defer rt.closure_caller = prev_caller;
-                    rt.drainMicrotasks() catch |e| {
+                    drainTopLevelMicrotasks(rt, result) catch |e| {
+                        const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                        const fo = faultOf(rt, err);
+                        if (failure) |out| out.* = fo.failure;
+                        return fo.err;
+                    };
+                }
+                return mintHandle(r, result, failure);
+            }
+            if (c.impl == .native_closure) {
+                const nc = c.impl.native_closure;
+                const func: *const fn (*IRuntime, *internal.heap.Object, []const internal.Value) internal.runtime.Error!internal.Value = @ptrCast(@alignCast(nc.func));
+                const result = func(rt, nc.env, argv) catch |e| {
+                    const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
+                    const fo = faultOf(rt, err);
+                    if (failure) |out| out.* = fo.failure;
+                    return fo.err;
+                };
+                if (top_level) {
+                    drainTopLevelMicrotasks(rt, result) catch |e| {
                         const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
                         const fo = faultOf(rt, err);
                         if (failure) |out| out.* = fo.failure;
@@ -1090,10 +1168,7 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
                         return fo.err;
                     };
                     if (top_level) {
-                        const prev_caller = rt.closure_caller;
-                        rt.closure_caller = .{ .ctx = rt, .call = internal.Vm.callStandalone };
-                        defer rt.closure_caller = prev_caller;
-                        rt.drainMicrotasks() catch |e| {
+                        drainTopLevelMicrotasks(rt, result) catch |e| {
                             const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
                             const fo = faultOf(rt, err);
                             if (failure) |out| out.* = fo.failure;
@@ -1144,10 +1219,7 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
                 return fo.err;
             };
             if (top_level) {
-                const prev_caller = rt.closure_caller;
-                rt.closure_caller = .{ .ctx = rt, .call = internal.Vm.callStandalone };
-                defer rt.closure_caller = prev_caller;
-                rt.drainMicrotasks() catch |e| {
+                drainTopLevelMicrotasks(rt, result) catch |e| {
                     const err = if (e != error.Internal and rt.exec_ctx.budget_fault != null) rt.limit(.steps) else e;
                     const fo = faultOf(rt, err);
                     if (failure) |out| out.* = fo.failure;
@@ -1165,6 +1237,20 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
             return fo.err;
         },
     }
+}
+
+/// Drains queued microtasks at the end of an outermost `rt.call` while keeping `result`
+/// rooted across any GC safepoints triggered by resumed coroutines or reactions (D57).
+fn drainTopLevelMicrotasks(rt: *IRuntime, result: internal.Value) internal.runtime.Error!void {
+    if (rt.microtask_head >= rt.microtasks.items.len) return;
+    var root_buf = [_]internal.Value{result};
+    var roots: internal.runtime.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const prev_caller = rt.closure_caller;
+    rt.closure_caller = .{ .ctx = rt, .call = internal.Vm.callStandalone };
+    defer rt.closure_caller = prev_caller;
+    try rt.drainMicrotasks();
 }
 
 /// Mints the result token the caller owns (D50). A failed mint faults the call with

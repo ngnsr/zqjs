@@ -17,7 +17,7 @@ extern "C" {
  * Callers can check `(zqjs_abi_version() >> 16) == (ZQJS_ABI_VERSION >> 16)`.
  */
 #define ZQJS_ABI_MAJOR 1u
-#define ZQJS_ABI_MINOR 1u
+#define ZQJS_ABI_MINOR 2u
 #define ZQJS_ABI_PATCH 0u
 #define ZQJS_ABI_VERSION ((ZQJS_ABI_MAJOR << 16) | (ZQJS_ABI_MINOR << 8) | ZQJS_ABI_PATCH)
 
@@ -98,6 +98,12 @@ typedef enum zqjs_handle_kind {
     ZQJS_HANDLE_ARRAY = 7
 } zqjs_handle_kind;
 
+typedef enum zqjs_promise_state {
+    ZQJS_PROMISE_PENDING = 0,
+    ZQJS_PROMISE_FULFILLED = 1,
+    ZQJS_PROMISE_REJECTED = 2
+} zqjs_promise_state;
+
 typedef struct zqjs_limits {
     uint32_t max_source_bytes;
     uint16_t max_nesting_depth;
@@ -121,8 +127,8 @@ typedef struct zqjs_options {
     /**
      * Must be initialized to `sizeof(zqjs_options)` (e.g. via `zqjs_options_default()`).
      * - Smaller structs (`>= offsetof(zqjs_options, clock_ctx) + sizeof(void *)`) are
-     *   accepted for backward compatibility; omitted trailing fields (e.g. `random_seed`)
-     *   use their documented defaults.
+     *   accepted for backward compatibility; omitted trailing fields (`random_seed`,
+     *   `max_native_stack_bytes`) use their documented defaults.
      * - Zero, truncated, or larger structs (`> sizeof(zqjs_options)`) are rejected with
      *   `ZQJS_ERR_INVALID_ARG`.
      */
@@ -135,6 +141,12 @@ typedef struct zqjs_options {
     void *clock_ctx;
     /** Deterministic PRNG seed for `Math.random()` (not cryptographically secure). */
     uint64_t random_seed;
+    /**
+     * Native stack budget in bytes across native->JS crossings (D60; default 4 MiB).
+     * Added in ABI 1.2.0 as a trailing field so `zqjs_limits` layout stays compatible
+     * with 1.0/1.1 callers.
+     */
+    size_t max_native_stack_bytes;
 } zqjs_options;
 
 typedef struct zqjs_diagnostic {
@@ -222,6 +234,18 @@ zqjs_status zqjs_new_string_utf16(
 );
 zqjs_status zqjs_new_object(zqjs_runtime *rt, zqjs_handle *out_handle);
 zqjs_status zqjs_new_array(zqjs_runtime *rt, zqjs_handle *out_handle);
+zqjs_status zqjs_new_promise(
+    zqjs_runtime *rt,
+    zqjs_handle *out_promise,
+    zqjs_handle *out_resolve,
+    zqjs_handle *out_reject
+);
+zqjs_status zqjs_handle_promise_state(
+    zqjs_runtime *rt,
+    zqjs_handle h,
+    zqjs_promise_state *out_state,
+    zqjs_handle *opt_out_value
+);
 zqjs_status zqjs_runtime_get_global(
     zqjs_runtime *rt,
     const char *name,

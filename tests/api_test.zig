@@ -287,6 +287,30 @@ test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" 
         _ = rt1.getIndex(arr, 0, null) catch {};
         return;
     }
+    if (std.mem.eql(u8, scenario, "promisestate-released")) {
+        const rt = try zqjs.Runtime.create(testing.allocator, .{});
+        defer rt.destroy();
+        const cap = try rt.newPromise();
+        cap.resolve.release();
+        cap.reject.release();
+        cap.promise.release();
+        _ = rt.promiseState(cap.promise) catch {};
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "promisestate-foreign")) {
+        const rt1 = try zqjs.Runtime.create(testing.allocator, .{});
+        defer rt1.destroy();
+        const rt2 = try zqjs.Runtime.create(testing.allocator, .{});
+        defer rt2.destroy();
+        const cap = try rt2.newPromise();
+        defer {
+            cap.promise.release();
+            cap.resolve.release();
+            cap.reject.release();
+        }
+        _ = rt1.promiseState(cap.promise) catch {};
+        return;
+    }
     if (std.mem.eql(u8, scenario, "native-use-temp-after-return")) {
         const Box = struct { h: zqjs.Handle = undefined };
         const S = struct {
@@ -386,6 +410,8 @@ test "the public API declares exactly the approved names (D46: a new export is a
         "NativeOut",
         "Options",
         "Program",
+        "PromiseCapability",
+        "PromiseState",
         "RunError",
         "Runtime",
         "StartError",
@@ -1118,6 +1144,8 @@ test "the guard and the tag checks panic, as expected, in a child process (E1, E
         .{ .name = "getprop-released", .message = "zqjs: Handle used after release" },
         .{ .name = "setprop-foreign-val", .message = "zqjs: Handle from another Runtime" },
         .{ .name = "getindex-foreign", .message = "zqjs: Handle from another Runtime" },
+        .{ .name = "promisestate-released", .message = "zqjs: Handle used after release" },
+        .{ .name = "promisestate-foreign", .message = "zqjs: Handle from another Runtime" },
         .{ .name = "program-after-destroy", .message = "zqjs: Program used after destroy" },
     };
     const count = if (std.debug.runtime_safety) scenarios.len else scenarios.len - 1;
@@ -2877,4 +2905,289 @@ test "M28b: a pending async call from a destroyed program does not break the nex
     S.held.?.release();
     S.held = null;
     rt.collectGarbage();
+}
+
+test "M29: newPromise, promiseState, handle rollback, frame timers, and limits on settlement" {
+    // 1. Partial handle-limit rollback on newPromise & non-allocating pending promiseState
+    {
+        const rt = try zqjs.Runtime.create(testing.allocator, .{ .limits = .{ .max_handles = 5 } });
+        defer rt.destroy();
+
+        const cap = try rt.newPromise();
+        defer {
+            cap.promise.release();
+            cap.resolve.release();
+            cap.reject.release();
+        }
+        try testing.expectEqual(zqjs.HandleKind.object, cap.promise.kind());
+        try testing.expectEqual(zqjs.HandleKind.function, cap.resolve.kind());
+        try testing.expectEqual(zqjs.HandleKind.function, cap.reject.kind());
+
+        // Non-promise returns null.
+        try testing.expect((try rt.promiseState(cap.resolve)) == null);
+        const plain_obj = try rt.newObject();
+        const pad_obj = try rt.newBoolean(false);
+        try testing.expect((try rt.promiseState(plain_obj)) == null);
+
+        // All 5 handle slots are now in use (promise, resolve, reject, plain_obj, pad_obj).
+        // Pending promiseState must still succeed because it never allocates or mints!
+        const mem_before = rt.memory();
+        const st_pending = (try rt.promiseState(cap.promise)).?;
+        try testing.expect(st_pending == .pending);
+        try testing.expectEqual(mem_before.bytes, rt.memory().bytes);
+
+        plain_obj.release();
+        // 4 of 5 slots used (1 free): newPromise fails on the 2nd handle and rolls back the 1st.
+        try testing.expectError(error.LimitExceeded, rt.newPromise());
+
+        pad_obj.release();
+        // 3 of 5 slots used (2 free): newPromise fails on the 3rd handle and rolls back 1st & 2nd.
+        try testing.expectError(error.LimitExceeded, rt.newPromise());
+
+        // Both free slots remain usable!
+        const val = try rt.newNumber(42);
+        defer val.release();
+        const r1 = try rt.call(cap.resolve, null, &.{val}, null);
+        r1.release();
+        const r2 = try rt.call(cap.reject, null, &.{val}, null);
+        r2.release();
+
+        const st_done = (try rt.promiseState(cap.promise)).?;
+        switch (st_done) {
+            .fulfilled => |vh| {
+                defer vh.release();
+                try testing.expectEqual(@as(?f64, 42), vh.number());
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    // 2. Host waitFrames(n) coroutine loop + rejection handling
+    {
+        const Timer = struct {
+            due_frame: u32,
+            resolve: zqjs.Handle,
+            reject: zqjs.Handle,
+        };
+        const HostLoop = struct {
+            frame: u32 = 0,
+            timers: std.ArrayList(Timer) = .empty,
+
+            fn waitFrames(rt_in: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, args: []const zqjs.Handle, out: *zqjs.NativeOut) zqjs.NativeError!void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                const n: u32 = @intFromFloat(args[0].number() orelse 0);
+                const cap = try rt_in.newPromise();
+                errdefer {
+                    cap.promise.release();
+                    cap.resolve.release();
+                    cap.reject.release();
+                }
+                try self.timers.append(testing.allocator, .{
+                    .due_frame = self.frame + n,
+                    .resolve = cap.resolve,
+                    .reject = cap.reject,
+                });
+                out.result = cap.promise;
+            }
+        };
+
+        var out_buf: [512]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        const rt = try zqjs.Runtime.create(testing.allocator, .{ .output = &out });
+        defer rt.destroy();
+
+        var host: HostLoop = .{};
+        defer {
+            for (host.timers.items) |t| {
+                t.resolve.release();
+                t.reject.release();
+            }
+            host.timers.deinit(testing.allocator);
+        }
+        try rt.defineGlobalFunction("waitFrames", HostLoop.waitFrames, &host);
+
+        const src =
+            \\async function worker(name, step) {
+            \\    const f1 = await waitFrames(step);
+            \\    const f2 = await waitFrames(step);
+            \\    print(name + ":" + f1 + "->" + f2);
+            \\    return f2;
+            \\}
+            \\async function catcher() {
+            \\    try {
+            \\        await waitFrames(3);
+            \\    } catch (e) {
+            \\        print("caught:" + e);
+            \\        return "recovered";
+            \\    }
+            \\}
+            \\const pA = worker("A", 1);
+            \\const pB = worker("B", 2);
+            \\const pC = catcher();
+        ;
+        const prog = try rt.compile("timers.js", src, null);
+        defer prog.destroy();
+        try rt.run(prog, null);
+
+        // Nothing printed yet: all three coroutines are suspended on host promises.
+        try testing.expectEqualStrings("", out.buffered());
+
+        while (host.frame < 5) {
+            host.frame += 1;
+            var i: usize = 0;
+            while (i < host.timers.items.len) {
+                if (host.timers.items[i].due_frame == host.frame) {
+                    const t = host.timers.orderedRemove(i);
+                    defer {
+                        t.resolve.release();
+                        t.reject.release();
+                    }
+                    if (host.frame == 3) {
+                        const msg = [_]u16{ 't', 'i', 'm', 'e', 'o', 'u', 't' };
+                        const reason = try rt.newStringUtf16(&msg);
+                        defer reason.release();
+                        const res = try rt.call(t.reject, null, &.{reason}, null);
+                        res.release();
+                    } else {
+                        const fnum = try rt.newNumber(@floatFromInt(host.frame));
+                        defer fnum.release();
+                        const res = try rt.call(t.resolve, null, &.{fnum}, null);
+                        res.release();
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            rt.collectGarbage();
+        }
+
+        try testing.expectEqual(@as(usize, 0), host.timers.items.len);
+        try testing.expectEqualStrings("A:1->2\ncaught:timeout\nB:2->4\n", out.buffered());
+    }
+
+    // 3. Limits apply to coroutines woken by host settlement, and remaining microtasks survive
+    {
+        var out_buf: [128]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        const rt = try zqjs.Runtime.create(testing.allocator, .{
+            .output = &out,
+            .limits = .{ .max_steps = 40 },
+        });
+        defer rt.destroy();
+
+        const Box = struct {
+            p1: ?zqjs.PromiseCapability = null,
+            p2: ?zqjs.PromiseCapability = null,
+            fn getP1(rt_in: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, nout: *zqjs.NativeOut) zqjs.NativeError!void {
+                const b: *@This() = @ptrCast(@alignCast(raw.?));
+                nout.result = try b.p1.?.promise.dup();
+                _ = rt_in;
+            }
+            fn getP2(rt_in: *zqjs.Runtime, raw: ?*anyopaque, _: ?zqjs.Handle, _: []const zqjs.Handle, nout: *zqjs.NativeOut) zqjs.NativeError!void {
+                const b: *@This() = @ptrCast(@alignCast(raw.?));
+                nout.result = try b.p2.?.promise.dup();
+                _ = rt_in;
+            }
+        };
+        var box: Box = .{
+            .p1 = try rt.newPromise(),
+            .p2 = try rt.newPromise(),
+        };
+        defer {
+            if (box.p1) |c| {
+                c.promise.release();
+                c.resolve.release();
+                c.reject.release();
+            }
+            if (box.p2) |c| {
+                c.promise.release();
+                c.resolve.release();
+                c.reject.release();
+            }
+        }
+        try rt.defineGlobalFunction("getP1", Box.getP1, &box);
+        try rt.defineGlobalFunction("getP2", Box.getP2, &box);
+
+        // Two coroutines await the same host promise p1: the first loops past max_steps,
+        // the second prints "second_ok".
+        const prog = try rt.compile("settle_limit.js",
+            \\async function runaway() {
+            \\    await getP1();
+            \\    let s = 0;
+            \\    for (let i = 0; i < 200; i++) s += i;
+            \\    return s;
+            \\}
+            \\async function okCoro() {
+            \\    const v = await getP1();
+            \\    print("second:" + v);
+            \\    return v;
+            \\}
+            \\runaway();
+            \\okCoro();
+        , null);
+        defer prog.destroy();
+        try rt.run(prog, null);
+
+        const n9 = try rt.newNumber(9);
+        defer n9.release();
+        var fail: zqjs.Failure = .{};
+        try testing.expectError(error.LimitExceeded, rt.call(box.p1.?.resolve, null, &.{n9}, &fail));
+        try testing.expectEqual(zqjs.Failure.Kind.limit, fail.kind);
+        try testing.expectEqual(zqjs.Limit.steps, fail.limit.?);
+        try testing.expectEqualStrings("", out.buffered());
+
+        // Settling p2 runs a fresh checkpoint, which finishes the preserved second coroutine!
+        const res = try rt.call(box.p2.?.resolve, null, &.{n9}, null);
+        res.release();
+        try testing.expectEqualStrings("second:9\n", out.buffered());
+    }
+}
+
+fn checkHostPromiseAllocFailOnce(gpa: std.mem.Allocator) !void {
+    const rt = try zqjs.Runtime.create(gpa, .{});
+    defer rt.destroy();
+
+    const cap = rt.newPromise() catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return e,
+    };
+    defer {
+        cap.promise.release();
+        cap.resolve.release();
+        cap.reject.release();
+    }
+
+    const st0 = (rt.promiseState(cap.promise) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return e,
+    }).?;
+    try testing.expect(st0 == .pending);
+
+    const val = rt.newNumber(123) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return e,
+    };
+    defer val.release();
+
+    const res = rt.call(cap.resolve, null, &.{val}, null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return e,
+    };
+    res.release();
+
+    const st1 = (rt.promiseState(cap.promise) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return e,
+    }).?;
+    switch (st1) {
+        .fulfilled => |vh| {
+            defer vh.release();
+            try testing.expectEqual(@as(?f64, 123), vh.number());
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "M29: allocation failures across newPromise, promiseState, and capability settlement" {
+    try testing.checkAllAllocationFailures(testing.allocator, checkHostPromiseAllocFailOnce, .{});
 }

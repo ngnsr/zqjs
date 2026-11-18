@@ -16,8 +16,8 @@ the runtime.
 
 | file | role |
 |---|---|
-| `src/api.zig` | public `zqjs` embedding module: `Runtime`, `Program`, `Execution`, `Handle`, `defineGlobalFunction`, `call`, `throwJs`, `Diagnostic`, `Failure`, and the re-entrant entry guard (D46–D54) |
-| `src/c_api.zig` | C11 ABI (`include/zqjs.h`, `libzqjs.a`): opaque handles, error codes, native callbacks, cooperative slices |
+| `src/api.zig` | public `zqjs` embedding module: `Runtime`, `Program`, `Execution`, `Handle`, `PromiseCapability`, `PromiseState`, `newPromise`, `promiseState`, `defineGlobalFunction`, `call`, `throwJs`, `Diagnostic`, `Failure`, and the re-entrant entry guard (D46–D54, D57) |
+| `src/c_api.zig` | C11 ABI (`include/zqjs.h`, `libzqjs.a`, ABI 1.2.0): opaque handles, error codes, native callbacks, host promises, cooperative slices |
 | `src/frontend/token.zig` | `Token` (tag + byte span + `newline_before`) and the full JS punctuator set |
 | `src/frontend/lexer.zig` | pull-based, allocation-free tokenizer. Validates numbers; finds string ends |
 | `src/frontend/ast.zig` | `Expr` and `Stmt` nodes, `Ref` (variable use), `Declarator`, `Script` |

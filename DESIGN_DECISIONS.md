@@ -1076,14 +1076,16 @@ state exactly as `Vm.markRoots` does *except* the Proto's constants: those belon
 its trace must never read the Proto. Resuming such a coroutine is the same host bug as calling a
 closure of a destroyed program (EMBEDDING.md); merely collecting is safe.
 
-## D57. Host-side promises *(M29; approved conceptually 2026-11-18)*
+## D57. Host-side promises *(M29; approved and implemented 2026-11-18)*
 For a game host, the point of `async` is `await host.waitFrames(3)` or `await host.load(…)`:
 JS awaits a promise that the **host** settles later, from its own loop. So the embedding API
 gains, in Zig and C:
-- `newPromise() → { promise, resolve, reject }` (three handles; `resolve`/`reject` are M18
-  capabilities, callable through the existing `call`);
-- `promiseState(handle) → pending | fulfilled(value handle) | rejected(value handle)` (never
-  allocates when pending);
+- `newPromise() → PromiseCapability { promise, resolve, reject }` (`zqjs_new_promise` in C;
+  three owned handles; `resolve`/`reject` are M18 capabilities, callable through the existing
+  `call`; partial mint failures roll back already-minted handles);
+- `promiseState(handle) → ?PromiseState { pending | fulfilled(Handle) | rejected(Handle) }`
+  (`zqjs_handle_promise_state` in C; `null` / `ZQJS_ERR_TYPE` on non-promise; never allocates
+  or mints when pending);
 - microtasks keep draining at the end of every outermost entry (M18), so a host `call` of
   `resolve` runs every coroutine it wakes before returning, under the same step and heap
   limits (D48, D51). A fault there is reported by that `call`, and later checkpoints continue
@@ -1248,9 +1250,11 @@ overflowed the same way before this entry.
 - Test: `tests/interpreter_test.zig` "native→JS recursion stops cleanly even when the host
   thread has a tiny stack": 256 KiB thread, budget 128 KiB, `map` and plain `async`
   recursion, both engines expect `LimitExceeded(native_stack)`. Before this entry it crashed the `interpreter_test` binary.
-- C API: `ZQJS_LIMIT_NATIVE_STACK` (12) reports the fault, but `zqjs_limits` gets no field:
+- C API: `ZQJS_LIMIT_NATIVE_STACK` (12) reports the fault, and `zqjs_limits` gets no field:
   it is embedded in the versioned `zqjs_options` before trailing fields, so a new field would
-  move them. C hosts get the default until the options struct is versioned for it.
+  move them. In ABI 1.2.0 (M29), `zqjs_options` gains a trailing `max_native_stack_bytes`
+  field (default 4 MiB, gated by `struct_size`) so C hosts can configure it while 1.0/1.1
+  callers stay binary-compatible.
 
 *Alternatives considered.*
 1. **A count of nested run loops (`max_native_depth`) with a measured cost per level.**

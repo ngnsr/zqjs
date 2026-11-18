@@ -33,7 +33,7 @@ Runtime                       owns heap, realm, handle table, root list, and eve
 - Every API call validates an internal atomic entry guard and owner thread id.
 - **At depth 0 (idle):** any public API call claims the guard as a host entry.
 - **Inside an active `NativeFn` callback (depth ≥ 1 on the owner thread):** the engine holds a callback-scoped `NativeRecord` capability on the execution context:
-  - **Sanctioned re-entrant calls (succeed):** `rt.call`, `rt.newNumber`, `rt.newBoolean`, `rt.newStringUtf16`, `rt.throwJs`, `Handle` operations (`kind`, `number`, `boolean`, `string`, `dup`, `release`), `rt.collectGarbage`, and `rt.memory`.
+  - **Sanctioned re-entrant calls (succeed):** `rt.call`, `rt.newNumber`, `rt.newBoolean`, `rt.newStringUtf16`, `rt.newObject`, `rt.newArray`, `rt.newPromise`, `rt.promiseState`, `rt.getGlobal`, `rt.getProperty`, `rt.setProperty`, `rt.getIndex`, `rt.setIndex`, `rt.throwJs`, `Handle` operations (`kind`, `number`, `boolean`, `string`, `dup`, `release`), `rt.collectGarbage`, and `rt.memory`.
   - **Top-level compilation/execution calls (return `error.Busy`):** `rt.compile`, `rt.start`, and `rt.run` return `error.Busy` without disturbing the active execution.
   - **Unsanctioned host re-entry (panics):** calling `Execution.resume`, `Execution.destroy`, `rt.defineGlobalFunction`, `Program.destroy`, or `rt.destroy` from inside a callback, re-entering from an output writer's `drain` (even during a nested `print` inside `rt.call`), or calling from another thread immediately panics:
     ```
@@ -128,9 +128,26 @@ pub const Failure = struct {
 
 ### 9. Internal Errors Poison the Runtime (E7, D49)
 A ZQJS bug must never crash the host. A failed VM defensive check, a bytecode verifier rejection after a successful compile, or `error.Internal` from a callback returns `error.Internal` with an `internal` `Failure` instead of panicking.
-- The error faults the execution like any other, and **poisons the runtime**: every later call that runs code or mints handles (`compile`, `start`, `run`, `resume`, `call`, `new*`, `dup`) returns `error.Internal` until `Runtime.destroy`.
+- The error faults the execution like any other, and **poisons the runtime**: every later call that runs code or mints handles (`compile`, `start`, `run`, `resume`, `call`, `new*`, `promiseState`, `dup`) returns `error.Internal` until `Runtime.destroy`.
 - Handle readers/releases, `collectGarbage`, `memory`, and all destroy paths stay usable, so the host can still inspect and clean up.
 - The CLI prints `internal error: <reason>` and exits with code 70; the `Failure` text itself stays the fixed `internal error`.
+
+### 10. Host Promises & Async Coroutines (`newPromise`, `promiseState`, M29, D57)
+A game or application host lets scripts `await` host events (frame timers, asset loads, network replies) by creating promises on the host side and settling them later from its own loop:
+
+- **Creating a host promise:**
+  - **Zig:** `const cap = try rt.newPromise()` returns `PromiseCapability{ .promise, .resolve, .reject }`. All three handles are owned by the caller; inside a `NativeFn`, assign `out.result = cap.promise` to transfer `promise` to the script and keep `cap.resolve` / `cap.reject` until settlement.
+  - **C ABI:** `zqjs_new_promise(rt, &promise, &resolve, &reject)` mints three owned handles.
+  - If handle creation fails midway (e.g. `Limits.max_handles` or `OutOfMemory`), any already-minted handles are rolled back automatically.
+- **Inspecting promise state:**
+  - **Zig:** `try rt.promiseState(h)` returns `?PromiseState` (`null` if `h` is not a Promise; `.pending`, `.{ .fulfilled = val_h }`, or `.{ .rejected = reason_h }`). `.pending` never allocates or mints a handle; `.fulfilled` and `.rejected` mint a new owned `Handle` (`h` itself is borrowed).
+  - **C ABI:** `zqjs_handle_promise_state(rt, h, &state, &opt_val)` returns `ZQJS_ERR_TYPE` if `h` is not a Promise, sets `state` to `ZQJS_PROMISE_PENDING` / `ZQJS_PROMISE_FULFILLED` / `ZQJS_PROMISE_REJECTED`, and when settled writes a newly-minted handle into `*opt_val` (if `opt_val != NULL`).
+- **Rules for settling promises from the host (D57):**
+  - **Serialised entry (E2, D52):** calls into a runtime must be serialised — one thread at a time, with no unsanctioned re-entry outside an active `NativeFn` callback.
+  - **Settlement via ordinary `call`:** the host settles promises only through ordinary API calls (`rt.call` / `zqjs_runtime_call` on the `resolve` or `reject` capability handle). Calling `resolve` or `reject` on an already-settled promise is a no-op returning `undefined`.
+  - **Outermost microtask checkpoint:** settling a promise enqueues reactions and `.await_resume` jobs, and drains the microtask queue at the outermost API checkpoint **before that `call` returns**. Every `async` coroutine and `.then` reaction woken by the settlement runs before control returns to the host.
+  - **Limits apply to resumed coroutines:** `max_steps`, `max_heap_bytes`, `max_call_depth`, and `max_native_stack_bytes` apply to all coroutines and callbacks that a settlement resumes.
+  - **Fault reporting & pending state:** a fault (`LimitExceeded`, `OutOfMemory`, `HostError`, `Unsupported`, `Internal`) during that checkpoint is reported directly by the host `call` that triggered it. An uncatchable fault consumes the active microtask job, leaves any affected promises pending (as in M18), and preserves the remaining microtask queue for a subsequent checkpoint. Keep the originating `Program` alive while any `async` coroutines started from it remain pending.
 
 ---
 
@@ -226,18 +243,18 @@ Every C ABI function returns `zqjs_status` rather than panicking or unwinding ac
 - **`host_message` lifetime:** `out->host_message` (`out->host_message_len`) is borrowed only until `zqjs_native_fn` returns and is copied into ZQJS's fixed 256-byte NUL-terminated `zqjs_failure.message` buffer (empty `host_message` on `ZQJS_ERR_HOST` defaults to `"host error"`).
 - **Error mapping:** `ZQJS_ERR_THROWN` (paired with `zqjs_runtime_throw_js`) → `ZQJS_FAILURE_THROWN`; `ZQJS_ERR_HOST` → `ZQJS_FAILURE_HOST`; `ZQJS_ERR_LIMIT_EXCEEDED` → `ZQJS_FAILURE_LIMIT`; `ZQJS_ERR_UNSUPPORTED` → `ZQJS_FAILURE_UNSUPPORTED`; `ZQJS_ERR_OUT_OF_MEMORY` → `ZQJS_FAILURE_OUT_OF_MEMORY`; `ZQJS_ERR_INTERNAL` → `ZQJS_FAILURE_INTERNAL` (poisons runtime).
 
-#### ABI Versioning & `zqjs_options` Compatibility (M12.3)
-- **`ZQJS_ABI_VERSION` / `zqjs_abi_version()`:** encoded as `(major << 16) | (minor << 8) | patch` (`1.1.0` = `0x00010100u`). Major bumps only on breaking layout/signature/semantic changes; minor bumps on backward-compatible additive changes (new functions or trailing `zqjs_options` fields). Hosts should check `(zqjs_abi_version() >> 16) == ZQJS_ABI_MAJOR` at startup.
+#### ABI Versioning & `zqjs_options` Compatibility (M12.3, M29)
+- **`ZQJS_ABI_VERSION` / `zqjs_abi_version()`:** encoded as `(major << 16) | (minor << 8) | patch` (`1.2.0` = `0x00010200u`). Major bumps only on breaking layout/signature/semantic changes; minor bumps on backward-compatible additive changes (new functions or trailing `zqjs_options` fields). Hosts should check `(zqjs_abi_version() >> 16) == ZQJS_ABI_MAJOR` at startup.
 - **`zqjs_options.struct_size`:**
-  - Always initialize with `zqjs_options_default()`, which sets `struct_size = sizeof(zqjs_options)` and populates all defaults (including `random_seed`).
+  - Always initialize with `zqjs_options_default()`, which sets `struct_size = sizeof(zqjs_options)` and populates all defaults (including `random_seed` and `max_native_stack_bytes`).
   - Passing `NULL` to `zqjs_runtime_create` uses `zqjs_options_default()`.
-  - Smaller/older structs (`>= offsetof(zqjs_options, clock_ctx) + sizeof(void *)`) are accepted; omitted trailing fields (such as `random_seed`) keep their defaults.
+  - Smaller/older structs (`>= offsetof(zqjs_options, clock_ctx) + sizeof(void *)`) are accepted; omitted trailing fields (`random_seed`, `max_native_stack_bytes`) keep their defaults (`zqjs_limits` layout is unchanged across 1.0–1.2).
   - Zero, truncated, or oversized structs (`struct_size > sizeof(zqjs_options)`) are rejected with `ZQJS_ERR_INVALID_ARG`.
 
-#### Structured Handles & Global Access (M12.2–M12.3)
-Both APIs support creating and inspecting JS objects, dense arrays, and runtime globals without flattening values across the boundary:
-- **Zig (`Runtime`):** `newObject`, `newArray`, `getGlobal`, `getProperty`, `setProperty`, `getIndex`, `setIndex`.
-- **C ABI:** `zqjs_new_object`, `zqjs_new_array`, `zqjs_runtime_get_global`, `zqjs_handle_get_property`, `zqjs_handle_set_property`, `zqjs_handle_get_index`, `zqjs_handle_set_index`.
+#### Structured Handles, Promises & Global Access (M12.2–M12.3, M29)
+Both APIs support creating and inspecting JS objects, dense arrays, host promises, and runtime globals without flattening values across the boundary:
+- **Zig (`Runtime`):** `newObject`, `newArray`, `newPromise`, `promiseState`, `getGlobal`, `getProperty`, `setProperty`, `getIndex`, `setIndex`.
+- **C ABI:** `zqjs_new_object`, `zqjs_new_array`, `zqjs_new_promise`, `zqjs_handle_promise_state`, `zqjs_runtime_get_global`, `zqjs_handle_get_property`, `zqjs_handle_set_property`, `zqjs_handle_get_index`, `zqjs_handle_set_index`.
 - **Ownership:** every returned handle is **owned** by the caller and must be released with `zqjs_handle_release` / `Handle.release()`. Input `obj` and `val` handles are **borrowed** and never consumed.
 - **Semantics:** missing properties and out-of-range array indices return an owned `undefined` handle; `setIndex` enforces D13 dense arrays (`index == length` appends, `index > length` fails with `ZQJS_ERR_UNSUPPORTED`); `getGlobal` resolves runtime globals (`Math`, `Array`, `Object`, host-registered natives, `undefined`, `NaN`, `Infinity`) while preserving E3 fresh per-execution top-level script bindings.
 

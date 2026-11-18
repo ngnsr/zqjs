@@ -586,6 +586,334 @@ static void test_m12_3_abi_version_options_and_handles(void) {
     assert(zqjs_runtime_destroy(rt_def) == ZQJS_OK);
 }
 
+typedef struct frame_timer {
+    bool active;
+    int due_frame;
+    bool should_reject;
+    zqjs_handle resolve;
+    zqjs_handle reject;
+} frame_timer;
+
+#define MAX_TIMERS 32
+
+typedef struct frame_host {
+    int current_frame;
+    frame_timer timers[MAX_TIMERS];
+    zqjs_handle script_promises[4];
+    size_t script_promise_count;
+} frame_host;
+
+static zqjs_status native_wait_frames(
+    zqjs_runtime *rt,
+    void *raw_ctx,
+    const zqjs_handle *opt_this,
+    const zqjs_handle *args,
+    size_t argc,
+    zqjs_native_out *out
+) {
+    (void)opt_this;
+    frame_host *host = (frame_host *)raw_ctx;
+    double n = 1.0;
+    if (argc >= 1) {
+        zqjs_status st = zqjs_handle_number(rt, args[0], &n);
+        if (st != ZQJS_OK) return st;
+    }
+    bool reject_flag = false;
+    if (argc >= 2) {
+        zqjs_status st = zqjs_handle_boolean(rt, args[1], &reject_flag);
+        if (st != ZQJS_OK) return st;
+    }
+
+    int slot = -1;
+    for (int i = 0; i < MAX_TIMERS; i++) {
+        if (!host->timers[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        out->host_message = "timer table full";
+        out->host_message_len = 16;
+        return ZQJS_ERR_HOST;
+    }
+
+    zqjs_handle p = ZQJS_HANDLE_NULL;
+    zqjs_handle res = ZQJS_HANDLE_NULL;
+    zqjs_handle rej = ZQJS_HANDLE_NULL;
+    zqjs_status st = zqjs_new_promise(rt, &p, &res, &rej);
+    if (st != ZQJS_OK) return st;
+
+    host->timers[slot].active = true;
+    host->timers[slot].due_frame = host->current_frame + (int)n;
+    host->timers[slot].should_reject = reject_flag;
+    host->timers[slot].resolve = res;
+    host->timers[slot].reject = rej;
+
+    out->has_result = true;
+    out->result = p;
+    return ZQJS_OK;
+}
+
+static zqjs_status native_track_promise(
+    zqjs_runtime *rt,
+    void *raw_ctx,
+    const zqjs_handle *opt_this,
+    const zqjs_handle *args,
+    size_t argc,
+    zqjs_native_out *out
+) {
+    (void)opt_this;
+    (void)out;
+    frame_host *host = (frame_host *)raw_ctx;
+    if (argc < 1 || host->script_promise_count >= 4) return ZQJS_ERR_HOST;
+    zqjs_handle duped = ZQJS_HANDLE_NULL;
+    zqjs_status st = zqjs_handle_dup(rt, args[0], &duped);
+    if (st != ZQJS_OK) return st;
+    host->script_promises[host->script_promise_count++] = duped;
+    return ZQJS_OK;
+}
+
+/* 7. M29 host promises (60-frame timer loop, leak & handle checks) + D60 C ABI 1.2.0 */
+static void test_m29_host_promises_60_frames_and_d60_native_stack(void) {
+    assert(ZQJS_ABI_VERSION == 0x00010200u);
+    assert(zqjs_abi_version() == 0x00010200u);
+
+    /* 7a. 1.1 struct_size backward compatibility (without max_native_stack_bytes) */
+    typedef struct zqjs_options_v1_1 {
+        uint32_t struct_size;
+        uint32_t reserved;
+        zqjs_limits limits;
+        zqjs_output_fn output_fn;
+        void *output_ctx;
+        zqjs_clock_fn clock_fn;
+        void *clock_ctx;
+        uint64_t random_seed;
+    } zqjs_options_v1_1;
+
+    zqjs_options def = zqjs_options_default();
+    assert(def.max_native_stack_bytes == 4u * 1024u * 1024u);
+
+    zqjs_options_v1_1 v11;
+    v11.struct_size = (uint32_t)sizeof(zqjs_options_v1_1);
+    v11.reserved = 0;
+    v11.limits = def.limits;
+    v11.output_fn = NULL;
+    v11.output_ctx = NULL;
+    v11.clock_fn = NULL;
+    v11.clock_ctx = NULL;
+    v11.random_seed = 12345ull;
+
+    zqjs_runtime *rt_v11 = NULL;
+    assert(zqjs_runtime_create((const zqjs_options *)&v11, &rt_v11) == ZQJS_OK);
+    assert(zqjs_runtime_destroy(rt_v11) == ZQJS_OK);
+
+    /* 7b. D60: C host configuring max_native_stack_bytes faults cleanly with ZQJS_LIMIT_NATIVE_STACK */
+    zqjs_options stack_opts = zqjs_options_default();
+    stack_opts.max_native_stack_bytes = 64u * 1024u;
+    zqjs_runtime *rt_stack = NULL;
+    assert(zqjs_runtime_create(&stack_opts, &rt_stack) == ZQJS_OK);
+
+    const char *rec_src = "function f(n) { return [n].map(x => f(x + 1)); } f(0);";
+    zqjs_diagnostic diag;
+    zqjs_program *rec_prog = NULL;
+    assert(zqjs_runtime_compile(rt_stack, "rec.js", 6, rec_src, strlen(rec_src), &diag, &rec_prog) == ZQJS_OK);
+    zqjs_failure fail;
+    assert(zqjs_runtime_run(rt_stack, rec_prog, &fail) == ZQJS_ERR_LIMIT_EXCEEDED);
+    assert(fail.kind == ZQJS_FAILURE_LIMIT);
+    assert(fail.limit == ZQJS_LIMIT_NATIVE_STACK);
+    assert(zqjs_program_destroy(rec_prog) == ZQJS_OK);
+    assert(zqjs_runtime_destroy(rt_stack) == ZQJS_OK);
+
+    /* 7c. zqjs_new_promise & zqjs_handle_promise_state validation and handle rollback */
+    zqjs_options cap_opts = zqjs_options_default();
+    cap_opts.limits.max_handles = 4;
+    zqjs_runtime *rt_cap = NULL;
+    assert(zqjs_runtime_create(&cap_opts, &rt_cap) == ZQJS_OK);
+
+    zqjs_handle p = ZQJS_HANDLE_NULL, res = ZQJS_HANDLE_NULL, rej = ZQJS_HANDLE_NULL;
+    assert(zqjs_new_promise(NULL, &p, &res, &rej) == ZQJS_ERR_INVALID_ARG);
+    assert(zqjs_new_promise(rt_cap, NULL, &res, &rej) == ZQJS_ERR_INVALID_ARG);
+    assert(zqjs_new_promise(rt_cap, &p, NULL, &rej) == ZQJS_ERR_INVALID_ARG);
+    assert(zqjs_new_promise(rt_cap, &p, &res, NULL) == ZQJS_ERR_INVALID_ARG);
+
+    assert(zqjs_new_promise(rt_cap, &p, &res, &rej) == ZQJS_OK);
+    zqjs_promise_state pst = ZQJS_PROMISE_FULFILLED;
+    zqjs_handle pval = ZQJS_HANDLE_NULL;
+    assert(zqjs_handle_promise_state(rt_cap, p, NULL, &pval) == ZQJS_ERR_INVALID_ARG);
+    assert(zqjs_handle_promise_state(rt_cap, ZQJS_HANDLE_NULL, &pst, &pval) == ZQJS_ERR_STALE_HANDLE);
+    assert(zqjs_handle_promise_state(rt_cap, res, &pst, &pval) == ZQJS_ERR_TYPE);
+
+    /* Fill the 4th slot so 0 slots remain free: pending state check still succeeds without allocating */
+    zqjs_handle fourth = ZQJS_HANDLE_NULL;
+    assert(zqjs_new_number(rt_cap, 7.0, &fourth) == ZQJS_OK);
+    assert(zqjs_handle_promise_state(rt_cap, p, &pst, &pval) == ZQJS_OK);
+    assert(pst == ZQJS_PROMISE_PENDING);
+    assert(pval.owner == NULL);
+
+    /* Release fourth (1 free slot left): zqjs_new_promise needs 3 slots, fails and rolls back */
+    assert(zqjs_handle_release(rt_cap, fourth) == ZQJS_OK);
+    zqjs_handle p2 = ZQJS_HANDLE_NULL, res2 = ZQJS_HANDLE_NULL, rej2 = ZQJS_HANDLE_NULL;
+    assert(zqjs_new_promise(rt_cap, &p2, &res2, &rej2) == ZQJS_ERR_LIMIT_EXCEEDED);
+    assert(p2.owner == NULL && res2.owner == NULL && rej2.owner == NULL);
+
+    /* The 1 free slot is still available to mint the settlement argument */
+    assert(zqjs_new_number(rt_cap, 55.0, &fourth) == ZQJS_OK);
+    assert(zqjs_handle_release(rt_cap, rej) == ZQJS_OK);
+    zqjs_handle call_ret = ZQJS_HANDLE_NULL;
+    assert(zqjs_runtime_call(rt_cap, res, NULL, &fourth, 1, &fail, &call_ret) == ZQJS_OK);
+    assert(zqjs_handle_release(rt_cap, call_ret) == ZQJS_OK);
+    assert(zqjs_handle_release(rt_cap, fourth) == ZQJS_OK);
+    assert(zqjs_handle_release(rt_cap, res) == ZQJS_OK);
+
+    /* Inspect fulfilled state with NULL out_value and with non-NULL out_value */
+    assert(zqjs_handle_promise_state(rt_cap, p, &pst, NULL) == ZQJS_OK);
+    assert(pst == ZQJS_PROMISE_FULFILLED);
+    assert(zqjs_handle_promise_state(rt_cap, p, &pst, &pval) == ZQJS_OK);
+    assert(pst == ZQJS_PROMISE_FULFILLED);
+    double fulfilled_num = 0.0;
+    assert(zqjs_handle_number(rt_cap, pval, &fulfilled_num) == ZQJS_OK && fulfilled_num == 55.0);
+    assert(zqjs_handle_release(rt_cap, pval) == ZQJS_OK);
+    assert(zqjs_handle_release(rt_cap, p) == ZQJS_OK);
+    assert(zqjs_runtime_destroy(rt_cap) == ZQJS_OK);
+
+    /* 7d. 60-frame game loop with async scripts awaiting frame timers, checking leaks & handle counts */
+    capture_buf cap = { .len = 0, .reenter_rt = NULL, .reenter_status = ZQJS_OK };
+    cap.data[0] = '\0';
+
+    const uint32_t handle_cap = 16;
+    zqjs_options loop_opts = zqjs_options_default();
+    loop_opts.limits.max_handles = handle_cap;
+    loop_opts.output_fn = test_output;
+    loop_opts.output_ctx = &cap;
+
+    zqjs_runtime *rt = NULL;
+    assert(zqjs_runtime_create(&loop_opts, &rt) == ZQJS_OK);
+
+    frame_host host;
+    memset(&host, 0, sizeof(host));
+
+    assert(zqjs_runtime_define_global_function(rt, "waitFrames", 10, native_wait_frames, &host) == ZQJS_OK);
+    assert(zqjs_runtime_define_global_function(rt, "trackPromise", 12, native_track_promise, &host) == ZQJS_OK);
+
+    /* Warm the realm and handle table before recording post-init baseline memory */
+    zqjs_handle warm_p = ZQJS_HANDLE_NULL, warm_res = ZQJS_HANDLE_NULL, warm_rej = ZQJS_HANDLE_NULL;
+    assert(zqjs_new_promise(rt, &warm_p, &warm_res, &warm_rej) == ZQJS_OK);
+    assert(zqjs_handle_release(rt, warm_p) == ZQJS_OK);
+    assert(zqjs_handle_release(rt, warm_res) == ZQJS_OK);
+    assert(zqjs_handle_release(rt, warm_rej) == ZQJS_OK);
+    assert(zqjs_runtime_collect_garbage(rt) == ZQJS_OK);
+    zqjs_memory base_mem;
+    assert(zqjs_runtime_memory(rt, &base_mem) == ZQJS_OK);
+
+    const char *game_src =
+        "async function patrol() {\n"
+        "    let sum = 0;\n"
+        "    for (let i = 0; i < 12; i++) {\n"
+        "        const f = await waitFrames(5, false);\n"
+        "        sum += f;\n"
+        "    }\n"
+        "    return sum;\n"
+        "}\n"
+        "async function burst() {\n"
+        "    const a = await waitFrames(20, false);\n"
+        "    let recovered = 0;\n"
+        "    try {\n"
+        "        await waitFrames(15, true);\n"
+        "    } catch (e) {\n"
+        "        recovered = e;\n"
+        "    }\n"
+        "    const b = await waitFrames(25, false);\n"
+        "    return a + recovered + b;\n"
+        "}\n"
+        "trackPromise(patrol());\n"
+        "trackPromise(burst());\n";
+
+    zqjs_program *prog = NULL;
+    assert(zqjs_runtime_compile(rt, "loop60.js", 9, game_src, strlen(game_src), &diag, &prog) == ZQJS_OK);
+
+    assert(zqjs_runtime_run(rt, prog, &fail) == ZQJS_OK);
+    assert(host.script_promise_count == 2);
+
+    /* Both script promises are pending before the 60-frame loop runs */
+    for (size_t i = 0; i < host.script_promise_count; i++) {
+        assert(zqjs_handle_promise_state(rt, host.script_promises[i], &pst, NULL) == ZQJS_OK);
+        assert(pst == ZQJS_PROMISE_PENDING);
+    }
+
+    for (int frame = 1; frame <= 60; frame++) {
+        host.current_frame = frame;
+        /* Settle all timers due on this frame (snapshot indices active at start of frame
+           so timers registered by resumed coroutines for future frames are not settled early) */
+        for (int i = 0; i < MAX_TIMERS; i++) {
+            if (host.timers[i].active && host.timers[i].due_frame == frame) {
+                host.timers[i].active = false;
+                zqjs_handle res_h = host.timers[i].resolve;
+                zqjs_handle rej_h = host.timers[i].reject;
+                bool should_rej = host.timers[i].should_reject;
+                host.timers[i].resolve = ZQJS_HANDLE_NULL;
+                host.timers[i].reject = ZQJS_HANDLE_NULL;
+
+                zqjs_handle fnum = ZQJS_HANDLE_NULL;
+                zqjs_handle ret = ZQJS_HANDLE_NULL;
+                assert(zqjs_new_number(rt, (double)frame, &fnum) == ZQJS_OK);
+                zqjs_handle target_cap = should_rej ? rej_h : res_h;
+                assert(zqjs_runtime_call(rt, target_cap, NULL, &fnum, 1, &fail, &ret) == ZQJS_OK);
+                assert(zqjs_handle_release(rt, ret) == ZQJS_OK);
+                assert(zqjs_handle_release(rt, fnum) == ZQJS_OK);
+                assert(zqjs_handle_release(rt, res_h) == ZQJS_OK);
+                assert(zqjs_handle_release(rt, rej_h) == ZQJS_OK);
+            }
+        }
+    }
+
+    /* Verify all timers fired and both script promises fulfilled with exact expected values */
+    for (int i = 0; i < MAX_TIMERS; i++) {
+        assert(!host.timers[i].active);
+    }
+
+    /* patrol(): 5 + 10 + 15 + ... + 60 = 5 * 78 = 390 */
+    assert(zqjs_handle_promise_state(rt, host.script_promises[0], &pst, &pval) == ZQJS_OK);
+    assert(pst == ZQJS_PROMISE_FULFILLED);
+    double v0 = 0.0;
+    assert(zqjs_handle_number(rt, pval, &v0) == ZQJS_OK && v0 == 390.0);
+    assert(zqjs_handle_release(rt, pval) == ZQJS_OK);
+
+    /* burst(): 20 + 35 (rejected at frame 35) + 60 = 115 */
+    assert(zqjs_handle_promise_state(rt, host.script_promises[1], &pst, &pval) == ZQJS_OK);
+    assert(pst == ZQJS_PROMISE_FULFILLED);
+    double v1 = 0.0;
+    assert(zqjs_handle_number(rt, pval, &v1) == ZQJS_OK && v1 == 115.0);
+    assert(zqjs_handle_release(rt, pval) == ZQJS_OK);
+
+    /* Release the tracked script promise handles, destroy program, and collect garbage */
+    for (size_t i = 0; i < host.script_promise_count; i++) {
+        assert(zqjs_handle_release(rt, host.script_promises[i]) == ZQJS_OK);
+    }
+    assert(zqjs_program_destroy(prog) == ZQJS_OK);
+    assert(zqjs_runtime_collect_garbage(rt) == ZQJS_OK);
+
+    /* Verify zero leaked handles: all 16 slots of `max_handles = 16` can be minted concurrently */
+    zqjs_handle verify_handles[16];
+    for (uint32_t i = 0; i < handle_cap; i++) {
+        assert(zqjs_new_number(rt, (double)i, &verify_handles[i]) == ZQJS_OK);
+    }
+    zqjs_handle extra = ZQJS_HANDLE_NULL;
+    assert(zqjs_new_number(rt, 99.0, &extra) == ZQJS_ERR_LIMIT_EXCEEDED);
+    for (uint32_t i = 0; i < handle_cap; i++) {
+        assert(zqjs_handle_release(rt, verify_handles[i]) == ZQJS_OK);
+    }
+
+    assert(zqjs_runtime_collect_garbage(rt) == ZQJS_OK);
+    zqjs_memory end_mem;
+    assert(zqjs_runtime_memory(rt, &end_mem) == ZQJS_OK);
+    /* After program destroy and major GC, heap bytes return to exact post-realm-init baseline,
+       and handle_bytes matches the 16-slot cap without growing */
+    assert(end_mem.heap_bytes == base_mem.heap_bytes);
+    assert(end_mem.handle_bytes == base_mem.handle_bytes);
+
+    assert(zqjs_runtime_destroy(rt) == ZQJS_OK);
+}
+
 int main(void) {
     capture_buf cap = { .len = 0, .reenter_rt = NULL, .reenter_status = ZQJS_OK };
     cap.data[0] = '\0';
@@ -643,6 +971,7 @@ int main(void) {
     test_host_js_host_round_trip();
     test_mid_run_program_destroy_and_runtime_destroy_with_children();
     test_m12_3_abi_version_options_and_handles();
+    test_m29_host_promises_60_frames_and_d60_native_stack();
 
     return 0;
 }

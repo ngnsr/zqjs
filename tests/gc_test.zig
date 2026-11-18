@@ -19,7 +19,7 @@ const scanned = [_][]const u8{
     "src/runtime/builtins.zig",
     "src/runtime/ops.zig",
     "src/vm/vm.zig",
-    "src/interp/treewalk.zig",
+    "src/interp/machine.zig",
     "src/bytecode/compiler.zig",
 };
 
@@ -1756,5 +1756,57 @@ test "M26: spreading and destructuring large arrays under GC stress" {
         var r = try support.run(testing.allocator, src, .{}, engine, .normal);
         defer r.deinit(testing.allocator);
         try testing.expectEqualStrings("0 1 299 45150\n", r.out);
+    }
+}
+
+test "M28a: GC stress during deep unwind through several finally tasks" {
+    const src =
+        \\let trace = [];
+        \\function deepReturn() {
+        \\    let r = { tag: "ret" + 1 };
+        \\    try {
+        \\        try {
+        \\            try {
+        \\                try {
+        \\                    return r;
+        \\                } finally {
+        \\                    trace.push({ f: "f1", s: "a" + 1 }.f);
+        \\                }
+        \\            } finally {
+        \\                trace.push({ f: "f2", s: "b" + 2 }.f);
+        \\            }
+        \\        } finally {
+        \\            trace.push({ f: "f3", s: "c" + 3 }.f);
+        \\        }
+        \\    } finally {
+        \\        trace.push({ f: "f4", s: "d" + 4 }.f);
+        \\    }
+        \\}
+        \\function deepThrow() {
+        \\    try {
+        \\        try {
+        \\            try {
+        \\                throw { msg: "err" + 42 };
+        \\            } finally {
+        \\                trace.push("t1");
+        \\            }
+        \\        } finally {
+        \\            trace.push("t2");
+        \\        }
+        \\    } finally {
+        \\        trace.push("t3");
+        \\    }
+        \\}
+        \\let v = deepReturn();
+        \\try {
+        \\    deepThrow();
+        \\} catch (e) {
+        \\    print(v.tag, e.msg, trace.join(","));
+        \\}
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("ret1 err42 f1,f2,f3,f4,t1,t2,t3\n", got);
     }
 }

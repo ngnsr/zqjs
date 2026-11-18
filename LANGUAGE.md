@@ -249,8 +249,8 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
   TDZ `ReferenceError`. Rest parameters must be last, have no default, and have no trailing comma.
 - **Limits:** more than `Limits.max_call_depth` (default 10,000) active calls →
   `LimitExceeded(call_depth)` (node: RangeError at about 11,000). The VM also limits the stack
-  slots reserved by all active frames (`max_stack_slots`), the tree-walker its native recursion
-  (`max_interpreter_depth`); which limit a runaway recursion hits first is engine-specific.
+  slots reserved by all active frames (`max_stack_slots`), the tree-walker its evaluation
+  nesting (`max_interpreter_depth`); which limit a runaway recursion hits first is engine-specific.
 
 ### Operators (M3), as in JavaScript
 - Operands are evaluated left to right; `&&`/`||`/`??` short-circuit and return an operand value (`??` only evaluates the right side when the left is `null` or `undefined`). Optional chaining (`?.`) short-circuits the rest of the chain to `undefined` (`true` for `delete`) when the base is `null` or `undefined`, preserving `this` on optional method calls.

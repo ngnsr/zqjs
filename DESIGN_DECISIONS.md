@@ -830,3 +830,272 @@ lands. That comes from allocation never collecting (D7), and was true in M8 too.
 ## D54. Language conversions unchanged; uniform string handles *(M9.1)*
 **Decision.** D40 stands: a `valueOf`/`toString` that is not the built-in native remains `Unsupported(user_conversion)`. Language semantics do not change in the same milestone that adds embedding; the re-entrancy machinery makes the change *cheap*, which is why it is recorded here as deliberate, not forgotten.
 **String handles.** Strings get handles like every other value (uniform model): a string token exists to pass the string back into JS safely and to survive collections. `Handle.string(buf)` copies the UTF-16 units out **without allocating** (no `OutOfMemory`), returns the string's **full length** (a too-small `buf` truncates visibly, `len > buf.len`), and signals a wrong-kind handle separately (`null`). Numbers and booleans read the same way (`?f64`/`?bool`, null = wrong kind); leaf reads never allocate (Q10).
+
+## D55. `try…finally`: a completion record in hidden slots, not subroutines *(M27; approved 2026-11-18 with the clarifications at the end)*
+**Decision (VM).** A `finally` block is compiled **once**, at one join point, and its exits
+are routed through two hidden local slots of the enclosing frame (allocated like for-of's
+`iter_slot`): `pending_kind` (a number) and `pending_value` (a Value). Every way out of the
+protected region (`try` block, and `catch` block when present) is lowered to "set the record,
+jump to the finally":
+- falling off the end: `kind = normal`;
+- `return e` (in the region, not inside a nested function): evaluate `e`, `value = e`,
+  `kind = return`;
+- `break`/`continue` whose target loop or switch is *outside* the region: `kind = jump_i`, one
+  `i` per distinct target (the compiler numbers them per `finally`);
+- a JS exception: a catch-all entry in `Proto.handlers` covering the whole region (the `catch`
+  block included) with `has_binding = true`; its handler code stores the caught value,
+  `kind = throw`.
+
+After the `finally` body, a dispatch chain (`get_local kind; push_const k; strict_eq;
+jump_if_false next; …`) re-performs the pending completion **in the enclosing context**: the
+compiler emits an ordinary `return pending_value`, `break`/`continue` to target `i`, or `throw
+pending_value` there. So nested `finally` blocks compose by plain recursion: a `return` that
+crosses three `finally` blocks becomes "record, jump" three times. If the `finally` body
+completes abruptly itself (its own `return`, `break`, `throw`), that completion simply wins and
+the record is dropped, as in the spec. `try {…} catch {…} finally {…}` is `try { try {…} catch
+{…} } finally {…}`. Both slots are cleared (`clear_local`) after dispatch so a value isn't
+kept alive past the statement.
+
+**No new control-flow instructions, no verifier changes.** Every jump is static, so D33's
+verifier and `max_stack` accounting work unchanged; the handler entry reuses M11.2's format.
+Only `throw` of a stored value is needed, which `throw` already does. Code size is linear in
+the source (the body is emitted once; each crossing adds a few instructions).
+
+*Alternatives considered.* (1) **Inline duplication** of the `finally` body at every exit
+(simple, but exponential in nesting depth: a `finally` containing a `try…finally` is copied at
+each outer exit). (2) **QuickJS-style `gosub`/`ret`** with a return pc on the operand stack:
+linear code, but `ret` is a computed jump, so the verifier would have to model subroutines
+(reachability and equal stack depth at every `gosub` site), and a pc in the operand stack is a
+non-Value the GC and `-Dstack-stress` would have to know about. The completion record needs
+neither, and it keeps the pending state in **frame slots**, which matters for D56: a frame
+suspended by `await` inside a `try` with a pending `return` keeps that state with no extra
+work.
+
+**Decision (tree-walker).** `execTry` runs the region; it captures either a `Completion`
+(D29: normal, break, continue, return — the return value is already in the interpreter's
+return slot) or `error.Thrown`, in which case it takes the value with `catchValue()` and roots
+it on the shadow stack. It runs the `finally` block; an abrupt completion or error from the
+`finally` wins; otherwise it re-performs the saved one (`throwValue(saved)` for an exception,
+restoring the saved return value for `return`).
+
+**Uncatchable faults skip `finally`.** `LimitExceeded`, `OutOfMemory`, `Unsupported` and
+`Internal` are not JS exceptions (M11.2); they already skip `catch` and unwind to the host, and
+they skip `finally` too: the execution is over, and running user code after a budget or memory
+fault would defeat the limit. Same rule as V8's termination. Documented in LANGUAGE.md.
+
+**Tests.** Node-differential tests for every exit kind crossing 1–3 nested `finally` blocks
+(return value overridden by `finally`'s return, `break` out of `finally`, exceptions replaced
+by exceptions thrown in `finally`, `continue` in loops, `switch`); closures created in the
+region; per-iteration bindings; a timing-ratio test that deep nesting compiles linearly; an
+allocation-failure test; and a check that `LimitExceeded` inside `try` does *not* run
+`finally`.
+
+**Clarifications (review, 2026-11-18).**
+1. **The record is cleared on every way out of the `finally` body**, not only after dispatch.
+   A `return`, `break` or `continue` that leaves the body emits `clear_local` for both slots
+   before its jump or return, because the compiler knows it is inside that body. An exception
+   leaving the body goes through a second catch-all handler covering exactly the body; its code
+   clears both slots and rethrows. So a frame that keeps running after an abrupt `finally` never
+   retains `pending_value`. Leaving the frame frees its slots anyway.
+2. **Handler order and ranges.** `Proto.handlers` is innermost-first and `unwind` takes the
+   first range that matches (M11.2). With `try {A} catch (e) {B} finally {C}`:
+   - the inner `catch` handler covers exactly `A` and is appended first, because the inner
+     statement is compiled first;
+   - the `finally` handler covers `A` and `B` and is appended after it, so an exception in `A`
+     reaches the `catch` first and the `finally` handler only sees what escapes `A`+`B`;
+   - neither range covers the handler code, `C`, or the dispatch chain, so an exception thrown
+     by `C` or by the dispatch's rethrow never re-enters its own `finally`.
+   The verifier already checks that ranges and `catch_pc` are in bounds. M27 adds a compiler
+   assertion that a `finally` handler's range never contains its own `catch_pc`.
+3. **Which jumps cross a `finally`.** The compiler keeps one stack of control contexts: loops,
+   `switch` blocks and `finally` regions, in nesting order. A `break`/`continue` resolves its
+   target, and the `finally` regions pushed *after* that target are the ones it crosses. If
+   there are none, it is a plain jump. Otherwise it records `jump_i` in the *innermost* crossed
+   region and jumps to its `finally`. That region's dispatch re-performs the same `break` in its
+   own context, where the same rule finds the next crossed region, if any. A `return` crosses
+   every `finally` region of the current function. A `break` whose target loop is inside the
+   protected region crosses nothing. Tests: `while (true) { try { break; } finally { … } }`, a
+   labelled-free nesting of loop / switch / three `finally` levels with `break`, `continue` and
+   `return` from the innermost, and a `continue` that crosses one `finally` but not another.
+
+## D56. `async`/`await` on the VM: one coroutine VM per async call *(M28; architecture accepted 2026-11-18, invariants added below; tree-walker decision open)*
+**What a suspension is.** `await` is only legal directly in an async function's own body (not
+in a nested non-async function, not at script top level: there, `await` stays
+`Unsupported(syntax)`, a restriction like D21's, since scripts have no top-level await and
+using `await` as an identifier is sloppy-only). So at an `await`, the suspending code is
+always **frame 0 of the async call**, at an instruction boundary, with no native call in
+flight and no nested VM above it. Nothing below that frame has to be preserved.
+
+**Decision: each async call runs on its own VM (a coroutine).** Calling an async closure,
+from any VM or from a native (`callCallable`), does not push a frame on the caller's VM.
+Instead the engine:
+1. creates the result promise `P` and a heap object `Coroutine { vm: *Vm, promise: *Object,
+   state: running | suspended | done }`, whose VM runs the closure as frame 0, exactly as D51's
+   nested VMs do (`nested = true`, sharing the current execution context: one budget, one
+   call-depth counter, one guard);
+2. runs it synchronously until it finishes or reaches `await`;
+3. returns `P` to the caller, which never sees the coroutine.
+
+To the caller this behaves like a native call (D35 precision at the call boundary). D51's
+machinery is reused unchanged: the coroutine VM registers as an active VM root while it runs,
+and deregisters when it suspends or finishes.
+
+**`await v` (new opcode `await`).** It pops `v` and stops the coroutine VM's run loop with a
+new state, `.awaiting`. The driver (Zig code, not the VM) then:
+- converts `v` with the existing `Promise.resolve` logic (a native promise with the realm's
+  prototype is used as is; anything else becomes a new fulfilled promise; M18's native-only
+  adoption rule is unchanged, so foreign thenables are not called);
+- attaches **one internal reaction** of a new kind, `.await_resume { coroutine }`, to that
+  promise directly (spec PerformPromiseThen with no result capability: no throwaway child
+  promise);
+- marks the coroutine `suspended` and returns.
+
+When the reaction runs (a microtask, M18's queue), the driver resumes the coroutine VM:
+- **fulfilled:** push the value and continue at the instruction after `await`;
+- **rejected:** set the thrown value and enter D55's/M11.2's unwind at the `await`'s pc, so
+  `try`/`catch`/`finally` around an `await` work unchanged.
+
+**Completion.** A `return v` in frame 0 ends the VM (D51's `nested_result`); the driver
+resolves `P` with `v` (M18's resolve: adopting a native promise, self-resolution TypeError). An
+uncaught JS exception rejects `P` with the value (`catchValue()`, so engine errors become the
+M25 error objects). An uncatchable fault (`LimitExceeded`, `OutOfMemory`, `Internal`) does
+**not** settle `P`: it propagates to the host like any fault (M18's rule: the active microtask
+is consumed, the queue is preserved), the coroutine is marked `done`, and `P` stays pending.
+
+**Ordering.** Must match Node exactly, checked by Node-differential tests: `await` of a native
+promise or a plain value takes one microtask tick; an async function returning a native promise
+settles `P` through M18's two-step adoption. The suspension/resumption points are the only
+observable places; nothing else depends on the coroutine representation.
+
+**GC.**
+- `Coroutine` is a new heap object kind, traced by `forEachChild`: its `promise`, and while
+  `suspended` its VM's live state with the same code as `Vm.markRoots` (operand stack to `sp`,
+  locals to `locals_len`, frames' closures and `this`). While `running`, the VM is an ordinary
+  registered root, so the object traces nothing extra.
+- An `.await_resume` reaction holds its coroutine, so a coroutine is alive exactly while some
+  reachable promise can resume it. A coroutine awaiting a promise nobody can settle becomes
+  garbage with it, and `release` frees its VM (no leak, and no host action needed).
+- **Generational barrier (D43).** A running VM writes its stacks without barriers. When a
+  coroutine *suspends*, its stacks may hold young values while the `Coroutine` object is old,
+  so the driver calls `remember` on the object at every suspension. One call per `await`, not
+  per store.
+- `-Dgc-stress` and `-Dstack-stress` apply inside coroutines like any VM; a test awaits in a
+  loop with collections forced between resumptions.
+
+**Memory and limits.** A suspended coroutine's VM is heap-owned memory: its charge is
+`@sizeOf(Coroutine) + @sizeOf(Vm) +` the capacity of its three stacks, recomputed at each
+suspension. The driver first shrinks the stacks to the frame-0 high-water mark (`max_stack`,
+`slot_count`), so ten thousand pending small async calls cost kilobytes each, not the growth
+headroom, and counts the result against `max_heap_bytes`. Running coroutines count
+against `max_stack_slots` and `max_call_depth` through the shared execution context, like any
+nested VM. The heap limit therefore bounds the number of pending async calls; no separate
+limit is introduced.
+
+*Alternatives considered.* (1) **Copy frame 0 out to the heap at `await` and back in at
+resume**, running async calls on the caller's VM: no VM allocation per call, but the copy has
+to rebuild `locals_base`/`stack_base`/`result_index` on whatever VM resumes it and interacts
+with D36's transactional `enter` and `-Dstack-stress` moves. It is a later optimisation behind
+the same `Coroutine` interface, if profiling shows VM creation matters. (2) **CPS-transforming
+async bodies into state machines in the compiler** (Regenerator style): no runtime support,
+but every local live across an `await` must be hoisted, which conflicts with the resolver's
+slot and cell decisions (D20, D36), and `try`/`finally` across `await` turns into a large
+state-machine rewrite.
+
+**Tree-walker: VM-only for now (decision needed).** The tree-walker recurses in Zig (D37), so
+suspending in the middle of an async body would need a separate native stack per pending call
+(a thread or hand-written context switching) or the explicit interpreter stack that D37 lists
+as debt. Proposed: in M28 the tree-walker reports `Unsupported(async)` for async functions;
+async diff tests run on the VM and are checked against Node `.out` files, which is the stronger
+oracle anyway. Async support in the tree-walker comes with paying off D37's debt (continuation
+records on the heap), which also removes its 64 MiB thread. *Alternative:* do D37 first and
+keep both engines in lockstep; this delays async by a milestone.
+
+**Syntax in M28:** `async function` declarations and expressions, async arrows (`async x =>`,
+`async (a, b) =>`, `async () => {}`), async methods in object literals, `await` as a unary
+operator (precedence of `typeof`; `await` inside default parameters is a SyntaxError, as in
+JS). Deferred: async generators, `for await`, top-level `await`, unhandled-rejection tracking.
+
+**Invariants (review, 2026-11-18; required before M28 starts).**
+1. **Rooting during construction and the synchronous run.** The driver holds `P` and the
+   `Coroutine` in a stack-local `ValueRoots`/object-root set (M16/M19 style) from the moment
+   each is allocated until the call returns. Order: allocate `P` → root it; allocate the
+   `Coroutine` with `state = starting, vm = null` → root it; create the VM (owned by the
+   coroutine from this point; an `errdefer` frees it and leaves `state = done, vm = null` if
+   creation fails); register the VM as an active root; run. Registering the `await` reaction
+   and suspending happen while the driver's roots are still live, so no allocation on those
+   paths (reaction list growth, the resolved promise for a non-promise `v`, the accounting
+   step) can collect the coroutine or `P`.
+2. **Coroutines in microtask jobs and reactions.** `Microtask` and `PromiseReaction` gain a
+   field `coroutine: ?*Coroutine`, never a raw pointer the GC can't see:
+   - `PromiseState.reactions` entries are traced by the promise's `forEachChild`;
+   - queued jobs are traced by `Runtime.markRoots` (the loop over `microtasks[head..]`);
+   - the job being run is traced through a new `Runtime.active_job: ?Microtask`, set before
+     the job runs and cleared after it, which `markRoots` also marks (`drainMicrotasks`'s
+     `ValueRoots` only holds Values).
+3. **Who owns the VM, by state.** One owner at a time, and `vm` is null exactly when no VM
+   exists:
+
+   | state | VM memory owned by | traced by | VM registered as active root |
+   |---|---|---|---|
+   | `starting` | the `Coroutine` | the driver's roots | no |
+   | `running` | the `Coroutine` | the registration | yes |
+   | `suspended` | the `Coroutine` | `forEachChild` | no |
+   | `done` | nobody: `vm.deinit`, `vm = null`, charge released | — | no |
+
+   `release` (sweep) frees the VM only if `vm != null`, so a coroutine that finished and is
+   later collected is not freed twice. A coroutine is never collected while `starting` or
+   `running`: it is held by the driver's roots or by `active_job`.
+4. **Exact accounting of a suspended VM.** Its charge is `@sizeOf(Coroutine) + @sizeOf(Vm)`
+   plus the capacity in bytes of every allocation the VM owns: `frames` (Frame), `locals`
+   (Slot), `stack` (Value), and any backing array added later (the rule: a `Vm` field that owns
+   memory must be listed in `Vm.ownedBytes()`, and a test compares it with a counting
+   allocator). At suspension the driver shrinks each array to the frame-0 high-water mark. A
+   shrink that fails keeps the old buffer, so shrinking can't fail. It then charges the
+   difference from the previous charge through the heap's normal accounting, *before* setting
+   `state = suspended`. If that charge exceeds `max_heap_bytes`, it is an ordinary
+   `LimitExceeded(heap_bytes)`: the coroutine goes to `done` (VM freed, charge released), `P`
+   stays pending, the fault propagates (M18's rule). The charge is released at `done` and at
+   sweep.
+5. **How a rejection enters exception dispatch.** `await` is precise (D35): when it suspends,
+   `pc` stays **on the `await` instruction** and the operand stack is as it was after popping
+   `v`. On resume:
+   - fulfilled: push the value, advance `pc` past `await`;
+   - rejected: set the thrown value (`throwValue`) and call the VM's `unwind` with the frame
+     cache's pc on the `await`, exactly as if `await` itself had thrown. The `await` lies
+     inside every `try` range around it, so the normal M11.2/D55 handler search applies. An
+     uncaught rejection rejects `P`.
+   Required tests, among others:
+   `async function f() { try { await Promise.reject("bad"); } catch (e) { return e; } }`, and
+   `async function f() { try { return await Promise.resolve(1); } finally { cleanup(); } }`
+   (D55 × D56: the pending `return` record survives a suspension inside `finally`'s region).
+
+## D57. Host-side promises *(M29; approved conceptually 2026-11-18)*
+For a game host, the point of `async` is `await host.waitFrames(3)` or `await host.load(…)`:
+JS awaits a promise that the **host** settles later, from its own loop. So the embedding API
+gains, in Zig and C:
+- `newPromise() → { promise, resolve, reject }` (three handles; `resolve`/`reject` are M18
+  capabilities, callable through the existing `call`);
+- `promiseState(handle) → pending | fulfilled(value handle) | rejected(value handle)` (never
+  allocates when pending);
+- microtasks keep draining at the end of every outermost entry (M18), so a host `call` of
+  `resolve` runs every coroutine it wakes before returning, under the same step and heap
+  limits (D48, D51). A fault there is reported by that `call`, and later checkpoints continue
+  the queue.
+EMBEDDING.md must state explicitly:
+- calls into a runtime must be serialised (E2, D52: one thread at a time, no re-entry outside a
+  callback);
+- the host settles promises only through ordinary API calls (`call` on a capability);
+- settling drains microtasks at the outermost API checkpoint, before that call returns;
+- step, heap and call-depth limits apply to the coroutines a settlement resumes;
+- a fault during that checkpoint is reported by the host call that triggered it;
+- an uncatchable fault can leave the affected promises pending, as in M18.
+
+C API version: `ZQJS_ABI_VERSION` 1.2.0 (additive). Tests: a C host that runs a 60-frame loop
+where scripts `await` frame timers, with leaks and handle counts checked after teardown.
+
+## D58. Milestone order for D55–D57
+M27 `try…finally` (both engines), M28 `async`/`await` (VM; tree-walker per D56's decision),
+M29 host promises. M27 is independent and can start immediately; M28 depends on M27 (an
+`await` inside `finally` must keep the pending record) and on D56's review; M29 depends on M28.
+`class` waits for functions as objects (`.prototype`, `new` on user functions, `this` binding
+in constructors), which gets its own design entry after M29.

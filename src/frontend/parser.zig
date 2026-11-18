@@ -112,6 +112,9 @@ const Parser = struct {
     ref_count: u32 = 0,
     binding_count: u32 = 0,
     function_count: u32 = 1, // function 0 is the script
+    last_was_paren: bool = false,
+    cover_init_span: ast.Span = .{ .start = 0, .end = 0 },
+    hole_span: ast.Span = .{ .start = 0, .end = 0 },
 
     fn advance(p: *Parser) Error!void {
         p.tok = try p.lexer.next();
@@ -155,11 +158,12 @@ const Parser = struct {
     }
 
     /// `let` begins a declaration when followed by a binding name, even on the next
-    /// line (`let\nx = 1` declares x). Followed by anything else, `let` is an ordinary
-    /// identifier in sloppy JS (`let;`, `let = 1`) or destructuring (`let [a]`).
+    /// line (`let\nx = 1` declares x), or by `[` / `{` (destructuring). Followed by
+    /// anything else, `let` is an ordinary identifier in sloppy JS (`let;`, `let = 1`).
     /// `let in x` / `let instanceof x` are expressions using a variable named `let`.
     fn letStartsDeclaration(p: *Parser) Error!bool {
         const next = try p.peek();
+        if (next.tag == .l_bracket or next.tag == .l_brace) return true;
         if (next.tag == .identifier) return !p.isText(next, "in") and !p.isText(next, "instanceof");
         return token.isKeyword(next.tag);
     }
@@ -192,7 +196,8 @@ const Parser = struct {
         if (p.isText(t, "let")) {
             const next = try p.peek();
             // `if (c) let x` is an error, but `if (c) let\nx` may be ASI + two statements.
-            if (next.tag == .identifier and !next.newline_before and !p.isText(next, "in") and !p.isText(next, "instanceof"))
+            if (!next.newline_before and (next.tag == .l_bracket or next.tag == .l_brace or
+                (next.tag == .identifier and !p.isText(next, "in") and !p.isText(next, "instanceof"))))
                 return p.fail(.{ .syntax_error = "lexical declaration cannot appear in a single-statement context" }, t);
             return p.fail(.{ .unsupported = .syntax }, t);
         }
@@ -212,23 +217,17 @@ const Parser = struct {
         return .{ .span = .{ .start = start, .end = end.end }, .data = .{ .declaration = decl } };
     }
 
-    /// `let|const name [= init] (, name [= init])*` without the terminator.
+    /// `let|const pattern [= init] (, pattern [= init])*` without the terminator.
     fn declaration(p: *Parser, kind: ast.DeclKind, allow_for_of: bool) Error!ast.Declaration {
         try p.advance(); // `let` / `const`
-        var list: std.ArrayList(ast.Declarator) = .empty;
+        var list: std.ArrayList(ast.DeclItem) = .empty;
         while (true) {
-            const name_tok = p.tok;
-            const name = name_tok.text(p.source());
-            if (name_tok.tag != .identifier and !token.isKeyword(name_tok.tag))
-                return p.fail(.{ .unsupported = .syntax }, name_tok); // destructuring, …
-            if (token.isKeyword(name_tok.tag) or token.reserved_identifiers.has(name) or std.mem.eql(u8, name, "let"))
-                return p.fail(.{ .syntax_error = "reserved word cannot be a variable name" }, name_tok);
-            try p.advance();
+            const start_tok = p.tok;
+            const pat = try p.parseBindingPattern(true);
             if (p.isText(p.tok, "in")) return p.fail(.{ .unsupported = .syntax }, p.tok);
             if (p.isText(p.tok, "of")) {
                 if (!allow_for_of or list.items.len > 0) return p.fail(.{ .syntax_error = "invalid for-of declaration" }, p.tok);
-                try list.append(p.arena, .{ .name = name, .span = span(name_tok, name_tok), .binding = p.binding_count, .init = null });
-                p.binding_count += 1;
+                try list.append(p.arena, .{ .pattern = pat, .init = null, .span = pat.span });
                 return .{ .kind = kind, .declarators = list.items };
             }
             var init: ?*const ast.Expr = null;
@@ -236,10 +235,12 @@ const Parser = struct {
                 try p.advance();
                 init = try p.expression();
             } else if (kind == .@"const") {
-                return p.fail(.{ .syntax_error = "missing initializer in const declaration" }, name_tok);
+                return p.fail(.{ .syntax_error = "missing initializer in const declaration" }, start_tok);
+            } else if (pat.data != .binding) {
+                return p.fail(.{ .syntax_error = "missing initializer in destructuring declaration" }, start_tok);
             }
-            try list.append(p.arena, .{ .name = name, .span = span(name_tok, name_tok), .binding = p.binding_count, .init = init });
-            p.binding_count += 1;
+            const end_pos = if (init) |e| e.span.end else pat.span.end;
+            try list.append(p.arena, .{ .pattern = pat, .init = init, .span = .{ .start = pat.span.start, .end = end_pos } });
             if (p.tok.tag != .comma) break;
             try p.advance();
         }
@@ -315,11 +316,16 @@ const Parser = struct {
                 .declaration => |decl| blk: {
                     if (decl.declarators.len != 1 or decl.declarators[0].init != null)
                         return p.fail(.{ .syntax_error = "for-of loop variable declaration may not have an initializer" }, p.tok);
-                    break :blk .{ .declaration = .{ .kind = decl.kind, .declarator = decl.declarators[0] } };
+                    break :blk .{ .declaration = .{ .kind = decl.kind, .pattern = decl.declarators[0].pattern } };
                 },
                 .expression => |e| blk: {
-                    if (e.data != .identifier) return p.failAt(.{ .unsupported = .syntax }, e.span.start, e.span.end);
-                    break :blk .{ .target = try p.assignTarget(e, "invalid left-hand side in for-of") };
+                    if (e.data == .array or e.data == .object) {
+                        if (p.last_was_paren) return p.failAt(.{ .syntax_error = "invalid left-hand side in for-of" }, e.span.start, e.span.end);
+                        break :blk .{ .target = try p.exprToAssignPattern(e) };
+                    }
+                    try p.rejectCoverExpr(e);
+                    const t = try p.assignTarget(e, "invalid left-hand side in for-of");
+                    break :blk .{ .target = try p.patNode(e.span, .{ .target = t }, 0) };
                 },
             };
             try p.advance();
@@ -470,11 +476,10 @@ const Parser = struct {
         if (p.isText(p.tok, "finally")) return p.fail(.{ .unsupported = .syntax }, p.tok);
         if (!p.isText(p.tok, "catch")) return p.fail(.{ .syntax_error = "missing catch or finally after try" }, p.tok);
         try p.advance(); // `catch`
-        var param: ?ast.Declarator = null;
+        var param: ?*const ast.Pattern = null;
         if (p.tok.tag == .l_paren) {
             try p.advance();
-            if (p.tok.tag == .l_brace or p.tok.tag == .l_bracket) return p.fail(.{ .unsupported = .syntax }, p.tok);
-            param = try p.bindingName();
+            param = try p.parseBindingPattern(false);
             if (p.tok.tag != .r_paren) return p.fail(.{ .syntax_error = "expected ')' after catch parameter" }, p.tok);
             try p.advance();
         }
@@ -497,7 +502,7 @@ const Parser = struct {
 
         var name: ?ast.Declarator = null;
         if (p.tok.tag != .l_paren) {
-            name = try p.bindingName();
+            name = try p.bindingName(false);
         } else if (kind == .declaration) {
             return p.fail(.{ .syntax_error = "function declaration needs a name" }, p.tok);
         }
@@ -529,15 +534,28 @@ const Parser = struct {
         return f;
     }
 
-    fn parseParams(p: *Parser) Error![]const ast.Declarator {
+    fn parseParams(p: *Parser) Error![]const ast.Param {
         if (p.tok.tag != .l_paren) return p.fail(.{ .syntax_error = "expected '('" }, p.tok);
         try p.advance();
-        var params: std.ArrayList(ast.Declarator) = .empty;
+        var params: std.ArrayList(ast.Param) = .empty;
         while (p.tok.tag != .r_paren) {
-            // Defaults, rest parameters and destructuring are valid JS outside ZQJS.
-            if (p.tok.tag != .identifier and !token.isKeyword(p.tok.tag)) return p.fail(.{ .unsupported = .syntax }, p.tok);
-            try params.append(p.arena, try p.bindingName());
-            if (p.tok.tag == .eq) return p.fail(.{ .unsupported = .syntax }, p.tok);
+            const p_start = p.tok.start;
+            if (p.tok.tag == .ellipsis) {
+                try p.advance();
+                const pat = try p.parseBindingPattern(false);
+                if (p.tok.tag == .eq) return p.fail(.{ .syntax_error = "rest parameter may not have a default initializer" }, p.tok);
+                if (p.tok.tag == .comma) return p.fail(.{ .syntax_error = "rest parameter must be last formal parameter" }, p.tok);
+                try params.append(p.arena, .{ .pattern = pat, .default = null, .is_rest = true, .span = .{ .start = p_start, .end = pat.span.end } });
+                break;
+            }
+            const pat = try p.parseBindingPattern(false);
+            var default: ?*const ast.Expr = null;
+            if (p.tok.tag == .eq) {
+                try p.advance();
+                default = try p.nested();
+            }
+            const p_end = if (default) |d| d.span.end else pat.span.end;
+            try params.append(p.arena, .{ .pattern = pat, .default = default, .is_rest = false, .span = .{ .start = p_start, .end = p_end } });
             if (p.tok.tag != .comma) break;
             try p.advance(); // a trailing comma is allowed: `function f(a,) {}`
         }
@@ -562,19 +580,166 @@ const Parser = struct {
     }
 
     /// A function or parameter name. Reserved words are SyntaxErrors; `let` is a legal
-    /// sloppy-mode name ZQJS doesn't support; `arguments` would shadow the arguments object.
-    fn bindingName(p: *Parser) Error!ast.Declarator {
+    /// sloppy-mode name ZQJS doesn't support (unless inside let/const, where it's a SyntaxError);
+    /// `arguments` would shadow the arguments object.
+    fn bindingName(p: *Parser, is_lexical_decl: bool) Error!ast.Declarator {
         const t = p.tok;
         const name = t.text(p.source());
         if (t.tag != .identifier and !token.isKeyword(t.tag)) return p.fail(.{ .unsupported = .syntax }, t);
         if (token.isKeyword(t.tag) or token.reserved_identifiers.has(name))
             return p.fail(.{ .syntax_error = "reserved word cannot be a binding name" }, t);
-        if (std.mem.eql(u8, name, "let")) return p.fail(.{ .unsupported = .syntax }, t);
+        if (std.mem.eql(u8, name, "let")) {
+            if (is_lexical_decl) return p.fail(.{ .syntax_error = "let is disallowed as a lexically bound name" }, t);
+            return p.fail(.{ .unsupported = .syntax }, t);
+        }
         if (std.mem.eql(u8, name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
         try p.advance();
         const d: ast.Declarator = .{ .name = name, .span = span(t, t), .binding = p.binding_count, .init = null };
         p.binding_count += 1;
         return d;
+    }
+
+    fn parseBindingPattern(p: *Parser, is_lexical_decl: bool) Error!*const ast.Pattern {
+        try p.enter();
+        defer p.depth -= 1;
+        return switch (p.tok.tag) {
+            .l_bracket => p.parseArrayBindingPattern(is_lexical_decl),
+            .l_brace => p.parseObjectBindingPattern(is_lexical_decl),
+            else => {
+                const d = try p.bindingName(is_lexical_decl);
+                return p.patNode(d.span, .{ .binding = d }, 0);
+            },
+        };
+    }
+
+    fn parseArrayBindingPattern(p: *Parser, is_lexical_decl: bool) Error!*const ast.Pattern {
+        const open = p.tok;
+        try p.advance();
+        var elems: std.ArrayList(?ast.Pattern.Elem) = .empty;
+        var rest: ?*const ast.Pattern = null;
+        var max_depth: u16 = 0;
+        while (p.tok.tag != .r_bracket) {
+            if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated array pattern" }, open);
+            if (p.tok.tag == .comma) {
+                try elems.append(p.arena, null);
+                try p.advance();
+                continue;
+            }
+            if (p.tok.tag == .ellipsis) {
+                try p.advance();
+                const r = try p.parseBindingPattern(is_lexical_decl);
+                max_depth = @max(max_depth, r.depth);
+                if (p.tok.tag == .eq) return p.fail(.{ .syntax_error = "rest element may not have a default initializer" }, p.tok);
+                if (p.tok.tag == .comma) return p.fail(.{ .syntax_error = "rest element must be last element" }, p.tok);
+                if (p.tok.tag != .r_bracket) return p.fail(.{ .syntax_error = "expected ']' after rest element" }, p.tok);
+                rest = r;
+                break;
+            }
+            const pat = try p.parseBindingPattern(is_lexical_decl);
+            max_depth = @max(max_depth, pat.depth);
+            var default: ?*const ast.Expr = null;
+            if (p.tok.tag == .eq) {
+                try p.advance();
+                default = try p.nested();
+                max_depth = @max(max_depth, default.?.depth);
+            }
+            const end_pos = if (default) |d| d.span.end else pat.span.end;
+            try elems.append(p.arena, .{ .pattern = pat, .default = default, .span = .{ .start = pat.span.start, .end = end_pos } });
+            if (p.tok.tag != .comma) break;
+            try p.advance();
+        }
+        const close = p.tok;
+        if (close.tag != .r_bracket) return p.fail(.{ .syntax_error = "expected ']'" }, close);
+        try p.advance();
+        return p.patNode(span(open, close), .{ .array = .{ .elems = elems.items, .rest = rest } }, max_depth);
+    }
+
+    fn parseObjectBindingPattern(p: *Parser, is_lexical_decl: bool) Error!*const ast.Pattern {
+        const open = p.tok;
+        try p.advance();
+        var props: std.ArrayList(ast.Pattern.Prop) = .empty;
+        var rest: ?*const ast.Pattern = null;
+        var max_depth: u16 = 0;
+        while (p.tok.tag != .r_brace) {
+            const t = p.tok;
+            if (t.tag == .eof) return p.fail(.{ .syntax_error = "unterminated object pattern" }, open);
+            if (t.tag == .ellipsis) {
+                try p.advance();
+                if (p.tok.tag == .l_brace or p.tok.tag == .l_bracket)
+                    return p.fail(.{ .syntax_error = "rest element must be an identifier" }, p.tok);
+                const d = try p.bindingName(is_lexical_decl);
+                const r = try p.patNode(d.span, .{ .binding = d }, 0);
+                max_depth = @max(max_depth, r.depth);
+                if (p.tok.tag == .eq) return p.fail(.{ .syntax_error = "rest element may not have a default initializer" }, p.tok);
+                if (p.tok.tag == .comma) return p.fail(.{ .syntax_error = "rest element must be last element" }, p.tok);
+                if (p.tok.tag != .r_brace) return p.fail(.{ .syntax_error = "expected '}' after rest element" }, p.tok);
+                rest = r;
+                break;
+            }
+            const k: ast.PropertyKey = switch (t.tag) {
+                .l_bracket => blk: {
+                    try p.advance();
+                    const e = try p.nested();
+                    try p.expectAfterExpression(.r_bracket);
+                    max_depth = @max(max_depth, e.depth);
+                    break :blk .{ .computed = e };
+                },
+                .string => blk: {
+                    const units = try p.decodeString(t);
+                    try p.advance();
+                    break :blk .{ .string = units };
+                },
+                .number => blk: {
+                    const n = try number.literalValue(p.arena, t.text(p.source()));
+                    try p.advance();
+                    break :blk .{ .number = n };
+                },
+                else => blk: {
+                    if (t.tag != .identifier and !token.isKeyword(t.tag)) return p.fail(.{ .syntax_error = "unexpected token in object pattern" }, t);
+                    try p.advance();
+                    break :blk .{ .name = t.text(p.source()) };
+                },
+            };
+            if (p.tok.tag == .colon) {
+                try p.advance();
+                const pat = try p.parseBindingPattern(is_lexical_decl);
+                max_depth = @max(max_depth, pat.depth);
+                var default: ?*const ast.Expr = null;
+                if (p.tok.tag == .eq) {
+                    try p.advance();
+                    default = try p.nested();
+                    max_depth = @max(max_depth, default.?.depth);
+                }
+                const end_pos = if (default) |d| d.span.end else pat.span.end;
+                try props.append(p.arena, .{ .key = k, .pattern = pat, .default = default, .shorthand = false, .span = .{ .start = t.start, .end = end_pos } });
+            } else {
+                if (k != .name or t.tag != .identifier) return p.fail(.{ .syntax_error = "unexpected token in object pattern" }, p.tok);
+                const name = k.name;
+                if (token.reserved_identifiers.has(name)) return p.fail(.{ .syntax_error = "reserved word cannot be a binding name" }, t);
+                if (std.mem.eql(u8, name, "let")) {
+                    if (is_lexical_decl) return p.fail(.{ .syntax_error = "let is disallowed as a lexically bound name" }, t);
+                    return p.fail(.{ .unsupported = .syntax }, t);
+                }
+                if (std.mem.eql(u8, name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
+                const d: ast.Declarator = .{ .name = name, .span = span(t, t), .binding = p.binding_count, .init = null };
+                p.binding_count += 1;
+                const pat = try p.patNode(d.span, .{ .binding = d }, 0);
+                var default: ?*const ast.Expr = null;
+                if (p.tok.tag == .eq) {
+                    try p.advance();
+                    default = try p.nested();
+                    max_depth = @max(max_depth, default.?.depth);
+                }
+                const end_pos = if (default) |def| def.span.end else t.end;
+                try props.append(p.arena, .{ .key = k, .pattern = pat, .default = default, .shorthand = true, .span = .{ .start = t.start, .end = end_pos } });
+            }
+            if (p.tok.tag != .comma) break;
+            try p.advance();
+        }
+        const close = p.tok;
+        if (close.tag != .r_brace) return p.fail(.{ .syntax_error = "expected '}'" }, close);
+        try p.advance();
+        return p.patNode(span(open, close), .{ .object = .{ .props = props.items, .rest = rest } }, max_depth);
     }
 
     fn endStatement(p: *Parser) Error!void {
@@ -599,18 +764,55 @@ const Parser = struct {
 
     /// Expression := Assignment. Assignment is right-associative and binds loosest.
     fn expression(p: *Parser) Error!*const ast.Expr {
+        const e = try p.expressionRaw();
+        try p.rejectCoverExpr(e);
+        return e;
+    }
+
+    /// Parses an expression without rejecting CoverInitializedName / array holes at the
+    /// top level, so `[a, , b] = ...`, `{ a = 1 } = ...`, and `({ a = 1 }) => ...` can
+    /// reinterpret them as patterns.
+    fn expressionRaw(p: *Parser) Error!*const ast.Expr {
         try p.enter();
         defer p.depth -= 1;
-        if (p.isArrowStart()) return p.arrowFunction();
-        const paren_start = p.tok.tag == .l_paren;
-        const lhs = try p.conditional();
-        // `(a = 1) =>`, `([a]) =>`: valid JS parameter lists that isArrowStart doesn't accept.
-        if (paren_start and p.tok.tag == .arrow) return p.fail(.{ .unsupported = .syntax }, p.tok);
+        p.last_was_paren = false;
+        if (p.tok.tag == .identifier) {
+            const next = try p.peek();
+            if (next.tag == .arrow) return p.arrowSingle();
+        }
+        var lhs_was_paren = false;
+        const lhs = if (p.tok.tag == .l_paren) blk: {
+            const res = try p.parseParenList();
+            if (p.tok.tag == .arrow) {
+                if (p.tok.newline_before) return p.fail(.{ .syntax_error = "line terminator before '=>'" }, p.tok);
+                return p.arrowFromParenList(res);
+            }
+            const inner = try p.finishParenAsExpr(res);
+            p.last_was_paren = true;
+            const full = try p.conditionalFromPrimary(inner);
+            lhs_was_paren = p.last_was_paren;
+            break :blk full;
+        } else try p.conditional();
+
         const op = assignOp(p.tok.tag) orelse return lhs;
-        // Parentheses are transparent, so `(x) = 1` arrives here as a plain identifier, as in JS.
+        if (op == .plain and (lhs.data == .array or lhs.data == .object)) {
+            if (lhs_was_paren) return p.failAt(.{ .syntax_error = "invalid assignment target" }, lhs.span.start, lhs.span.end);
+            const pat = try p.exprToAssignPattern(lhs);
+            try p.advance();
+            const value = try p.expression();
+            p.last_was_paren = false;
+            return p.node(
+                .{ .start = lhs.span.start, .end = value.span.end },
+                .{ .assign_pattern = .{ .pattern = pat, .value = value } },
+                @max(lhs.depth, value.depth),
+            );
+        }
+        try p.rejectCoverExpr(lhs);
+        // Parentheses are transparent for single identifiers, so `(x) = 1` arrives here as `.identifier`.
         const target = try p.assignTarget(lhs, "invalid assignment target");
         try p.advance();
         const value = try p.expression();
+        p.last_was_paren = false;
         return p.node(
             .{ .start = lhs.span.start, .end = value.span.end },
             .{ .assign = .{ .op = op, .target = target, .value = value } },
@@ -618,47 +820,122 @@ const Parser = struct {
         );
     }
 
-    fn isArrowStart(p: *Parser) bool {
-        if (p.tok.tag == .identifier) {
-            var look = p.lexer;
-            const next_tok = look.next() catch return false;
-            return next_tok.tag == .arrow;
-        }
-        if (p.tok.tag == .l_paren) {
-            // Only `(ident, ident,)` can be supported parameters, so stop at the first other
-            // token: scanning to the matching `)` made nested parentheses quadratic.
-            var look = p.lexer;
-            while (true) {
-                const t = look.next() catch return false;
-                switch (t.tag) {
-                    .identifier, .comma => {},
-                    .r_paren => break,
-                    else => return false,
+    const ParenItem = struct {
+        expr: *const ast.Expr,
+        is_rest: bool,
+        was_paren: bool,
+        span: ast.Span,
+    };
+
+    const ParenList = struct {
+        start: u32,
+        items: []const ParenItem,
+        has_trailing_comma: bool,
+        has_rest_trailing_comma: bool,
+    };
+
+    fn parseParenList(p: *Parser) Error!ParenList {
+        try p.enter();
+        defer p.depth -= 1;
+        const open = p.tok;
+        try p.advance(); // `(`
+        var items: std.ArrayList(ParenItem) = .empty;
+        var has_trailing_comma = false;
+        var has_rest_trailing_comma = false;
+        while (p.tok.tag != .r_paren) {
+            if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated parenthesised expression" }, open);
+            const item_start = p.tok.start;
+            if (p.tok.tag == .ellipsis) {
+                try p.advance();
+                const saved_no_in = p.no_in;
+                p.no_in = false;
+                defer p.no_in = saved_no_in;
+                const e = try p.expressionRaw();
+                try items.append(p.arena, .{ .expr = e, .is_rest = true, .was_paren = p.last_was_paren, .span = .{ .start = item_start, .end = e.span.end } });
+                if (p.tok.tag == .comma) {
+                    const next = try p.peek();
+                    if (next.tag == .r_paren) {
+                        has_rest_trailing_comma = true;
+                        has_trailing_comma = true;
+                        try p.advance();
+                        break;
+                    }
+                    return p.fail(.{ .syntax_error = "rest parameter must be last formal parameter" }, p.tok);
                 }
+                break;
             }
-            const after = look.next() catch return false;
-            return after.tag == .arrow;
+            const saved_no_in = p.no_in;
+            p.no_in = false;
+            defer p.no_in = saved_no_in;
+            const e = try p.expressionRaw();
+            try items.append(p.arena, .{ .expr = e, .is_rest = false, .was_paren = p.last_was_paren, .span = .{ .start = item_start, .end = e.span.end } });
+            if (p.tok.tag != .comma) break;
+            try p.advance();
+            if (p.tok.tag == .r_paren) {
+                has_trailing_comma = true;
+                break;
+            }
         }
-        return false;
+        try p.expectAfterExpression(.r_paren);
+        return .{
+            .start = open.start,
+            .items = items.items,
+            .has_trailing_comma = has_trailing_comma,
+            .has_rest_trailing_comma = has_rest_trailing_comma,
+        };
     }
 
-    fn arrowFunction(p: *Parser) Error!*const ast.Expr {
+    fn finishParenAsExpr(p: *Parser, res: ParenList) Error!*const ast.Expr {
+        if (res.items.len == 0) return p.failAt(.{ .syntax_error = "unexpected token ')'" }, res.start, res.start + 1);
+        for (res.items) |it| {
+            if (it.is_rest) return p.failAt(.{ .syntax_error = "unexpected token '...'" }, it.span.start, it.span.end);
+        }
+        if (res.has_trailing_comma) return p.failAt(.{ .syntax_error = "unexpected token ')'" }, res.items[res.items.len - 1].span.end, res.items[res.items.len - 1].span.end + 1);
+        if (res.items.len > 1) {
+            for (res.items) |it| try p.rejectCoverExpr(it.expr);
+            return p.failAt(.{ .unsupported = .syntax }, res.items[0].span.end, res.items[1].span.start);
+        }
+        return res.items[0].expr;
+    }
+
+    fn arrowSingle(p: *Parser) Error!*const ast.Expr {
         try p.enter();
         defer p.depth -= 1;
         const start = p.tok.start;
         const id = p.function_count;
         p.function_count += 1;
 
-        var params: []const ast.Declarator = &.{};
-        if (p.tok.tag == .l_paren) {
-            params = try p.parseParams();
-        } else {
-            const single = try p.bindingName();
-            const buf = try p.arena.alloc(ast.Declarator, 1);
-            buf[0] = single;
-            params = buf;
-        }
+        const single = try p.bindingName(false);
+        const pat = try p.patNode(single.span, .{ .binding = single }, 0);
+        const buf = try p.arena.alloc(ast.Param, 1);
+        buf[0] = .{ .pattern = pat, .default = null, .is_rest = false, .span = single.span };
+        return p.arrowBody(start, id, buf);
+    }
 
+    fn arrowFromParenList(p: *Parser, res: ParenList) Error!*const ast.Expr {
+        try p.enter();
+        defer p.depth -= 1;
+        const id = p.function_count;
+        p.function_count += 1;
+
+        if (res.has_rest_trailing_comma) return p.fail(.{ .syntax_error = "rest parameter must be last formal parameter" }, p.tok);
+        var params: std.ArrayList(ast.Param) = .empty;
+        for (res.items) |it| {
+            if (it.was_paren) return p.failAt(.{ .syntax_error = "invalid arrow function parameter" }, it.span.start, it.span.end);
+            if (it.is_rest) {
+                if (it.expr.data == .assign or it.expr.data == .assign_pattern)
+                    return p.failAt(.{ .syntax_error = "rest parameter may not have a default initializer" }, it.span.start, it.span.end);
+                const pat = try p.exprToBindingPattern(it.expr);
+                try params.append(p.arena, .{ .pattern = pat, .default = null, .is_rest = true, .span = it.span });
+            } else {
+                const param = try p.exprToArrowParam(it.expr, it.span);
+                try params.append(p.arena, param);
+            }
+        }
+        return p.arrowBody(res.start, id, params.items);
+    }
+
+    fn arrowBody(p: *Parser, start: u32, id: u32, params: []const ast.Param) Error!*const ast.Expr {
         if (p.tok.tag != .arrow) return p.fail(.{ .syntax_error = "expected '=>'" }, p.tok);
         if (p.tok.newline_before) return p.fail(.{ .syntax_error = "line terminator before '=>'" }, p.tok);
         try p.advance(); // `=>`
@@ -703,8 +980,21 @@ const Parser = struct {
 
     /// ConditionalExpression := LogicalORExpression (`?` AssignmentExpression `:` AssignmentExpression)?
     fn conditional(p: *Parser) Error!*const ast.Expr {
-        const cond = try p.binary(0);
+        return p.conditionalFrom(try p.binary(0));
+    }
+
+    fn conditionalFromPrimary(p: *Parser, prim: *const ast.Expr) Error!*const ast.Expr {
+        const post = try p.postfix(try p.calls(prim));
+        if (post != prim) p.last_was_paren = false;
+        const bin = try p.binaryFrom(post, 0);
+        if (bin != post) p.last_was_paren = false;
+        return p.conditionalFrom(bin);
+    }
+
+    fn conditionalFrom(p: *Parser, cond: *const ast.Expr) Error!*const ast.Expr {
         if (p.tok.tag != .question) return cond;
+        try p.rejectCoverExpr(cond);
+        p.last_was_paren = false;
         try p.enter();
         defer p.depth -= 1;
         try p.advance();
@@ -737,11 +1027,22 @@ const Parser = struct {
         return p.expression();
     }
 
+    fn nestedRaw(p: *Parser) Error!*const ast.Expr {
+        const saved = p.no_in;
+        p.no_in = false;
+        defer p.no_in = saved;
+        return p.expressionRaw();
+    }
+
     fn binary(p: *Parser, min_bp: u8) Error!*const ast.Expr {
+        return p.binaryFrom(try p.prefix(), min_bp);
+    }
+
+    fn binaryFrom(p: *Parser, lhs_in: *const ast.Expr, min_bp: u8) Error!*const ast.Expr {
         try p.enter();
         defer p.depth -= 1;
 
-        var lhs = try p.prefix();
+        var lhs = lhs_in;
         var saw_logical = false;
         var saw_nullish = false;
         while (true) {
@@ -753,6 +1054,7 @@ const Parser = struct {
             else
                 infix(p.tok.tag) orelse break;
             if (info.bp < min_bp) break;
+            try p.rejectCoverExpr(lhs);
             // JS forbids mixing `??` with `&&` or `||` without parentheses; the RHS of `??`
             // is a BitwiseORExpression (bp 3), so `a ?? b && c` falls through to `saw_nullish`.
             const rhs_min_bp: u8 = switch (info.op) {
@@ -770,6 +1072,7 @@ const Parser = struct {
             };
             try p.advance();
             const rhs = try p.binary(rhs_min_bp);
+            try p.rejectCoverExpr(rhs);
             lhs = try p.node(
                 .{ .start = lhs.span.start, .end = rhs.span.end },
                 .{ .binary = .{ .op = info.op, .lhs = lhs, .rhs = rhs } },
@@ -785,6 +1088,7 @@ const Parser = struct {
             .minus, .plus, .bang, .tilde => {
                 try p.advance();
                 const operand = try p.binary(unary_bp);
+                try p.rejectCoverExpr(operand);
                 // JS forbids `-a ** b`: it is ambiguous whether `-` applies before or after `**`.
                 // (`++a ** b` is fine: update expressions are not unary operators here.)
                 if (p.tok.tag == .star_star)
@@ -873,11 +1177,13 @@ const Parser = struct {
     fn memberStep(p: *Parser, callee: *const ast.Expr) Error!?*const ast.Expr {
         return switch (p.tok.tag) {
             .dot => blk: {
+                try p.rejectCoverExpr(callee);
                 try p.advance();
                 const name = try p.expectPropertyName();
                 break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = name.text(p.source()) } } }, callee.depth);
             },
             .l_bracket => blk: {
+                try p.rejectCoverExpr(callee);
                 try p.advance();
                 const k = try p.nested();
                 const close = p.tok;
@@ -900,8 +1206,10 @@ const Parser = struct {
         var callee = callee_in;
         while (true) {
             if (p.tok.tag == .l_paren) {
+                try p.rejectCoverExpr(callee);
                 callee = try p.callArgs(callee);
             } else if (p.tok.tag == .question_dot) {
+                try p.rejectCoverExpr(callee);
                 return p.optionalChain(callee);
             } else if (try p.memberStep(callee)) |next| {
                 callee = next;
@@ -991,10 +1299,18 @@ const Parser = struct {
         var args: std.ArrayList(*const ast.Expr) = .empty;
         var depth = base_depth;
         while (p.tok.tag != .r_paren) {
-            if (p.tok.tag == .ellipsis) return p.fail(.{ .unsupported = .syntax }, p.tok); // spread
-            const arg = try p.nested();
-            try args.append(p.arena, arg);
-            depth = @max(depth, arg.depth);
+            if (p.tok.tag == .ellipsis) {
+                const ell = p.tok;
+                try p.advance();
+                const inner = try p.nested();
+                const sp = try p.node(.{ .start = ell.start, .end = inner.span.end }, .{ .spread = inner }, inner.depth);
+                try args.append(p.arena, sp);
+                depth = @max(depth, sp.depth);
+            } else {
+                const arg = try p.nested();
+                try args.append(p.arena, arg);
+                depth = @max(depth, arg.depth);
+            }
             if (p.tok.tag != .comma) break;
             try p.advance(); // a trailing comma is allowed: `f(1,)`
         }
@@ -1012,17 +1328,47 @@ const Parser = struct {
         );
     }
 
-    /// `[a, b, …]`. Holes (`[1,,2]`) are Unsupported: arrays are dense (D13).
+    /// `[a, ...b, …]`. Holes (`[1,,2]`) are allowed during parsing as a cover grammar
+    /// for array patterns (`[a,,b] = x`), and rejected as `Unsupported(sparse_array)` if
+    /// not reinterpreted as a pattern.
     fn arrayLiteral(p: *Parser) Error!*const ast.Expr {
         const open = p.tok;
         try p.advance();
         var items: std.ArrayList(*const ast.Expr) = .empty;
         var depth: u16 = 0;
+        var has_cover_init = false;
+        var has_hole = false;
+        var has_rest_trailing_comma = false;
         while (p.tok.tag != .r_bracket) {
-            if (p.tok.tag == .comma) return p.fail(.{ .unsupported = .sparse_array }, p.tok);
-            if (p.tok.tag == .ellipsis) return p.fail(.{ .unsupported = .syntax }, p.tok); // spread
+            if (p.tok.tag == .comma) {
+                const c_tok = p.tok;
+                if (!has_hole) p.hole_span = span(c_tok, c_tok);
+                has_hole = true;
+                try items.append(p.arena, try p.node(span(c_tok, c_tok), .hole, 0));
+                try p.advance();
+                continue;
+            }
             if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated array literal" }, open);
-            const e = try p.nested();
+            if (p.tok.tag == .ellipsis) {
+                const ell = p.tok;
+                try p.advance();
+                const inner = try p.nestedRaw();
+                if (inner.has_cover_init) has_cover_init = true;
+                if (inner.has_hole) has_hole = true;
+                const sp = try p.node(.{ .start = ell.start, .end = inner.span.end }, .{ .spread = inner }, inner.depth);
+                try items.append(p.arena, sp);
+                depth = @max(depth, sp.depth);
+                if (p.tok.tag != .comma) break;
+                try p.advance();
+                if (p.tok.tag == .r_bracket) {
+                    has_rest_trailing_comma = true;
+                    break;
+                }
+                continue;
+            }
+            const e = try p.nestedRaw();
+            if (e.has_cover_init) has_cover_init = true;
+            if (e.has_hole) has_hole = true;
             try items.append(p.arena, e);
             depth = @max(depth, e.depth);
             if (p.tok.tag != .comma) break;
@@ -1030,17 +1376,42 @@ const Parser = struct {
         }
         const close = p.tok;
         try p.expectAfterExpression(.r_bracket);
-        return p.node(span(open, close), .{ .array = items.items }, depth);
+        const arr = try p.node(span(open, close), .{ .array = items.items }, depth);
+        if (has_cover_init or has_hole or has_rest_trailing_comma) {
+            const mut = @constCast(arr);
+            mut.has_cover_init = has_cover_init;
+            mut.has_hole = has_hole;
+            mut.has_rest_trailing_comma = has_rest_trailing_comma;
+        }
+        return arr;
     }
 
-    /// `{ key: value, [expr]: value, name, method() {…}, … }`.
+    /// `{ key: value, [expr]: value, name, method() {…}, ...rest, … }`.
     fn objectLiteral(p: *Parser) Error!*const ast.Expr {
         const open = p.tok;
         try p.advance();
         var props: std.ArrayList(ast.PropertyDef) = .empty;
         var depth: u16 = 0;
+        var has_cover_init = false;
+        var has_hole = false;
+        var has_rest_trailing_comma = false;
         while (p.tok.tag != .r_brace) {
             const t = p.tok;
+            if (t.tag == .eof) return p.fail(.{ .syntax_error = "unterminated object literal" }, open);
+            if (t.tag == .ellipsis) {
+                try p.advance();
+                const inner = try p.nestedRaw();
+                try p.rejectCoverExpr(inner);
+                try props.append(p.arena, .{ .spread = .{ .expr = inner, .span = .{ .start = t.start, .end = inner.span.end } } });
+                depth = @max(depth, inner.depth);
+                if (p.tok.tag != .comma) break;
+                try p.advance();
+                if (p.tok.tag == .r_brace) {
+                    has_rest_trailing_comma = true;
+                    break;
+                }
+                continue;
+            }
             const k: ast.PropertyKey = switch (t.tag) {
                 .l_bracket => blk: {
                     try p.advance();
@@ -1058,15 +1429,14 @@ const Parser = struct {
                     try p.advance();
                     break :blk .{ .number = n };
                 },
-                .eof => return p.fail(.{ .syntax_error = "unterminated object literal" }, open),
                 else => blk: {
-                    if (t.tag != .identifier and !token.isKeyword(t.tag)) return p.fail(.{ .unsupported = .syntax }, t); // `...`, `*`, …
+                    if (t.tag != .identifier and !token.isKeyword(t.tag)) return p.fail(.{ .unsupported = .syntax }, t);
                     const name = t.text(p.source());
                     // `get x() {}`, `set x(v) {}`, `async f() {}`: accessors and async methods.
                     if (std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "set") or std.mem.eql(u8, name, "async")) {
                         const next = try p.peek();
                         switch (next.tag) {
-                            .colon, .l_paren, .comma, .r_brace => {},
+                            .colon, .l_paren, .comma, .r_brace, .eq => {},
                             else => return p.fail(.{ .unsupported = .syntax }, t),
                         }
                     }
@@ -1074,17 +1444,22 @@ const Parser = struct {
                     break :blk .{ .name = name };
                 },
             };
-            const value: *const ast.Expr = switch (p.tok.tag) {
-                .colon => blk: {
+            switch (p.tok.tag) {
+                .colon => {
                     if (isProtoKey(k)) return p.fail(.{ .unsupported = .builtin }, t); // sets the prototype
                     try p.advance();
-                    break :blk try p.nested();
+                    const value = try p.nestedRaw();
+                    if (value.has_cover_init) has_cover_init = true;
+                    if (value.has_hole) has_hole = true;
+                    try props.append(p.arena, .{ .prop = .{ .key = k, .value = value, .shorthand = false, .span = .{ .start = t.start, .end = value.span.end } } });
+                    depth = @max(depth, value.depth);
                 },
-                .l_paren => blk: {
+                .l_paren => {
                     const f = try p.functionRest(t.start, .expression, null);
-                    break :blk try p.node(f.span, .{ .function = f }, 0);
+                    const value = try p.node(f.span, .{ .function = f }, 0);
+                    try props.append(p.arena, .{ .prop = .{ .key = k, .value = value, .shorthand = false, .span = .{ .start = t.start, .end = value.span.end } } });
                 },
-                .comma, .r_brace => blk: {
+                .comma, .r_brace => {
                     // Shorthand `{ x }` is a reference to the variable x.
                     if (k != .name or t.tag != .identifier) return p.fail(.{ .syntax_error = "unexpected token in object literal" }, p.tok);
                     if (token.reserved_identifiers.has(k.name)) return p.fail(.{ .syntax_error = "reserved word as shorthand property" }, t);
@@ -1092,21 +1467,43 @@ const Parser = struct {
                     if (std.mem.eql(u8, k.name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
                     const id = p.ref_count;
                     p.ref_count += 1;
-                    break :blk try p.node(span(t, t), .{ .identifier = .{ .name = k.name, .span = span(t, t), .id = id } }, 0);
+                    const value = try p.node(span(t, t), .{ .identifier = .{ .name = k.name, .span = span(t, t), .id = id } }, 0);
+                    try props.append(p.arena, .{ .prop = .{ .key = k, .value = value, .shorthand = true, .span = span(t, t) } });
                 },
-                .eq => return p.fail(.{ .unsupported = .syntax }, p.tok), // `{ a = 1 }`: destructuring
+                .eq => {
+                    // CoverInitializedName `{ a = 1 }`: only valid inside a destructuring pattern.
+                    if (k != .name or t.tag != .identifier) return p.fail(.{ .syntax_error = "unexpected '=' in object literal" }, p.tok);
+                    if (token.reserved_identifiers.has(k.name)) return p.fail(.{ .syntax_error = "reserved word as shorthand property" }, t);
+                    if (std.mem.eql(u8, k.name, "let")) return p.fail(.{ .unsupported = .syntax }, t);
+                    if (std.mem.eql(u8, k.name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
+                    const eq_tok = p.tok;
+                    try p.advance();
+                    const def = try p.nested();
+                    if (!has_cover_init) p.cover_init_span = span(eq_tok, eq_tok);
+                    has_cover_init = true;
+                    const id = p.ref_count;
+                    p.ref_count += 1;
+                    const ref: ast.Ref = .{ .name = k.name, .span = span(t, t), .id = id };
+                    try props.append(p.arena, .{ .cover_init = .{ .ref = ref, .default = def, .span = .{ .start = t.start, .end = def.span.end } } });
+                    depth = @max(depth, def.depth);
+                },
                 .number, .string, .identifier => return p.fail(.{ .syntax_error = "unexpected token in object literal" }, p.tok),
                 else => return p.fail(.{ .unsupported = .syntax }, p.tok),
-            };
-            try props.append(p.arena, .{ .key = k, .value = value, .span = .{ .start = t.start, .end = value.span.end } });
-            depth = @max(depth, value.depth);
+            }
             if (k == .computed) depth = @max(depth, k.computed.depth);
             if (p.tok.tag != .comma) break;
             try p.advance(); // a trailing comma is allowed
         }
         const close = p.tok;
         try p.expectAfterExpression(.r_brace);
-        return p.node(span(open, close), .{ .object = props.items }, depth);
+        const obj = try p.node(span(open, close), .{ .object = props.items }, depth);
+        if (has_cover_init or has_hole or has_rest_trailing_comma) {
+            const mut = @constCast(obj);
+            mut.has_cover_init = has_cover_init;
+            mut.has_hole = has_hole;
+            mut.has_rest_trailing_comma = has_rest_trailing_comma;
+        }
+        return obj;
     }
 
     /// The literal key `__proto__:` (not computed, not shorthand) sets the prototype.
@@ -1170,13 +1567,8 @@ const Parser = struct {
                 return p.node(s, .{ .identifier = .{ .name = name, .span = s, .id = id } }, 0);
             },
             .l_paren => {
-                try p.advance();
-                // `()` is only valid as an arrow-function parameter list.
-                if (p.tok.tag == .r_paren) return p.fail(.{ .syntax_error = "unexpected token ')'" }, p.tok);
-                if (p.tok.tag == .ellipsis) return p.fail(.{ .unsupported = .syntax }, p.tok); // `(...a) =>`
-                const inner = try p.nested();
-                try p.expectAfterExpression(.r_paren);
-                return inner;
+                const res = try p.parseParenList();
+                return p.finishParenAsExpr(res);
             },
             // Tokens that cannot begin an expression in any JavaScript.
             .eof, .semicolon, .r_paren, .r_bracket, .r_brace, .comma, .star, .star_star, .percent, .eq3, .neq3, .eq2, .neq2, .lt, .le, .gt, .ge, .shl, .shr, .ushr, .amp, .pipe, .caret, .amp_amp, .pipe_pipe, .question2, .question, .question_dot, .colon, .eq, .arrow, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .star_star_eq, .shl_eq, .shr_eq, .ushr_eq, .amp_eq, .pipe_eq, .caret_eq, .amp_amp_eq, .pipe_pipe_eq, .question2_eq => return p.fail(.{ .syntax_error = "unexpected token" }, t),
@@ -1205,6 +1597,203 @@ const Parser = struct {
         const e = try p.arena.create(ast.Expr);
         e.* = .{ .span = s, .depth = @intCast(depth), .data = data };
         return e;
+    }
+
+    fn patNode(p: *Parser, s: ast.Span, data: ast.Pattern.Data, child_depth: u16) Error!*const ast.Pattern {
+        const depth = @as(u32, child_depth) + 1;
+        if (depth > p.limits.max_nesting_depth) return p.limitExceeded(s.start, s.end);
+        const pat = try p.arena.create(ast.Pattern);
+        pat.* = .{ .span = s, .depth = @intCast(depth), .data = data };
+        return pat;
+    }
+
+    fn rejectCoverExpr(p: *Parser, e: *const ast.Expr) Error!void {
+        if (e.has_cover_init) return p.failAt(.{ .syntax_error = "invalid shorthand property initializer" }, p.cover_init_span.start, p.cover_init_span.end);
+        if (e.has_hole) return p.failAt(.{ .unsupported = .sparse_array }, p.hole_span.start, p.hole_span.end);
+    }
+
+    fn exprToAssignPattern(p: *Parser, e: *const ast.Expr) Error!*const ast.Pattern {
+        try p.enter();
+        defer p.depth -= 1;
+        switch (e.data) {
+            .identifier => |r| {
+                try p.rejectCoverExpr(e);
+                return p.patNode(e.span, .{ .target = .{ .ref = r } }, 0);
+            },
+            .member => |m| {
+                try p.rejectCoverExpr(e);
+                return p.patNode(e.span, .{ .target = .{ .member = m } }, 0);
+            },
+            .array => |items| {
+                if (e.has_rest_trailing_comma) return p.failAt(.{ .syntax_error = "rest element must be last element" }, e.span.end - 1, e.span.end);
+                var elems: std.ArrayList(?ast.Pattern.Elem) = .empty;
+                var rest: ?*const ast.Pattern = null;
+                var max_depth: u16 = 0;
+                for (items, 0..) |item, i| {
+                    switch (item.data) {
+                        .hole => try elems.append(p.arena, null),
+                        .spread => |inner| {
+                            if (i != items.len - 1) return p.failAt(.{ .syntax_error = "rest element must be last element" }, item.span.start, item.span.end);
+                            if (inner.data == .assign or inner.data == .assign_pattern)
+                                return p.failAt(.{ .syntax_error = "rest element may not have a default initializer" }, inner.span.start, inner.span.end);
+                            const r = try p.exprToAssignPattern(inner);
+                            max_depth = @max(max_depth, r.depth);
+                            rest = r;
+                        },
+                        .assign => |a| {
+                            if (a.op != .plain) return p.failAt(.{ .syntax_error = "invalid destructuring assignment target" }, item.span.start, item.span.end);
+                            const pat = try p.patNode(item.span, .{ .target = a.target }, 0);
+                            max_depth = @max(max_depth, pat.depth);
+                            try elems.append(p.arena, .{ .pattern = pat, .default = a.value, .span = item.span });
+                        },
+                        .assign_pattern => |ap| {
+                            max_depth = @max(max_depth, ap.pattern.depth);
+                            try elems.append(p.arena, .{ .pattern = ap.pattern, .default = ap.value, .span = item.span });
+                        },
+                        else => {
+                            const pat = try p.exprToAssignPattern(item);
+                            max_depth = @max(max_depth, pat.depth);
+                            try elems.append(p.arena, .{ .pattern = pat, .default = null, .span = item.span });
+                        },
+                    }
+                }
+                return p.patNode(e.span, .{ .array = .{ .elems = elems.items, .rest = rest } }, max_depth);
+            },
+            .object => |props| {
+                if (e.has_rest_trailing_comma) return p.failAt(.{ .syntax_error = "rest element must be last element" }, e.span.end - 1, e.span.end);
+                var out: std.ArrayList(ast.Pattern.Prop) = .empty;
+                var rest: ?*const ast.Pattern = null;
+                var max_depth: u16 = 0;
+                for (props, 0..) |prop, i| {
+                    switch (prop) {
+                        .spread => |sp| {
+                            if (i != props.len - 1) return p.failAt(.{ .syntax_error = "rest element must be last element" }, sp.span.start, sp.span.end);
+                            if (sp.expr.data == .assign or sp.expr.data == .assign_pattern)
+                                return p.failAt(.{ .syntax_error = "rest element may not have a default initializer" }, sp.span.start, sp.span.end);
+                            if (sp.expr.data != .identifier and sp.expr.data != .member)
+                                return p.invalidTarget(sp.expr, "invalid rest assignment target");
+                            const r = try p.exprToAssignPattern(sp.expr);
+                            max_depth = @max(max_depth, r.depth);
+                            rest = r;
+                        },
+                        .cover_init => |ci| {
+                            const pat = try p.patNode(ci.ref.span, .{ .target = .{ .ref = ci.ref } }, 0);
+                            try out.append(p.arena, .{ .key = .{ .name = ci.ref.name }, .pattern = pat, .default = ci.default, .shorthand = true, .span = ci.span });
+                        },
+                        .prop => |pr| {
+                            if (pr.shorthand) {
+                                const pat = try p.exprToAssignPattern(pr.value);
+                                try out.append(p.arena, .{ .key = pr.key, .pattern = pat, .default = null, .shorthand = true, .span = pr.span });
+                            } else {
+                                var default: ?*const ast.Expr = null;
+                                const pat: *const ast.Pattern = switch (pr.value.data) {
+                                    .assign => |a| blk: {
+                                        if (a.op != .plain) return p.failAt(.{ .syntax_error = "invalid destructuring assignment target" }, pr.value.span.start, pr.value.span.end);
+                                        default = a.value;
+                                        break :blk try p.patNode(pr.value.span, .{ .target = a.target }, 0);
+                                    },
+                                    .assign_pattern => |ap| blk: {
+                                        default = ap.value;
+                                        break :blk ap.pattern;
+                                    },
+                                    else => try p.exprToAssignPattern(pr.value),
+                                };
+                                max_depth = @max(max_depth, pat.depth);
+                                try out.append(p.arena, .{ .key = pr.key, .pattern = pat, .default = default, .shorthand = false, .span = pr.span });
+                            }
+                        },
+                    }
+                }
+                return p.patNode(e.span, .{ .object = .{ .props = out.items, .rest = rest } }, max_depth);
+            },
+            else => return p.invalidTarget(e, "invalid assignment target"),
+        }
+    }
+
+    fn refToDeclarator(p: *Parser, r: ast.Ref) Error!ast.Declarator {
+        if (token.reserved_identifiers.has(r.name))
+            return p.failAt(.{ .syntax_error = "reserved word cannot be a binding name" }, r.span.start, r.span.end);
+        if (std.mem.eql(u8, r.name, "let")) return p.failAt(.{ .unsupported = .syntax }, r.span.start, r.span.end);
+        if (std.mem.eql(u8, r.name, "arguments")) return p.failAt(.{ .unsupported = .arguments }, r.span.start, r.span.end);
+        const d: ast.Declarator = .{ .name = r.name, .span = r.span, .binding = p.binding_count, .init = null };
+        p.binding_count += 1;
+        return d;
+    }
+
+    fn targetPatternToBindingPattern(p: *Parser, pat: *const ast.Pattern) Error!*const ast.Pattern {
+        try p.enter();
+        defer p.depth -= 1;
+        switch (pat.data) {
+            .binding => return pat,
+            .target => |t| switch (t) {
+                .ref => |r| {
+                    const d = try p.refToDeclarator(r);
+                    return p.patNode(pat.span, .{ .binding = d }, 0);
+                },
+                .member => return p.failAt(.{ .syntax_error = "invalid binding pattern" }, pat.span.start, pat.span.end),
+            },
+            .array => |arr| {
+                var elems: std.ArrayList(?ast.Pattern.Elem) = .empty;
+                var max_depth: u16 = 0;
+                for (arr.elems) |maybe| {
+                    const el = maybe orelse {
+                        try elems.append(p.arena, null);
+                        continue;
+                    };
+                    const sub = try p.targetPatternToBindingPattern(el.pattern);
+                    max_depth = @max(max_depth, sub.depth);
+                    try elems.append(p.arena, .{ .pattern = sub, .default = el.default, .span = el.span });
+                }
+                const rest = if (arr.rest) |r| blk: {
+                    const sr = try p.targetPatternToBindingPattern(r);
+                    max_depth = @max(max_depth, sr.depth);
+                    break :blk sr;
+                } else null;
+                return p.patNode(pat.span, .{ .array = .{ .elems = elems.items, .rest = rest } }, max_depth);
+            },
+            .object => |obj| {
+                var props: std.ArrayList(ast.Pattern.Prop) = .empty;
+                var max_depth: u16 = 0;
+                for (obj.props) |pr| {
+                    const sub = try p.targetPatternToBindingPattern(pr.pattern);
+                    max_depth = @max(max_depth, sub.depth);
+                    try props.append(p.arena, .{ .key = pr.key, .pattern = sub, .default = pr.default, .shorthand = pr.shorthand, .span = pr.span });
+                }
+                const rest = if (obj.rest) |r| blk: {
+                    if (r.data != .target or r.data.target != .ref)
+                        return p.failAt(.{ .syntax_error = "rest element must be an identifier" }, r.span.start, r.span.end);
+                    const sr = try p.targetPatternToBindingPattern(r);
+                    max_depth = @max(max_depth, sr.depth);
+                    break :blk sr;
+                } else null;
+                return p.patNode(pat.span, .{ .object = .{ .props = props.items, .rest = rest } }, max_depth);
+            },
+        }
+    }
+
+    fn exprToBindingPattern(p: *Parser, e: *const ast.Expr) Error!*const ast.Pattern {
+        const tp = try p.exprToAssignPattern(e);
+        return p.targetPatternToBindingPattern(tp);
+    }
+
+    fn exprToArrowParam(p: *Parser, e: *const ast.Expr, item_span: ast.Span) Error!ast.Param {
+        switch (e.data) {
+            .assign => |a| {
+                if (a.op != .plain or a.target != .ref)
+                    return p.failAt(.{ .syntax_error = "invalid arrow function parameter" }, item_span.start, item_span.end);
+                const d = try p.refToDeclarator(a.target.ref);
+                const pat = try p.patNode(d.span, .{ .binding = d }, 0);
+                return .{ .pattern = pat, .default = a.value, .is_rest = false, .span = item_span };
+            },
+            .assign_pattern => |ap| {
+                const pat = try p.targetPatternToBindingPattern(ap.pattern);
+                return .{ .pattern = pat, .default = ap.value, .is_rest = false, .span = item_span };
+            },
+            else => {
+                const pat = try p.exprToBindingPattern(e);
+                return .{ .pattern = pat, .default = null, .is_rest = false, .span = item_span };
+            },
+        }
     }
 
     fn fail(p: *Parser, detail: Diagnostic.Detail, t: Token) Error {

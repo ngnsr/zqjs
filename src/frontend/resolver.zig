@@ -94,6 +94,8 @@ pub const Resolution = struct {
         /// Slot of the first parameter (1 in a named function expression, whose own
         /// name comes first; else 0). Parameters occupy consecutive slots.
         param_slot: u32 = 0,
+        param_scope: ?u32 = null,
+        is_simple_params: bool = true,
         captures: []const Capture = &.{},
     };
 
@@ -122,6 +124,7 @@ pub fn resolve(arena: Allocator, script: ast.Script, diag: *Diagnostic) Error!Re
         .bindings = try arena.alloc(Resolution.Binding, script.binding_count),
         .functions = try arena.alloc(Resolution.Function, script.function_count),
     };
+    @memset(r.refs, .global);
     @memset(r.functions, .{});
     try r.fns.append(arena, .{ .id = 0, .live_start = 0 });
     try r.block(script.statements, .script);
@@ -152,6 +155,10 @@ const Resolver = struct {
     live: std.ArrayList(Live) = .empty,
     scope_start: usize = 0,
     scope: u32 = 0,
+    /// Index in `r.live` where the enclosing parameter scope starts (for checking
+    /// parameter/body redeclarations in `block(..., .body)`).
+    param_scope_start: ?usize = null,
+    param_scope_end: usize = 0,
 
     const Saved = struct { scope_start: usize, live_len: usize, scope: u32 };
 
@@ -179,25 +186,67 @@ const Resolver = struct {
         r.functions[f.id].captures = f.captures.items;
     }
 
+    const Range = struct { start: usize, end: usize };
+
     /// The script body, a function body or a `{ … }` block: declare everything first,
     /// then resolve.
     fn block(r: *Resolver, stmts: []const ast.Stmt, comptime kind: enum { script, body, block }) Error!void {
-        const saved: ?Saved = if (kind == .body) null else try r.enterScope(); // a body shares the parameters' scope
-        defer if (saved) |sv| r.exitScope(sv);
+        const saved = try r.enterScope();
+        defer r.exitScope(saved);
+        const param_range: ?Range = if (kind == .body)
+            if (r.param_scope_start) |ps| .{ .start = ps, .end = r.param_scope_end } else null
+        else
+            null;
         for (stmts) |s| switch (s.data) {
-            .declaration => |decl| for (decl.declarators) |d| try r.declare(d, if (decl.kind == .let) .let else .@"const", kind == .script),
-            .function => |f| try r.declare(f.name.?, .function, kind == .script),
+            .declaration => |decl| for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", kind == .script, true, param_range),
+            .function => |f| try r.declare(f.name.?, .function, kind == .script, true, param_range),
             else => {},
         };
         for (stmts) |s| try r.stmt(s);
     }
 
-    fn declare(r: *Resolver, d: ast.Declarator, kind: Resolution.BindingKind, script_scope: bool) Error!void {
+    fn declarePattern(
+        r: *Resolver,
+        pat: *const ast.Pattern,
+        kind: Resolution.BindingKind,
+        script_scope: bool,
+        dup_is_syntax: bool,
+        param_range: ?Range,
+    ) Error!void {
+        switch (pat.data) {
+            .binding => |d| try r.declare(d, kind, script_scope, dup_is_syntax, param_range),
+            .array => |arr| {
+                for (arr.elems) |maybe| if (maybe) |el| try r.declarePattern(el.pattern, kind, script_scope, dup_is_syntax, param_range);
+                if (arr.rest) |rest| try r.declarePattern(rest, kind, script_scope, dup_is_syntax, param_range);
+            },
+            .object => |obj| {
+                for (obj.props) |pr| try r.declarePattern(pr.pattern, kind, script_scope, dup_is_syntax, param_range);
+                if (obj.rest) |rest| try r.declarePattern(rest, kind, script_scope, dup_is_syntax, param_range);
+            },
+            .target => unreachable,
+        }
+    }
+
+    fn declare(
+        r: *Resolver,
+        d: ast.Declarator,
+        kind: Resolution.BindingKind,
+        script_scope: bool,
+        dup_is_syntax: bool,
+        param_range: ?Range,
+    ) Error!void {
+        if (param_range) |pr| {
+            for (r.live.items[pr.start..pr.end]) |l| {
+                if (!std.mem.eql(u8, l.name, d.name)) continue;
+                if (kind == .function) return r.fail(.{ .unsupported = .duplicate_function }, d.span);
+                return r.fail(.{ .syntax_error = "identifier has already been declared" }, d.span);
+            }
+        }
         for (r.live.items[r.scope_start..]) |l| {
             if (!std.mem.eql(u8, l.name, d.name)) continue;
             const old = r.bindings[l.binding].kind;
-            // Sloppy JS allows these (the later declaration wins); not certain errors.
-            if (kind == .param and old == .param) return r.fail(.{ .unsupported = .duplicate_parameter }, d.span);
+            // Sloppy JS allows duplicate simple params (the later wins); non-simple params are SyntaxError.
+            if (kind == .param and old == .param and !dup_is_syntax) return r.fail(.{ .unsupported = .duplicate_parameter }, d.span);
             if (kind == .function and (old == .function or old == .param)) return r.fail(.{ .unsupported = .duplicate_function }, d.span);
             return r.fail(.{ .syntax_error = "identifier has already been declared" }, d.span);
         }
@@ -221,8 +270,11 @@ const Resolver = struct {
         switch (s.data) {
             .empty, .@"break", .@"continue" => {},
             .expression => |e| try r.expr(e),
-            // Already declared by the enclosing block; only the initialisers remain.
-            .declaration => |decl| for (decl.declarators) |d| if (d.init) |init| try r.expr(init),
+            // Already declared by the enclosing block; only the initialisers and pattern exprs remain.
+            .declaration => |decl| for (decl.declarators) |d| {
+                if (d.init) |init| try r.expr(init);
+                try r.resolvePatternExprs(d.pattern);
+            },
             .function => |f| try r.function(f),
             .@"return" => |v| if (v) |e| try r.expr(e),
             .throw => |e| try r.expr(e),
@@ -230,12 +282,13 @@ const Resolver = struct {
                 try r.block(t.body, .block);
                 const saved = try r.enterScope();
                 defer r.exitScope(saved);
-                if (t.catch_param) |cp| try r.declare(cp, .let, false);
+                if (t.catch_param) |cp| try r.declarePattern(cp, .let, false, true, null);
                 for (t.catch_body) |cs| switch (cs.data) {
-                    .declaration => |decl| for (decl.declarators) |d| try r.declare(d, if (decl.kind == .let) .let else .@"const", false),
-                    .function => |f| try r.declare(f.name.?, .function, false),
+                    .declaration => |decl| for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", false, true, null),
+                    .function => |f| try r.declare(f.name.?, .function, false, true, null),
                     else => {},
                 };
+                if (t.catch_param) |cp| try r.resolvePatternExprs(cp);
                 for (t.catch_body) |cs| try r.stmt(cs);
             },
             .block => |stmts| try r.block(stmts, .block),
@@ -259,7 +312,7 @@ const Resolver = struct {
                 // All case clauses share one lexical scope (TDZ across cases).
                 for (sw.cases) |c| {
                     for (c.body) |st| switch (st.data) {
-                        .declaration => |d| for (d.declarators) |decl| try r.declare(decl, if (d.kind == .let) .let else .@"const", false),
+                        .declaration => |d| for (d.declarators) |decl| try r.declarePattern(decl.pattern, if (d.kind == .let) .let else .@"const", false, true, null),
                         else => {},
                     };
                 }
@@ -275,8 +328,11 @@ const Resolver = struct {
                 defer r.exitScope(saved);
                 if (f.init) |init| switch (init) {
                     .declaration => |decl| {
-                        for (decl.declarators) |d| try r.declare(d, if (decl.kind == .let) .let else .@"const", false);
-                        for (decl.declarators) |d| if (d.init) |e| try r.expr(e);
+                        for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", false, true, null);
+                        for (decl.declarators) |d| {
+                            if (d.init) |e| try r.expr(e);
+                            try r.resolvePatternExprs(d.pattern);
+                        }
                     },
                     .expression => |e| try r.expr(e),
                 };
@@ -288,33 +344,75 @@ const Resolver = struct {
                 const saved = try r.enterScope();
                 defer r.exitScope(saved);
                 switch (f.target) {
-                    .declaration => |d| try r.declare(d.declarator, if (d.kind == .let) .let else .@"const", false),
-                    .target => |t| switch (t) {
-                        .ref => |ref| r.refs[ref.id] = try r.lookup(ref.name),
-                        .member => |m| try r.member(m),
+                    .declaration => |d| {
+                        try r.declarePattern(d.pattern, if (d.kind == .let) .let else .@"const", false, true, null);
+                        try r.expr(f.iterable);
+                        try r.resolvePatternExprs(d.pattern);
+                    },
+                    .target => |t| {
+                        try r.expr(f.iterable);
+                        try r.resolvePatternExprs(t);
                     },
                 }
-                try r.expr(f.iterable);
                 try r.stmt(f.body.*);
             },
         }
     }
 
     /// A function's own scopes: for a named expression, one holding just its name, then
-    /// one for the parameters and the body's declarations (a body `let` may not reuse a
-    /// parameter's name, so they share a scope).
+    /// a parameter scope (for parameters and their defaults, isolated from body `let`/`const`),
+    /// then the body scope.
     fn function(r: *Resolver, f: *const ast.Function) Error!void {
         try r.fns.append(r.arena, .{ .id = f.id, .is_arrow = f.is_arrow, .live_start = r.live.items.len });
         const name_scope: ?Saved = if (f.kind == .expression and f.name != null) try r.enterScope() else null;
-        if (name_scope != null) try r.declare(f.name.?, .function_name, false);
-        const saved = try r.enterScope();
+        if (name_scope != null) try r.declare(f.name.?, .function_name, false, true, null);
+        const param_saved = try r.enterScope();
+        r.functions[f.id].param_scope = r.scope;
+        const is_simple = for (f.params) |p| {
+            if (p.pattern.data != .binding or p.default != null or p.is_rest) break false;
+        } else true;
+        r.functions[f.id].is_simple_params = is_simple;
         r.functions[f.id].param_slot = @intCast(r.live.items.len - r.current().live_start);
-        for (f.params) |p| try r.declare(p, .param, false);
-        r.functions[f.id].param_count = @intCast(f.params.len);
+        r.functions[f.id].param_count = if (is_simple) @intCast(f.params.len) else 0;
+        for (f.params) |p| try r.declarePattern(p.pattern, .param, false, !is_simple, null);
+        for (f.params) |p| {
+            try r.resolvePatternExprs(p.pattern);
+            if (p.default) |def| try r.expr(def);
+        }
+        const prev_pstart = r.param_scope_start;
+        const prev_pend = r.param_scope_end;
+        r.param_scope_start = r.scope_start;
+        r.param_scope_end = r.live.items.len;
+        defer {
+            r.param_scope_start = prev_pstart;
+            r.param_scope_end = prev_pend;
+        }
         try r.block(f.body, .body);
-        r.exitScope(saved);
+        r.exitScope(param_saved);
         if (name_scope) |sv| r.exitScope(sv);
         r.finishFunction();
+    }
+
+    fn resolvePatternExprs(r: *Resolver, pat: *const ast.Pattern) Error!void {
+        switch (pat.data) {
+            .binding => {},
+            .target => |t| try r.assignTarget(t),
+            .array => |arr| {
+                for (arr.elems) |maybe| if (maybe) |el| {
+                    try r.resolvePatternExprs(el.pattern);
+                    if (el.default) |def| try r.expr(def);
+                };
+                if (arr.rest) |rest| try r.resolvePatternExprs(rest);
+            },
+            .object => |obj| {
+                for (obj.props) |pr| {
+                    if (pr.key == .computed) try r.expr(pr.key.computed);
+                    try r.resolvePatternExprs(pr.pattern);
+                    if (pr.default) |def| try r.expr(def);
+                }
+                if (obj.rest) |rest| try r.resolvePatternExprs(rest);
+            },
+        }
     }
 
     fn expr(r: *Resolver, e: *const ast.Expr) Error!void {
@@ -336,12 +434,22 @@ const Resolver = struct {
                 try r.expr(a.value);
                 try r.assignTarget(a.target);
             },
+            .assign_pattern => |ap| {
+                try r.expr(ap.value);
+                try r.resolvePatternExprs(ap.pattern);
+            },
+            .spread => |inner| try r.expr(inner),
+            .hole => unreachable,
             .update => |u| try r.assignTarget(u.target),
             .member, .delete => |m| try r.member(m),
             .optional_chain, .delete_optional => |oc| try r.optionalChain(oc),
-            .object => |props| for (props) |prop| {
-                if (prop.key == .computed) try r.expr(prop.key.computed);
-                try r.expr(prop.value);
+            .object => |props| for (props) |prop| switch (prop) {
+                .prop => |pr| {
+                    if (pr.key == .computed) try r.expr(pr.key.computed);
+                    try r.expr(pr.value);
+                },
+                .spread => |sp| try r.expr(sp.expr),
+                .cover_init => unreachable,
             },
             .array => |items| for (items) |item| try r.expr(item),
             .this => if (r.current().is_arrow) return r.fail(.{ .unsupported = .arrow_this }, e.span),
@@ -590,7 +698,7 @@ test "for-head bindings live in their own scope around the body" {
     try testing.expect(r.res.bindings[0].slot != r.res.bindings[1].slot);
     // The head binding is findable from the `for` node; M6 copies exactly these per iteration.
     const head = r.script.statements[0].data.@"for".init.?.declaration;
-    try testing.expectEqual(@as(u32, 0), head.declarators[0].binding);
+    try testing.expectEqual(@as(u32, 0), head.declarators[0].pattern.data.binding.binding);
 }
 
 test "undefined, NaN and Infinity: SyntaxError only at script level" {
@@ -632,8 +740,7 @@ test "functions number their own slots; parameters come first, after a named exp
     defer arena.deinit();
     var d: Diagnostic = .{};
     const r = try resolveSource(arena.allocator(), "let a; function f(p, q) { let b; } let g = function self(x) { let y; };", &d);
-    // Binding ids (parse order): a 0, f 1, p 2, q 3, b 4, self 5, x 6, y 7, g 8; `g`'s
-    // declarator is created after its initialiser has been parsed.
+    // Binding ids (parse order): a 0, f 1, p 2, q 3, b 4, g 5, self 6, x 7, y 8.
     const slot = struct {
         fn of(res: Resolution, binding: u32) u32 {
             return res.bindings[binding].slot;
@@ -642,8 +749,8 @@ test "functions number their own slots; parameters come first, after a named exp
     try testing.expectEqual(@as(u32, 0), slot(r.res, 2)); // p: f's slot 0
     try testing.expectEqual(@as(u32, 1), slot(r.res, 3)); // q
     try testing.expectEqual(@as(u32, 2), slot(r.res, 4)); // b
-    try testing.expectEqual(@as(u32, 0), slot(r.res, 5)); // self: the named expression's own name
-    try testing.expectEqual(@as(u32, 1), slot(r.res, 6)); // x
+    try testing.expectEqual(@as(u32, 0), slot(r.res, 6)); // self: the named expression's own name
+    try testing.expectEqual(@as(u32, 1), slot(r.res, 7)); // x
     try testing.expectEqual(@as(u32, 1), r.res.functions[2].param_slot);
     try testing.expectEqual(@as(u32, 0), r.res.functions[1].param_slot);
     try testing.expectEqual(@as(u32, 3), r.res.functions[0].slot_count); // a, f, g

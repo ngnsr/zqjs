@@ -1,0 +1,21 @@
+10 20 30
+x z
+k1 100 k2 200
+A 2 55357 B undefined
+7 8,9
+2 4 5
+10 2 null 4 d2,d4
+0 22 33 y-outer,oy,oz
+1 2 20 1,c,d 10 3 4
+a 1,2 b c
+TypeError
+TypeError
+TypeError
+TypeError
+2 1
+ok 42,99 2
+1:10,2:200,3:30
+13,17
+1:0,2:3
+500 fail none
+3 1,2,3,last

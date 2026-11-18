@@ -372,7 +372,6 @@ test "M14.3: Set unsupported methods, non-Set receivers, and non-array iterables
 test "M14.4: unsupported iterables, Iterator.prototype methods, and member for-of targets" {
     try expectUnsupported("for (const x of {}) {}", "", "Unsupported(builtin)");
     try expectUnsupported("[1].values().map;", "", "('map')");
-    try expectUnsupported("let o = {}; for (o.x of [1]) {}", "", "Unsupported(syntax)");
 }
 
 test "M15.1: JSON.parse reviver exclusion, new JSON(), nesting limit, and OOM" {

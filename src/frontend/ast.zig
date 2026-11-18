@@ -137,10 +137,62 @@ pub const Target = union(enum) {
     member: Member,
 };
 
-pub const PropertyDef = struct {
-    key: PropertyKey,
-    value: *const Expr,
+pub const PropertyDef = union(enum) {
+    prop: struct {
+        key: PropertyKey,
+        value: *const Expr,
+        shorthand: bool,
+        span: Span,
+    },
+    spread: struct {
+        expr: *const Expr,
+        span: Span,
+    },
+    /// CoverInitializedName `{ a = 1 }`: only valid when reinterpreted as a pattern.
+    cover_init: struct {
+        ref: Ref,
+        default: *const Expr,
+        span: Span,
+    },
+};
+
+/// A destructuring or assignment pattern (M26).
+/// `depth` counts nesting toward `Limits.max_nesting_depth`.
+pub const Pattern = struct {
     span: Span,
+    depth: u16,
+    data: Data,
+
+    pub const Data = union(enum) {
+        /// Binding leaf (`let`/`const`/param/`catch`/`for-of` decl).
+        binding: Declarator,
+        /// Assignment target leaf (`[x, o.y] = ...`).
+        target: Target,
+        /// `[elem0, , elem2, ...rest]` (`null` element = hole).
+        array: struct {
+            elems: []const ?Elem,
+            rest: ?*const Pattern,
+        },
+        /// `{ prop0, prop1, ...rest }`.
+        object: struct {
+            props: []const Prop,
+            rest: ?*const Pattern,
+        },
+    };
+
+    pub const Elem = struct {
+        pattern: *const Pattern,
+        default: ?*const Expr,
+        span: Span,
+    };
+
+    pub const Prop = struct {
+        key: PropertyKey,
+        pattern: *const Pattern,
+        default: ?*const Expr,
+        shorthand: bool,
+        span: Span,
+    };
 };
 
 pub const Expr = struct {
@@ -148,6 +200,15 @@ pub const Expr = struct {
     /// 1 + depth of the deepest child; bounded by Limits.max_nesting_depth, so every
     /// recursive walk over the tree has bounded native stack use.
     depth: u16,
+    /// True if this node (or a nested array/object literal) contains a CoverInitializedName
+    /// `{ a = 1 }`, which is a SyntaxError unless reinterpreted as a pattern.
+    has_cover_init: bool = false,
+    /// True if this node (or a nested array literal) contains a hole `[a, , b]`, which
+    /// is Unsupported(sparse_array) unless reinterpreted as a pattern.
+    has_hole: bool = false,
+    /// True if an array/object literal ends with `...rest,`, which is a SyntaxError
+    /// when reinterpreted as a pattern.
+    has_rest_trailing_comma: bool = false,
     data: Data,
 
     pub const Call = struct { callee: *const Expr, args: []const *const Expr };
@@ -170,6 +231,12 @@ pub const Expr = struct {
         conditional: struct { cond: *const Expr, then_expr: *const Expr, else_expr: *const Expr },
         /// `target = value` (`plain`), `target op= value` (`compound`), or logical assignment.
         assign: struct { op: AssignOp, target: Target, value: *const Expr },
+        /// `pattern = value` destructuring assignment (M26).
+        assign_pattern: struct { pattern: *const Pattern, value: *const Expr },
+        /// `...expr` inside array literals or call arguments (M26).
+        spread: *const Expr,
+        /// Elision hole inside an array literal cover grammar; only valid in patterns.
+        hole,
         /// `callee(args)`. A member callee (`o.f(…)`) is a method call: `this` is `o`.
         call: Call,
         /// `new callee(args)` or `new callee`.
@@ -193,6 +260,14 @@ pub const Expr = struct {
     };
 };
 
+/// A function parameter (M26: pattern, optional default, optional rest).
+pub const Param = struct {
+    pattern: *const Pattern,
+    default: ?*const Expr,
+    is_rest: bool,
+    span: Span,
+};
+
 /// A function declaration or expression (M6).
 pub const Function = struct {
     span: Span,
@@ -203,8 +278,7 @@ pub const Function = struct {
     /// Required for declarations (bound in the enclosing scope); optional for
     /// expressions (bound only inside the function, DESIGN_DECISIONS D36).
     name: ?Declarator,
-    /// Plain identifiers only (no defaults, rest or destructuring). `init` is always null.
-    params: []const Declarator,
+    params: []const Param,
     body: []const Stmt,
 };
 
@@ -218,9 +292,15 @@ pub const Declarator = struct {
     init: ?*const Expr,
 };
 
+pub const DeclItem = struct {
+    pattern: *const Pattern,
+    init: ?*const Expr,
+    span: Span,
+};
+
 pub const Declaration = struct {
     kind: DeclKind,
-    declarators: []const Declarator,
+    declarators: []const DeclItem,
 };
 
 pub const Stmt = struct {
@@ -251,7 +331,7 @@ pub const Stmt = struct {
         throw: *const Expr,
         @"try": struct {
             body: []const Stmt,
-            catch_param: ?Declarator,
+            catch_param: ?*const Pattern,
             catch_body: []const Stmt,
         },
     };
@@ -269,8 +349,8 @@ pub const ForInit = union(enum) {
 };
 
 pub const ForOfTarget = union(enum) {
-    declaration: struct { kind: DeclKind, declarator: Declarator },
-    target: Target,
+    declaration: struct { kind: DeclKind, pattern: *const Pattern },
+    target: *const Pattern,
 };
 
 pub const Script = struct {

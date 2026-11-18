@@ -81,7 +81,7 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `function_properties` | not yet | `f.x`, `f.length`, `print.name`, `o instanceof F` | functions aren't objects yet (no `.prototype` property on user functions) |
 | `primitive_write` | restriction | `'s'.x = 1`, `delete 'ab'.length` | sloppy JS silently ignores these |
 | `labels` | not yet | `foo: while (…)`, `break foo;` | |
-| `syntax` | not yet | `,`, `var`, destructuring, `for…in`, `let` used as a variable name, default/rest parameters, tagged templates, generators, `async`, regexes … | any JS token or construct not yet in the grammar below |
+| `syntax` | not yet | `,`, `var`, `for…in`, `let` used as a variable name, tagged templates, generators, `async`, regexes … | any JS token or construct not yet in the grammar below |
 
 ## 3. Lexical grammar (M1)
 
@@ -124,11 +124,17 @@ Each `Unsupported` diagnostic names one of these stable ids.
 Script            := BodyItem*
 BodyItem          := FunctionDeclaration | StatementListItem   (script and function bodies)
 FunctionDeclaration := 'function' Identifier Params Body   (hoisted; not inside blocks)
-Params            := '(' (Identifier (',' Identifier)* ','?)? ')'
+Params            := '(' (Param (',' Param)* ','?)? ')'
+Param             := '...' BindingPattern | BindingPattern ('=' Expression)?
 Body              := '{' BodyItem* '}'
 StatementListItem := Declaration | Statement
 Declaration       := ('let' | 'const') Declarator (',' Declarator)* ';'
-Declarator        := Identifier ('=' Expression)?          (const requires '=')
+Declarator        := BindingPattern ('=' Expression)?     (const and destructuring require '=')
+BindingPattern    := Identifier
+                   | '[' (ArrayPatElem? (',' ArrayPatElem?)* (',' '...' BindingPattern)?)? ']'
+                   | '{' (ObjPatProp (',' ObjPatProp)* (',' '...' Identifier)? ','?)? '}'
+ArrayPatElem      := BindingPattern ('=' Expression)?
+ObjPatProp        := Identifier ('=' Expression)? | PropertyKey ':' BindingPattern ('=' Expression)?
 Statement         := ';'                                   (empty statement)
                    | '{' StatementListItem* '}'            (block)
                    | 'if' '(' Expression ')' Statement ('else' Statement)?
@@ -141,7 +147,7 @@ Statement         := ';'                                   (empty statement)
                    | Expression ';'
 CaseClause        := ('case' Expression | 'default') ':' StatementListItem*
 ForInit           := ('let' | 'const') Declarator (',' Declarator)* | Expression
-Expression        := Identifier AssignOp Expression | ArrowFunction | Logical   (right-associative)
+Expression        := Target AssignOp Expression | Pattern '=' Expression | ArrowFunction | Logical   (right-associative)
 ArrowFunction     := (Identifier | Params) '=>' (Body | Expression)   (no line break before '=>')
 AssignOp          := '=' | '+=' | '-=' | '*=' | '/=' | '%=' | '**='
                    | '<<=' | '>>=' | '>>>=' | '&=' | '^=' | '|=' | '&&=' | '||=' | '??='
@@ -160,15 +166,17 @@ Exp               := Unary | Postfix '**' Exp               (right-associative)
 Unary             := ('-' | '+' | '!' | '~' | 'typeof') Unary | ('++' | '--') Unary | 'delete' Member | Postfix
 Postfix           := Primary ('++' | '--')?                 (no line break before ++/--)
 Primary           := Number | String | Template | 'true' | 'false' | 'null' | Identifier
-                   | '[' (Expression (',' Expression)* ','?)? ']'      (array, no holes)
+                   | '[' (ArgItem (',' ArgItem)* ','?)? ']'             (array, no holes)
                    | '{' (PropDef (',' PropDef)* ','?)? '}'            (object)
                    | 'this'                                (only inside functions)
                    | 'function' Identifier? Params Body    (function expression)
                    | '(' Expression ')'
-                   | Primary '(' (Expression (',' Expression)* ','?)? ')'   (call)
+                   | Primary '(' (ArgItem (',' ArgItem)* ','?)? ')'   (call)
                    | Primary '.' IdentifierName | Primary '[' Expression ']'   (member)
-                   | Primary '?.' (IdentifierName | '[' Expression ']' | '(' (Expression (',' Expression)* ','?)? ')')   (optional chain)
+                   | Primary '?.' (IdentifierName | '[' Expression ']' | '(' (ArgItem (',' ArgItem)* ','?)? ')')   (optional chain)
+ArgItem           := '...'? Expression
 PropDef           := (IdentifierName | String | Number | '[' Expression ']') ':' Expression
+                   | '...' Expression                      (spread)
                    | Identifier                            (shorthand) | IdentifierName Params Body (method)
 ```
 
@@ -224,14 +232,19 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
 - **Values:** functions compare by identity (`===`), are truthy, and convert to NaN. Converting
   one to a string, or comparing it with a string or another function, needs its source text:
   `Unsupported(function_to_string)`.
-- **Arrow functions (M20):** `x => expr`, `(x) => expr`, `() => expr`, `(a, b) => expr`,
+- **Arrow functions (M20, M26):** `x => expr`, `(x) => expr`, `() => expr`, `(a, b) => expr`,
+  pattern/default/rest parameters (`({a}) => a`, `([a, b]) => a + b`, `(a = 1) => a`, `(...r) => r`),
   `x => { body }`, `(a, b) => { body }`, and `x => ({ a: 1 })` (parenthesised object-literal
   bodies). An expression body returns its value; a block body returns `undefined` unless
   `return` executes. A line terminator before `=>` is a SyntaxError. Arrow functions share
-  closure and parameter rules with function expressions (`duplicate_parameter`,
-  `Unsupported(syntax)` for defaults/rest/destructuring), throw `TypeError` on `new`, and
+  closure and parameter rules with function expressions (`duplicate_parameter` for simple lists,
+  `SyntaxError` for duplicates in non-simple lists), throw `TypeError` on `new`, and
   fail at resolve time with `Unsupported(arrow_this)` if `this` is read inside an arrow body
   (outside a nested regular `function`).
+- **Default & rest parameters (M26):** `function f(a, b = a + 1, ...r)` and arrow equivalents.
+  Defaults are evaluated lazily left to right when the argument is `undefined`, in a parameter
+  scope isolated from body `let`/`const` declarations; referring to a later parameter eagerly is a
+  TDZ `ReferenceError`. Rest parameters must be last, have no default, and have no trailing comma.
 - **Limits:** more than `Limits.max_call_depth` (default 10,000) active calls →
   `LimitExceeded(call_depth)` (node: RangeError at about 11,000). The VM also limits the stack
   slots reserved by all active frames (`max_stack_slots`), the tree-walker its native recursion
@@ -324,3 +337,11 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
 - **`const`**: writing to an initialised const binding throws a **TypeError**, only when the
   write executes (`if (false) c = 2;` is fine). It is never an early error.
 - **`for (let …)`**: each iteration gets a fresh copy of the head bindings (see Functions).
+- **Destructuring & spread (M26):** array patterns (`[a, , b = 1, ...r]`) consume any iterable
+  through the built-in iterator machinery; object patterns (`{ a, b: c = 1, [k]: v, ...r }`) copy
+  remaining own enumerable string-keyed properties in `Object.keys` order. Defaults are evaluated
+  lazily left to right when the value is `undefined`; destructuring `null`/`undefined` throws
+  `TypeError`. Supported in `let`/`const` declarations, function/arrow parameters, `for...of`
+  heads, `catch` parameters, and plain assignment expressions (`[a, b] = [b, a]`, `({ a } = o)`).
+  Spread (`...xs`) is supported in array literals, object literals (`null`/`undefined` spread
+  nothing), calls (preserving `this` on method calls), and `new` calls.

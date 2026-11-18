@@ -62,14 +62,36 @@ const Shared = struct {
         defer c.deinit();
 
         if (f) |func| {
-            // Parameters arrive as plain values; box the captured ones.
-            for (func.params) |p| if (c.binding(p.binding).captured) try c.emit(.box_local, &.{c.slotOf(p.binding)});
-            // A named expression's own name: the running closure.
+            // A named expression's own name: the running closure (visible to parameter defaults).
             if (func.kind == .expression) if (func.name) |n| {
                 if (c.binding(n.binding).captured) try c.emit(.new_cell, &.{c.slotOf(n.binding)});
                 try c.emit(.push_callee, &.{});
                 try c.initBinding(n.binding);
             };
+            const fn_info = c.s.res.functions[func.id];
+            if (fn_info.is_simple_params) {
+                // Parameters arrive as plain values; box the captured ones.
+                for (func.params) |p| {
+                    const b = p.pattern.data.binding.binding;
+                    if (c.binding(b).captured) try c.emit(.box_local, &.{c.slotOf(b)});
+                }
+            } else {
+                for (func.params) |p| try c.enterPatternBindings(p.pattern);
+                for (func.params, 0..) |p, i| {
+                    if (p.is_rest) {
+                        try c.emit(.rest_array, &.{@intCast(i)});
+                    } else {
+                        try c.emit(.get_arg, &.{@intCast(i)});
+                        if (p.default) |def| {
+                            const skip = try c.jumpIfNotUndefined();
+                            try c.emit(.pop, &.{});
+                            try c.expr(def);
+                            c.patch(skip, c.here());
+                        }
+                    }
+                    try c.bindPattern(p.pattern, .init);
+                }
+            }
         }
         const completes = try c.statements(body, .{ .start = 0, .end = 0 });
         if (completes) switch (kind) {
@@ -263,6 +285,7 @@ const Compiler = struct {
             error.OutOfMemory => return error.OutOfMemory,
         };
         // On a later failure the string is freed by the heap rollback in `compile`.
+        gop.key_ptr.* = std.mem.sliceAsBytes(str.units);
         gop.value_ptr.* = try c.constant(.{ .string = str });
         return gop.value_ptr.*;
     }
@@ -286,10 +309,31 @@ const Compiler = struct {
     /// that cannot complete normally. Scope entry first, like the tree-walker: all
     /// let/const of the scope enter the TDZ (fresh cells for captured ones), then the
     /// function declarations are created (hoisted and initialised).
+    fn allocTemp(c: *Compiler) u32 {
+        const info = c.s.res.functions[c.function];
+        const slot = info.slot_count + c.temp_depth;
+        c.temp_depth += 1;
+        c.max_temp = @max(c.max_temp, c.temp_depth);
+        return slot;
+    }
+
+    fn freeTemp(c: *Compiler) void {
+        c.temp_depth -= 1;
+    }
+
+    /// Emits a jump to skip the default if the top of the stack is NOT `undefined`.
+    /// Leaves the value on the stack in both branches.
+    fn jumpIfNotUndefined(c: *Compiler) Error!u32 {
+        try c.emit(.dup, &.{});
+        try c.emit(.push_undefined, &.{});
+        try c.emit(.strict_eq, &.{});
+        return c.jumpForward(.jump_if_false);
+    }
+
     fn statements(c: *Compiler, stmts: []const ast.Stmt, span: ast.Span) Error!bool {
         c.span = span;
         for (stmts) |s| switch (s.data) {
-            .declaration => |decl| for (decl.declarators) |d| try c.enterBinding(d.binding),
+            .declaration => |decl| for (decl.declarators) |d| try c.enterPatternBindings(d.pattern),
             .function => |f| if (c.binding(f.name.?.binding).captured) try c.emit(.new_cell, &.{c.slotOf(f.name.?.binding)}),
             else => {},
         };
@@ -300,6 +344,21 @@ const Compiler = struct {
         };
         for (stmts) |s| if (!try c.stmt(s)) return false;
         return true;
+    }
+
+    fn enterPatternBindings(c: *Compiler, pat: *const ast.Pattern) Error!void {
+        switch (pat.data) {
+            .binding => |d| try c.enterBinding(d.binding),
+            .target => {},
+            .array => |arr| {
+                for (arr.elems) |maybe| if (maybe) |el| try c.enterPatternBindings(el.pattern);
+                if (arr.rest) |r| try c.enterPatternBindings(r);
+            },
+            .object => |obj| {
+                for (obj.props) |pr| try c.enterPatternBindings(pr.pattern);
+                if (obj.rest) |r| try c.enterPatternBindings(r);
+            },
+        }
     }
 
     /// The binding's scope is being entered: TDZ (a fresh cell if captured).
@@ -315,7 +374,7 @@ const Compiler = struct {
     fn declare(c: *Compiler, decl: ast.Declaration) Error!void {
         for (decl.declarators) |d| {
             if (d.init) |init| try c.expr(init) else try c.emit(.push_undefined, &.{});
-            try c.initBinding(d.binding);
+            try c.bindPattern(d.pattern, .init);
         }
     }
 
@@ -363,9 +422,8 @@ const Compiler = struct {
                 if (t.catch_param) |cp| {
                     c.depth += 1;
                     c.max_stack = @max(c.max_stack, c.depth);
-                    const b = c.binding(cp.binding);
-                    if (b.captured) try c.emit(.new_cell, &.{b.slot});
-                    try c.initBinding(cp.binding);
+                    try c.enterPatternBindings(cp);
+                    try c.bindPattern(cp, .init);
                 }
                 const catch_completes = try c.statements(t.catch_body, s.span);
                 if (to_end) |j| c.patch(j, c.here());
@@ -427,10 +485,10 @@ const Compiler = struct {
                 // cont: [copy]; [update; pop]; jump top; end:
                 // `copy` gives captured `let` head bindings fresh cells per iteration
                 // (CreatePerIterationEnvironment), as the tree-walker copies its record.
-                var copies: []const ast.Declarator = &.{};
+                var copies: []const ast.DeclItem = &.{};
                 if (f.init) |init| switch (init) {
                     .declaration => |decl| {
-                        for (decl.declarators) |d| try c.enterBinding(d.binding);
+                        for (decl.declarators) |d| try c.enterPatternBindings(d.pattern);
                         try c.declare(decl);
                         if (decl.kind == .let) copies = decl.declarators;
                     },
@@ -465,18 +523,15 @@ const Compiler = struct {
             .for_of => |f| {
                 // Store iterator in a hidden local slot so the operand stack stays empty
                 // across `body` (preserving `return`/`try`/`break`/`continue` stack invariants).
-                const info = c.s.res.functions[c.function];
-                const iter_slot: u32 = info.slot_count + c.temp_depth;
-                c.temp_depth += 1;
-                c.max_temp = @max(c.max_temp, c.temp_depth);
-                defer c.temp_depth -= 1;
+                const iter_slot = c.allocTemp();
+                defer c.freeTemp();
 
-                var single_copy: [1]ast.Declarator = undefined;
-                var copies: []const ast.Declarator = &.{};
+                var single_copy: [1]ast.DeclItem = undefined;
+                var copies: []const ast.DeclItem = &.{};
                 if (f.target == .declaration) {
-                    const d = f.target.declaration.declarator;
-                    try c.enterBinding(d.binding);
-                    single_copy[0] = d;
+                    const pat = f.target.declaration.pattern;
+                    try c.enterPatternBindings(pat);
+                    single_copy[0] = .{ .pattern = pat, .init = null, .span = pat.span };
                     copies = &single_copy;
                 }
                 try c.expr(f.iterable);
@@ -491,11 +546,10 @@ const Compiler = struct {
                 switch (f.target) {
                     .declaration => |decl| {
                         try c.perIteration(copies);
-                        try c.initBinding(decl.declarator.binding);
+                        try c.bindPattern(decl.pattern, .init);
                     },
                     .target => |t| {
-                        try c.write(t.ref);
-                        try c.emit(.pop, &.{});
+                        try c.bindPattern(t, .assign);
                     },
                 }
                 const body_completes = try c.loopBody(&loop, f.body.*);
@@ -529,7 +583,7 @@ const Compiler = struct {
         try c.expr(sw.discriminant);
         for (sw.cases) |cs| {
             for (cs.body) |s| switch (s.data) {
-                .declaration => |d| for (d.declarators) |decl| try c.enterBinding(decl.binding),
+                .declaration => |d| for (d.declarators) |decl| try c.enterPatternBindings(decl.pattern),
                 else => {},
             };
         }
@@ -579,8 +633,23 @@ const Compiler = struct {
         return (default_idx == null) or (switch_breaks.items.len > 0) or last_completes;
     }
 
-    fn perIteration(c: *Compiler, head: []const ast.Declarator) Error!void {
-        for (head) |d| if (c.binding(d.binding).captured) try c.emit(.fresh_cell, &.{c.slotOf(d.binding)});
+    fn perIteration(c: *Compiler, head: []const ast.DeclItem) Error!void {
+        for (head) |d| try c.perIterationPattern(d.pattern);
+    }
+
+    fn perIterationPattern(c: *Compiler, pat: *const ast.Pattern) Error!void {
+        switch (pat.data) {
+            .binding => |d| if (c.binding(d.binding).captured) try c.emit(.fresh_cell, &.{c.slotOf(d.binding)}),
+            .target => {},
+            .array => |arr| {
+                for (arr.elems) |maybe| if (maybe) |el| try c.perIterationPattern(el.pattern);
+                if (arr.rest) |r| try c.perIterationPattern(r);
+            },
+            .object => |obj| {
+                for (obj.props) |pr| try c.perIterationPattern(pr.pattern);
+                if (obj.rest) |r| try c.perIterationPattern(r);
+            },
+        }
     }
 
     fn loopBody(c: *Compiler, loop: *Loop, body: ast.Stmt) Error!bool {
@@ -674,6 +743,12 @@ const Compiler = struct {
                 try c.expr(cond.else_expr);
                 c.patch(to_end, c.here());
             },
+            .assign_pattern => |ap| {
+                try c.expr(ap.value);
+                try c.emit(.dup, &.{});
+                try c.bindPattern(ap.pattern, .assign);
+            },
+            .spread, .hole => unreachable,
             .assign => |a| switch (a.target) {
                 .ref => |ref| switch (a.op) {
                     .plain => {
@@ -801,32 +876,46 @@ const Compiler = struct {
             .delete_optional => |oc| try c.optionalChain(oc, true),
             .this => try c.emit(.push_this, &.{}),
             .array => |items| {
-                for (items) |item| try c.expr(item);
-                try c.emit(.new_array, &.{@intCast(items.len)});
+                const has_spread = for (items) |item| {
+                    if (item.data == .spread) break true;
+                } else false;
+                if (!has_spread) {
+                    for (items) |item| try c.expr(item);
+                    try c.emit(.new_array, &.{@intCast(items.len)});
+                } else {
+                    try c.compileArgsArray(items);
+                }
             },
             .object => |props| {
                 // Each key (if computed), then its value, in source order.
                 try c.emit(.new_object, &.{});
-                for (props) |prop| switch (prop.key) {
-                    .name => |n| {
-                        try c.expr(prop.value);
-                        try c.emit(.define_prop, &.{try c.name(n)});
+                for (props) |prop| switch (prop) {
+                    .prop => |pr| switch (pr.key) {
+                        .name => |n| {
+                            try c.expr(pr.value);
+                            try c.emit(.define_prop, &.{try c.name(n)});
+                        },
+                        .string => |units| {
+                            try c.emit(.push_const, &.{try c.string(units)});
+                            try c.expr(pr.value);
+                            try c.emit(.define_elem, &.{});
+                        },
+                        .number => |n| {
+                            try c.emit(.push_const, &.{try c.number(n)});
+                            try c.expr(pr.value);
+                            try c.emit(.define_elem, &.{});
+                        },
+                        .computed => |k| {
+                            try c.expr(k);
+                            try c.expr(pr.value);
+                            try c.emit(.define_elem, &.{});
+                        },
                     },
-                    .string => |units| {
-                        try c.emit(.push_const, &.{try c.string(units)});
-                        try c.expr(prop.value);
-                        try c.emit(.define_elem, &.{});
+                    .spread => |sp| {
+                        try c.expr(sp.expr);
+                        try c.emit(.object_spread, &.{});
                     },
-                    .number => |n| {
-                        try c.emit(.push_const, &.{try c.number(n)});
-                        try c.expr(prop.value);
-                        try c.emit(.define_elem, &.{});
-                    },
-                    .computed => |k| {
-                        try c.expr(k);
-                        try c.expr(prop.value);
-                        try c.emit(.define_elem, &.{});
-                    },
+                    .cover_init => unreachable,
                 };
             },
             .call => |call| {
@@ -846,13 +935,29 @@ const Compiler = struct {
                         .string, .number => unreachable,
                     }
                 } else try c.expr(call.callee);
-                for (call.args) |arg| try c.expr(arg);
-                try c.emit(if (method) .call_method else .call, &.{@intCast(call.args.len)}); // args.len < source size
+                const has_spread = for (call.args) |arg| {
+                    if (arg.data == .spread) break true;
+                } else false;
+                if (has_spread) {
+                    try c.compileArgsArray(call.args);
+                    try c.emit(if (method) .call_method_spread else .call_spread, &.{});
+                } else {
+                    for (call.args) |arg| try c.expr(arg);
+                    try c.emit(if (method) .call_method else .call, &.{@intCast(call.args.len)}); // args.len < source size
+                }
             },
             .new_call => |nc| {
                 try c.expr(nc.callee);
-                for (nc.args) |arg| try c.expr(arg);
-                try c.emit(.new_call, &.{@intCast(nc.args.len)});
+                const has_spread = for (nc.args) |arg| {
+                    if (arg.data == .spread) break true;
+                } else false;
+                if (has_spread) {
+                    try c.compileArgsArray(nc.args);
+                    try c.emit(.new_call_spread, &.{});
+                } else {
+                    for (nc.args) |arg| try c.expr(arg);
+                    try c.emit(.new_call, &.{@intCast(nc.args.len)});
+                }
             },
         }
     }
@@ -922,8 +1027,16 @@ const Compiler = struct {
                     }
                 },
                 .call => |args| {
-                    for (args) |arg| try c.expr(arg);
-                    try c.emit(if (has_receiver) .call_method else .call, &.{@intCast(args.len)});
+                    const has_spread = for (args) |arg| {
+                        if (arg.data == .spread) break true;
+                    } else false;
+                    if (has_spread) {
+                        try c.compileArgsArray(args);
+                        try c.emit(if (has_receiver) .call_method_spread else .call_spread, &.{});
+                    } else {
+                        for (args) |arg| try c.expr(arg);
+                        try c.emit(if (has_receiver) .call_method else .call, &.{@intCast(args.len)});
+                    }
                     has_receiver = false;
                 },
             }
@@ -940,6 +1053,202 @@ const Compiler = struct {
         try c.emit(.pop, &.{});
         try c.emit(if (is_delete) .push_true else .push_undefined, &.{});
         c.patch(to_end, c.here());
+    }
+
+    fn compileArgsArray(c: *Compiler, items: []const *const ast.Expr) Error!void {
+        try c.emit(.new_array, &.{0});
+        for (items) |item| {
+            if (item.data == .spread) {
+                try c.expr(item.data.spread);
+                try c.emit(.array_spread, &.{});
+            } else {
+                try c.expr(item);
+                try c.emit(.array_push, &.{});
+            }
+        }
+    }
+
+    const MemberSlots = struct {
+        base_slot: u32,
+        key_slot: ?u32,
+        prop_name: ?[]const u8,
+    };
+
+    fn preEvalMemberTarget(c: *Compiler, pat: *const ast.Pattern) Error!?MemberSlots {
+        if (pat.data != .target or pat.data.target != .member) return null;
+        const m = pat.data.target.member;
+        try c.expr(m.object);
+        const base_slot = c.allocTemp();
+        try c.emit(.init_local, &.{base_slot});
+        switch (m.key) {
+            .name => |n| return .{ .base_slot = base_slot, .key_slot = null, .prop_name = n },
+            .computed => |k| {
+                try c.expr(k);
+                const key_slot = c.allocTemp();
+                try c.emit(.init_local, &.{key_slot});
+                return .{ .base_slot = base_slot, .key_slot = key_slot, .prop_name = null };
+            },
+            .string, .number => unreachable,
+        }
+    }
+
+    fn storeMemberSlots(c: *Compiler, ms: MemberSlots) Error!void {
+        const val_slot = c.allocTemp();
+        try c.emit(.init_local, &.{val_slot});
+        try c.emit(.get_local, &.{ ms.base_slot, try c.name("<base>") });
+        if (ms.key_slot) |ks| try c.emit(.get_local, &.{ ks, try c.name("<key>") });
+        try c.emit(.get_local, &.{ val_slot, try c.name("<val>") });
+        if (ms.prop_name) |n| {
+            try c.emit(.set_prop, &.{try c.name(n)});
+        } else {
+            try c.emit(.set_elem, &.{});
+        }
+        try c.emit(.pop, &.{});
+        try c.emit(.clear_local, &.{val_slot});
+        c.freeTemp();
+        if (ms.key_slot) |ks| {
+            try c.emit(.clear_local, &.{ks});
+            c.freeTemp();
+        }
+        try c.emit(.clear_local, &.{ms.base_slot});
+        c.freeTemp();
+    }
+
+    /// Consumes the top of the stack and binds/assigns it according to `pat`.
+    fn bindPattern(c: *Compiler, pat: *const ast.Pattern, mode: enum { init, assign }) Error!void {
+        switch (pat.data) {
+            .binding => |d| try c.initBinding(d.binding),
+            .target => |t| switch (t) {
+                .ref => |ref| {
+                    try c.write(ref);
+                    try c.emit(.pop, &.{});
+                },
+                .member => |m| {
+                    const val_slot = c.allocTemp();
+                    defer c.freeTemp();
+                    try c.emit(.init_local, &.{val_slot});
+                    try c.expr(m.object);
+                    switch (m.key) {
+                        .name => |n| {
+                            try c.emit(.get_local, &.{ val_slot, try c.name("<val>") });
+                            try c.emit(.set_prop, &.{try c.name(n)});
+                        },
+                        .computed => |k| {
+                            try c.expr(k);
+                            try c.emit(.get_local, &.{ val_slot, try c.name("<val>") });
+                            try c.emit(.set_elem, &.{});
+                        },
+                        .string, .number => unreachable,
+                    }
+                    try c.emit(.pop, &.{});
+                    try c.emit(.clear_local, &.{val_slot});
+                },
+            },
+            .array => |arr| {
+                try c.emit(.get_iter, &.{});
+                const iter_slot = c.allocTemp();
+                defer c.freeTemp();
+                try c.emit(.init_local, &.{iter_slot});
+                for (arr.elems) |maybe_el| {
+                    const el = maybe_el orelse {
+                        try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
+                        try c.emit(.iter_next, &.{});
+                        try c.emit(.pop, &.{});
+                        try c.emit(.pop, &.{});
+                        continue;
+                    };
+                    const ms = if (mode == .assign) try c.preEvalMemberTarget(el.pattern) else null;
+                    try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
+                    try c.emit(.iter_next, &.{});
+                    try c.emit(.pop, &.{});
+                    if (el.default) |def| {
+                        const skip = try c.jumpIfNotUndefined();
+                        try c.emit(.pop, &.{});
+                        try c.expr(def);
+                        c.patch(skip, c.here());
+                    }
+                    if (ms) |slots| try c.storeMemberSlots(slots) else try c.bindPattern(el.pattern, mode);
+                }
+                if (arr.rest) |rest| {
+                    const ms = if (mode == .assign) try c.preEvalMemberTarget(rest) else null;
+                    try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
+                    try c.emit(.iter_rest, &.{});
+                    if (ms) |slots| try c.storeMemberSlots(slots) else try c.bindPattern(rest, mode);
+                }
+                try c.emit(.clear_local, &.{iter_slot});
+            },
+            .object => |obj| {
+                try c.emit(.require_obj, &.{});
+                const src_slot = c.allocTemp();
+                defer c.freeTemp();
+                try c.emit(.init_local, &.{src_slot});
+
+                var computed_slots: std.ArrayList(u32) = .empty;
+                defer computed_slots.deinit(c.s.gpa);
+
+                for (obj.props) |pr| {
+                    var k_slot: ?u32 = null;
+                    if (pr.key == .computed) {
+                        try c.expr(pr.key.computed);
+                        k_slot = c.allocTemp();
+                        try c.emit(.init_local, &.{k_slot.?});
+                        try computed_slots.append(c.s.gpa, k_slot.?);
+                    }
+                    const ms = if (mode == .assign) try c.preEvalMemberTarget(pr.pattern) else null;
+                    try c.emit(.get_local, &.{ src_slot, try c.name("<obj>") });
+                    switch (pr.key) {
+                        .name => |n| try c.emit(.get_prop, &.{try c.name(n)}),
+                        .string => |u| {
+                            try c.emit(.push_const, &.{try c.string(u)});
+                            try c.emit(.get_elem, &.{});
+                        },
+                        .number => |n| {
+                            try c.emit(.push_const, &.{try c.number(n)});
+                            try c.emit(.get_elem, &.{});
+                        },
+                        .computed => {
+                            try c.emit(.get_local, &.{ k_slot.?, try c.name("<key>") });
+                            try c.emit(.get_elem, &.{});
+                        },
+                    }
+                    if (pr.default) |def| {
+                        const skip = try c.jumpIfNotUndefined();
+                        try c.emit(.pop, &.{});
+                        try c.expr(def);
+                        c.patch(skip, c.here());
+                    }
+                    if (ms) |slots| try c.storeMemberSlots(slots) else try c.bindPattern(pr.pattern, mode);
+                }
+                if (obj.rest) |rest| {
+                    const ms = if (mode == .assign) try c.preEvalMemberTarget(rest) else null;
+                    try c.emit(.get_local, &.{ src_slot, try c.name("<obj>") });
+                    var ci: usize = 0;
+                    for (obj.props) |pr| switch (pr.key) {
+                        .name => |n| {
+                            const units = try c.s.gpa.alloc(u16, n.len);
+                            defer c.s.gpa.free(units);
+                            for (n, units) |ch, *u| u.* = ch;
+                            try c.emit(.push_const, &.{try c.string(units)});
+                        },
+                        .string => |u| try c.emit(.push_const, &.{try c.string(u)}),
+                        .number => |n| try c.emit(.push_const, &.{try c.number(n)}),
+                        .computed => {
+                            try c.emit(.get_local, &.{ computed_slots.items[ci], try c.name("<key>") });
+                            ci += 1;
+                        },
+                    };
+                    try c.emit(.object_rest, &.{@intCast(obj.props.len)});
+                    if (ms) |slots| try c.storeMemberSlots(slots) else try c.bindPattern(rest, mode);
+                }
+                var i = computed_slots.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    try c.emit(.clear_local, &.{computed_slots.items[i]});
+                    c.freeTemp();
+                }
+                try c.emit(.clear_local, &.{src_slot});
+            },
+        }
     }
 
     /// `o.name` / `o[k]`, read or deleted.

@@ -136,6 +136,30 @@ pub const Op = enum(u8) {
     /// Push the frame's `this`; Unsupported(sloppy_this) if the call had no receiver.
     push_this,
 
+    // ---- M26: destructuring, spread, rest, default parameters
+    /// Push `args[i]` (or `undefined` if `i >= argc`).
+    get_arg,
+    /// Push a new array containing `args[i..argc]`.
+    rest_array,
+    /// [arr, val] → [arr]: append `val` to `arr`.
+    array_push,
+    /// [arr, iterable] → [arr]: append all elements of `iterable` to `arr`.
+    array_spread,
+    /// [obj, src] → [obj]: copy own enumerable string-keyed properties of `src` to `obj`.
+    object_spread,
+    /// [callee, args_arr] → [result].
+    call_spread,
+    /// [receiver, callee, args_arr] → [result].
+    call_method_spread,
+    /// [callee, args_arr] → [result].
+    new_call_spread,
+    /// [iter] → [array]: drain remaining elements of `iter` into a new array.
+    iter_rest,
+    /// [val] → [val]: throw TypeError if `val` is `null` or `undefined`.
+    require_obj,
+    /// [src, k0 … k(n-1)] → [rest_obj]: copy own enumerable properties of `src` except k0..k(n-1).
+    object_rest,
+
     // ---- operators (runtime/ops.zig): pop operands, push the result
     add,
     sub,
@@ -250,6 +274,12 @@ pub const Op = enum(u8) {
             .set_elem => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
             .in, .instanceof => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .push_this => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
+            .get_arg, .rest_array => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
+            .array_push, .array_spread, .object_spread => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
+            .call_spread, .new_call_spread => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
+            .call_method_spread => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
+            .iter_rest, .require_obj => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .object_rest => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
             .call_method => .{ .operands = &.{.argc}, .pops = 2, .pushes = 1 },
             .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .neg, .to_number, .not, .bit_not, .typeof, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
@@ -267,7 +297,7 @@ pub const Op = enum(u8) {
     /// `call_method` and `new_array` pop their arguments too.
     pub fn popsWith(op: Op, argc: u32) u64 {
         const extra: u64 = switch (op) {
-            .call, .call_method, .new_call, .new_array => argc,
+            .call, .call_method, .new_call, .new_array, .object_rest => argc,
             else => 0,
         };
         return op.info().pops + extra;

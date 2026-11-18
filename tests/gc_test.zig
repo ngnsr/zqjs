@@ -1698,3 +1698,23 @@ test "M23: Array.prototype.sort with allocating comparator survives GC stress" {
         try testing.expectEqualStrings("40 0 12\n", r.out);
     }
 }
+
+test "M26: spreading and destructuring large arrays under GC stress" {
+    const src =
+        \\const a = [];
+        \\for (let i = 0; i < 300; i++) a.push({ n: i, tag: "t" + String(i) });
+        \\const b = [...a, { n: 300, tag: "end" }];
+        \\const [first, second, ...rest] = b;
+        \\function sumRest(x, y, ...tail) {
+        \\    let total = x.n + y.n;
+        \\    for (const { n } of tail) total += n;
+        \\    return total;
+        \\}
+        \\print(first.n, second.n, rest.length, sumRest(...b));
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("0 1 299 45150\n", r.out);
+    }
+}

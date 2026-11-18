@@ -103,6 +103,7 @@ const Verifier = struct {
                 .halt => if (p.kind != .script) return v.fail(p, at, "halt in a function"),
                 .@"return" => if (p.kind != .function) return v.fail(p, at, "return outside a function"),
                 .push_callee => if (p.kind != .function) return v.fail(p, at, "push_callee outside a function"),
+                .get_arg, .rest_array => if (p.kind != .function) return v.fail(p, at, "function-only instruction outside a function"),
                 else => {},
             }
             starts.set(pc);
@@ -375,4 +376,60 @@ test "instanceof pops 2, pushes 1 and checks underflow" {
     var f: Failure = .{};
     try testing.expectEqual(@as(u32, 2), (try verify(testing.allocator, &ok, .{}, &f)).max_stack);
     try expectInvalid(enc(.{ .push_null, .instanceof, .pop, .halt }), 1, "stack underflow");
+}
+
+test "M26: new opcodes verification rules" {
+    // get_arg and rest_array are only allowed in functions.
+    try expectInvalid(enc(.{ .get_arg, 0, .pop, .halt }), 1, "function-only instruction outside a function");
+    try expectInvalid(enc(.{ .rest_array, 0, .pop, .halt }), 1, "function-only instruction outside a function");
+    // Valid inside functions with exact max_stack.
+    try testing.expectEqual(@as(?[]const u8, null), try verifyTree(function(enc(.{ .get_arg, 0, .@"return" }), .{ .stack = 1 })));
+    try testing.expectEqual(@as(?[]const u8, null), try verifyTree(function(enc(.{ .rest_array, 0, .@"return" }), .{ .stack = 1 })));
+
+    // Stack underflow checks for spread, array, object, and destructuring opcodes.
+    try expectInvalid(enc(.{ .array_push, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .push_null, .array_push, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .array_spread, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .object_spread, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .call_spread, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .call_method_spread, .pop, .halt }), 2, "stack underflow");
+    try expectInvalid(enc(.{ .push_null, .push_null, .call_method_spread, .pop, .halt }), 2, "stack underflow");
+    try expectInvalid(enc(.{ .new_call_spread, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .iter_rest, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .require_obj, .pop, .halt }), 1, "stack underflow");
+    // object_rest pops 1 + argc values.
+    try expectInvalid(enc(.{ .push_null, .push_null, .object_rest, 2, .pop, .halt }), 2, "stack underflow");
+
+    // Valid stack effects for M26 opcodes.
+    var f: Failure = .{};
+    const valid_spread: Proto = .{
+        .code = enc(.{
+            .new_array,          0,
+            .push_null,          .array_push,
+            .push_null,          .array_spread,
+            .pop,                .new_object,
+            .push_null,          .object_spread,
+            .require_obj,        .push_null,
+            .push_null,          .object_rest,
+            2,                   .pop,
+            .push_null,          .iter_rest,
+            .pop,                .push_null,
+            .new_array,          0,
+            .call_spread,        .pop,
+            .push_null,          .push_null,
+            .new_array,          0,
+            .call_method_spread, .pop,
+            .push_null,          .new_array,
+            0,                   .new_call_spread,
+            .pop,                .halt,
+        }),
+        .consts = &.{},
+        .names = &.{},
+        .slot_count = 0,
+        .max_stack = 3,
+    };
+    const info = try verify(testing.allocator, &valid_spread, .{}, &f);
+    try testing.expectEqual(@as(u32, 3), info.max_stack);
+    try testing.expectEqual(@as(u32, 0), info.unreachable_instructions);
+    try testing.expectEqual(@as(u32, 0), info.inexact_max_stack);
 }

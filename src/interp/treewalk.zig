@@ -202,10 +202,29 @@ const Interpreter = struct {
         it.env = try it.rt.heap.newEnv(it.env, s, it.res.scopes[s].len);
     }
 
+    fn patternScope(it: *const Interpreter, pat: *const ast.Pattern) ?u32 {
+        switch (pat.data) {
+            .binding => |d| return it.res.bindings[d.binding].scope,
+            .target => return null,
+            .array => |arr| {
+                for (arr.elems) |maybe| if (maybe) |el| if (it.patternScope(el.pattern)) |s| return s;
+                if (arr.rest) |r| return it.patternScope(r);
+                return null;
+            },
+            .object => |obj| {
+                for (obj.props) |pr| if (it.patternScope(pr.pattern)) |s| return s;
+                if (obj.rest) |r| return it.patternScope(r);
+                return null;
+            },
+        }
+    }
+
     /// The scope a statement list declares into, if it declares anything.
     fn scopeOf(it: *const Interpreter, stmts: []const ast.Stmt) ?u32 {
         for (stmts) |s| switch (s.data) {
-            .declaration => |decl| return it.res.bindings[decl.declarators[0].binding].scope,
+            .declaration => |decl| for (decl.declarators) |d| {
+                if (it.patternScope(d.pattern)) |sc| return sc;
+            },
             .function => |f| return it.res.bindings[f.name.?.binding].scope,
             else => {},
         };
@@ -238,7 +257,7 @@ const Interpreter = struct {
     fn declare(it: *Interpreter, decl: ast.Declaration) Error!void {
         for (decl.declarators) |d| {
             const v: Value = if (d.init) |init| try it.eval(init) else .undefined;
-            it.store(d.binding, v); // initialisation: no TDZ or const check
+            try it.bindPattern(d.pattern, v, .init);
         }
     }
 
@@ -353,9 +372,9 @@ const Interpreter = struct {
                 break :blk null;
             };
             defer it.env = saved;
-            const catch_scope: ?u32 = if (t.catch_param) |cp| it.res.bindings[cp.binding].scope else it.scopeOf(t.catch_body);
+            const catch_scope: ?u32 = (if (t.catch_param) |cp| it.patternScope(cp) else null) orelse it.scopeOf(t.catch_body);
             try it.pushScope(catch_scope);
-            if (t.catch_param) |cp| it.store(cp.binding, val.?);
+            if (t.catch_param) |cp| try it.bindPattern(cp, val.?, .init);
             return it.body(t.catch_body);
         }
     }
@@ -366,9 +385,16 @@ const Interpreter = struct {
         var per_iteration = false;
         if (f.init) |init| switch (init) {
             .declaration => |decl| {
-                try it.pushScope(it.res.bindings[decl.declarators[0].binding].scope);
+                var head_scope: ?u32 = null;
+                for (decl.declarators) |d| {
+                    if (it.patternScope(d.pattern)) |sc| {
+                        head_scope = sc;
+                        break;
+                    }
+                }
+                try it.pushScope(head_scope);
                 try it.declare(decl);
-                per_iteration = decl.kind == .let; // the spec copies only `let` bindings
+                per_iteration = decl.kind == .let and head_scope != null; // the spec copies only `let` bindings
             },
             .expression => |e| _ = try it.eval(e),
         };
@@ -392,8 +418,11 @@ const Interpreter = struct {
         defer it.env = saved;
         const balanced = it.mark();
         defer it.release(balanced);
+        var for_of_has_scope = false;
         if (f.target == .declaration) {
-            try it.pushScope(it.res.bindings[f.target.declaration.declarator.binding].scope);
+            const sc = it.patternScope(f.target.declaration.pattern);
+            for_of_has_scope = sc != null;
+            try it.pushScope(sc);
         }
         const iterable = try it.eval(f.iterable);
         try it.hold(iterable);
@@ -405,19 +434,10 @@ const Interpreter = struct {
             try it.hold(next_val);
             switch (f.target) {
                 .declaration => |decl| {
-                    try it.copyScope();
-                    it.store(decl.declarator.binding, next_val);
+                    if (for_of_has_scope) try it.copyScope();
+                    try it.bindPattern(decl.pattern, next_val, .init);
                 },
-                .target => |t| {
-                    const ref = t.ref;
-                    if (it.bindingOf(ref) != null) {
-                        try it.write(ref, next_val);
-                    } else if (builtins.isBuiltinGlobal(ref.name)) {
-                        return it.rt.fail(.builtin);
-                    } else {
-                        return it.rt.throw(.ReferenceError, &.{ .{ .ascii = ref.name }, .{ .ascii = " is not defined" } });
-                    }
-                },
+                .target => |t| try it.bindPattern(t, next_val, .assign),
             }
             switch (try it.exec(f.body.*)) {
                 .normal, .@"continue" => {},
@@ -481,6 +501,13 @@ const Interpreter = struct {
             .binary => |b| return it.evalBinary(b),
             .conditional => |c| return if (ops.toBoolean(try it.eval(c.cond))) it.eval(c.then_expr) else it.eval(c.else_expr),
             .assign => |a| return it.evalAssign(a),
+            .assign_pattern => |ap| {
+                const v = try it.eval(ap.value);
+                try it.hold(v);
+                try it.bindPattern(ap.pattern, v, .assign);
+                return v;
+            },
+            .spread, .hole => unreachable,
             .update => |u| return it.evalUpdate(u),
             .member => |m| {
                 const base = try it.eval(m.object);
@@ -621,8 +648,20 @@ const Interpreter = struct {
         const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
         try it.hold(.{ .object = arr });
         for (items) |item| {
-            const v = try it.eval(item);
-            try rt.heap.appendElement(arr, v);
+            if (item.data == .spread) {
+                const m = it.mark();
+                defer it.release(m);
+                const iterable = try it.eval(item.data.spread);
+                try it.hold(iterable);
+                const iter = try builtins.getIterator(rt, iterable);
+                try it.hold(.{ .object = iter });
+                while (try builtins.iteratorNextVal(rt, iter)) |elem| {
+                    try rt.heap.appendElement(arr, elem);
+                }
+            } else {
+                const v = try it.eval(item);
+                try rt.heap.appendElement(arr, v);
+            }
         }
         return .{ .object = arr };
     }
@@ -635,9 +674,19 @@ const Interpreter = struct {
         for (props) |prop| {
             const m = it.mark();
             defer it.release(m);
-            const k = try it.literalKey(prop.key);
-            try it.holdKey(k);
-            try object.define(rt, o, k, try it.eval(prop.value));
+            switch (prop) {
+                .prop => |pr| {
+                    const k = try it.literalKey(pr.key);
+                    try it.holdKey(k);
+                    try object.define(rt, o, k, try it.eval(pr.value));
+                },
+                .spread => |sp| {
+                    const src = try it.eval(sp.expr);
+                    try it.hold(src);
+                    try copyDataProperties(rt, o, src, &.{});
+                },
+                .cover_init => unreachable,
+            }
         }
         return .{ .object = o };
     }
@@ -672,15 +721,33 @@ const Interpreter = struct {
         return it.invokeCallable(callee, receiver, c.args);
     }
 
+    fn evalArgsList(it: *Interpreter, arg_exprs: []const *const ast.Expr) Error![]Value {
+        const rt = it.rt;
+        var args: std.ArrayList(Value) = .empty;
+        errdefer args.deinit(rt.gpa);
+        for (arg_exprs) |arg| {
+            if (arg.data == .spread) {
+                const iterable = try it.eval(arg.data.spread);
+                try it.hold(iterable);
+                const iter = try builtins.getIterator(rt, iterable);
+                try it.hold(.{ .object = iter });
+                while (try builtins.iteratorNextVal(rt, iter)) |elem| {
+                    try it.hold(elem);
+                    try args.append(rt.gpa, elem);
+                }
+            } else {
+                const v = try it.eval(arg);
+                try it.hold(v);
+                try args.append(rt.gpa, v);
+            }
+        }
+        return args.toOwnedSlice(rt.gpa);
+    }
+
     fn invokeCallable(it: *Interpreter, callee: Value, receiver: ?Value, arg_exprs: []const *const ast.Expr) Error!Value {
         const rt = it.rt;
-        const args = try rt.gpa.alloc(Value, arg_exprs.len);
+        const args = try it.evalArgsList(arg_exprs);
         defer rt.gpa.free(args);
-        // `args` is not traced: each value is on the shadow stack too.
-        for (arg_exprs, args) |arg, *slot| {
-            slot.* = try it.eval(arg);
-            try it.hold(slot.*);
-        }
         return switch (callee) {
             .native => |n| if (n.host != null) rt.fail(.builtin) else n.call(rt, receiver orelse .undefined, args),
             // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
@@ -739,12 +806,8 @@ const Interpreter = struct {
         const rt = it.rt;
         const callee = try it.eval(nc.callee);
         try it.hold(callee);
-        const args = try rt.gpa.alloc(Value, nc.args.len);
+        const args = try it.evalArgsList(nc.args);
         defer rt.gpa.free(args);
-        for (nc.args, args) |arg, *slot| {
-            slot.* = try it.eval(arg);
-            try it.hold(slot.*);
-        }
         if (callee == .closure and callee.closure.impl == .tree) {
             const f: *const ast.Function = @ptrCast(@alignCast(callee.closure.impl.tree.func));
             if (f.is_arrow) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
@@ -817,14 +880,145 @@ const Interpreter = struct {
         if (saved_this) |v| try it.hold(v);
         it.env = t.env;
         it.this = this; // decided by the call, not by where the function was defined
-        // Parameters and the body's declarations share one scope.
-        const scope = if (f.params.len > 0) it.res.bindings[f.params[0].binding].scope else it.scopeOf(f.body);
-        try it.pushScope(scope);
-        for (f.params, 0..) |p, i| it.store(p.binding, if (i < args.len) args[i] else .undefined);
+        // Parameter scope is separate from body scope so default expressions cannot see body `let`/`const`.
+        if (it.res.functions[f.id].param_scope) |ps| {
+            if (it.res.scopes[ps].len > 0) try it.pushScope(ps);
+        }
+        for (f.params, 0..) |p, i| {
+            const pm = it.mark();
+            defer it.release(pm);
+            if (p.is_rest) {
+                const arr = try it.rt.heap.newArray((try builtins.realm(it.rt)).array_prototype);
+                if (i < args.len) try it.rt.heap.appendElements(arr, args[i..]);
+                try it.bindPattern(p.pattern, .{ .object = arr }, .init);
+            } else {
+                var v: Value = if (i < args.len) args[i] else .undefined;
+                if (p.default) |def| if (v == .undefined) {
+                    v = try it.eval(def);
+                };
+                try it.bindPattern(p.pattern, v, .init);
+            }
+        }
+        try it.pushScope(it.scopeOf(f.body));
         return switch (try it.body(f.body)) {
             .@"return" => it.ret,
             else => .undefined,
         };
+    }
+
+    const MemberTargetVal = struct { base: Value, kv: KeyValue };
+
+    fn preEvalMember(it: *Interpreter, pat: *const ast.Pattern) Error!?MemberTargetVal {
+        if (pat.data != .target or pat.data.target != .member) return null;
+        const m = pat.data.target.member;
+        const base = try it.eval(m.object);
+        try it.hold(base);
+        const kv = try it.keyValue(m);
+        if (kv == .value) try it.hold(kv.value);
+        return .{ .base = base, .kv = kv };
+    }
+
+    fn bindPattern(it: *Interpreter, pat: *const ast.Pattern, val: Value, mode: enum { init, assign }) Error!void {
+        const rt = it.rt;
+        const balanced = it.mark();
+        defer it.release(balanced);
+        try it.hold(val);
+        switch (pat.data) {
+            .binding => |d| it.store(d.binding, val),
+            .target => |t| switch (t) {
+                .ref => |ref| {
+                    if (it.bindingOf(ref) != null) {
+                        try it.write(ref, val);
+                    } else if (builtins.isBuiltinGlobal(ref.name)) {
+                        return rt.fail(.builtin);
+                    } else {
+                        return rt.throw(.ReferenceError, &.{ .{ .ascii = ref.name }, .{ .ascii = " is not defined" } });
+                    }
+                },
+                .member => |m| {
+                    const base = try it.eval(m.object);
+                    try it.hold(base);
+                    const k = try it.toKey(try it.keyValue(m));
+                    try object.set(rt, base, k, val);
+                },
+            },
+            .array => |arr| {
+                const iter = try builtins.getIterator(rt, val);
+                try it.hold(.{ .object = iter });
+                for (arr.elems) |maybe_el| {
+                    const em = it.mark();
+                    defer it.release(em);
+                    const el = maybe_el orelse {
+                        _ = try builtins.iteratorNextVal(rt, iter);
+                        continue;
+                    };
+                    const mv = if (mode == .assign) try it.preEvalMember(el.pattern) else null;
+                    var v = (try builtins.iteratorNextVal(rt, iter)) orelse .undefined;
+                    try it.hold(v);
+                    if (el.default) |def| if (v == .undefined) {
+                        v = try it.eval(def);
+                        try it.hold(v);
+                    };
+                    if (mv) |m| {
+                        try object.set(rt, m.base, try it.toKey(m.kv), v);
+                    } else {
+                        try it.bindPattern(el.pattern, v, mode);
+                    }
+                }
+                if (arr.rest) |rest| {
+                    const mv = if (mode == .assign) try it.preEvalMember(rest) else null;
+                    const rest_arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
+                    try it.hold(.{ .object = rest_arr });
+                    while (try builtins.iteratorNextVal(rt, iter)) |elem| {
+                        try rt.heap.appendElement(rest_arr, elem);
+                    }
+                    if (mv) |m| {
+                        try object.set(rt, m.base, try it.toKey(m.kv), .{ .object = rest_arr });
+                    } else {
+                        try it.bindPattern(rest, .{ .object = rest_arr }, mode);
+                    }
+                }
+            },
+            .object => |obj| {
+                if (val == .undefined or val == .null) {
+                    return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot destructure '" }, .{ .ascii = @tagName(val) }, .{ .ascii = "'" } });
+                }
+                var excluded: std.ArrayList(object.Key) = .empty;
+                defer excluded.deinit(rt.gpa);
+                for (obj.props) |pr| {
+                    const k = try it.literalKey(pr.key);
+                    if (obj.rest != null) {
+                        try it.holdKey(k);
+                        try excluded.append(rt.gpa, k);
+                    }
+                    const pm = it.mark();
+                    defer it.release(pm);
+                    const mv = if (mode == .assign) try it.preEvalMember(pr.pattern) else null;
+                    var v = try object.get(rt, val, k);
+                    try it.hold(v);
+                    if (pr.default) |def| if (v == .undefined) {
+                        v = try it.eval(def);
+                        try it.hold(v);
+                    };
+                    if (mv) |m| {
+                        try object.set(rt, m.base, try it.toKey(m.kv), v);
+                    } else {
+                        try it.bindPattern(pr.pattern, v, mode);
+                    }
+                }
+                if (obj.rest) |rest| {
+                    const mv = if (mode == .assign) try it.preEvalMember(rest) else null;
+                    const rest_obj = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
+                    try it.hold(.{ .object = rest_obj });
+                    try copyDataProperties(rt, rest_obj, val, excluded.items);
+                    if (mv) |m| {
+                        try object.set(rt, m.base, try it.toKey(m.kv), .{ .object = rest_obj });
+                    } else {
+                        try it.bindPattern(rest, .{ .object = rest_obj }, mode);
+                    }
+                }
+            },
+        }
     }
 
     fn bindingOf(it: *const Interpreter, ref: ast.Ref) ?u32 {
@@ -853,6 +1047,41 @@ const Interpreter = struct {
         return it.rt.throw(.ReferenceError, &.{ .{ .ascii = "Cannot access '" }, .{ .ascii = ref.name }, .{ .ascii = "' before initialization" } });
     }
 };
+
+fn keyEq(a: object.Key, b: object.Key) bool {
+    return switch (a) {
+        .index => |ia| b == .index and b.index == ia,
+        .atom => |aa| b == .atom and b.atom == aa,
+    };
+}
+
+fn keyIn(k: object.Key, list: []const object.Key) bool {
+    for (list) |ex| if (keyEq(k, ex)) return true;
+    return false;
+}
+
+fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []const object.Key) Error!void {
+    switch (src) {
+        .string => |s| {
+            for (0..s.units.len) |i| {
+                const k: object.Key = .{ .index = @intCast(i) };
+                if (keyIn(k, excluded)) continue;
+                const ch = try rt.heap.newString(&.{.{ .utf16 = s.units[i..][0..1] }});
+                try object.define(rt, dst, k, .{ .string = ch });
+            }
+        },
+        .object => |o| {
+            const keys = try object.ownKeys(rt, o);
+            defer rt.gpa.free(keys);
+            for (keys) |k| {
+                if (keyIn(k, excluded)) continue;
+                const v = try object.get(rt, src, k);
+                try object.define(rt, dst, k, v);
+            }
+        },
+        .undefined, .null, .boolean, .number, .native, .closure => {},
+    }
+}
 
 // ---- the recursion guard really bounds the Zig stack
 

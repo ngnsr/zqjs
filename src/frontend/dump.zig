@@ -54,7 +54,7 @@ const Dumper = struct {
                     try d.stmt(st);
                 }
                 try w.writeAll(") (catch ");
-                if (t.catch_param) |cp| try d.binding(cp) else try w.writeByte('_');
+                if (t.catch_param) |cp| try d.pattern(cp) else try w.writeByte('_');
                 for (t.catch_body) |st| {
                     try w.writeByte(' ');
                     try d.stmt(st);
@@ -133,13 +133,10 @@ const Dumper = struct {
                 switch (f.target) {
                     .declaration => |dc| {
                         try w.print("({s} ", .{@tagName(dc.kind)});
-                        try d.binding(dc.declarator);
+                        try d.pattern(dc.pattern);
                         try w.writeByte(')');
                     },
-                    .target => |t| switch (t) {
-                        .ref => |r| try d.ref(r),
-                        .member => |m| try d.member(m),
-                    },
+                    .target => |t| try d.pattern(t),
                 }
                 try w.writeByte(' ');
                 try d.expr(f.iterable);
@@ -155,6 +152,59 @@ const Dumper = struct {
         try d.w.print("{s}#{d}@{s}{d}", .{ dc.name, dc.binding, if (b.captured) "c" else "", b.slot });
     }
 
+    fn pattern(d: Dumper, pat: *const ast.Pattern) Error!void {
+        const w = d.w;
+        switch (pat.data) {
+            .binding => |dc| try d.binding(dc),
+            .target => |t| try d.target(t),
+            .array => |arr| {
+                try w.writeAll("(pat-array");
+                for (arr.elems) |maybe| {
+                    try w.writeByte(' ');
+                    if (maybe) |el| {
+                        if (el.default) |def| {
+                            try w.writeAll("(= ");
+                            try d.pattern(el.pattern);
+                            try w.writeByte(' ');
+                            try d.expr(def);
+                            try w.writeByte(')');
+                        } else {
+                            try d.pattern(el.pattern);
+                        }
+                    } else {
+                        try w.writeByte('_');
+                    }
+                }
+                if (arr.rest) |r| {
+                    try w.writeAll(" (... ");
+                    try d.pattern(r);
+                    try w.writeByte(')');
+                }
+                try w.writeByte(')');
+            },
+            .object => |obj| {
+                try w.writeAll("(pat-object");
+                for (obj.props) |pr| {
+                    try w.writeAll(" (");
+                    try d.key(pr.key);
+                    try w.writeByte(' ');
+                    try d.pattern(pr.pattern);
+                    if (pr.default) |def| {
+                        try w.writeByte(' ');
+                        try d.expr(def);
+                    }
+                    try w.writeByte(')');
+                }
+                if (obj.rest) |r| {
+                    try w.writeAll(" (... ");
+                    try d.pattern(r);
+                    try w.writeByte(')');
+                }
+                try w.writeByte(')');
+            },
+        }
+    }
+
     fn function(d: Dumper, f: *const ast.Function) Error!void {
         const w = d.w;
         if (f.is_arrow) {
@@ -166,7 +216,19 @@ const Dumper = struct {
         }
         for (f.params, 0..) |p, i| {
             if (i > 0) try w.writeByte(' ');
-            try d.binding(p);
+            if (p.is_rest) {
+                try w.writeAll("(... ");
+                try d.pattern(p.pattern);
+                try w.writeByte(')');
+            } else if (p.default) |def| {
+                try w.writeAll("(= ");
+                try d.pattern(p.pattern);
+                try w.writeByte(' ');
+                try d.expr(def);
+                try w.writeByte(')');
+            } else {
+                try d.pattern(p.pattern);
+            }
         }
         try w.writeByte(')');
         const captures = d.res.functions[f.id].captures;
@@ -186,7 +248,7 @@ const Dumper = struct {
         try d.w.print("({s}", .{@tagName(decl.kind)});
         for (decl.declarators) |dc| {
             try d.w.writeAll(" (");
-            try d.binding(dc);
+            try d.pattern(dc.pattern);
             if (dc.init) |init| {
                 try d.w.writeByte(' ');
                 try d.expr(init);
@@ -315,6 +377,19 @@ const Dumper = struct {
                 try d.expr(c.else_expr);
                 try w.writeByte(')');
             },
+            .assign_pattern => |ap| {
+                try w.writeAll("(= ");
+                try d.pattern(ap.pattern);
+                try w.writeByte(' ');
+                try d.expr(ap.value);
+                try w.writeByte(')');
+            },
+            .spread => |inner| {
+                try w.writeAll("(... ");
+                try d.expr(inner);
+                try w.writeByte(')');
+            },
+            .hole => unreachable,
             .assign => |a| {
                 switch (a.op) {
                     .plain => try w.writeAll("(= "),
@@ -361,13 +436,21 @@ const Dumper = struct {
             },
             .object => |props| {
                 try w.writeAll("(object");
-                for (props) |prop| {
-                    try w.writeAll(" (");
-                    try d.key(prop.key);
-                    try w.writeByte(' ');
-                    try d.expr(prop.value);
-                    try w.writeByte(')');
-                }
+                for (props) |prop| switch (prop) {
+                    .prop => |pr| {
+                        try w.writeAll(" (");
+                        try d.key(pr.key);
+                        try w.writeByte(' ');
+                        try d.expr(pr.value);
+                        try w.writeByte(')');
+                    },
+                    .spread => |sp| {
+                        try w.writeAll(" (... ");
+                        try d.expr(sp.expr);
+                        try w.writeByte(')');
+                    },
+                    .cover_init => unreachable,
+                };
                 try w.writeByte(')');
             },
             .update => |u| {

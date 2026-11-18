@@ -70,6 +70,34 @@ test "M20: the arrow lookahead keeps nested parentheses linear" {
     try testing.expect(t_nested < 20 * t_flat);
 }
 
+test "M26: cover grammar keeps deeply nested parens/arrays/objects followed by => linear" {
+    const depth = 150;
+    var flat: std.ArrayList(u8) = .empty;
+    defer flat.deinit(testing.allocator);
+    try flat.append(testing.allocator, '[');
+    for (0..10_000) |_| try flat.appendSlice(testing.allocator, "1,");
+    try flat.appendSlice(testing.allocator, "];");
+
+    // Deeply nested (([{"k": ...}])) => 1 (invalid arrow head, must fail in linear time).
+    var nested_arrow: std.ArrayList(u8) = .empty;
+    defer nested_arrow.deinit(testing.allocator);
+    try nested_arrow.appendNTimes(testing.allocator, '(', depth);
+    try nested_arrow.appendNTimes(testing.allocator, '[', 50);
+    for (0..10_000) |_| try nested_arrow.appendSlice(testing.allocator, "{a:1},");
+    try nested_arrow.appendNTimes(testing.allocator, ']', 50);
+    try nested_arrow.appendNTimes(testing.allocator, ')', depth);
+    try nested_arrow.appendSlice(testing.allocator, " => 1;");
+
+    const t_flat = @max(try parseNanos(flat.items), 1);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: Diagnostic = .{};
+    const start = std.Io.Timestamp.now(testing.io, .awake);
+    try testing.expectError(error.SyntaxError, parse(arena.allocator(), nested_arrow.items, .{}, &d));
+    const t_nested = start.durationTo(std.Io.Timestamp.now(testing.io, .awake)).toNanoseconds();
+    try testing.expect(t_nested < 30 * t_flat);
+}
+
 fn fuzzOne(_: void, smith: *testing.Smith) anyerror!void {
     var buf: [1024]u8 = undefined;
     try frontendOnce(testing.allocator, buf[0..smith.slice(&buf)], .{ .max_nesting_depth = 64 });

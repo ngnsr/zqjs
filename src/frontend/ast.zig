@@ -48,9 +48,10 @@ pub const BinaryOp = enum {
     strict_ne,
     /// `key in object` (M7).
     in,
-    /// `&&` and `||` short-circuit; the compiler treats them as control flow.
+    /// `&&`, `||`, and `??` short-circuit; the compiler treats them as control flow.
     logical_and,
     logical_or,
+    nullish,
 
     pub fn symbol(op: BinaryOp) []const u8 {
         return switch (op) {
@@ -75,6 +76,7 @@ pub const BinaryOp = enum {
             .in => "in",
             .logical_and => "&&",
             .logical_or => "||",
+            .nullish => "??",
         };
     }
 };
@@ -107,6 +109,23 @@ pub const PropertyKey = union(enum) {
 pub const Member = struct {
     object: *const Expr,
     key: PropertyKey,
+};
+
+/// An optional chain starting at the first `?.` (M24).
+pub const OptionalChain = struct {
+    base: *const Expr,
+    steps: []const Step,
+
+    pub const Step = struct {
+        optional: bool,
+        kind: Kind,
+    };
+
+    pub const Kind = union(enum) {
+        prop: []const u8,
+        elem: *const Expr,
+        call: []const *const Expr,
+    };
 };
 
 /// What an assignment or `++`/`--` writes to.
@@ -155,12 +174,15 @@ pub const Expr = struct {
         /// `++x`, `--x`, `x++`, `x--`.
         update: struct { op: enum { inc, dec }, prefix: bool, target: Target },
         member: Member,
+        optional_chain: OptionalChain,
         /// `{ key: value, … }`, in source order.
         object: []const PropertyDef,
         /// `[a, b, …]` (no holes: the parser rejects them).
         array: []const *const Expr,
         /// `delete object.name` / `delete object[expr]`.
         delete: Member,
+        /// `delete a?.b` / `delete a?.[k]` (last step is `.prop` or `.elem`).
+        delete_optional: OptionalChain,
         /// `this`, only inside functions (at script level: Unsupported).
         this,
         /// `function [name](params) { body }` as an expression.

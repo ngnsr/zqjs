@@ -223,6 +223,34 @@ const Dumper = struct {
         try d.w.writeByte(')');
     }
 
+    fn optionalChain(d: Dumper, oc: ast.OptionalChain) Error!void {
+        try d.w.writeAll("(?. ");
+        try d.expr(oc.base);
+        for (oc.steps) |s| {
+            try d.w.writeByte(' ');
+            switch (s.kind) {
+                .prop => |n| {
+                    try d.w.writeAll(if (s.optional) "?." else ".");
+                    try d.w.writeAll(n);
+                },
+                .elem => |e| {
+                    try d.w.writeAll(if (s.optional) "?.[" else "[");
+                    try d.expr(e);
+                    try d.w.writeByte(']');
+                },
+                .call => |args| {
+                    try d.w.writeAll(if (s.optional) "(?.call" else "(call");
+                    for (args) |arg| {
+                        try d.w.writeByte(' ');
+                        try d.expr(arg);
+                    }
+                    try d.w.writeByte(')');
+                },
+            }
+        }
+        try d.w.writeByte(')');
+    }
+
     fn key(d: Dumper, k: ast.PropertyKey) Error!void {
         switch (k) {
             .name => |n| try d.w.writeAll(n),
@@ -312,9 +340,15 @@ const Dumper = struct {
             .function => |f| try d.function(f),
             .this => try w.writeAll("this"),
             .member => |m| try d.member(m),
+            .optional_chain => |oc| try d.optionalChain(oc),
             .delete => |m| {
                 try w.writeAll("(delete ");
                 try d.member(m);
+                try w.writeByte(')');
+            },
+            .delete_optional => |oc| {
+                try w.writeAll("(delete ");
+                try d.optionalChain(oc);
                 try w.writeByte(')');
             },
             .array => |items| {

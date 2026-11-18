@@ -81,7 +81,7 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `function_properties` | not yet | `f.x`, `f.length`, `print.name` | functions aren't objects yet |
 | `primitive_write` | restriction | `'s'.x = 1`, `delete 'ab'.length` | sloppy JS silently ignores these |
 | `labels` | not yet | `foo: while (…)`, `break foo;` | |
-| `syntax` | not yet | `,`, `??`, `var`, destructuring, `for…in`, `let` used as a variable name, default/rest parameters, tagged templates, generators, `async`, regexes … | any JS token or construct not yet in the grammar below |
+| `syntax` | not yet | `,`, `var`, destructuring, `for…in`, `let` used as a variable name, default/rest parameters, tagged templates, generators, `async`, regexes … | any JS token or construct not yet in the grammar below |
 
 ## 3. Lexical grammar (M1)
 
@@ -145,8 +145,9 @@ Expression        := Identifier AssignOp Expression | ArrowFunction | Logical   
 ArrowFunction     := (Identifier | Params) '=>' (Body | Expression)   (no line break before '=>')
 AssignOp          := '=' | '+=' | '-=' | '*=' | '/=' | '%=' | '**='
                    | '<<=' | '>>=' | '>>>=' | '&=' | '^=' | '|=' | '&&=' | '||=' | '??='
-Logical           := Logical ('||' | '&&') Logical          (&& binds tighter than ||)
-                   | BitOr
+Logical           := Logical ('||' | '&&') Logical          (&& binds tighter than ||; cannot mix with ??)
+                   | Coalesce
+Coalesce          := Coalesce '??' BitOr | BitOr
 BitOr             := BitOr '|' BitXor | BitXor
 BitXor            := BitXor '^' BitAnd | BitAnd
 BitAnd            := BitAnd '&' Equality | Equality
@@ -166,6 +167,7 @@ Primary           := Number | String | Template | 'true' | 'false' | 'null' | Id
                    | '(' Expression ')'
                    | Primary '(' (Expression (',' Expression)* ','?)? ')'   (call)
                    | Primary '.' IdentifierName | Primary '[' Expression ']'   (member)
+                   | Primary '?.' (IdentifierName | '[' Expression ']' | '(' (Expression (',' Expression)* ','?)? ')')   (optional chain)
 PropDef           := (IdentifierName | String | Number | '[' Expression ']') ':' Expression
                    | Identifier                            (shorthand) | IdentifierName Params Body (method)
 ```
@@ -236,7 +238,7 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
   (`max_interpreter_depth`); which limit a runaway recursion hits first is engine-specific.
 
 ### Operators (M3), as in JavaScript
-- Operands are evaluated left to right; `&&`/`||` short-circuit and return an operand value.
+- Operands are evaluated left to right; `&&`/`||`/`??` short-circuit and return an operand value (`??` only evaluates the right side when the left is `null` or `undefined`). Optional chaining (`?.`) short-circuits the rest of the chain to `undefined` (`true` for `delete`) when the base is `null` or `undefined`, preserving `this` on optional method calls.
 - `+` concatenates if either side is a string, otherwise adds numbers. `- * / % **` and unary
   `-`/`+` convert to numbers (`+'0x10'` is 16, `+'1_000'` is NaN, `+''` is 0).
 - `<` `<=` `>` `>=` compare two strings by UTF-16 code unit, anything else as numbers.

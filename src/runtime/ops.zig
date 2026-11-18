@@ -282,7 +282,7 @@ pub fn binary(rt: *Runtime, op: ast.BinaryOp, a_in: Value, b_in: Value) Error!Va
         .ge => .{ .boolean = if (try lessThan(rt, a, b)) |r| !r else false },
         .strict_eq => .{ .boolean = strictEquals(a, b) },
         .strict_ne => .{ .boolean = !strictEquals(a, b) },
-        .logical_and, .logical_or => unreachable,
+        .logical_and, .logical_or, .nullish => unreachable,
     };
 }
 

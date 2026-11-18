@@ -650,6 +650,13 @@ const Compiler = struct {
                     try c.expr(b.rhs);
                     c.patch(to_end, c.here());
                 },
+                .nullish => {
+                    try c.expr(b.lhs);
+                    const to_end = try c.jumpIfLogicalAssignShortCircuit(.nullish);
+                    try c.emit(.pop, &.{});
+                    try c.expr(b.rhs);
+                    c.patch(to_end, c.here());
+                },
                 else => {
                     try c.expr(b.lhs);
                     try c.expr(b.rhs);
@@ -789,7 +796,9 @@ const Compiler = struct {
                 },
             },
             .member => |m| try c.member(m, .get),
+            .optional_chain => |oc| try c.optionalChain(oc, false),
             .delete => |m| try c.member(m, .delete),
+            .delete_optional => |oc| try c.optionalChain(oc, true),
             .this => try c.emit(.push_this, &.{}),
             .array => |items| {
                 for (items) |item| try c.expr(item);
@@ -846,6 +855,91 @@ const Compiler = struct {
                 try c.emit(.new_call, &.{@intCast(nc.args.len)});
             },
         }
+    }
+
+    fn jumpIfNullish(c: *Compiler, targets: *std.ArrayList(u32)) Error!void {
+        try c.emit(.dup, &.{});
+        try c.emit(.push_null, &.{});
+        try c.emit(.strict_eq, &.{});
+        try targets.append(c.s.gpa, try c.jumpForward(.jump_if_true));
+        try c.emit(.dup, &.{});
+        try c.emit(.push_undefined, &.{});
+        try c.emit(.strict_eq, &.{});
+        try targets.append(c.s.gpa, try c.jumpForward(.jump_if_true));
+    }
+
+    fn optionalChain(c: *Compiler, oc: ast.OptionalChain, is_delete: bool) Error!void {
+        var short_1: std.ArrayList(u32) = .empty;
+        defer short_1.deinit(c.s.gpa);
+        var short_2: std.ArrayList(u32) = .empty;
+        defer short_2.deinit(c.s.gpa);
+
+        var has_receiver = false;
+        if (oc.steps[0].kind == .call and oc.base.data == .member) {
+            const m = oc.base.data.member;
+            try c.expr(m.object);
+            try c.emit(.dup, &.{});
+            switch (m.key) {
+                .name => |n| try c.emit(.get_prop, &.{try c.name(n)}),
+                .computed => |k| {
+                    try c.expr(k);
+                    try c.emit(.get_elem, &.{});
+                },
+                .string, .number => unreachable,
+            }
+            has_receiver = true;
+        } else {
+            try c.expr(oc.base);
+        }
+
+        for (oc.steps, 0..) |step, i| {
+            if (step.optional) {
+                try c.jumpIfNullish(if (has_receiver) &short_2 else &short_1);
+            }
+            switch (step.kind) {
+                .prop => |n| {
+                    if (is_delete and i == oc.steps.len - 1) {
+                        try c.emit(.delete_prop, &.{try c.name(n)});
+                    } else {
+                        if (i + 1 < oc.steps.len and oc.steps[i + 1].kind == .call) {
+                            try c.emit(.dup, &.{});
+                            has_receiver = true;
+                        }
+                        try c.emit(.get_prop, &.{try c.name(n)});
+                    }
+                },
+                .elem => |k| {
+                    if (is_delete and i == oc.steps.len - 1) {
+                        try c.expr(k);
+                        try c.emit(.delete_elem, &.{});
+                    } else {
+                        if (i + 1 < oc.steps.len and oc.steps[i + 1].kind == .call) {
+                            try c.emit(.dup, &.{});
+                            has_receiver = true;
+                        }
+                        try c.expr(k);
+                        try c.emit(.get_elem, &.{});
+                    }
+                },
+                .call => |args| {
+                    for (args) |arg| try c.expr(arg);
+                    try c.emit(if (has_receiver) .call_method else .call, &.{@intCast(args.len)});
+                    has_receiver = false;
+                },
+            }
+        }
+        std.debug.assert(!has_receiver);
+
+        const to_end = try c.jumpForward(.jump);
+        if (short_2.items.len > 0) {
+            c.depth += 1;
+            for (short_2.items) |j| c.patch(j, c.here());
+            try c.emit(.pop, &.{});
+        }
+        for (short_1.items) |j| c.patch(j, c.here());
+        try c.emit(.pop, &.{});
+        try c.emit(if (is_delete) .push_true else .push_undefined, &.{});
+        c.patch(to_end, c.here());
     }
 
     /// `o.name` / `o[k]`, read or deleted.
@@ -940,6 +1034,6 @@ fn binaryOp(op: ast.BinaryOp) Op {
         .strict_eq => .strict_eq,
         .strict_ne => .strict_ne,
         .in => .in,
-        .logical_and, .logical_or => unreachable, // control flow, handled by the caller
+        .logical_and, .logical_or, .nullish => unreachable, // control flow, handled by the caller
     };
 }

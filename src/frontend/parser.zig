@@ -44,6 +44,7 @@ const Infix = struct { op: ast.BinaryOp, bp: u8, right_assoc: bool = false };
 fn infix(tag: Tag) ?Infix {
     return switch (tag) {
         .pipe_pipe => .{ .op = .logical_or, .bp = 1 },
+        .question2 => .{ .op = .nullish, .bp = 1 },
         .amp_amp => .{ .op = .logical_and, .bp = 2 },
         .pipe => .{ .op = .bit_or, .bp = 3 },
         .caret => .{ .op = .bit_xor, .bp = 4 },
@@ -741,12 +742,29 @@ const Parser = struct {
         defer p.depth -= 1;
 
         var lhs = try p.prefix();
+        var saw_logical = false;
+        var saw_nullish = false;
         while (true) {
             if (p.tok.tag == .eq2 or p.tok.tag == .neq2) return p.fail(.{ .unsupported = .loose_equality }, p.tok);
             const info: Infix = if (!p.no_in and p.isText(p.tok, "in")) .{ .op = .in, .bp = 7 } else infix(p.tok.tag) orelse break;
             if (info.bp < min_bp) break;
+            // JS forbids mixing `??` with `&&` or `||` without parentheses; the RHS of `??`
+            // is a BitwiseORExpression (bp 3), so `a ?? b && c` falls through to `saw_nullish`.
+            const rhs_min_bp: u8 = switch (info.op) {
+                .nullish => blk: {
+                    if (saw_logical) return p.fail(.{ .syntax_error = "cannot mix '??' with '&&' or '||'" }, p.tok);
+                    saw_nullish = true;
+                    break :blk 3;
+                },
+                .logical_and, .logical_or => blk: {
+                    if (saw_nullish) return p.fail(.{ .syntax_error = "cannot mix '??' with '&&' or '||'" }, p.tok);
+                    saw_logical = true;
+                    break :blk info.bp + 1;
+                },
+                else => if (info.right_assoc) info.bp else info.bp + 1,
+            };
             try p.advance();
-            const rhs = try p.binary(if (info.right_assoc) info.bp else info.bp + 1);
+            const rhs = try p.binary(rhs_min_bp);
             lhs = try p.node(
                 .{ .start = lhs.span.start, .end = rhs.span.end },
                 .{ .binary = .{ .op = info.op, .lhs = lhs, .rhs = rhs } },
@@ -790,9 +808,15 @@ const Parser = struct {
                 if (p.tok.tag == .star_star)
                     return p.fail(.{ .syntax_error = "unary operator before '**' needs parentheses" }, t);
                 // `delete x` (a variable) and `delete 1` mean something in sloppy JS, but
-                // only member deletion is part of ZQJS.
-                if (operand.data != .member) return p.fail(.{ .unsupported = .syntax }, t);
-                return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .delete = operand.data.member }, operand.depth);
+                // only member (and optional member) deletion is part of ZQJS.
+                switch (operand.data) {
+                    .member => |m| return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .delete = m }, operand.depth),
+                    .optional_chain => |oc| {
+                        if (oc.steps[oc.steps.len - 1].kind == .call) return p.fail(.{ .unsupported = .syntax }, t);
+                        return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .delete_optional = oc }, operand.depth);
+                    },
+                    else => return p.fail(.{ .unsupported = .syntax }, t),
+                }
             } else if (p.isText(t, "typeof")) {
                 try p.advance();
                 const operand = try p.binary(unary_bp);
@@ -829,18 +853,23 @@ const Parser = struct {
         return p.failAt(.{ .syntax_error = msg }, e.span.start, e.span.end);
     }
 
+    fn expectPropertyName(p: *Parser) Error!Token {
+        const name = p.tok;
+        // Any identifier or keyword names a property: `o.if`, `o.this`. A literal,
+        // `=` or a closing token can't follow `.` or `?.` in any JS; others (`o.#x`) might.
+        if (name.tag != .identifier and !token.isKeyword(name.tag)) return switch (name.tag) {
+            .eof, .semicolon, .comma, .eq, .r_paren, .r_bracket, .r_brace, .number, .string, .template_no_sub, .template_head, .dot, .question_dot => p.fail(.{ .syntax_error = "expected a property name after '.'" }, name),
+            else => p.fail(.{ .unsupported = .syntax }, name),
+        };
+        try p.advance();
+        return name;
+    }
+
     fn memberStep(p: *Parser, callee: *const ast.Expr) Error!?*const ast.Expr {
         return switch (p.tok.tag) {
             .dot => blk: {
                 try p.advance();
-                const name = p.tok;
-                // Any identifier or keyword names a property: `o.if`, `o.this`. A literal,
-                // `=` or a closing token can't follow `.` in any JS; others (`o.#x`) might.
-                if (name.tag != .identifier and !token.isKeyword(name.tag)) return switch (name.tag) {
-                    .eof, .semicolon, .comma, .eq, .r_paren, .r_bracket, .r_brace, .number, .string => p.fail(.{ .syntax_error = "expected a property name after '.'" }, name),
-                    else => p.fail(.{ .unsupported = .syntax }, name),
-                };
-                try p.advance();
+                const name = try p.expectPropertyName();
                 break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = name.text(p.source()) } } }, callee.depth);
             },
             .l_bracket => blk: {
@@ -850,7 +879,6 @@ const Parser = struct {
                 try p.expectAfterExpression(.r_bracket);
                 break :blk try p.node(.{ .start = callee.span.start, .end = close.end }, .{ .member = .{ .object = callee, .key = .{ .computed = k } } }, @max(callee.depth, k.depth));
             },
-            .question_dot => p.fail(.{ .unsupported = .syntax }, p.tok), // optional chaining
             else => null,
         };
     }
@@ -861,19 +889,73 @@ const Parser = struct {
         return callee;
     }
 
-    /// `callee(args)`, `object.name`, `object[key]`, chained. Unlike `++`, these may
-    /// continue on the next line: `x\n(2)` calls x, `x\n[0]` indexes it.
+    /// `callee(args)`, `object.name`, `object[key]`, or an optional chain starting at `?.`.
+    /// Unlike `++`, these may continue on the next line: `x\n(2)` calls x, `x\n[0]` indexes it.
     fn calls(p: *Parser, callee_in: *const ast.Expr) Error!*const ast.Expr {
         var callee = callee_in;
         while (true) {
             if (p.tok.tag == .l_paren) {
                 callee = try p.callArgs(callee);
+            } else if (p.tok.tag == .question_dot) {
+                return p.optionalChain(callee);
             } else if (try p.memberStep(callee)) |next| {
                 callee = next;
             } else if (p.tok.tag == .template_no_sub or p.tok.tag == .template_head) {
                 return p.fail(.{ .unsupported = .syntax }, p.tok); // tagged template
             } else return callee;
         }
+    }
+
+    fn optionalChain(p: *Parser, base: *const ast.Expr) Error!*const ast.Expr {
+        var steps: std.ArrayList(ast.OptionalChain.Step) = .empty;
+        var depth = base.depth;
+        var end = base.span.end;
+        while (true) {
+            const optional = p.tok.tag == .question_dot;
+            if (optional) {
+                try p.advance();
+                if (p.tok.tag == .l_paren) {
+                    const parsed = try p.parseCallArgs(depth);
+                    try steps.append(p.arena, .{ .optional = true, .kind = .{ .call = parsed.args } });
+                    depth = parsed.depth;
+                    end = parsed.end;
+                } else if (p.tok.tag == .l_bracket) {
+                    try p.advance();
+                    const k = try p.nested();
+                    const close = p.tok;
+                    try p.expectAfterExpression(.r_bracket);
+                    try steps.append(p.arena, .{ .optional = true, .kind = .{ .elem = k } });
+                    depth = @max(depth, k.depth);
+                    end = close.end;
+                } else {
+                    const name = try p.expectPropertyName();
+                    try steps.append(p.arena, .{ .optional = true, .kind = .{ .prop = name.text(p.source()) } });
+                    end = name.end;
+                }
+            } else if (p.tok.tag == .l_paren) {
+                const parsed = try p.parseCallArgs(depth);
+                try steps.append(p.arena, .{ .optional = false, .kind = .{ .call = parsed.args } });
+                depth = parsed.depth;
+                end = parsed.end;
+            } else if (p.tok.tag == .l_bracket) {
+                try p.advance();
+                const k = try p.nested();
+                const close = p.tok;
+                try p.expectAfterExpression(.r_bracket);
+                try steps.append(p.arena, .{ .optional = false, .kind = .{ .elem = k } });
+                depth = @max(depth, k.depth);
+                end = close.end;
+            } else if (p.tok.tag == .dot) {
+                try p.advance();
+                const name = try p.expectPropertyName();
+                try steps.append(p.arena, .{ .optional = false, .kind = .{ .prop = name.text(p.source()) } });
+                end = name.end;
+            } else break;
+        }
+        if (p.tok.tag == .template_no_sub or p.tok.tag == .template_head) {
+            return p.fail(.{ .syntax_error = "tagged template literal is not allowed in optional chain" }, p.tok);
+        }
+        return p.node(.{ .start = base.span.start, .end = end }, .{ .optional_chain = .{ .base = base, .steps = steps.items } }, depth);
     }
 
     fn newExpr(p: *Parser) Error!*const ast.Expr {
@@ -891,30 +973,38 @@ const Parser = struct {
             const c = call_node.data.call;
             return p.node(.{ .start = start, .end = call_node.span.end }, .{ .new_call = .{ .callee = c.callee, .args = c.args } }, call_node.depth);
         }
+        if (p.tok.tag == .question_dot) {
+            return p.fail(.{ .syntax_error = "optional chaining is not allowed in 'new'" }, p.tok);
+        }
         return p.node(.{ .start = start, .end = target.span.end }, .{ .new_call = .{ .callee = target, .args = &.{} } }, target.depth);
     }
 
-    fn callArgs(p: *Parser, callee: *const ast.Expr) Error!*const ast.Expr {
-        {
-            try p.advance();
-            var args: std.ArrayList(*const ast.Expr) = .empty;
-            var depth = callee.depth;
-            while (p.tok.tag != .r_paren) {
-                if (p.tok.tag == .ellipsis) return p.fail(.{ .unsupported = .syntax }, p.tok); // spread
-                const arg = try p.nested();
-                try args.append(p.arena, arg);
-                depth = @max(depth, arg.depth);
-                if (p.tok.tag != .comma) break;
-                try p.advance(); // a trailing comma is allowed: `f(1,)`
-            }
-            const close = p.tok;
-            try p.expectAfterExpression(.r_paren);
-            return p.node(
-                .{ .start = callee.span.start, .end = close.end },
-                .{ .call = .{ .callee = callee, .args = args.items } },
-                depth,
-            );
+    const ParsedArgs = struct { args: []const *const ast.Expr, depth: u16, end: u32 };
+
+    fn parseCallArgs(p: *Parser, base_depth: u16) Error!ParsedArgs {
+        try p.advance();
+        var args: std.ArrayList(*const ast.Expr) = .empty;
+        var depth = base_depth;
+        while (p.tok.tag != .r_paren) {
+            if (p.tok.tag == .ellipsis) return p.fail(.{ .unsupported = .syntax }, p.tok); // spread
+            const arg = try p.nested();
+            try args.append(p.arena, arg);
+            depth = @max(depth, arg.depth);
+            if (p.tok.tag != .comma) break;
+            try p.advance(); // a trailing comma is allowed: `f(1,)`
         }
+        const close = p.tok;
+        try p.expectAfterExpression(.r_paren);
+        return .{ .args = args.items, .depth = depth, .end = close.end };
+    }
+
+    fn callArgs(p: *Parser, callee: *const ast.Expr) Error!*const ast.Expr {
+        const parsed = try p.parseCallArgs(callee.depth);
+        return p.node(
+            .{ .start = callee.span.start, .end = parsed.end },
+            .{ .call = .{ .callee = callee, .args = parsed.args } },
+            parsed.depth,
+        );
     }
 
     /// `[a, b, …]`. Holes (`[1,,2]`) are Unsupported: arrays are dense (D13).

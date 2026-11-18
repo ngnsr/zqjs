@@ -338,6 +338,7 @@ const Resolver = struct {
             },
             .update => |u| try r.assignTarget(u.target),
             .member, .delete => |m| try r.member(m),
+            .optional_chain, .delete_optional => |oc| try r.optionalChain(oc),
             .object => |props| for (props) |prop| {
                 if (prop.key == .computed) try r.expr(prop.key.computed);
                 try r.expr(prop.value);
@@ -355,6 +356,15 @@ const Resolver = struct {
     fn member(r: *Resolver, m: ast.Member) Error!void {
         try r.expr(m.object);
         if (m.key == .computed) try r.expr(m.key.computed);
+    }
+
+    fn optionalChain(r: *Resolver, oc: ast.OptionalChain) Error!void {
+        try r.expr(oc.base);
+        for (oc.steps) |s| switch (s.kind) {
+            .prop => {},
+            .elem => |e| try r.expr(e),
+            .call => |args| for (args) |arg| try r.expr(arg),
+        };
     }
 
     fn assignTarget(r: *Resolver, t: ast.Target) Error!void {

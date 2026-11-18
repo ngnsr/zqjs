@@ -1,0 +1,42 @@
+fallback
+fallback
+undefined
+null
+0
+0
+
+false
+NaN
+[object Object]
+
+lhs1: 0
+0
+lhs2: 
+
+lhs3: false
+false
+lhs4: null
+rhs4: 99
+99
+lhs5: undefined
+rhs5: 99
+99
+42
+mid: 0
+0
+0
+
+7
+0
+0
+3
+3
+3
+t
+f
+val=0,default,default,
+0
+
+missing
+after-null
+0

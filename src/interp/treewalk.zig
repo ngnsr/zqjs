@@ -487,11 +487,13 @@ const Interpreter = struct {
                 try it.hold(base);
                 return object.get(rt, base, try it.toKey(try it.keyValue(m)));
             },
+            .optional_chain => |oc| return it.evalOptionalChain(oc, false),
             .delete => |m| {
                 const base = try it.eval(m.object);
                 try it.hold(base);
                 return .{ .boolean = try object.delete(rt, base, try it.toKey(try it.keyValue(m))) };
             },
+            .delete_optional => |oc| return it.evalOptionalChain(oc, true),
             .this => return it.this orelse rt.fail(.sloppy_this),
             .array => |items| return it.evalArray(items),
             .object => |props| return it.evalObject(props),
@@ -512,6 +514,7 @@ const Interpreter = struct {
             // (`lhs` isn't needed once the right side runs.)
             .logical_and => return if (ops.toBoolean(lhs)) it.eval(b.rhs) else lhs,
             .logical_or => return if (ops.toBoolean(lhs)) lhs else it.eval(b.rhs),
+            .nullish => return if (lhs == .null or lhs == .undefined) it.eval(b.rhs) else lhs,
             else => {
                 try it.hold(lhs);
                 return ops.binary(rt, b.op, lhs, try it.eval(b.rhs));
@@ -666,10 +669,15 @@ const Interpreter = struct {
             else => try it.eval(c.callee),
         };
         try it.hold(callee);
-        const args = try rt.gpa.alloc(Value, c.args.len);
+        return it.invokeCallable(callee, receiver, c.args);
+    }
+
+    fn invokeCallable(it: *Interpreter, callee: Value, receiver: ?Value, arg_exprs: []const *const ast.Expr) Error!Value {
+        const rt = it.rt;
+        const args = try rt.gpa.alloc(Value, arg_exprs.len);
         defer rt.gpa.free(args);
         // `args` is not traced: each value is on the shadow stack too.
-        for (c.args, args) |arg, *slot| {
+        for (arg_exprs, args) |arg, *slot| {
             slot.* = try it.eval(arg);
             try it.hold(slot.*);
         }
@@ -679,6 +687,52 @@ const Interpreter = struct {
             .closure => |cl| it.call(cl, if (receiver) |r| (if (r == .object) r else null) else null, args),
             else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
         };
+    }
+
+    fn evalOptionalChain(it: *Interpreter, oc: ast.OptionalChain, is_delete: bool) Error!Value {
+        const rt = it.rt;
+        var receiver: ?Value = null;
+        var val: Value = undefined;
+        if (oc.steps[0].kind == .call and oc.base.data == .member) {
+            const m = oc.base.data.member;
+            const base = try it.eval(m.object);
+            try it.hold(base);
+            receiver = base;
+            val = try object.get(rt, base, try it.toKey(try it.keyValue(m)));
+        } else {
+            val = try it.eval(oc.base);
+        }
+        try it.hold(val);
+
+        for (oc.steps, 0..) |step, i| {
+            if (step.optional and (val == .null or val == .undefined)) {
+                return if (is_delete) .{ .boolean = true } else .undefined;
+            }
+            switch (step.kind) {
+                .prop => |n| {
+                    const key = try object.named(rt, n);
+                    if (is_delete and i == oc.steps.len - 1) {
+                        return .{ .boolean = try object.delete(rt, val, key) };
+                    }
+                    receiver = val;
+                    val = try object.get(rt, val, key);
+                },
+                .elem => |e| {
+                    const key = try object.key(rt, try it.eval(e));
+                    if (is_delete and i == oc.steps.len - 1) {
+                        return .{ .boolean = try object.delete(rt, val, key) };
+                    }
+                    receiver = val;
+                    val = try object.get(rt, val, key);
+                },
+                .call => |args| {
+                    val = try it.invokeCallable(val, receiver, args);
+                    receiver = null;
+                },
+            }
+            try it.hold(val);
+        }
+        return val;
     }
 
     fn evalNewCall(it: *Interpreter, nc: @FieldType(ast.Expr.Data, "new_call")) Error!Value {

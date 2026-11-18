@@ -51,6 +51,9 @@ pub const Lexer = struct {
         }
         for (token.punctuators) |p| {
             if (std.mem.startsWith(u8, l.source[start..], p[0])) {
+                // `?.` followed by a decimal digit is `?` then a `.5`-style number
+                // (ECMAScript OptionalChainPunctuator :: ?. [lookahead not in DecimalDigit]).
+                if (p[1] == .question_dot and isDigit(l.peekAt(start + 2))) continue;
                 l.pos += @intCast(p[0].len);
                 return l.make(p[1], start, newline_before);
             }

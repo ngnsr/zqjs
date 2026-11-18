@@ -1,0 +1,36 @@
+undefined undefined
+undefined undefined
+undefined undefined
+logs1: 0
+undefined
+undefined
+logs2: 0
+0 b
+undefined undefined undefined
+paren-throw: TypeError
+42
+nonopt-step-throw: TypeError
+10 20
+logs3: key1,key2
+105
+106
+107
+208
+109
+undefined
+undefined
+logs4: 2
+call-nonfn: TypeError
+true true true
+true false
+true false
+true false
+delete-throw: TypeError
+logs5: key1,key2,delk
+11 undefined 33 undefined
+4 4
+77 undefined undefined
+name=Ada
+name=anon
+name=anon
+0.5 1

@@ -1136,11 +1136,9 @@ test "M30: RegExp pattern nesting limit and runtime Unsupported features (both e
     try expectLimit("new RegExp('(((((a)))))');", .{ .max_nesting_depth = 4 }, .nesting_depth);
 
     const cases = [_]struct { src: []const u8, feat: zqjs.Feature }{
-        .{ .src = "new RegExp('a', 'u');", .feat = .regex_flags },
-        .{ .src = "new RegExp('a', 'd');", .feat = .regex_flags },
-        .{ .src = "new RegExp('(?<=a)b');", .feat = .regex_lookbehind },
-        .{ .src = "new RegExp('(?<n>a)');", .feat = .regex_named_groups },
         .{ .src = "new RegExp('\\\\p{ASCII}');", .feat = .regex_unicode_property },
+        .{ .src = "new RegExp('\\\\u{41}');", .feat = .regex_unicode_escape_braced },
+        .{ .src = "new RegExp('(?=a)*');", .feat = .regex_annex_b },
     };
     for (cases) |c| {
         for (support.engines) |engine| {

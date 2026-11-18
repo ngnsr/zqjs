@@ -3479,13 +3479,102 @@ fn regexpExecInto(
     return true;
 }
 
+fn advanceStringIndex(units: []const u16, idx: usize, is_unicode: bool) usize {
+    if (!is_unicode or idx + 1 >= units.len) return idx + 1;
+    const first = units[idx];
+    const second = units[idx + 1];
+    if (first >= 0xD800 and first <= 0xDBFF and second >= 0xDC00 and second <= 0xDFFF) {
+        return idx + 2;
+    }
+    return idx + 1;
+}
+
+fn buildMatchGroupsObject(
+    rt: *Runtime,
+    named_groups: []const regex.NamedGroup,
+    s_units: []const u16,
+    captures: []const ?regex.Range,
+) Error!*Object {
+    const groups_obj = try rt.heap.newObject(null);
+    var root_buf = [_]Value{ .{ .object = groups_obj }, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    for (named_groups) |ng| {
+        const key_atom = try rt.heap.intern(ng.name);
+        const val: Value = if (captures[ng.capture_index]) |rng| blk: {
+            const sub = try rt.heap.newString(&.{.{ .utf16 = s_units[rng.start..rng.end] }});
+            root_buf[1] = .{ .string = sub };
+            break :blk root_buf[1];
+        } else .undefined;
+        try object.define(rt, groups_obj, object.namedAtom(key_atom), val);
+        root_buf[1] = .undefined;
+    }
+    return groups_obj;
+}
+
+fn makeIndexPair(rt: *Runtime, r: *const Realm, rng: regex.Range) Error!Value {
+    const pair = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{.{ .object = pair }};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    try rt.heap.appendElement(pair, .{ .number = @floatFromInt(rng.start) });
+    try rt.heap.appendElement(pair, .{ .number = @floatFromInt(rng.end) });
+    return .{ .object = pair };
+}
+
+fn buildMatchIndicesArray(
+    rt: *Runtime,
+    r: *const Realm,
+    named_groups: []const regex.NamedGroup,
+    captures: []const ?regex.Range,
+) Error!*Object {
+    const indices_arr = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ .{ .object = indices_arr }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    for (captures) |maybe_rng| {
+        if (maybe_rng) |rng| {
+            root_buf[1] = try makeIndexPair(rt, r, rng);
+            try rt.heap.appendElement(indices_arr, root_buf[1]);
+            root_buf[1] = .undefined;
+        } else {
+            try rt.heap.appendElement(indices_arr, .undefined);
+        }
+    }
+
+    if (named_groups.len > 0) {
+        const idx_groups = try rt.heap.newObject(null);
+        root_buf[2] = .{ .object = idx_groups };
+        for (named_groups) |ng| {
+            const key_atom = try rt.heap.intern(ng.name);
+            const val: Value = if (captures[ng.capture_index]) |rng| blk: {
+                root_buf[1] = try makeIndexPair(rt, r, rng);
+                break :blk root_buf[1];
+            } else .undefined;
+            try object.define(rt, idx_groups, object.namedAtom(key_atom), val);
+            root_buf[1] = .undefined;
+        }
+        try object.define(rt, indices_arr, try object.named(rt, "groups"), root_buf[2]);
+    } else {
+        try object.define(rt, indices_arr, try object.named(rt, "groups"), .undefined);
+    }
+    return indices_arr;
+}
+
 fn regexpExecImpl(rt: *Runtime, rx_obj: *Object, s: *const heap_mod.String) Error!Value {
     var root_buf = [_]Value{ .{ .object = rx_obj }, .{ .string = s }, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const cap_len = @as(usize, rx_obj.kind.regexp.program.capture_count) + 1;
+    const prog = &rx_obj.kind.regexp.program;
+    const cap_len = @as(usize, prog.capture_count) + 1;
     const captures = try rt.gpa.alloc(?regex.Range, cap_len);
     defer rt.gpa.free(captures);
 
@@ -3507,6 +3596,21 @@ fn regexpExecImpl(rt: *Runtime, rx_obj: *Object, s: *const heap_mod.String) Erro
     }
     try object.define(rt, arr, try object.named(rt, "index"), .{ .number = @floatFromInt(captures[0].?.start) });
     try object.define(rt, arr, try object.named(rt, "input"), .{ .string = s });
+
+    const groups_val: Value = if (prog.named_groups.len > 0) blk: {
+        const g = try buildMatchGroupsObject(rt, prog.named_groups, s.units, captures);
+        root_buf[3] = .{ .object = g };
+        break :blk root_buf[3];
+    } else .undefined;
+    try object.define(rt, arr, try object.named(rt, "groups"), groups_val);
+    root_buf[3] = .undefined;
+
+    if (prog.flags.has_indices) {
+        const indices_arr = try buildMatchIndicesArray(rt, r, prog.named_groups, captures);
+        root_buf[3] = .{ .object = indices_arr };
+        try object.define(rt, arr, try object.named(rt, "indices"), root_buf[3]);
+        root_buf[3] = .undefined;
+    }
     return .{ .object = arr };
 }
 
@@ -3578,6 +3682,7 @@ fn stringMatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const captures = try rt.gpa.alloc(?regex.Range, cap_len);
     defer rt.gpa.free(captures);
 
+    const is_unicode = rx_obj.kind.regexp.program.flags.isUnicodeMode();
     while (try regexpExecInto(rt, rx_obj, s, captures)) {
         const rng = captures[0].?;
         const sub = try rt.heap.newString(&.{.{ .utf16 = s.units[rng.start..rng.end] }});
@@ -3586,7 +3691,8 @@ fn stringMatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         root_buf[4] = .undefined;
         if (rng.start == rng.end) {
             const this_idx = try toLength(rt, rx_obj.kind.regexp.last_index);
-            rt.heap.storeRegExpLastIndex(rx_obj, .{ .number = this_idx + 1 });
+            const next_idx = advanceStringIndex(s.units, @intFromFloat(this_idx), is_unicode);
+            rt.heap.storeRegExpLastIndex(rx_obj, .{ .number = @floatFromInt(next_idx) });
         }
     }
     if (out.kind.array.items.len == 0) return .null;
@@ -3618,6 +3724,7 @@ fn expandRegExpReplacement(
     out: *std.ArrayList(u16),
     s_units: []const u16,
     captures: []const ?regex.Range,
+    named_groups: []const regex.NamedGroup,
     repl_units: []const u16,
 ) Error!void {
     const full = captures[0].?;
@@ -3646,6 +3753,23 @@ fn expandRegExpReplacement(
                     try appendUnits(rt, out, s_units[full.end..]);
                     i += 2;
                     continue;
+                },
+                '<' => {
+                    if (named_groups.len > 0) {
+                        if (std.mem.indexOfScalarPos(u16, repl_units, i + 2, '>')) |close_idx| {
+                            const gname = repl_units[i + 2 .. close_idx];
+                            for (named_groups) |ng| {
+                                if (std.mem.eql(u16, ng.name, gname)) {
+                                    if (captures[ng.capture_index]) |rng| {
+                                        try appendUnits(rt, out, s_units[rng.start..rng.end]);
+                                    }
+                                    break;
+                                }
+                            }
+                            i = close_idx + 1;
+                            continue;
+                        }
+                    }
                 },
                 '0'...'9' => {
                     const d1: usize = next - '0';
@@ -3691,6 +3815,8 @@ fn stringReplaceRegExp(
         break :blk rs;
     } else null;
 
+    const named_groups = rx_obj.kind.regexp.program.named_groups;
+    const is_unicode = rx_obj.kind.regexp.program.flags.isUnicodeMode();
     const is_global = rx_obj.kind.regexp.global;
     if (is_global) {
         rt.heap.storeRegExpLastIndex(rx_obj, .{ .number = 0 });
@@ -3715,7 +3841,8 @@ fn stringReplaceRegExp(
         const rng = caps[0].?;
         if (rng.start == rng.end) {
             const this_idx = try toLength(rt, rx_obj.kind.regexp.last_index);
-            rt.heap.storeRegExpLastIndex(rx_obj, .{ .number = this_idx + 1 });
+            const next_idx = advanceStringIndex(s.units, @intFromFloat(this_idx), is_unicode);
+            rt.heap.storeRegExpLastIndex(rx_obj, .{ .number = @floatFromInt(next_idx) });
         }
     }
 
@@ -3724,7 +3851,9 @@ fn stringReplaceRegExp(
     var out: std.ArrayList(u16) = .empty;
     defer out.deinit(rt.gpa);
 
-    const cb_args: []Value = if (is_func) try rt.gpa.alloc(Value, cap_len + 2) else &.{};
+    const has_named = named_groups.len > 0;
+    const cb_arg_count = cap_len + 2 + @as(usize, if (has_named) 1 else 0);
+    const cb_args: []Value = if (is_func) try rt.gpa.alloc(Value, cb_arg_count) else &.{};
     defer if (is_func) rt.gpa.free(cb_args);
     @memset(cb_args, .undefined);
     var cb_roots: rt_mod.ValueRoots = .{ .values = cb_args };
@@ -3747,13 +3876,16 @@ fn stringReplaceRegExp(
             }
             cb_args[cap_len] = .{ .number = @floatFromInt(full.start) };
             cb_args[cap_len + 1] = this;
+            if (has_named) {
+                cb_args[cap_len + 2] = .{ .object = try buildMatchGroupsObject(rt, named_groups, s.units, caps) };
+            }
             const res = try rt.callCallable(repl_arg, .undefined, cb_args);
             root_buf[4] = res;
             const rs = try toStringObj(rt, res);
             root_buf[4] = .{ .string = rs };
             try appendUnits(rt, &out, rs.units);
         } else {
-            try expandRegExpReplacement(rt, &out, s.units, caps, repl_str.?.units);
+            try expandRegExpReplacement(rt, &out, s.units, caps, named_groups, repl_str.?.units);
         }
         next_src_pos = full.end;
     }
@@ -3792,6 +3924,7 @@ fn stringSplitRegExp(
         return .{ .object = out };
     }
 
+    const is_unicode = p_split.flags.isUnicodeMode();
     const size: u32 = @intCast(s.units.len);
     var p: u32 = 0;
     var q: u32 = 0;
@@ -3799,7 +3932,7 @@ fn stringSplitRegExp(
         if (!try runRegExpMatcher(rt, &p_split, s.units, q, captures)) break;
         const full = captures[0].?;
         if (full.end == p) {
-            q = full.start + 1;
+            q = @intCast(advanceStringIndex(s.units, q, is_unicode));
             continue;
         }
         const seg = try rt.heap.newString(&.{.{ .utf16 = s.units[p..full.start] }});

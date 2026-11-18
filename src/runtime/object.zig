@@ -192,10 +192,13 @@ fn ownGet(rt: *Runtime, o: *Object, k: Key) Error!?Value {
             if (isNamed(k, "lastIndex")) return re.last_index;
             if (isNamed(k, "source")) return .{ .string = re.source };
             if (isNamed(k, "flags")) return .{ .string = re.flags };
+            if (isNamed(k, "hasIndices")) return .{ .boolean = re.program.flags.has_indices };
             if (isNamed(k, "global")) return .{ .boolean = re.global };
             if (isNamed(k, "ignoreCase")) return .{ .boolean = re.program.flags.ignore_case };
             if (isNamed(k, "multiline")) return .{ .boolean = re.program.flags.multiline };
             if (isNamed(k, "dotAll")) return .{ .boolean = re.program.flags.dot_all };
+            if (isNamed(k, "unicode")) return .{ .boolean = re.program.flags.unicode };
+            if (isNamed(k, "unicodeSets")) return .{ .boolean = re.program.flags.unicode_sets };
             if (isNamed(k, "sticky")) return .{ .boolean = re.program.flags.sticky };
         },
         .ordinary, .iterator, .promise => {},
@@ -208,10 +211,13 @@ fn ownGet(rt: *Runtime, o: *Object, k: Key) Error!?Value {
 fn isRegExpGetter(k: Key) bool {
     return isNamed(k, "source") or
         isNamed(k, "flags") or
+        isNamed(k, "hasIndices") or
         isNamed(k, "global") or
         isNamed(k, "ignoreCase") or
         isNamed(k, "multiline") or
         isNamed(k, "dotAll") or
+        isNamed(k, "unicode") or
+        isNamed(k, "unicodeSets") or
         isNamed(k, "sticky");
 }
 

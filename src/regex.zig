@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const limits = @import("limits.zig");
 const Limit = limits.Limit;
+const unicode = @import("regex_unicode.zig");
 
 /// Maximum group/lookahead nesting depth during parsing. Prevents pathological patterns
 /// from consuming excessive compile-time stack memory and satisfies the spec requirement.
@@ -39,16 +40,23 @@ pub const max_backtrack_states: u32 = limits.regex_max_backtrack_states;
 pub const max_backtrack_cells: u32 = limits.regex_max_backtrack_cells;
 
 pub const Flags = struct {
+    has_indices: bool = false,
     ignore_case: bool = false,
     multiline: bool = false,
     dot_all: bool = false,
+    unicode: bool = false,
+    unicode_sets: bool = false,
     sticky: bool = false,
+
+    pub fn isUnicodeMode(self: Flags) bool {
+        return self.unicode or self.unicode_sets;
+    }
 };
 
 pub const ParsedFlags = struct {
     flags: Flags = .{},
     global: bool = false,
-    canonical_buf: [5]u8 = undefined,
+    canonical_buf: [8]u8 = undefined,
     canonical_len: u8 = 0,
 
     pub fn canonical(self: *const ParsedFlags) []const u8 {
@@ -123,20 +131,23 @@ pub fn parseFlagsUtf16(units: []const u16, diag: *Diagnostic) CompileError!Parse
         diag.* = .{ .message = "incompatible 'u' and 'v' regular expression flags" };
         return error.SyntaxError;
     }
-    if (seen_d or seen_u or seen_v) {
-        diag.* = .{ .message = "unsupported regular expression flag", .feature = "regex_flags" };
-        return error.Unsupported;
-    }
 
     var out: ParsedFlags = .{
         .flags = .{
+            .has_indices = seen_d,
             .ignore_case = seen_i,
             .multiline = seen_m,
             .dot_all = seen_s,
+            .unicode = seen_u,
+            .unicode_sets = seen_v,
             .sticky = seen_y,
         },
         .global = seen_g,
     };
+    if (seen_d) {
+        out.canonical_buf[out.canonical_len] = 'd';
+        out.canonical_len += 1;
+    }
     if (seen_g) {
         out.canonical_buf[out.canonical_len] = 'g';
         out.canonical_len += 1;
@@ -151,6 +162,14 @@ pub fn parseFlagsUtf16(units: []const u16, diag: *Diagnostic) CompileError!Parse
     }
     if (seen_s) {
         out.canonical_buf[out.canonical_len] = 's';
+        out.canonical_len += 1;
+    }
+    if (seen_u) {
+        out.canonical_buf[out.canonical_len] = 'u';
+        out.canonical_len += 1;
+    }
+    if (seen_v) {
+        out.canonical_buf[out.canonical_len] = 'v';
         out.canonical_len += 1;
     }
     if (seen_y) {
@@ -255,15 +274,31 @@ const BuiltinClass = enum(u8) {
     not_space, // \S
 };
 
-const ClassItem = union(enum) {
-    range: struct { lo: u16, hi: u16 },
+const ClassOp = enum(u8) {
+    union_op,
+    intersection_op,
+    subtraction_op,
+};
+
+const ClassNode = union(enum) {
+    range: struct { lo: u21, hi: u21 },
     builtin: BuiltinClass,
+    unicode_prop: []const unicode.Range,
+    string_prop: []const []const u21,
+    string_literal: struct { start: u32, len: u32 },
+    compound: struct {
+        op: ClassOp,
+        inverted: bool,
+        ignore_case: bool,
+        start: u32,
+        len: u32,
+    },
 };
 
 const ClassDef = struct {
-    inverted: bool,
-    start: u32,
-    len: u32,
+    root_node: u32,
+    has_strings: bool,
+    max_str_len: u32,
 };
 
 const LoopInfo = struct {
@@ -276,17 +311,20 @@ const LoopInfo = struct {
 
 const Inst = union(enum) {
     match,
-    char: u16,
-    char_icase: u16, // stored as ASCII uppercase
+    char: u21,
+    char_icase: u21, // stored as canonicalized char/cp
     any, // . (not LineTerminator)
     any_dot_all, // . with dot_all
     bol, // ^
+    bol_multiline, // ^ with multiline
     eol, // $
+    eol_multiline, // $ with multiline
     word_boundary, // \b
     not_word_boundary, // \B
     builtin: BuiltinClass,
     class: u32, // index into Program.classes
-    backref: u16, // 1..9
+    backref: u16, // 1..capture_count
+    backref_icase: u16, // 1..capture_count with ignore_case
     save_start: u16, // capture index
     save_end: u16, // capture index
     jump: u32,
@@ -305,6 +343,7 @@ const Inst = union(enum) {
     },
     lookahead: struct {
         negative: bool,
+        reverse: bool,
         body_pc: u32,
         next_pc: u32,
         cap_start: u16,
@@ -313,11 +352,18 @@ const Inst = union(enum) {
     lookahead_done,
 };
 
+pub const NamedGroup = struct {
+    name: []const u16,
+    capture_index: u16,
+};
+
 pub const Program = struct {
     insts: []Inst,
     classes: []ClassDef,
-    class_items: []ClassItem,
+    class_nodes: []ClassNode,
+    class_strings: []u21,
     loops: []LoopInfo,
+    named_groups: []NamedGroup = &.{},
     capture_count: u16,
     loop_count: u16,
     flags: Flags,
@@ -325,16 +371,25 @@ pub const Program = struct {
     pub fn deinit(self: *Program, gpa: Allocator) void {
         gpa.free(self.insts);
         gpa.free(self.classes);
-        gpa.free(self.class_items);
+        gpa.free(self.class_nodes);
+        gpa.free(self.class_strings);
         gpa.free(self.loops);
+        for (self.named_groups) |ng| gpa.free(ng.name);
+        gpa.free(self.named_groups);
         self.* = undefined;
     }
 
     pub fn ownedBytes(self: *const Program) usize {
-        return self.insts.len * @sizeOf(Inst) +
+        var total = self.insts.len * @sizeOf(Inst) +
             self.classes.len * @sizeOf(ClassDef) +
-            self.class_items.len * @sizeOf(ClassItem) +
-            self.loops.len * @sizeOf(LoopInfo);
+            self.class_nodes.len * @sizeOf(ClassNode) +
+            self.class_strings.len * @sizeOf(u21) +
+            self.loops.len * @sizeOf(LoopInfo) +
+            self.named_groups.len * @sizeOf(NamedGroup);
+        for (self.named_groups) |ng| {
+            total += ng.name.len * @sizeOf(u16);
+        }
+        return total;
     }
 
     pub fn clone(self: *const Program, gpa: Allocator) error{OutOfMemory}!Program {
@@ -342,37 +397,62 @@ pub const Program = struct {
         errdefer gpa.free(insts);
         const classes = try gpa.dupe(ClassDef, self.classes);
         errdefer gpa.free(classes);
-        const class_items = try gpa.dupe(ClassItem, self.class_items);
-        errdefer gpa.free(class_items);
+        const class_nodes = try gpa.dupe(ClassNode, self.class_nodes);
+        errdefer gpa.free(class_nodes);
+        const class_strings = try gpa.dupe(u21, self.class_strings);
+        errdefer gpa.free(class_strings);
         const loops = try gpa.dupe(LoopInfo, self.loops);
+        errdefer gpa.free(loops);
+        const named_groups = try gpa.alloc(NamedGroup, self.named_groups.len);
+        var cloned_names: usize = 0;
+        errdefer {
+            for (named_groups[0..cloned_names]) |ng| gpa.free(ng.name);
+            gpa.free(named_groups);
+        }
+        for (self.named_groups, 0..) |ng, idx| {
+            named_groups[idx] = .{
+                .name = try gpa.dupe(u16, ng.name),
+                .capture_index = ng.capture_index,
+            };
+            cloned_names += 1;
+        }
         return .{
             .insts = insts,
             .classes = classes,
-            .class_items = class_items,
+            .class_nodes = class_nodes,
+            .class_strings = class_strings,
             .loops = loops,
+            .named_groups = named_groups,
             .capture_count = self.capture_count,
             .loop_count = self.loop_count,
             .flags = self.flags,
         };
     }
+
+    pub fn findNamedGroup(self: *const Program, name: []const u16) ?u16 {
+        for (self.named_groups) |ng| {
+            if (std.mem.eql(u16, ng.name, name)) return ng.capture_index;
+        }
+        return null;
+    }
 };
 
-fn isAsciiDigit(c: u16) bool {
+fn isAsciiDigit(c: u21) bool {
     return c >= '0' and c <= '9';
 }
 
-fn isAsciiWord(c: u16) bool {
+fn isAsciiWord(c: u21) bool {
     return (c >= 'a' and c <= 'z') or
         (c >= 'A' and c <= 'Z') or
         (c >= '0' and c <= '9') or
         c == '_';
 }
 
-fn isLineTerminator(c: u16) bool {
+fn isLineTerminator(c: u21) bool {
     return c == 0x000A or c == 0x000D or c == 0x2028 or c == 0x2029;
 }
 
-fn isWhiteSpaceOrLineTerminator(c: u16) bool {
+fn isWhiteSpaceOrLineTerminator(c: u21) bool {
     return switch (c) {
         0x0009,
         0x000A,
@@ -394,7 +474,7 @@ fn isWhiteSpaceOrLineTerminator(c: u16) bool {
     };
 }
 
-fn matchesBuiltin(b: BuiltinClass, c: u16) bool {
+fn matchesBuiltin(b: BuiltinClass, c: u21) bool {
     return switch (b) {
         .digit => isAsciiDigit(c),
         .not_digit => !isAsciiDigit(c),
@@ -405,8 +485,16 @@ fn matchesBuiltin(b: BuiltinClass, c: u16) bool {
     };
 }
 
-fn asciiUpper(c: u16) u16 {
-    return if (c >= 'a' and c <= 'z') c - 32 else c;
+fn isLeadSurrogate(cu: u16) bool {
+    return cu >= 0xD800 and cu <= 0xDBFF;
+}
+
+fn isTrailSurrogate(cu: u16) bool {
+    return cu >= 0xDC00 and cu <= 0xDFFF;
+}
+
+fn combineSurrogates(lead: u16, trail: u16) u21 {
+    return 0x10000 + ((@as(u21, lead - 0xD800) << 10) | @as(u21, trail - 0xDC00));
 }
 
 fn hexDigit(c: u16) ?u16 {
@@ -416,11 +504,40 @@ fn hexDigit(c: u16) ?u16 {
     return null;
 }
 
-fn isSyntaxCharacter(c: u16) bool {
+fn isSyntaxCharacter(c: u21) bool {
     return switch (c) {
         '^', '$', '\\', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|' => true,
         else => false,
     };
+}
+
+fn isClassSetSyntaxChar(c: u21) bool {
+    return switch (c) {
+        '(', ')', '[', ']', '{', '}', '/', '-', '\\', '|' => true,
+        else => false,
+    };
+}
+
+fn isClassSetReservedPunctuator(c: u21) bool {
+    return switch (c) {
+        '&', '-', '!', '#', '%', ',', ':', ';', '<', '=', '>', '@', '`', '~' => true,
+        else => false,
+    };
+}
+
+fn isClassSetDoublePunctuatorChar(c: u21) bool {
+    return switch (c) {
+        '&', '!', '#', '$', '%', '*', '+', ',', '.', ':', ';', '<', '=', '>', '?', '@', '^', '`', '~' => true,
+        else => false,
+    };
+}
+
+fn isGroupNameStart(c: u16) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
+}
+
+fn isGroupNamePart(c: u16) bool {
+    return isGroupNameStart(c) or isAsciiDigit(c);
 }
 
 const GroupKind = enum {
@@ -428,6 +545,15 @@ const GroupKind = enum {
     non_capturing,
     pos_lookahead,
     neg_lookahead,
+    pos_lookbehind,
+    neg_lookbehind,
+
+    fn isAssertion(self: GroupKind) bool {
+        return switch (self) {
+            .pos_lookahead, .neg_lookahead, .pos_lookbehind, .neg_lookbehind => true,
+            else => false,
+        };
+    }
 };
 
 const GroupFrame = struct {
@@ -436,14 +562,17 @@ const GroupFrame = struct {
     cap_before: u16,
     term_start_pc: u32,
     branch_start_pc: u32,
+    saved_flags: Flags,
+    saved_in_lookbehind: bool,
     /// Fixup list of `jump` instructions at the end of finished branches in this group.
     end_jumps: std.ArrayList(u32) = .empty,
-    /// PC of the `lookahead` instruction if `kind` is lookahead.
+    /// PC of the `lookahead` instruction if `kind` is an assertion.
     lookahead_pc: u32 = 0,
 };
 
 const LastAtom = struct {
     start_pc: u32,
+    end_pc: u32,
     cap_start: u16,
     cap_end: u16,
     quantifiable: bool,
@@ -455,6 +584,7 @@ const Compiler = struct {
     pattern: []const u16,
     pos: usize = 0,
     flags: Flags,
+    in_lookbehind: bool = false,
     max_depth: u16 = max_depth,
     diag: *Diagnostic,
     total_captures: u16 = 0,
@@ -462,9 +592,11 @@ const Compiler = struct {
 
     insts: std.ArrayList(Inst) = .empty,
     classes: std.ArrayList(ClassDef) = .empty,
-    class_items: std.ArrayList(ClassItem) = .empty,
+    class_nodes: std.ArrayList(ClassNode) = .empty,
+    class_strings: std.ArrayList(u21) = .empty,
     loops: std.ArrayList(LoopInfo) = .empty,
     groups: std.ArrayList(GroupFrame) = .empty,
+    named_groups: std.ArrayList(NamedGroup) = .empty,
 
     /// Top-level current alternative start PC and end-of-branch `jump` fixups.
     top_branch_start_pc: u32 = 0,
@@ -477,8 +609,18 @@ const Compiler = struct {
         self.top_end_jumps.deinit(self.gpa);
         self.insts.deinit(self.gpa);
         self.classes.deinit(self.gpa);
-        self.class_items.deinit(self.gpa);
+        self.class_nodes.deinit(self.gpa);
+        self.class_strings.deinit(self.gpa);
         self.loops.deinit(self.gpa);
+        for (self.named_groups.items) |ng| self.gpa.free(ng.name);
+        self.named_groups.deinit(self.gpa);
+    }
+
+    fn failAnnexB(self: *Compiler, msg: []const u8) CompileError {
+        if (self.flags.isUnicodeMode()) {
+            return self.failSyntax(msg);
+        }
+        return self.failUnsupported("regex_annex_b", msg);
     }
 
     fn failSyntax(self: *Compiler, msg: []const u8) CompileError {
@@ -549,14 +691,77 @@ const Compiler = struct {
             }
             if (g.term_start_pc > at) g.term_start_pc += 1;
             if (g.branch_start_pc > at) g.branch_start_pc += 1;
-            if (g.lookahead_pc >= at and (g.kind == .pos_lookahead or g.kind == .neg_lookahead)) {
+            if (g.lookahead_pc >= at and g.kind.isAssertion()) {
                 g.lookahead_pc += 1;
             }
         }
     }
 
-    /// Pre-pass to count capturing groups so `\N` can be validated against total captures
-    /// before emitting instructions.
+    fn shiftInstTargets(item: *Inst, delta: i64) void {
+        const shift = struct {
+            fn apply(pc: *u32, d: i64) void {
+                pc.* = @intCast(@as(i64, pc.*) + d);
+            }
+        }.apply;
+        switch (item.*) {
+            .jump => |*t| shift(t, delta),
+            .split => |*s| {
+                shift(&s.first, delta);
+                shift(&s.second, delta);
+            },
+            .loop_init => |*l| shift(&l.step_pc, delta),
+            .loop_step => |*l| {
+                shift(&l.body_pc, delta);
+                shift(&l.exit_pc, delta);
+            },
+            .lookahead => |*la| {
+                shift(&la.body_pc, delta);
+                shift(&la.next_pc, delta);
+            },
+            else => {},
+        }
+    }
+
+    /// Move `[src_start .. src_end)` to `dst` (`dst <= src_start <= src_end`),
+    /// relocating internal PC targets within `[dst .. src_end)`.
+    fn moveInstRange(self: *Compiler, dst: u32, src_start: u32, src_end: u32) void {
+        if (dst == src_start or src_start == src_end) return;
+        const len: u32 = src_end - src_start;
+        const gap: u32 = src_start - dst;
+        std.mem.rotate(Inst, self.insts.items[dst..src_end], gap);
+        for (self.insts.items[dst .. dst + len]) |*item| {
+            shiftInstTargets(item, -@as(i64, gap));
+        }
+        for (self.insts.items[dst + len .. src_end]) |*item| {
+            shiftInstTargets(item, @as(i64, len));
+        }
+    }
+
+    fn currentBranchStartPc(self: *const Compiler) u32 {
+        if (self.groups.items.len > 0) {
+            return self.groups.items[self.groups.items.len - 1].branch_start_pc;
+        }
+        return self.top_branch_start_pc;
+    }
+
+    fn emitAtomInst(self: *Compiler, inst: Inst) CompileError!u32 {
+        if (self.in_lookbehind) {
+            const at = self.currentBranchStartPc();
+            try self.insertInstAt(at, inst);
+            return at;
+        }
+        return self.emit(inst);
+    }
+
+    fn findNamedGroup(self: *const Compiler, name: []const u16) ?u16 {
+        for (self.named_groups.items) |ng| {
+            if (std.mem.eql(u16, ng.name, name)) return ng.capture_index;
+        }
+        return null;
+    }
+
+    /// Pre-pass to count capturing groups and register named groups so `\N` and `\k<name>`
+    /// (including forward references) can be validated before emitting instructions.
     fn countCapturesPrepass(self: *Compiler) CompileError!u16 {
         var count: u32 = 0;
         var i: usize = 0;
@@ -580,8 +785,40 @@ const Compiler = struct {
             }
             if (c == '(') {
                 if (i + 1 < self.pattern.len and self.pattern[i + 1] == '?') {
-                    // (?...) is not a plain capturing group; named groups (?<name>...)
-                    // are rejected as Unsupported during the main parse.
+                    if (i + 2 < self.pattern.len and self.pattern[i + 2] == '<') {
+                        if (i + 3 >= self.pattern.len) {
+                            return self.failSyntax("unterminated group");
+                        }
+                        if (self.pattern[i + 3] != '=' and self.pattern[i + 3] != '!') {
+                            count += 1;
+                            if (count > max_captures) return self.failComplex("too many capturing groups");
+                            var j = i + 3;
+                            if (j >= self.pattern.len or !isGroupNameStart(self.pattern[j])) {
+                                return self.failSyntax("invalid capture group name");
+                            }
+                            j += 1;
+                            while (j < self.pattern.len and self.pattern[j] != '>') : (j += 1) {
+                                if (!isGroupNamePart(self.pattern[j])) {
+                                    return self.failSyntax("invalid capture group name");
+                                }
+                            }
+                            if (j >= self.pattern.len) {
+                                return self.failSyntax("unterminated capture group name");
+                            }
+                            const name = self.pattern[i + 3 .. j];
+                            if (self.findNamedGroup(name) != null) {
+                                return self.failSyntax("duplicate capture group name");
+                            }
+                            const duped = try self.gpa.dupe(u16, name);
+                            errdefer self.gpa.free(duped);
+                            try self.named_groups.append(self.gpa, .{
+                                .name = duped,
+                                .capture_index = @intCast(count),
+                            });
+                            i = j + 1;
+                            continue;
+                        }
+                    }
                 } else {
                     count += 1;
                     if (count > max_captures) return self.failComplex("too many capturing groups");
@@ -592,18 +829,18 @@ const Compiler = struct {
         return @intCast(count);
     }
 
-    fn emitLiteral(self: *Compiler, c: u16) CompileError!void {
-        if (self.flags.ignore_case and c > 0x7F) {
-            return self.failUnsupported("regex_ignore_case_unicode", "non-ASCII character with ignore_case flag");
-        }
-        const start_pc: u32 = @intCast(self.insts.items.len);
-        if (self.flags.ignore_case) {
-            _ = try self.emit(.{ .char_icase = asciiUpper(c) });
-        } else {
-            _ = try self.emit(.{ .char = c });
-        }
+    fn emitLiteral(self: *Compiler, c: u21) CompileError!void {
+        const inst: Inst = if (self.flags.ignore_case) blk: {
+            const canon: u21 = if (self.flags.isUnicodeMode())
+                unicode.canonicalizeUnicode(c)
+            else
+                unicode.canonicalizeLegacy(@intCast(c));
+            break :blk .{ .char_icase = canon };
+        } else .{ .char = c };
+        const start_pc = try self.emitAtomInst(inst);
         self.last_atom = .{
             .start_pc = start_pc,
+            .end_pc = start_pc + 1,
             .cap_start = self.next_capture + 1,
             .cap_end = self.next_capture,
             .quantifiable = true,
@@ -613,27 +850,122 @@ const Compiler = struct {
 
     fn parseHexEscape(self: *Compiler, digits: usize) CompileError!u16 {
         if (self.pos + digits > self.pattern.len) {
-            return self.failUnsupported("regex_annex_b", "malformed hex or unicode escape");
+            return self.failAnnexB("malformed hex or unicode escape");
         }
         var val: u16 = 0;
         for (0..digits) |k| {
             const d = hexDigit(self.pattern[self.pos + k]) orelse
-                return self.failUnsupported("regex_annex_b", "malformed hex or unicode escape");
+                return self.failAnnexB("malformed hex or unicode escape");
             val = (val << 4) | d;
         }
         self.pos += digits;
         return val;
     }
 
+    fn parseBracedHexEscape(self: *Compiler) CompileError!u21 {
+        if (!self.flags.isUnicodeMode()) {
+            return self.failUnsupported("regex_unicode_escape_braced", "\\u{...} escape requires unicode mode");
+        }
+        self.pos += 1; // consume '{'
+        if (self.pos >= self.pattern.len) return self.failSyntax("unterminated \\u{...} escape");
+        var val: u32 = 0;
+        var count: usize = 0;
+        while (self.pos < self.pattern.len and self.pattern[self.pos] != '}') : (self.pos += 1) {
+            const d = hexDigit(self.pattern[self.pos]) orelse return self.failSyntax("invalid hex digit in \\u{...}");
+            val = (val << 4) | d;
+            if (val > 0x10FFFF) return self.failSyntax("unicode code point out of range");
+            count += 1;
+        }
+        if (count == 0 or self.pos >= self.pattern.len or self.pattern[self.pos] != '}') {
+            return self.failSyntax("invalid \\u{...} escape");
+        }
+        self.pos += 1; // consume '}'
+        return @intCast(val);
+    }
+
+    fn parseUnicodeEscapeCp(self: *Compiler) CompileError!u21 {
+        if (self.pos < self.pattern.len and self.pattern[self.pos] == '{') {
+            return self.parseBracedHexEscape();
+        }
+        const cu = try self.parseHexEscape(4);
+        if (self.flags.isUnicodeMode() and isLeadSurrogate(cu) and
+            self.pos + 6 <= self.pattern.len and
+            self.pattern[self.pos] == '\\' and
+            self.pattern[self.pos + 1] == 'u' and
+            self.pattern[self.pos + 2] != '{')
+        {
+            var valid = true;
+            var trail: u16 = 0;
+            for (0..4) |k| {
+                if (hexDigit(self.pattern[self.pos + 2 + k])) |d| {
+                    trail = (trail << 4) | d;
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid and isTrailSurrogate(trail)) {
+                self.pos += 6;
+                return combineSurrogates(cu, trail);
+            }
+        }
+        return cu;
+    }
+
+    const ParsedProperty = union(enum) {
+        code_points: []const unicode.Range,
+        strings: []const []const u21,
+    };
+
+    fn parseUnicodeProperty(self: *Compiler, negated: bool) CompileError!ParsedProperty {
+        if (!self.flags.isUnicodeMode()) {
+            return self.failUnsupported("regex_unicode_property", "unicode property escapes are not supported");
+        }
+        if (self.pos >= self.pattern.len or self.pattern[self.pos] != '{') {
+            return self.failSyntax("expected '{' after \\p or \\P");
+        }
+        self.pos += 1;
+        var buf: [64]u8 = undefined;
+        var len: usize = 0;
+        while (self.pos < self.pattern.len and self.pattern[self.pos] != '}') : (self.pos += 1) {
+            const ch = self.pattern[self.pos];
+            if (ch > 0x7F or len >= buf.len) return self.failSyntax("invalid unicode property name");
+            buf[len] = @intCast(ch);
+            len += 1;
+        }
+        if (len == 0 or self.pos >= self.pattern.len or self.pattern[self.pos] != '}') {
+            return self.failSyntax("unterminated unicode property escape");
+        }
+        self.pos += 1; // consume '}'
+        const spec = buf[0..len];
+        if (unicode.lookupProperty(spec)) |ranges| {
+            return .{ .code_points = ranges };
+        }
+        if (self.flags.unicode_sets and !negated) {
+            if (unicode.lookupPropertyOfStrings(spec)) |strings| {
+                return .{ .strings = strings };
+            }
+        }
+        return self.failSyntax("unknown unicode property");
+    }
+
     const ClassAtom = union(enum) {
-        single: u16,
+        single: u21,
         builtin: BuiltinClass,
+        unicode_prop: struct { ranges: []const unicode.Range, inverted: bool },
     };
 
     fn parseClassAtom(self: *Compiler) CompileError!ClassAtom {
         const c = self.pattern[self.pos];
         self.pos += 1;
-        if (c != '\\') return .{ .single = c };
+        if (c != '\\') {
+            if (self.flags.isUnicodeMode() and isLeadSurrogate(c) and self.pos < self.pattern.len and isTrailSurrogate(self.pattern[self.pos])) {
+                const trail = self.pattern[self.pos];
+                self.pos += 1;
+                return .{ .single = combineSurrogates(c, trail) };
+            }
+            return .{ .single = c };
+        }
         if (self.pos >= self.pattern.len) return self.failSyntax("unterminated escape in character class");
         const esc = self.pattern[self.pos];
         self.pos += 1;
@@ -645,7 +977,7 @@ const Compiler = struct {
             's' => return .{ .builtin = .space },
             'S' => return .{ .builtin = .not_space },
             'b' => return .{ .single = 0x0008 },
-            'B' => return self.failUnsupported("regex_annex_b", "\\B inside character class"),
+            'B' => return self.failAnnexB("\\B inside character class"),
             'n' => return .{ .single = '\n' },
             'r' => return .{ .single = '\r' },
             't' => return .{ .single = '\t' },
@@ -653,105 +985,119 @@ const Compiler = struct {
             'v' => return .{ .single = 0x000B },
             '0' => {
                 if (self.pos < self.pattern.len and isAsciiDigit(self.pattern[self.pos])) {
-                    return self.failUnsupported("regex_annex_b", "legacy octal escape in character class");
+                    return self.failAnnexB("legacy octal escape in character class");
                 }
                 return .{ .single = 0 };
             },
-            '1'...'9' => return self.failUnsupported("regex_annex_b", "decimal/octal escape in character class"),
+            '1'...'9' => return self.failAnnexB("decimal/octal escape in character class"),
             'x' => return .{ .single = try self.parseHexEscape(2) },
-            'u' => {
-                if (self.pos < self.pattern.len and self.pattern[self.pos] == '{') {
-                    return self.failUnsupported("regex_unicode_escape_braced", "\\u{...} escape requires unicode mode");
+            'u' => return .{ .single = try self.parseUnicodeEscapeCp() },
+            'c' => {
+                if (self.pos < self.pattern.len) {
+                    const next = self.pattern[self.pos];
+                    if ((next >= 'A' and next <= 'Z') or (next >= 'a' and next <= 'z')) {
+                        self.pos += 1;
+                        return .{ .single = next & 0x1F };
+                    }
                 }
-                return .{ .single = try self.parseHexEscape(4) };
+                return self.failAnnexB("invalid \\c control escape");
             },
-            'c' => return self.failUnsupported("regex_control_escape", "\\c control escape is not supported"),
-            'p', 'P' => return self.failUnsupported("regex_unicode_property", "unicode property escapes are not supported"),
-            'k' => return self.failUnsupported("regex_named_groups", "named backreferences are not supported"),
+            'p', 'P' => {
+                const prop = try self.parseUnicodeProperty(esc == 'P');
+                return .{ .unicode_prop = .{ .ranges = prop.code_points, .inverted = (esc == 'P') } };
+            },
+            'k' => {
+                if (self.named_groups.items.len > 0 or self.flags.isUnicodeMode()) {
+                    return self.failSyntax("\\k is not allowed in character class");
+                }
+                return self.failAnnexB("annex B \\k identity escape in character class");
+            },
             else => {
                 if (isSyntaxCharacter(esc) or esc == '/' or esc == '-') {
                     return .{ .single = esc };
                 }
+                if (self.flags.isUnicodeMode()) {
+                    return self.failSyntax("invalid identity escape in unicode character class");
+                }
                 if ((esc >= 'a' and esc <= 'z') or (esc >= 'A' and esc <= 'Z')) {
-                    return self.failUnsupported("regex_annex_b", "annex B letter identity escape");
+                    return self.failAnnexB("annex B letter identity escape");
                 }
                 return .{ .single = esc };
             },
         }
     }
 
-    fn addClassRange(self: *Compiler, lo: u16, hi: u16) CompileError!void {
-        if (self.class_items.items.len >= max_class_items) {
+    fn appendClassNode(self: *Compiler, node: ClassNode) CompileError!u32 {
+        if (self.class_nodes.items.len >= max_class_items) {
             return self.failComplex("too many character class items");
         }
-        try self.class_items.append(self.gpa, .{ .range = .{ .lo = lo, .hi = hi } });
+        const idx: u32 = @intCast(self.class_nodes.items.len);
+        try self.class_nodes.append(self.gpa, node);
+        return idx;
     }
 
-    fn addClassRangeFolded(self: *Compiler, lo: u16, hi: u16) CompileError!void {
-        if (self.flags.ignore_case and (lo > 0x7F or hi > 0x7F)) {
-            return self.failUnsupported("regex_ignore_case_unicode", "non-ASCII character or range in class with ignore_case flag");
-        }
-        if (!self.flags.ignore_case) {
-            try self.addClassRange(lo, hi);
-            return;
-        }
-        if (hi < 'a' or lo > 'z') {
-            try self.addClassRange(lo, hi);
-            return;
-        }
-        if (lo < 'a') {
-            try self.addClassRange(lo, 'a' - 1);
-        }
-        const lower_lo = @max(lo, @as(u16, 'a'));
-        const lower_hi = @min(hi, @as(u16, 'z'));
-        try self.addClassRange(lower_lo - 32, lower_hi - 32);
-        if (hi > 'z') {
-            try self.addClassRange('z' + 1, hi);
+    fn appendClassAtomNode(self: *Compiler, atom: ClassAtom) CompileError!void {
+        switch (atom) {
+            .single => |ch| _ = try self.appendClassNode(.{ .range = .{ .lo = ch, .hi = ch } }),
+            .builtin => |b| _ = try self.appendClassNode(.{ .builtin = b }),
+            .unicode_prop => |p| {
+                if (p.inverted) {
+                    const child_idx = try self.appendClassNode(.{ .unicode_prop = p.ranges });
+                    _ = try self.appendClassNode(.{
+                        .compound = .{
+                            .op = .union_op,
+                            .inverted = true,
+                            .ignore_case = self.flags.ignore_case,
+                            .start = child_idx,
+                            .len = 1,
+                        },
+                    });
+                } else {
+                    _ = try self.appendClassNode(.{ .unicode_prop = p.ranges });
+                }
+            },
         }
     }
 
     fn parseClass(self: *Compiler) CompileError!void {
+        if (self.flags.unicode_sets) {
+            return self.parseClassV();
+        }
         var inverted = false;
         if (self.pos < self.pattern.len and self.pattern[self.pos] == '^') {
             inverted = true;
             self.pos += 1;
         }
-        const items_start: u32 = @intCast(self.class_items.items.len);
+        const nodes_start: u32 = @intCast(self.class_nodes.items.len);
         while (self.pos < self.pattern.len and self.pattern[self.pos] != ']') {
             const first = try self.parseClassAtom();
             if (self.pos < self.pattern.len and self.pattern[self.pos] == '-') {
                 if (self.pos + 1 < self.pattern.len and self.pattern[self.pos + 1] == ']') {
                     // Trailing `-` before `]` is a literal `-`.
-                    switch (first) {
-                        .single => |ch| try self.addClassRangeFolded(ch, ch),
-                        .builtin => |b| {
-                            if (self.class_items.items.len >= max_class_items) return self.failComplex("too many character class items");
-                            try self.class_items.append(self.gpa, .{ .builtin = b });
-                        },
-                    }
+                    try self.appendClassAtomNode(first);
                     self.pos += 1;
-                    try self.addClassRangeFolded('-', '-');
+                    _ = try self.appendClassNode(.{ .range = .{ .lo = '-', .hi = '-' } });
                     break;
                 }
                 self.pos += 1; // consume '-'
                 const second = try self.parseClassAtom();
-                if (first == .builtin or second == .builtin) {
-                    return self.failUnsupported("regex_annex_b", "character class range with character class escape");
+                if (first != .single or second != .single) {
+                    if (self.flags.isUnicodeMode()) {
+                        return self.failSyntax("character class range with character class escape");
+                    }
+                    try self.appendClassAtomNode(first);
+                    _ = try self.appendClassNode(.{ .range = .{ .lo = '-', .hi = '-' } });
+                    try self.appendClassAtomNode(second);
+                    continue;
                 }
                 const lo = first.single;
                 const hi = second.single;
                 if (lo > hi) {
                     return self.failSyntax("character class range out of order");
                 }
-                try self.addClassRangeFolded(lo, hi);
+                _ = try self.appendClassNode(.{ .range = .{ .lo = lo, .hi = hi } });
             } else {
-                switch (first) {
-                    .single => |ch| try self.addClassRangeFolded(ch, ch),
-                    .builtin => |b| {
-                        if (self.class_items.items.len >= max_class_items) return self.failComplex("too many character class items");
-                        try self.class_items.append(self.gpa, .{ .builtin = b });
-                    },
-                }
+                try self.appendClassAtomNode(first);
             }
         }
         if (self.pos >= self.pattern.len or self.pattern[self.pos] != ']') {
@@ -759,21 +1105,381 @@ const Compiler = struct {
         }
         self.pos += 1; // consume ']'
 
-        const items_len: u32 = @intCast(self.class_items.items.len - items_start);
+        const nodes_len: u32 = @intCast(self.class_nodes.items.len - nodes_start);
+        const root_node = try self.appendClassNode(.{
+            .compound = .{
+                .op = .union_op,
+                .inverted = inverted,
+                .ignore_case = self.flags.ignore_case,
+                .start = nodes_start,
+                .len = nodes_len,
+            },
+        });
         const class_idx: u32 = @intCast(self.classes.items.len);
         try self.classes.append(self.gpa, .{
-            .inverted = inverted,
-            .start = items_start,
-            .len = items_len,
+            .root_node = root_node,
+            .has_strings = false,
+            .max_str_len = 1,
         });
-        const start_pc = try self.emit(.{ .class = class_idx });
+        const start_pc = try self.emitAtomInst(.{ .class = class_idx });
         self.last_atom = .{
             .start_pc = start_pc,
+            .end_pc = start_pc + 1,
             .cap_start = self.next_capture + 1,
             .cap_end = self.next_capture,
             .quantifiable = true,
             .is_lookahead = false,
         };
+    }
+
+    fn parseVClassChar(self: *Compiler, in_q: bool) CompileError!u21 {
+        if (self.pos >= self.pattern.len) return self.failSyntax("unterminated v-mode character class");
+        const c = self.pattern[self.pos];
+        self.pos += 1;
+        if (c != '\\') {
+            if (!in_q and isClassSetSyntaxChar(c)) {
+                return self.failSyntax("unescaped syntax character in v-mode character class");
+            }
+            if (!in_q and isClassSetDoublePunctuatorChar(c) and
+                self.pos < self.pattern.len and self.pattern[self.pos] == c)
+            {
+                return self.failSyntax("reserved double punctuator in v-mode character class");
+            }
+            if (isLeadSurrogate(c) and self.pos < self.pattern.len and isTrailSurrogate(self.pattern[self.pos])) {
+                const trail = self.pattern[self.pos];
+                self.pos += 1;
+                return combineSurrogates(c, trail);
+            }
+            return c;
+        }
+        if (self.pos >= self.pattern.len) return self.failSyntax("unterminated escape in v-mode character class");
+        const esc = self.pattern[self.pos];
+        self.pos += 1;
+        return switch (esc) {
+            'b' => 0x0008,
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'f' => 0x000C,
+            'v' => 0x000B,
+            '0' => blk: {
+                if (self.pos < self.pattern.len and isAsciiDigit(self.pattern[self.pos])) {
+                    return self.failSyntax("legacy octal escape in v-mode character class");
+                }
+                break :blk 0;
+            },
+            'x' => try self.parseHexEscape(2),
+            'u' => try self.parseUnicodeEscapeCp(),
+            'c' => blk: {
+                if (self.pos < self.pattern.len) {
+                    const next = self.pattern[self.pos];
+                    if ((next >= 'A' and next <= 'Z') or (next >= 'a' and next <= 'z')) {
+                        self.pos += 1;
+                        break :blk next & 0x1F;
+                    }
+                }
+                return self.failSyntax("invalid \\c control escape");
+            },
+            else => {
+                if (isSyntaxCharacter(esc) or esc == '/' or isClassSetReservedPunctuator(esc)) {
+                    return esc;
+                }
+                return self.failSyntax("invalid escape in v-mode character class");
+            },
+        };
+    }
+
+    fn parseClassV(self: *Compiler) CompileError!void {
+        const ClassVFrame = struct {
+            inverted: bool,
+            op: ?ClassOp = null,
+            may_contain_strings: bool = false,
+            first_may_contain_strings: bool = false,
+            max_str_len: u32 = 1,
+            children: std.ArrayList(ClassNode) = .empty,
+        };
+
+        var stack: std.ArrayList(ClassVFrame) = .empty;
+        defer {
+            for (stack.items) |*f| f.children.deinit(self.gpa);
+            stack.deinit(self.gpa);
+        }
+
+        const pushFrame = struct {
+            fn call(comp: *Compiler, st: *std.ArrayList(ClassVFrame)) CompileError!void {
+                if (comp.groups.items.len + st.items.len >= comp.max_depth) {
+                    return comp.failDepth("regex character class nesting exceeds max_depth");
+                }
+                var inv = false;
+                if (comp.pos < comp.pattern.len and comp.pattern[comp.pos] == '^') {
+                    inv = true;
+                    comp.pos += 1;
+                }
+                try st.append(comp.gpa, .{ .inverted = inv });
+            }
+        }.call;
+
+        try pushFrame(self, &stack);
+
+        while (stack.items.len > 0) {
+            if (self.pos >= self.pattern.len) return self.failSyntax("unterminated character class");
+            const cur = self.pattern[self.pos];
+
+            if (cur == ']') {
+                self.pos += 1;
+                var frame = stack.pop().?;
+                defer frame.children.deinit(self.gpa);
+
+                if (frame.inverted and frame.may_contain_strings) {
+                    return self.failSyntax("negated character class cannot contain strings");
+                }
+                const start: u32 = @intCast(self.class_nodes.items.len);
+                if (self.class_nodes.items.len + frame.children.items.len >= max_class_items) {
+                    return self.failComplex("too many character class items");
+                }
+                try self.class_nodes.appendSlice(self.gpa, frame.children.items);
+                const compound_node: ClassNode = .{
+                    .compound = .{
+                        .op = frame.op orelse .union_op,
+                        .inverted = frame.inverted,
+                        .ignore_case = self.flags.ignore_case,
+                        .start = start,
+                        .len = @intCast(frame.children.items.len),
+                    },
+                };
+                const effective_strings = if (frame.inverted) false else frame.may_contain_strings;
+
+                if (stack.items.len == 0) {
+                    const root_node = try self.appendClassNode(compound_node);
+                    const class_idx: u32 = @intCast(self.classes.items.len);
+                    try self.classes.append(self.gpa, .{
+                        .root_node = root_node,
+                        .has_strings = effective_strings,
+                        .max_str_len = frame.max_str_len,
+                    });
+                    const start_pc = try self.emitAtomInst(.{ .class = class_idx });
+                    self.last_atom = .{
+                        .start_pc = start_pc,
+                        .end_pc = start_pc + 1,
+                        .cap_start = self.next_capture + 1,
+                        .cap_end = self.next_capture,
+                        .quantifiable = true,
+                        .is_lookahead = false,
+                    };
+                    return;
+                }
+
+                const parent = &stack.items[stack.items.len - 1];
+                try parent.children.append(self.gpa, compound_node);
+                parent.max_str_len = @max(parent.max_str_len, frame.max_str_len);
+                if (parent.children.items.len == 1) {
+                    parent.first_may_contain_strings = effective_strings;
+                    parent.may_contain_strings = effective_strings;
+                } else {
+                    switch (parent.op orelse .union_op) {
+                        .union_op => parent.may_contain_strings = parent.may_contain_strings or effective_strings,
+                        .intersection_op => parent.may_contain_strings = parent.may_contain_strings and effective_strings,
+                        .subtraction_op => parent.may_contain_strings = parent.first_may_contain_strings,
+                    }
+                }
+                // Check for operator after nested [...]
+                if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '&' and self.pattern[self.pos + 1] == '&') {
+                    if (parent.op == .subtraction_op or parent.op == .union_op) return self.failSyntax("cannot mix class set operators");
+                    if (self.pos + 2 < self.pattern.len and self.pattern[self.pos + 2] == '&') return self.failSyntax("invalid '&&&' in character class");
+                    parent.op = .intersection_op;
+                    self.pos += 2;
+                    if (self.pos >= self.pattern.len or self.pattern[self.pos] == ']') return self.failSyntax("trailing '&&' in character class");
+                } else if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '-' and self.pattern[self.pos + 1] == '-') {
+                    if (parent.op == .intersection_op or parent.op == .union_op) return self.failSyntax("cannot mix class set operators");
+                    parent.op = .subtraction_op;
+                    self.pos += 2;
+                    if (self.pos >= self.pattern.len or self.pattern[self.pos] == ']') return self.failSyntax("trailing '--' in character class");
+                } else if (self.pos < self.pattern.len and self.pattern[self.pos] != ']') {
+                    if (parent.op == .intersection_op or parent.op == .subtraction_op) return self.failSyntax("cannot mix class set operators");
+                    parent.op = .union_op;
+                }
+                continue;
+            }
+
+            if (cur == '[') {
+                self.pos += 1;
+                try pushFrame(self, &stack);
+                continue;
+            }
+
+            const frame = &stack.items[stack.items.len - 1];
+            if (self.pos + 1 < self.pattern.len and ((cur == '&' and self.pattern[self.pos + 1] == '&') or (cur == '-' and self.pattern[self.pos + 1] == '-'))) {
+                return self.failSyntax("unexpected class set operator");
+            }
+
+            // Parse one ClassSetOperand
+            var operand_node: ClassNode = undefined;
+            var operand_has_strings = false;
+            var operand_max_len: u32 = 1;
+
+            if (cur == '\\' and self.pos + 1 < self.pattern.len) {
+                const esc = self.pattern[self.pos + 1];
+                switch (esc) {
+                    'd' => {
+                        self.pos += 2;
+                        operand_node = .{ .builtin = .digit };
+                    },
+                    'D' => {
+                        self.pos += 2;
+                        operand_node = .{ .builtin = .not_digit };
+                    },
+                    'w' => {
+                        self.pos += 2;
+                        operand_node = .{ .builtin = .word };
+                    },
+                    'W' => {
+                        self.pos += 2;
+                        operand_node = .{ .builtin = .not_word };
+                    },
+                    's' => {
+                        self.pos += 2;
+                        operand_node = .{ .builtin = .space };
+                    },
+                    'S' => {
+                        self.pos += 2;
+                        operand_node = .{ .builtin = .not_space };
+                    },
+                    'p', 'P' => {
+                        self.pos += 2;
+                        const prop = try self.parseUnicodeProperty(esc == 'P');
+                        switch (prop) {
+                            .code_points => |ranges| {
+                                if (esc == 'P') {
+                                    const child_idx = try self.appendClassNode(.{ .unicode_prop = ranges });
+                                    operand_node = .{
+                                        .compound = .{
+                                            .op = .union_op,
+                                            .inverted = true,
+                                            .ignore_case = self.flags.ignore_case,
+                                            .start = child_idx,
+                                            .len = 1,
+                                        },
+                                    };
+                                } else {
+                                    operand_node = .{ .unicode_prop = ranges };
+                                }
+                            },
+                            .strings => |strings| {
+                                operand_node = .{ .string_prop = strings };
+                                operand_has_strings = true;
+                                for (strings) |s| {
+                                    operand_max_len = @max(operand_max_len, @as(u32, @intCast(s.len)));
+                                }
+                            },
+                        }
+                    },
+                    'q' => {
+                        self.pos += 2;
+                        if (self.pos >= self.pattern.len or self.pattern[self.pos] != '{') {
+                            return self.failSyntax("expected '{' after \\q");
+                        }
+                        self.pos += 1;
+                        var alts: std.ArrayList(ClassNode) = .empty;
+                        defer alts.deinit(self.gpa);
+                        while (true) {
+                            const str_start: u32 = @intCast(self.class_strings.items.len);
+                            while (self.pos < self.pattern.len and self.pattern[self.pos] != '|' and self.pattern[self.pos] != '}') {
+                                const ch = try self.parseVClassChar(true);
+                                try self.class_strings.append(self.gpa, ch);
+                            }
+                            const str_len: u32 = @intCast(self.class_strings.items.len - str_start);
+                            if (str_len == 1) {
+                                const cp = self.class_strings.items[str_start];
+                                self.class_strings.shrinkRetainingCapacity(str_start);
+                                try alts.append(self.gpa, .{ .range = .{ .lo = cp, .hi = cp } });
+                            } else {
+                                operand_has_strings = true;
+                                operand_max_len = @max(operand_max_len, str_len);
+                                try alts.append(self.gpa, .{ .string_literal = .{ .start = str_start, .len = str_len } });
+                            }
+                            if (self.pos >= self.pattern.len) return self.failSyntax("unterminated \\q{...}");
+                            if (self.pattern[self.pos] == '}') {
+                                self.pos += 1;
+                                break;
+                            }
+                            self.pos += 1; // consume '|'
+                        }
+                        if (alts.items.len == 1) {
+                            operand_node = alts.items[0];
+                        } else {
+                            const start: u32 = @intCast(self.class_nodes.items.len);
+                            if (self.class_nodes.items.len + alts.items.len >= max_class_items) {
+                                return self.failComplex("too many character class items");
+                            }
+                            try self.class_nodes.appendSlice(self.gpa, alts.items);
+                            operand_node = .{
+                                .compound = .{
+                                    .op = .union_op,
+                                    .inverted = false,
+                                    .ignore_case = self.flags.ignore_case,
+                                    .start = start,
+                                    .len = @intCast(alts.items.len),
+                                },
+                            };
+                        }
+                    },
+                    else => {
+                        const first_cp = try self.parseVClassChar(false);
+                        if (self.pos < self.pattern.len and self.pattern[self.pos] == '-' and
+                            !(self.pos + 1 < self.pattern.len and self.pattern[self.pos + 1] == '-'))
+                        {
+                            self.pos += 1; // consume '-'
+                            const second_cp = try self.parseVClassChar(false);
+                            if (first_cp > second_cp) return self.failSyntax("character class range out of order");
+                            operand_node = .{ .range = .{ .lo = first_cp, .hi = second_cp } };
+                        } else {
+                            operand_node = .{ .range = .{ .lo = first_cp, .hi = first_cp } };
+                        }
+                    },
+                }
+            } else {
+                const first_cp = try self.parseVClassChar(false);
+                if (self.pos < self.pattern.len and self.pattern[self.pos] == '-' and
+                    !(self.pos + 1 < self.pattern.len and self.pattern[self.pos + 1] == '-'))
+                {
+                    self.pos += 1; // consume '-'
+                    const second_cp = try self.parseVClassChar(false);
+                    if (first_cp > second_cp) return self.failSyntax("character class range out of order");
+                    operand_node = .{ .range = .{ .lo = first_cp, .hi = second_cp } };
+                } else {
+                    operand_node = .{ .range = .{ .lo = first_cp, .hi = first_cp } };
+                }
+            }
+
+            try frame.children.append(self.gpa, operand_node);
+            frame.max_str_len = @max(frame.max_str_len, operand_max_len);
+            if (frame.children.items.len == 1) {
+                frame.first_may_contain_strings = operand_has_strings;
+                frame.may_contain_strings = operand_has_strings;
+            } else {
+                switch (frame.op orelse .union_op) {
+                    .union_op => frame.may_contain_strings = frame.may_contain_strings or operand_has_strings,
+                    .intersection_op => frame.may_contain_strings = frame.may_contain_strings and operand_has_strings,
+                    .subtraction_op => frame.may_contain_strings = frame.first_may_contain_strings,
+                }
+            }
+
+            if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '&' and self.pattern[self.pos + 1] == '&') {
+                if (frame.op == .subtraction_op or frame.op == .union_op) return self.failSyntax("cannot mix class set operators");
+                if (self.pos + 2 < self.pattern.len and self.pattern[self.pos + 2] == '&') return self.failSyntax("invalid '&&&' in character class");
+                frame.op = .intersection_op;
+                self.pos += 2;
+                if (self.pos >= self.pattern.len or self.pattern[self.pos] == ']') return self.failSyntax("trailing '&&' in character class");
+            } else if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '-' and self.pattern[self.pos + 1] == '-') {
+                if (frame.op == .intersection_op or frame.op == .union_op) return self.failSyntax("cannot mix class set operators");
+                frame.op = .subtraction_op;
+                self.pos += 2;
+                if (self.pos >= self.pattern.len or self.pattern[self.pos] == ']') return self.failSyntax("trailing '--' in character class");
+            } else if (self.pos < self.pattern.len and self.pattern[self.pos] != ']') {
+                if (frame.op == .intersection_op or frame.op == .subtraction_op) return self.failSyntax("cannot mix class set operators");
+                frame.op = .union_op;
+            }
+        }
     }
 
     fn parseAtomEscape(self: *Compiler) CompileError!void {
@@ -782,12 +1488,12 @@ const Compiler = struct {
         self.pos += 1;
         switch (esc) {
             'b' => {
-                const pc = try self.emit(.word_boundary);
-                self.last_atom = .{ .start_pc = pc, .cap_start = 1, .cap_end = 0, .quantifiable = false, .is_lookahead = false };
+                const pc = try self.emitAtomInst(.word_boundary);
+                self.last_atom = .{ .start_pc = pc, .end_pc = pc + 1, .cap_start = 1, .cap_end = 0, .quantifiable = false, .is_lookahead = false };
             },
             'B' => {
-                const pc = try self.emit(.not_word_boundary);
-                self.last_atom = .{ .start_pc = pc, .cap_start = 1, .cap_end = 0, .quantifiable = false, .is_lookahead = false };
+                const pc = try self.emitAtomInst(.not_word_boundary);
+                self.last_atom = .{ .start_pc = pc, .end_pc = pc + 1, .cap_start = 1, .cap_end = 0, .quantifiable = false, .is_lookahead = false };
             },
             'd' => try self.emitBuiltinAtom(.digit),
             'D' => try self.emitBuiltinAtom(.not_digit),
@@ -802,28 +1508,28 @@ const Compiler = struct {
             'v' => try self.emitLiteral(0x000B),
             '0' => {
                 if (self.pos < self.pattern.len and isAsciiDigit(self.pattern[self.pos])) {
-                    return self.failUnsupported("regex_annex_b", "legacy octal escape");
+                    return self.failAnnexB("legacy octal escape");
                 }
                 try self.emitLiteral(0);
             },
             '1'...'9' => {
                 var num: u32 = esc - '0';
-                if (self.pos < self.pattern.len and isAsciiDigit(self.pattern[self.pos])) {
-                    while (self.pos < self.pattern.len and isAsciiDigit(self.pattern[self.pos])) {
-                        num = num *| 10 +| (self.pattern[self.pos] - '0');
-                        self.pos += 1;
-                    }
-                    if (num <= self.total_captures) {
-                        return self.failUnsupported("regex_backref_gt9", "backreferences above \\9 are not supported");
-                    }
-                    return self.failUnsupported("regex_annex_b", "decimal or octal escape exceeding capture count");
+                while (self.pos < self.pattern.len and isAsciiDigit(self.pattern[self.pos])) {
+                    num = num *| 10 +| (self.pattern[self.pos] - '0');
+                    self.pos += 1;
                 }
                 if (num > self.total_captures) {
-                    return self.failUnsupported("regex_annex_b", "backreference exceeds number of capturing groups");
+                    return self.failAnnexB("backreference exceeds number of capturing groups");
                 }
-                const start_pc = try self.emit(.{ .backref = @intCast(num) });
+                const cap_idx: u16 = @intCast(num);
+                const inst: Inst = if (self.flags.ignore_case)
+                    .{ .backref_icase = cap_idx }
+                else
+                    .{ .backref = cap_idx };
+                const start_pc = try self.emitAtomInst(inst);
                 self.last_atom = .{
                     .start_pc = start_pc,
+                    .end_pc = start_pc + 1,
                     .cap_start = self.next_capture + 1,
                     .cap_end = self.next_capture,
                     .quantifiable = true,
@@ -835,20 +1541,97 @@ const Compiler = struct {
                 try self.emitLiteral(c);
             },
             'u' => {
-                if (self.pos < self.pattern.len and self.pattern[self.pos] == '{') {
-                    return self.failUnsupported("regex_unicode_escape_braced", "\\u{...} escape requires unicode mode");
-                }
-                const c = try self.parseHexEscape(4);
-                try self.emitLiteral(c);
+                const cp = try self.parseUnicodeEscapeCp();
+                try self.emitLiteral(cp);
             },
-            'c' => return self.failUnsupported("regex_control_escape", "\\c control escape is not supported"),
-            'p', 'P' => return self.failUnsupported("regex_unicode_property", "unicode property escapes are not supported"),
-            'k' => return self.failUnsupported("regex_named_groups", "named backreferences are not supported"),
+            'c' => {
+                if (self.pos < self.pattern.len) {
+                    const next = self.pattern[self.pos];
+                    if ((next >= 'A' and next <= 'Z') or (next >= 'a' and next <= 'z')) {
+                        self.pos += 1;
+                        try self.emitLiteral(next & 0x1F);
+                        return;
+                    }
+                }
+                return self.failAnnexB("invalid \\c control escape");
+            },
+            'p', 'P' => {
+                const prop = try self.parseUnicodeProperty(esc == 'P');
+                var has_strings = false;
+                var max_str_len: u32 = 1;
+                const node: ClassNode = switch (prop) {
+                    .code_points => |ranges| .{ .unicode_prop = ranges },
+                    .strings => |strings| blk: {
+                        has_strings = true;
+                        for (strings) |s| max_str_len = @max(max_str_len, @as(u32, @intCast(s.len)));
+                        break :blk .{ .string_prop = strings };
+                    },
+                };
+                const child_idx = try self.appendClassNode(node);
+                const root_node = try self.appendClassNode(.{
+                    .compound = .{
+                        .op = .union_op,
+                        .inverted = (esc == 'P'),
+                        .ignore_case = self.flags.ignore_case,
+                        .start = child_idx,
+                        .len = 1,
+                    },
+                });
+                const class_idx: u32 = @intCast(self.classes.items.len);
+                try self.classes.append(self.gpa, .{
+                    .root_node = root_node,
+                    .has_strings = has_strings,
+                    .max_str_len = max_str_len,
+                });
+                const start_pc = try self.emitAtomInst(.{ .class = class_idx });
+                self.last_atom = .{
+                    .start_pc = start_pc,
+                    .end_pc = start_pc + 1,
+                    .cap_start = self.next_capture + 1,
+                    .cap_end = self.next_capture,
+                    .quantifiable = true,
+                    .is_lookahead = false,
+                };
+            },
+            'k' => {
+                if (self.named_groups.items.len == 0) {
+                    return self.failAnnexB("annex B \\k identity escape");
+                }
+                if (self.pos >= self.pattern.len or self.pattern[self.pos] != '<') {
+                    return self.failSyntax("invalid named backreference");
+                }
+                self.pos += 1;
+                const name_start = self.pos;
+                while (self.pos < self.pattern.len and self.pattern[self.pos] != '>') : (self.pos += 1) {}
+                if (self.pos >= self.pattern.len) {
+                    return self.failSyntax("unterminated named backreference");
+                }
+                const name = self.pattern[name_start..self.pos];
+                self.pos += 1;
+                const cap_idx = self.findNamedGroup(name) orelse {
+                    return self.failSyntax("unknown named capture group");
+                };
+                const inst: Inst = if (self.flags.ignore_case)
+                    .{ .backref_icase = cap_idx }
+                else
+                    .{ .backref = cap_idx };
+                const start_pc = try self.emitAtomInst(inst);
+                self.last_atom = .{
+                    .start_pc = start_pc,
+                    .end_pc = start_pc + 1,
+                    .cap_start = self.next_capture + 1,
+                    .cap_end = self.next_capture,
+                    .quantifiable = true,
+                    .is_lookahead = false,
+                };
+            },
             else => {
                 if (isSyntaxCharacter(esc) or esc == '/') {
                     try self.emitLiteral(esc);
+                } else if (self.flags.isUnicodeMode()) {
+                    return self.failSyntax("invalid identity escape in unicode mode");
                 } else if ((esc >= 'a' and esc <= 'z') or (esc >= 'A' and esc <= 'Z')) {
-                    return self.failUnsupported("regex_annex_b", "annex B letter identity escape");
+                    return self.failAnnexB("annex B letter identity escape");
                 } else {
                     try self.emitLiteral(esc);
                 }
@@ -857,14 +1640,79 @@ const Compiler = struct {
     }
 
     fn emitBuiltinAtom(self: *Compiler, b: BuiltinClass) CompileError!void {
-        const start_pc = try self.emit(.{ .builtin = b });
+        const start_pc = try self.emitAtomInst(.{ .builtin = b });
         self.last_atom = .{
             .start_pc = start_pc,
+            .end_pc = start_pc + 1,
             .cap_start = self.next_capture + 1,
             .cap_end = self.next_capture,
             .quantifiable = true,
             .is_lookahead = false,
         };
+    }
+
+    fn parseInlineModifiers(self: *Compiler) CompileError!Flags {
+        var new_flags = self.flags;
+        var seen_add_i = false;
+        var seen_add_m = false;
+        var seen_add_s = false;
+        var seen_rem_i = false;
+        var seen_rem_m = false;
+        var seen_rem_s = false;
+        var in_remove = false;
+        var has_any_flag = false;
+
+        while (self.pos < self.pattern.len) {
+            const ch = self.pattern[self.pos];
+            self.pos += 1;
+            if (ch == ':') {
+                if (!has_any_flag) return self.failSyntax("invalid group modifier");
+                return new_flags;
+            }
+            if (ch == '-') {
+                if (in_remove) return self.failSyntax("invalid group modifier");
+                in_remove = true;
+                continue;
+            }
+            has_any_flag = true;
+            switch (ch) {
+                'i' => {
+                    if (in_remove) {
+                        if (seen_add_i or seen_rem_i) return self.failSyntax("duplicate group modifier");
+                        seen_rem_i = true;
+                        new_flags.ignore_case = false;
+                    } else {
+                        if (seen_add_i) return self.failSyntax("duplicate group modifier");
+                        seen_add_i = true;
+                        new_flags.ignore_case = true;
+                    }
+                },
+                'm' => {
+                    if (in_remove) {
+                        if (seen_add_m or seen_rem_m) return self.failSyntax("duplicate group modifier");
+                        seen_rem_m = true;
+                        new_flags.multiline = false;
+                    } else {
+                        if (seen_add_m) return self.failSyntax("duplicate group modifier");
+                        seen_add_m = true;
+                        new_flags.multiline = true;
+                    }
+                },
+                's' => {
+                    if (in_remove) {
+                        if (seen_add_s or seen_rem_s) return self.failSyntax("duplicate group modifier");
+                        seen_rem_s = true;
+                        new_flags.dot_all = false;
+                    } else {
+                        if (seen_add_s) return self.failSyntax("duplicate group modifier");
+                        seen_add_s = true;
+                        new_flags.dot_all = true;
+                    }
+                },
+                else => return self.failSyntax("invalid group modifier"),
+            }
+        }
+        return self.failSyntax("unterminated group modifier");
     }
 
     fn openGroup(self: *Compiler) CompileError!void {
@@ -874,6 +1722,8 @@ const Compiler = struct {
         var kind: GroupKind = .capturing;
         var cap_idx: u16 = 0;
         const cap_before = self.next_capture;
+        const saved_flags = self.flags;
+        const saved_in_lookbehind = self.in_lookbehind;
 
         if (self.pos < self.pattern.len and self.pattern[self.pos] == '?') {
             self.pos += 1;
@@ -885,12 +1735,27 @@ const Compiler = struct {
                 '=' => kind = .pos_lookahead,
                 '!' => kind = .neg_lookahead,
                 '<' => {
-                    if (self.pos < self.pattern.len and (self.pattern[self.pos] == '=' or self.pattern[self.pos] == '!')) {
-                        return self.failUnsupported("regex_lookbehind", "lookbehind assertions are not supported");
+                    if (self.pos >= self.pattern.len) return self.failSyntax("unterminated group");
+                    if (self.pattern[self.pos] == '=') {
+                        self.pos += 1;
+                        kind = .pos_lookbehind;
+                    } else if (self.pattern[self.pos] == '!') {
+                        self.pos += 1;
+                        kind = .neg_lookbehind;
+                    } else {
+                        // Named capturing group (?<name>...) already validated in prepass.
+                        while (self.pos < self.pattern.len and self.pattern[self.pos] != '>') : (self.pos += 1) {}
+                        if (self.pos >= self.pattern.len) return self.failSyntax("unterminated capture group name");
+                        self.pos += 1; // consume '>'
+                        self.next_capture += 1;
+                        cap_idx = self.next_capture;
                     }
-                    return self.failUnsupported("regex_named_groups", "named capturing groups are not supported");
                 },
-                'i', 'm', 's', '-' => return self.failUnsupported("regex_modifiers", "inline flag modifiers are not supported"),
+                'i', 'm', 's', '-' => {
+                    self.pos -= 1;
+                    self.flags = try self.parseInlineModifiers();
+                    kind = .non_capturing;
+                },
                 else => return self.failSyntax("invalid group modifier"),
             }
         } else {
@@ -901,18 +1766,33 @@ const Compiler = struct {
         const term_start_pc: u32 = @intCast(self.insts.items.len);
         var lookahead_pc: u32 = 0;
         switch (kind) {
-            .capturing => _ = try self.emit(.{ .save_start = cap_idx }),
+            .capturing => _ = try self.emit(if (self.in_lookbehind) .{ .save_end = cap_idx } else .{ .save_start = cap_idx }),
             .non_capturing => {},
             .pos_lookahead, .neg_lookahead => {
                 lookahead_pc = try self.emit(.{
                     .lookahead = .{
                         .negative = (kind == .neg_lookahead),
+                        .reverse = false,
                         .body_pc = term_start_pc + 1,
                         .next_pc = 0, // patched on closeGroup
                         .cap_start = cap_before + 1,
                         .cap_end = cap_before,
                     },
                 });
+                self.in_lookbehind = false;
+            },
+            .pos_lookbehind, .neg_lookbehind => {
+                lookahead_pc = try self.emit(.{
+                    .lookahead = .{
+                        .negative = (kind == .neg_lookbehind),
+                        .reverse = true,
+                        .body_pc = term_start_pc + 1,
+                        .next_pc = 0, // patched on closeGroup
+                        .cap_start = cap_before + 1,
+                        .cap_end = cap_before,
+                    },
+                });
+                self.in_lookbehind = true;
             },
         }
         const branch_start_pc: u32 = @intCast(self.insts.items.len);
@@ -923,6 +1803,8 @@ const Compiler = struct {
             .cap_before = cap_before,
             .term_start_pc = term_start_pc,
             .branch_start_pc = branch_start_pc,
+            .saved_flags = saved_flags,
+            .saved_in_lookbehind = saved_in_lookbehind,
             .lookahead_pc = lookahead_pc,
         });
         self.last_atom = null;
@@ -968,40 +1850,41 @@ const Compiler = struct {
             self.insts.items[j].jump = end_pc;
         }
 
+        self.flags = g.saved_flags;
+        self.in_lookbehind = g.saved_in_lookbehind;
+
+        var quantifiable = true;
+        var is_assertion = false;
         switch (g.kind) {
             .capturing => {
-                _ = try self.emit(.{ .save_end = g.capture_index });
-                self.last_atom = .{
-                    .start_pc = g.term_start_pc,
-                    .cap_start = g.cap_before + 1,
-                    .cap_end = self.next_capture,
-                    .quantifiable = true,
-                    .is_lookahead = false,
-                };
+                _ = try self.emit(if (self.in_lookbehind) .{ .save_start = g.capture_index } else .{ .save_end = g.capture_index });
             },
-            .non_capturing => {
-                self.last_atom = .{
-                    .start_pc = g.term_start_pc,
-                    .cap_start = g.cap_before + 1,
-                    .cap_end = self.next_capture,
-                    .quantifiable = true,
-                    .is_lookahead = false,
-                };
-            },
-            .pos_lookahead, .neg_lookahead => {
+            .non_capturing => {},
+            .pos_lookahead, .neg_lookahead, .pos_lookbehind, .neg_lookbehind => {
                 const done_pc = try self.emit(.lookahead_done);
                 self.insts.items[g.lookahead_pc].lookahead.next_pc = done_pc + 1;
                 self.insts.items[g.lookahead_pc].lookahead.cap_start = g.cap_before + 1;
                 self.insts.items[g.lookahead_pc].lookahead.cap_end = self.next_capture;
-                self.last_atom = .{
-                    .start_pc = g.term_start_pc,
-                    .cap_start = g.cap_before + 1,
-                    .cap_end = self.next_capture,
-                    .quantifiable = false,
-                    .is_lookahead = true,
-                };
+                quantifiable = false;
+                is_assertion = true;
             },
         }
+
+        const group_end_pc: u32 = @intCast(self.insts.items.len);
+        var start_pc = g.term_start_pc;
+        if (self.in_lookbehind) {
+            const dst = self.currentBranchStartPc();
+            self.moveInstRange(dst, g.term_start_pc, group_end_pc);
+            start_pc = dst;
+        }
+        self.last_atom = .{
+            .start_pc = start_pc,
+            .end_pc = start_pc + (group_end_pc - g.term_start_pc),
+            .cap_start = g.cap_before + 1,
+            .cap_end = self.next_capture,
+            .quantifiable = quantifiable,
+            .is_lookahead = is_assertion,
+        };
     }
 
     fn parseBracedQuantifier(self: *Compiler) CompileError!?struct { min: u32, max: u32 } {
@@ -1041,7 +1924,7 @@ const Compiler = struct {
     fn applyQuantifier(self: *Compiler, min: u32, max: u32) CompileError!void {
         const atom = self.last_atom orelse return self.failSyntax("nothing to repeat");
         if (atom.is_lookahead) {
-            return self.failUnsupported("regex_annex_b", "quantifier on lookahead assertion");
+            return self.failAnnexB("quantifier on lookahead assertion");
         }
         if (!atom.quantifiable) {
             return self.failSyntax("nothing to repeat");
@@ -1070,11 +1953,12 @@ const Compiler = struct {
                 .step_pc = 0, // patched below
             },
         });
-        const step_pc = try self.emit(.{
+        const step_pc = atom.end_pc + 1;
+        try self.insertInstAt(step_pc, .{
             .loop_step = .{
                 .loop_id = loop_id,
                 .body_pc = atom.start_pc + 1,
-                .exit_pc = @intCast(self.insts.items.len + 1),
+                .exit_pc = step_pc + 1,
             },
         });
         self.insts.items[atom.start_pc].loop_init.step_pc = step_pc;
@@ -1089,17 +1973,18 @@ const Compiler = struct {
             self.pos += 1;
             switch (c) {
                 '^' => {
-                    const pc = try self.emit(.bol);
-                    self.last_atom = .{ .start_pc = pc, .cap_start = 1, .cap_end = 0, .quantifiable = false, .is_lookahead = false };
+                    const pc = try self.emitAtomInst(if (self.flags.multiline) .bol_multiline else .bol);
+                    self.last_atom = .{ .start_pc = pc, .end_pc = pc + 1, .cap_start = 1, .cap_end = 0, .quantifiable = false, .is_lookahead = false };
                 },
                 '$' => {
-                    const pc = try self.emit(.eol);
-                    self.last_atom = .{ .start_pc = pc, .cap_start = 1, .cap_end = 0, .quantifiable = false, .is_lookahead = false };
+                    const pc = try self.emitAtomInst(if (self.flags.multiline) .eol_multiline else .eol);
+                    self.last_atom = .{ .start_pc = pc, .end_pc = pc + 1, .cap_start = 1, .cap_end = 0, .quantifiable = false, .is_lookahead = false };
                 },
                 '.' => {
-                    const pc = try self.emit(if (self.flags.dot_all) .any_dot_all else .any);
+                    const pc = try self.emitAtomInst(if (self.flags.dot_all) .any_dot_all else .any);
                     self.last_atom = .{
                         .start_pc = pc,
+                        .end_pc = pc + 1,
                         .cap_start = self.next_capture + 1,
                         .cap_end = self.next_capture,
                         .quantifiable = true,
@@ -1108,7 +1993,10 @@ const Compiler = struct {
                 },
                 '\\' => try self.parseAtomEscape(),
                 '[' => try self.parseClass(),
-                ']' => return self.failUnsupported("regex_annex_b", "unescaped ']' outside character class"),
+                ']' => {
+                    if (self.flags.isUnicodeMode()) return self.failSyntax("unescaped ']' outside character class");
+                    try self.emitLiteral(']');
+                },
                 '(' => try self.openGroup(),
                 ')' => try self.closeGroup(),
                 '|' => try self.handleAlternation(),
@@ -1119,11 +2007,22 @@ const Compiler = struct {
                     if (try self.parseBracedQuantifier()) |q| {
                         try self.applyQuantifier(q.min, q.max);
                     } else {
-                        return self.failUnsupported("regex_annex_b", "unescaped '{' that does not form a quantifier");
+                        if (self.flags.isUnicodeMode()) return self.failSyntax("unescaped '{' that does not form a quantifier");
+                        try self.emitLiteral('{');
                     }
                 },
-                '}' => return self.failUnsupported("regex_annex_b", "unescaped '}' outside quantifier"),
-                else => try self.emitLiteral(c),
+                '}' => {
+                    if (self.flags.isUnicodeMode()) return self.failSyntax("unescaped '}' outside quantifier");
+                    try self.emitLiteral('}');
+                },
+                else => {
+                    var cp: u21 = c;
+                    if (self.flags.isUnicodeMode() and isLeadSurrogate(c) and self.pos < self.pattern.len and isTrailSurrogate(self.pattern[self.pos])) {
+                        cp = combineSurrogates(c, self.pattern[self.pos]);
+                        self.pos += 1;
+                    }
+                    try self.emitLiteral(cp);
+                },
             }
         }
 
@@ -1141,16 +2040,21 @@ const Compiler = struct {
         errdefer self.gpa.free(insts);
         const classes = try self.classes.toOwnedSlice(self.gpa);
         errdefer self.gpa.free(classes);
-        const class_items = try self.class_items.toOwnedSlice(self.gpa);
-        errdefer self.gpa.free(class_items);
+        const class_nodes = try self.class_nodes.toOwnedSlice(self.gpa);
+        errdefer self.gpa.free(class_nodes);
+        const class_strings = try self.class_strings.toOwnedSlice(self.gpa);
+        errdefer self.gpa.free(class_strings);
         const loops = try self.loops.toOwnedSlice(self.gpa);
         errdefer self.gpa.free(loops);
+        const named_groups = try self.named_groups.toOwnedSlice(self.gpa);
 
         return .{
             .insts = insts,
             .classes = classes,
-            .class_items = class_items,
+            .class_nodes = class_nodes,
+            .class_strings = class_strings,
             .loops = loops,
+            .named_groups = named_groups,
             .capture_count = self.total_captures,
             .loop_count = @intCast(loops.len),
             .flags = self.flags,
@@ -1186,12 +2090,14 @@ const Action = union(enum) {
     branch: struct {
         pc: u32,
         idx: u32,
+        reverse: bool,
         cap_base: u32,
         loop_base: u32,
     },
     lookahead_neg_success: struct {
         next_pc: u32,
         idx: u32,
+        saved_reverse: bool,
         cap_base: u32,
         loop_base: u32,
     },
@@ -1199,6 +2105,7 @@ const Action = union(enum) {
 
 const LookaheadMarker = struct {
     negative: bool,
+    saved_reverse: bool,
     next_pc: u32,
     saved_idx: u32,
     action_watermark: u32,
@@ -1206,11 +2113,19 @@ const LookaheadMarker = struct {
     loop_watermark: u32,
 };
 
+const EvalFrame = struct {
+    node_idx: u32,
+    child_pos: u32,
+    acc: bool,
+    ignore_case: bool,
+};
+
 const Matcher = struct {
     gpa: Allocator,
     p: *const Program,
     input: []const u16,
     steps: *u64,
+    reverse: bool = false,
 
     /// Current capture slots: 2 slots (start, end) per capture index `1..capture_count`.
     /// Index `2 * (cap - 1)` is start, `2 * (cap - 1) + 1` is end.
@@ -1223,12 +2138,14 @@ const Matcher = struct {
     loop_pool: std.ArrayList(LoopState) = .empty,
     actions: std.ArrayList(Action) = .empty,
     markers: std.ArrayList(LookaheadMarker) = .empty,
+    eval_stack: std.ArrayList(EvalFrame) = .empty,
 
     fn deinit(self: *Matcher) void {
         self.cap_pool.deinit(self.gpa);
         self.loop_pool.deinit(self.gpa);
         self.actions.deinit(self.gpa);
         self.markers.deinit(self.gpa);
+        self.eval_stack.deinit(self.gpa);
         self.gpa.free(self.caps);
         self.gpa.free(self.loops);
     }
@@ -1262,6 +2179,7 @@ const Matcher = struct {
             .branch = .{
                 .pc = pc,
                 .idx = idx,
+                .reverse = self.reverse,
                 .cap_base = snap.cap_base,
                 .loop_base = snap.loop_base,
             },
@@ -1282,33 +2200,232 @@ const Matcher = struct {
         @memset(self.caps[start_slot..end_slot], unset_pos);
     }
 
-    fn matchesClass(self: *const Matcher, class_idx: u32, raw_c: u16) bool {
-        const def = self.p.classes[class_idx];
-        const c = if (self.p.flags.ignore_case) asciiUpper(raw_c) else raw_c;
-        const items = self.p.class_items[def.start..][0..def.len];
-        var matched = false;
-        for (items) |item| {
-            switch (item) {
-                .range => |r| {
-                    if (c >= r.lo and c <= r.hi) {
-                        matched = true;
-                        break;
-                    }
-                },
-                .builtin => |b| {
-                    if (matchesBuiltin(b, raw_c)) {
-                        matched = true;
-                        break;
-                    }
-                },
+    fn canonicalize(self: *const Matcher, cp: u21) u21 {
+        return if (self.p.flags.isUnicodeMode())
+            unicode.canonicalizeUnicode(cp)
+        else
+            unicode.canonicalizeLegacy(@intCast(cp));
+    }
+
+    fn matchesIcase(self: *const Matcher, a: u21, b: u21) bool {
+        return self.canonicalize(a) == self.canonicalize(b);
+    }
+
+    fn matchesRangeIcase(self: *const Matcher, lo: u21, hi: u21, cp: u21) bool {
+        if (cp >= lo and cp <= hi) return true;
+        const canon_cp = self.canonicalize(cp);
+        if (lo == hi) return canon_cp == self.canonicalize(lo);
+        if (canon_cp >= lo and canon_cp <= hi) return true;
+        if (cp < 128 and ((cp >= 'a' and cp <= 'z') or (cp >= 'A' and cp <= 'Z'))) {
+            const flipped = cp ^ 32;
+            if (flipped >= lo and flipped <= hi) return true;
+        }
+        if (hi > 0x7F and hi - lo <= 1024) {
+            var x = lo;
+            while (x <= hi) : (x += 1) {
+                if (self.canonicalize(x) == canon_cp) return true;
             }
         }
-        return if (def.inverted) !matched else matched;
+        return false;
+    }
+
+    fn matchesCpSlice(self: *const Matcher, a: []const u21, b: []const u21, icase: bool) bool {
+        if (a.len != b.len) return false;
+        if (!icase) return std.mem.eql(u21, a, b);
+        for (a, b) |ca, cb| {
+            if (!self.matchesIcase(ca, cb)) return false;
+        }
+        return true;
+    }
+
+    fn evalLeafNode(self: *const Matcher, node: ClassNode, cps: []const u21, icase: bool) bool {
+        switch (node) {
+            .range => |r| {
+                if (cps.len != 1) return false;
+                if (icase) return self.matchesRangeIcase(r.lo, r.hi, cps[0]);
+                return cps[0] >= r.lo and cps[0] <= r.hi;
+            },
+            .builtin => |b| return cps.len == 1 and matchesBuiltin(b, cps[0]),
+            .unicode_prop => |ranges| {
+                if (cps.len != 1) return false;
+                if (unicode.inRanges(cps[0], ranges)) return true;
+                return icase and unicode.inRanges(self.canonicalize(cps[0]), ranges);
+            },
+            .string_prop => |strings| {
+                for (strings) |s| {
+                    if (self.matchesCpSlice(s, cps, icase)) return true;
+                }
+                return false;
+            },
+            .string_literal => |sl| {
+                const target = self.p.class_strings[sl.start..][0..sl.len];
+                return self.matchesCpSlice(target, cps, icase);
+            },
+            .compound => unreachable,
+        }
+    }
+
+    fn matchesClassSlice(self: *Matcher, root_node: u32, cps: []const u21) ExecError!bool {
+        self.eval_stack.clearRetainingCapacity();
+
+        const combine = struct {
+            fn apply(frame: *EvalFrame, op: ClassOp, child_res: bool, total_len: u32) void {
+                switch (op) {
+                    .union_op => {
+                        frame.acc = frame.acc or child_res;
+                        if (frame.acc) frame.child_pos = total_len;
+                    },
+                    .intersection_op => {
+                        frame.acc = frame.acc and child_res;
+                        if (!frame.acc) frame.child_pos = total_len;
+                    },
+                    .subtraction_op => {
+                        if (frame.child_pos == 1) {
+                            frame.acc = child_res;
+                        } else {
+                            frame.acc = frame.acc and !child_res;
+                        }
+                        if (!frame.acc) frame.child_pos = total_len;
+                    },
+                }
+            }
+        }.apply;
+
+        const root = self.p.class_nodes[root_node];
+        switch (root) {
+            .compound => |c| {
+                try self.eval_stack.append(self.gpa, .{
+                    .node_idx = root_node,
+                    .child_pos = 0,
+                    .acc = (c.op == .intersection_op),
+                    .ignore_case = c.ignore_case,
+                });
+            },
+            else => return self.evalLeafNode(root, cps, self.p.flags.ignore_case),
+        }
+
+        while (self.eval_stack.items.len > 0) {
+            const top_idx = self.eval_stack.items.len - 1;
+            const frame = &self.eval_stack.items[top_idx];
+            const comp = self.p.class_nodes[frame.node_idx].compound;
+            if (frame.child_pos < comp.len) {
+                const child_idx = comp.start + frame.child_pos;
+                frame.child_pos += 1;
+                const child = self.p.class_nodes[child_idx];
+                switch (child) {
+                    .compound => |cc| {
+                        try self.eval_stack.append(self.gpa, .{
+                            .node_idx = child_idx,
+                            .child_pos = 0,
+                            .acc = (cc.op == .intersection_op),
+                            .ignore_case = cc.ignore_case,
+                        });
+                    },
+                    else => {
+                        const res = self.evalLeafNode(child, cps, frame.ignore_case);
+                        combine(frame, comp.op, res, comp.len);
+                    },
+                }
+            } else {
+                const finished = self.eval_stack.pop().?;
+                const res = if (comp.inverted) !finished.acc else finished.acc;
+                if (self.eval_stack.items.len == 0) return res;
+                const parent = &self.eval_stack.items[self.eval_stack.items.len - 1];
+                const parent_comp = self.p.class_nodes[parent.node_idx].compound;
+                combine(parent, parent_comp.op, res, parent_comp.len);
+            }
+        }
+        unreachable;
     }
 
     fn isWordAt(self: *const Matcher, pos: u32) bool {
         if (pos >= self.input.len) return false;
         return isAsciiWord(self.input[pos]);
+    }
+
+    const DecodedCp = struct {
+        cp: u21,
+        next_idx: u32,
+    };
+
+    fn readCodePointAt(self: *const Matcher, idx: u32, rev: bool) ?DecodedCp {
+        if (!self.p.flags.isUnicodeMode()) {
+            if (rev) {
+                return if (idx > 0) .{ .cp = self.input[idx - 1], .next_idx = idx - 1 } else null;
+            }
+            return if (idx < self.input.len) .{ .cp = self.input[idx], .next_idx = idx + 1 } else null;
+        }
+        if (rev) {
+            if (idx == 0) return null;
+            const c1 = self.input[idx - 1];
+            if (isTrailSurrogate(c1) and idx >= 2 and isLeadSurrogate(self.input[idx - 2])) {
+                return .{ .cp = combineSurrogates(self.input[idx - 2], c1), .next_idx = idx - 2 };
+            }
+            return .{ .cp = c1, .next_idx = idx - 1 };
+        }
+        if (idx >= self.input.len) return null;
+        const c0 = self.input[idx];
+        if (isLeadSurrogate(c0) and idx + 1 < self.input.len and isTrailSurrogate(self.input[idx + 1])) {
+            return .{ .cp = combineSurrogates(c0, self.input[idx + 1]), .next_idx = idx + 2 };
+        }
+        return .{ .cp = c0, .next_idx = idx + 1 };
+    }
+
+    fn readCodePoint(self: *const Matcher, idx: u32) ?DecodedCp {
+        return self.readCodePointAt(idx, self.reverse);
+    }
+
+    fn matchBackref(self: *const Matcher, cap_num: u16, icase: bool, idx: u32) ?u32 {
+        const slot = (@as(usize, cap_num) - 1) * 2;
+        const c_start = self.caps[slot];
+        const c_end = self.caps[slot + 1];
+        if (c_start == unset_pos or c_end == unset_pos) {
+            // Unset capture group always succeeds matching empty string.
+            return idx;
+        }
+        const len = c_end - c_start;
+        if (!icase or !self.p.flags.isUnicodeMode()) {
+            const ref_slice = self.input[c_start..c_end];
+            const cur_slice = if (self.reverse) blk: {
+                if (idx < len) return null;
+                break :blk self.input[idx - len .. idx];
+            } else blk: {
+                if (idx + len > self.input.len) return null;
+                break :blk self.input[idx..][0..len];
+            };
+            if (icase) {
+                for (ref_slice, cur_slice) |a, b| {
+                    if (unicode.canonicalizeLegacy(a) != unicode.canonicalizeLegacy(b)) return null;
+                }
+            } else {
+                if (!std.mem.eql(u16, ref_slice, cur_slice)) return null;
+            }
+            return if (self.reverse) idx - len else idx + len;
+        }
+        // Unicode mode with ignore_case: compare code-point by code-point.
+        if (self.reverse) {
+            var r_pos = c_end;
+            var cur = idx;
+            while (r_pos > c_start) {
+                const ref_cp = self.readCodePointAt(r_pos, true) orelse return null;
+                const cur_cp = self.readCodePointAt(cur, true) orelse return null;
+                if (!self.matchesIcase(ref_cp.cp, cur_cp.cp)) return null;
+                r_pos = ref_cp.next_idx;
+                cur = cur_cp.next_idx;
+            }
+            return cur;
+        } else {
+            var r_pos = c_start;
+            var cur = idx;
+            while (r_pos < c_end) {
+                const ref_cp = self.readCodePointAt(r_pos, false) orelse return null;
+                const cur_cp = self.readCodePointAt(cur, false) orelse return null;
+                if (!self.matchesIcase(ref_cp.cp, cur_cp.cp)) return null;
+                r_pos = ref_cp.next_idx;
+                cur = cur_cp.next_idx;
+            }
+            return cur;
+        }
     }
 
     fn runAt(self: *Matcher, start_idx: u32) ExecError!?u32 {
@@ -1318,6 +2435,7 @@ const Matcher = struct {
         self.loop_pool.clearRetainingCapacity();
         self.actions.clearRetainingCapacity();
         self.markers.clearRetainingCapacity();
+        self.reverse = false;
 
         var pc: u32 = 0;
         var idx: u32 = start_idx;
@@ -1328,44 +2446,60 @@ const Matcher = struct {
             const advance: bool = switch (inst) {
                 .match => return idx,
                 .char => |expected| blk: {
-                    if (idx < self.input.len and self.input[idx] == expected) {
-                        idx += 1;
-                        pc += 1;
-                        break :blk true;
+                    if (self.readCodePoint(idx)) |d| {
+                        if (d.cp == expected) {
+                            idx = d.next_idx;
+                            pc += 1;
+                            break :blk true;
+                        }
                     }
                     break :blk false;
                 },
-                .char_icase => |expected_upper| blk: {
-                    if (idx < self.input.len and asciiUpper(self.input[idx]) == expected_upper) {
-                        idx += 1;
-                        pc += 1;
-                        break :blk true;
+                .char_icase => |expected_canon| blk: {
+                    if (self.readCodePoint(idx)) |d| {
+                        if (self.canonicalize(d.cp) == expected_canon) {
+                            idx = d.next_idx;
+                            pc += 1;
+                            break :blk true;
+                        }
                     }
                     break :blk false;
                 },
                 .any => blk: {
-                    if (idx < self.input.len and !isLineTerminator(self.input[idx])) {
-                        idx += 1;
-                        pc += 1;
-                        break :blk true;
+                    if (self.readCodePoint(idx)) |d| {
+                        if (!isLineTerminator(d.cp)) {
+                            idx = d.next_idx;
+                            pc += 1;
+                            break :blk true;
+                        }
                     }
                     break :blk false;
                 },
                 .any_dot_all => blk: {
-                    if (idx < self.input.len) {
-                        idx += 1;
+                    if (self.readCodePoint(idx)) |d| {
+                        idx = d.next_idx;
                         pc += 1;
                         break :blk true;
                     }
                     break :blk false;
                 },
                 .bol => blk: {
-                    const ok = (idx == 0) or (self.p.flags.multiline and idx > 0 and isLineTerminator(self.input[idx - 1]));
+                    const ok = idx == 0;
+                    if (ok) pc += 1;
+                    break :blk ok;
+                },
+                .bol_multiline => blk: {
+                    const ok = (idx == 0) or (idx > 0 and isLineTerminator(self.input[idx - 1]));
                     if (ok) pc += 1;
                     break :blk ok;
                 },
                 .eol => blk: {
-                    const ok = (idx == self.input.len) or (self.p.flags.multiline and idx < self.input.len and isLineTerminator(self.input[idx]));
+                    const ok = idx == self.input.len;
+                    if (ok) pc += 1;
+                    break :blk ok;
+                },
+                .eol_multiline => blk: {
+                    const ok = (idx == self.input.len) or (idx < self.input.len and isLineTerminator(self.input[idx]));
                     if (ok) pc += 1;
                     break :blk ok;
                 },
@@ -1388,49 +2522,90 @@ const Matcher = struct {
                     break :blk false;
                 },
                 .builtin => |b| blk: {
-                    if (idx < self.input.len and matchesBuiltin(b, self.input[idx])) {
-                        idx += 1;
-                        pc += 1;
-                        break :blk true;
+                    if (self.readCodePoint(idx)) |d| {
+                        if (matchesBuiltin(b, d.cp)) {
+                            idx = d.next_idx;
+                            pc += 1;
+                            break :blk true;
+                        }
                     }
                     break :blk false;
                 },
                 .class => |c_idx| blk: {
-                    if (idx < self.input.len and self.matchesClass(c_idx, self.input[idx])) {
-                        idx += 1;
+                    const def = self.p.classes[c_idx];
+                    if (!def.has_strings) {
+                        if (self.readCodePoint(idx)) |d| {
+                            if (try self.matchesClassSlice(def.root_node, &.{d.cp})) {
+                                idx = d.next_idx;
+                                pc += 1;
+                                break :blk true;
+                            }
+                        }
+                        break :blk false;
+                    }
+                    // v-mode class that may match strings (longest match first, backtrack to shorter).
+                    var stack_cps: [64]u21 = undefined;
+                    var stack_ends: [65]u32 = undefined;
+                    const max_k = def.max_str_len;
+                    const heap_cps = if (max_k > stack_cps.len) try self.gpa.alloc(u21, max_k) else null;
+                    defer if (heap_cps) |h| self.gpa.free(h);
+                    const heap_ends = if (max_k > stack_cps.len) try self.gpa.alloc(u32, max_k + 1) else null;
+                    defer if (heap_ends) |h| self.gpa.free(h);
+
+                    const cps_buf = if (heap_cps) |h| h else stack_cps[0..max_k];
+                    const ends_buf = if (heap_ends) |h| h else stack_ends[0 .. max_k + 1];
+
+                    ends_buf[0] = idx;
+                    var decoded: usize = 0;
+                    var cur = idx;
+                    while (decoded < max_k) : (decoded += 1) {
+                        const d = self.readCodePoint(cur) orelse break;
+                        cps_buf[decoded] = d.cp;
+                        cur = d.next_idx;
+                        ends_buf[decoded + 1] = cur;
+                    }
+                    if (self.reverse and decoded > 1) {
+                        std.mem.reverse(u21, cps_buf[0..decoded]);
+                    }
+
+                    var matched_any = false;
+                    var longest_end: u32 = 0;
+                    var k: usize = 0;
+                    while (k <= decoded) : (k += 1) {
+                        const slice = if (self.reverse)
+                            cps_buf[decoded - k .. decoded]
+                        else
+                            cps_buf[0..k];
+                        if (try self.matchesClassSlice(def.root_node, slice)) {
+                            if (matched_any) {
+                                try self.pushBranch(pc + 1, longest_end);
+                            }
+                            matched_any = true;
+                            longest_end = ends_buf[k];
+                        }
+                    }
+                    if (matched_any) {
+                        idx = longest_end;
                         pc += 1;
                         break :blk true;
                     }
                     break :blk false;
                 },
                 .backref => |cap_num| blk: {
-                    const slot = (@as(usize, cap_num) - 1) * 2;
-                    const c_start = self.caps[slot];
-                    const c_end = self.caps[slot + 1];
-                    if (c_start == unset_pos or c_end == unset_pos) {
-                        // Unset capture group always succeeds matching empty string.
+                    if (self.matchBackref(cap_num, false, idx)) |next_idx| {
+                        idx = next_idx;
                         pc += 1;
                         break :blk true;
                     }
-                    const len = c_end - c_start;
-                    if (idx + len > self.input.len) break :blk false;
-                    const ref_slice = self.input[c_start..c_end];
-                    const cur_slice = self.input[idx..][0..len];
-                    if (self.p.flags.ignore_case) {
-                        var match_ok = true;
-                        for (ref_slice, cur_slice) |a, b| {
-                            if (asciiUpper(a) != asciiUpper(b)) {
-                                match_ok = false;
-                                break;
-                            }
-                        }
-                        if (!match_ok) break :blk false;
-                    } else {
-                        if (!std.mem.eql(u16, ref_slice, cur_slice)) break :blk false;
+                    break :blk false;
+                },
+                .backref_icase => |cap_num| blk: {
+                    if (self.matchBackref(cap_num, true, idx)) |next_idx| {
+                        idx = next_idx;
+                        pc += 1;
+                        break :blk true;
                     }
-                    idx += len;
-                    pc += 1;
-                    break :blk true;
+                    break :blk false;
                 },
                 .save_start => |cap_num| blk: {
                     const slot = (@as(usize, cap_num) - 1) * 2;
@@ -1512,6 +2687,7 @@ const Matcher = struct {
                             .lookahead_neg_success = .{
                                 .next_pc = la.next_pc,
                                 .idx = idx,
+                                .saved_reverse = self.reverse,
                                 .cap_base = snap.cap_base,
                                 .loop_base = snap.loop_base,
                             },
@@ -1519,12 +2695,14 @@ const Matcher = struct {
                     }
                     try self.markers.append(self.gpa, .{
                         .negative = la.negative,
+                        .saved_reverse = self.reverse,
                         .next_pc = la.next_pc,
                         .saved_idx = idx,
                         .action_watermark = action_wm,
                         .cap_watermark = cap_wm,
                         .loop_watermark = loop_wm,
                     });
+                    self.reverse = la.reverse;
                     pc = la.body_pc;
                     break :blk true;
                 },
@@ -1534,6 +2712,7 @@ const Matcher = struct {
                     self.actions.shrinkRetainingCapacity(m.action_watermark);
                     self.cap_pool.shrinkRetainingCapacity(m.cap_watermark);
                     self.loop_pool.shrinkRetainingCapacity(m.loop_watermark);
+                    self.reverse = m.saved_reverse;
                     if (m.negative) {
                         // Negative lookahead body matched -> the assertion fails!
                         break :blk false;
@@ -1560,6 +2739,7 @@ const Matcher = struct {
                 switch (act) {
                     .branch => |b| {
                         self.restoreSnapshot(b.cap_base, b.loop_base);
+                        self.reverse = b.reverse;
                         pc = b.pc;
                         idx = b.idx;
                     },
@@ -1568,6 +2748,7 @@ const Matcher = struct {
                         // so pop its marker, restore state before the lookahead, and continue!
                         _ = self.markers.pop();
                         self.restoreSnapshot(ns.cap_base, ns.loop_base);
+                        self.reverse = ns.saved_reverse;
                         pc = ns.next_pc;
                         idx = ns.idx;
                     },
@@ -1611,7 +2792,7 @@ pub fn exec(
 
     var pos: u32 = start;
     const limit: u32 = if (p.flags.sticky) start else @intCast(input.len);
-    while (pos <= limit) : (pos += 1) {
+    while (pos <= limit) {
         if (try matcher.runAt(pos)) |end_idx| {
             captures[0] = .{ .start = pos, .end = end_idx };
             for (0..p.capture_count) |i| {
@@ -1624,6 +2805,11 @@ pub fn exec(
                 }
             }
             return true;
+        }
+        if (p.flags.isUnicodeMode() and pos + 1 < input.len and isLeadSurrogate(input[pos]) and isTrailSurrogate(input[pos + 1])) {
+            pos += 2;
+        } else {
+            pos += 1;
         }
     }
     return false;

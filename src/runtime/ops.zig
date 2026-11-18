@@ -17,7 +17,7 @@ const object = @import("object.zig");
 
 // ------------------------------------------------------------ ToBoolean
 
-pub fn toBoolean(v: Value) bool {
+pub inline fn toBoolean(v: Value) bool {
     return switch (v) {
         .undefined, .null => false,
         .boolean => |b| b,

@@ -289,18 +289,18 @@ pub const Vm = struct {
             return bc.readU32(self.code, self.pc + 1 + 4 * i); // instruction bounds checked in execute
         }
 
-        fn target(self: FrameCache, vm: *const Vm) Error!u32 {
+        inline fn target(self: FrameCache, vm: *const Vm) Error!u32 {
             const t = self.operand(0);
             if (t >= self.code.len) return vm.bug("jump target outside the code");
             return t;
         }
 
-        fn slot(self: FrameCache, vm: *Vm, i: u32) Error!*Slot {
+        inline fn slot(self: FrameCache, vm: *Vm, i: u32) Error!*Slot {
             if (i >= self.p.slot_count) return vm.bug("slot index out of range");
             return &vm.locals[self.locals_base + i];
         }
 
-        fn value(self: FrameCache, vm: *Vm, i: u32) Error!*?Value {
+        inline fn value(self: FrameCache, vm: *Vm, i: u32) Error!*?Value {
             return switch ((try self.slot(vm, i)).*) {
                 .value => |*v| v,
                 .cell => return vm.bug("value access to a cell slot"),
@@ -311,32 +311,32 @@ pub const Vm = struct {
             return vm.cellIn(try self.slot(vm, i));
         }
 
-        fn ensurePush(self: FrameCache, vm: *const Vm) Error!void {
+        inline fn ensurePush(self: FrameCache, vm: *const Vm) Error!void {
             if (self.sp >= self.stack_limit) return vm.bug("stack overflow");
         }
 
-        fn ensurePush2(self: FrameCache, vm: *const Vm) Error!void {
+        inline fn ensurePush2(self: FrameCache, vm: *const Vm) Error!void {
             if (self.sp + 1 >= self.stack_limit) return vm.bug("stack overflow");
         }
 
-        fn push(self: *FrameCache, vm: *Vm, v: Value) Error!void {
+        inline fn push(self: *FrameCache, vm: *Vm, v: Value) Error!void {
             try self.ensurePush(vm);
             const sp = self.sp;
             vm.stack[sp] = v;
             self.sp = sp + 1;
         }
 
-        fn peek(self: FrameCache, vm: *const Vm, depth: u32) Error!Value {
+        inline fn peek(self: FrameCache, vm: *const Vm, depth: u32) Error!Value {
             if (depth >= self.sp - self.stack_base) return vm.bug("stack underflow");
             return vm.stack[self.sp - 1 - depth];
         }
 
-        fn top(self: FrameCache, vm: *Vm) Error!*Value {
+        inline fn top(self: FrameCache, vm: *Vm) Error!*Value {
             if (self.sp == self.stack_base) return vm.bug("stack underflow");
             return &vm.stack[self.sp - 1];
         }
 
-        fn drop(self: *FrameCache, vm: *const Vm, n: u32) Error!void {
+        inline fn drop(self: *FrameCache, vm: *const Vm, n: u32) Error!void {
             if (n > self.sp - self.stack_base) return vm.bug("stack underflow");
             self.sp -= n;
         }

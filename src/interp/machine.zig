@@ -65,12 +65,17 @@ fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUs
     try rt.drainMicrotasks();
 }
 
-const UnwindKind = enum { @"break", @"continue", @"return", throw };
+const UnwindKind = union(enum) {
+    @"break": ?[]const u8,
+    @"continue": ?[]const u8,
+    @"return",
+    throw,
+};
 
 const FinallyPending = union(enum) {
     normal,
-    @"break",
-    @"continue",
+    @"break": ?[]const u8,
+    @"continue": ?[]const u8,
     @"return": Value,
     throw: Value,
 };
@@ -121,6 +126,7 @@ const Task = union(enum) {
     for_update: ForTask,
     for_of_init: struct { stmt: *const ast.Stmt, has_scope: bool, values_base: u32 },
     for_of_iter: struct { stmt: *const ast.Stmt, iter: *heap.Object, has_scope: bool, values_base: u32 },
+    labeled: struct { label: []const u8, values_base: u32 },
     throw_finish,
     try_catch: struct { catch_param: ?*const ast.Pattern, catch_body: []const ast.Stmt, saved_env: ?*Env, values_base: u32 },
     try_finally: struct { finally_body: []const ast.Stmt, saved_env: ?*Env, values_base: u32 },
@@ -158,9 +164,9 @@ const Task = union(enum) {
     object_prop_val: struct { key: object.Key, props: []const ast.PropertyDef, idx: usize },
     object_prop_computed_val: struct { value: *const ast.Expr, props: []const ast.PropertyDef, idx: usize },
     object_spread_finish: struct { props: []const ast.PropertyDef, idx: usize },
-    call_member_base: struct { key: ast.PropertyKey, args: []const *const ast.Expr },
-    call_member_key: struct { named: ?[]const u8, args: []const *const ast.Expr },
-    call_after_callee: struct { args: []const *const ast.Expr, has_receiver: bool },
+    call_member_base: struct { key: ast.PropertyKey, args: []const *const ast.Expr, tagged: ?*const ast.Expr.TaggedTemplate = null },
+    call_member_key: struct { named: ?[]const u8, args: []const *const ast.Expr, tagged: ?*const ast.Expr.TaggedTemplate = null },
+    call_after_callee: struct { args: []const *const ast.Expr, has_receiver: bool, tagged: ?*const ast.Expr.TaggedTemplate = null },
     new_call_after_callee: []const *const ast.Expr,
     eval_args_next: struct { args: []const *const ast.Expr, idx: usize, args_base: usize },
     eval_args_spread: struct { args: []const *const ast.Expr, idx: usize, args_base: usize },
@@ -214,6 +220,7 @@ const Machine = struct {
     fn deinit(m: *Machine) void {
         if (m.rt.engine_roots) |e| if (e.ctx == @as(*anyopaque, m)) {
             m.rt.engine_roots = null;
+            m.rt.template_cache.clearRetainingCapacity();
         };
         m.tasks.deinit(m.rt.gpa);
         m.values.deinit(m.rt.gpa);
@@ -505,8 +512,8 @@ const Machine = struct {
                     m.env = tf.saved_env;
                     m.values.shrinkRetainingCapacity(tf.values_base);
                     const pending: FinallyPending = switch (kind) {
-                        .@"break" => .@"break",
-                        .@"continue" => .@"continue",
+                        .@"break" => |lbl| .{ .@"break" = lbl },
+                        .@"continue" => |lbl| .{ .@"continue" = lbl },
                         .@"return" => blk: {
                             const rv = m.ret;
                             m.ret = .undefined;
@@ -518,12 +525,24 @@ const Machine = struct {
                     try m.pushTask(.{ .block = tf.finally_body });
                     return;
                 },
+                .labeled => |lb| {
+                    if (kind == .@"break") {
+                        if (kind.@"break") |lbl| {
+                            if (std.mem.eql(u8, lb.label, lbl)) {
+                                _ = m.tasks.pop();
+                                m.values.shrinkRetainingCapacity(lb.values_base);
+                                return;
+                            }
+                        }
+                    }
+                    _ = m.tasks.pop();
+                },
                 .while_iter => |w| {
-                    if (kind == .@"continue") {
+                    if (kind == .@"continue" and loopMatchesLabel(m.tasks.items, m.tasks.items.len - 1, kind.@"continue")) {
                         m.values.shrinkRetainingCapacity(w.values_base);
                         return;
                     }
-                    if (kind == .@"break") {
+                    if (kind == .@"break" and kind.@"break" == null) {
                         _ = m.tasks.pop();
                         m.values.shrinkRetainingCapacity(w.values_base);
                         return;
@@ -531,11 +550,11 @@ const Machine = struct {
                     _ = m.tasks.pop();
                 },
                 .do_while_cond => |dw| {
-                    if (kind == .@"continue") {
+                    if (kind == .@"continue" and loopMatchesLabel(m.tasks.items, m.tasks.items.len - 1, kind.@"continue")) {
                         m.values.shrinkRetainingCapacity(dw.values_base);
                         return;
                     }
-                    if (kind == .@"break") {
+                    if (kind == .@"break" and kind.@"break" == null) {
                         _ = m.tasks.pop();
                         m.values.shrinkRetainingCapacity(dw.values_base);
                         return;
@@ -543,11 +562,11 @@ const Machine = struct {
                     _ = m.tasks.pop();
                 },
                 .for_update => |f| {
-                    if (kind == .@"continue") {
+                    if (kind == .@"continue" and loopMatchesLabel(m.tasks.items, m.tasks.items.len - 1, kind.@"continue")) {
                         m.values.shrinkRetainingCapacity(f.values_base);
                         return;
                     }
-                    if (kind == .@"break") {
+                    if (kind == .@"break" and kind.@"break" == null) {
                         _ = m.tasks.pop();
                         m.values.shrinkRetainingCapacity(f.values_base);
                         return;
@@ -555,11 +574,11 @@ const Machine = struct {
                     _ = m.tasks.pop();
                 },
                 .for_of_iter => |f| {
-                    if (kind == .@"continue") {
+                    if (kind == .@"continue" and loopMatchesLabel(m.tasks.items, m.tasks.items.len - 1, kind.@"continue")) {
                         m.values.shrinkRetainingCapacity(f.values_base);
                         return;
                     }
-                    if (kind == .@"break") {
+                    if (kind == .@"break" and kind.@"break" == null) {
                         _ = m.tasks.pop();
                         m.values.shrinkRetainingCapacity(f.values_base);
                         return;
@@ -567,7 +586,7 @@ const Machine = struct {
                     _ = m.tasks.pop();
                 },
                 .switch_exec => |sw| {
-                    if (kind == .@"break") {
+                    if (kind == .@"break" and kind.@"break" == null) {
                         _ = m.tasks.pop();
                         m.values.shrinkRetainingCapacity(sw.values_base);
                         return;
@@ -580,6 +599,20 @@ const Machine = struct {
         // Unwound past `stop_len` (top-level or barrier): only `throw` can reach here.
         std.debug.assert(kind == .throw);
         return error.Thrown;
+    }
+
+    fn loopMatchesLabel(tasks: []const Task, loop_idx: usize, maybe_lbl: ?[]const u8) bool {
+        const lbl = maybe_lbl orelse return true;
+        var i = loop_idx;
+        while (i > 0) {
+            i -= 1;
+            switch (tasks[i]) {
+                .labeled => |lb| if (std.mem.eql(u8, lb.label, lbl)) return true,
+                .depth_pop, .scope_exit => {},
+                else => return false,
+            }
+        }
+        return false;
     }
 
     inline fn pushEval(m: *Machine, e: *const ast.Expr) Error!void {
@@ -844,10 +877,11 @@ const Machine = struct {
                 m.env = tf.saved_env;
                 try m.pushTask(.{ .block = tf.finally_body });
             },
+            .labeled => {},
             .finally_resume => |pending| switch (pending) {
                 .normal => {},
-                .@"break" => return .@"break",
-                .@"continue" => return .@"continue",
+                .@"break" => |lbl| return .{ .@"break" = lbl },
+                .@"continue" => |lbl| return .{ .@"continue" = lbl },
                 .@"return" => |v| {
                     m.ret = v;
                     return .@"return";
@@ -906,6 +940,11 @@ const Machine = struct {
                         try m.pushEval(br.rhs);
                     } else {
                         m.depth -= 1;
+                    },
+                    .comma => {
+                        _ = m.popVal();
+                        try m.pushTask(.depth_pop);
+                        try m.pushEval(br.rhs);
                     },
                     else => {
                         try m.pushTask(.{ .binary_finish = br.op });
@@ -1211,9 +1250,9 @@ const Machine = struct {
             },
             .call_member_base => |cm| {
                 switch (cm.key) {
-                    .name => |n| try m.pushTask(.{ .call_member_key = .{ .named = n, .args = cm.args } }),
+                    .name => |n| try m.pushTask(.{ .call_member_key = .{ .named = n, .args = cm.args, .tagged = cm.tagged } }),
                     .computed => |e| {
-                        try m.pushTask(.{ .call_member_key = .{ .named = null, .args = cm.args } });
+                        try m.pushTask(.{ .call_member_key = .{ .named = null, .args = cm.args, .tagged = cm.tagged } });
                         try m.pushTask(.{ .eval = e });
                     },
                     .string, .number => unreachable,
@@ -1226,6 +1265,10 @@ const Machine = struct {
                 try m.pushVal(callee);
                 // values: [..., receiver (base), callee]
                 const args_base = m.values.items.len;
+                if (cm.tagged) |tt| {
+                    const tpl = try builtins.getTemplateObjectFromUnits(rt, @intFromPtr(tt), tt.cooked, tt.raw);
+                    try m.pushVal(tpl);
+                }
                 try m.pushTask(.{ .invoke_call = .{ .has_receiver = true, .args_base = args_base } });
                 if (cm.args.len > 0) {
                     try m.pushTask(.{ .eval_args_next = .{ .args = cm.args, .idx = 0, .args_base = args_base } });
@@ -1234,6 +1277,10 @@ const Machine = struct {
             .call_after_callee => |ca| {
                 // values: [..., callee]
                 const args_base = m.values.items.len;
+                if (ca.tagged) |tt| {
+                    const tpl = try builtins.getTemplateObjectFromUnits(rt, @intFromPtr(tt), tt.cooked, tt.raw);
+                    try m.pushVal(tpl);
+                }
                 try m.pushTask(.{ .invoke_call = .{ .has_receiver = ca.has_receiver, .args_base = args_base } });
                 if (ca.args.len > 0) {
                     try m.pushTask(.{ .eval_args_next = .{ .args = ca.args, .idx = 0, .args_base = args_base } });
@@ -1778,13 +1825,19 @@ const Machine = struct {
                 try m.pushTask(.{ .for_of_init = .{ .stmt = s, .has_scope = has_scope, .values_base = values_base } });
                 try m.pushEval(f.iterable);
             },
-            .@"break" => {
-                m.depth -= 1;
-                return .@"break";
+            .labeled => |l| {
+                const values_base: u32 = @intCast(m.values.items.len);
+                try m.pushTask(.depth_pop);
+                try m.pushTask(.{ .labeled = .{ .label = l.label, .values_base = values_base } });
+                try m.pushTask(.{ .exec = l.body });
             },
-            .@"continue" => {
+            .@"break" => |lbl| {
                 m.depth -= 1;
-                return .@"continue";
+                return .{ .@"break" = lbl };
+            },
+            .@"continue" => |lbl| {
+                m.depth -= 1;
+                return .{ .@"continue" = lbl };
             },
             .throw => |e| {
                 try m.pushTask(.depth_pop);
@@ -1968,6 +2021,17 @@ const Machine = struct {
                 } else {
                     try m.pushTask(.{ .call_after_callee = .{ .args = c.args, .has_receiver = false } });
                     try m.pushEval(c.callee);
+                }
+            },
+            .tagged_template => |*tt| {
+                try m.pushTask(.depth_pop);
+                if (tt.callee.data == .member) {
+                    const mem = tt.callee.data.member;
+                    try m.pushTask(.{ .call_member_base = .{ .key = mem.key, .args = tt.exprs, .tagged = tt } });
+                    try m.pushEval(mem.object);
+                } else {
+                    try m.pushTask(.{ .call_after_callee = .{ .args = tt.exprs, .has_receiver = false, .tagged = tt } });
+                    try m.pushEval(tt.callee);
                 }
             },
             .new_call => |nc| {

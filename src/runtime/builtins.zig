@@ -3961,3 +3961,71 @@ fn stringSplitRegExp(
     try rt.heap.appendElement(out, root_buf[4]);
     return .{ .object = out };
 }
+
+pub fn getTemplateObjectFromConsts(
+    rt: *Runtime,
+    key: usize,
+    cooked: []const u32,
+    raw: []const u32,
+    consts: []const Value,
+) Error!Value {
+    if (rt.template_cache.get(key)) |cached| return .{ .object = cached };
+    const r = try realm(rt);
+    const arr = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ .{ .object = arr }, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const raw_arr = try rt.heap.newArray(r.array_prototype);
+    root_buf[1] = .{ .object = raw_arr };
+
+    for (cooked) |k| {
+        const v: Value = if (k == std.math.maxInt(u32)) .undefined else consts[k];
+        try rt.heap.appendElement(arr, v);
+    }
+    for (raw) |k| {
+        try rt.heap.appendElement(raw_arr, consts[k]);
+    }
+    try object.define(rt, arr, try object.named(rt, "raw"), root_buf[1]);
+    try rt.template_cache.put(rt.gpa, key, arr);
+    return .{ .object = arr };
+}
+
+pub fn getTemplateObjectFromUnits(
+    rt: *Runtime,
+    key: usize,
+    cooked: []const ?[]const u16,
+    raw: []const []const u16,
+) Error!Value {
+    if (rt.template_cache.get(key)) |cached| return .{ .object = cached };
+    const r = try realm(rt);
+    const arr = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ .{ .object = arr }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const raw_arr = try rt.heap.newArray(r.array_prototype);
+    root_buf[1] = .{ .object = raw_arr };
+
+    for (cooked) |maybe_u| {
+        if (maybe_u) |u| {
+            const s = try rt.heap.newString(&.{.{ .utf16 = u }});
+            root_buf[2] = .{ .string = s };
+            try rt.heap.appendElement(arr, root_buf[2]);
+            root_buf[2] = .undefined;
+        } else {
+            try rt.heap.appendElement(arr, .undefined);
+        }
+    }
+    for (raw) |u| {
+        const s = try rt.heap.newString(&.{.{ .utf16 = u }});
+        root_buf[2] = .{ .string = s };
+        try rt.heap.appendElement(raw_arr, root_buf[2]);
+        root_buf[2] = .undefined;
+    }
+    try object.define(rt, arr, try object.named(rt, "raw"), root_buf[1]);
+    try rt.template_cache.put(rt.gpa, key, arr);
+    return .{ .object = arr };
+}

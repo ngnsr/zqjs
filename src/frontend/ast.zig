@@ -54,6 +54,7 @@ pub const BinaryOp = enum {
     logical_and,
     logical_or,
     nullish,
+    comma,
 
     pub fn symbol(op: BinaryOp) []const u8 {
         return switch (op) {
@@ -80,6 +81,7 @@ pub const BinaryOp = enum {
             .logical_and => "&&",
             .logical_or => "||",
             .nullish => "??",
+            .comma => ",",
         };
     }
 };
@@ -217,6 +219,14 @@ pub const Expr = struct {
         quasis: []const []const u16,
         exprs: []const *const Expr,
     };
+    pub const TaggedTemplate = struct {
+        callee: *const Expr,
+        /// `cooked.len == raw.len == exprs.len + 1`; invalid escapes in tagged
+        /// templates yield `null` (`undefined` in JS) in `cooked`.
+        cooked: []const ?[]const u16,
+        raw: []const []const u16,
+        exprs: []const *const Expr,
+    };
 
     pub const Data = union(enum) {
         number: f64,
@@ -225,6 +235,7 @@ pub const Expr = struct {
         /// `/pattern/flags` literal (M30, D61).
         regexp: struct { pattern: []const u16, flags: []const u8 },
         template: Template,
+        tagged_template: TaggedTemplate,
         boolean: bool,
         null,
         identifier: Ref,
@@ -333,8 +344,9 @@ pub const Stmt = struct {
         /// bindings are the ones the spec copies per iteration (DESIGN_DECISIONS D22).
         @"for": struct { init: ?ForInit, cond: ?*const Expr, update: ?*const Expr, body: *const Stmt },
         for_of: struct { target: ForOfTarget, iterable: *const Expr, body: *const Stmt },
-        @"break",
-        @"continue",
+        labeled: struct { label: []const u8, body: *const Stmt },
+        @"break": ?[]const u8,
+        @"continue": ?[]const u8,
         /// Only at the top level of a script or a function body (blocks: Unsupported).
         function: *const Function,
         /// `return [value];`, only inside a function.

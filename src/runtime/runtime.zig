@@ -235,6 +235,8 @@ pub const Runtime = struct {
     /// More root sets, marked by every collection (M9.0): the embedding API registers each
     /// live program (its constants) and execution (its VM, suspended or not) here.
     extra_roots: std.ArrayList(EngineRoots) = .empty,
+    /// Per-run cached tagged-template `TemplateStringsArray` objects (keyed by AST/Proto site pointer).
+    template_cache: std.AutoHashMapUnmanaged(usize, *heap_mod.Object) = .empty,
     limit_hit: ?Limit = null,
     /// Set by a defensive-check failure (D49): an invariant of the VM, compiler or
     /// verifier is broken, so nothing about the state can be trusted. The embedding API
@@ -281,6 +283,7 @@ pub const Runtime = struct {
         rt.exec_ctx.vms.deinit(rt.gpa);
         rt.joining.deinit(rt.gpa);
         rt.extra_roots.deinit(rt.gpa);
+        rt.template_cache.deinit(rt.gpa);
         rt.microtasks.deinit(rt.gpa);
         rt.heap.deinit();
         rt.* = undefined;
@@ -421,6 +424,8 @@ pub const Runtime = struct {
         for (rt.exec_ctx.vms.items) |e| e.mark(e.ctx, h);
         for (rt.microtasks.items[rt.microtask_head..]) |mt| markMicrotask(h, mt);
         if (rt.active_job) |mt| markMicrotask(h, mt);
+        var tpl_it = rt.template_cache.valueIterator();
+        while (tpl_it.next()) |obj_ptr| h.markObj(&obj_ptr.*.obj);
         rt.handles.mark(h); // host handles (M9.1, D50): slots with a reference
     }
 

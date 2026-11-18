@@ -113,6 +113,8 @@ pub const Op = enum(u8) {
     new_array,
     /// Push a new RegExp object compiled from consts[k_pattern] and consts[k_flags] (M30, D61).
     new_regexp,
+    /// Push the cached TemplateStringsArray for templates[idx] (tagged template literal).
+    get_template_obj,
     /// [obj, value] → [obj]: define obj.name (an object literal's `name: value`).
     define_prop,
     /// [obj, key, value] → [obj]: the same with a computed or literal key.
@@ -271,6 +273,7 @@ pub const Op = enum(u8) {
             .new_object => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
             .new_array => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
             .new_regexp => .{ .operands = &.{ .@"const", .@"const" }, .pops = 0, .pushes = 1 },
+            .get_template_obj => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
             .define_prop => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
             .define_elem => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
             .get_prop, .delete_prop => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
@@ -374,6 +377,15 @@ pub const Proto = struct {
     functions: []Proto = &.{},
     /// Exception handlers ordered innermost-first (M11.2).
     handlers: []const ExceptionHandler = &.{},
+    /// Tagged template call sites (M32b).
+    templates: []const TemplateSite = &.{},
+
+    pub const TemplateSite = struct {
+        /// Indices into `consts` (`std.math.maxInt(u32)` means `undefined` for invalid escapes).
+        cooked: []const u32,
+        /// Indices into `consts` (always string constants).
+        raw: []const u32,
+    };
 
     pub const Capture = struct {
         from: enum { parent_slot, parent_capture },
@@ -400,6 +412,11 @@ pub const Proto = struct {
         for (p.names) |n| gpa.free(n);
         gpa.free(p.names);
         gpa.free(p.name_atoms);
+        for (p.templates) |t| {
+            gpa.free(t.cooked);
+            gpa.free(t.raw);
+        }
+        gpa.free(p.templates);
         p.* = undefined;
     }
 };

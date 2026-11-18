@@ -1,0 +1,7 @@
+a,b,0:0,0:1,0:2,1:0,2:0,try,finally
+3 10 12 2
+a
+b|c\d::a\nb|c\\d::3
+|::\unicode|::42
+true true hello hello
+P:val=99

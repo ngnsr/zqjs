@@ -269,6 +269,7 @@ const Resolver = struct {
     fn stmt(r: *Resolver, s: ast.Stmt) Error!void {
         switch (s.data) {
             .empty, .@"break", .@"continue" => {},
+            .labeled => |l| try r.stmt(l.body.*),
             .expression => |e| try r.expr(e),
             // Already declared by the enclosing block; only the initialisers and pattern exprs remain.
             .declaration => |decl| for (decl.declarators) |d| {
@@ -422,6 +423,10 @@ const Resolver = struct {
         switch (e.data) {
             .number, .string, .regexp, .boolean, .null => {},
             .template => |t| for (t.exprs) |ex| try r.expr(ex),
+            .tagged_template => |tt| {
+                try r.expr(tt.callee);
+                for (tt.exprs) |ex| try r.expr(ex);
+            },
             .identifier => |ref| r.refs[ref.id] = try r.lookup(ref.name),
             .unary => |u| try r.expr(u.operand),
             .binary => |b| {

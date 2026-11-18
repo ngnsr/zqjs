@@ -92,6 +92,11 @@ fn assignOp(tag: Tag) ?ast.AssignOp {
     };
 }
 
+const LabelEntry = struct {
+    name: []const u8,
+    is_loop: bool,
+};
+
 const Parser = struct {
     lexer: Lexer,
     tok: Token,
@@ -105,6 +110,8 @@ const Parser = struct {
     /// Number of enclosing `switch` statements *in the current function*; `break` is
     /// legal when `loop_depth > 0 or switch_depth > 0`.
     switch_depth: u32 = 0,
+    /// Active statement labels in the current function/script.
+    labels: std.ArrayList(LabelEntry) = .empty,
     /// Number of enclosing functions; `return` is legal only when > 0.
     function_depth: u32 = 0,
     /// Inside a `for (…;` head: `in` is not an operator there (`for (x in o)` is for-in).
@@ -222,12 +229,49 @@ const Parser = struct {
                 return p.fail(.{ .syntax_error = "lexical declaration cannot appear in a single-statement context" }, t);
             return p.fail(.{ .unsupported = .syntax }, t);
         }
+        if (p.tok.tag == .identifier and (try p.peek()).tag == .colon) {
+            return p.labeledStatement();
+        }
         const e = try p.expression();
-        // `foo: …` is a label; any other `:` after an expression is unsupported syntax.
-        if (p.tok.tag == .colon and e.data == .identifier) return p.fail(.{ .unsupported = .labels }, p.tok);
+        if (p.tok.tag == .colon) return p.fail(.{ .syntax_error = "unexpected ':'" }, p.tok);
         const end = p.tok;
         try p.endStatement();
         return .{ .span = .{ .start = e.span.start, .end = end.end }, .data = .{ .expression = e } };
+    }
+
+    fn labeledStatement(p: *Parser) Error!ast.Stmt {
+        const start = p.tok.start;
+        const saved_len = p.labels.items.len;
+        defer p.labels.items.len = saved_len;
+
+        var chain: std.ArrayList([]const u8) = .empty;
+        while (p.tok.tag == .identifier and (try p.peek()).tag == .colon) {
+            const lbl_tok = p.tok;
+            const name = lbl_tok.text(p.source());
+            for (p.labels.items) |existing| {
+                if (std.mem.eql(u8, existing.name, name)) {
+                    return p.fail(.{ .syntax_error = "label has already been declared" }, lbl_tok);
+                }
+            }
+            try p.labels.append(p.arena, .{ .name = name, .is_loop = false });
+            try chain.append(p.arena, name);
+            try p.advance(); // identifier
+            try p.advance(); // `:`
+        }
+        const is_loop = (p.tok.tag == .kw_while or p.tok.tag == .kw_for or (p.tok.tag == .identifier and p.isText(p.tok, "do")));
+        for (p.labels.items[saved_len..]) |*entry| entry.is_loop = is_loop;
+
+        var body = try p.boxed(try p.statement());
+        var i = chain.items.len;
+        while (i > 0) {
+            i -= 1;
+            const lbl = chain.items[i];
+            if (i == 0) {
+                return .{ .span = .{ .start = start, .end = body.span.end }, .data = .{ .labeled = .{ .label = lbl, .body = body } } };
+            }
+            body = try p.boxed(.{ .span = body.span, .data = .{ .labeled = .{ .label = lbl, .body = body } } });
+        }
+        unreachable;
     }
 
     fn declarationStatement(p: *Parser, kind: ast.DeclKind) Error!ast.Stmt {
@@ -254,7 +298,7 @@ const Parser = struct {
             var init: ?*const ast.Expr = null;
             if (p.tok.tag == .eq) {
                 try p.advance();
-                init = try p.expression();
+                init = try p.assignment();
                 if (pat.data == .binding) inferExprName(init.?, pat.data.binding.name);
             } else if (kind == .@"const") {
                 return p.fail(.{ .syntax_error = "missing initializer in const declaration" }, start_tok);
@@ -373,16 +417,28 @@ const Parser = struct {
         return p.boxed(try p.statement());
     }
 
-    /// `break;` / `continue;`. Labels and ASI are classified carefully:
-    ///   `break foo;`   label (same line): Unsupported(labels), even outside a loop,
-    ///                  because `foo: { break foo; }` is valid JS
-    ///   `break\nfoo;`  ASI makes this `break; foo;`: Unsupported(asi) inside a loop,
-    ///                  SyntaxError outside one (an unlabeled break needs a loop)
     fn jumpStatement(p: *Parser) Error!ast.Stmt {
         const t = p.tok;
         try p.advance();
-        if (p.tok.tag == .identifier and !p.tok.newline_before) return p.fail(.{ .unsupported = .labels }, p.tok);
-        if (t.tag == .kw_break) {
+        var label: ?[]const u8 = null;
+        if (p.tok.tag == .identifier and !p.tok.newline_before) {
+            const name = p.tok.text(p.source());
+            var found: ?LabelEntry = null;
+            var i = p.labels.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (std.mem.eql(u8, p.labels.items[i].name, name)) {
+                    found = p.labels.items[i];
+                    break;
+                }
+            }
+            const entry = found orelse return p.fail(.{ .syntax_error = "undefined label" }, p.tok);
+            if (t.tag == .kw_continue and !entry.is_loop) {
+                return p.fail(.{ .syntax_error = "illegal continue statement: label does not denote an iteration statement" }, p.tok);
+            }
+            label = name;
+            try p.advance();
+        } else if (t.tag == .kw_break) {
             if (p.loop_depth == 0 and p.switch_depth == 0)
                 return p.fail(.{ .syntax_error = "'break' outside a loop or switch" }, t);
         } else if (p.loop_depth == 0) {
@@ -390,7 +446,7 @@ const Parser = struct {
         }
         const end = p.tok;
         try p.endStatement();
-        return .{ .span = span(t, end), .data = if (t.tag == .kw_break) .@"break" else .@"continue" };
+        return .{ .span = span(t, end), .data = if (t.tag == .kw_break) .{ .@"break" = label } else .{ .@"continue" = label } };
     }
 
     fn doWhileStatement(p: *Parser) Error!ast.Stmt {
@@ -563,13 +619,16 @@ const Parser = struct {
         if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{'" }, p.tok);
         const outer_loops = p.loop_depth;
         const outer_switches = p.switch_depth;
+        const outer_labels = p.labels;
         p.loop_depth = 0;
         p.switch_depth = 0;
+        p.labels = .empty;
         p.function_depth += 1;
         p.async_ctx = if (is_async) .body else .none;
         defer {
             p.loop_depth = outer_loops;
             p.switch_depth = outer_switches;
+            p.labels = outer_labels;
             p.function_depth -= 1;
         }
         const parsed_body = try p.parseFunctionBody();
@@ -606,7 +665,7 @@ const Parser = struct {
             var default: ?*const ast.Expr = null;
             if (p.tok.tag == .eq) {
                 try p.advance();
-                default = try p.nested();
+                default = try p.nestedAssignment();
                 if (pat.data == .binding) inferExprName(default.?, pat.data.binding.name);
             }
             const p_end = if (default) |d| d.span.end else pat.span.end;
@@ -701,7 +760,7 @@ const Parser = struct {
             var default: ?*const ast.Expr = null;
             if (p.tok.tag == .eq) {
                 try p.advance();
-                default = try p.nested();
+                default = try p.nestedAssignment();
                 max_depth = @max(max_depth, default.?.depth);
                 if (pat.data == .binding) inferExprName(default.?, pat.data.binding.name);
             }
@@ -769,7 +828,7 @@ const Parser = struct {
                 var default: ?*const ast.Expr = null;
                 if (p.tok.tag == .eq) {
                     try p.advance();
-                    default = try p.nested();
+                    default = try p.nestedAssignment();
                     max_depth = @max(max_depth, default.?.depth);
                     if (pat.data == .binding) inferExprName(default.?, pat.data.binding.name);
                 }
@@ -796,7 +855,7 @@ const Parser = struct {
                 var default: ?*const ast.Expr = null;
                 if (p.tok.tag == .eq) {
                     try p.advance();
-                    default = try p.nested();
+                    default = try p.nestedAssignment();
                     max_depth = @max(max_depth, default.?.depth);
                     inferExprName(default.?, name);
                 }
@@ -832,8 +891,23 @@ const Parser = struct {
 
     // ------------------------------------------------------------ expressions
 
-    /// Expression := Assignment. Assignment is right-associative and binds loosest.
+    /// Expression := Assignment (',' Assignment)*. Comma is left-associative and binds loosest.
     fn expression(p: *Parser) Error!*const ast.Expr {
+        var lhs = try p.assignment();
+        while (p.tok.tag == .comma) {
+            try p.advance();
+            const rhs = try p.assignment();
+            p.last_was_paren = false;
+            lhs = try p.node(
+                .{ .start = lhs.span.start, .end = rhs.span.end },
+                .{ .binary = .{ .op = .comma, .lhs = lhs, .rhs = rhs } },
+                @max(lhs.depth, rhs.depth),
+            );
+        }
+        return lhs;
+    }
+
+    fn assignment(p: *Parser) Error!*const ast.Expr {
         const e = try p.expressionRaw();
         try p.rejectCoverExpr(e);
         return e;
@@ -916,7 +990,7 @@ const Parser = struct {
             if (lhs_was_paren) return p.failAt(.{ .syntax_error = "invalid assignment target" }, lhs.span.start, lhs.span.end);
             const pat = try p.exprToAssignPattern(lhs);
             try p.advance();
-            const value = try p.expression();
+            const value = try p.assignment();
             p.last_was_paren = false;
             return p.node(
                 .{ .start = lhs.span.start, .end = value.span.end },
@@ -928,7 +1002,7 @@ const Parser = struct {
         // Parentheses are transparent for single identifiers, so `(x) = 1` arrives here as `.identifier`.
         const target = try p.assignTarget(lhs, "invalid assignment target");
         try p.advance();
-        const value = try p.expression();
+        const value = try p.assignment();
         if (op == .plain and target == .ref) inferExprName(value, target.ref.name);
         p.last_was_paren = false;
         return p.node(
@@ -1040,8 +1114,17 @@ const Parser = struct {
         }
         if (res.has_trailing_comma) return p.failAt(.{ .syntax_error = "unexpected token ')'" }, res.items[res.items.len - 1].span.end, res.items[res.items.len - 1].span.end + 1);
         if (res.items.len > 1) {
-            for (res.items) |it| try p.rejectCoverExpr(it.expr);
-            return p.failAt(.{ .unsupported = .syntax }, res.items[0].span.end, res.items[1].span.start);
+            var acc = res.items[0].expr;
+            try p.rejectCoverExpr(acc);
+            for (res.items[1..]) |it| {
+                try p.rejectCoverExpr(it.expr);
+                acc = try p.node(
+                    .{ .start = acc.span.start, .end = it.expr.span.end },
+                    .{ .binary = .{ .op = .comma, .lhs = acc, .rhs = it.expr } },
+                    @max(acc.depth, it.expr.depth),
+                );
+            }
+            return acc;
         }
         return res.items[0].expr;
     }
@@ -1098,14 +1181,17 @@ const Parser = struct {
 
         const outer_loops = p.loop_depth;
         const outer_switches = p.switch_depth;
+        const outer_labels = p.labels;
         const outer_async_ctx = p.async_ctx;
         p.loop_depth = 0;
         p.switch_depth = 0;
+        p.labels = .empty;
         p.function_depth += 1;
         p.async_ctx = if (is_async) .body else .none;
         defer {
             p.loop_depth = outer_loops;
             p.switch_depth = outer_switches;
+            p.labels = outer_labels;
             p.function_depth -= 1;
             p.async_ctx = outer_async_ctx;
         }
@@ -1117,7 +1203,7 @@ const Parser = struct {
             body = parsed_body.body;
             end = parsed_body.end;
         } else {
-            const expr = try p.expression();
+            const expr = try p.assignment();
             const stmts = try p.arena.alloc(ast.Stmt, 1);
             stmts[0] = .{ .span = expr.span, .data = .{ .@"return" = expr } };
             body = stmts;
@@ -1163,7 +1249,7 @@ const Parser = struct {
         const then_expr = try p.nested();
         if (p.tok.tag != .colon) return p.fail(.{ .syntax_error = "expected ':'" }, p.tok);
         try p.advance();
-        const else_expr = try p.expression();
+        const else_expr = try p.assignment();
         return p.node(
             .{ .start = cond.span.start, .end = else_expr.span.end },
             .{ .conditional = .{ .cond = cond, .then_expr = then_expr, .else_expr = else_expr } },
@@ -1186,6 +1272,13 @@ const Parser = struct {
         p.no_in = false;
         defer p.no_in = saved;
         return p.expression();
+    }
+
+    fn nestedAssignment(p: *Parser) Error!*const ast.Expr {
+        const saved = p.no_in;
+        p.no_in = false;
+        defer p.no_in = saved;
+        return p.assignment();
     }
 
     fn nestedRaw(p: *Parser) Error!*const ast.Expr {
@@ -1371,6 +1464,10 @@ const Parser = struct {
                 try p.expectAfterExpression(.r_bracket);
                 break :blk try p.node(.{ .start = callee.span.start, .end = close.end }, .{ .member = .{ .object = callee, .key = .{ .computed = k } } }, @max(callee.depth, k.depth));
             },
+            .template_no_sub, .template_head => blk: {
+                try p.rejectCoverExpr(callee);
+                break :blk try p.taggedTemplate(callee);
+            },
             else => null,
         };
     }
@@ -1381,7 +1478,7 @@ const Parser = struct {
         return callee;
     }
 
-    /// `callee(args)`, `object.name`, `object[key]`, or an optional chain starting at `?.`.
+    /// `callee(args)`, `object.name`, `object[key]`, `callee\`...\``, or an optional chain starting at `?.`.
     /// Unlike `++`, these may continue on the next line: `x\n(2)` calls x, `x\n[0]` indexes it.
     fn calls(p: *Parser, callee_in: *const ast.Expr) Error!*const ast.Expr {
         var callee = callee_in;
@@ -1394,8 +1491,6 @@ const Parser = struct {
                 return p.optionalChain(callee);
             } else if (try p.memberStep(callee)) |next| {
                 callee = next;
-            } else if (p.tok.tag == .template_no_sub or p.tok.tag == .template_head) {
-                return p.fail(.{ .unsupported = .syntax }, p.tok); // tagged template
             } else return callee;
         }
     }
@@ -1483,12 +1578,12 @@ const Parser = struct {
             if (p.tok.tag == .ellipsis) {
                 const ell = p.tok;
                 try p.advance();
-                const inner = try p.nested();
+                const inner = try p.nestedAssignment();
                 const sp = try p.node(.{ .start = ell.start, .end = inner.span.end }, .{ .spread = inner }, inner.depth);
                 try args.append(p.arena, sp);
                 depth = @max(depth, sp.depth);
             } else {
-                const arg = try p.nested();
+                const arg = try p.nestedAssignment();
                 try args.append(p.arena, arg);
                 depth = @max(depth, arg.depth);
             }
@@ -1688,7 +1783,7 @@ const Parser = struct {
                     }
                     const eq_tok = p.tok;
                     try p.advance();
-                    const def = try p.nested();
+                    const def = try p.nestedAssignment();
                     if (!has_cover_init) p.cover_init_span = span(eq_tok, eq_tok);
                     has_cover_init = true;
                     const id = p.ref_count;
@@ -2165,6 +2260,85 @@ const Parser = struct {
         }
     }
 
+    fn taggedTemplate(p: *Parser, callee: *const ast.Expr) Error!*const ast.Expr {
+        try p.enter();
+        defer p.depth -= 1;
+
+        var cooked: std.ArrayList(?[]const u16) = .empty;
+        var raw: std.ArrayList([]const u16) = .empty;
+        var exprs: std.ArrayList(*const ast.Expr) = .empty;
+        var max_depth: u16 = callee.depth;
+
+        if (p.tok.tag == .template_no_sub) {
+            const t = p.tok;
+            const slice = p.source()[t.start + 1 .. t.end - 1];
+            try raw.append(p.arena, try p.decodeRawTemplate(slice, t.start + 1));
+            try cooked.append(p.arena, try p.decodeEscapesOptional(slice, t.start + 1, true, true));
+            try p.advance();
+            return p.node(.{ .start = callee.span.start, .end = t.end }, .{ .tagged_template = .{
+                .callee = callee,
+                .cooked = cooked.items,
+                .raw = raw.items,
+                .exprs = exprs.items,
+            } }, max_depth);
+        }
+
+        const head = p.tok;
+        const head_slice = p.source()[head.start + 1 .. head.end - 2];
+        try raw.append(p.arena, try p.decodeRawTemplate(head_slice, head.start + 1));
+        try cooked.append(p.arena, try p.decodeEscapesOptional(head_slice, head.start + 1, true, true));
+        try p.advance();
+
+        while (true) {
+            const expr = try p.nested();
+            max_depth = @max(max_depth, expr.depth);
+            try exprs.append(p.arena, expr);
+
+            if (p.tok.tag != .r_brace) return p.unexpectedAfterExpression(p.tok);
+            p.tok = try p.lexer.nextTemplatePart();
+            const part = p.tok;
+            if (part.tag == .template_tail) {
+                const slice = p.source()[part.start .. part.end - 1];
+                try raw.append(p.arena, try p.decodeRawTemplate(slice, part.start));
+                try cooked.append(p.arena, try p.decodeEscapesOptional(slice, part.start, true, true));
+                try p.advance();
+                return p.node(.{ .start = callee.span.start, .end = part.end }, .{ .tagged_template = .{
+                    .callee = callee,
+                    .cooked = cooked.items,
+                    .raw = raw.items,
+                    .exprs = exprs.items,
+                } }, max_depth);
+            }
+            const slice = p.source()[part.start .. part.end - 2];
+            try raw.append(p.arena, try p.decodeRawTemplate(slice, part.start));
+            try cooked.append(p.arena, try p.decodeEscapesOptional(slice, part.start, true, true));
+            try p.advance();
+        }
+    }
+
+    fn decodeRawTemplate(p: *Parser, s: []const u8, base: u32) Error![]const u16 {
+        var out: std.ArrayList(u16) = .empty;
+        try out.ensureTotalCapacityPrecise(p.arena, s.len);
+        var i: usize = 0;
+        while (i < s.len) {
+            const c = s[i];
+            if (c >= 0x80) {
+                const cp, const len = try p.decodeUtf8(s, i, base);
+                appendCodePoint(&out, cp);
+                i += len;
+                continue;
+            }
+            if (c == '\r') {
+                out.appendAssumeCapacity('\n');
+                i += if (i + 1 < s.len and s[i + 1] == '\n') 2 else 1;
+                continue;
+            }
+            out.appendAssumeCapacity(c);
+            i += 1;
+        }
+        return out.items;
+    }
+
     /// Decodes a string literal token (quotes included) to UTF-16 code units
     /// (LANGUAGE.md §3). The lexer has already found the closing quote.
     fn decodeString(p: *Parser, t: Token) Error![]const u16 {
@@ -2173,6 +2347,10 @@ const Parser = struct {
     }
 
     fn decodeEscapes(p: *Parser, s: []const u8, base: u32, is_template: bool) Error![]const u16 {
+        return (try p.decodeEscapesOptional(s, base, is_template, false)).?;
+    }
+
+    fn decodeEscapesOptional(p: *Parser, s: []const u8, base: u32, is_template: bool, allow_invalid: bool) Error!?[]const u16 {
         var out: std.ArrayList(u16) = .empty;
         // Every source byte yields at most one code unit (a 4-byte UTF-8 sequence or a
         // `\u{…}` escape yields two), so one allocation suffices.
@@ -2210,13 +2388,25 @@ const Parser = struct {
                 't' => out.appendAssumeCapacity('\t'),
                 'v' => out.appendAssumeCapacity(0x0B),
                 '0' => {
-                    if (i < s.len and std.ascii.isDigit(s[i])) return p.failAt(.{ .unsupported = .legacy_octal }, esc_start, base + i + 1);
+                    if (i < s.len and std.ascii.isDigit(s[i])) {
+                        if (allow_invalid) return null;
+                        return p.failAt(.{ .unsupported = .legacy_octal }, esc_start, base + i + 1);
+                    }
                     out.appendAssumeCapacity(0);
                 },
-                '1'...'9' => return p.failAt(.{ .unsupported = .legacy_octal }, esc_start, base + i),
+                '1'...'9' => {
+                    if (allow_invalid) return null;
+                    return p.failAt(.{ .unsupported = .legacy_octal }, esc_start, base + i);
+                },
                 'x' => {
-                    const hi = hexAt(s, i) orelse return p.failAt(.{ .syntax_error = "invalid hexadecimal escape" }, esc_start, base + i);
-                    const lo = hexAt(s, i + 1) orelse return p.failAt(.{ .syntax_error = "invalid hexadecimal escape" }, esc_start, base + i);
+                    const hi = hexAt(s, i) orelse {
+                        if (allow_invalid) return null;
+                        return p.failAt(.{ .syntax_error = "invalid hexadecimal escape" }, esc_start, base + i);
+                    };
+                    const lo = hexAt(s, i + 1) orelse {
+                        if (allow_invalid) return null;
+                        return p.failAt(.{ .syntax_error = "invalid hexadecimal escape" }, esc_start, base + i);
+                    };
                     out.appendAssumeCapacity(hi * 16 + lo);
                     i += 2;
                 },
@@ -2228,17 +2418,29 @@ const Parser = struct {
                         i += 1;
                         n += 1;
                     }) {
-                        const d = hexAt(s, i) orelse return p.failAt(.{ .syntax_error = "invalid Unicode escape" }, esc_start, base + i);
+                        const d = hexAt(s, i) orelse {
+                            if (allow_invalid) return null;
+                            return p.failAt(.{ .syntax_error = "invalid Unicode escape" }, esc_start, base + i);
+                        };
                         cp = @min(cp * 16 + d, 0x110000); // saturate: cp * 16 can't overflow
                     }
-                    if (i >= s.len or n == 0) return p.failAt(.{ .syntax_error = "invalid Unicode escape" }, esc_start, base + i);
+                    if (i >= s.len or n == 0) {
+                        if (allow_invalid) return null;
+                        return p.failAt(.{ .syntax_error = "invalid Unicode escape" }, esc_start, base + i);
+                    }
                     i += 1; // `}`
-                    if (cp > 0x10FFFF) return p.failAt(.{ .syntax_error = "Unicode escape above U+10FFFF" }, esc_start, base + i);
+                    if (cp > 0x10FFFF) {
+                        if (allow_invalid) return null;
+                        return p.failAt(.{ .syntax_error = "Unicode escape above U+10FFFF" }, esc_start, base + i);
+                    }
                     appendCodePoint(&out, @intCast(cp));
                 } else {
                     var unit: u16 = 0;
                     for (0..4) |k| {
-                        const d = hexAt(s, i + k) orelse return p.failAt(.{ .syntax_error = "invalid Unicode escape" }, esc_start, base + i);
+                        const d = hexAt(s, i + k) orelse {
+                            if (allow_invalid) return null;
+                            return p.failAt(.{ .syntax_error = "invalid Unicode escape" }, esc_start, base + i);
+                        };
                         unit = unit * 16 + d;
                     }
                     out.appendAssumeCapacity(unit); // lone surrogates are allowed

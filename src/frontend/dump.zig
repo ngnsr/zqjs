@@ -31,8 +31,13 @@ const Dumper = struct {
         const w = d.w;
         switch (s.data) {
             .empty => try w.writeAll("(empty)"),
-            .@"break" => try w.writeAll("(break)"),
-            .@"continue" => try w.writeAll("(continue)"),
+            .labeled => |l| {
+                try w.print("(label {s} ", .{l.label});
+                try d.stmt(l.body.*);
+                try w.writeByte(')');
+            },
+            .@"break" => |lbl| if (lbl) |l| try w.print("(break {s})", .{l}) else try w.writeAll("(break)"),
+            .@"continue" => |lbl| if (lbl) |l| try w.print("(continue {s})", .{l}) else try w.writeAll("(continue)"),
             .function => |f| try d.function(f),
             .@"return" => |v| {
                 try w.writeAll("(return");
@@ -367,6 +372,19 @@ const Dumper = struct {
                     try d.expr(ex);
                     try w.writeByte(' ');
                     try d.string(t.quasis[i + 1]);
+                }
+                try w.writeByte(')');
+            },
+            .tagged_template => |tt| {
+                try w.writeAll("(tagged-template ");
+                try d.expr(tt.callee);
+                try w.writeByte(' ');
+                try d.string(tt.raw[0]);
+                for (tt.exprs, 0..) |ex, i| {
+                    try w.writeByte(' ');
+                    try d.expr(ex);
+                    try w.writeByte(' ');
+                    try d.string(tt.raw[i + 1]);
                 }
                 try w.writeByte(')');
             },

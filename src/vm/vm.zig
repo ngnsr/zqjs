@@ -139,6 +139,7 @@ pub const Vm = struct {
         if (vm.rt.engine_roots) |e| if (e.ctx == @as(*anyopaque, vm)) {
             vm.rt.engine_roots = null; // no collection may scan a VM that is gone
         };
+        if (!vm.nested) vm.rt.template_cache.clearRetainingCapacity();
         const gpa = vm.rt.gpa;
         vm.frames.deinit(gpa);
         gpa.free(vm.locals);
@@ -845,6 +846,14 @@ pub const Vm = struct {
                 try cache.ensurePush(vm);
                 const re = try builtins.newRegExpFromStrings(rt, pat_val.string, flags_val.string);
                 try cache.push(vm, re);
+            },
+            .get_template_obj => {
+                const idx = cache.operand(0);
+                if (idx >= p.templates.len) return vm.bug("template index out of range");
+                const site = &p.templates[idx];
+                try cache.ensurePush(vm);
+                const obj = try builtins.getTemplateObjectFromConsts(rt, @intFromPtr(site), site.cooked, site.raw, p.consts);
+                try cache.push(vm, obj);
             },
             .define_prop => {
                 const o = try cache.peek(vm, 1);

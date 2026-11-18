@@ -113,6 +113,22 @@ const Verifier = struct {
                             return v.fail(p, at, "new_regexp operand is not a string constant");
                     }
                 },
+                .get_template_obj => {
+                    const idx = bc.readU32(p.code, pc + 1);
+                    if (idx >= p.templates.len)
+                        return v.fail(p, at, "template index out of range");
+                    const site = p.templates[idx];
+                    if (site.cooked.len != site.raw.len)
+                        return v.fail(p, at, "template cooked/raw length mismatch");
+                    for (site.cooked) |k| {
+                        if (k != std.math.maxInt(u32) and (k >= p.consts.len or p.consts[k] != .string))
+                            return v.fail(p, at, "template cooked operand is not a string constant");
+                    }
+                    for (site.raw) |k| {
+                        if (k >= p.consts.len or p.consts[k] != .string)
+                            return v.fail(p, at, "template raw operand is not a string constant");
+                    }
+                },
                 else => {},
             }
             starts.set(pc);

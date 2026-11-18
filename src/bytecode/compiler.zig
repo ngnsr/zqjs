@@ -155,9 +155,16 @@ const FinallyContext = struct {
     }
 };
 
+const LabelTarget = struct {
+    name: []const u8,
+    breaks: std.ArrayList(u32) = .empty,
+    loop: ?*Loop = null,
+};
+
 const ControlContext = union(enum) {
     loop: *Loop,
     @"switch": *std.ArrayList(u32),
+    label: *LabelTarget,
     finally_region: *FinallyContext,
     finally_body: *FinallyContext,
 };
@@ -173,6 +180,7 @@ const Compiler = struct {
     names: std.ArrayList([]const u8) = .empty,
     functions: std.ArrayList(Proto) = .empty,
     handlers: std.ArrayList(Proto.ExceptionHandler) = .empty,
+    templates: std.ArrayList(Proto.TemplateSite) = .empty,
     // Deduplication. Numbers by bit pattern, so 0 and -0 stay distinct and every NaN
     // literal (there is only one bit pattern the lexer produces) shares one entry.
     number_index: std.AutoHashMapUnmanaged(u64, u32) = .empty,
@@ -203,6 +211,11 @@ const Compiler = struct {
         for (c.functions.items) |*f| f.deinit(gpa);
         c.functions.deinit(gpa);
         c.handlers.deinit(gpa);
+        for (c.templates.items) |t| {
+            gpa.free(t.cooked);
+            gpa.free(t.raw);
+        }
+        c.templates.deinit(gpa);
         c.controls.deinit(gpa);
     }
 
@@ -244,6 +257,7 @@ const Compiler = struct {
             gpa.free(functions);
         }
         const handlers = try gpa.dupe(Proto.ExceptionHandler, c.handlers.items);
+        const templates = try c.templates.toOwnedSlice(gpa);
         // Ownership of names and nested Protos has moved: don't free them twice.
         c.names.clearRetainingCapacity();
         c.functions.clearRetainingCapacity();
@@ -266,6 +280,7 @@ const Compiler = struct {
             .captures = captures,
             .functions = functions,
             .handlers = handlers,
+            .templates = templates,
         };
     }
 
@@ -486,6 +501,8 @@ const Compiler = struct {
                 // top: cond; jump_if_false end; body; jump top; end:
                 var loop: Loop = .{};
                 defer c.deinitLoop(&loop);
+                c.attachLabelsToLoop(&loop);
+                c.attachLabelsToLoop(&loop);
                 const top = c.here();
                 try c.expr(w.cond);
                 const to_end = try c.jumpForward(.jump_if_false);
@@ -499,6 +516,8 @@ const Compiler = struct {
                 // top: body; cont: cond; jump_if_true top; end:
                 var loop: Loop = .{};
                 defer c.deinitLoop(&loop);
+                c.attachLabelsToLoop(&loop);
+                c.attachLabelsToLoop(&loop);
                 const top = c.here();
                 const body_completes = try c.loopBody(&loop, dw.body.*);
                 if (body_completes or loop.continues.items.len > 0) {
@@ -530,6 +549,8 @@ const Compiler = struct {
                 try c.perIteration(copies);
                 var loop: Loop = .{};
                 defer c.deinitLoop(&loop);
+                c.attachLabelsToLoop(&loop);
+                c.attachLabelsToLoop(&loop);
                 const top = c.here();
                 const to_end = if (f.cond) |cond| blk: {
                     try c.expr(cond);
@@ -569,6 +590,7 @@ const Compiler = struct {
                 try c.emit(.init_local, &.{iter_slot});
                 var loop: Loop = .{};
                 defer c.deinitLoop(&loop);
+                c.attachLabelsToLoop(&loop);
                 const top = c.here();
                 try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
                 try c.emit(.iter_next, &.{});
@@ -594,27 +616,50 @@ const Compiler = struct {
                 try c.emit(.clear_local, &.{iter_slot});
                 return true;
             },
-            // The parser guarantees break/continue only occur inside loops (or switch for break).
-            .@"break" => {
+            .labeled => |l| {
+                var target: LabelTarget = .{ .name = l.label };
+                defer target.breaks.deinit(c.s.gpa);
+                try c.controls.append(c.s.gpa, .{ .label = &target });
+                const body_completes = blk: {
+                    defer _ = c.controls.pop();
+                    break :blk try c.stmt(l.body.*);
+                };
+                for (target.breaks.items) |j| c.patch(j, c.here());
+                return body_completes or target.breaks.items.len > 0;
+            },
+            // The parser guarantees break/continue only occur inside valid loops/switches/labels.
+            .@"break" => |maybe_lbl| {
                 var i = c.controls.items.len;
-                const jt: JumpTarget = while (i > 0) {
+                const jt: JumpTarget = if (maybe_lbl) |lbl| while (i > 0) {
+                    i -= 1;
+                    switch (c.controls.items[i]) {
+                        .label => |lt| if (std.mem.eql(u8, lt.name, lbl)) break .{ .switch_break = &lt.breaks },
+                        else => {},
+                    }
+                } else unreachable else while (i > 0) {
                     i -= 1;
                     switch (c.controls.items[i]) {
                         .loop => |l| break .{ .loop_break = l },
                         .@"switch" => |sb| break .{ .switch_break = sb },
-                        .finally_region, .finally_body => {},
+                        .label, .finally_region, .finally_body => {},
                     }
                 } else unreachable;
                 try c.emitJump(jt);
                 return false;
             },
-            .@"continue" => {
+            .@"continue" => |maybe_lbl| {
                 var i = c.controls.items.len;
-                const jt: JumpTarget = while (i > 0) {
+                const jt: JumpTarget = if (maybe_lbl) |lbl| while (i > 0) {
+                    i -= 1;
+                    switch (c.controls.items[i]) {
+                        .label => |lt| if (std.mem.eql(u8, lt.name, lbl)) break .{ .loop_continue = lt.loop.? },
+                        else => {},
+                    }
+                } else unreachable else while (i > 0) {
                     i -= 1;
                     switch (c.controls.items[i]) {
                         .loop => |l| break .{ .loop_continue = l },
-                        .@"switch", .finally_region, .finally_body => {},
+                        .@"switch", .label, .finally_region, .finally_body => {},
                     }
                 } else unreachable;
                 try c.emitJump(jt);
@@ -641,10 +686,21 @@ const Compiler = struct {
                     try fr.to_finally.append(c.s.gpa, try c.jumpForward(.jump));
                     return;
                 },
-                .loop, .@"switch" => {},
+                .loop, .@"switch", .label => {},
             }
         }
         try c.emit(.@"return", &.{});
+    }
+
+    fn attachLabelsToLoop(c: *Compiler, loop: *Loop) void {
+        var i = c.controls.items.len;
+        while (i > 0) {
+            i -= 1;
+            switch (c.controls.items[i]) {
+                .label => |lt| lt.loop = loop,
+                else => break,
+            }
+        }
     }
 
     fn emitJump(c: *Compiler, jt: JumpTarget) Error!void {
@@ -665,6 +721,13 @@ const Compiler = struct {
                 },
                 .@"switch" => |sb| switch (jt) {
                     .switch_break => |ts| if (sb == ts) {
+                        try jt.append(c.s.gpa, try c.jumpForward(.jump));
+                        return;
+                    },
+                    .loop_break, .loop_continue => {},
+                },
+                .label => |lt| switch (jt) {
+                    .switch_break => |ts| if (&lt.breaks == ts) {
                         try jt.append(c.s.gpa, try c.jumpForward(.jump));
                         return;
                     },
@@ -1005,6 +1068,11 @@ const Compiler = struct {
                     try c.expr(b.rhs);
                     c.patch(to_end, c.here());
                 },
+                .comma => {
+                    try c.expr(b.lhs);
+                    try c.emit(.pop, &.{});
+                    try c.expr(b.rhs);
+                },
                 else => {
                     try c.expr(b.lhs);
                     try c.expr(b.rhs);
@@ -1198,22 +1266,7 @@ const Compiler = struct {
                 };
             },
             .call => |call| {
-                // Callee, then arguments left to right, then the callable check. A member
-                // callee is a method call: [receiver, callee, args] (D41).
-                const method = call.callee.data == .member;
-                if (method) {
-                    const m = call.callee.data.member;
-                    try c.expr(m.object);
-                    try c.emit(.dup, &.{});
-                    switch (m.key) {
-                        .name => |n| try c.emit(.get_prop, &.{try c.name(n)}),
-                        .computed => |k| {
-                            try c.expr(k);
-                            try c.emit(.get_elem, &.{});
-                        },
-                        .string, .number => unreachable,
-                    }
-                } else try c.expr(call.callee);
+                const method = try c.compileCallee(call.callee);
                 const has_spread = for (call.args) |arg| {
                     if (arg.data == .spread) break true;
                 } else false;
@@ -1224,6 +1277,24 @@ const Compiler = struct {
                     for (call.args) |arg| try c.expr(arg);
                     try c.emit(if (method) .call_method else .call, &.{@intCast(call.args.len)}); // args.len < source size
                 }
+            },
+            .tagged_template => |tt| {
+                const method = try c.compileCallee(tt.callee);
+                const cooked_idx = try c.s.gpa.alloc(u32, tt.cooked.len);
+                errdefer c.s.gpa.free(cooked_idx);
+                const raw_idx = try c.s.gpa.alloc(u32, tt.raw.len);
+                errdefer c.s.gpa.free(raw_idx);
+                for (tt.cooked, 0..) |maybe_u, i| {
+                    cooked_idx[i] = if (maybe_u) |u| try c.string(u) else std.math.maxInt(u32);
+                }
+                for (tt.raw, 0..) |u, i| {
+                    raw_idx[i] = try c.string(u);
+                }
+                const site_idx: u32 = @intCast(c.templates.items.len);
+                try c.templates.append(c.s.gpa, .{ .cooked = cooked_idx, .raw = raw_idx });
+                try c.emit(.get_template_obj, &.{site_idx});
+                for (tt.exprs) |ex| try c.expr(ex);
+                try c.emit(if (method) .call_method else .call, &.{@intCast(tt.exprs.len + 1)});
             },
             .new_call => |nc| {
                 try c.expr(nc.callee);
@@ -1599,6 +1670,25 @@ const Compiler = struct {
             .plain, .compound => unreachable,
         }
     }
+
+    fn compileCallee(c: *Compiler, callee: *const ast.Expr) Error!bool {
+        // A member callee is a method call: [receiver, callee] (D41).
+        const method = callee.data == .member;
+        if (method) {
+            const m = callee.data.member;
+            try c.expr(m.object);
+            try c.emit(.dup, &.{});
+            switch (m.key) {
+                .name => |n| try c.emit(.get_prop, &.{try c.name(n)}),
+                .computed => |k| {
+                    try c.expr(k);
+                    try c.emit(.get_elem, &.{});
+                },
+                .string, .number => unreachable,
+            }
+        } else try c.expr(callee);
+        return method;
+    }
 };
 
 fn binaryOp(op: ast.BinaryOp) Op {
@@ -1623,6 +1713,6 @@ fn binaryOp(op: ast.BinaryOp) Op {
         .strict_ne => .strict_ne,
         .in => .in,
         .instanceof => .instanceof,
-        .logical_and, .logical_or, .nullish => unreachable, // control flow, handled by the caller
+        .logical_and, .logical_or, .nullish, .comma => unreachable, // control flow, handled by the caller
     };
 }

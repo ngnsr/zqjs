@@ -361,7 +361,8 @@ pub const Vm = struct {
             const state = @call(.always_inline, execute, .{ vm, &cache }) catch |e| {
                 cache.syncSp(vm);
                 if (e == error.Thrown) {
-                    if (vm.unwind(&cache)) |_| {
+                    if (vm.unwind(cache.pc)) |_| {
+                        cache = FrameCache.fromVm(vm, vm.pc);
                         if (bounded) n += 1;
                         continue;
                     } else |ue| {
@@ -461,8 +462,7 @@ pub const Vm = struct {
         const state = vm.execute(&cache) catch |e| {
             cache.syncSp(vm);
             if (e == error.Thrown) {
-                if (vm.unwind(&cache)) |_| {
-                    cache.syncSp(vm);
+                if (vm.unwind(cache.pc)) |_| {
                     return .running;
                 } else |ue| {
                     vm.fault = ue;
@@ -1200,14 +1200,14 @@ pub const Vm = struct {
     /// Two-phase JS exception unwind: scans active frames for a matching `try` handler
     /// before mutating any frame/stack state, so uncaught exceptions preserve exact
     /// faulting PC, stack, and frames.
-    noinline fn unwind(vm: *Vm, cache: *FrameCache) Error!void {
+    noinline fn unwind(vm: *Vm, fault_pc: u32) Error!void {
         @branchHint(.cold);
         var match_frame: ?usize = null;
         var match_handler: Proto.ExceptionHandler = undefined;
         var fi: usize = vm.frames.items.len;
         while (fi > 0) {
             fi -= 1;
-            const check_pc: u32 = if (fi == vm.frames.items.len - 1) cache.pc else vm.frames.items[fi + 1].return_pc - 1;
+            const check_pc: u32 = if (fi == vm.frames.items.len - 1) fault_pc else vm.frames.items[fi + 1].return_pc - 1;
             for (vm.frames.items[fi].proto.handlers) |h| {
                 if (h.try_start <= check_pc and check_pc < h.try_end) {
                     match_frame = fi;
@@ -1234,7 +1234,6 @@ pub const Vm = struct {
             vm.sp += 1;
         }
         vm.pc = match_handler.catch_pc;
-        cache.* = FrameCache.fromVm(vm, match_handler.catch_pc);
     }
 
     /// A defensive check failed (D49): poison the runtime and return `error.Internal`.

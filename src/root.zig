@@ -14,7 +14,7 @@ pub const dump = @import("frontend/dump.zig");
 pub const ops = @import("runtime/ops.zig");
 pub const Runtime = @import("runtime/runtime.zig").Runtime;
 pub const ErrorName = @import("runtime/runtime.zig").ErrorName;
-pub const interpret = @import("interp/treewalk.zig").run;
+pub const interpret = @import("interp/machine.zig").run;
 pub const bytecode = @import("bytecode/bytecode.zig");
 pub const compile = @import("bytecode/compiler.zig").compile;
 pub const verify = @import("bytecode/verify.zig");
@@ -47,5 +47,5 @@ test {
     _ = @import("runtime/pow.zig");
     _ = @import("bytecode/bytecode.zig");
     _ = @import("bytecode/verify.zig");
-    _ = @import("interp/treewalk.zig");
+    _ = @import("interp/machine.zig");
 }

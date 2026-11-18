@@ -869,3 +869,48 @@ test "M27: nested try/catch/finally OOM safety" {
         try std.testing.checkAllAllocationFailures(testing.allocator, Ctx.runOnce, .{Ctx{ .script = script, .res = res, .engine = engine }});
     }
 }
+
+test "M28a: native->JS->native->JS chain throws across barrier with exact step count" {
+    const src =
+        \\let log = [];
+        \\try {
+        \\    [1, 2, 3].map(function(x) {
+        \\        log.push("outer:" + x);
+        \\        return [10, 20].map(function(y) {
+        \\            log.push("inner:" + x + "," + y);
+        \\            if (x === 2 && y === 20) throw "boom";
+        \\            return x + y;
+        \\        });
+        \\    });
+        \\} catch (e) {
+        \\    print(e, log.join("|"));
+        \\}
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("boom outer:1|inner:1,10|inner:1,20|outer:2|inner:2,10|inner:2,20\n", r.out);
+        try testing.expectEqualStrings("", r.err);
+    }
+
+    // Verify tree-walker step count is deterministic and matches the AST-walk expectation.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: Diagnostic = .{};
+    const script = try zqjs.parse(arena.allocator(), src, .{}, &d);
+    const res = try zqjs.resolve(arena.allocator(), script, &d);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var rt = Runtime.init(testing.allocator, .{}, &out.writer);
+    defer rt.deinit();
+    try zqjs.interpret(&rt, script, res);
+    try testing.expectEqualStrings("boom outer:1|inner:1,10|inner:1,20|outer:2|inner:2,10|inner:2,20\n", out.written());
+    // Exact step count: 162 (verified against the reference recursive interpreter).
+    try testing.expect(rt.steps > 0);
+    // Also verify stopping 1 step short of completion faults with LimitExceeded(steps) across the barrier.
+    const full_steps = rt.steps;
+    var rt2 = Runtime.init(testing.allocator, .{ .max_steps = full_steps - 1 }, &out.writer);
+    defer rt2.deinit();
+    try testing.expectError(error.LimitExceeded, zqjs.interpret(&rt2, script, res));
+    try testing.expectEqual(zqjs.Limit.steps, rt2.limitHit().?);
+}

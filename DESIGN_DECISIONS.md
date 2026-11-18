@@ -248,6 +248,7 @@ that first enforces it; defaults are deliberately conservative.
 | `max_array_length` | 2²⁶ | element growth | M7 |
 | `max_object_properties` | 2²⁰ | property insertion | M7 |
 | `max_temp_roots` | 1 024 | `pushTemp` | M8 |
+| `max_native_stack_bytes` | 4 MiB | every native→JS crossing (D60) | D60 |
 
 *CLI default:* the library leaves `max_steps` unlimited because an embedder must choose its own
 budget, but the `zqjs` command defaults to 200 million steps (a few seconds), so an accidental
@@ -1196,3 +1197,77 @@ union written less directly.
 
 **M-order (D58 revised):** M28a explicit-stack tree-walker → M28b `async`/`await` on both
 engines (D56) → M29 host promises (D57).
+
+## D60. Bounding native stack across native→JS crossings *(approved and implemented 2026-11-18)*
+**Problem.** D59 made JS→JS calls cost no native stack, but every native→JS crossing still
+nests one Zig run loop: a built-in calling a closure (`rt.callCallable` → `Vm.callFromBuiltin`
+/ `Machine.callFromBuiltin`, D51/D59), a host native calling `rt.call` (D52), and from M28b the
+start of an async call's coroutine (D56). The only bound is `max_call_depth` (10 000), which
+counts JS frames and crossings alike, so it allows thousands of crossings. With default limits
+`function f(n) { return [n].map(x => f(x + 1)); } f(0);` overflows the 8 MiB main thread on
+both engines (segfault; in Debug the overflow handler sometimes hangs at 0% CPU instead of
+exiting, seen with `forEach` on the VM). Plain `async` recursion will do the same in M28b.
+
+**Measured** (native stack per crossing: the distance between successive `callFromBuiltin`
+frames over 200 crossings, `@frameAddress`, Apple M-series, 2026-11-18):
+
+| engine | Debug | ReleaseSafe | ReleaseFast |
+|---|---|---|---|
+| VM | 49–52 KB | 3.9 KB | 3.6–4.0 KB |
+| tree-walker (machine) | 70–72 KB | 24 KB | 25 KB |
+
+Stable across `map`, `forEach`, `sort` comparators and callbacks with more locals (within
+±3 KB). Almost all of it is the engine's own loop plus the built-in's frame (Debug VM: 47.5 of
+49.3 KB; `callCallable` → `callFromBuiltin` is 1.4–1.8 KB). So the cost per crossing varies
+**14×** with the build mode and **7×** between engines, and the stack available varies with the
+host's thread (8 MiB main thread, 512 KiB macOS pthread default, 1 MiB Windows, 16 MiB
+`std.Thread` default). An 8 MiB stack holds ~110 crossings in Debug on the tree-walker.
+Async coroutine starts were not measured: M28b isn't written yet (`m28b-async` == `main`).
+
+**Decision: a byte budget, checked against the real stack pointer.**
+- New limit `max_native_stack_bytes`, default **4 MiB**, and `Limit.native_stack`.
+- Every depth-0 entry (the API guard's claim, and `runSource` for the CLI) records
+  `rt.stack_base = @frameAddress()`.
+- One helper, `rt.checkNativeStack()`, runs at every crossing before it nests:
+  `rt.callCallable` (the one funnel to both engines' `callFromBuiltin` and `callStandalone`),
+  the nested path of the API's `rt.call`, and, from M28b, the coroutine start/resume. It faults with `LimitExceeded(native_stack)` when
+  `stack_base - @frameAddress() > max_native_stack_bytes`. The fault is uncatchable like the
+  other limits and unwinds the same way `call_depth` does today, so nothing new is needed.
+- Engine- and mode-independent: bytes are bytes, so no per-engine constant to keep measured.
+  Cost: one subtraction and compare per crossing (crossings already allocate a VM or push
+  tasks). Plain JS recursion stays bounded by `max_call_depth`/`max_stack_slots`, unchanged.
+- Contract for embedders (D15, `limits.zig` doc comment): the thread running zqjs needs
+  `max_native_stack_bytes` plus headroom for one crossing and the host's own frames, at least
+  128 KiB in Debug (one Debug crossing is ~72 KB). 4 MiB fits the 8 MiB main thread and
+  `std.Thread`'s default; a host on a smaller thread lowers it (e.g. 128 KiB on 256 KiB).
+- At the default, crossings allowed: Debug ~58 (tree-walker) / ~85 (VM), ReleaseFast ~165 /
+  ~1 100. Deep recursion *through callbacks* is rare in real code; Node allows ~11k but does
+  not nest native frames per crossing like model B does.
+- Test: `tests/interpreter_test.zig` "native→JS recursion stops cleanly even when the host
+  thread has a tiny stack": 256 KiB thread, budget 128 KiB, both engines expect
+  `LimitExceeded(native_stack)`. Before this entry it crashed the `interpreter_test` binary.
+- C API: `ZQJS_LIMIT_NATIVE_STACK` (12) reports the fault, but `zqjs_limits` gets no field:
+  it is embedded in the versioned `zqjs_options` before trailing fields, so a new field would
+  move them. C hosts get the default until the options struct is versioned for it.
+
+*Alternatives considered.*
+1. **A count of nested run loops (`max_native_depth`) with a measured cost per level.**
+   Simple, but one default can't fit both a 72 KB Debug tree-walker crossing and a 3.6 KB
+   ReleaseFast VM one: sized for Debug (~64) it caps release builds 14× below what the stack
+   allows; sized for release it crashes Debug. The constants also drift with every change to
+   the run loops, and it still assumes a stack size.
+2. **Lower the effective depth for crossings** (charge each crossing N units of
+   `max_call_depth`). The same problem as 1, plus it couples two unrelated budgets.
+3. **Lower `max_call_depth`.** Penalizes plain recursion, which costs no native stack since
+   D59, and still doesn't know the thread's stack size.
+4. **Read the thread's real stack bounds** (`pthread_get_stackaddr_np`/`pthread_getattr_np`/
+   `GetCurrentThreadStackLimits`) and fault near the guard page, with no limit to configure.
+   The best behavior, and what V8 does, but std 0.17.1 exposes none of these, so it means
+   per-OS `extern` code (and Zig's own non-libc threads on Linux have no pthread attrs). Could
+   later become the default *value* of `max_native_stack_bytes` without changing this design.
+5. **No nesting at all** (resumable built-ins, D51's model A). Removes the problem instead of
+   bounding it, but rewrites every callback-taking built-in; out of scope.
+
+*Follow-up, independent of the bound:* the Debug VM run loop frame (~47 KB) and the
+tree-walker's ReleaseFast frame (~25 KB, 7× the VM's) are large; moving cold opcode/task arms
+out of line would raise the number of crossings any budget allows.

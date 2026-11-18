@@ -770,6 +770,7 @@ const Guard = struct {
             @panic("zqjs: Runtime entered while another call into it is running");
         }
         rt.owner_thread = std.Thread.getCurrentId();
+        rt.stack_base = @frameAddress(); // D60: depth 0, the base of this entry's native stack
         return .{ .rt = rt, .claimed = true };
     }
 
@@ -784,6 +785,7 @@ const Guard = struct {
             @panic("zqjs: Runtime entered while another call into it is running");
         }
         rt.owner_thread = std.Thread.getCurrentId();
+        rt.stack_base = @frameAddress(); // D60: depth 0, the base of this entry's native stack
         return .{ .rt = rt, .claimed = true };
     }
 
@@ -801,6 +803,7 @@ const Guard = struct {
             @panic("zqjs: Runtime entered while another call into it is running");
         }
         rt.owner_thread = std.Thread.getCurrentId();
+        rt.stack_base = @frameAddress(); // D60: depth 0, the base of this entry's native stack
         return .{ .rt = rt, .claimed = true };
     }
 
@@ -1105,6 +1108,11 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
                 if (failure) |out| out.* = fo.failure;
                 return fo.err;
             }
+            rt.checkNativeStack() catch |e| {
+                const fo = faultOf(rt, e);
+                if (failure) |out| out.* = fo.failure;
+                return fo.err;
+            };
             var vm = internal.Vm.initCall(rt, c, this_obj, argv) catch |e| {
                 const fo = faultOf(rt, e);
                 if (failure) |out| out.* = fo.failure;

@@ -95,6 +95,7 @@ pub const CLimit = enum(c_int) {
     interpreter_depth = 9,
     conversion_depth = 10,
     handles = 11,
+    native_stack = 12,
 };
 
 pub const CFailureKind = enum(c_int) {
@@ -247,6 +248,7 @@ pub const CFailure = extern struct {
             .interpreter_depth => .interpreter_depth,
             .conversion_depth => .conversion_depth,
             .handles => .handles,
+            .native_stack => .native_stack,
         } else .none;
         const msg = f.message();
         const n = @min(msg.len, 256);

@@ -259,6 +259,31 @@ test "deep recursion stops cleanly even when the host thread has a tiny stack" {
     }
 }
 
+test "native→JS recursion stops cleanly even when the host thread has a tiny stack" {
+    // Each native→JS crossing (a built-in calling a closure: D51, D59) nests one Zig run
+    // loop, 3.6–72 KB of native stack depending on engine and build mode (D60), and
+    // max_call_depth alone allows thousands of them. A host on a small thread sets the
+    // native stack budget below its stack size (D60).
+    const Host = struct {
+        fn work(result: *?support.Outcome, engine: zqjs.Engine, err: *?anyerror) void {
+            result.* = support.run(testing.allocator, "function f(n) { return [n].map(x => f(x + 1)); } f(0);", .{ .max_native_stack_bytes = 128 * 1024 }, engine, .normal) catch |e| {
+                err.* = e;
+                return;
+            };
+        }
+    };
+    for (support.engines) |engine| {
+        var result: ?support.Outcome = null;
+        var err: ?anyerror = null;
+        const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Host.work, .{ &result, engine, &err });
+        t.join();
+        if (err) |e| return e;
+        var r = result.?;
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("t.js: LimitExceeded(native_stack)\n", r.err);
+    }
+}
+
 /// Runs `source` on both engines and expects the given Unsupported diagnostic (the
 /// feature id, and for `builtin` the member) after `output`.
 fn expectUnsupported(source: []const u8, output: []const u8, diagnostic: []const u8) !void {
@@ -866,7 +891,11 @@ test "M27: nested try/catch/finally OOM safety" {
                 }
             }
         };
-        try std.testing.checkAllAllocationFailures(testing.allocator, Ctx.runOnce, .{Ctx{ .script = script, .res = res, .engine = engine }});
+        // Leak and use-after-free checks without testing.allocator's stack capture on every
+        // allocation, which dominated this O(allocations²) loop.
+        var sa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+        try std.testing.checkAllAllocationFailures(sa.allocator(), Ctx.runOnce, .{Ctx{ .script = script, .res = res, .engine = engine }});
+        try testing.expectEqual(@as(usize, 0), sa.deinit()); // leaks
     }
 }
 

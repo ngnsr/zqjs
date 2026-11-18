@@ -131,6 +131,8 @@ pub const Op = enum(u8) {
     delete_elem,
     /// [key, object] → [key in object].
     in,
+    /// [lhs, rhs] → [lhs instanceof rhs].
+    instanceof,
     /// Push the frame's `this`; Unsupported(sloppy_this) if the call had no receiver.
     push_this,
 
@@ -246,7 +248,7 @@ pub const Op = enum(u8) {
             .get_elem, .delete_elem => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .set_prop => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
             .set_elem => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
-            .in => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
+            .in, .instanceof => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .push_this => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
             .call_method => .{ .operands = &.{.argc}, .pops = 2, .pushes = 1 },
             .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne => .{ .operands = &.{}, .pops = 2, .pushes = 1 },

@@ -145,16 +145,7 @@ pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
         .boolean => return getFrom(rt, (try builtins.realm(rt)).boolean_prototype, k),
         .object => |o| return getFrom(rt, o, k),
         .native => |n| {
-            const r = try builtins.realm(rt);
-            const ns = switch (n.namespace orelse return rt.fail(.function_properties)) {
-                .object => r.object_namespace,
-                .array => r.array_namespace,
-                .string => r.string_namespace,
-                .number => r.number_namespace,
-                .map => r.map_namespace,
-                .set => r.set_namespace,
-                .promise => r.promise_namespace,
-            };
+            const ns = (try builtins.namespaceObject(rt, n)) orelse return rt.fail(.function_properties);
             if (own(ns, k)) |v| return v;
             if (nodeHas(ns.builtin.?, k) or nodeHas(.function_prototype, k)) return unsupportedBuiltin(rt, k);
             return .undefined;
@@ -288,6 +279,29 @@ pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
         if (try ownGet(rt, cur, k) != null) return true;
         // node has it there, so the answer is known even if the value isn't.
         if (cur.builtin) |b| if (nodeHas(b, k)) return true;
+    }
+    return false;
+}
+
+/// `lhs instanceof rhs` (M25).
+pub fn instanceOf(rt: *Runtime, lhs: Value, rhs: Value) Error!bool {
+    heap_mod.checkValue(lhs);
+    heap_mod.checkValue(rhs);
+    const rhs_native = switch (rhs) {
+        .native => |n| n,
+        .closure => return rt.fail(.function_properties),
+        else => return rt.throw(.TypeError, &.{.{ .ascii = "Right-hand side of 'instanceof' is not callable" }}),
+    };
+    var cur: ?*Object = switch (lhs) {
+        .object => |o| o.proto,
+        .native, .closure => (try builtins.realm(rt)).function_prototype,
+        else => return false,
+    };
+    const target_proto = (try builtins.constructorPrototype(rt, rhs_native)) orelse
+        return rt.throw(.TypeError, &.{.{ .ascii = "Function has non-object prototype 'undefined' in instanceof check" }});
+    while (cur) |o| : (cur = o.proto) {
+        o.obj.checkLive();
+        if (o == target_proto) return true;
     }
     return false;
 }

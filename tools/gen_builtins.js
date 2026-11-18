@@ -39,6 +39,22 @@ const objects = vm.runInNewContext(`({
   iterator_prototype: Object.getPrototypeOf(Object.getPrototypeOf([].values())),
   math: Math,
   json: JSON,
+  error_constructor: Error,
+  error_prototype: Error.prototype,
+  type_error_constructor: TypeError,
+  type_error_prototype: TypeError.prototype,
+  range_error_constructor: RangeError,
+  range_error_prototype: RangeError.prototype,
+  syntax_error_constructor: SyntaxError,
+  syntax_error_prototype: SyntaxError.prototype,
+  reference_error_constructor: ReferenceError,
+  reference_error_prototype: ReferenceError.prototype,
+  eval_error_constructor: EvalError,
+  eval_error_prototype: EvalError.prototype,
+  uri_error_constructor: URIError,
+  uri_error_prototype: URIError.prototype,
+  aggregate_error_constructor: AggregateError,
+  aggregate_error_prototype: AggregateError.prototype,
 })`);
 
 const lines = [

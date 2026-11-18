@@ -276,6 +276,7 @@ pub fn binary(rt: *Runtime, op: ast.BinaryOp, a_in: Value, b_in: Value) Error!Va
         .bit_xor => .{ .number = bitXor(try toNumber(rt, a), try toNumber(rt, b)) },
         .bit_or => .{ .number = bitOr(try toNumber(rt, a), try toNumber(rt, b)) },
         .in => .{ .boolean = try object.has(rt, try object.key(rt, a), b) },
+        .instanceof => .{ .boolean = try object.instanceOf(rt, a, b) },
         .lt => .{ .boolean = (try lessThan(rt, a, b)) orelse false },
         .gt => .{ .boolean = (try lessThan(rt, b, a)) orelse false },
         .le => .{ .boolean = if (try lessThan(rt, b, a)) |r| !r else false },

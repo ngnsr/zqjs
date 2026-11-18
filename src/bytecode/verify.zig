@@ -369,3 +369,10 @@ test "the code-size limit covers the whole tree" {
     _ = try verify(testing.allocator, &root, .{ .max_code_bytes = 9 }, &f); // 7 + 2 bytes
     try testing.expectError(error.InvalidBytecode, verify(testing.allocator, &root, .{ .max_code_bytes = 8 }, &f));
 }
+
+test "instanceof pops 2, pushes 1 and checks underflow" {
+    const ok: Proto = .{ .code = enc(.{ .push_null, .push_null, .instanceof, .pop, .halt }), .consts = &.{}, .names = &.{}, .slot_count = 0, .max_stack = 2 };
+    var f: Failure = .{};
+    try testing.expectEqual(@as(u32, 2), (try verify(testing.allocator, &ok, .{}, &f)).max_stack);
+    try expectInvalid(enc(.{ .push_null, .instanceof, .pop, .halt }), 1, "stack underflow");
+}

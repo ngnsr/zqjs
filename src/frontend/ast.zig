@@ -48,6 +48,8 @@ pub const BinaryOp = enum {
     strict_ne,
     /// `key in object` (M7).
     in,
+    /// `lhs instanceof rhs` (M25).
+    instanceof,
     /// `&&`, `||`, and `??` short-circuit; the compiler treats them as control flow.
     logical_and,
     logical_or,
@@ -74,6 +76,7 @@ pub const BinaryOp = enum {
             .strict_eq => "===",
             .strict_ne => "!==",
             .in => "in",
+            .instanceof => "instanceof",
             .logical_and => "&&",
             .logical_or => "||",
             .nullish => "??",

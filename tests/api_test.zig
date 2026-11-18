@@ -2839,3 +2839,22 @@ test "M20: host calls JS arrow returned from script via Runtime.call" {
     defer r2.release();
     try testing.expectEqual(@as(f64, 24), r2.number().?);
 }
+
+test "M25: uncaught engine error still reports same name and message to host" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+
+    const p1 = try rt.compile("m25_type.js", "null.x;", null);
+    defer p1.destroy();
+    var f1: zqjs.Failure = .{};
+    try testing.expectError(error.Thrown, rt.run(p1, &f1));
+    try testing.expectEqual(zqjs.Failure.Kind.thrown, f1.kind);
+    try testing.expectEqualStrings("TypeError: Cannot read properties of null (reading 'x')", f1.message());
+
+    const p2 = try rt.compile("m25_ref.js", "undeclared_m25;", null);
+    defer p2.destroy();
+    var f2: zqjs.Failure = .{};
+    try testing.expectError(error.Thrown, rt.run(p2, &f2));
+    try testing.expectEqual(zqjs.Failure.Kind.thrown, f2.kind);
+    try testing.expectEqualStrings("ReferenceError: undeclared_m25 is not defined", f2.message());
+}

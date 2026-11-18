@@ -762,3 +762,39 @@ test "M23: split, replace, splice, sort, concat, and Object.entries OOM safety" 
     };
     try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
 }
+
+test "M25: Error construction, AggregateError, and instanceof OOM safety" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: Diagnostic = .{};
+    const src =
+        \\const e1 = new Error("msg", { cause: 42 });
+        \\const e2 = TypeError("bad");
+        \\const ae = new AggregateError([e1, e2], "many", { cause: e1 });
+        \\String(ae);
+        \\ae instanceof AggregateError;
+        \\ae instanceof Error;
+        \\try { null.x; } catch (err) { String(err); }
+    ;
+    const script = try zqjs.parse(arena.allocator(), src, .{}, &d);
+    const res = try zqjs.resolve(arena.allocator(), script, &d);
+
+    const OomCtx = struct {
+        script: zqjs.ast.Script,
+        res: zqjs.Resolution,
+
+        fn runOnce(alloc: Allocator, ctx: @This()) !void {
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            var rt = Runtime.init(alloc, .{}, &out.writer);
+            defer rt.deinit();
+            try zqjs.interpret(&rt, ctx.script, ctx.res);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{OomCtx{ .script = script, .res = res }});
+}
+
+test "M25: instanceof user-defined function fails with Unsupported(function_properties)" {
+    try expectUnsupported("function F() {} ({}) instanceof F;", "", "Unsupported(function_properties)");
+    try expectUnsupported("const F = () => {}; ({}) instanceof F;", "", "Unsupported(function_properties)");
+}

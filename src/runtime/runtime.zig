@@ -363,14 +363,10 @@ pub const Runtime = struct {
             return v;
         }
         const ex = rt.exception.?;
-        const r = try builtins_mod.realm(rt);
-        const obj = try rt.heap.newObject(r.object_prototype);
-        const name_str = try rt.heap.newString(&.{.{ .ascii = @tagName(ex.name) }});
-        try object_mod.define(rt, obj, .{ .atom = try rt.heap.internAscii("name") }, .{ .string = name_str });
-        try object_mod.define(rt, obj, .{ .atom = try rt.heap.internAscii("message") }, .{ .string = ex.message });
+        const err_val = try builtins_mod.makeEngineError(rt, ex.name, ex.message);
         rt.exception = null;
         rt.thrown_value = null;
-        return .{ .object = obj };
+        return err_val;
     }
 
     pub fn fail(rt: *Runtime, feature: Feature) Error {

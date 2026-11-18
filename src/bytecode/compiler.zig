@@ -1034,6 +1034,7 @@ fn binaryOp(op: ast.BinaryOp) Op {
         .strict_eq => .strict_eq,
         .strict_ne => .strict_ne,
         .in => .in,
+        .instanceof => .instanceof,
         .logical_and, .logical_or, .nullish => unreachable, // control flow, handled by the caller
     };
 }

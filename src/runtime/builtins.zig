@@ -43,7 +43,15 @@ pub const Realm = struct {
     set_prototype: *Object,
     promise_prototype: *Object,
     iterator_prototype: *Object,
-    /// Static members of the `Object`, `Array`, `String`, `Number`, `Map`, `Set`, and `Promise` globals.
+    error_prototype: *Object,
+    type_error_prototype: *Object,
+    range_error_prototype: *Object,
+    syntax_error_prototype: *Object,
+    reference_error_prototype: *Object,
+    eval_error_prototype: *Object,
+    uri_error_prototype: *Object,
+    aggregate_error_prototype: *Object,
+    /// Static members of the `Object`, `Array`, `String`, `Number`, `Map`, `Set`, `Promise`, and `Error` globals.
     object_namespace: *Object,
     array_namespace: *Object,
     string_namespace: *Object,
@@ -51,12 +59,56 @@ pub const Realm = struct {
     map_namespace: *Object,
     set_namespace: *Object,
     promise_namespace: *Object,
+    error_namespace: *Object,
+    type_error_namespace: *Object,
+    range_error_namespace: *Object,
+    syntax_error_namespace: *Object,
+    reference_error_namespace: *Object,
+    eval_error_namespace: *Object,
+    uri_error_namespace: *Object,
+    aggregate_error_namespace: *Object,
     math: *Object,
     json: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [19]*Object {
-        return .{ r.object_prototype, r.array_prototype, r.string_prototype, r.number_prototype, r.boolean_prototype, r.function_prototype, r.map_prototype, r.set_prototype, r.promise_prototype, r.iterator_prototype, r.object_namespace, r.array_namespace, r.string_namespace, r.number_namespace, r.map_namespace, r.set_namespace, r.promise_namespace, r.math, r.json };
+    pub fn objects(r: *const Realm) [35]*Object {
+        return .{
+            r.object_prototype,
+            r.array_prototype,
+            r.string_prototype,
+            r.number_prototype,
+            r.boolean_prototype,
+            r.function_prototype,
+            r.map_prototype,
+            r.set_prototype,
+            r.promise_prototype,
+            r.iterator_prototype,
+            r.error_prototype,
+            r.type_error_prototype,
+            r.range_error_prototype,
+            r.syntax_error_prototype,
+            r.reference_error_prototype,
+            r.eval_error_prototype,
+            r.uri_error_prototype,
+            r.aggregate_error_prototype,
+            r.object_namespace,
+            r.array_namespace,
+            r.string_namespace,
+            r.number_namespace,
+            r.map_namespace,
+            r.set_namespace,
+            r.promise_namespace,
+            r.error_namespace,
+            r.type_error_namespace,
+            r.range_error_namespace,
+            r.syntax_error_namespace,
+            r.reference_error_namespace,
+            r.eval_error_namespace,
+            r.uri_error_namespace,
+            r.aggregate_error_namespace,
+            r.math,
+            r.json,
+        };
     }
 };
 
@@ -64,6 +116,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     if (rt.realm) |*r| return r;
     const h = &rt.heap;
     const object_prototype = try builtin(h, null, .object_prototype);
+    const error_prototype = try builtin(h, object_prototype, .error_prototype);
     var r: Realm = .{
         .object_prototype = object_prototype,
         .array_prototype = try builtin(h, object_prototype, .array_prototype),
@@ -75,6 +128,14 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .set_prototype = try builtin(h, object_prototype, .set_prototype),
         .promise_prototype = try builtin(h, object_prototype, .promise_prototype),
         .iterator_prototype = try builtin(h, object_prototype, .iterator_prototype),
+        .error_prototype = error_prototype,
+        .type_error_prototype = try builtin(h, error_prototype, .type_error_prototype),
+        .range_error_prototype = try builtin(h, error_prototype, .range_error_prototype),
+        .syntax_error_prototype = try builtin(h, error_prototype, .syntax_error_prototype),
+        .reference_error_prototype = try builtin(h, error_prototype, .reference_error_prototype),
+        .eval_error_prototype = try builtin(h, error_prototype, .eval_error_prototype),
+        .uri_error_prototype = try builtin(h, error_prototype, .uri_error_prototype),
+        .aggregate_error_prototype = try builtin(h, error_prototype, .aggregate_error_prototype),
         .object_namespace = try builtin(h, null, .object_constructor),
         .array_namespace = try builtin(h, null, .array_constructor),
         .string_namespace = try builtin(h, null, .string_constructor),
@@ -82,6 +143,14 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .map_namespace = try builtin(h, null, .map_constructor),
         .set_namespace = try builtin(h, null, .set_constructor),
         .promise_namespace = try builtin(h, null, .promise_constructor),
+        .error_namespace = try builtin(h, null, .error_constructor),
+        .type_error_namespace = try builtin(h, null, .type_error_constructor),
+        .range_error_namespace = try builtin(h, null, .range_error_constructor),
+        .syntax_error_namespace = try builtin(h, null, .syntax_error_constructor),
+        .reference_error_namespace = try builtin(h, null, .reference_error_constructor),
+        .eval_error_namespace = try builtin(h, null, .eval_error_constructor),
+        .uri_error_namespace = try builtin(h, null, .uri_error_constructor),
+        .aggregate_error_namespace = try builtin(h, null, .aggregate_error_constructor),
         .math = try builtin(h, object_prototype, .math),
         .json = try builtin(h, object_prototype, .json),
     };
@@ -188,6 +257,15 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try registerMath(rt, r.math);
     try method(rt, r.json, "parse", &json.parse_native);
     try method(rt, r.json, "stringify", &json.stringify_native);
+    try initErrorProto(rt, r.error_prototype, r.error_namespace, "Error", &error_global);
+    try method(rt, r.error_prototype, "toString", &error_to_string);
+    try initErrorProto(rt, r.type_error_prototype, r.type_error_namespace, "TypeError", &type_error_global);
+    try initErrorProto(rt, r.range_error_prototype, r.range_error_namespace, "RangeError", &range_error_global);
+    try initErrorProto(rt, r.syntax_error_prototype, r.syntax_error_namespace, "SyntaxError", &syntax_error_global);
+    try initErrorProto(rt, r.reference_error_prototype, r.reference_error_namespace, "ReferenceError", &reference_error_global);
+    try initErrorProto(rt, r.eval_error_prototype, r.eval_error_namespace, "EvalError", &eval_error_global);
+    try initErrorProto(rt, r.uri_error_prototype, r.uri_error_namespace, "URIError", &uri_error_global);
+    try initErrorProto(rt, r.aggregate_error_prototype, r.aggregate_error_namespace, "AggregateError", &aggregate_error_global);
     _ = &r;
     rt.realm = r;
     return &rt.realm.?;
@@ -211,7 +289,51 @@ fn constant(rt: *Runtime, o: *Object, name: []const u8, v: Value) Error!void {
 
 /// The natives ToPrimitive may call (D40); anything else found there is user code.
 pub fn isConversion(n: *const Native) bool {
-    return n == &object_to_string or n == &object_value_of or n == &array_to_string;
+    return n == &object_to_string or n == &object_value_of or n == &array_to_string or n == &error_to_string;
+}
+
+pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
+    const ns = n.namespace orelse return null;
+    const r = try realm(rt);
+    return switch (ns) {
+        .object => r.object_namespace,
+        .array => r.array_namespace,
+        .string => r.string_namespace,
+        .number => r.number_namespace,
+        .map => r.map_namespace,
+        .set => r.set_namespace,
+        .promise => r.promise_namespace,
+        .@"error" => r.error_namespace,
+        .type_error => r.type_error_namespace,
+        .range_error => r.range_error_namespace,
+        .syntax_error => r.syntax_error_namespace,
+        .reference_error => r.reference_error_namespace,
+        .eval_error => r.eval_error_namespace,
+        .uri_error => r.uri_error_namespace,
+        .aggregate_error => r.aggregate_error_namespace,
+    };
+}
+
+pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
+    const ns = n.namespace orelse return null;
+    const r = try realm(rt);
+    return switch (ns) {
+        .object => r.object_prototype,
+        .array => r.array_prototype,
+        .string => r.string_prototype,
+        .number => r.number_prototype,
+        .map => r.map_prototype,
+        .set => r.set_prototype,
+        .promise => r.promise_prototype,
+        .@"error" => r.error_prototype,
+        .type_error => r.type_error_prototype,
+        .range_error => r.range_error_prototype,
+        .syntax_error => r.syntax_error_prototype,
+        .reference_error => r.reference_error_prototype,
+        .eval_error => r.eval_error_prototype,
+        .uri_error => r.uri_error_prototype,
+        .aggregate_error => r.aggregate_error_prototype,
+    };
 }
 
 // ---------------------------------------------------------------- globals
@@ -228,6 +350,14 @@ pub const is_finite_global: Native = .{ .name = "isFinite", .call = globalIsFini
 pub const map_global: Native = .{ .name = "Map", .call = mapWithoutNew, .construct = mapConstruct, .namespace = .map };
 pub const set_global: Native = .{ .name = "Set", .call = setWithoutNew, .construct = setConstruct, .namespace = .set };
 pub const promise_global: Native = .{ .name = "Promise", .call = promiseWithoutNew, .construct = promiseConstruct, .namespace = .promise };
+pub const error_global: Native = .{ .name = "Error", .call = errorCall, .construct = errorConstruct, .namespace = .@"error" };
+pub const type_error_global: Native = .{ .name = "TypeError", .call = typeErrorCall, .construct = typeErrorConstruct, .namespace = .type_error };
+pub const range_error_global: Native = .{ .name = "RangeError", .call = rangeErrorCall, .construct = rangeErrorConstruct, .namespace = .range_error };
+pub const syntax_error_global: Native = .{ .name = "SyntaxError", .call = syntaxErrorCall, .construct = syntaxErrorConstruct, .namespace = .syntax_error };
+pub const reference_error_global: Native = .{ .name = "ReferenceError", .call = referenceErrorCall, .construct = referenceErrorConstruct, .namespace = .reference_error };
+pub const eval_error_global: Native = .{ .name = "EvalError", .call = evalErrorCall, .construct = evalErrorConstruct, .namespace = .eval_error };
+pub const uri_error_global: Native = .{ .name = "URIError", .call = uriErrorCall, .construct = uriErrorConstruct, .namespace = .uri_error };
+pub const aggregate_error_global: Native = .{ .name = "AggregateError", .call = aggregateErrorCall, .construct = aggregateErrorConstruct, .namespace = .aggregate_error };
 
 /// A global read: implemented, host-registered (M9.1, D53), known to node (Unsupported),
 /// or a ReferenceError.
@@ -257,6 +387,14 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "Map")) return .{ .native = &map_global };
     if (std.mem.eql(u8, name, "Set")) return .{ .native = &set_global };
     if (std.mem.eql(u8, name, "Promise")) return .{ .native = &promise_global };
+    if (std.mem.eql(u8, name, "Error")) return .{ .native = &error_global };
+    if (std.mem.eql(u8, name, "TypeError")) return .{ .native = &type_error_global };
+    if (std.mem.eql(u8, name, "RangeError")) return .{ .native = &range_error_global };
+    if (std.mem.eql(u8, name, "SyntaxError")) return .{ .native = &syntax_error_global };
+    if (std.mem.eql(u8, name, "ReferenceError")) return .{ .native = &reference_error_global };
+    if (std.mem.eql(u8, name, "EvalError")) return .{ .native = &eval_error_global };
+    if (std.mem.eql(u8, name, "URIError")) return .{ .native = &uri_error_global };
+    if (std.mem.eql(u8, name, "AggregateError")) return .{ .native = &aggregate_error_global };
     if (std.mem.eql(u8, name, "Math")) return .{ .object = (try realm(rt)).math };
     if (std.mem.eql(u8, name, "JSON")) return .{ .object = (try realm(rt)).json };
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return .{ .native = n };
@@ -2534,20 +2672,17 @@ fn anyRejectCb(rt: *Runtime, elem_env: *Object, args: []const Value) Error!Value
 
 fn makeAggregateError(rt: *Runtime, errors_arr_val: Value) Error!Value {
     const r = try realm(rt);
-    var root_buf = [_]Value{ errors_arr_val, .undefined, .undefined, .undefined };
+    var root_buf = [_]Value{ errors_arr_val, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const err_obj = try rt.heap.newObject(r.object_prototype);
+    const err_obj = try rt.heap.newObject(r.aggregate_error_prototype);
     root_buf[1] = .{ .object = err_obj };
-    const name_str = try rt.heap.newString(&.{.{ .ascii = "AggregateError" }});
-    root_buf[2] = .{ .string = name_str };
     const msg_str = try rt.heap.newString(&.{.{ .ascii = "All promises were rejected" }});
-    root_buf[3] = .{ .string = msg_str };
-    try object.define(rt, err_obj, try object.named(rt, "name"), root_buf[2]);
-    try object.define(rt, err_obj, try object.named(rt, "message"), root_buf[3]);
-    try object.define(rt, err_obj, try object.named(rt, "errors"), errors_arr_val);
+    root_buf[2] = .{ .string = msg_str };
+    try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("message"), .{ .value = root_buf[2], .enumerable = false });
+    try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("errors"), .{ .value = errors_arr_val, .enumerable = false });
     return root_buf[1];
 }
 
@@ -2572,19 +2707,16 @@ pub fn callPromiseCapability(rt: *Runtime, p_obj: *Object, is_reject: bool, args
 pub fn resolvePromiseValue(rt: *Runtime, p_obj: *Object, val: Value) Error!void {
     if (val == .object and val.object == p_obj) {
         const r = try realm(rt);
-        var err_roots_buf = [_]Value{ .{ .object = p_obj }, .undefined, .undefined, .undefined };
+        var err_roots_buf = [_]Value{ .{ .object = p_obj }, .undefined, .undefined };
         var err_roots: rt_mod.ValueRoots = .{ .values = &err_roots_buf };
         try err_roots.register(rt);
         defer err_roots.unregister(rt);
 
-        const err_obj = try rt.heap.newObject(r.object_prototype);
+        const err_obj = try rt.heap.newObject(r.type_error_prototype);
         err_roots_buf[1] = .{ .object = err_obj };
-        const name_str = try rt.heap.newString(&.{.{ .ascii = "TypeError" }});
-        err_roots_buf[2] = .{ .string = name_str };
         const msg_str = try rt.heap.newString(&.{.{ .ascii = "Chaining cycle detected for promise" }});
-        err_roots_buf[3] = .{ .string = msg_str };
-        try object.define(rt, err_obj, try object.named(rt, "name"), err_roots_buf[2]);
-        try object.define(rt, err_obj, try object.named(rt, "message"), err_roots_buf[3]);
+        err_roots_buf[2] = .{ .string = msg_str };
+        try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("message"), .{ .value = err_roots_buf[2], .enumerable = false });
         try settlePromiseFromJob(rt, p_obj, true, err_roots_buf[1]);
         return;
     }
@@ -2747,4 +2879,170 @@ fn iteratorNext(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     try object.define(rt, out, try object.named(rt, "value"), next_v orelse .undefined);
     try object.define(rt, out, try object.named(rt, "done"), .{ .boolean = next_v == null });
     return .{ .object = out };
+}
+
+// ---------------------------------------------------------------- Errors (M25)
+
+const error_to_string: Native = .{ .name = "toString", .call = errorToString };
+
+fn initErrorProto(rt: *Runtime, proto: *Object, ns: *Object, name_ascii: []const u8, ctor: *const Native) Error!void {
+    try constant(rt, ns, "prototype", .{ .object = proto });
+    try constant(rt, proto, "constructor", .{ .native = ctor });
+    try constant(rt, proto, "name", .{ .string = try rt.heap.ascii(name_ascii) });
+    try constant(rt, proto, "message", .{ .string = try rt.heap.ascii("") });
+}
+
+fn errorToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    if (this != .object) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Error.prototype.toString requires that 'this' be an Object" }});
+    }
+    var root_buf = [_]Value{ this, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const name_val = try object.get(rt, this, try object.named(rt, "name"));
+    const name_str = if (name_val == .undefined) try rt.heap.ascii("Error") else try toStringObj(rt, name_val);
+    root_buf[1] = .{ .string = name_str };
+
+    const msg_val = try object.get(rt, this, try object.named(rt, "message"));
+    const msg_str = if (msg_val == .undefined) try rt.heap.ascii("") else try toStringObj(rt, msg_val);
+    root_buf[2] = .{ .string = msg_str };
+
+    if (name_str.units.len == 0) return .{ .string = msg_str };
+    if (msg_str.units.len == 0) return .{ .string = name_str };
+    return .{ .string = try rt.heap.newString(&.{ .{ .utf16 = name_str.units }, .{ .ascii = ": " }, .{ .utf16 = msg_str.units } }) };
+}
+
+fn buildError(rt: *Runtime, proto: *Object, msg_arg: Value, opts_arg: Value) Error!*Object {
+    var root_buf = [_]Value{ msg_arg, opts_arg, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const err_obj = try rt.heap.newObject(proto);
+    root_buf[2] = .{ .object = err_obj };
+
+    if (msg_arg != .undefined) {
+        const msg_str = try toStringObj(rt, msg_arg);
+        root_buf[3] = .{ .string = msg_str };
+        try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("message"), .{ .value = root_buf[3], .enumerable = false });
+    }
+    if (opts_arg == .object) {
+        const cause_key = try object.named(rt, "cause");
+        if (try object.has(rt, cause_key, opts_arg)) {
+            const cause_val = try object.get(rt, opts_arg, cause_key);
+            root_buf[3] = cause_val;
+            try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("cause"), .{ .value = cause_val, .enumerable = false });
+        }
+    }
+    return err_obj;
+}
+
+pub fn makeEngineError(rt: *Runtime, name: rt_mod.ErrorName, msg: *const heap_mod.String) Error!Value {
+    const r = try realm(rt);
+    const proto = switch (name) {
+        .ReferenceError => r.reference_error_prototype,
+        .TypeError => r.type_error_prototype,
+        .RangeError => r.range_error_prototype,
+        .SyntaxError => r.syntax_error_prototype,
+    };
+    var root_buf = [_]Value{ .{ .string = msg }, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const err_obj = try rt.heap.newObject(proto);
+    root_buf[1] = .{ .object = err_obj };
+    try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("message"), .{ .value = root_buf[0], .enumerable = false });
+    return root_buf[1];
+}
+
+fn errorCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return errorConstruct(rt, args);
+}
+fn errorConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    return .{ .object = try buildError(rt, r.error_prototype, arg(args, 0), arg(args, 1)) };
+}
+
+fn typeErrorCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return typeErrorConstruct(rt, args);
+}
+fn typeErrorConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    return .{ .object = try buildError(rt, r.type_error_prototype, arg(args, 0), arg(args, 1)) };
+}
+
+fn rangeErrorCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return rangeErrorConstruct(rt, args);
+}
+fn rangeErrorConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    return .{ .object = try buildError(rt, r.range_error_prototype, arg(args, 0), arg(args, 1)) };
+}
+
+fn syntaxErrorCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return syntaxErrorConstruct(rt, args);
+}
+fn syntaxErrorConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    return .{ .object = try buildError(rt, r.syntax_error_prototype, arg(args, 0), arg(args, 1)) };
+}
+
+fn referenceErrorCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return referenceErrorConstruct(rt, args);
+}
+fn referenceErrorConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    return .{ .object = try buildError(rt, r.reference_error_prototype, arg(args, 0), arg(args, 1)) };
+}
+
+fn evalErrorCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return evalErrorConstruct(rt, args);
+}
+fn evalErrorConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    return .{ .object = try buildError(rt, r.eval_error_prototype, arg(args, 0), arg(args, 1)) };
+}
+
+fn uriErrorCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return uriErrorConstruct(rt, args);
+}
+fn uriErrorConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    return .{ .object = try buildError(rt, r.uri_error_prototype, arg(args, 0), arg(args, 1)) };
+}
+
+fn aggregateErrorCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return aggregateErrorConstruct(rt, args);
+}
+fn aggregateErrorConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    const errors_arg = arg(args, 0);
+    const msg_arg = arg(args, 1);
+    const opts_arg = arg(args, 2);
+
+    var root_buf = [_]Value{ errors_arg, msg_arg, opts_arg, .undefined, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const err_obj = try buildError(rt, r.aggregate_error_prototype, msg_arg, opts_arg);
+    root_buf[3] = .{ .object = err_obj };
+
+    const errors_arr = try rt.heap.newArray(r.array_prototype);
+    root_buf[4] = .{ .object = errors_arr };
+
+    const iter = try getIterator(rt, errors_arg);
+    root_buf[5] = .{ .object = iter };
+
+    while (try iteratorNextVal(rt, iter)) |elem| {
+        root_buf[6] = elem;
+        try rt.heap.appendElement(errors_arr, elem);
+        root_buf[6] = .undefined;
+    }
+
+    try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("errors"), .{ .value = root_buf[4], .enumerable = false });
+    return root_buf[3];
 }

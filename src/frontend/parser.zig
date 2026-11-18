@@ -746,7 +746,12 @@ const Parser = struct {
         var saw_nullish = false;
         while (true) {
             if (p.tok.tag == .eq2 or p.tok.tag == .neq2) return p.fail(.{ .unsupported = .loose_equality }, p.tok);
-            const info: Infix = if (!p.no_in and p.isText(p.tok, "in")) .{ .op = .in, .bp = 7 } else infix(p.tok.tag) orelse break;
+            const info: Infix = if (!p.no_in and p.isText(p.tok, "in"))
+                .{ .op = .in, .bp = 7 }
+            else if (p.isText(p.tok, "instanceof"))
+                .{ .op = .instanceof, .bp = 7 }
+            else
+                infix(p.tok.tag) orelse break;
             if (info.bp < min_bp) break;
             // JS forbids mixing `??` with `&&` or `||` without parentheses; the RHS of `??`
             // is a BitwiseORExpression (bp 3), so `a ?? b && c` falls through to `saw_nullish`.

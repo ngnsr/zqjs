@@ -24,6 +24,22 @@ pub const Builtin = enum {
     iterator_prototype,
     math,
     json,
+    error_constructor,
+    error_prototype,
+    type_error_constructor,
+    type_error_prototype,
+    range_error_constructor,
+    range_error_prototype,
+    syntax_error_constructor,
+    syntax_error_prototype,
+    reference_error_constructor,
+    reference_error_prototype,
+    eval_error_constructor,
+    eval_error_prototype,
+    uri_error_constructor,
+    uri_error_prototype,
+    aggregate_error_constructor,
+    aggregate_error_prototype,
 };
 
 /// Whether node gives `b` an own property called `name`.
@@ -49,6 +65,22 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .iterator_prototype => iterator_prototype.has(name),
         .math => math.has(name),
         .json => json.has(name),
+        .error_constructor => error_constructor.has(name),
+        .error_prototype => error_prototype.has(name),
+        .type_error_constructor => type_error_constructor.has(name),
+        .type_error_prototype => type_error_prototype.has(name),
+        .range_error_constructor => range_error_constructor.has(name),
+        .range_error_prototype => range_error_prototype.has(name),
+        .syntax_error_constructor => syntax_error_constructor.has(name),
+        .syntax_error_prototype => syntax_error_prototype.has(name),
+        .reference_error_constructor => reference_error_constructor.has(name),
+        .reference_error_prototype => reference_error_prototype.has(name),
+        .eval_error_constructor => eval_error_constructor.has(name),
+        .eval_error_prototype => eval_error_prototype.has(name),
+        .uri_error_constructor => uri_error_constructor.has(name),
+        .uri_error_prototype => uri_error_prototype.has(name),
+        .aggregate_error_constructor => aggregate_error_constructor.has(name),
+        .aggregate_error_prototype => aggregate_error_prototype.has(name),
     };
 }
 
@@ -469,4 +501,104 @@ const json = std.StaticStringMap(void).initComptime(.{
     .{"parse"},
     .{"rawJSON"},
     .{"stringify"},
+});
+
+const error_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"captureStackTrace"},
+    .{"isError"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+    .{"stackTraceLimit"},
+});
+
+const error_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"message"},
+    .{"name"},
+    .{"toString"},
+});
+
+const type_error_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const type_error_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"message"},
+    .{"name"},
+});
+
+const range_error_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const range_error_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"message"},
+    .{"name"},
+});
+
+const syntax_error_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const syntax_error_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"message"},
+    .{"name"},
+});
+
+const reference_error_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const reference_error_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"message"},
+    .{"name"},
+});
+
+const eval_error_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const eval_error_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"message"},
+    .{"name"},
+});
+
+const uri_error_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const uri_error_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"message"},
+    .{"name"},
+});
+
+const aggregate_error_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const aggregate_error_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"message"},
+    .{"name"},
 });

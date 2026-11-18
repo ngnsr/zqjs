@@ -1,0 +1,63 @@
+Error Error boom true true Error boom true Error  0 0
+Error: boom Error: boom Error: boom
+Error: boom
+Error
+TypeError TypeError boom true true TypeError boom true TypeError  0 0
+TypeError: boom TypeError: boom TypeError: boom
+TypeError: boom
+TypeError
+RangeError RangeError boom true true RangeError boom true RangeError  0 0
+RangeError: boom RangeError: boom RangeError: boom
+RangeError: boom
+RangeError
+SyntaxError SyntaxError boom true true SyntaxError boom true SyntaxError  0 0
+SyntaxError: boom SyntaxError: boom SyntaxError: boom
+SyntaxError: boom
+SyntaxError
+ReferenceError ReferenceError boom true true ReferenceError boom true ReferenceError  0 0
+ReferenceError: boom ReferenceError: boom ReferenceError: boom
+ReferenceError: boom
+ReferenceError
+EvalError EvalError boom true true EvalError boom true EvalError  0 0
+EvalError: boom EvalError: boom EvalError: boom
+EvalError: boom
+EvalError
+URIError URIError boom true true URIError boom true URIError  0 0
+URIError: boom URIError: boom URIError: boom
+URIError: boom
+URIError
+true
+true
+true
+true
+true
+true
+true
+true
+true Error
+true Error: 123
+[object Object] Error: [object Object]
+42 true 0
+true true
+false
+false false
+inherited true
+AggregateError many root true 1,2 true
+AggregateError set a,b AggregateError: set
+AggregateError  x,y AggregateError
+agg non-iter: true TypeError
+empty name: msg
+empty msg: Error
+both empty: true
+undef name: Error: m
+undef msg: Custom
+toString non-obj: true
+[object Object] 1,2
+[object Object] 1,2
+engine TypeError: true true true TypeError TypeError
+engine ReferenceError: true true true ReferenceError
+engine RangeError: true true true RangeError
+engine SyntaxError: true true true SyntaxError
+map throw: true true TypeError
+self-res: true true true TypeError
+Promise.any: true true true r1,r2 AggregateError: All promises were rejected

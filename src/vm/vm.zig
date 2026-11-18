@@ -674,7 +674,7 @@ pub const Vm = struct {
                 try cache.push(vm, vm.frame().this orelse return rt.fail(.sloppy_this));
             },
 
-            .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in => {
+            .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in, .instanceof => {
                 // M10.2b/M10.2c: fast path when both operands are already `.number` (`f64`),
                 // matching IEEE-754 / JS semantics for NaN, infinities, and -0. All mixed or
                 // out-of-domain cases fall back to `ops.binary`.
@@ -698,7 +698,7 @@ pub const Vm = struct {
                     .ge => .{ .boolean = lhs.number >= rhs.number },
                     .strict_eq => .{ .boolean = lhs.number == rhs.number },
                     .strict_ne => .{ .boolean = lhs.number != rhs.number },
-                    .pow, .in => try ops.binary(rt, binaryOp(op), lhs, rhs),
+                    .pow, .in, .instanceof => try ops.binary(rt, binaryOp(op), lhs, rhs),
                     else => unreachable,
                 } else try ops.binary(rt, binaryOp(op), lhs, rhs);
                 cache.sp -= 1;
@@ -1079,6 +1079,7 @@ fn binaryOp(op: Op) BinaryOp {
         .strict_eq => .strict_eq,
         .strict_ne => .strict_ne,
         .in => .in,
+        .instanceof => .instanceof,
         else => unreachable,
     };
 }

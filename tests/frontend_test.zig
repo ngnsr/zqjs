@@ -98,6 +98,46 @@ test "M26: cover grammar keeps deeply nested parens/arrays/objects followed by =
     try testing.expect(t_nested < 30 * t_flat);
 }
 
+test "M27: 200 nested try/finally with return compiles linearly in time and code size" {
+    const depth = 200;
+    var flat: std.ArrayList(u8) = .empty;
+    defer flat.deinit(testing.allocator);
+    try flat.appendSlice(testing.allocator, "function f() { ");
+    for (0..depth) |_| try flat.appendSlice(testing.allocator, "try { } finally { let x = 1; } ");
+    try flat.appendSlice(testing.allocator, "return 1; }");
+
+    var nested: std.ArrayList(u8) = .empty;
+    defer nested.deinit(testing.allocator);
+    try nested.appendSlice(testing.allocator, "function f() { ");
+    for (0..depth) |_| try nested.appendSlice(testing.allocator, "try { ");
+    try nested.appendSlice(testing.allocator, "return 1;");
+    for (0..depth) |_| try nested.appendSlice(testing.allocator, " } finally { let x = 1; }");
+    try nested.appendSlice(testing.allocator, " }");
+
+    const compileOnce = struct {
+        fn run(src: []const u8) !struct { nanos: i96, code_len: usize } {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            var d: Diagnostic = .{};
+            const script = try parse(arena.allocator(), src, .{}, &d);
+            const res = try zqjs.resolve(arena.allocator(), script, &d);
+            var h = zqjs.heap.Heap.init(testing.allocator, .{});
+            defer h.deinit();
+            const start = std.Io.Timestamp.now(testing.io, .awake);
+            var proto = try zqjs.compile(testing.allocator, &h, script, res, .{}, &d);
+            defer proto.deinit(testing.allocator);
+            const elapsed = start.durationTo(std.Io.Timestamp.now(testing.io, .awake)).toNanoseconds();
+            return .{ .nanos = elapsed, .code_len = proto.functions[0].code.len };
+        }
+    }.run;
+
+    const r_flat = try compileOnce(flat.items);
+    const r_nested = try compileOnce(nested.items);
+    try testing.expect(r_nested.nanos < 20 * @max(r_flat.nanos, 1));
+    // Each finally level is a constant number of bytes (~80-120 bytes); exponential would be > 2^200.
+    try testing.expect(r_nested.code_len < depth * 256);
+}
+
 fn fuzzOne(_: void, smith: *testing.Smith) anyerror!void {
     var buf: [1024]u8 = undefined;
     try frontendOnce(testing.allocator, buf[0..smith.slice(&buf)], .{ .max_nesting_depth = 64 });

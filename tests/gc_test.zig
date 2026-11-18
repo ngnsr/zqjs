@@ -582,6 +582,46 @@ test "garbage under a small limit: the tree-walker runs to its step budget too" 
     }
 }
 
+test "M27: abrupt exit from finally clears pending_value so large object is collectible" {
+    for ([_][]const u8{
+        // Abrupt break from finally clears pending_value (return value).
+        \\function f() {
+        \\  for (let i = 0; i < 1; i++) {
+        \\    let big = 'a';
+        \\    for (let j = 0; j < 14; j++) big = big + big;
+        \\    try { return big; } finally { break; }
+        \\  }
+        \\  let big2 = 'b';
+        \\  for (let j = 0; j < 14; j++) big2 = big2 + big2;
+        \\  return big2.length;
+        \\}
+        \\print(f());
+        ,
+        // Exception thrown in finally clears pending_value via the finally catch-all handler.
+        \\function f() {
+        \\  try {
+        \\    let big = 'a';
+        \\    for (let j = 0; j < 14; j++) big = big + big;
+        \\    try { return big; } finally { throw 'abort'; }
+        \\  } catch (e) {}
+        \\  let big2 = 'b';
+        \\  for (let j = 0; j < 14; j++) big2 = big2 + big2;
+        \\  return big2.length;
+        \\}
+        \\print(f());
+        ,
+    }) |source| {
+        var got: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer got.deinit();
+        var discard: std.Io.Writer.Discarding = .init(&.{});
+        var dbg: ProgramAllocator = .init;
+        defer endProgram(&dbg);
+        _ = try zqjs.runSource(dbg.allocator(), "t", source, .{ .max_heap_bytes = 96 << 10, .max_steps = 50_000 }, .{ .mode = .harness, .engine = .vm }, &got.writer, &discard.writer);
+        try testing.expectEqualStrings("16384\n", got.written());
+        try testing.expectEqualStrings("", discard.writer.buffered());
+    }
+}
+
 // ---------------------------------------------------------------- P3: stress infrastructure
 
 test "the heap verifier passes after real collections and catches each kind of corruption" {

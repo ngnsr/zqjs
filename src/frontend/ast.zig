@@ -332,7 +332,8 @@ pub const Stmt = struct {
         @"try": struct {
             body: []const Stmt,
             catch_param: ?*const Pattern,
-            catch_body: []const Stmt,
+            catch_body: ?[]const Stmt,
+            finally_body: ?[]const Stmt,
         },
     };
 };

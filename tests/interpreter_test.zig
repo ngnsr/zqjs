@@ -797,3 +797,75 @@ test "M25: instanceof user-defined function fails with Unsupported(function_prop
     try expectUnsupported("function F() {} ({}) instanceof F;", "", "Unsupported(function_properties)");
     try expectUnsupported("const F = () => {}; ({}) instanceof F;", "", "Unsupported(function_properties)");
 }
+
+test "M27: LimitExceeded(steps) skips finally on both engines" {
+    const src =
+        \\try {
+        \\  while (true) {}
+        \\} finally {
+        \\  print('should_not_run');
+        \\}
+    ;
+    for ([_]zqjs.Engine{ .treewalk, .vm }) |engine| {
+        var r = try support.run(testing.allocator, src, .{ .max_steps = 500 }, engine, .harness);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("t.js: LimitExceeded(steps)\n", r.out);
+        try testing.expectEqualStrings("", r.err);
+    }
+}
+
+test "M27: nested try/catch/finally OOM safety" {
+    const src =
+        \\function f(x) {
+        \\  try {
+        \\    try {
+        \\      if (x === 0) throw { msg: 'err' + x };
+        \\      return 'ok' + x;
+        \\    } catch (e) {
+        \\      if (x === 0) throw e;
+        \\    } finally {
+        \\      let a = [1, 2];
+        \\      a.push(3);
+        \\    }
+        \\  } catch (e) {
+        \\    return e.msg;
+        \\  } finally {
+        \\    let b = 'done';
+        \\  }
+        \\}
+        \\f(0);
+        \\f(1);
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var d: Diagnostic = .{};
+    const script = try zqjs.parse(arena.allocator(), src, .{}, &d);
+    const res = try zqjs.resolve(arena.allocator(), script, &d);
+    for ([_]zqjs.Engine{ .treewalk, .vm }) |engine| {
+        const Ctx = struct {
+            script: zqjs.ast.Script,
+            res: zqjs.Resolution,
+            engine: zqjs.Engine,
+            fn runOnce(alloc: Allocator, ctx: @This()) !void {
+                var out: std.Io.Writer.Allocating = .init(alloc);
+                defer out.deinit();
+                var rt = Runtime.init(alloc, .{}, &out.writer);
+                defer rt.deinit();
+                switch (ctx.engine) {
+                    .treewalk => try zqjs.interpret(&rt, ctx.script, ctx.res),
+                    .vm => {
+                        var d_local: Diagnostic = .{};
+                        var proto = try zqjs.compile(rt.gpa, &rt.heap, ctx.script, ctx.res, .{}, &d_local);
+                        defer proto.deinit(rt.gpa);
+                        var f_local: zqjs.verify.Failure = .{};
+                        _ = try zqjs.verify.verify(rt.gpa, &proto, .{}, &f_local);
+                        var vm = try zqjs.Vm.init(&rt, &proto);
+                        defer vm.deinit();
+                        try vm.run();
+                    },
+                }
+            }
+        };
+        try std.testing.checkAllAllocationFailures(testing.allocator, Ctx.runOnce, .{Ctx{ .script = script, .res = res, .engine = engine }});
+    }
+}

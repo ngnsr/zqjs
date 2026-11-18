@@ -144,6 +144,8 @@ Statement         := ';'                                   (empty statement)
                    | 'for' '(' ForInit? ';' Expression? ';' Expression? ')' Statement
                    | 'break' ';' | 'continue' ';'          (break in loop/switch; continue in loop)
                    | 'return' Expression? ';'              (only inside a function)
+                   | 'throw' Expression ';'
+                   | 'try' Block (('catch' ('(' BindingPattern ')')? Block) ('finally' Block)? | 'finally' Block)
                    | Expression ';'
 CaseClause        := ('case' Expression | 'default') ':' StatementListItem*
 ForInit           := ('let' | 'const') Declarator (',' Declarator)* | Expression
@@ -345,3 +347,14 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
   heads, `catch` parameters, and plain assignment expressions (`[a, b] = [b, a]`, `({ a } = o)`).
   Spread (`...xs`) is supported in array literals, object literals (`null`/`undefined` spread
   nothing), calls (preserving `this` on method calls), and `new` calls.
+
+### `try` / `catch` / `finally` (M11.2, M27)
+- `try { ... } catch [(e)] { ... }`, `try { ... } finally { ... }`, and
+  `try { ... } catch [(e)] { ... } finally { ... }`. `try {}` with neither `catch` nor
+  `finally` is a `SyntaxError`, as is `finally` without `try`.
+- `finally` always runs on normal completion, `return`, `break`, `continue`, and JS `throw`.
+  An abrupt completion in `finally` (`return`, `break`, `continue`, `throw`) overrides the
+  pending completion; otherwise the pending completion is re-performed after `finally` finishes.
+- **Uncatchable faults skip `finally`:** `LimitExceeded`, `OutOfMemory`, `Unsupported`, and
+  `Internal` are not JS exceptions; they skip both `catch` and `finally` and unwind directly
+  to the host.

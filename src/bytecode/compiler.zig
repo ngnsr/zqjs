@@ -112,6 +112,56 @@ const Loop = struct {
     continues: std.ArrayList(u32) = .empty,
 };
 
+const JumpTarget = union(enum) {
+    loop_break: *Loop,
+    loop_continue: *Loop,
+    switch_break: *std.ArrayList(u32),
+
+    fn eql(a: JumpTarget, b: JumpTarget) bool {
+        return switch (a) {
+            .loop_break => |pa| b == .loop_break and pa == b.loop_break,
+            .loop_continue => |pa| b == .loop_continue and pa == b.loop_continue,
+            .switch_break => |pa| b == .switch_break and pa == b.switch_break,
+        };
+    }
+
+    fn append(self: JumpTarget, gpa: std.mem.Allocator, j: u32) !void {
+        switch (self) {
+            .loop_break => |l| try l.breaks.append(gpa, j),
+            .loop_continue => |l| try l.continues.append(gpa, j),
+            .switch_break => |s| try s.append(gpa, j),
+        }
+    }
+};
+
+const FinallyContext = struct {
+    kind_slot: u32,
+    val_slot: u32,
+    to_finally: std.ArrayList(u32) = .empty,
+    jumps: std.ArrayList(JumpTarget) = .empty,
+    has_return: bool = false,
+
+    fn deinit(fc: *FinallyContext, gpa: std.mem.Allocator) void {
+        fc.to_finally.deinit(gpa);
+        fc.jumps.deinit(gpa);
+    }
+
+    fn addJump(fc: *FinallyContext, gpa: std.mem.Allocator, jt: JumpTarget) !u32 {
+        for (fc.jumps.items, 0..) |existing, i| {
+            if (existing.eql(jt)) return @intCast(3 + i);
+        }
+        try fc.jumps.append(gpa, jt);
+        return @intCast(3 + fc.jumps.items.len - 1);
+    }
+};
+
+const ControlContext = union(enum) {
+    loop: *Loop,
+    @"switch": *std.ArrayList(u32),
+    finally_region: *FinallyContext,
+    finally_body: *FinallyContext,
+};
+
 /// The compiler of one function (or the script).
 const Compiler = struct {
     s: *Shared,
@@ -135,10 +185,8 @@ const Compiler = struct {
     max_stack: u32 = 0,
     temp_depth: u32 = 0,
     max_temp: u32 = 0,
-    /// Active loop for `continue` (and `break` when not inside a `switch`).
-    loop: ?*Loop = null,
-    /// Active break target list (innermost loop or `switch`).
-    breaks: ?*std.ArrayList(u32) = null,
+    /// Active control contexts (loops, switches, finally regions/bodies), innermost last.
+    controls: std.ArrayList(ControlContext) = .empty,
     /// Span of the statement being compiled, for limit diagnostics.
     span: ast.Span = .{ .start = 0, .end = 0 },
 
@@ -155,6 +203,7 @@ const Compiler = struct {
         for (c.functions.items) |*f| f.deinit(gpa);
         c.functions.deinit(gpa);
         c.handlers.deinit(gpa);
+        c.controls.deinit(gpa);
     }
 
     /// Moves everything into a Proto. On failure nothing has moved, so `deinit` still
@@ -403,7 +452,7 @@ const Compiler = struct {
             .block => |stmts| return c.statements(stmts, s.span),
             .@"return" => |v| {
                 if (v) |e| try c.expr(e) else try c.emit(.push_undefined, &.{});
-                try c.emit(.@"return", &.{});
+                try c.emitReturn();
                 return false;
             },
             .throw => |e| {
@@ -411,33 +460,7 @@ const Compiler = struct {
                 try c.emit(.throw, &.{});
                 return false;
             },
-            .@"try" => |t| {
-                const try_depth = c.depth;
-                const try_start = c.here();
-                const try_completes = try c.statements(t.body, s.span);
-                const try_end = c.here();
-                const to_end = if (try_completes) try c.jumpForward(.jump) else null;
-                const catch_pc = c.here();
-                c.depth = try_depth;
-                if (t.catch_param) |cp| {
-                    c.depth += 1;
-                    c.max_stack = @max(c.max_stack, c.depth);
-                    try c.enterPatternBindings(cp);
-                    try c.bindPattern(cp, .init);
-                }
-                const catch_completes = try c.statements(t.catch_body, s.span);
-                if (to_end) |j| c.patch(j, c.here());
-                if (try_end > try_start) {
-                    try c.handlers.append(c.s.gpa, .{
-                        .try_start = try_start,
-                        .try_end = try_end,
-                        .catch_pc = catch_pc,
-                        .stack_depth = try_depth,
-                        .has_binding = t.catch_param != null,
-                    });
-                }
-                return try_completes or catch_completes;
-            },
+            .@"try" => |t| return c.compileTry(t, s.span),
             .@"if" => |i| {
                 try c.expr(i.cond);
                 const to_else = try c.jumpForward(.jump_if_false);
@@ -566,16 +589,261 @@ const Compiler = struct {
             },
             // The parser guarantees break/continue only occur inside loops (or switch for break).
             .@"break" => {
-                const j = try c.jumpForward(.jump);
-                try c.breaks.?.append(c.s.gpa, j);
+                var i = c.controls.items.len;
+                const jt: JumpTarget = while (i > 0) {
+                    i -= 1;
+                    switch (c.controls.items[i]) {
+                        .loop => |l| break .{ .loop_break = l },
+                        .@"switch" => |sb| break .{ .switch_break = sb },
+                        .finally_region, .finally_body => {},
+                    }
+                } else unreachable;
+                try c.emitJump(jt);
                 return false;
             },
             .@"continue" => {
-                const j = try c.jumpForward(.jump);
-                try c.loop.?.continues.append(c.s.gpa, j);
+                var i = c.controls.items.len;
+                const jt: JumpTarget = while (i > 0) {
+                    i -= 1;
+                    switch (c.controls.items[i]) {
+                        .loop => |l| break .{ .loop_continue = l },
+                        .@"switch", .finally_region, .finally_body => {},
+                    }
+                } else unreachable;
+                try c.emitJump(jt);
                 return false;
             },
         }
+        return true;
+    }
+
+    fn emitReturn(c: *Compiler) Error!void {
+        var i = c.controls.items.len;
+        while (i > 0) {
+            i -= 1;
+            switch (c.controls.items[i]) {
+                .finally_body => |fb| {
+                    try c.emit(.clear_local, &.{fb.kind_slot});
+                    try c.emit(.clear_local, &.{fb.val_slot});
+                },
+                .finally_region => |fr| {
+                    fr.has_return = true;
+                    try c.emit(.init_local, &.{fr.val_slot});
+                    try c.emit(.push_const, &.{try c.number(2)});
+                    try c.emit(.init_local, &.{fr.kind_slot});
+                    try fr.to_finally.append(c.s.gpa, try c.jumpForward(.jump));
+                    return;
+                },
+                .loop, .@"switch" => {},
+            }
+        }
+        try c.emit(.@"return", &.{});
+    }
+
+    fn emitJump(c: *Compiler, jt: JumpTarget) Error!void {
+        var i = c.controls.items.len;
+        while (i > 0) {
+            i -= 1;
+            switch (c.controls.items[i]) {
+                .loop => |l| switch (jt) {
+                    .loop_break => |tl| if (l == tl) {
+                        try jt.append(c.s.gpa, try c.jumpForward(.jump));
+                        return;
+                    },
+                    .loop_continue => |tl| if (l == tl) {
+                        try jt.append(c.s.gpa, try c.jumpForward(.jump));
+                        return;
+                    },
+                    .switch_break => {},
+                },
+                .@"switch" => |sb| switch (jt) {
+                    .switch_break => |ts| if (sb == ts) {
+                        try jt.append(c.s.gpa, try c.jumpForward(.jump));
+                        return;
+                    },
+                    .loop_break, .loop_continue => {},
+                },
+                .finally_body => |fb| {
+                    try c.emit(.clear_local, &.{fb.kind_slot});
+                    try c.emit(.clear_local, &.{fb.val_slot});
+                },
+                .finally_region => |fr| {
+                    const kind_id = try fr.addJump(c.s.gpa, jt);
+                    try c.emit(.push_const, &.{try c.number(@floatFromInt(kind_id))});
+                    try c.emit(.init_local, &.{fr.kind_slot});
+                    try fr.to_finally.append(c.s.gpa, try c.jumpForward(.jump));
+                    return;
+                },
+            }
+        }
+        unreachable;
+    }
+
+    fn compileTryCatch(c: *Compiler, t: @FieldType(ast.Stmt.Data, "try"), span: ast.Span) Error!bool {
+        const cb = t.catch_body orelse return c.statements(t.body, span);
+        const try_depth = c.depth;
+        const try_start = c.here();
+        const try_completes = try c.statements(t.body, span);
+        const try_end = c.here();
+        const to_end = if (try_completes) try c.jumpForward(.jump) else null;
+        const catch_pc = c.here();
+        c.depth = try_depth;
+        if (t.catch_param) |cp| {
+            c.depth += 1;
+            c.max_stack = @max(c.max_stack, c.depth);
+            try c.enterPatternBindings(cp);
+            try c.bindPattern(cp, .init);
+        }
+        const catch_completes = try c.statements(cb, span);
+        if (to_end) |j| c.patch(j, c.here());
+        if (try_end > try_start) {
+            try c.handlers.append(c.s.gpa, .{
+                .try_start = try_start,
+                .try_end = try_end,
+                .catch_pc = catch_pc,
+                .stack_depth = try_depth,
+                .has_binding = t.catch_param != null,
+            });
+        }
+        return try_completes or catch_completes;
+    }
+
+    fn compileTry(c: *Compiler, t: @FieldType(ast.Stmt.Data, "try"), span: ast.Span) Error!bool {
+        const fb = t.finally_body orelse return c.compileTryCatch(t, span);
+        const kind_slot = c.allocTemp();
+        const val_slot = c.allocTemp();
+        defer {
+            c.freeTemp();
+            c.freeTemp();
+        }
+        var fc: FinallyContext = .{ .kind_slot = kind_slot, .val_slot = val_slot };
+        defer fc.deinit(c.s.gpa);
+
+        const try_depth = c.depth;
+        try c.controls.append(c.s.gpa, .{ .finally_region = &fc });
+        const region_start = c.here();
+        const region_completes = blk: {
+            errdefer _ = c.controls.pop();
+            const ok = try c.compileTryCatch(t, span);
+            _ = c.controls.pop();
+            break :blk ok;
+        };
+        const region_end = c.here();
+
+        const to_finally_normal = if (region_completes) blk: {
+            try c.emit(.push_const, &.{try c.number(0)});
+            try c.emit(.init_local, &.{kind_slot});
+            break :blk if (region_end > region_start) try c.jumpForward(.jump) else null;
+        } else null;
+
+        if (region_end > region_start) {
+            const region_catch_pc = c.here();
+            std.debug.assert(region_catch_pc < region_start or region_catch_pc >= region_end);
+            c.depth = try_depth + 1;
+            c.max_stack = @max(c.max_stack, c.depth);
+            try c.emit(.init_local, &.{val_slot});
+            try c.emit(.push_const, &.{try c.number(1)});
+            try c.emit(.init_local, &.{kind_slot});
+            try c.handlers.append(c.s.gpa, .{
+                .try_start = region_start,
+                .try_end = region_end,
+                .catch_pc = region_catch_pc,
+                .stack_depth = try_depth,
+                .has_binding = true,
+            });
+        }
+
+        const finally_pc = c.here();
+        c.depth = try_depth;
+        if (to_finally_normal) |j| c.patch(j, finally_pc);
+        for (fc.to_finally.items) |j| c.patch(j, finally_pc);
+
+        try c.controls.append(c.s.gpa, .{ .finally_body = &fc });
+        const fin_start = c.here();
+        const fin_completes = blk: {
+            errdefer _ = c.controls.pop();
+            const ok = try c.statements(fb, span);
+            _ = c.controls.pop();
+            break :blk ok;
+        };
+        const fin_end = c.here();
+
+        if (fin_end > fin_start) {
+            const to_dispatch = if (fin_completes) try c.jumpForward(.jump) else null;
+            const fin_catch_pc = c.here();
+            std.debug.assert(fin_catch_pc < fin_start or fin_catch_pc >= fin_end);
+            c.depth = try_depth + 1;
+            c.max_stack = @max(c.max_stack, c.depth);
+            try c.emit(.clear_local, &.{kind_slot});
+            try c.emit(.clear_local, &.{val_slot});
+            try c.emit(.throw, &.{});
+            try c.handlers.append(c.s.gpa, .{
+                .try_start = fin_start,
+                .try_end = fin_end,
+                .catch_pc = fin_catch_pc,
+                .stack_depth = try_depth,
+                .has_binding = true,
+            });
+            if (to_dispatch) |j| c.patch(j, c.here());
+        }
+
+        if (!fin_completes) return false;
+        c.depth = try_depth;
+
+        const has_throw = region_end > region_start;
+        const total_abrupt: usize = @as(usize, @intFromBool(has_throw)) + @as(usize, @intFromBool(fc.has_return)) + fc.jumps.items.len;
+        var emitted: usize = 0;
+
+        if (has_throw) {
+            emitted += 1;
+            const is_last_unconditional = !region_completes and emitted == total_abrupt;
+            const next = if (!is_last_unconditional) blk: {
+                try c.emit(.get_local, &.{ kind_slot, try c.name("<pending>") });
+                try c.emit(.push_const, &.{try c.number(1)});
+                try c.emit(.strict_eq, &.{});
+                break :blk try c.jumpForward(.jump_if_false);
+            } else null;
+            try c.emit(.get_local, &.{ val_slot, try c.name("<pending>") });
+            try c.emit(.clear_local, &.{kind_slot});
+            try c.emit(.clear_local, &.{val_slot});
+            try c.emit(.throw, &.{});
+            if (next) |j| c.patch(j, c.here());
+            c.depth = try_depth;
+        }
+        if (fc.has_return) {
+            emitted += 1;
+            const is_last_unconditional = !region_completes and emitted == total_abrupt;
+            const next = if (!is_last_unconditional) blk: {
+                try c.emit(.get_local, &.{ kind_slot, try c.name("<pending>") });
+                try c.emit(.push_const, &.{try c.number(2)});
+                try c.emit(.strict_eq, &.{});
+                break :blk try c.jumpForward(.jump_if_false);
+            } else null;
+            try c.emit(.get_local, &.{ val_slot, try c.name("<pending>") });
+            try c.emit(.clear_local, &.{kind_slot});
+            try c.emit(.clear_local, &.{val_slot});
+            try c.emitReturn();
+            if (next) |j| c.patch(j, c.here());
+            c.depth = try_depth;
+        }
+        for (fc.jumps.items, 0..) |jt, idx| {
+            emitted += 1;
+            const is_last_unconditional = !region_completes and emitted == total_abrupt;
+            const next = if (!is_last_unconditional) blk: {
+                try c.emit(.get_local, &.{ kind_slot, try c.name("<pending>") });
+                try c.emit(.push_const, &.{try c.number(@floatFromInt(3 + idx))});
+                try c.emit(.strict_eq, &.{});
+                break :blk try c.jumpForward(.jump_if_false);
+            } else null;
+            try c.emit(.clear_local, &.{kind_slot});
+            try c.emit(.clear_local, &.{val_slot});
+            try c.emitJump(jt);
+            if (next) |j| c.patch(j, c.here());
+            c.depth = try_depth;
+        }
+        if (!region_completes) return false;
+        try c.emit(.clear_local, &.{kind_slot});
+        try c.emit(.clear_local, &.{val_slot});
         return true;
     }
 
@@ -611,9 +879,8 @@ const Compiler = struct {
 
         var switch_breaks: std.ArrayList(u32) = .empty;
         defer switch_breaks.deinit(c.s.gpa);
-        const outer_breaks = c.breaks;
-        c.breaks = &switch_breaks;
-        defer c.breaks = outer_breaks;
+        try c.controls.append(c.s.gpa, .{ .@"switch" = &switch_breaks });
+        defer _ = c.controls.pop();
 
         var last_completes = true;
         for (sw.cases, 0..) |cs, i| {
@@ -653,14 +920,8 @@ const Compiler = struct {
     }
 
     fn loopBody(c: *Compiler, loop: *Loop, body: ast.Stmt) Error!bool {
-        const outer_loop = c.loop;
-        const outer_breaks = c.breaks;
-        c.loop = loop;
-        c.breaks = &loop.breaks;
-        defer {
-            c.loop = outer_loop;
-            c.breaks = outer_breaks;
-        }
+        try c.controls.append(c.s.gpa, .{ .loop = loop });
+        defer _ = c.controls.pop();
         return c.stmt(body);
     }
 

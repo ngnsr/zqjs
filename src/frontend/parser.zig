@@ -467,28 +467,42 @@ const Parser = struct {
         return .{ .span = span(t, end), .data = .{ .throw = value } };
     }
 
-    /// `try { ... } catch [(e)] { ... }`. `finally` is Unsupported.
+    /// `try { ... } [catch [(e)] { ... }] [finally { ... }]`.
     fn tryStatement(p: *Parser) Error!ast.Stmt {
         const start = p.tok.start;
         try p.advance(); // `try`
         if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{' after try" }, p.tok);
         const try_blk = try p.block();
-        if (p.isText(p.tok, "finally")) return p.fail(.{ .unsupported = .syntax }, p.tok);
-        if (!p.isText(p.tok, "catch")) return p.fail(.{ .syntax_error = "missing catch or finally after try" }, p.tok);
-        try p.advance(); // `catch`
+        var end = try_blk.span.end;
         var param: ?*const ast.Pattern = null;
-        if (p.tok.tag == .l_paren) {
-            try p.advance();
-            param = try p.parseBindingPattern(false);
-            if (p.tok.tag != .r_paren) return p.fail(.{ .syntax_error = "expected ')' after catch parameter" }, p.tok);
-            try p.advance();
+        var catch_body: ?[]const ast.Stmt = null;
+        if (p.isText(p.tok, "catch")) {
+            try p.advance(); // `catch`
+            if (p.tok.tag == .l_paren) {
+                try p.advance();
+                param = try p.parseBindingPattern(false);
+                if (p.tok.tag != .r_paren) return p.fail(.{ .syntax_error = "expected ')' after catch parameter" }, p.tok);
+                try p.advance();
+            }
+            if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{' after catch" }, p.tok);
+            const catch_blk = try p.block();
+            catch_body = catch_blk.data.block;
+            end = catch_blk.span.end;
         }
-        if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{' after catch" }, p.tok);
-        const catch_blk = try p.block();
-        if (p.isText(p.tok, "finally")) return p.fail(.{ .unsupported = .syntax }, p.tok);
+        var finally_body: ?[]const ast.Stmt = null;
+        if (p.isText(p.tok, "finally")) {
+            try p.advance(); // `finally`
+            if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{' after finally" }, p.tok);
+            const finally_blk = try p.block();
+            finally_body = finally_blk.data.block;
+            end = finally_blk.span.end;
+        }
+        if (catch_body == null and finally_body == null) {
+            return p.fail(.{ .syntax_error = "missing catch or finally after try" }, p.tok);
+        }
         return .{
-            .span = .{ .start = start, .end = catch_blk.span.end },
-            .data = .{ .@"try" = .{ .body = try_blk.data.block, .catch_param = param, .catch_body = catch_blk.data.block } },
+            .span = .{ .start = start, .end = end },
+            .data = .{ .@"try" = .{ .body = try_blk.data.block, .catch_param = param, .catch_body = catch_body, .finally_body = finally_body } },
         };
     }
 
@@ -1559,6 +1573,8 @@ const Parser = struct {
                 if (std.mem.eql(u8, name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
                 // `this`, `new`, `typeof`, `function`, … start constructs ZQJS lacks;
                 // `let` as a variable name is legal sloppy JS we choose not to support.
+                if (std.mem.eql(u8, name, "finally"))
+                    return p.fail(.{ .syntax_error = "unexpected token 'finally'" }, t);
                 if (token.reserved_identifiers.has(name) or std.mem.eql(u8, name, "let"))
                     return p.fail(.{ .unsupported = .syntax }, t);
                 try p.advance();

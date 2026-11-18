@@ -1,0 +1,44 @@
+t1
+f1
+t2
+f2
+caught2: err2
+t3
+f3
+retBasic: 33
+retOverride: 2
+throwOverrideRet: saved
+replaced: second
+try norm
+finally norm
+tcf norm: after
+try ret
+finally ret
+tcf ret: from_try
+try throw
+catch e_throw
+finally throw
+tcf throw: from_catch_ret
+try rethrow
+catch e_rethrow
+finally rethrow
+outer rethrow: e_rethrow
+try catch_throw
+catch e_catch_throw
+finally catch_throw
+outer catch_throw: from_catch
+while_break_fin 1
+after while: 1
+loop fin 0
+loop body end 0
+loop catch 1 skip
+loop fin 1
+loop fin 2
+obj identity: true
+closures: try:0,fin:0,try:1,catch:1:1,fin:1,try:2,fin:2
+map fin 10
+map fin 20
+map fin 30
+mapped: 11,40,31
+promise then fin 5
+promise res: 15

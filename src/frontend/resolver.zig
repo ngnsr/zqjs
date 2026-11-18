@@ -280,16 +280,19 @@ const Resolver = struct {
             .throw => |e| try r.expr(e),
             .@"try" => |t| {
                 try r.block(t.body, .block);
-                const saved = try r.enterScope();
-                defer r.exitScope(saved);
-                if (t.catch_param) |cp| try r.declarePattern(cp, .let, false, true, null);
-                for (t.catch_body) |cs| switch (cs.data) {
-                    .declaration => |decl| for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", false, true, null),
-                    .function => |f| try r.declare(f.name.?, .function, false, true, null),
-                    else => {},
-                };
-                if (t.catch_param) |cp| try r.resolvePatternExprs(cp);
-                for (t.catch_body) |cs| try r.stmt(cs);
+                if (t.catch_body) |cb| {
+                    const saved = try r.enterScope();
+                    defer r.exitScope(saved);
+                    if (t.catch_param) |cp| try r.declarePattern(cp, .let, false, true, null);
+                    for (cb) |cs| switch (cs.data) {
+                        .declaration => |decl| for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", false, true, null),
+                        .function => |f| try r.declare(f.name.?, .function, false, true, null),
+                        else => {},
+                    };
+                    if (t.catch_param) |cp| try r.resolvePatternExprs(cp);
+                    for (cb) |cs| try r.stmt(cs);
+                }
+                if (t.finally_body) |fb| try r.block(fb, .block);
             },
             .block => |stmts| try r.block(stmts, .block),
             .@"if" => |i| {

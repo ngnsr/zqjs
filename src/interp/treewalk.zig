@@ -362,21 +362,55 @@ const Interpreter = struct {
         return .normal;
     }
 
-    fn execTry(it: *Interpreter, t: @FieldType(ast.Stmt.Data, "try")) Error!Completion {
+    fn execTryRegion(it: *Interpreter, t: @FieldType(ast.Stmt.Data, "try")) Error!Completion {
         const saved = it.env;
+        defer it.env = saved;
         if (it.block(t.body)) |c| return c else |err| {
             if (err != error.Thrown) return err;
+            const cb = t.catch_body orelse return err;
             it.env = saved;
-            const val: ?Value = if (t.catch_param != null) try it.rt.catchValue() else blk: {
+            const balanced = it.mark();
+            defer it.release(balanced);
+            const val: ?Value = if (t.catch_param != null) blk: {
+                const v = try it.rt.catchValue();
+                try it.hold(v);
+                break :blk v;
+            } else blk: {
                 it.rt.clearThrown();
                 break :blk null;
             };
-            defer it.env = saved;
-            const catch_scope: ?u32 = (if (t.catch_param) |cp| it.patternScope(cp) else null) orelse it.scopeOf(t.catch_body);
+            const catch_scope: ?u32 = (if (t.catch_param) |cp| it.patternScope(cp) else null) orelse it.scopeOf(cb);
             try it.pushScope(catch_scope);
             if (t.catch_param) |cp| try it.bindPattern(cp, val.?, .init);
-            return it.body(t.catch_body);
+            return it.body(cb);
         }
+    }
+
+    fn execTry(it: *Interpreter, t: @FieldType(ast.Stmt.Data, "try")) Error!Completion {
+        const fb = t.finally_body orelse return it.execTryRegion(t);
+        const balanced = it.mark();
+        defer it.release(balanced);
+        var region_comp: ?Completion = null;
+        var region_ret: Value = .undefined;
+        var region_thrown: ?Value = null;
+        if (it.execTryRegion(t)) |c| {
+            region_comp = c;
+            if (c == .@"return") {
+                region_ret = it.ret;
+                try it.hold(region_ret);
+            }
+        } else |err| {
+            if (err != error.Thrown) return err;
+            const thrown = try it.rt.catchValue();
+            try it.hold(thrown);
+            region_thrown = thrown;
+        }
+        const fin_comp = try it.block(fb);
+        if (fin_comp != .normal) return fin_comp;
+        if (region_thrown) |v| return it.rt.throwValue(v);
+        const c = region_comp.?;
+        if (c == .@"return") it.ret = region_ret;
+        return c;
     }
 
     fn execFor(it: *Interpreter, f: @FieldType(ast.Stmt.Data, "for")) Error!Completion {

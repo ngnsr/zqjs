@@ -50,6 +50,12 @@ pub const Limits = struct {
     /// Nesting of built-in conversions that recurse in Zig: converting an array to a
     /// string converts its elements (`[[[…]]]`). LimitExceeded(conversion_depth).
     max_conversion_depth: u32 = 1_000,
+    /// Native stack the engines may use below the host's entry point, checked at every
+    /// native→JS crossing (a built-in or host native calling JS), each of which nests a
+    /// Zig run loop: 3.6–72 KB per crossing by engine and build mode. The host's thread
+    /// needs this plus ≥ 128 KiB of headroom; lower it on small threads.
+    /// LimitExceeded(native_stack) (DESIGN_DECISIONS D60).
+    max_native_stack_bytes: usize = 4 * 1024 * 1024,
     /// Host handles (M9.1, D50): maximum slot / concurrent handle capacity on this
     /// runtime — host-owned handles and engine-owned callback temporaries (native-call
     /// records, D53) alike. Released slots increment their 64-bit generation and return
@@ -77,6 +83,7 @@ pub const Limit = enum {
     interpreter_depth,
     conversion_depth,
     handles,
+    native_stack,
 };
 
 comptime {

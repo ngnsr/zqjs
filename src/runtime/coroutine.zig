@@ -50,6 +50,7 @@ pub fn start(
     ctx: anytype,
     comptime create_and_run: fn (@TypeOf(ctx), *Coroutine) Error!Outcome,
 ) Error!Value {
+    try rt.checkNativeStack(); // D60: the first step nests a run loop
     const r = try builtins.realm(rt);
     const p_obj = try rt.heap.newPromise(r.promise_prototype);
     var roots: CoroutineRoots = .{ .promise = p_obj };
@@ -74,6 +75,7 @@ pub fn resumeCoroutine(rt: *Runtime, co: *Coroutine, val: Value, rejected: bool)
     if (co.state == .done) return;
     std.debug.assert(co.state == .suspended);
     const eng = co.engine orelse return;
+    try rt.checkNativeStack(); // D60; co stays suspended on a fault
     co.state = .running;
     const resume_fn: ResumeFn = @ptrCast(@alignCast(co.vtable.@"resume"));
     const outcome = resume_fn(eng, val, rejected) catch |e| {

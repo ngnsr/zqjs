@@ -67,7 +67,8 @@ typedef enum zqjs_limit {
     ZQJS_LIMIT_STACK_SLOTS = 8,
     ZQJS_LIMIT_INTERPRETER_DEPTH = 9,
     ZQJS_LIMIT_CONVERSION_DEPTH = 10,
-    ZQJS_LIMIT_HANDLES = 11
+    ZQJS_LIMIT_HANDLES = 11,
+    ZQJS_LIMIT_NATIVE_STACK = 12
 } zqjs_limit;
 
 typedef enum zqjs_failure_kind {

@@ -225,6 +225,8 @@ pub const Runtime = struct {
     engine_roots: ?EngineRoots = null,
     /// The running engine's closure-invocation hook for JS → Builtin → JS reentrancy (M16.1).
     closure_caller: ?ClosureCaller = null,
+    /// Frame address at the latest depth-0 entry (D60); 0 = unset, never faults.
+    stack_base: usize = 0,
     /// Pending microtasks drained at the outermost turn checkpoint (M18).
     microtasks: std.ArrayList(Microtask) = .empty,
     microtask_head: usize = 0,
@@ -377,6 +379,12 @@ pub const Runtime = struct {
         return error.Unsupported;
     }
 
+    /// D60: call before a native→JS crossing nests another run loop. Stacks grow down
+    /// on every supported target, so the bytes used are the base minus the frame address.
+    pub fn checkNativeStack(rt: *Runtime) Error!void {
+        if (rt.stack_base -| @frameAddress() > rt.limits.max_native_stack_bytes) return rt.limit(.native_stack);
+    }
+
     pub fn limit(rt: *Runtime, which: Limit) Error {
         rt.limit_hit = which;
         return error.LimitExceeded;
@@ -451,6 +459,7 @@ pub const Runtime = struct {
                         return f(rt, nc.env, args);
                     },
                     .vm, .tree => {
+                        try rt.checkNativeStack();
                         const cc = rt.closure_caller orelse return rt.bug("closure called without an active engine");
                         return cc.call(cc.ctx, c, if (this_val == .object) this_val else null, args);
                     },

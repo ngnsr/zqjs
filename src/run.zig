@@ -62,6 +62,7 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
 
     var rt = Runtime.init(gpa, limits, out);
     defer rt.deinit();
+    rt.stack_base = @frameAddress();
     // An option can only add collections: under -Dgc-stress every safepoint collects anyway.
     rt.heap.collect_always = options.collect_always or rt.heap.collect_always;
     rt.heap.verify_always = options.verify_heap or rt.heap.verify_always;

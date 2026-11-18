@@ -100,6 +100,20 @@ pub fn build(b: *std.Build) void {
         integration.setCwd(b.path(".")); // diff_test reads tests/diff at runtime
         test_step.dependOn(&integration.step);
     }
+    const regex_mod = b.createModule(.{
+        .root_source_file = b.path("src/regex.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const regex_tests = b.addRunArtifact(b.addTest(.{ .name = "regex_test", .filters = filters, .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/regex_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "regex", .module = regex_mod }, .{ .name = "zqjs_internal", .module = mod }, .{ .name = "zqjs", .module = api } },
+    }) }));
+    regex_tests.setCwd(b.path("."));
+    test_step.dependOn(&regex_tests.step);
+
     // The embedding API's tests see only `zqjs`, as an embedder does: an import of
     // `zqjs_internal` there fails to build.
     const api_tests = b.addRunArtifact(b.addTest(.{ .name = "api_test", .filters = filters, .root_module = b.createModule(.{
@@ -337,6 +351,7 @@ pub fn build(b: *std.Build) void {
         &.{ "node", "tests/harness/golden.js", "--check" },
         &.{ "node", "tools/gen_pow_data.js", "--check" },
         &.{ "node", "tools/gen_builtins.js", "--check" },
+        &.{ "node", "tools/gen_regex_cases.js", "--check" },
         &.{ "python3", "-I", "tools/pow_reference.py", "--check" },
     }) |argv| {
         const cmd = b.addSystemCommand(argv);
@@ -350,4 +365,7 @@ pub fn build(b: *std.Build) void {
     regen_reference.setCwd(b.path("."));
     regen_reference.step.dependOn(&regen_goldens.step);
     update.dependOn(&regen_reference.step);
+    const regen_regex = b.addSystemCommand(&.{ "node", "tools/gen_regex_cases.js" });
+    regen_regex.setCwd(b.path("."));
+    update.dependOn(&regen_regex.step);
 }

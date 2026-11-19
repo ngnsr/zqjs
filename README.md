@@ -141,7 +141,7 @@ int main(void) {
 
 For a C11 multi-plugin cooperative host example, see [examples/plugin_host.c](examples/plugin_host.c) (`zig build plugin-host`).
 
-For a full C11 host loop with structured `initGame({ update, draw, state })` handles (optional Raylib dependency — `zig build test` stays Raylib-free; pass `-Draylib-prefix=<path>` if Raylib isn't in a default location), see [examples/raylib_c_demo.c](examples/raylib_c_demo.c):
+For a full C11 host loop with structured `initGame({ update, draw, state })` handles (optional Raylib dependency — `zig build test` stays Raylib-free; pass `-Draylib-prefix=<path>` if Raylib isn't in a default location), see [examples/raylib_c_demo.c](examples/raylib_c_demo.c) or the standalone [zqjs-raylib](https://github.com/ngnsr/zqjs-raylib) repository:
 ```sh
 zig build raylib-smoke   # headless 60-frame + error-handling smoke test
 zig build raylib-demo    # interactive GUI window (requires Raylib)

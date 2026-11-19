@@ -71,35 +71,47 @@ pub fn build(b: *std.Build) void {
     run.addPassthruArgs();
     b.step("run", "Run the zqjs CLI").dependOn(&run.step);
 
-    // Unit tests inside src/, and one binary per integration test file in tests/: a test
-    // binary runs its tests one at a time, so separate binaries are what lets the build
-    // run them in parallel. `--fuzz=N` fuzzes only one test per run, so pick fuzz targets
-    // with -Dtest-filter:
+    // Unit tests inside src/, an umbrella integration binary (`internal_tests`) so `zig build test`
+    // compiles `zqjs_internal` once instead of nine times, plus lazy `test-<name>` steps for
+    // running any single suite during iteration. `--fuzz=N` fuzzes only one test per run, so pick
+    // fuzz targets with -Dtest-filter:
     //   zig build test --fuzz=100K -Dtest-filter="fuzz: the verifier"
     const filters: []const []const u8 = if (b.option([]const u8, "test-filter", "Run only tests whose name contains this")) |f| &.{f} else &.{};
     const test_step = b.step("test", "Run unit and integration tests");
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod, .filters = filters })).step);
-    // Everything in tests/ goes through the public `zqjs` module. Data files are generated
+    const run_unit_tests = b.addRunArtifact(b.addTest(.{ .root_module = mod, .filters = filters }));
+    test_step.dependOn(&run_unit_tests.step);
+    b.step("test-unit", "Run unit tests inside src/").dependOn(&run_unit_tests.step);
+
+    // Everything in tests/ goes through `zqjs_internal` / `zqjs`. Data files are generated
     // or checked with node by the scripts in tests/harness/.
-    for ([_][]const u8{
-        "gc_test", // the garbage collector: store-API scan, generations, cards, mutants
-        "interpreter_test", // both engines: limits, allocation failures, exceptions, fuzzing
-        "bytecode_test", // compiler + verifier over all programs, snapshots, limits, fuzzing
-        "diff_test", // diff/*.js on both engines: output must equal node's (diff/*.out)
-        "vm_test", // the VM's step() contract, cleanup, --trace
-        "syntax_test", // syntax/cases.jsonl: outcome + resolved dump for each source
-        "ops_test", // ops/*.jsonl: conversions and operators vs node, bit for bit
-        "frontend_test", // allocation-failure paths and fuzzing of parse, resolve, dump
-        "regex_test", // regex/cases.jsonl: standalone regex compiler and matcher vs node
-    }) |name| {
-        const integration = b.addRunArtifact(b.addTest(.{ .name = name, .filters = filters, .root_module = b.createModule(.{
-            .root_source_file = b.path(b.fmt("tests/{s}.zig", .{name})),
+    const internal_tests = b.addRunArtifact(b.addTest(.{ .name = "internal_tests", .filters = filters, .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/internal_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    }) }));
+    internal_tests.setCwd(b.path(".")); // diff_test, gc_test, etc. read repo paths at runtime
+    test_step.dependOn(&internal_tests.step);
+
+    for ([_]struct { step: []const u8, file: []const u8 }{
+        .{ .step = "test-gc", .file = "gc_test" }, // the garbage collector: store-API scan, generations, cards, mutants
+        .{ .step = "test-interpreter", .file = "interpreter_test" }, // both engines: limits, allocation failures, exceptions, fuzzing
+        .{ .step = "test-bytecode", .file = "bytecode_test" }, // compiler + verifier over all programs, snapshots, limits, fuzzing
+        .{ .step = "test-diff", .file = "diff_test" }, // diff/*.js on both engines: output must equal node's (diff/*.out)
+        .{ .step = "test-vm", .file = "vm_test" }, // the VM's step() contract, cleanup, --trace
+        .{ .step = "test-syntax", .file = "syntax_test" }, // syntax/cases.jsonl: outcome + resolved dump for each source
+        .{ .step = "test-ops", .file = "ops_test" }, // ops/*.jsonl: conversions and operators vs node, bit for bit
+        .{ .step = "test-frontend", .file = "frontend_test" }, // allocation-failure paths and fuzzing of parse, resolve, dump
+        .{ .step = "test-regex", .file = "regex_test" }, // regex/cases.jsonl: standalone regex compiler and matcher vs node
+    }) |entry| {
+        const single = b.addRunArtifact(b.addTest(.{ .name = entry.file, .filters = filters, .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("tests/{s}.zig", .{entry.file})),
             .target = target,
             .optimize = optimize,
             .imports = imports,
         }) }));
-        integration.setCwd(b.path(".")); // diff_test reads tests/diff at runtime
-        test_step.dependOn(&integration.step);
+        single.setCwd(b.path("."));
+        b.step(entry.step, b.fmt("Run only {s}", .{entry.file})).dependOn(&single.step);
     }
 
     // The embedding API's tests see only `zqjs`, as an embedder does: an import of
@@ -112,6 +124,7 @@ pub fn build(b: *std.Build) void {
     }) }));
     api_tests.setCwd(b.path("."));
     test_step.dependOn(&api_tests.step);
+    b.step("test-api", "Run embedding API tests").dependOn(&api_tests.step);
 
     // C ABI layout & unit tests (M9.2)
     const c_api_test_mod = b.createModule(.{

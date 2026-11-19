@@ -411,6 +411,7 @@ pub const Stmt = struct {
         @"for": struct { init: ?ForInit, cond: ?*const Expr, update: ?*const Expr, body: *const Stmt },
         /// `is_await`: `for await (… of …)` in an async function (D68).
         for_of: struct { target: ForOfTarget, iterable: *const Expr, body: *const Stmt, is_await: bool = false },
+        for_in: struct { target: ForOfTarget, object: *const Expr, body: *const Stmt },
         labeled: struct { label: []const u8, body: *const Stmt },
         @"break": ?[]const u8,
         @"continue": ?[]const u8,

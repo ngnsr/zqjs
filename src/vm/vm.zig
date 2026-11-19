@@ -1068,6 +1068,20 @@ pub const Vm = struct {
                 vm.stack[cache.sp - 1] = next_v orelse .undefined;
                 try cache.push(vm, .{ .boolean = next_v == null });
             },
+            .for_in_init => {
+                const obj = try cache.peek(vm, 0);
+                cache.syncSp(vm);
+                const iter = try builtins.forInInit(rt, obj);
+                vm.stack[cache.sp - 1] = .{ .object = iter };
+            },
+            .for_in_next => {
+                const iter_val = try cache.peek(vm, 0);
+                if (iter_val != .object or iter_val.object.kind != .iterator) return vm.bug("for_in_next on non-iterator");
+                cache.syncSp(vm);
+                const next_v = try builtins.forInNext(rt, iter_val.object);
+                vm.stack[cache.sp - 1] = next_v orelse .undefined;
+                try cache.push(vm, .{ .boolean = next_v == null });
+            },
             .new_call => {
                 const argc = cache.operand(0);
                 const group = argc + 1;

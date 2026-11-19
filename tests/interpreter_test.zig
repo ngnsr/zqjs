@@ -326,8 +326,8 @@ test "built-ins: known to node but not implemented is Unsupported, naming the me
     try expectUnsupported("[1].flat;", "", "('flat')");
     try expectUnsupported("'abc'.matchAll;", "", "('matchAll')");
     try expectUnsupported("(1).toFixed;", "", "('toFixed')");
-    try expectUnsupported("Object.freeze;", "", "('freeze')");
-    try expectUnsupported("({}).hasOwnProperty;", "", "('hasOwnProperty')");
+    try expectUnsupported("Object.groupBy;", "", "('groupBy')");
+    try expectUnsupported("({}).toLocaleString;", "", "('toLocaleString')");
     try expectUnsupported("({}).constructor;", "", "('constructor')");
     try expectUnsupported("console;", "", "('console')");
     try expectUnsupported("Object({});", "", "Unsupported(builtin)");

@@ -298,6 +298,10 @@ pub const Op = enum(u8) {
     async_yield_star_call,
     /// [kind, awaited] → [value, kind]: the rest of the round; kinds as `yield_star_step`'s.
     async_yield_star_result,
+    /// [object] → [iter]: build a `for...in` iterator over own + inherited enumerable string keys (D69).
+    for_in_init,
+    /// [iter] → [key, done]: advance `for...in` iterator; pushes `(undefined, true)` when done (D69).
+    for_in_next,
 
     pub const Info = struct {
         operands: []const Operand,
@@ -393,8 +397,8 @@ pub const Op = enum(u8) {
             .neg, .to_number, .not, .bit_not, .typeof, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .jump => .{ .operands = &.{.target}, .pops = 0, .pushes = 0 },
             .jump_if_false, .jump_if_true => .{ .operands = &.{.target}, .pops = 1, .pushes = 0 },
-            .get_iter => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
-            .iter_next => .{ .operands = &.{}, .pops = 1, .pushes = 2 },
+            .get_iter, .for_in_init => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .iter_next, .for_in_next => .{ .operands = &.{}, .pops = 1, .pushes = 2 },
             .iter_close, .iter_close_throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
             .call, .new_call => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
             .halt => .{ .operands = &.{}, .pops = 0, .pushes = 0 },

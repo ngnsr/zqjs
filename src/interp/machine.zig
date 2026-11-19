@@ -127,6 +127,8 @@ const Task = union(enum) {
     for_update: ForTask,
     for_of_init: struct { stmt: *const ast.Stmt, has_scope: bool, values_base: u32 },
     for_of_iter: struct { stmt: *const ast.Stmt, iter: *heap.Object, has_scope: bool, values_base: u32 },
+    for_in_start: struct { stmt: *const ast.Stmt, has_scope: bool, values_base: u32 },
+    for_in_iter: struct { stmt: *const ast.Stmt, iter: *heap.Object, has_scope: bool, values_base: u32 },
     labeled: struct { label: []const u8, values_base: u32 },
     throw_finish,
     try_catch: struct { catch_param: ?*const ast.Pattern, catch_body: []const ast.Stmt, saved_env: ?*Env, values_base: u32 },
@@ -332,6 +334,7 @@ const Machine = struct {
         for (m.tasks.items) |t| switch (t) {
             .scope_exit, .scope_exit_depth => |e| if (e) |rec| visit(ctx, &rec.obj),
             .for_of_iter => |f| visit(ctx, &f.iter.obj),
+            .for_in_iter => |f| visit(ctx, &f.iter.obj),
             .yield_star_step => |ys| {
                 visit(ctx, &ys.iter.obj);
                 heap.visitValue(ys.received, ctx, visit);
@@ -721,6 +724,19 @@ const Machine = struct {
                     }
                     _ = m.tasks.pop();
                 },
+                .for_in_iter => |f| {
+                    if (kind == .@"continue" and loopMatchesLabel(m.tasks.items, m.tasks.items.len - 1, kind.@"continue")) {
+                        m.values.shrinkRetainingCapacity(f.values_base);
+                        return;
+                    }
+                    if (kind == .@"break" and kind.@"break" == null) {
+                        _ = m.tasks.pop();
+                        m.values.shrinkRetainingCapacity(f.values_base);
+                        return;
+                    }
+                    _ = m.tasks.pop();
+                    m.values.shrinkRetainingCapacity(f.values_base);
+                },
                 .for_of_iter => |f| {
                     if (kind == .@"continue" and loopMatchesLabel(m.tasks.items, m.tasks.items.len - 1, kind.@"continue")) {
                         m.values.shrinkRetainingCapacity(f.values_base);
@@ -1033,6 +1049,8 @@ const Machine = struct {
             .for_update,
             .for_of_init,
             .for_of_iter,
+            .for_in_start,
+            .for_in_iter,
             => return m.stepLoopSwitchTask(task),
             .throw_finish => {
                 const v = m.popVal();
@@ -1355,6 +1373,35 @@ const Machine = struct {
                     },
                     .target => |t| {
                         try m.pushTask(.{ .exec = fo.body });
+                        try m.pushTask(.{ .bind_pattern = .{ .pat = t, .mode = .assign } });
+                        try m.pushVal(next_val);
+                    },
+                }
+            },
+            .for_in_start => |f| {
+                const obj = m.popVal();
+                const iter = try builtins.forInInit(rt, obj);
+                try m.pushTask(.{ .for_in_iter = .{
+                    .stmt = f.stmt,
+                    .iter = iter,
+                    .has_scope = f.has_scope,
+                    .values_base = f.values_base,
+                } });
+            },
+            .for_in_iter => |f| {
+                try rt.step();
+                const fi = f.stmt.data.for_in;
+                const next_val = (try builtins.forInNext(rt, f.iter)) orelse return null;
+                try m.pushTask(.{ .for_in_iter = f });
+                switch (fi.target) {
+                    .declaration => |decl| {
+                        if (f.has_scope) try m.copyScope();
+                        try m.pushTask(.{ .exec = fi.body });
+                        try m.pushTask(.{ .bind_pattern = .{ .pat = decl.pattern, .mode = .init } });
+                        try m.pushVal(next_val);
+                    },
+                    .target => |t| {
+                        try m.pushTask(.{ .exec = fi.body });
                         try m.pushTask(.{ .bind_pattern = .{ .pat = t, .mode = .assign } });
                         try m.pushVal(next_val);
                     },
@@ -2692,6 +2739,21 @@ const Machine = struct {
                 }
                 try m.pushTask(.{ .for_of_init = .{ .stmt = s, .has_scope = has_scope, .values_base = values_base } });
                 try m.pushEval(f.iterable);
+            },
+            .for_in => |f| {
+                const values_base: u32 = @intCast(m.values.items.len);
+                try m.pushTask(.depth_pop);
+                const saved = m.env;
+                var has_scope = false;
+                if (f.target == .declaration) {
+                    const sc = m.patternScope(f.target.declaration.pattern);
+                    has_scope = sc != null;
+                    if (try m.pushScope(sc)) {
+                        try m.pushTask(.{ .scope_exit = saved });
+                    }
+                }
+                try m.pushTask(.{ .for_in_start = .{ .stmt = s, .has_scope = has_scope, .values_base = values_base } });
+                try m.pushEval(f.object);
             },
             .labeled => |l| {
                 const values_base: u32 = @intCast(m.values.items.len);

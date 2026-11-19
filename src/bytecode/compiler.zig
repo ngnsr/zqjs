@@ -675,6 +675,46 @@ const Compiler = struct {
                 try c.emit(.clear_local, &.{iter_slot});
                 return true;
             },
+            .for_in => |f| {
+                const loop_depth = c.depth;
+                const iter_slot = c.allocTemp();
+                defer c.freeTemp();
+
+                var single_copy: [1]ast.DeclItem = undefined;
+                var copies: []const ast.DeclItem = &.{};
+                if (f.target == .declaration) {
+                    const pat = f.target.declaration.pattern;
+                    try c.enterPatternBindings(pat);
+                    single_copy[0] = .{ .pattern = pat, .init = null, .span = pat.span };
+                    copies = &single_copy;
+                }
+                try c.expr(f.object);
+                try c.emit(.for_in_init, &.{});
+                try c.emit(.init_local, &.{iter_slot});
+                var loop: Loop = .{};
+                defer c.deinitLoop(&loop);
+                c.attachLabelsToLoop(&loop);
+                const top = c.here();
+                try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
+                try c.emit(.for_in_next, &.{});
+                const to_end = try c.jumpForward(.jump_if_true);
+                switch (f.target) {
+                    .declaration => |decl| {
+                        try c.perIteration(copies);
+                        try c.bindPattern(decl.pattern, .init);
+                    },
+                    .target => |t| try c.bindPattern(t, .assign),
+                }
+                const body_completes = try c.loopBody(&loop, f.body.*);
+                if (body_completes) try c.emit(.jump, &.{top});
+                for (loop.continues.items) |j| c.patch(j, top);
+                c.patch(to_end, c.here());
+                c.depth = loop_depth + 1;
+                try c.emit(.pop, &.{});
+                for (loop.breaks.items) |j| c.patch(j, c.here());
+                try c.emit(.clear_local, &.{iter_slot});
+                return true;
+            },
             .labeled => |l| {
                 var target: LabelTarget = .{ .name = l.label };
                 defer target.breaks.deinit(c.s.gpa);

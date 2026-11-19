@@ -148,21 +148,29 @@ const Dumper = struct {
             },
             .for_of => |f| {
                 try w.writeAll(if (f.is_await) "(for-await-of " else "(for-of ");
-                switch (f.target) {
-                    .declaration => |dc| {
-                        try w.print("({s} ", .{@tagName(dc.kind)});
-                        try d.pattern(dc.pattern);
-                        try w.writeByte(')');
-                    },
-                    .target => |t| try d.pattern(t),
-                }
-                try w.writeByte(' ');
-                try d.expr(f.iterable);
-                try w.writeByte(' ');
-                try d.stmt(f.body.*);
-                try w.writeByte(')');
+                try d.forEachHead(f.target, f.iterable, f.body.*);
+            },
+            .for_in => |f| {
+                try w.writeAll("(for-in ");
+                try d.forEachHead(f.target, f.object, f.body.*);
             },
         }
+    }
+
+    fn forEachHead(d: Dumper, for_target: ast.ForOfTarget, rhs: *const ast.Expr, body: ast.Stmt) Error!void {
+        switch (for_target) {
+            .declaration => |dc| {
+                try d.w.print("({s} ", .{@tagName(dc.kind)});
+                try d.pattern(dc.pattern);
+                try d.w.writeByte(')');
+            },
+            .target => |t| try d.pattern(t),
+        }
+        try d.w.writeByte(' ');
+        try d.expr(rhs);
+        try d.w.writeByte(' ');
+        try d.stmt(body);
+        try d.w.writeByte(')');
     }
 
     fn binding(d: Dumper, dc: ast.Declarator) Error!void {

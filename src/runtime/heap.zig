@@ -119,6 +119,10 @@ pub const ClosureMeta = struct {
     field_keys: []Value = &.{},
     /// Instance fields and private instance methods/accessors installed per `new C()` (M35, D65).
     instance_inits: []InstanceInit = &.{},
+    extensible: bool = true,
+    prototype_writable: bool = true,
+    name_configurable: bool = true,
+    length_configurable: bool = true,
 };
 
 pub const InstanceInit = struct {
@@ -379,6 +383,8 @@ pub const IteratorKind = enum {
     custom,
     /// %AsyncFromSyncIteratorPrototype% object (D68): `target` is the sync iterator record.
     async_from_sync,
+    /// `for...in` iterator (D69): `target` is the root object, `next_method` is an internal Array of snapshotted `*String` keys.
+    for_in,
 };
 
 pub const IteratorState = struct {
@@ -483,6 +489,11 @@ pub const Object = struct {
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
     builtin: ?Builtin = null,
+    extensible: bool = true,
+    array_elements_configurable: bool = true,
+    array_elements_writable: bool = true,
+    array_length_writable: bool = true,
+    regexp_last_index_writable: bool = true,
 };
 
 /// A part of a string being built: either UTF-16 units or ASCII bytes (numbers,
@@ -1145,6 +1156,16 @@ pub const Heap = struct {
         o.kind = .{ .iterator = .{ .target = target, .next_method = next_method, .kind = .custom } };
         h.barrier(&o.obj, null, target);
         h.barrier(&o.obj, null, next_method);
+        return o;
+    }
+
+    /// Creates a `for...in` iterator holding `target` and the snapshotted `keys_arr` (D69).
+    pub fn newForInIterator(h: *Heap, target: Value, keys_arr: *Object) Error!*Object {
+        const o = try h.newObject(null);
+        const keys_val: Value = .{ .object = keys_arr };
+        o.kind = .{ .iterator = .{ .target = target, .next_method = keys_val, .kind = .for_in } };
+        h.barrier(&o.obj, null, target);
+        h.barrier(&o.obj, null, keys_val);
         return o;
     }
 

@@ -304,7 +304,9 @@ const Parser = struct {
             const pat = try p.parseBindingPattern(true);
             if (p.isText(p.tok, "in")) {
                 if (p.for_await_head) return p.fail(.{ .syntax_error = "for await requires 'of'" }, p.tok);
-                return p.fail(.{ .unsupported = .syntax }, p.tok);
+                if (!allow_for_of or list.items.len > 0) return p.fail(.{ .syntax_error = "invalid for-in declaration" }, p.tok);
+                try list.append(p.arena, .{ .pattern = pat, .init = null, .span = pat.span });
+                return .{ .kind = kind, .declarators = list.items };
             }
             if (p.isText(p.tok, "of")) {
                 if (!allow_for_of or list.items.len > 0) return p.fail(.{ .syntax_error = "invalid for-of declaration" }, p.tok);
@@ -406,25 +408,15 @@ const Parser = struct {
         p.for_await_head = false;
         if (p.isText(p.tok, "in")) {
             if (is_await) return p.fail(.{ .syntax_error = "for await requires 'of'" }, p.tok);
-            return p.fail(.{ .unsupported = .syntax }, p.tok);
+            const target = try p.extractForEachTarget(init, "for-in");
+            try p.advance();
+            const obj_expr = try p.expression();
+            try p.expectAfterExpression(.r_paren);
+            const body = try p.loopBody();
+            return .{ .span = .{ .start = start, .end = body.span.end }, .data = .{ .for_in = .{ .target = target, .object = obj_expr, .body = body } } };
         }
         if (p.isText(p.tok, "of")) {
-            const target: ast.ForOfTarget = switch (init orelse return p.fail(.{ .syntax_error = "missing left-hand side in for-of" }, p.tok)) {
-                .declaration => |decl| blk: {
-                    if (decl.declarators.len != 1 or decl.declarators[0].init != null)
-                        return p.fail(.{ .syntax_error = "for-of loop variable declaration may not have an initializer" }, p.tok);
-                    break :blk .{ .declaration = .{ .kind = decl.kind, .pattern = decl.declarators[0].pattern } };
-                },
-                .expression => |e| blk: {
-                    if (e.data == .array or e.data == .object) {
-                        if (p.last_was_paren) return p.failAt(.{ .syntax_error = "invalid left-hand side in for-of" }, e.span.start, e.span.end);
-                        break :blk .{ .target = try p.exprToAssignPattern(e) };
-                    }
-                    try p.rejectCoverExpr(e);
-                    const t = try p.assignTarget(e, "invalid left-hand side in for-of");
-                    break :blk .{ .target = try p.patNode(e.span, .{ .target = t }, 0) };
-                },
-            };
+            const target = try p.extractForEachTarget(init, "for-of");
             try p.advance();
             const iterable = try p.expression();
             try p.expectAfterExpression(.r_paren);
@@ -441,6 +433,25 @@ const Parser = struct {
 
         const body = try p.loopBody();
         return .{ .span = .{ .start = start, .end = body.span.end }, .data = .{ .@"for" = .{ .init = init, .cond = cond, .update = update, .body = body } } };
+    }
+
+    fn extractForEachTarget(p: *Parser, init: ?ast.ForInit, comptime kind: []const u8) Error!ast.ForOfTarget {
+        return switch (init orelse return p.fail(.{ .syntax_error = "missing left-hand side in " ++ kind }, p.tok)) {
+            .declaration => |decl| blk: {
+                if (decl.declarators.len != 1 or decl.declarators[0].init != null)
+                    return p.fail(.{ .syntax_error = kind ++ " loop variable declaration may not have an initializer" }, p.tok);
+                break :blk .{ .declaration = .{ .kind = decl.kind, .pattern = decl.declarators[0].pattern } };
+            },
+            .expression => |e| blk: {
+                if (e.data == .array or e.data == .object) {
+                    if (p.last_was_paren) return p.failAt(.{ .syntax_error = "invalid left-hand side in " ++ kind }, e.span.start, e.span.end);
+                    break :blk .{ .target = try p.exprToAssignPattern(e) };
+                }
+                try p.rejectCoverExpr(e);
+                const t = try p.assignTarget(e, "invalid left-hand side in " ++ kind);
+                break :blk .{ .target = try p.patNode(e.span, .{ .target = t }, 0) };
+            },
+        };
     }
 
     fn loopBody(p: *Parser) Error!*const ast.Stmt {

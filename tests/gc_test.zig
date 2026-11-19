@@ -2189,3 +2189,38 @@ test "M38: for await, async yield* and AsyncIteratorClose survive forced GC on b
         try testing.expectEqualStrings("s0,s1,s2,boom-s0,p,q,c0,s0,s1,rundefined closed|closed|closed|c-ret|closed\n", got);
     }
 }
+
+test "M39: old object with Object.setPrototypeOf pointing to young prototype survives minor GC (barrier)" {
+    const src =
+        \\const oldObj = { own: 1 };
+        \\for (let i = 0; i < 200; i++) { let junk = { a: i, b: "x" + i }; }
+        \\Object.setPrototypeOf(oldObj, { inherited: "young-" + 42 });
+        \\for (let i = 0; i < 200; i++) { let junk = { a: i, b: "y" + i }; }
+        \\print(oldObj.own, oldObj.inherited);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("1 young-42\n", got);
+    }
+}
+
+test "M39: for...in iterator holding keys and target survives forced GC on both engines" {
+    const src =
+        \\const proto = { p1: 1, p2: 2 };
+        \\const obj = Object.create(proto);
+        \\obj.a = 10;
+        \\obj.b = 20;
+        \\const out = [];
+        \\for (const k in obj) {
+        \\    for (let i = 0; i < 150; i++) { let junk = { k: k + i }; }
+        \\    out.push(k + "=" + obj[k]);
+        \\}
+        \\print(out.join(","));
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("a=10,b=20,p1=1,p2=2\n", got);
+    }
+}

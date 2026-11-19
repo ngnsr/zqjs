@@ -227,13 +227,27 @@ fn getFrom(rt: *Runtime, start: *Object, receiver: Value, k: Key) Error!Value {
 fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
     switch (o.kind) {
         .array => |elements| switch (k) {
-            .index => |i| return if (i < elements.items.len) .{ .value = elements.items[i] } else null,
-            .atom => if (isNamed(k, "length")) return .{ .value = .{ .number = @floatFromInt(elements.items.len) }, .enumerable = false, .configurable = false },
+            .index => |i| return if (i < elements.items.len) .{
+                .value = elements.items[i],
+                .writable = o.array_elements_writable,
+                .configurable = o.array_elements_configurable,
+            } else null,
+            .atom => if (isNamed(k, "length")) return .{
+                .value = .{ .number = @floatFromInt(elements.items.len) },
+                .enumerable = false,
+                .writable = o.array_length_writable,
+                .configurable = false,
+            },
             .symbol => {},
         },
         .map, .set => |table| if (isNamed(k, "size")) return .{ .value = .{ .number = @floatFromInt(table.live_count) }, .enumerable = false, .writable = false },
         .regexp => |re| {
-            if (isNamed(k, "lastIndex")) return .{ .value = re.last_index, .enumerable = false, .configurable = false };
+            if (isNamed(k, "lastIndex")) return .{
+                .value = re.last_index,
+                .enumerable = false,
+                .writable = o.regexp_last_index_writable,
+                .configurable = false,
+            };
             if (isNamed(k, "source")) return .{ .value = .{ .string = re.source }, .enumerable = false, .writable = false };
             if (isNamed(k, "flags")) return .{ .value = .{ .string = re.flags }, .enumerable = false, .writable = false };
             if (isNamed(k, "hasIndices")) return .{ .value = .{ .boolean = re.program.flags.has_indices }, .enumerable = false, .writable = false };
@@ -307,6 +321,10 @@ fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainH
                 if (isNamed(k, "name") or isNamed(k, "length")) {
                     return .{ .data = .{ .is_own = sameTarget(cur, base), .writable = false } };
                 }
+                if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) {
+                    const writable = if (c.meta) |m| m.prototype_writable else true;
+                    return .{ .data = .{ .is_own = sameTarget(cur, base), .writable = writable } };
+                }
                 if (c.meta) |m| {
                     if (m.props.count() > 0) {
                         if (m.props.get(try propKey(rt, k))) |p| {
@@ -326,28 +344,50 @@ fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainH
     }
 }
 
-fn invokeSetter(rt: *Runtime, p: Property, receiver: Value, v: Value) Error!void {
-    if (p.setter == .undefined) return; // sloppy-mode no-op on getter-only accessor
+fn invokeSetter(rt: *Runtime, p: Property, receiver: Value, v: Value, strict: bool) Error!void {
+    if (p.setter == .undefined) {
+        if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot set property which has only a getter" }});
+        return;
+    }
     _ = try rt.callCallable(p.setter, receiver, &.{v});
 }
 
 /// `base[k] = v` with prototype accessor/writable checks (D64).
 pub fn set(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
+    return setImpl(rt, base, k, v, false);
+}
+
+/// Strict-mode `base[k] = v` (throws `TypeError` on non-writable/non-extensible targets).
+pub fn setStrict(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
+    return setImpl(rt, base, k, v, true);
+}
+
+fn setImpl(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!void {
     switch (base) {
         .undefined, .null => {
             var buf: [10]u8 = undefined;
             return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot set properties of " }, .{ .ascii = @tagName(base) }, .{ .ascii = " (setting '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
         },
-        .string, .number, .boolean, .symbol => return rt.fail(.primitive_write), // sloppy JS ignores these
+        .string, .number, .boolean, .symbol => return if (strict) rt.throw(.TypeError, &.{.{ .ascii = "Cannot create property on primitive" }}) else rt.fail(.primitive_write),
         .native => {
             if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
-            if (isNamed(k, "name") or isNamed(k, "length")) return;
+            if (isNamed(k, "name") or isNamed(k, "length")) {
+                if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
+                return;
+            }
             return rt.fail(.function_properties);
         },
         .closure => |c| {
             if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
-            if (isNamed(k, "name") or isNamed(k, "length")) return;
+            if (isNamed(k, "name") or isNamed(k, "length")) {
+                if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
+                return;
+            }
             if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) {
+                if (c.meta) |m| if (!m.prototype_writable) {
+                    if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property 'prototype'" }});
+                    return;
+                };
                 try rt.heap.storeClosurePrototype(@constCast(c), v);
                 return;
             }
@@ -357,18 +397,21 @@ pub fn set(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
         },
     }
     switch (try lookupSetChain(rt, base, base, k)) {
-        .accessor => |p| return invokeSetter(rt, p, base, v),
-        .data => |d| if (!d.writable) return, // sloppy-mode no-op on non-writable property
+        .accessor => |p| return invokeSetter(rt, p, base, v, strict),
+        .data => |d| if (!d.writable) {
+            if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
+            return; // sloppy-mode no-op on non-writable property
+        },
         .none => {},
     }
-    try setOwnData(rt, base, k, v);
+    try setOwnData(rt, base, k, v, strict);
 }
 
 pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value) Error!void {
     const proto = try getPrototypeOfValue(rt, home);
     if (proto != .null and proto != .undefined) {
         switch (try lookupSetChain(rt, proto, null, k)) {
-            .accessor => |p| return invokeSetter(rt, p, receiver, v),
+            .accessor => |p| return invokeSetter(rt, p, receiver, v, false),
             .data => |d| if (!d.writable) return,
             .none => {},
         }
@@ -376,13 +419,13 @@ pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value) Er
     // Check own property on receiver before writing own data property.
     switch (receiver) {
         .object => |o| if (try ownProp(rt, o, k)) |p| {
-            if (p.is_accessor) return invokeSetter(rt, p, receiver, v);
+            if (p.is_accessor) return invokeSetter(rt, p, receiver, v, false);
             if (!p.writable) return;
         },
         .closure => |c| {
             if (isNamed(k, "name") or isNamed(k, "length")) return;
             if (c.meta) |m| if (m.props.get(try propKey(rt, k))) |p| {
-                if (p.is_accessor) return invokeSetter(rt, p, receiver, v);
+                if (p.is_accessor) return invokeSetter(rt, p, receiver, v, false);
                 if (!p.writable) return;
             };
         },
@@ -392,39 +435,67 @@ pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value) Er
         },
         else => return rt.fail(.primitive_write),
     }
-    try setOwnData(rt, receiver, k, v);
+    try setOwnData(rt, receiver, k, v, false);
 }
 
-fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
+fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!void {
     switch (base) {
         .closure => |c| {
-            try rt.heap.storeClosurePropKey(@constCast(c), try propKey(rt, k), v);
+            const pk = try propKey(rt, k);
+            if (c.meta) |m| if (!m.extensible and !m.props.contains(pk)) {
+                if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot add property, object is not extensible" }});
+                return;
+            };
+            try rt.heap.storeClosurePropKey(@constCast(c), pk, v);
         },
         .object => |o| {
             switch (o.kind) {
                 .array => |elements| switch (k) {
                     .index => |i| {
                         if (i < elements.items.len) {
+                            if (!o.array_elements_writable) {
+                                if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
+                                return;
+                            }
                             rt.heap.storeElement(o, i, v);
                         } else if (i == elements.items.len) {
+                            if (!o.extensible or !o.array_length_writable) {
+                                if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot add property, object is not extensible" }});
+                                return;
+                            }
                             try rt.heap.appendElement(o, v);
                         } else return rt.fail(.sparse_array);
                         return;
                     },
-                    .atom => if (isNamed(k, "length")) return setLength(rt, o, v),
+                    .atom => if (isNamed(k, "length")) return setLength(rt, o, v, strict),
                     .symbol => {},
                 },
-                .map, .set => if (isNamed(k, "size")) return, // Map/Set size is a read-only getter
+                .map, .set => if (isNamed(k, "size")) {
+                    if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot set property size" }});
+                    return; // Map/Set size is a read-only getter
+                },
                 .regexp => {
                     if (isNamed(k, "lastIndex")) {
+                        if (!o.regexp_last_index_writable) {
+                            if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property 'lastIndex'" }});
+                            return;
+                        }
                         rt.heap.storeRegExpLastIndex(o, v);
                         return;
                     }
-                    if (isRegExpGetter(k)) return;
+                    if (isRegExpGetter(k)) {
+                        if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
+                        return;
+                    }
                 },
                 .ordinary, .iterator, .promise, .generator => {},
             }
-            try putOwn(rt, o, k, v);
+            const pk = try propKey(rt, k);
+            if (!o.extensible and !o.props.contains(pk)) {
+                if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot add property, object is not extensible" }});
+                return;
+            }
+            try rt.heap.storePropKey(o, pk, v);
         },
         else => unreachable,
     }
@@ -564,11 +635,21 @@ fn putOwn(rt: *Runtime, o: *Object, k: Key, v: Value) Error!void {
     try rt.heap.storePropKey(o, try propKey(rt, k), v);
 }
 
-fn setLength(rt: *Runtime, arr: *Object, v: Value) Error!void {
+fn setLength(rt: *Runtime, arr: *Object, v: Value, strict: bool) Error!void {
     const n = try ops.toNumber(rt, v);
     if (!(n >= 0 and n <= max_index + 1 and @floor(n) == n)) return rt.throw(.RangeError, &.{.{ .ascii = "Invalid array length" }});
     const len: usize = @intFromFloat(n);
-    if (len > arr.kind.array.items.len) return rt.fail(.sparse_array);
+    const cur_len = arr.kind.array.items.len;
+    if (!arr.array_length_writable) {
+        if (len == cur_len) return;
+        if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property 'length'" }});
+        return;
+    }
+    if (len > cur_len) return rt.fail(.sparse_array);
+    if (!arr.array_elements_configurable and len < cur_len) {
+        if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property of non-configurable array" }});
+        return;
+    }
     rt.heap.shrinkElements(arr, len);
 }
 
@@ -580,7 +661,8 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
         .string, .number, .boolean, .symbol => return rt.fail(.primitive_write),
         .native => return rt.fail(.function_properties),
         .closure => |c| {
-            if (isNamed(k, "name") or isNamed(k, "length")) return true;
+            if (isNamed(k, "name")) return if (c.meta) |m| m.name_configurable else true;
+            if (isNamed(k, "length")) return if (c.meta) |m| m.length_configurable else true;
             if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return false;
             if (c.meta == null or c.meta.?.props.count() == 0) return true;
             const pk = try propKey(rt, k);
@@ -593,7 +675,13 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
     switch (o.kind) {
         .array => |elements| switch (k) {
             // Deleting an element leaves a hole; deleting past the end does nothing.
-            .index => |i| return if (i < elements.items.len) rt.fail(.sparse_array) else true,
+            .index => |i| {
+                if (i < elements.items.len) {
+                    if (!o.array_elements_configurable) return false;
+                    return rt.fail(.sparse_array);
+                }
+                return true;
+            },
             .atom => if (isNamed(k, "length")) return false, // non-configurable
             .symbol => {},
         },
@@ -605,6 +693,32 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
     if (o.props.get(pk)) |p| if (!p.configurable) return false;
     rt.heap.removePropKey(o, pk);
     return true;
+}
+
+/// Own property check (`Object.hasOwn` / `hasOwnProperty`).
+pub fn hasOwn(rt: *Runtime, base: Value, k: Key) Error!bool {
+    heap_mod.checkValue(base);
+    return switch (base) {
+        .object => |o| (try ownProp(rt, o, k)) != null,
+        .closure => |c| {
+            if (isNamed(k, "name") or isNamed(k, "length")) return true;
+            if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return true;
+            if (c.meta) |m| if (m.props.count() > 0) return m.props.contains(try propKey(rt, k));
+            return false;
+        },
+        .native => |n| {
+            if (isNamed(k, "name") or isNamed(k, "length")) return true;
+            if (try builtins.namespaceObject(rt, n)) |ns| return (try ownProp(rt, ns, k)) != null;
+            return false;
+        },
+        .string => |s| switch (k) {
+            .index => |i| i < s.units.len,
+            .atom => isNamed(k, "length"),
+            .symbol => false,
+        },
+        .number, .boolean, .symbol => false,
+        .undefined, .null => rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
+    };
 }
 
 /// `k in base`.
@@ -686,9 +800,10 @@ fn appendPropsKeys(
     prop_vals: []const Property,
     first_named: usize,
     include_symbols: bool,
+    include_non_enum: bool,
 ) Error!void {
     for (prop_keys, prop_vals) |pk, p| {
-        if (!p.enumerable or pk.isSymbol()) continue;
+        if ((!include_non_enum and !p.enumerable) or pk.isSymbol()) continue;
         const a = pk.asAtom();
         if (a.atom.?.index) |i| {
             try out.insert(rt.gpa, first_named + indexPosition(out.items[first_named..], i), .{ .index = i });
@@ -698,7 +813,7 @@ fn appendPropsKeys(
     }
     if (include_symbols) {
         for (prop_keys, prop_vals) |pk, p| {
-            if (!p.enumerable or !pk.isSymbol()) continue;
+            if ((!include_non_enum and !p.enumerable) or !pk.isSymbol()) continue;
             try out.append(rt.gpa, .{ .symbol = pk.asSymbol() });
         }
     }
@@ -726,7 +841,17 @@ pub fn ownKeysClosure(rt: *Runtime, c: *const heap_mod.Closure) Error![]Key {
     if (m.props.count() == 0) return &.{};
     var out: std.ArrayList(Key) = .empty;
     errdefer out.deinit(rt.gpa);
-    try appendPropsKeys(rt, &out, m.props.keys(), m.props.values(), 0, false);
+    try appendPropsKeys(rt, &out, m.props.keys(), m.props.values(), 0, false, false);
+    return out.toOwnedSlice(rt.gpa);
+}
+
+/// Own string/index keys of a closure, optionally including non-enumerable `m.props`.
+pub fn ownPropertyNamesClosure(rt: *Runtime, c: *const heap_mod.Closure) Error![]Key {
+    const m = c.meta orelse return &.{};
+    if (m.props.count() == 0) return &.{};
+    var out: std.ArrayList(Key) = .empty;
+    errdefer out.deinit(rt.gpa);
+    try appendPropsKeys(rt, &out, m.props.keys(), m.props.values(), 0, false, true);
     return out.toOwnedSlice(rt.gpa);
 }
 
@@ -740,7 +865,20 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => {},
     }
     const first_named = out.items.len;
-    try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false);
+    try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false, false);
+    return out.toOwnedSlice(rt.gpa);
+}
+
+/// Own string/index keys including non-enumerable `o.props` (for Object.getOwnPropertyNames / for...in).
+pub fn ownPropertyNames(rt: *Runtime, o: *Object) Error![]Key {
+    var out: std.ArrayList(Key) = .empty;
+    errdefer out.deinit(rt.gpa);
+    switch (o.kind) {
+        .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => {},
+    }
+    const first_named = out.items.len;
+    try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false, true);
     return out.toOwnedSlice(rt.gpa);
 }
 
@@ -753,7 +891,7 @@ pub fn ownAllKeys(rt: *Runtime, o: *Object) Error![]Key {
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => {},
     }
     const first_named = out.items.len;
-    try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, true);
+    try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, true, false);
     return out.toOwnedSlice(rt.gpa);
 }
 
@@ -762,7 +900,7 @@ pub fn ownAllKeysClosure(rt: *Runtime, c: *const heap_mod.Closure) Error![]Key {
     if (m.props.count() == 0) return &.{};
     var out: std.ArrayList(Key) = .empty;
     errdefer out.deinit(rt.gpa);
-    try appendPropsKeys(rt, &out, m.props.keys(), m.props.values(), 0, true);
+    try appendPropsKeys(rt, &out, m.props.keys(), m.props.values(), 0, true, false);
     return out.toOwnedSlice(rt.gpa);
 }
 

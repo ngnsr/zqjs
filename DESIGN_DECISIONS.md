@@ -1781,3 +1781,21 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
   holds (a pre-existing leak when an `await` operand threw).
 - `for await` outside an async function is a SyntaxError (node agrees), except at script top
   level (`Unsupported(syntax)`, D56); `for await (… in …)` and `for await (;;)` are SyntaxErrors.
+
+---
+
+## D69. `for...in` and `Object` Prototype, Extensibility & Integrity APIs (M39)
+
+**Decision:** Support `for...in` loops (`let`/`const`/identifier/member/destructuring heads, per-iteration bindings, `break`/`continue`/labels/`return`/`try/finally`) and the `Object` prototype, extensibility, and integrity APIs (`Object.create(proto, props)`, `Object.setPrototypeOf`, `preventExtensions`/`isExtensible`, `seal`/`isSealed`, `freeze`/`isFrozen`, `hasOwn`, `getOwnPropertyNames`, `is`, `fromEntries`, and `Object.prototype.{hasOwnProperty, isPrototypeOf, propertyIsEnumerable}`) across both engines.
+
+- **Heap & GC (`heap.zig`):**
+  - `Object` gains `extensible`, `array_elements_configurable`, `array_elements_writable`, `array_length_writable`, and `regexp_last_index_writable` (packed into existing padding). `ClosureMeta` gains `extensible`, `prototype_writable`, `name_configurable`, and `length_configurable`.
+  - Prototype updates go through `storeObjectProto` / `storeClosureProto` with generational write barriers (preserving the raw-store invariant).
+  - `IteratorKind.for_in` reuses `IteratorState` (`target` = iterated root value, `next_method` = internal `Array` of snapshotted `*String` atom keys), traced and swept through existing `IteratorState` paths.
+- **Object Semantics (`object.zig`, `builtins.zig`):**
+  - `setImpl` / `setStrict` enforce `!extensible`, `writable`, `array_elements_writable`, `array_length_writable`, `regexp_last_index_writable`, and `ClosureMeta.prototype_writable` (sloppy no-op in `set`, `TypeError` in `setStrict` for `Object.assign` and `Object.defineProperty`; array mutators check integrity flags via `checkArrayMutate`).
+  - `Object.setPrototypeOf` implements `OrdinarySetPrototypeOf` (same-proto no-op even when non-extensible, `!extensible` `TypeError`, full cycle check).
+  - `Object.seal` / `Object.freeze` / `Object.isSealed` / `Object.isFrozen` handle ordinary objects, arrays, regexps, functions/closures (including `name`/`length`/`prototype`), accessors, and manually locked objects.
+  - `{ __proto__: p }` and `Object.prototype.__proto__` remain `Unsupported(builtin)` per D39.
+- **`for...in` Execution (`parser.zig`, `resolver.zig`, `compiler.zig`, `vm.zig`, `machine.zig`):**
+  - Cold VM opcodes `for_in_init` and `for_in_next`, and `Machine` tasks `for_in_start` / `for_in_iter`, share `builtins.forInInit` and `builtins.forInNext` (D16): `null`/`undefined`/booleans/numbers/symbols yield 0 keys; strings yield `"0"`..`"N-1"`; objects walk the prototype chain in spec key order, skipping symbols, shadowing higher-chain keys with both enumerable and non-enumerable own keys, and re-checking enumerability on each step to honor dynamic `delete`. `for...in` does not call `IteratorClose`.

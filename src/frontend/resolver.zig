@@ -355,23 +355,26 @@ const Resolver = struct {
                 if (f.update) |e| try r.expr(e);
                 try r.stmt(f.body.*);
             },
-            .for_of => |f| {
-                const saved = try r.enterScope();
-                defer r.exitScope(saved);
-                switch (f.target) {
-                    .declaration => |d| {
-                        try r.declarePattern(d.pattern, if (d.kind == .let) .let else .@"const", false, true, null);
-                        try r.expr(f.iterable);
-                        try r.resolvePatternExprs(d.pattern);
-                    },
-                    .target => |t| {
-                        try r.expr(f.iterable);
-                        try r.resolvePatternExprs(t);
-                    },
-                }
-                try r.stmt(f.body.*);
+            .for_of => |f| try r.resolveForEach(f.target, f.iterable, f.body),
+            .for_in => |f| try r.resolveForEach(f.target, f.object, f.body),
+        }
+    }
+
+    fn resolveForEach(r: *Resolver, for_target: ast.ForOfTarget, rhs: *const ast.Expr, body: *const ast.Stmt) Error!void {
+        const saved = try r.enterScope();
+        defer r.exitScope(saved);
+        switch (for_target) {
+            .declaration => |d| {
+                try r.declarePattern(d.pattern, if (d.kind == .let) .let else .@"const", false, true, null);
+                try r.expr(rhs);
+                try r.resolvePatternExprs(d.pattern);
+            },
+            .target => |t| {
+                try r.expr(rhs);
+                try r.resolvePatternExprs(t);
             },
         }
+        try r.stmt(body.*);
     }
 
     /// A function's own scopes: for a named expression, one holding just its name, then

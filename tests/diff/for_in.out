@@ -1,0 +1,11 @@
+order: 2,10,b,a,1,p1,p2
+shadow: y
+sym: a
+delete: a,c
+str: 0,1
+arr: 0,1,extra
+control: xm,xn,zm
+retfin: try:a
+closures: p,q,r
+member: u,v v
+destr: a-b,c-d

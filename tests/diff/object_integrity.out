@@ -1,0 +1,39 @@
+create: 42 1 11 99
+create keys: a,b
+setProto1: 10 true
+setProto2: 20 true
+setProtoNull: null undefined
+cycle: TypeError
+cycle2: TypeError
+primExt: false true true
+primFreeze: hi 42 true
+primSetProto: 42
+pe: false false false
+pe after: 3 undefined false
+pe setProto: TypeError
+sl: false true false
+sl write: 2 false
+fr: false true true
+fr write: 1 2 false
+fr assign: TypeError
+manual: true true
+peArr pe: false false false
+arr fr: false true true
+arr sloppy: 3 1
+arr mut: TypeError
+arr mut: TypeError
+arr mut: TypeError
+arr mut: TypeError
+arr mut: TypeError
+arr mut: TypeError
+arr mut: TypeError
+arr mut: TypeError
+re frozen: true 0
+fn frozen: true true
+hasOwn: true false true
+hasOwnProp: true false
+isProtoOf: true true false false
+propIsEnum: true false false
+gopn: own,nonEnum
+is: true false true
+fromEntries: 1 2

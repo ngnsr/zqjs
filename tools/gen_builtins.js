@@ -58,6 +58,8 @@ const objects = vm.runInNewContext(`({
   aggregate_error_prototype: AggregateError.prototype,
   regexp_constructor: RegExp,
   regexp_prototype: RegExp.prototype,
+  symbol_constructor: Symbol,
+  symbol_prototype: Symbol.prototype,
 })`);
 
 const lines = [

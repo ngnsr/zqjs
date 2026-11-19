@@ -105,6 +105,16 @@ pub fn value(v: Value, w: *Writer) Writer.Error!void {
         .boolean => |b| try w.writeAll(if (b) "true" else "false"),
         .native => |n| try w.print("<native {s}>", .{n.name}),
         .closure => try w.writeAll("<function>"),
+        .symbol => |s| {
+            try w.writeAll("Symbol(");
+            if (s.description) |d| {
+                for (d.units) |u| switch (u) {
+                    0x20...0x7e => try w.writeByte(@intCast(u)),
+                    else => try w.print("\\u{X:0>4}", .{u}),
+                };
+            }
+            try w.writeByte(')');
+        },
         .object => |o| try w.writeAll(switch (o.kind) {
             .array => "<array>",
             .regexp => "<regexp>",

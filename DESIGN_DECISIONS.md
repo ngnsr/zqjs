@@ -1560,3 +1560,24 @@ until a follow-up milestone).
   - Base classes run instance private-method installation and instance field initializers on `this` upon entering the constructor body.
   - Derived classes run them immediately after `super(...)` initializes `this`.
   - Static private methods, static fields, and `static { ... }` blocks execute in declaration order with `this = C` and `home_object = C` when the class is evaluated.
+
+---
+
+## D66. `Symbol` and `Symbol.iterator` (M36)
+
+**Decision:** Support ECMAScript `Symbol` primitives, symbol-keyed properties on objects and closures, the global symbol registry (`Symbol.for`/`Symbol.keyFor`), and custom `[Symbol.iterator]` iterables (with `IteratorClose`) across both the VM and tree-walking interpreter.
+
+- **`Symbol` value & GC representation (`value.zig`, `heap.zig`, `runtime.zig`, `handles.zig`, `c_api.zig`):**
+  - `heap.Symbol { obj, description: ?*const String, is_global: bool }` (`Obj.Kind.symbol`) is traced for its optional `description` string, exposed as `Value.symbol`, and surfaced in the embedding/C API as `HandleKind.symbol` / `ZQJS_HANDLE_SYMBOL`.
+  - `Symbol(desc?)` is non-constructable (`new Symbol()` and `class C extends Symbol {}` throw `TypeError`), converts `desc` via `ToString` when not `undefined`, and supports `Symbol.prototype.{toString, valueOf, description, constructor}`. Explicit `String(sym)` / `print(sym)` format `"Symbol(desc)"`, while implicit `ToString` / `ToNumber` conversions throw `TypeError` per ECMAScript.
+  - `Runtime.global_symbols` maps UTF-16 registry keys (`*const heap.String`) to interned `*heap.Symbol` objects for `Symbol.for` and `Symbol.keyFor`; `Runtime.markRoots` keeps all global registry keys and symbols strongly rooted across collections.
+- **Unified `PropKey` & enumeration (`heap.zig`, `object.zig`, `builtins.zig`):**
+  - `Object.props` and `ClosureMeta.props` key on an 8-byte `PropKey { obj: *Obj }` wrapping either an interned `*String` atom or a `*Symbol` (same hash/equality/barrier path, distinguishing symbols via `obj.kind == .symbol`).
+  - Both keys and property values participate in generational write barriers (`propertyBarrier` / `barrierObj`) and card/remembered-set scanning (`forEachChild`, `RememberedScan.entries`).
+  - Ordinary string enumeration (`for...in` keys, `Object.keys/values/entries`) excludes symbols; `Object.getOwnPropertySymbols` returns own symbol keys (including non-enumerable ones) in insertion order; `Object.assign`, object spread (`{ ...src }`), object rest, `Object.defineProperty`, `Object.defineProperties`, `Object.getOwnPropertyDescriptor`, and `Object.getOwnPropertyDescriptors` handle both string and symbol keys via `ownAllKeys`; `JSON.stringify` ignores symbol-keyed properties and symbol values (emitting `null` in arrays).
+- **`Symbol.iterator` & custom iterators (`builtins.zig`, `heap.zig`, `vm.zig`, `machine.zig`):**
+  - `Realm.sym_iterator` (`Symbol.iterator`) is the supported well-known symbol (other well-known symbols remain `Unsupported(builtin)` via `builtin_names.zig` per D39) and is installed as `[Symbol.iterator]` on `Array.prototype` (`values`), `String.prototype`, `Map.prototype` (`entries`), `Set.prototype` (`values`), and `%IteratorPrototype%`.
+  - `builtins.getIterator` invokes `[Symbol.iterator]` (using a zero-allocation fast path when an untouched built-in iterator returns itself with the built-in `next`), caches `next` once in `IteratorState.next_method` (`IteratorKind.custom`), and `iteratorNextVal` reads `done` before `value`, leaving `value` unread when `done` is truthy.
+- **`IteratorClose` (`builtins.zig`, `bytecode.zig`, `compiler.zig`, `vm.zig`, `machine.zig`):**
+  - `builtins.iteratorClose(rt, iter, is_throw)` invokes `iter.return()` on abrupt exits (normal `break`/`return`/outer-jump/partial destructuring or exception unwind), validating callable `return` and object result when `!is_throw` while preserving original exceptions when `is_throw` is true; built-in iterators preserve their remaining cursor state after `break`.
+  - Bytecode adds `.iter_close` and `.iter_close_throw` with `for_of` and array-destructuring catch-all exception handlers and unwind handling in `Machine`; `Machine.callFromBuiltin` saves and roots `m.ret` so calling `iter.return()` during a `return` unwind preserves the enclosing return value.

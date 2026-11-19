@@ -43,6 +43,8 @@ pub const Builtin = enum {
     aggregate_error_prototype,
     regexp_constructor,
     regexp_prototype,
+    symbol_constructor,
+    symbol_prototype,
 };
 
 /// Whether node gives `b` an own property called `name`.
@@ -87,6 +89,8 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .aggregate_error_prototype => aggregate_error_prototype.has(name),
         .regexp_constructor => regexp_constructor.has(name),
         .regexp_prototype => regexp_prototype.has(name),
+        .symbol_constructor => symbol_constructor.has(name),
+        .symbol_prototype => symbol_prototype.has(name),
     };
 }
 
@@ -657,4 +661,34 @@ const regexp_prototype = std.StaticStringMap(void).initComptime(.{
     .{"toString"},
     .{"unicode"},
     .{"unicodeSets"},
+});
+
+const symbol_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"asyncDispose"},
+    .{"asyncIterator"},
+    .{"dispose"},
+    .{"for"},
+    .{"hasInstance"},
+    .{"isConcatSpreadable"},
+    .{"iterator"},
+    .{"keyFor"},
+    .{"length"},
+    .{"match"},
+    .{"matchAll"},
+    .{"name"},
+    .{"prototype"},
+    .{"replace"},
+    .{"search"},
+    .{"species"},
+    .{"split"},
+    .{"toPrimitive"},
+    .{"toStringTag"},
+    .{"unscopables"},
+});
+
+const symbol_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"description"},
+    .{"toString"},
+    .{"valueOf"},
 });

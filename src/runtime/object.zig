@@ -33,6 +33,7 @@ const names = @import("builtin_names.zig");
 pub const Key = union(enum) {
     index: u32,
     atom: *String,
+    symbol: *heap_mod.Symbol,
 };
 
 /// The largest array index (2^32 − 2); one more is the largest length.
@@ -49,6 +50,7 @@ pub fn key(rt: *Runtime, v: Value) Error!Key {
             return .{ .atom = try rt.heap.internAscii(ops.formatNumber(&buf, n)) };
         },
         .string => |s| return keyUnits(rt, s.units),
+        .symbol => |s| return .{ .symbol = @constCast(s) },
         .undefined, .null, .boolean => {
             var buf: ops.NumberBuf = undefined;
             return .{ .atom = try rt.heap.internAscii((try ops.toPiece(rt, v, &buf)).ascii) };
@@ -82,13 +84,22 @@ pub fn atomOf(rt: *Runtime, k: Key) Error!*String {
             var buf: [10]u8 = undefined;
             break :blk rt.heap.internAscii(std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
         },
+        .symbol => unreachable,
+    };
+}
+
+pub fn propKey(rt: *Runtime, k: Key) Error!heap_mod.PropKey {
+    return switch (k) {
+        .symbol => |s| heap_mod.PropKey.fromSymbol(s),
+        .atom => |a| heap_mod.PropKey.fromAtom(a),
+        .index => |i| heap_mod.PropKey.fromAtom(try atomOf(rt, .{ .index = i })),
     };
 }
 
 pub fn isNamed(k: Key, text: []const u8) bool {
     const a = switch (k) {
         .atom => |a| a,
-        .index => return false,
+        .index, .symbol => return false,
     };
     if (a.units.len != text.len) return false;
     for (text, a.units) |c, u| if (c != u) return false;
@@ -99,7 +110,7 @@ pub fn isNamed(k: Key, text: []const u8) bool {
 fn nodeHas(b: names.Builtin, k: Key) bool {
     const a = switch (k) {
         .atom => |a| a,
-        .index => return false,
+        .index, .symbol => return false,
     };
     var buf: [64]u8 = undefined;
     if (a.units.len > buf.len) return false;
@@ -112,6 +123,7 @@ fn nodeHas(b: names.Builtin, k: Key) bool {
 
 /// Unsupported(builtin), recording which member.
 fn unsupportedBuiltin(rt: *Runtime, k: Key) Error {
+    if (k == .symbol) return rt.fail(.builtin);
     rt.unsupported_name = try atomOf(rt, k);
     return rt.fail(.builtin);
 }
@@ -121,6 +133,7 @@ fn keyPiece(k: Key, buf: *[10]u8) Piece {
     return switch (k) {
         .atom => |a| .{ .utf16 = a.units },
         .index => |i| .{ .ascii = std.fmt.bufPrint(buf, "{d}", .{i}) catch unreachable },
+        .symbol => .{ .ascii = "Symbol" },
     };
 }
 
@@ -142,10 +155,12 @@ fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error!Val
             switch (k) {
                 .index => |i| if (i < s.units.len) return .{ .string = try rt.heap.newString(&.{.{ .utf16 = s.units[i..][0..1] }}) },
                 .atom => if (isNamed(k, "length")) return .{ .number = @floatFromInt(s.units.len) },
+                .symbol => {},
             }
             const r = try builtins.realm(rt);
             return getFrom(rt, r.string_prototype, receiver, k);
         },
+        .symbol => return getFrom(rt, (try builtins.realm(rt)).symbol_prototype, receiver, k),
         .number => return getFrom(rt, (try builtins.realm(rt)).number_prototype, receiver, k),
         .boolean => return getFrom(rt, (try builtins.realm(rt)).boolean_prototype, receiver, k),
         .object => |o| return getFrom(rt, o, receiver, k),
@@ -168,7 +183,7 @@ fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error!Val
                 }
             }
             if (c.meta) |m| if (m.props.count() > 0) {
-                if (m.props.get(try atomOf(rt, k))) |p| return resolvePropValue(rt, receiver, p);
+                if (m.props.get(try propKey(rt, k))) |p| return resolvePropValue(rt, receiver, p);
             };
             if (c.meta) |m| if (m.proto) |p| return getWithReceiver(rt, p, receiver, k);
             return getFrom(rt, (try builtins.realm(rt)).function_prototype, receiver, k);
@@ -181,6 +196,7 @@ pub fn getPrototypeOfValue(rt: *Runtime, v: Value) Error!Value {
         .object => |o| if (o.proto) |p| .{ .object = p } else .null,
         .closure => |c| if (c.meta) |m| (m.proto orelse .{ .object = (try builtins.realm(rt)).function_prototype }) else .{ .object = (try builtins.realm(rt)).function_prototype },
         .native => .{ .object = (try builtins.realm(rt)).function_prototype },
+        .symbol => .{ .object = (try builtins.realm(rt)).symbol_prototype },
         else => .null,
     };
 }
@@ -213,6 +229,7 @@ fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
         .array => |elements| switch (k) {
             .index => |i| return if (i < elements.items.len) .{ .value = elements.items[i] } else null,
             .atom => if (isNamed(k, "length")) return .{ .value = .{ .number = @floatFromInt(elements.items.len) }, .enumerable = false, .configurable = false },
+            .symbol => {},
         },
         .map, .set => |table| if (isNamed(k, "size")) return .{ .value = .{ .number = @floatFromInt(table.live_count) }, .enumerable = false, .writable = false },
         .regexp => |re| {
@@ -231,7 +248,7 @@ fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
         .ordinary, .iterator, .promise => {},
     }
     if (o.props.count() == 0) return null; // don't intern index keys just to miss
-    return o.props.get(try atomOf(rt, k));
+    return o.props.get(try propKey(rt, k));
 }
 
 fn isRegExpGetter(k: Key) bool {
@@ -251,9 +268,9 @@ fn isRegExpGetter(k: Key) bool {
 fn own(o: *Object, k: Key) ?Value {
     const a = switch (k) {
         .atom => |a| a,
-        .index => return null,
+        .index, .symbol => return null,
     };
-    return if (o.props.get(a)) |p| p.value else null;
+    return if (o.props.get(heap_mod.PropKey.fromAtom(a))) |p| p.value else null;
 }
 
 // ---------------------------------------------------------------- set, define, delete
@@ -292,7 +309,7 @@ fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainH
                 }
                 if (c.meta) |m| {
                     if (m.props.count() > 0) {
-                        if (m.props.get(try atomOf(rt, k))) |p| {
+                        if (m.props.get(try propKey(rt, k))) |p| {
                             if (p.is_accessor) return .{ .accessor = p };
                             return .{ .data = .{ .is_own = sameTarget(cur, base), .writable = p.writable } };
                         }
@@ -321,7 +338,7 @@ pub fn set(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
             var buf: [10]u8 = undefined;
             return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot set properties of " }, .{ .ascii = @tagName(base) }, .{ .ascii = " (setting '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
         },
-        .string, .number, .boolean => return rt.fail(.primitive_write), // sloppy JS ignores these
+        .string, .number, .boolean, .symbol => return rt.fail(.primitive_write), // sloppy JS ignores these
         .native => {
             if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
             if (isNamed(k, "name") or isNamed(k, "length")) return;
@@ -364,7 +381,7 @@ pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value) Er
         },
         .closure => |c| {
             if (isNamed(k, "name") or isNamed(k, "length")) return;
-            if (c.meta) |m| if (m.props.get(try atomOf(rt, k))) |p| {
+            if (c.meta) |m| if (m.props.get(try propKey(rt, k))) |p| {
                 if (p.is_accessor) return invokeSetter(rt, p, receiver, v);
                 if (!p.writable) return;
             };
@@ -381,7 +398,7 @@ pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value) Er
 fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
     switch (base) {
         .closure => |c| {
-            try rt.heap.storeClosureProperty(@constCast(c), try atomOf(rt, k), v);
+            try rt.heap.storeClosurePropKey(@constCast(c), try propKey(rt, k), v);
         },
         .object => |o| {
             switch (o.kind) {
@@ -395,6 +412,7 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
                         return;
                     },
                     .atom => if (isNamed(k, "length")) return setLength(rt, o, v),
+                    .symbol => {},
                 },
                 .map, .set => if (isNamed(k, "size")) return, // Map/Set size is a read-only getter
                 .regexp => {
@@ -420,19 +438,19 @@ pub fn define(rt: *Runtime, o: *Object, k: Key, v: Value) Error!void {
 }
 
 pub fn defineNonEnumerable(rt: *Runtime, target: Value, k: Key, v: Value) Error!void {
-    const a = try atomOf(rt, k);
+    const pk = try propKey(rt, k);
     switch (target) {
-        .object => |o| try rt.heap.defineProperty(o, a, .{ .value = v, .enumerable = false }),
-        .closure => |c| try rt.heap.defineClosureProperty(@constCast(c), a, .{ .value = v, .enumerable = false }),
+        .object => |o| try rt.heap.definePropKey(o, pk, .{ .value = v, .enumerable = false }),
+        .closure => |c| try rt.heap.defineClosurePropKey(@constCast(c), pk, .{ .value = v, .enumerable = false }),
         else => unreachable,
     }
 }
 
 pub fn defineAccessor(rt: *Runtime, target: Value, k: Key, fn_val: Value, is_setter: bool, enumerable: bool) Error!void {
-    const a = try atomOf(rt, k);
+    const pk = try propKey(rt, k);
     const existing: ?Property = switch (target) {
-        .object => |o| o.props.get(a),
-        .closure => |c| if (c.meta) |m| m.props.get(a) else null,
+        .object => |o| o.props.get(pk),
+        .closure => |c| if (c.meta) |m| m.props.get(pk) else null,
         else => unreachable,
     };
     const keep_other = existing != null and existing.?.is_accessor;
@@ -445,18 +463,18 @@ pub fn defineAccessor(rt: *Runtime, target: Value, k: Key, fn_val: Value, is_set
         .writable = false,
     };
     switch (target) {
-        .object => |o| try rt.heap.defineProperty(o, a, prop),
-        .closure => |c| try rt.heap.defineClosureProperty(@constCast(c), a, prop),
+        .object => |o| try rt.heap.definePropKey(o, pk, prop),
+        .closure => |c| try rt.heap.defineClosurePropKey(@constCast(c), pk, prop),
         else => unreachable,
     }
 }
 
 pub fn definePublicField(rt: *Runtime, target: Value, k: Key, v: Value) Error!void {
-    const a = try atomOf(rt, k);
+    const pk = try propKey(rt, k);
     const prop: Property = .{ .value = v, .enumerable = true, .writable = true, .configurable = true };
     switch (target) {
-        .object => |o| try rt.heap.defineProperty(o, a, prop),
-        .closure => |c| try rt.heap.defineClosureProperty(@constCast(c), a, prop),
+        .object => |o| try rt.heap.definePropKey(o, pk, prop),
+        .closure => |c| try rt.heap.defineClosurePropKey(@constCast(c), pk, prop),
         else => unreachable,
     }
 }
@@ -543,7 +561,7 @@ pub fn hasPrivate(rt: *Runtime, base: Value, brand: *const heap_mod.Closure, nam
 }
 
 fn putOwn(rt: *Runtime, o: *Object, k: Key, v: Value) Error!void {
-    try rt.heap.storeProperty(o, try atomOf(rt, k), v);
+    try rt.heap.storePropKey(o, try propKey(rt, k), v);
 }
 
 fn setLength(rt: *Runtime, arr: *Object, v: Value) Error!void {
@@ -559,15 +577,15 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
     heap_mod.checkValue(base);
     const o = switch (base) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .string, .number, .boolean => return rt.fail(.primitive_write),
+        .string, .number, .boolean, .symbol => return rt.fail(.primitive_write),
         .native => return rt.fail(.function_properties),
         .closure => |c| {
             if (isNamed(k, "name") or isNamed(k, "length")) return true;
             if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return false;
             if (c.meta == null or c.meta.?.props.count() == 0) return true;
-            const a = try atomOf(rt, k);
-            if (c.meta.?.props.get(a)) |p| if (!p.configurable) return false;
-            rt.heap.removeClosureProperty(@constCast(c), a);
+            const pk = try propKey(rt, k);
+            if (c.meta.?.props.get(pk)) |p| if (!p.configurable) return false;
+            rt.heap.removeClosurePropKey(@constCast(c), pk);
             return true;
         },
         .object => |o| o,
@@ -577,14 +595,15 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
             // Deleting an element leaves a hole; deleting past the end does nothing.
             .index => |i| return if (i < elements.items.len) rt.fail(.sparse_array) else true,
             .atom => if (isNamed(k, "length")) return false, // non-configurable
+            .symbol => {},
         },
         .regexp => if (isNamed(k, "lastIndex")) return false, // non-configurable
         .ordinary, .map, .set, .iterator, .promise => {},
     }
     if (o.props.count() == 0) return true;
-    const a = try atomOf(rt, k);
-    if (o.props.get(a)) |p| if (!p.configurable) return false;
-    rt.heap.removeProperty(o, a);
+    const pk = try propKey(rt, k);
+    if (o.props.get(pk)) |p| if (!p.configurable) return false;
+    rt.heap.removePropKey(o, pk);
     return true;
 }
 
@@ -604,7 +623,7 @@ pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
         .closure => |c| {
             if (isNamed(k, "name") or isNamed(k, "length")) return true;
             if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return true;
-            if (c.meta) |m| if (m.props.count() > 0) if (m.props.contains(try atomOf(rt, k))) return true;
+            if (c.meta) |m| if (m.props.count() > 0) if (m.props.contains(try propKey(rt, k))) return true;
             if (c.meta) |m| if (m.proto) |p| return has(rt, k, p);
             return hasInChain(rt, (try builtins.realm(rt)).function_prototype, k);
         },
@@ -660,20 +679,58 @@ pub fn instanceOf(rt: *Runtime, lhs: Value, rhs: Value) Error!bool {
     return false;
 }
 
-/// Own enumerable keys of a closure in spec order (Object.keys(fn)).
+fn appendPropsKeys(
+    rt: *Runtime,
+    out: *std.ArrayList(Key),
+    prop_keys: []const heap_mod.PropKey,
+    prop_vals: []const Property,
+    first_named: usize,
+    include_symbols: bool,
+) Error!void {
+    for (prop_keys, prop_vals) |pk, p| {
+        if (!p.enumerable or pk.isSymbol()) continue;
+        const a = pk.asAtom();
+        if (a.atom.?.index) |i| {
+            try out.insert(rt.gpa, first_named + indexPosition(out.items[first_named..], i), .{ .index = i });
+        } else {
+            try out.append(rt.gpa, .{ .atom = a });
+        }
+    }
+    if (include_symbols) {
+        for (prop_keys, prop_vals) |pk, p| {
+            if (!p.enumerable or !pk.isSymbol()) continue;
+            try out.append(rt.gpa, .{ .symbol = pk.asSymbol() });
+        }
+    }
+}
+
+fn collectSymbolKeys(
+    rt: *Runtime,
+    prop_keys: []const heap_mod.PropKey,
+    prop_vals: []const Property,
+    include_non_enum: bool,
+) Error![]*heap_mod.Symbol {
+    var out: std.ArrayList(*heap_mod.Symbol) = .empty;
+    errdefer out.deinit(rt.gpa);
+    for (prop_keys, prop_vals) |pk, p| {
+        if (!pk.isSymbol()) continue;
+        if (!include_non_enum and !p.enumerable) continue;
+        try out.append(rt.gpa, pk.asSymbol());
+    }
+    return out.toOwnedSlice(rt.gpa);
+}
+
+/// Own enumerable string/index keys of a closure in spec order (Object.keys(fn)).
 pub fn ownKeysClosure(rt: *Runtime, c: *const heap_mod.Closure) Error![]Key {
     const m = c.meta orelse return &.{};
     if (m.props.count() == 0) return &.{};
     var out: std.ArrayList(Key) = .empty;
     errdefer out.deinit(rt.gpa);
-    for (m.props.keys(), m.props.values()) |a, p| {
-        if (!p.enumerable) continue;
-        if (a.atom.?.index) |i| try out.insert(rt.gpa, indexPosition(out.items, i), .{ .index = i }) else try out.append(rt.gpa, .{ .atom = a });
-    }
+    try appendPropsKeys(rt, &out, m.props.keys(), m.props.values(), 0, false);
     return out.toOwnedSlice(rt.gpa);
 }
 
-/// Own enumerable keys in spec order: array indices ascending, then the rest in
+/// Own enumerable string/index keys in spec order: array indices ascending, then the rest in
 /// insertion order (Object.keys).
 pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
     var out: std.ArrayList(Key) = .empty;
@@ -683,11 +740,41 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
         .ordinary, .map, .set, .iterator, .promise, .regexp => {},
     }
     const first_named = out.items.len;
-    for (o.props.keys(), o.props.values()) |a, p| {
-        if (!p.enumerable) continue;
-        if (a.atom.?.index) |i| try out.insert(rt.gpa, first_named + indexPosition(out.items[first_named..], i), .{ .index = i }) else try out.append(rt.gpa, .{ .atom = a });
-    }
+    try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false);
     return out.toOwnedSlice(rt.gpa);
+}
+
+/// Own enumerable keys including symbols (indices ascending, then strings, then symbols).
+pub fn ownAllKeys(rt: *Runtime, o: *Object) Error![]Key {
+    var out: std.ArrayList(Key) = .empty;
+    errdefer out.deinit(rt.gpa);
+    switch (o.kind) {
+        .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
+        .ordinary, .map, .set, .iterator, .promise, .regexp => {},
+    }
+    const first_named = out.items.len;
+    try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, true);
+    return out.toOwnedSlice(rt.gpa);
+}
+
+pub fn ownAllKeysClosure(rt: *Runtime, c: *const heap_mod.Closure) Error![]Key {
+    const m = c.meta orelse return &.{};
+    if (m.props.count() == 0) return &.{};
+    var out: std.ArrayList(Key) = .empty;
+    errdefer out.deinit(rt.gpa);
+    try appendPropsKeys(rt, &out, m.props.keys(), m.props.values(), 0, true);
+    return out.toOwnedSlice(rt.gpa);
+}
+
+pub fn ownSymbolKeys(rt: *Runtime, o: *Object, include_non_enum: bool) Error![]*heap_mod.Symbol {
+    if (o.props.count() == 0) return &.{};
+    return collectSymbolKeys(rt, o.props.keys(), o.props.values(), include_non_enum);
+}
+
+pub fn ownSymbolKeysClosure(rt: *Runtime, c: *const heap_mod.Closure, include_non_enum: bool) Error![]*heap_mod.Symbol {
+    const m = c.meta orelse return &.{};
+    if (m.props.count() == 0) return &.{};
+    return collectSymbolKeys(rt, m.props.keys(), m.props.values(), include_non_enum);
 }
 
 /// Where index `i` goes among the index keys at the front of `keys` (kept ascending).
@@ -697,7 +784,7 @@ fn indexPosition(keys: []const Key, i: u32) usize {
         .index => |j| if (j < i) {
             n += 1;
         },
-        .atom => break,
+        .atom, .symbol => break,
     };
     return n;
 }

@@ -1,0 +1,53 @@
+for-of: 1,2,3
+arr-spread: 0,1,2,3,4
+call-spread: 10,20,21,22
+method-spread: 106
+new-spread: 5,6,7
+super-spread: 9,10,11,12
+destruct: 1 2 3,4,5
+class-iter: 4,3,2,1
+Array.from: 1,2,3,4
+Array.from map: 10,20,30
+Array.from throw: Error return:3
+Map: 2 1 2
+Map bad entry: TypeError closed
+Set: 3 10,11,12
+AggErr: agg 10,11,12
+builtin ids: true true true function
+str-iter: true a 2 b true
+override arr: 30,20,10
+override next: 
+cache next: first 2 0
+non-iter for-of: TypeError
+non-iter map: TypeError
+non-iter set: TypeError
+bad sym.iter: TypeError
+prim iter: TypeError
+bad next: TypeError
+prim res: TypeError
+next throws: RangeError 
+value getter throws: RangeError 
+builtin after break: 10 20 30 true
+exhausted: body:1,body:2,body:3
+break: body:1,body:2,return:3
+return: 42 body:1,body:2,return:3
+throw: Error body:1,return:2
+labelled: a:1,b:10,b:11,return:12,a:2,b:10,return:11,return:3
+finInside: retVal try:1,fin,return:2
+finOutside: retOut body:1,return:2,outerFin
+partial: 1 return:2
+empty: return:1
+exhPat: 1 2 undefined 
+restPat: 1 2,3 
+defThrow: ReferenceError closed
+setThrow: TypeError return:2
+nestedDest: SyntaxError innerRet outerRet
+both throw: RangeError:orig
+break nonObj ret: TypeError
+destruct nonObj ret: TypeError
+throw ignores nonObj ret: RangeError:kept
+builtin ret once: RangeError 1
+pAll: 1,2,3
+pSettled: fulfilled:4,fulfilled:5
+pRace: 7
+pAny: 11

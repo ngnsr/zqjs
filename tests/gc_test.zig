@@ -159,7 +159,7 @@ test "collect frees the unreachable, keeps the reachable, and accounts exactly" 
     try testing.expectEqual(@as(u64, 200), h.stats.swept);
     try testing.expectEqual(@as(u64, 3), h.stats.marked); // keep, its key atom, its string
     try testing.expectEqual(h.bytes, h.stats.live_after_last);
-    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("kept"), keep.props.get(try h.internAscii("k")).?.value.string.units);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("kept"), keep.props.get(heap.PropKey.fromAtom(try h.internAscii("k"))).?.value.string.units);
 }
 
 test "a value reachable only through a chain of every object kind survives" {
@@ -199,10 +199,10 @@ test "a value reachable only through a chain of every object kind survives" {
     collectMajor(&h, &.{&root.obj}); // a minor one would keep the loose atom (promoted)
     try testing.expectEqual(live, h.bytes);
     // Walk the chain again: every link and leaf is intact.
-    const a2 = root.props.get(try h.internAscii("list")).?.value.object;
+    const a2 = root.props.get(heap.PropKey.fromAtom(try h.internAscii("list"))).?.value.object;
     const c2 = a2.kind.array.items[0].closure.impl.vm.captures[0];
     const o2 = c2.value.?.object;
-    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("via the prototype"), o2.proto.?.props.get(deep_key).?.value.string.units);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("via the prototype"), o2.proto.?.props.get(heap.PropKey.fromAtom(deep_key)).?.value.string.units);
     const e2 = a2.kind.array.items[1].closure.impl.tree.env.?.parent.?;
     try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("via the environment"), e2.values[0].?.string.units);
 }
@@ -239,13 +239,13 @@ test "weak atoms (D11): kept by their objects, dropped with them, reusable after
     for (0..5) |_| collectMajor(&h, &.{&o.obj});
     for (0..10_000) |i| {
         const k = try h.internAscii(std.fmt.bufPrint(&buf, "k{d}", .{i}) catch unreachable);
-        try testing.expectEqual(@as(f64, @floatFromInt(i)), o.props.get(k).?.value.number); // same atom as the key
+        try testing.expectEqual(@as(f64, @floatFromInt(i)), o.props.get(heap.PropKey.fromAtom(k)).?.value.number); // same atom as the key
     }
     // delete o[k], collect, reuse k: a fresh atom works as the key.
     h.removeProperty(o, try h.internAscii("k7"));
     collectMajor(&h, &.{&o.obj});
     try h.storeProperty(o, try h.internAscii("k7"), .{ .number = 77 });
-    try testing.expectEqual(@as(f64, 77), o.props.get(try h.internAscii("k7")).?.value.number);
+    try testing.expectEqual(@as(f64, 77), o.props.get(heap.PropKey.fromAtom(try h.internAscii("k7"))).?.value.number);
     // Drop the object: the table shrinks back to its baseline, and every entry left is a
     // live object (the cleanup ran before the sweep freed anything).
     collectMajor(&h, &.{});
@@ -646,9 +646,9 @@ test "the heap verifier passes after real collections and catches each kind of c
     h.gray = null;
     // An edge from a live object to a collected one (a hand-made tombstone).
     var dead: heap.Object = .{ .obj = .{ .kind = .dead, .next = null }, .proto = null };
-    keep.props.getPtr(try h.internAscii("a")).?.value = .{ .object = &dead };
+    keep.props.getPtr(heap.PropKey.fromAtom(try h.internAscii("a"))).?.value = .{ .object = &dead };
     try testing.expectError(error.EdgeToCollectedObject, h.verify());
-    keep.props.getPtr(try h.internAscii("a")).?.value = .{ .object = arr };
+    keep.props.getPtr(heap.PropKey.fromAtom(try h.internAscii("a"))).?.value = .{ .object = arr };
     // A non-atom in the atom table.
     const plain = try h.ascii("not an atom");
     try h.atoms.putNoClobber(h.allocator(), plain, {});
@@ -1185,7 +1185,7 @@ test "property cards: deletes at the start, middle and end shift young entries a
         try collectMinor(&h, &.{&o.obj});
         for (young) |i| {
             const k = try h.internAscii(keyName(&buf, i));
-            try testing.expectEqualSlices(u16, utf16("young"), o.props.get(k).?.value.string.units);
+            try testing.expectEqualSlices(u16, utf16("young"), o.props.get(heap.PropKey.fromAtom(k)).?.value.string.units);
         }
         try h.verifyCollected();
     }
@@ -1915,5 +1915,107 @@ test "M31: old closure storing young property and lazy prototype survives minor 
         const got = try runCollecting(src, engine, .{});
         defer testing.allocator.free(got);
         try testing.expectEqualStrings("young-42 77 new-99 88\n", got);
+    }
+}
+
+test "M36: old object storing young symbol property key survives minor GC and is collected when unreachable" {
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+
+    const obj = try h.newObject(null);
+    try collectMinor(&h, &.{&obj.obj});
+    try testing.expect(obj.obj.old);
+
+    const desc = try h.ascii("sym-key");
+    const sym = try h.newSymbol(desc, false);
+    const val = try h.ascii("sym-val");
+    try h.storePropKey(obj, heap.PropKey.fromSymbol(sym), .{ .string = val });
+    try h.verify();
+
+    try collectMinor(&h, &.{&obj.obj});
+    try testing.expect(sym.obj.old);
+    try testing.expect(desc.obj.old);
+    try testing.expect(val.obj.old);
+    try testing.expectEqual(val, obj.props.get(heap.PropKey.fromSymbol(sym)).?.value.string);
+    try h.verifyCollected();
+
+    collectMajor(&h, &.{});
+    try testing.expectEqual(@as(usize, 0), h.bytes);
+    try h.verify();
+}
+
+test "M36: global symbol registry (Symbol.for) survives GC on both engines" {
+    const src =
+        \\let saved = Symbol.for("persist-" + 1);
+        \\for (let i = 0; i < 200; i++) {
+        \\    let transient = Symbol("tmp-" + i);
+        \\    let trash = { [transient]: "pad-" + i };
+        \\}
+        \\const looked = Symbol.for("persist-1");
+        \\print(looked === saved, Symbol.keyFor(looked), looked.description);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("true persist-1 persist-1\n", got);
+    }
+}
+
+test "M36: custom iterators, spread, destructuring, and IteratorClose survive forced GC on both engines" {
+    const src =
+        \\const sym = Symbol("k");
+        \\const rec = { [sym]: 10 };
+        \\function garbageSum(n) {
+        \\    let t = { a: "g-" + n, b: [n, n + 1] };
+        \\    return t.b[0];
+        \\}
+        \\rec[sym] += garbageSum(5);
+        \\const log = [];
+        \\function makeIter(n) {
+        \\    return {
+        \\        [Symbol.iterator]() {
+        \\            let i = 0;
+        \\            return {
+        \\                next() {
+        \\                    const box = { v: "item-" + (++i) };
+        \\                    if (i <= n) return { value: box, done: false };
+        \\                    return { done: true };
+        \\                },
+        \\                return() {
+        \\                    log.push("closed-" + i);
+        \\                    return { done: true };
+        \\                },
+        \\            };
+        \\        },
+        \\    };
+        \\}
+        \\let full = [];
+        \\for (const item of makeIter(3)) full.push(item.v);
+        \\for (const item of makeIter(5)) {
+        \\    log.push("brk-" + item.v);
+        \\    if (item.v === "item-2") break;
+        \\}
+        \\function retEarly() {
+        \\    for (const item of makeIter(4)) {
+        \\        return { res: "ok-" + item.v };
+        \\    }
+        \\    return { res: "none" };
+        \\}
+        \\const retVal = retEarly();
+        \\try {
+        \\    for (const item of makeIter(4)) {
+        \\        throw { err: "thr-" + item.v };
+        \\    }
+        \\} catch (e) {
+        \\    log.push(e.err);
+        \\}
+        \\const spread = [...makeIter(2)].map(x => x.v);
+        \\const [first] = makeIter(3);
+        \\print(rec[sym], full.join(","), retVal.res, spread.join(","), first.v, log.join("|"));
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("15 item-1,item-2,item-3 ok-item-1 item-1,item-2 item-1 brk-item-1|brk-item-2|closed-2|closed-1|closed-1|thr-item-1|closed-1\n", got);
     }
 }

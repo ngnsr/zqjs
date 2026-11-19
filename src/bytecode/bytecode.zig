@@ -248,6 +248,10 @@ pub const Op = enum(u8) {
     get_iter,
     /// [iterator] → [iterator, value, done_bool]: advance iterator (M14.4).
     iter_next,
+    /// [iterator_or_undefined] → []: close iterator on normal/break/return abrupt exit.
+    iter_close,
+    /// [iterator_or_undefined] → []: close iterator on throw (suppressing return() errors).
+    iter_close_throw,
     /// Stack: [callee, arg0 … arg(argc-1)] → [result]. The callee is evaluated first,
     /// then the arguments, and only then is it checked (TypeError if not callable,
     /// matching the tree-walker). A closure gets a new frame (D36) with no receiver; a
@@ -364,6 +368,7 @@ pub const Op = enum(u8) {
             .jump_if_false, .jump_if_true => .{ .operands = &.{.target}, .pops = 1, .pushes = 0 },
             .get_iter => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .iter_next => .{ .operands = &.{}, .pops = 1, .pushes = 2 },
+            .iter_close, .iter_close_throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
             .call, .new_call => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
             .halt => .{ .operands = &.{}, .pops = 0, .pushes = 0 },
             .await => .{ .operands = &.{}, .pops = 1, .pushes = 1 },

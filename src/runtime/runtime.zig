@@ -237,6 +237,8 @@ pub const Runtime = struct {
     extra_roots: std.ArrayList(EngineRoots) = .empty,
     /// Per-run cached tagged-template `TemplateStringsArray` objects (keyed by AST/Proto site pointer).
     template_cache: std.AutoHashMapUnmanaged(usize, *heap_mod.Object) = .empty,
+    /// Global symbol registry (`Symbol.for` / `Symbol.keyFor`, M36 D66). Strong roots.
+    global_symbols: std.HashMapUnmanaged(*const heap_mod.String, *heap_mod.Symbol, SymbolRegistryContext, 80) = .empty,
     limit_hit: ?Limit = null,
     /// Set by a defensive-check failure (D49): an invariant of the VM, compiler or
     /// verifier is broken, so nothing about the state can be trusted. The embedding API
@@ -284,6 +286,7 @@ pub const Runtime = struct {
         rt.joining.deinit(rt.gpa);
         rt.extra_roots.deinit(rt.gpa);
         rt.template_cache.deinit(rt.gpa);
+        rt.global_symbols.deinit(rt.gpa);
         rt.microtasks.deinit(rt.gpa);
         rt.heap.deinit();
         rt.* = undefined;
@@ -410,7 +413,15 @@ pub const Runtime = struct {
 
     /// The runtime's own roots (GC_DESIGN §4), then the running engine's.
     fn markRoots(rt: *Runtime, h: *Heap) void {
-        if (rt.realm) |*r| for (r.objects()) |o| h.markObj(&o.obj);
+        if (rt.realm) |*r| {
+            for (r.objects()) |o| h.markObj(&o.obj);
+            h.markObj(&r.sym_iterator.obj);
+        }
+        var sym_it = rt.global_symbols.iterator();
+        while (sym_it.next()) |e| {
+            h.markObj(@constCast(&e.key_ptr.*.obj));
+            h.markObj(&e.value_ptr.*.obj);
+        }
         if (rt.exception) |e| h.markObj(@constCast(&e.message.obj));
         if (rt.thrown_value) |v| h.markValue(v);
         if (rt.unsupported_name) |n| h.markObj(@constCast(&n.obj));
@@ -536,5 +547,23 @@ pub const Runtime = struct {
 
     pub fn limitHit(rt: *const Runtime) ?Limit {
         return rt.limit_hit orelse rt.heap.limit_hit;
+    }
+};
+
+pub const SymbolRegistryContext = struct {
+    pub fn hash(_: SymbolRegistryContext, s: *const heap_mod.String) u64 {
+        return heap_mod.hashUnits(u16, s.units);
+    }
+    pub fn eql(_: SymbolRegistryContext, a: *const heap_mod.String, b: *const heap_mod.String) bool {
+        return std.mem.eql(u16, a.units, b.units);
+    }
+};
+
+pub const SymbolRegistryUtf16Adapter = struct {
+    pub fn hash(_: SymbolRegistryUtf16Adapter, units: []const u16) u64 {
+        return heap_mod.hashUnits(u16, units);
+    }
+    pub fn eql(_: SymbolRegistryUtf16Adapter, units: []const u16, s: *const heap_mod.String) bool {
+        return std.mem.eql(u16, units, s.units);
     }
 };

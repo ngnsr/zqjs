@@ -385,18 +385,16 @@ test "M14.2: Map unsupported methods, non-Map receivers, and non-Map new() targe
     try expectUnsupported("let o = { get: new Map().get }; o.get('x');", "", "Unsupported(builtin)");
     try expectUnsupported("new Object();", "", "Unsupported(builtin)");
     try expectUnsupported("new Array();", "", "Unsupported(builtin)");
-    try expectUnsupported("new Map({});", "", "Unsupported(builtin)");
 }
 
 test "M14.3: Set unsupported methods, non-Set receivers, and non-array iterables" {
     try expectUnsupported("new Set().constructor;", "", "('constructor')");
     try expectUnsupported("let o = { has: new Set().has }; o.has('x');", "", "Unsupported(builtin)");
-    try expectUnsupported("new Set({});", "", "Unsupported(builtin)");
 }
 
 test "M14.4: unsupported iterables, Iterator.prototype methods, and member for-of targets" {
-    try expectUnsupported("for (const x of {}) {}", "", "Unsupported(builtin)");
     try expectUnsupported("[1].values().map;", "", "('map')");
+    try expectUnsupported("Symbol.toPrimitive;", "", "('toPrimitive')");
 }
 
 test "M15.1: JSON.parse reviver exclusion, new JSON(), nesting limit, and OOM" {

@@ -68,6 +68,7 @@ pub const Obj = struct {
 
     pub const Kind = enum {
         string,
+        symbol,
         cell,
         closure,
         env,
@@ -100,7 +101,7 @@ pub const Cell = struct {
 
 /// Lazily allocated own-property table, `.prototype` box, and lexical `this` for `Closure` (M31, D62).
 pub const ClosureMeta = struct {
-    props: std.AutoArrayHashMapUnmanaged(*String, Property) = .empty,
+    props: std.AutoArrayHashMapUnmanaged(PropKey, Property) = .empty,
     /// On a constructable user closure: null until `.prototype` is lazily materialized
     /// or explicitly overwritten (`F.prototype = v`).
     prototype: ?Value = null,
@@ -174,6 +175,45 @@ pub const String = struct {
         /// a canonical numeric string ≤ 2^32 − 2 (D13).
         index: ?u32,
     } = null,
+};
+
+pub const Symbol = struct {
+    obj: Obj,
+    /// `null` for `Symbol()` / `Symbol(undefined)`; `""` for `Symbol("")`.
+    description: ?*const String,
+    /// True iff registered in `Runtime.global_symbols` via `Symbol.for(key)`.
+    is_global: bool = false,
+};
+
+/// Property map key: either an interned atom (`*String`) or a `*Symbol` (M36, D66).
+/// Both have `obj: Obj` at offset 0 and compare by pointer identity, so `Object.props`
+/// keeps an 8-byte key with zero per-object overhead.
+pub const PropKey = struct {
+    obj: *Obj,
+
+    pub inline fn fromAtom(a: *String) PropKey {
+        return .{ .obj = &a.obj };
+    }
+
+    pub inline fn fromSymbol(s: *Symbol) PropKey {
+        return .{ .obj = &s.obj };
+    }
+
+    pub inline fn isSymbol(k: PropKey) bool {
+        return k.obj.kind == .symbol;
+    }
+
+    pub inline fn asAtom(k: PropKey) *String {
+        return @fieldParentPtr("obj", k.obj);
+    }
+
+    pub inline fn asSymbol(k: PropKey) *Symbol {
+        return @fieldParentPtr("obj", k.obj);
+    }
+
+    pub inline fn toValue(k: PropKey) Value {
+        return if (k.isSymbol()) .{ .symbol = k.asSymbol() } else .{ .string = k.asAtom() };
+    }
 };
 
 pub const PrivateKey = struct {
@@ -282,6 +322,7 @@ pub fn sameValueZero(a: Value, b: Value) bool {
         .boolean => |x| x == b.boolean,
         .number => |x| (x == b.number) or (std.math.isNan(x) and std.math.isNan(b.number)),
         .string => |x| std.mem.eql(u16, x.units, b.string.units),
+        .symbol => |x| x == b.symbol,
         .native => |x| x == b.native,
         .closure => |x| x == b.closure,
         .object => |x| x == b.object,
@@ -305,6 +346,10 @@ pub fn hashValue(v: Value) u64 {
             hasher.update(std.mem.asBytes(&bits));
         },
         .string => |s| hasher.update(std.mem.sliceAsBytes(s.units)),
+        .symbol => |s| {
+            const p: usize = @intFromPtr(s);
+            hasher.update(std.mem.asBytes(&p));
+        },
         .native => |n| {
             const p: usize = @intFromPtr(n);
             hasher.update(std.mem.asBytes(&p));
@@ -331,10 +376,12 @@ pub const IteratorKind = enum {
     array_keys,
     array_entries,
     string_chars,
+    custom,
 };
 
 pub const IteratorState = struct {
     target: Value,
+    next_method: Value = .undefined,
     kind: IteratorKind,
     cursor: usize = 0,
     done: bool = false,
@@ -387,9 +434,9 @@ pub const Object = struct {
     /// The prototype. Only Object.create and the built-ins set it, always to an existing
     /// object or null, so a chain can never form a cycle.
     proto: ?*Object,
-    /// Own properties in insertion order, keyed by atom. Index-like keys of ordinary
-    /// objects live here too; `ownKeys` puts them first, ascending.
-    props: std.AutoArrayHashMapUnmanaged(*String, Property) = .empty,
+    /// Own properties in insertion order, keyed by atom or symbol. Index-like keys of
+    /// ordinary objects live here too; `ownKeys` puts them first, ascending.
+    props: std.AutoArrayHashMapUnmanaged(PropKey, Property) = .empty,
     /// Private fields/methods/accessors keyed by `(class_ctor, atom_name)` (M35, D65).
     private_props: ?*PrivateMap = null,
     kind: union(enum) {
@@ -743,7 +790,10 @@ pub const Heap = struct {
                     visitValue(e.key, &scan, RememberedScan.child);
                     visitValue(e.value, &scan, RememberedScan.child);
                 },
-                .iterator => |it| visitValue(it.target, &scan, RememberedScan.child),
+                .iterator => |it| {
+                    visitValue(it.target, &scan, RememberedScan.child);
+                    visitValue(it.next_method, &scan, RememberedScan.child);
+                },
                 .promise => |pr| {
                     visitValue(pr.result, &scan, RememberedScan.child);
                     for (pr.reactions.items) |rx| {
@@ -770,7 +820,7 @@ pub const Heap = struct {
         }
         fn entries(c: *RememberedScan, o: *Object, lo: usize, hi: usize) void {
             for (o.props.keys()[lo..hi], o.props.values()[lo..hi]) |k, p| {
-                c.child(&k.obj);
+                c.child(k.obj);
                 visitValue(p.value, c, child);
                 if (p.is_accessor) visitValue(p.setter, c, child);
             }
@@ -1036,6 +1086,23 @@ pub const Heap = struct {
         return o;
     }
 
+    pub fn newCustomIterator(h: *Heap, proto: ?*Object, target: Value, next_method: Value) Error!*Object {
+        const o = try h.newObject(proto);
+        o.kind = .{ .iterator = .{ .target = target, .next_method = next_method, .kind = .custom } };
+        h.barrier(&o.obj, null, target);
+        h.barrier(&o.obj, null, next_method);
+        return o;
+    }
+
+    pub fn newSymbol(h: *Heap, description: ?*const String, is_global: bool) Error!*Symbol {
+        const charge = try h.reserve(@sizeOf(Symbol), 0, 1);
+        errdefer h.bytes -= charge;
+        const s = try h.gpa.create(Symbol);
+        s.* = .{ .obj = h.newHeader(.symbol), .description = description, .is_global = is_global };
+        h.young = &s.obj;
+        return s;
+    }
+
     pub fn newPromise(h: *Heap, proto: ?*Object) Error!*Object {
         const o = try h.newObject(proto);
         o.kind = .{ .promise = .{} };
@@ -1082,25 +1149,33 @@ pub const Heap = struct {
     /// `o[key] = value`: updates an own property in place (keeping its position and
     /// enumerability) or adds an enumerable one at the end (D13).
     pub fn storeProperty(h: *Heap, o: *Object, key: *String, value: Value) Error!void {
+        return h.storePropKey(o, PropKey.fromAtom(key), value);
+    }
+
+    pub fn storePropKey(h: *Heap, o: *Object, key: PropKey, value: Value) Error!void {
         o.obj.checkLive();
         try h.growPropCards(o);
         const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
         const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
         if (gop.found_existing) gop.value_ptr.value = value else gop.value_ptr.* = .{ .value = value };
-        if (!gop.found_existing) h.barrier(&o.obj, null, .{ .string = key }); // the key is a child too
+        if (!gop.found_existing) h.barrierObj(&o.obj, key.obj); // the key is a child too
         h.barrier(&o.obj, old, value);
         h.propertyBarrier(o, gop.index, key, value);
     }
 
     /// Adds or replaces a property with explicit attributes (built-in method tables, defineProperty).
     pub fn defineProperty(h: *Heap, o: *Object, key: *String, p: Property) Error!void {
+        return h.definePropKey(o, PropKey.fromAtom(key), p);
+    }
+
+    pub fn definePropKey(h: *Heap, o: *Object, key: PropKey, p: Property) Error!void {
         o.obj.checkLive();
         try h.growPropCards(o);
         const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
         const old_val: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
         const old_set: ?Value = if (gop.found_existing and gop.value_ptr.is_accessor) gop.value_ptr.setter else null;
         gop.value_ptr.* = p;
-        if (!gop.found_existing) h.barrier(&o.obj, null, .{ .string = key }); // the key is a child too
+        if (!gop.found_existing) h.barrierObj(&o.obj, key.obj); // the key is a child too
         h.barrier(&o.obj, old_val, p.value);
         h.propertyBarrier(o, gop.index, key, p.value);
         if (p.is_accessor) {
@@ -1116,6 +1191,10 @@ pub const Heap = struct {
     /// the removed entry's on is dirtied (PC2): a young entry may have moved under a clean
     /// one. An owner that isn't remembered has nothing young to move.
     pub fn removeProperty(h: *Heap, o: *Object, key: *String) void {
+        h.removePropKey(o, PropKey.fromAtom(key));
+    }
+
+    pub fn removePropKey(h: *Heap, o: *Object, key: PropKey) void {
         const index = o.props.getIndex(key) orelse return;
         const old = o.props.values()[index];
         o.props.orderedRemoveAt(index);
@@ -1158,7 +1237,7 @@ pub const Heap = struct {
     /// carded table dirties the card of entry `index`, new entry or updated one alike.
     /// Looked up whenever an old owner stores something young: a table can keep its
     /// bitmap after deletes take it below `card_elements` entries.
-    inline fn propertyBarrier(h: *Heap, o: *Object, index: usize, key: *String, value: Value) void {
+    inline fn propertyBarrier(h: *Heap, o: *Object, index: usize, key: PropKey, value: Value) void {
         if (!o.obj.old or (key.obj.old and !isYoung(value))) return;
         if (mutation == .no_prop_card_set) return;
         const words = h.prop_cards.get(o) orelse return; // no bitmap: scanned whole
@@ -1279,26 +1358,38 @@ pub const Heap = struct {
     }
 
     pub fn storeClosureProperty(h: *Heap, c: *Closure, key: *String, value: Value) Error!void {
+        return h.storeClosurePropKey(c, PropKey.fromAtom(key), value);
+    }
+
+    pub fn storeClosurePropKey(h: *Heap, c: *Closure, key: PropKey, value: Value) Error!void {
         const m = try h.ensureClosureMeta(c);
         const gop = m.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
         const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
         if (gop.found_existing) gop.value_ptr.value = value else gop.value_ptr.* = .{ .value = value };
-        if (!gop.found_existing) h.barrier(&c.obj, null, .{ .string = key });
+        if (!gop.found_existing) h.barrierObj(&c.obj, key.obj);
         h.barrier(&c.obj, old, value);
     }
 
     pub fn defineClosureProperty(h: *Heap, c: *Closure, key: *String, prop: Property) Error!void {
+        return h.defineClosurePropKey(c, PropKey.fromAtom(key), prop);
+    }
+
+    pub fn defineClosurePropKey(h: *Heap, c: *Closure, key: PropKey, prop: Property) Error!void {
         const m = try h.ensureClosureMeta(c);
         const gop = m.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
         const old_val: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
         const old_set: ?Value = if (gop.found_existing and gop.value_ptr.is_accessor) gop.value_ptr.setter else null;
         gop.value_ptr.* = prop;
-        if (!gop.found_existing) h.barrier(&c.obj, null, .{ .string = key });
+        if (!gop.found_existing) h.barrierObj(&c.obj, key.obj);
         h.barrier(&c.obj, old_val, prop.value);
         if (prop.is_accessor) h.barrier(&c.obj, old_set, prop.setter) else if (old_set) |s| h.barrier(&c.obj, s, null);
     }
 
     pub fn removeClosureProperty(h: *Heap, c: *Closure, key: *String) void {
+        h.removeClosurePropKey(c, PropKey.fromAtom(key));
+    }
+
+    pub fn removeClosurePropKey(h: *Heap, c: *Closure, key: PropKey) void {
         c.obj.checkLive();
         const m = c.meta orelse return;
         const index = m.props.getIndex(key) orelse return;
@@ -1435,6 +1526,12 @@ pub const Heap = struct {
         if (owner.old and isYoung(v)) h.remember(owner);
     }
 
+    pub inline fn barrierObj(h: *Heap, owner: *Obj, child: *Obj) void {
+        owner.checkLive();
+        child.checkLive();
+        if (owner.old and !child.old) h.remember(owner);
+    }
+
     /// Puts an old object on the remembered list, once (the bit makes it idempotent).
     pub fn remember(h: *Heap, owner: *Obj) void {
         if (owner.remembered) return;
@@ -1447,6 +1544,7 @@ pub const Heap = struct {
         return switch (v) {
             .undefined, .null, .boolean, .number, .native => false,
             .string => |s| !s.obj.old,
+            .symbol => |s| !s.obj.old,
             .closure => |c| !c.obj.old,
             .object => |o| !o.obj.old,
         };
@@ -1706,6 +1804,7 @@ pub const Heap = struct {
     fn fixedCharge(obj: *const Obj) usize {
         return switch (obj.kind) {
             .string => @sizeOf(String) + @as(*const String, @alignCast(@fieldParentPtr("obj", obj))).units.len * @sizeOf(u16) + 2 * per_allocation_overhead,
+            .symbol => @sizeOf(Symbol) + per_allocation_overhead,
             .cell => @sizeOf(Cell) + per_allocation_overhead,
             .closure => switch (@as(*const Closure, @alignCast(@fieldParentPtr("obj", obj))).impl) {
                 .vm => |v| @sizeOf(Closure) + v.captures.len * @sizeOf(*Cell) + 2 * per_allocation_overhead,
@@ -1729,6 +1828,7 @@ pub const Heap = struct {
                 s.units = &poison_units;
                 s.atom = null;
             },
+            .symbol => @as(*Symbol, @fieldParentPtr("obj", obj)).description = null,
             .cell => @as(*Cell, @fieldParentPtr("obj", obj)).value = null,
             .closure => {
                 const c: *Closure = @fieldParentPtr("obj", obj);
@@ -1802,6 +1902,7 @@ pub const Heap = struct {
     fn freeStruct(h: *Heap, obj: *Obj, kind: Obj.Kind) void {
         switch (kind) {
             .string => h.gpa.destroy(@as(*String, @fieldParentPtr("obj", obj))),
+            .symbol => h.gpa.destroy(@as(*Symbol, @fieldParentPtr("obj", obj))),
             .cell => h.gpa.destroy(@as(*Cell, @fieldParentPtr("obj", obj))),
             .closure => h.gpa.destroy(@as(*Closure, @fieldParentPtr("obj", obj))),
             .env => h.gpa.destroy(@as(*Env, @fieldParentPtr("obj", obj))),
@@ -1881,6 +1982,10 @@ pub const Heap = struct {
 pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *Obj) void) void {
     switch (obj.kind) {
         .string => {},
+        .symbol => {
+            const s: *Symbol = @fieldParentPtr("obj", obj);
+            if (s.description) |d| visit(ctx, @constCast(&d.obj));
+        },
         .dead => unreachable, // markObj rejects tombstones before they are scanned
         .cell => {
             const c: *Cell = @fieldParentPtr("obj", obj);
@@ -1895,7 +2000,7 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                 if (m.home_object) |ho| visitValue(ho, ctx, visit);
                 if (m.brand) |br| visitValue(br, ctx, visit);
                 for (m.props.keys(), m.props.values()) |k, p| {
-                    visit(ctx, &k.obj);
+                    visit(ctx, k.obj);
                     visitValue(p.value, ctx, visit);
                     if (p.is_accessor) visitValue(p.setter, ctx, visit);
                 }
@@ -1934,7 +2039,7 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
             const o: *Object = @fieldParentPtr("obj", obj);
             if (o.proto) |p| visit(ctx, &p.obj);
             for (o.props.keys(), o.props.values()) |k, p| {
-                visit(ctx, &k.obj);
+                visit(ctx, k.obj);
                 visitValue(p.value, ctx, visit);
                 if (p.is_accessor) visitValue(p.setter, ctx, visit);
             }
@@ -1954,7 +2059,10 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                     visitValue(e.key, ctx, visit);
                     visitValue(e.value, ctx, visit);
                 },
-                .iterator => |it| visitValue(it.target, ctx, visit),
+                .iterator => |it| {
+                    visitValue(it.target, ctx, visit);
+                    visitValue(it.next_method, ctx, visit);
+                },
                 .promise => |pr| {
                     visitValue(pr.result, ctx, visit);
                     for (pr.reactions.items) |rx| {
@@ -1995,6 +2103,7 @@ pub fn visitValue(v: Value, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *Obj
     switch (v) {
         .undefined, .null, .boolean, .number, .native => {}, // natives are static
         .string => |s| visit(ctx, @constCast(&s.obj)),
+        .symbol => |s| visit(ctx, @constCast(&s.obj)),
         .closure => |c| visit(ctx, @constCast(&c.obj)),
         .object => |o| visit(ctx, &o.obj),
     }
@@ -2004,6 +2113,7 @@ pub fn visitValue(v: Value, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *Obj
 pub inline fn checkValue(v: Value) void {
     switch (v) {
         .string => |x| x.obj.checkLive(),
+        .symbol => |x| x.obj.checkLive(),
         .closure => |x| x.obj.checkLive(),
         .object => |x| x.obj.checkLive(),
         .undefined, .null, .boolean, .number, .native => {},
@@ -2023,7 +2133,7 @@ fn arrayIndex(units: []const u16) ?u32 {
 }
 
 /// Atoms hash by content (FNV-1a over code units, so ASCII and UTF-16 lookups agree).
-fn hashUnits(comptime T: type, units: []const T) u64 {
+pub fn hashUnits(comptime T: type, units: []const T) u64 {
     var h: u64 = 0xcbf29ce484222325;
     for (units) |u| {
         h ^= @as(u16, u);
@@ -2082,10 +2192,10 @@ test "object storage is charged to the heap limit and refunded exactly" {
     const arr = try h.newArray(o);
     const k = try h.internAscii("k");
     const before = h.bytes;
-    try o.props.put(h.allocator(), k, .{ .value = .null });
+    try o.props.put(h.allocator(), PropKey.fromAtom(k), .{ .value = .null });
     try arr.kind.array.append(h.allocator(), .{ .number = 1 });
     try testing.expect(h.bytes > before);
-    _ = o.props.orderedRemove(k);
+    _ = o.props.orderedRemove(PropKey.fromAtom(k));
     o.props.clearAndFree(h.allocator());
     arr.kind.array.clearAndFree(h.allocator());
     try testing.expectEqual(before, h.bytes);
@@ -2106,7 +2216,7 @@ test "forEachChild enumerates every reference edge (what the M8 GC will mark)" {
     const str = try h.ascii("value");
     const arr = try h.newArray(proto);
     try arr.kind.array.append(h.allocator(), .{ .string = str });
-    try o.props.put(h.allocator(), key, .{ .value = .{ .object = arr } });
+    try o.props.put(h.allocator(), PropKey.fromAtom(key), .{ .value = .{ .object = arr } });
     const cell = try h.newCell(.{ .object = o });
     const env = try h.newEnv(null, 0, 1);
     env.values[0] = .{ .string = str };

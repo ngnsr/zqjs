@@ -10,6 +10,7 @@ pub const Value = union(enum) {
     boolean: bool,
     number: f64,
     string: *const heap.String,
+    symbol: *const heap.Symbol,
     /// A function implemented in Zig. Becomes a function object in M7.
     native: *const Native,
     /// A function defined in the script (M6, M31 D62).
@@ -65,5 +66,6 @@ pub const Native = struct {
         uri_error,
         aggregate_error,
         regexp,
+        symbol,
     } = null,
 };

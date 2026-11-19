@@ -95,7 +95,8 @@ typedef enum zqjs_handle_kind {
     ZQJS_HANDLE_STRING = 4,
     ZQJS_HANDLE_FUNCTION = 5,
     ZQJS_HANDLE_OBJECT = 6,
-    ZQJS_HANDLE_ARRAY = 7
+    ZQJS_HANDLE_ARRAY = 7,
+    ZQJS_HANDLE_SYMBOL = 8
 } zqjs_handle_kind;
 
 typedef enum zqjs_promise_state {

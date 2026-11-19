@@ -74,11 +74,14 @@ pub const Realm = struct {
     uri_error_namespace: *Object,
     aggregate_error_namespace: *Object,
     regexp_namespace: *Object,
+    symbol_prototype: *Object,
+    symbol_namespace: *Object,
+    sym_iterator: *heap_mod.Symbol,
     math: *Object,
     json: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [38]*Object {
+    pub fn objects(r: *const Realm) [40]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -100,6 +103,7 @@ pub const Realm = struct {
             r.uri_error_prototype,
             r.aggregate_error_prototype,
             r.regexp_prototype,
+            r.symbol_prototype,
             r.object_namespace,
             r.array_namespace,
             r.string_namespace,
@@ -116,6 +120,7 @@ pub const Realm = struct {
             r.uri_error_namespace,
             r.aggregate_error_namespace,
             r.regexp_namespace,
+            r.symbol_namespace,
             r.math,
             r.json,
         };
@@ -164,6 +169,9 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .uri_error_namespace = try builtin(h, null, .uri_error_constructor),
         .aggregate_error_namespace = try builtin(h, null, .aggregate_error_constructor),
         .regexp_namespace = try builtin(h, null, .regexp_constructor),
+        .symbol_prototype = try builtin(h, object_prototype, .symbol_prototype),
+        .symbol_namespace = try builtin(h, null, .symbol_constructor),
+        .sym_iterator = try h.newSymbol(try h.ascii("Symbol.iterator"), false),
         .math = try builtin(h, object_prototype, .math),
         .json = try builtin(h, object_prototype, .json),
     };
@@ -231,6 +239,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.object_namespace, "defineProperties", &object_define_properties);
     try method(rt, r.object_namespace, "getOwnPropertyDescriptor", &object_get_own_property_descriptor);
     try method(rt, r.object_namespace, "getOwnPropertyDescriptors", &object_get_own_property_descriptors);
+    try method(rt, r.object_namespace, "getOwnPropertySymbols", &object_get_own_property_symbols);
     try method(rt, r.array_namespace, "isArray", &array_is_array);
     try method(rt, r.array_namespace, "from", &array_from);
     try method(rt, r.array_namespace, "of", &array_of);
@@ -273,6 +282,11 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.promise_namespace, "race", &promise_race_static);
     try method(rt, r.promise_namespace, "any", &promise_any_static);
     try method(rt, r.iterator_prototype, "next", &iterator_next);
+    try symbolMethod(rt, r.array_prototype, r.sym_iterator, &array_values);
+    try symbolMethod(rt, r.string_prototype, r.sym_iterator, &string_iterator);
+    try symbolMethod(rt, r.map_prototype, r.sym_iterator, &map_entries);
+    try symbolMethod(rt, r.set_prototype, r.sym_iterator, &set_values);
+    try symbolMethod(rt, r.iterator_prototype, r.sym_iterator, &iterator_self);
     try registerMath(rt, r.math);
     try method(rt, r.json, "parse", &json.parse_native);
     try method(rt, r.json, "stringify", &json.stringify_native);
@@ -302,6 +316,24 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.function_prototype, "call", &function_call);
     try method(rt, r.function_prototype, "apply", &function_apply);
     try method(rt, r.function_prototype, "bind", &function_bind);
+    try rt.heap.defineProperty(r.symbol_namespace, try rt.heap.internAscii("prototype"), .{
+        .value = .{ .object = r.symbol_prototype },
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
+    try rt.heap.defineProperty(r.symbol_namespace, try rt.heap.internAscii("iterator"), .{
+        .value = .{ .symbol = r.sym_iterator },
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
+    try method(rt, r.symbol_namespace, "for", &symbol_for);
+    try method(rt, r.symbol_namespace, "keyFor", &symbol_key_for);
+    try constant(rt, r.symbol_prototype, "constructor", .{ .native = &symbol_global });
+    try method(rt, r.symbol_prototype, "toString", &symbol_to_string);
+    try method(rt, r.symbol_prototype, "valueOf", &symbol_value_of);
+    try object.defineAccessor(rt, .{ .object = r.symbol_prototype }, try object.named(rt, "description"), .{ .native = &symbol_description_getter }, false, false);
     _ = &r;
     rt.realm = r;
     return &rt.realm.?;
@@ -316,6 +348,10 @@ fn builtin(h: *heap_mod.Heap, proto: ?*Object, b: names.Builtin) Error!*Object {
 fn method(rt: *Runtime, o: *Object, name: []const u8, n: *const Native) Error!void {
     const k = try rt.heap.internAscii(name);
     try rt.heap.defineProperty(o, k, .{ .value = .{ .native = n }, .enumerable = false });
+}
+
+fn symbolMethod(rt: *Runtime, o: *Object, sym: *heap_mod.Symbol, n: *const Native) Error!void {
+    try rt.heap.definePropKey(o, heap_mod.PropKey.fromSymbol(sym), .{ .value = .{ .native = n }, .enumerable = false });
 }
 
 fn constant(rt: *Runtime, o: *Object, name: []const u8, v: Value) Error!void {
@@ -349,6 +385,7 @@ pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
         .uri_error => r.uri_error_namespace,
         .aggregate_error => r.aggregate_error_namespace,
         .regexp => r.regexp_namespace,
+        .symbol => r.symbol_namespace,
     };
 }
 
@@ -373,6 +410,7 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
         .uri_error => r.uri_error_prototype,
         .aggregate_error => r.aggregate_error_prototype,
         .regexp => r.regexp_prototype,
+        .symbol => r.symbol_prototype,
     };
 }
 
@@ -400,6 +438,7 @@ pub const eval_error_global: Native = .{ .name = "EvalError", .call = evalErrorC
 pub const uri_error_global: Native = .{ .name = "URIError", .call = uriErrorCall, .construct = uriErrorConstruct, .namespace = .uri_error };
 pub const aggregate_error_global: Native = .{ .name = "AggregateError", .call = aggregateErrorCall, .construct = aggregateErrorConstruct, .namespace = .aggregate_error };
 pub const regexp_global: Native = .{ .name = "RegExp", .call = regexpCall, .construct = regexpConstruct, .namespace = .regexp };
+pub const symbol_global: Native = .{ .name = "Symbol", .call = symbolCall, .namespace = .symbol };
 
 /// A global read: implemented, host-registered (M9.1, D53), known to node (Unsupported),
 /// or a ReferenceError.
@@ -439,6 +478,7 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "URIError")) return .{ .native = &uri_error_global };
     if (std.mem.eql(u8, name, "AggregateError")) return .{ .native = &aggregate_error_global };
     if (std.mem.eql(u8, name, "RegExp")) return .{ .native = &regexp_global };
+    if (std.mem.eql(u8, name, "Symbol")) return .{ .native = &symbol_global };
     if (std.mem.eql(u8, name, "Math")) return .{ .object = (try realm(rt)).math };
     if (std.mem.eql(u8, name, "JSON")) return .{ .object = (try realm(rt)).json };
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return .{ .native = n };
@@ -464,7 +504,7 @@ fn notCallable(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 /// Evaluates `new callee(args...)` for built-in constructors (M14).
 pub fn construct(rt: *Runtime, callee: Value, args: []const Value) Error!Value {
     return switch (callee) {
-        .native => |n| if (n.construct) |c| c(rt, args) else if (n.namespace != null) rt.fail(.builtin) else rt.throw(.TypeError, &.{ .{ .ascii = n.name }, .{ .ascii = " is not a constructor" } }),
+        .native => |n| if (n.construct) |c| c(rt, args) else if (n == &symbol_global) rt.throw(.TypeError, &.{.{ .ascii = "Symbol is not a constructor" }}) else if (n.namespace != null) rt.fail(.builtin) else rt.throw(.TypeError, &.{ .{ .ascii = n.name }, .{ .ascii = " is not a constructor" } }),
         .closure => rt.fail(.builtin),
         else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }}),
     };
@@ -488,7 +528,7 @@ pub fn hasAutoPrototype(c: *const heap_mod.Closure) bool {
 
 pub fn isConstructor(v: Value) bool {
     return switch (v) {
-        .native => |n| n.construct != null or n.namespace != null,
+        .native => |n| n.construct != null or (n.namespace != null and n.namespace.? != .symbol),
         .closure => |c| switch (c.impl) {
             .vm, .tree => hasAutoPrototype(c),
             .bound => |b| isConstructor(b.target),
@@ -714,6 +754,12 @@ fn printImpl(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     _ = this;
     for (args, 0..) |value, i| {
         if (i > 0) try rt.out.writeByte(' ');
+        if (value == .symbol) {
+            try rt.out.writeAll("Symbol(");
+            if (value.symbol.description) |d| try ops.writeUtf16(rt.out, d.units);
+            try rt.out.writeByte(')');
+            continue;
+        }
         var buf: ops.NumberBuf = undefined;
         switch (try ops.toPiece(rt, value, &buf)) {
             .ascii => |s| try rt.out.writeAll(s),
@@ -747,6 +793,7 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
         .boolean => "Boolean",
         .number => "Number",
         .string => "String",
+        .symbol => "Symbol",
         .native, .closure => "Function",
         .object => |o| switch (o.kind) {
             .array => "Array",
@@ -757,6 +804,7 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
                 .set_values, .set_entries => "Set Iterator",
                 .array_values, .array_keys, .array_entries => "Array Iterator",
                 .string_chars => "String Iterator",
+                .custom => "Object",
             },
             .promise => "Promise",
             .regexp => "RegExp",
@@ -1810,6 +1858,7 @@ const object_define_property: Native = .{ .name = "defineProperty", .length = 3,
 const object_define_properties: Native = .{ .name = "defineProperties", .length = 2, .call = objectDefineProperties };
 const object_get_own_property_descriptor: Native = .{ .name = "getOwnPropertyDescriptor", .length = 2, .call = objectGetOwnPropertyDescriptor };
 const object_get_own_property_descriptors: Native = .{ .name = "getOwnPropertyDescriptors", .length = 1, .call = objectGetOwnPropertyDescriptors };
+const object_get_own_property_symbols: Native = .{ .name = "getOwnPropertySymbols", .length = 1, .call = objectGetOwnPropertySymbols };
 const array_is_array: Native = .{ .name = "isArray", .call = arrayIsArray };
 const array_from: Native = .{ .name = "from", .call = arrayFrom };
 const array_of: Native = .{ .name = "of", .call = arrayOf };
@@ -1823,7 +1872,7 @@ fn objectKeys(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const out = try rt.heap.newArray(r.array_prototype);
     switch (arg(args, 0)) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .boolean, .number, .native => {},
+        .boolean, .number, .symbol, .native => {},
         .closure => |c| {
             const keys = try object.ownKeysClosure(rt, c);
             defer rt.gpa.free(keys);
@@ -1846,8 +1895,33 @@ fn pushKey(rt: *Runtime, out: *Object, k: object.Key) Error!void {
             var buf: [10]u8 = undefined;
             break :blk try rt.heap.ascii(std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
         },
+        .symbol => unreachable,
     };
     try rt.heap.appendElement(out, .{ .string = s });
+}
+
+fn objectGetOwnPropertySymbols(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    const v = arg(args, 0);
+    if (v == .undefined or v == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    const out = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ v, .{ .object = out } };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const syms: []*heap_mod.Symbol = switch (v) {
+        .object => |o| try object.ownSymbolKeys(rt, o, true),
+        .closure => |c| try object.ownSymbolKeysClosure(rt, c, true),
+        else => &.{},
+    };
+    defer rt.gpa.free(syms);
+    for (syms) |sym| {
+        try rt.heap.appendElement(out, .{ .symbol = sym });
+    }
+    return .{ .object = out };
 }
 
 fn objectCreate(rt: *Runtime, _: Value, args: []const Value) Error!Value {
@@ -1870,6 +1944,7 @@ fn objectGetPrototypeOf(rt: *Runtime, _: Value, args: []const Value) Error!Value
         .boolean => .{ .object = r.boolean_prototype },
         .number => .{ .object = r.number_prototype },
         .string => .{ .object = r.string_prototype },
+        .symbol => .{ .object = r.symbol_prototype },
         .native, .closure, .object => object.getPrototypeOfValue(rt, v),
     };
 }
@@ -1911,6 +1986,7 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                     .atom => if (object.isNamed(k, "length")) {
                         return .{ .value = .{ .number = @floatFromInt(elements.items.len) }, .enumerable = false, .configurable = false };
                     },
+                    .symbol => {},
                 },
                 .regexp => |re| if (object.isNamed(k, "lastIndex")) {
                     return .{ .value = re.last_index, .enumerable = false, .configurable = false };
@@ -1918,7 +1994,7 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                 .ordinary, .map, .set, .iterator, .promise => {},
             }
             if (o.props.count() == 0) return null;
-            return o.props.get(try object.atomOf(rt, k));
+            return o.props.get(try object.propKey(rt, k));
         },
         .closure => |c| {
             if (object.isNamed(k, "length")) return .{ .value = .{ .number = @floatFromInt(closureLength(c)) }, .enumerable = false, .writable = false };
@@ -1932,7 +2008,7 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                     return .{ .value = .{ .object = p }, .enumerable = false, .configurable = false };
                 }
             }
-            if (c.meta) |m| if (m.props.count() > 0) return m.props.get(try object.atomOf(rt, k));
+            if (c.meta) |m| if (m.props.count() > 0) return m.props.get(try object.propKey(rt, k));
             return null;
         },
         .string => |s| switch (k) {
@@ -1943,6 +2019,7 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
             .atom => if (object.isNamed(k, "length")) {
                 return .{ .value = .{ .number = @floatFromInt(s.units.len) }, .enumerable = false, .writable = false, .configurable = false };
             },
+            .symbol => {},
         },
         .native => |n| {
             if (object.isNamed(k, "length")) return .{ .value = .{ .number = @floatFromInt(n.length) }, .enumerable = false, .writable = false };
@@ -1977,18 +2054,18 @@ fn objectGetOwnPropertyDescriptors(rt: *Runtime, _: Value, args: []const Value) 
 
     switch (target) {
         .object => |o| {
-            for (o.props.keys(), o.props.values()) |a, p| {
+            for (o.props.keys(), o.props.values()) |pk, p| {
                 const desc = try descriptorToObject(rt, p);
                 root_buf[2] = desc;
-                try rt.heap.storeProperty(out, a, desc);
+                try rt.heap.storePropKey(out, pk, desc);
                 root_buf[2] = .undefined;
             }
         },
         .closure => |c| if (c.meta) |m| {
-            for (m.props.keys(), m.props.values()) |a, p| {
+            for (m.props.keys(), m.props.values()) |pk, p| {
                 const desc = try descriptorToObject(rt, p);
                 root_buf[2] = desc;
-                try rt.heap.storeProperty(out, a, desc);
+                try rt.heap.storePropKey(out, pk, desc);
                 root_buf[2] = .undefined;
             }
         },
@@ -1997,11 +2074,19 @@ fn objectGetOwnPropertyDescriptors(rt: *Runtime, _: Value, args: []const Value) 
     return .{ .object = out };
 }
 
+fn keyToRootValue(k: object.Key) Value {
+    return switch (k) {
+        .atom => |a| .{ .string = a },
+        .symbol => |s| .{ .symbol = s },
+        .index => .undefined,
+    };
+}
+
 fn defineOwnPropertyFromDesc(rt: *Runtime, target: Value, k: object.Key, desc: Value) Error!void {
     if (desc != .object and desc != .closure and desc != .native) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Property description must be an object" }});
     }
-    var root_buf = [_]Value{ target, desc, .undefined, .undefined, .undefined };
+    var root_buf = [_]Value{ target, desc, .undefined, .undefined, .undefined, keyToRootValue(k) };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -2121,10 +2206,10 @@ fn defineOwnPropertyFromDesc(rt: *Runtime, target: Value, k: object.Key, desc: V
         if (has_conf) next.configurable = conf_val;
     }
 
-    const a = try object.atomOf(rt, k);
+    const pk = try object.propKey(rt, k);
     switch (target) {
-        .object => |o| try rt.heap.defineProperty(o, a, next),
-        .closure => |c| try rt.heap.defineClosureProperty(@constCast(c), a, next),
+        .object => |o| try rt.heap.definePropKey(o, pk, next),
+        .closure => |c| try rt.heap.defineClosurePropKey(@constCast(c), pk, next),
         else => unreachable,
     }
 }
@@ -2153,28 +2238,26 @@ fn objectDefineProperties(rt: *Runtime, _: Value, args: []const Value) Error!Val
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    switch (props) {
-        .object => |o| {
-            const keys = try object.ownKeys(rt, o);
-            defer rt.gpa.free(keys);
-            for (keys) |k| {
-                const desc = try object.get(rt, props, k);
-                root_buf[2] = desc;
-                try defineOwnPropertyFromDesc(rt, target, k, desc);
-                root_buf[2] = .undefined;
-            }
-        },
-        .closure => |c| {
-            const keys = try object.ownKeysClosure(rt, c);
-            defer rt.gpa.free(keys);
-            for (keys) |k| {
-                const desc = try object.get(rt, props, k);
-                root_buf[2] = desc;
-                try defineOwnPropertyFromDesc(rt, target, k, desc);
-                root_buf[2] = .undefined;
-            }
-        },
-        else => {},
+    const keys: []object.Key = switch (props) {
+        .object => |o| try object.ownAllKeys(rt, o),
+        .closure => |c| try object.ownAllKeysClosure(rt, c),
+        else => &.{},
+    };
+    defer rt.gpa.free(keys);
+    if (keys.len > 0) {
+        const key_vals = try rt.gpa.alloc(Value, keys.len);
+        defer rt.gpa.free(key_vals);
+        for (keys, key_vals) |k, *dst| dst.* = keyToRootValue(k);
+        var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+        try key_roots.register(rt);
+        defer key_roots.unregister(rt);
+
+        for (keys) |k| {
+            const desc = try object.get(rt, props, k);
+            root_buf[2] = desc;
+            try defineOwnPropertyFromDesc(rt, target, k, desc);
+            root_buf[2] = .undefined;
+        }
     }
     return target;
 }
@@ -2191,6 +2274,7 @@ fn keyToString(rt: *Runtime, k: object.Key) Error!*heap_mod.String {
             var buf: [10]u8 = undefined;
             break :blk try rt.heap.ascii(std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
         },
+        .symbol => unreachable,
     };
 }
 
@@ -2209,7 +2293,7 @@ fn objectValuesEntriesImpl(rt: *Runtime, args: []const Value, comptime is_entrie
 
     switch (arg(args, 0)) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .boolean, .number, .native => {},
+        .boolean, .number, .symbol, .native => {},
         .closure => |c| {
             const keys = try object.ownKeysClosure(rt, c);
             defer rt.gpa.free(keys);
@@ -2279,41 +2363,61 @@ fn objectAssign(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const target = arg(args, 0);
     switch (target) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .boolean, .number, .string => return unsupportedReceiver(rt, "assign"),
+        .boolean, .number, .string, .symbol => return unsupportedReceiver(rt, "assign"),
         .native => return rt.fail(.function_properties),
         .object, .closure => {},
     }
     if (args.len <= 1) return target;
 
-    var root_buf = [_]Value{ target, .undefined };
+    var root_buf = [_]Value{ target, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
     for (args[1..]) |src| {
+        root_buf[1] = src;
         switch (src) {
-            .undefined, .null, .boolean, .number, .native => {},
+            .undefined, .null, .boolean, .number, .symbol, .native => {},
             .closure => |c| {
-                const keys = try object.ownKeysClosure(rt, c);
+                const keys = try object.ownAllKeysClosure(rt, c);
                 defer rt.gpa.free(keys);
+                const key_vals = try rt.gpa.alloc(Value, keys.len);
+                defer rt.gpa.free(key_vals);
+                for (keys, key_vals) |k, *dst| dst.* = keyToRootValue(k);
+                var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+                try key_roots.register(rt);
+                defer key_roots.unregister(rt);
                 for (keys) |k| {
-                    try object.set(rt, target, k, try object.get(rt, src, k));
+                    const val = try object.get(rt, src, k);
+                    root_buf[2] = val;
+                    try object.set(rt, target, k, val);
+                    root_buf[2] = .undefined;
                 }
             },
             .string => |s| for (0..s.units.len) |i| {
                 const ch = try rt.heap.newString(&.{.{ .utf16 = s.units[i .. i + 1] }});
-                root_buf[1] = .{ .string = ch };
-                try object.set(rt, target, .{ .index = @intCast(i) }, root_buf[1]);
-                root_buf[1] = .undefined;
+                root_buf[2] = .{ .string = ch };
+                try object.set(rt, target, .{ .index = @intCast(i) }, root_buf[2]);
+                root_buf[2] = .undefined;
             },
             .object => |src_obj| {
-                const keys = try object.ownKeys(rt, src_obj);
+                const keys = try object.ownAllKeys(rt, src_obj);
                 defer rt.gpa.free(keys);
+                const key_vals = try rt.gpa.alloc(Value, keys.len);
+                defer rt.gpa.free(key_vals);
+                for (keys, key_vals) |k, *dst| dst.* = keyToRootValue(k);
+                var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+                try key_roots.register(rt);
+                defer key_roots.unregister(rt);
                 for (keys) |k| {
-                    try object.set(rt, target, k, try ownKeyValue(rt, src_obj, k));
+                    const val = try ownKeyValue(rt, src_obj, k);
+                    root_buf[2] = val;
+                    try object.set(rt, target, k, val);
+                    root_buf[2] = .undefined;
                 }
             },
         }
+        root_buf[1] = .undefined;
     }
     return target;
 }
@@ -2345,7 +2449,10 @@ fn arrayFrom(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     while (try iteratorNextVal(rt, iter)) |elem| : (k += 1) {
         root_buf[5] = elem;
         const val = if (has_map)
-            try rt.callCallable(map_fn, this_arg, &.{ root_buf[5], .{ .number = @floatFromInt(k) } })
+            rt.callCallable(map_fn, this_arg, &.{ root_buf[5], .{ .number = @floatFromInt(k) } }) catch |e| {
+                if (e == error.Thrown) try iteratorClose(rt, iter, true);
+                return e;
+            }
         else
             elem;
         root_buf[5] = val;
@@ -2357,7 +2464,74 @@ fn arrayFrom(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 
 fn stringCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     if (args.len == 0) return .{ .string = try rt.heap.newString(&.{}) };
+    if (args[0] == .symbol) return .{ .string = try symbolDescriptiveString(rt, args[0].symbol) };
     return .{ .string = try toStringObj(rt, args[0]) };
+}
+
+// ---------------------------------------------------------------- Symbol (M36, D66)
+
+const symbol_for: Native = .{ .name = "for", .length = 1, .call = symbolFor };
+const symbol_key_for: Native = .{ .name = "keyFor", .length = 1, .call = symbolKeyFor };
+const symbol_to_string: Native = .{ .name = "toString", .call = symbolToString };
+const symbol_value_of: Native = .{ .name = "valueOf", .call = symbolValueOf };
+const symbol_description_getter: Native = .{ .name = "get description", .call = symbolDescriptionGetter };
+
+fn symbolDescriptiveString(rt: *Runtime, sym: *const heap_mod.Symbol) Error!*const heap_mod.String {
+    return if (sym.description) |d|
+        rt.heap.newString(&.{ .{ .ascii = "Symbol(" }, .{ .utf16 = d.units }, .{ .ascii = ")" } })
+    else
+        rt.heap.ascii("Symbol()");
+}
+
+fn symbolCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const desc: ?*const heap_mod.String = if (args.len == 0 or args[0] == .undefined)
+        null
+    else
+        try toStringObj(rt, args[0]);
+    return .{ .symbol = try rt.heap.newSymbol(desc, false) };
+}
+
+fn symbolFor(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const key_str = try toStringObj(rt, arg(args, 0));
+    if (rt.global_symbols.get(key_str)) |sym| {
+        return .{ .symbol = sym };
+    }
+    var root_buf = [_]Value{.{ .string = key_str }};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const sym = try rt.heap.newSymbol(key_str, true);
+    try rt.global_symbols.putNoClobber(rt.gpa, key_str, sym);
+    return .{ .symbol = sym };
+}
+
+fn symbolKeyFor(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const v = arg(args, 0);
+    if (v != .symbol) return rt.throw(.TypeError, &.{.{ .ascii = "Symbol.keyFor requires a symbol argument" }});
+    const sym = v.symbol;
+    return if (sym.is_global) .{ .string = sym.description.? } else .undefined;
+}
+
+fn thisSymbol(rt: *Runtime, this: Value, name: []const u8) Error!*const heap_mod.Symbol {
+    return switch (this) {
+        .symbol => |s| s,
+        else => rt.throw(.TypeError, &.{ .{ .ascii = "Symbol.prototype." }, .{ .ascii = name }, .{ .ascii = " requires that 'this' be a Symbol" } }),
+    };
+}
+
+fn symbolToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const sym = try thisSymbol(rt, this, "toString");
+    return .{ .string = try symbolDescriptiveString(rt, sym) };
+}
+
+fn symbolValueOf(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return .{ .symbol = try thisSymbol(rt, this, "valueOf") };
+}
+
+fn symbolDescriptionGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const sym = try thisSymbol(rt, this, "description");
+    return if (sym.description) |d| .{ .string = d } else .undefined;
 }
 
 fn numberCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
@@ -2752,14 +2926,35 @@ fn mapConstruct(rt: *Runtime, args: []const Value) Error!Value {
     const m = try rt.heap.newMap(r.map_prototype);
     const iterable = arg(args, 0);
     if (iterable == .undefined or iterable == .null) return .{ .object = m };
+
+    var root_buf = [_]Value{ iterable, .{ .object = m }, .undefined, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     const iter = try getIterator(rt, iterable);
+    root_buf[2] = .{ .object = iter };
+
     while (try iteratorNextVal(rt, iter)) |entry| {
-        if (entry != .object) {
+        root_buf[3] = entry;
+        if (!entry.isObjectLike()) {
+            try iteratorClose(rt, iter, true);
             return rt.throw(.TypeError, &.{.{ .ascii = "Iterator value is not an entry object" }});
         }
-        const k = try object.get(rt, entry, .{ .index = 0 });
-        const v = try object.get(rt, entry, .{ .index = 1 });
+        const k = object.get(rt, entry, .{ .index = 0 }) catch |e| {
+            if (e == error.Thrown) try iteratorClose(rt, iter, true);
+            return e;
+        };
+        root_buf[4] = k;
+        const v = object.get(rt, entry, .{ .index = 1 }) catch |e| {
+            if (e == error.Thrown) try iteratorClose(rt, iter, true);
+            return e;
+        };
+        root_buf[5] = v;
         try rt.heap.mapSet(m, k, v);
+        root_buf[3] = .undefined;
+        root_buf[4] = .undefined;
+        root_buf[5] = .undefined;
     }
     return .{ .object = m };
 }
@@ -2852,9 +3047,18 @@ fn setConstruct(rt: *Runtime, args: []const Value) Error!Value {
     const s = try rt.heap.newSet(r.set_prototype);
     const iterable = arg(args, 0);
     if (iterable == .undefined or iterable == .null) return .{ .object = s };
+
+    var root_buf = [_]Value{ iterable, .{ .object = s }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     const iter = try getIterator(rt, iterable);
+    root_buf[2] = .{ .object = iter };
     while (try iteratorNextVal(rt, iter)) |v| {
+        root_buf[3] = v;
         try rt.heap.setAdd(s, v);
+        root_buf[3] = .undefined;
     }
     return .{ .object = s };
 }
@@ -3420,23 +3624,49 @@ pub fn settlePromiseFromJob(rt: *Runtime, p_obj: *Object, is_rejected: bool, val
     pr.reactions.clearRetainingCapacity();
 }
 
-// ---------------------------------------------------------------- Iterators (M14.4)
+// ---------------------------------------------------------------- Iterators (M14.4, M36 D66)
 
 const iterator_next: Native = .{ .name = "next", .call = iteratorNext };
+const string_iterator: Native = .{ .name = "[Symbol.iterator]", .call = stringIterator };
+const iterator_self: Native = .{ .name = "[Symbol.iterator]", .call = iteratorSelf };
+
+fn stringIterator(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const s = try thisString(rt, this, "[Symbol.iterator]");
+    return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, .{ .string = s }, .string_chars) };
+}
+
+fn iteratorSelf(_: *Runtime, this: Value, _: []const Value) Error!Value {
+    return this;
+}
 
 pub fn getIterator(rt: *Runtime, iterable: Value) Error!*Object {
+    if (iterable == .undefined or iterable == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }});
+    }
     const r = try realm(rt);
-    return switch (iterable) {
-        .object => |o| switch (o.kind) {
-            .map => rt.heap.newIterator(r.iterator_prototype, iterable, .map_entries),
-            .set => rt.heap.newIterator(r.iterator_prototype, iterable, .set_values),
-            .array => rt.heap.newIterator(r.iterator_prototype, iterable, .array_values),
-            .iterator => o,
-            .ordinary, .promise, .regexp => unsupportedReceiver(rt, "Symbol.iterator"),
-        },
-        .string => rt.heap.newIterator(r.iterator_prototype, iterable, .string_chars),
-        else => rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }}),
-    };
+    var root_buf = [_]Value{ iterable, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const method_fn = try object.get(rt, iterable, .{ .symbol = r.sym_iterator });
+    root_buf[1] = method_fn;
+    if (method_fn == .undefined or method_fn == .null or !method_fn.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }});
+    }
+    const iter_val = try rt.callCallable(method_fn, iterable, &.{});
+    root_buf[2] = iter_val;
+    if (!iter_val.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Result of the Symbol.iterator method is not an object" }});
+    }
+    const next_fn = try object.get(rt, iter_val, try object.named(rt, "next"));
+    root_buf[3] = next_fn;
+    if (iter_val == .object and iter_val.object.kind == .iterator and
+        next_fn == .native and next_fn.native == &iterator_next)
+    {
+        return iter_val.object;
+    }
+    return rt.heap.newCustomIterator(r.iterator_prototype, iter_val, next_fn);
 }
 
 fn makePairArray(rt: *Runtime, a: Value, b: Value) Error!Value {
@@ -3505,10 +3735,95 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
                 return .{ .string = try rt.heap.newString(&.{.{ .utf16 = units[start .. start + step] }}) };
             }
         },
+        .custom => {
+            var root_buf = [_]Value{ .{ .object = iter }, .undefined };
+            var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+
+            // Per ES IteratorStep: if next() throws, IteratorClose is not called.
+            errdefer {
+                it.done = true;
+                it.target = .undefined;
+                it.next_method = .undefined;
+            }
+            if (!it.next_method.isFunction()) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "iterator.next is not a function" }});
+            }
+            const res = try rt.callCallable(it.next_method, it.target, &.{});
+            root_buf[1] = res;
+            if (!res.isObjectLike()) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
+            }
+            const done_val = try object.get(rt, res, try object.named(rt, "done"));
+            if (!ops.toBoolean(done_val)) {
+                return try object.get(rt, res, try object.named(rt, "value"));
+            }
+            it.next_method = .undefined;
+        },
     }
     it.done = true;
     it.target = .undefined; // permanently exhausted; allow target collection
     return null;
+}
+
+pub fn iteratorClose(rt: *Runtime, iter: *Object, is_throw: bool) Error!void {
+    const it = &iter.kind.iterator;
+    if (it.done) return;
+    const is_custom = it.kind == .custom;
+    const target: Value = if (is_custom) it.target else .{ .object = iter };
+    if (is_custom) {
+        it.done = true;
+        it.target = .undefined;
+        it.next_method = .undefined;
+    }
+
+    const saved_ex = if (is_throw) rt.exception else null;
+    const saved_tv = if (is_throw) rt.thrown_value else null;
+    if (is_throw) {
+        rt.exception = null;
+        rt.thrown_value = null;
+    }
+    defer if (is_throw) {
+        rt.exception = saved_ex;
+        rt.thrown_value = saved_tv;
+    };
+
+    var root_buf = [_]Value{
+        target,
+        .undefined,
+        .undefined,
+        if (saved_ex) |ex| .{ .string = ex.message } else .undefined,
+        saved_tv orelse .undefined,
+    };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const ret = object.get(rt, target, try object.named(rt, "return")) catch |e| {
+        if (e == error.Thrown and is_throw) {
+            rt.clearThrown();
+            return;
+        }
+        return e;
+    };
+    if (ret == .undefined or ret == .null) return;
+    if (!ret.isFunction()) {
+        if (is_throw) return;
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator return method is not a function" }});
+    }
+    root_buf[1] = ret;
+    const res = rt.callCallable(ret, target, &.{}) catch |e| {
+        if (e == error.Thrown and is_throw) {
+            rt.clearThrown();
+            return;
+        }
+        return e;
+    };
+    root_buf[2] = res;
+    if (!is_throw and !res.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
+    }
 }
 
 fn iteratorNext(rt: *Runtime, this: Value, _: []const Value) Error!Value {

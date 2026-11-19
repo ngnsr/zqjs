@@ -23,7 +23,7 @@ pub inline fn toBoolean(v: Value) bool {
         .boolean => |b| b,
         .number => |n| !(n == 0 or std.math.isNan(n)), // 0, -0 and NaN are falsy
         .string => |s| s.units.len != 0,
-        .native, .closure, .object => true,
+        .symbol, .native, .closure, .object => true,
     };
 }
 
@@ -37,6 +37,7 @@ pub fn toNumber(rt: *Runtime, v: Value) Error!f64 {
         .boolean => |b| if (b) 1 else 0,
         .number => |n| n,
         .string => |s| stringToNumber(gpa, s.units),
+        .symbol => rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert a Symbol value to a number" }}),
         // ToPrimitive gives the source text, which is never a numeric string.
         .native, .closure => std.math.nan(f64),
         .object => toNumber(rt, try object.toPrimitive(rt, v, .number)),
@@ -165,6 +166,7 @@ pub fn toPiece(rt: *Runtime, v: Value, buf: *NumberBuf) Error!Piece {
         .boolean => |b| .{ .ascii = if (b) "true" else "false" },
         .number => |n| .{ .ascii = formatNumber(buf, n) },
         .string => |s| .{ .utf16 = s.units },
+        .symbol => rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert a Symbol value to a string" }}),
         // Node prints the function's source text; ZQJS has none to show (yet).
         .native, .closure => rt.fail(.function_to_string),
         .object => toPiece(rt, try object.toPrimitive(rt, v, .string), buf),
@@ -235,6 +237,7 @@ pub fn strictEquals(a: Value, b: Value) bool {
         .boolean => |x| x == b.boolean,
         .number => |x| x == b.number, // NaN !== NaN, 0 === -0
         .string => |x| std.mem.eql(u16, x.units, b.string.units),
+        .symbol => |x| x == b.symbol,
         .native => |x| x == b.native,
         .closure => |x| x == b.closure, // identity
         .object => |x| x == b.object,
@@ -295,6 +298,7 @@ pub fn typeOf(rt: *Runtime, v: Value) Error!Value {
         .boolean => "boolean",
         .number => "number",
         .string => "string",
+        .symbol => "symbol",
         .native, .closure => "function",
         .object => "object",
     };

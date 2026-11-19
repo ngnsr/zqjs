@@ -493,7 +493,7 @@ pub const Vm = struct {
             };
         }
 
-        fn cellAt(self: FrameCache, vm: *Vm, i: u32) Error!*Cell {
+        inline fn cellAt(self: FrameCache, vm: *Vm, i: u32) Error!*Cell {
             return vm.cellIn(try self.slot(vm, i));
         }
 
@@ -852,6 +852,348 @@ pub const Vm = struct {
                 cache.sp -= n;
                 try cache.push(vm, .{ .object = arr });
             },
+            .new_regexp,
+            .get_template_obj,
+            .setup_class,
+            .define_method,
+            .define_elem_method,
+            .define_accessor,
+            .define_elem_accessor,
+            .define_private_method,
+            .define_private_accessor,
+            .define_public_field,
+            .define_private_field,
+            .get_private,
+            .set_private,
+            .in_private,
+            .store_field_key,
+            .add_instance_init,
+            .run_static_init,
+            .set_brand,
+            .super_call,
+            .super_call_spread,
+            .super_get_prop,
+            .super_get_elem,
+            .super_set_prop,
+            .super_set_elem,
+            .throw_delete_super,
+            .delete_prop,
+            .delete_elem,
+            .rest_array,
+            .array_spread,
+            .object_spread,
+            .iter_rest,
+            .require_obj,
+            .object_rest,
+            .new_call_spread,
+            .call_spread,
+            .call_method_spread,
+            .iter_close,
+            .iter_close_throw,
+            => {
+                cache.syncSp(vm);
+                if (try vm.executeCold(op, pc, next)) {
+                    cache.* = FrameCache.fromVm(vm, 0);
+                    return .running;
+                }
+                cache.sp = vm.sp;
+            },
+            .define_prop => {
+                const o = try cache.peek(vm, 1);
+                if (o != .object) return vm.bug("define on a non-object");
+                try object.define(rt, o.object, try vm.nameKey(cache.operand(0)), try cache.peek(vm, 0));
+                try cache.drop(vm, 1);
+            },
+            .define_elem => {
+                const o = try cache.peek(vm, 2);
+                if (o != .object) return vm.bug("define on a non-object");
+                try object.define(rt, o.object, try object.key(rt, try cache.peek(vm, 1)), try cache.peek(vm, 0));
+                try cache.drop(vm, 2);
+            },
+            .get_prop => {
+                cache.syncSp(vm);
+                const r = try object.get(rt, try cache.peek(vm, 0), try vm.nameKey(cache.operand(0)));
+                (try cache.top(vm)).* = r;
+            },
+            .get_elem => {
+                const idx = try cache.peek(vm, 0);
+                const base = try cache.peek(vm, 1);
+                const r: Value = if (fastArrayGet(base, idx)) |v| v else blk: {
+                    cache.syncSp(vm);
+                    const k = try object.key(rt, idx);
+                    break :blk try object.get(rt, base, k);
+                };
+                try cache.drop(vm, 1);
+                (try cache.top(vm)).* = r;
+            },
+            .set_prop => {
+                const v = try cache.peek(vm, 0);
+                cache.syncSp(vm);
+                try object.set(rt, try cache.peek(vm, 1), try vm.nameKey(cache.operand(0)), v);
+                try cache.drop(vm, 1);
+                (try cache.top(vm)).* = v;
+            },
+            .set_elem => {
+                const v = try cache.peek(vm, 0);
+                const k = try object.key(rt, try cache.peek(vm, 1)); // after the value: JS's order for `=`
+                cache.syncSp(vm);
+                try object.set(rt, try cache.peek(vm, 2), k, v);
+                try cache.drop(vm, 2);
+                (try cache.top(vm)).* = v;
+            },
+            .push_this => {
+                try cache.ensurePush(vm);
+                try cache.push(vm, try vm.requireThis());
+            },
+            .get_arg => {
+                const idx = cache.operand(0);
+                const f = vm.frame();
+                const val: Value = if (idx < f.argc) vm.stack[f.args_start + idx] else .undefined;
+                try cache.push(vm, val);
+            },
+            .array_push => {
+                const arr_v = try cache.peek(vm, 1);
+                const val = try cache.peek(vm, 0);
+                if (arr_v != .object or arr_v.object.kind != .array) return vm.bug("array_push on non-array");
+                try rt.heap.appendElement(arr_v.object, val);
+                try cache.drop(vm, 1);
+            },
+
+            .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in, .instanceof => {
+                // M10.2b/M10.2c: fast path when both operands are already `.number` (`f64`),
+                // matching IEEE-754 / JS semantics for NaN, infinities, and -0. All mixed or
+                // out-of-domain cases fall back to `ops.binary`.
+                const lhs = try cache.peek(vm, 1);
+                const rhs = try cache.peek(vm, 0);
+                const r: Value = if (lhs == .number and rhs == .number) switch (op) {
+                    .add => .{ .number = lhs.number + rhs.number },
+                    .sub => .{ .number = lhs.number - rhs.number },
+                    .mul => .{ .number = lhs.number * rhs.number },
+                    .div => .{ .number = lhs.number / rhs.number },
+                    .mod => .{ .number = fastRemainder(lhs.number, rhs.number) },
+                    .shl => .{ .number = ops.bitShl(lhs.number, rhs.number) },
+                    .shr => .{ .number = ops.bitShr(lhs.number, rhs.number) },
+                    .ushr => .{ .number = ops.bitUshr(lhs.number, rhs.number) },
+                    .bit_and => .{ .number = ops.bitAnd(lhs.number, rhs.number) },
+                    .bit_xor => .{ .number = ops.bitXor(lhs.number, rhs.number) },
+                    .bit_or => .{ .number = ops.bitOr(lhs.number, rhs.number) },
+                    .lt => .{ .boolean = lhs.number < rhs.number },
+                    .le => .{ .boolean = lhs.number <= rhs.number },
+                    .gt => .{ .boolean = lhs.number > rhs.number },
+                    .ge => .{ .boolean = lhs.number >= rhs.number },
+                    .strict_eq => .{ .boolean = lhs.number == rhs.number },
+                    .strict_ne => .{ .boolean = lhs.number != rhs.number },
+                    .pow, .in, .instanceof => try ops.binary(rt, binaryOp(op), lhs, rhs),
+                    else => unreachable,
+                } else try ops.binary(rt, binaryOp(op), lhs, rhs);
+                cache.sp -= 1;
+                vm.stack[cache.sp - 1] = r;
+            },
+            // Compute into a local, then store. `top().* = .{ .number = f(peek(0)) }` would
+            // be wrong: Zig builds the union in place, so the slot's tag changes *before*
+            // f reads the old value through peek (result-location aliasing).
+            .neg, .to_number, .not, .bit_not, .typeof => {
+                const v = try cache.peek(vm, 0);
+                const r: Value = switch (op) {
+                    .neg => .{ .number = if (v == .number) -v.number else -(try ops.toNumber(rt, v)) },
+                    .to_number => if (v == .number) v else .{ .number = try ops.toNumber(rt, v) },
+                    .not => .{ .boolean = !ops.toBoolean(v) },
+                    .bit_not => .{ .number = ops.bitNot(if (v == .number) v.number else try ops.toNumber(rt, v)) },
+                    .typeof => try ops.typeOf(rt, v),
+                    else => unreachable,
+                };
+                (try cache.top(vm)).* = r;
+            },
+            .inc, .dec => {
+                const t = try cache.top(vm);
+                if (t.* != .number) return vm.bug("inc/dec on a non-number"); // always after to_number
+                t.number += if (op == .inc) 1 else -1;
+            },
+
+            .jump => next = try cache.target(vm),
+            .jump_if_false, .jump_if_true => {
+                const truthy = ops.toBoolean(try cache.peek(vm, 0));
+                try cache.drop(vm, 1);
+                if (truthy == (op == .jump_if_true)) next = try cache.target(vm);
+            },
+            .get_iter => {
+                const iterable = try cache.peek(vm, 0);
+                cache.syncSp(vm);
+                const iter = try builtins.getIterator(rt, iterable);
+                vm.stack[cache.sp - 1] = .{ .object = iter };
+            },
+            .iter_next => {
+                const iter_val = try cache.peek(vm, 0);
+                if (iter_val != .object or iter_val.object.kind != .iterator) return vm.bug("iter_next on non-iterator");
+                cache.syncSp(vm);
+                const next_v = try builtins.iteratorNextVal(rt, iter_val.object);
+                vm.stack[cache.sp - 1] = next_v orelse .undefined;
+                try cache.push(vm, .{ .boolean = next_v == null });
+            },
+            .new_call => {
+                const argc = cache.operand(0);
+                const group = argc + 1;
+                if (group > cache.sp - cache.stack_base) return vm.bug("stack underflow");
+                const base = cache.sp - group;
+                const args = cache.sp - argc;
+                cache.syncSp(vm);
+                const callee = vm.stack[base];
+                if (try vm.callConstruct(base, callee, args, vm.stack[args..cache.sp], false, next)) {
+                    cache.* = FrameCache.fromVm(vm, 0);
+                    return .running;
+                }
+                cache.sp = base + 1;
+            },
+            .call, .call_method => {
+                // Stack: [callee, args…] or [receiver, callee, args…], arguments in source
+                // order. The result replaces the whole group, from `base`.
+                const argc = cache.operand(0);
+                const group = argc + @as(u32, if (op == .call_method) 2 else 1);
+                if (group > cache.sp - cache.stack_base) return vm.bug("stack underflow");
+                const base = cache.sp - group;
+                const args = cache.sp - argc;
+                const receiver: ?Value = if (op == .call_method) vm.stack[base] else null;
+                switch (vm.stack[args - 1]) {
+                    // A built-in native *borrows* the argument slice: valid only during the call; it
+                    // cannot call back into JS, so the stack cannot move under it. A host native
+                    // (D53) receives temporary handles owned by its native-call record. If either
+                    // fails, nothing has been popped: the stack is still a valid pre-call state (D35).
+                    .native => |n| {
+                        cache.syncSp(vm);
+                        const this_obj: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
+                        const result = (if (n.host) |h|
+                            h.call(rt, h.ctx, this_obj, vm.stack[args..cache.sp])
+                        else
+                            n.call(rt, receiver orelse .undefined, vm.stack[args..cache.sp])) catch |e| {
+                            if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
+                                return rt.limit(.steps);
+                            return e;
+                        };
+                        if (rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
+                            return rt.limit(.steps);
+                        vm.stack[base] = result;
+                        cache.sp = base + 1;
+                    },
+                    .closure => |c| switch (c.impl) {
+                        .promise_cap => |cap| {
+                            cache.syncSp(vm);
+                            vm.stack[base] = try @import("../runtime/builtins.zig").callPromiseCapability(rt, cap.promise, cap.is_reject, vm.stack[args..cache.sp]);
+                            cache.sp = base + 1;
+                        },
+                        .native_closure => |nc| {
+                            cache.syncSp(vm);
+                            const f: *const fn (*Runtime, *heap.Object, []const Value) Error!Value = @ptrCast(@alignCast(nc.func));
+                            vm.stack[base] = try f(rt, nc.env, vm.stack[args..cache.sp]);
+                            cache.sp = base + 1;
+                        },
+                        .bound => |b| {
+                            cache.syncSp(vm);
+                            if (try vm.callBound(b, base, vm.stack[args..cache.sp], next)) {
+                                cache.* = FrameCache.fromVm(vm, 0);
+                                return .running;
+                            }
+                            cache.sp = base + 1;
+                        },
+                        .vm => |v_impl| {
+                            // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
+                            const this: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
+                            cache.syncSp(vm);
+                            const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
+                            if (callee_proto.is_async) {
+                                vm.stack[base] = try vm.startAsyncFromVm(c, this, vm.stack[args..cache.sp]);
+                                cache.sp = base + 1;
+                            } else {
+                                try vm.enter(c, base, args, argc, next, this, false, false, null);
+                                cache.* = FrameCache.fromVm(vm, 0);
+                                return .running; // pc is the callee's 0
+                            }
+                        },
+                        .tree => return vm.bug("a non-VM closure in the VM"),
+                    },
+                    else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
+                }
+            },
+            .@"return" => {
+                if (vm.frames.items.len < 2) {
+                    // A nested call's body returned (D51): the value is the call's
+                    // result, and the call ends here — no caller frame to unwind to.
+                    if (vm.nested and vm.frames.items.len == 1) {
+                        const ret_v = try cache.peek(vm, 0);
+                        const f = vm.frame();
+                        cache.syncSp(vm);
+                        vm.nested_result = if (f.is_construct and !ret_v.isObjectLike()) f.this.? else ret_v;
+                        vm.halted = true;
+                        return .halted;
+                    }
+                    return vm.bug("return in the script");
+                }
+                const ret_v = try cache.peek(vm, 0);
+                const cur_f = vm.frame();
+                const v: Value = if (!cur_f.is_construct)
+                    ret_v
+                else if (cur_f.proto.has_super_ctor) blk: {
+                    if (ret_v.isObjectLike()) break :blk ret_v;
+                    if (ret_v == .undefined) {
+                        break :blk cur_f.this orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
+                    }
+                    return rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
+                } else if (!ret_v.isObjectLike())
+                    .{ .object = cur_f.construct_instance.? }
+                else
+                    ret_v;
+                const f = vm.frames.pop().?;
+                if (f.is_super_call) {
+                    vm.frames.items[vm.frames.items.len - 1].this = v;
+                }
+                if (vm.chain) |cx| cx.call_depth -= 1; // the frame died (D51 #2)
+                vm.locals_len = f.locals_base;
+                vm.reserved -= f.proto.slot_count + f.proto.max_stack;
+                vm.sp = f.result_index;
+                vm.stack[vm.sp] = v; // replaces the callee (and receiver); arguments and callee operands are gone
+                vm.sp += 1;
+                vm.pc = f.return_pc;
+                if (f.is_super_call) {
+                    if (vm.frames.items[vm.frames.items.len - 1].closure) |dc| {
+                        try builtins.runInstanceInits(rt, @constCast(dc), v);
+                    }
+                }
+                cache.* = FrameCache.fromVm(vm, f.return_pc);
+                return .running;
+            },
+            .halt => {
+                if (vm.frames.items.len != 1) return vm.bug("halt in a function");
+                if (cache.sp != 0) return vm.bug("stack not empty at halt");
+                vm.halted = true;
+                return .halted; // pc stays on `halt`
+            },
+            .await => {
+                const v = try cache.peek(vm, 0);
+                cache.sp -= 1;
+                cache.syncSp(vm);
+                vm.pc = pc;
+                vm.awaited = v;
+                return .awaiting;
+            },
+            .throw => {
+                const v = try cache.peek(vm, 0);
+                return rt.throwValue(v);
+            },
+        }
+        if (next >= code.len) return vm.bug("pc outside the code");
+        vm.pc = next;
+        cache.pc = next;
+        return .running;
+    }
+
+    // ---- cold opcodes & calls (outlined to keep `Vm.run` small and `FrameCache` in registers)
+
+    /// Executes cold/rare opcodes out-of-line. Returns `true` if a new VM frame was entered.
+    noinline fn executeCold(vm: *Vm, op: Op, pc: u32, next: u32) Error!bool {
+        @branchHint(.cold);
+        const rt = vm.rt;
+        var cache = FrameCache.fromVm(vm, pc);
+        const p = cache.p;
+        switch (op) {
             .new_regexp => {
                 const k_pat = cache.operand(0);
                 const k_flags = cache.operand(1);
@@ -954,7 +1296,6 @@ pub const Vm = struct {
             .get_private => {
                 const brand_val = vm.frame().closure.?.meta.?.brand orelse return vm.bug("get_private without brand");
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                cache.syncSp(vm);
                 const r = try object.getPrivate(rt, try cache.peek(vm, 0), brand_val.closure, name_str);
                 (try cache.top(vm)).* = r;
             },
@@ -962,7 +1303,6 @@ pub const Vm = struct {
                 const v = try cache.peek(vm, 0);
                 const brand_val = vm.frame().closure.?.meta.?.brand orelse return vm.bug("set_private without brand");
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                cache.syncSp(vm);
                 try object.setPrivate(rt, try cache.peek(vm, 1), brand_val.closure, name_str, v);
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = v;
@@ -1007,7 +1347,6 @@ pub const Vm = struct {
                 if (fn_val != .closure or ctor_val != .closure) return vm.bug("run_static_init expects closures");
                 try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), ctor_val);
                 try rt.heap.storeClosureBrand(@constCast(fn_val.closure), ctor_val);
-                cache.syncSp(vm);
                 const r = try rt.callCallable(fn_val, ctor_val, &.{});
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = r;
@@ -1024,33 +1363,32 @@ pub const Vm = struct {
                 const argc = cache.operand(0);
                 const args_start = cache.sp - argc;
                 const base = args_start;
-                if (try vm.callSuper(cache, base, vm.stack[args_start..cache.sp], false, next)) return .running;
+                if (try vm.callSuper(base, vm.stack[args_start..cache.sp], false, next)) return true;
+                cache.sp = base + 1;
             },
             .super_call_spread => {
                 const arr_val = try cache.peek(vm, 0);
                 const base = cache.sp - 1;
                 if (arr_val != .object or arr_val.object.kind != .array) return vm.bug("super_call_spread expects array");
-                if (try vm.callSuper(cache, base, arr_val.object.kind.array.items, true, next)) return .running;
+                if (try vm.callSuper(base, arr_val.object.kind.array.items, true, next)) return true;
+                cache.sp = base + 1;
             },
             .super_get_prop => {
                 const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_get_prop without home_object");
                 try cache.ensurePush(vm);
-                cache.syncSp(vm);
                 try cache.push(vm, try object.getSuper(rt, home, this_val, try vm.nameKey(cache.operand(0))));
             },
             .super_get_elem => {
                 const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_get_elem without home_object");
                 const k = try object.key(rt, try cache.peek(vm, 0));
-                cache.syncSp(vm);
                 (try cache.top(vm)).* = try object.getSuper(rt, home, this_val, k);
             },
             .super_set_prop => {
                 const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_set_prop without home_object");
                 const val = try cache.peek(vm, 0);
-                cache.syncSp(vm);
                 try object.setSuper(rt, home, this_val, try vm.nameKey(cache.operand(0)), val);
             },
             .super_set_elem => {
@@ -1059,55 +1397,11 @@ pub const Vm = struct {
                 const val = try cache.peek(vm, 0);
                 const key_val = try cache.peek(vm, 1);
                 const k = try object.key(rt, key_val);
-                cache.syncSp(vm);
                 try object.setSuper(rt, home, this_val, k, val);
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = val;
             },
             .throw_delete_super => return rt.throw(.ReferenceError, &.{.{ .ascii = "Unsupported reference to 'super'" }}),
-            .define_prop => {
-                const o = try cache.peek(vm, 1);
-                if (o != .object) return vm.bug("define on a non-object");
-                try object.define(rt, o.object, try vm.nameKey(cache.operand(0)), try cache.peek(vm, 0));
-                try cache.drop(vm, 1);
-            },
-            .define_elem => {
-                const o = try cache.peek(vm, 2);
-                if (o != .object) return vm.bug("define on a non-object");
-                try object.define(rt, o.object, try object.key(rt, try cache.peek(vm, 1)), try cache.peek(vm, 0));
-                try cache.drop(vm, 2);
-            },
-            .get_prop => {
-                cache.syncSp(vm);
-                const r = try object.get(rt, try cache.peek(vm, 0), try vm.nameKey(cache.operand(0)));
-                (try cache.top(vm)).* = r;
-            },
-            .get_elem => {
-                const idx = try cache.peek(vm, 0);
-                const base = try cache.peek(vm, 1);
-                const r: Value = if (fastArrayGet(base, idx)) |v| v else blk: {
-                    cache.syncSp(vm);
-                    const k = try object.key(rt, idx);
-                    break :blk try object.get(rt, base, k);
-                };
-                try cache.drop(vm, 1);
-                (try cache.top(vm)).* = r;
-            },
-            .set_prop => {
-                const v = try cache.peek(vm, 0);
-                cache.syncSp(vm);
-                try object.set(rt, try cache.peek(vm, 1), try vm.nameKey(cache.operand(0)), v);
-                try cache.drop(vm, 1);
-                (try cache.top(vm)).* = v;
-            },
-            .set_elem => {
-                const v = try cache.peek(vm, 0);
-                const k = try object.key(rt, try cache.peek(vm, 1)); // after the value: JS's order for `=`
-                cache.syncSp(vm);
-                try object.set(rt, try cache.peek(vm, 2), k, v);
-                try cache.drop(vm, 2);
-                (try cache.top(vm)).* = v;
-            },
             .delete_prop => {
                 const r = try object.delete(rt, try cache.peek(vm, 0), try vm.nameKey(cache.operand(0)));
                 (try cache.top(vm)).* = .{ .boolean = r };
@@ -1118,20 +1412,9 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = .{ .boolean = r };
             },
-            .push_this => {
-                try cache.ensurePush(vm);
-                try cache.push(vm, try vm.requireThis());
-            },
-            .get_arg => {
-                const idx = cache.operand(0);
-                const f = vm.frame();
-                const val: Value = if (idx < f.argc) vm.stack[f.args_start + idx] else .undefined;
-                try cache.push(vm, val);
-            },
             .rest_array => {
                 const start_idx = cache.operand(0);
                 const f = vm.frame();
-                cache.syncSp(vm);
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
                 if (start_idx < f.argc) {
                     const args_start = f.args_start + start_idx;
@@ -1140,19 +1423,15 @@ pub const Vm = struct {
                 }
                 try cache.push(vm, .{ .object = arr });
             },
-            .array_push => {
-                const arr_v = try cache.peek(vm, 1);
-                const val = try cache.peek(vm, 0);
-                if (arr_v != .object or arr_v.object.kind != .array) return vm.bug("array_push on non-array");
-                try rt.heap.appendElement(arr_v.object, val);
-                try cache.drop(vm, 1);
-            },
             .array_spread => {
                 const arr_v = try cache.peek(vm, 1);
                 const iterable = try cache.peek(vm, 0);
                 if (arr_v != .object or arr_v.object.kind != .array) return vm.bug("array_spread on non-array");
-                cache.syncSp(vm);
                 const iter = try builtins.getIterator(rt, iterable);
+                var root_buf = [_]Value{ arr_v, .{ .object = iter } };
+                var val_roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+                try val_roots.register(rt);
+                defer val_roots.unregister(rt);
                 while (try builtins.iteratorNextVal(rt, iter)) |elem| {
                     try rt.heap.appendElement(arr_v.object, elem);
                 }
@@ -1162,15 +1441,17 @@ pub const Vm = struct {
                 const obj_v = try cache.peek(vm, 1);
                 const src = try cache.peek(vm, 0);
                 if (obj_v != .object) return vm.bug("object_spread on non-object");
-                cache.syncSp(vm);
                 try copyDataProperties(rt, obj_v.object, src, &.{});
                 try cache.drop(vm, 1);
             },
             .iter_rest => {
                 const iter_val = try cache.peek(vm, 0);
                 if (iter_val != .object or iter_val.object.kind != .iterator) return vm.bug("iter_rest on non-iterator");
-                cache.syncSp(vm);
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
+                var root_buf = [_]Value{ iter_val, .{ .object = arr } };
+                var val_roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+                try val_roots.register(rt);
+                defer val_roots.unregister(rt);
                 while (try builtins.iteratorNextVal(rt, iter_val.object)) |elem| {
                     try rt.heap.appendElement(arr, elem);
                 }
@@ -1188,7 +1469,6 @@ pub const Vm = struct {
                 if (group > cache.sp - cache.stack_base) return vm.bug("stack underflow");
                 const base = cache.sp - group;
                 const src = vm.stack[base];
-                cache.syncSp(vm);
                 const excluded = try rt.gpa.alloc(object.Key, n);
                 defer rt.gpa.free(excluded);
                 for (vm.stack[base + 1 .. cache.sp], excluded) |kv, *dst| {
@@ -1204,10 +1484,8 @@ pub const Vm = struct {
                 const args_v = try cache.peek(vm, 0);
                 if (args_v != .object or args_v.object.kind != .array) return vm.bug("new_call_spread args not array");
                 const base = cache.sp - 2;
-                cache.syncSp(vm);
-                if (try vm.callConstruct(cache, base, callee, 0, args_v.object.kind.array.items, true, next)) {
-                    return .running;
-                }
+                if (try vm.callConstruct(base, callee, 0, args_v.object.kind.array.items, true, next)) return true;
+                cache.sp = base + 1;
             },
             .call_spread, .call_method_spread => {
                 const is_method = op == .call_method_spread;
@@ -1221,7 +1499,6 @@ pub const Vm = struct {
                 const args_slice = args_v.object.kind.array.items;
                 switch (callee) {
                     .native => |n| {
-                        cache.syncSp(vm);
                         const this_obj: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
                         const result = (if (n.host) |h|
                             h.call(rt, h.ctx, this_obj, args_slice)
@@ -1238,31 +1515,27 @@ pub const Vm = struct {
                     },
                     .closure => |c| switch (c.impl) {
                         .promise_cap => |cap| {
-                            cache.syncSp(vm);
                             vm.stack[base] = try builtins.callPromiseCapability(rt, cap.promise, cap.is_reject, args_slice);
                             cache.sp = base + 1;
                         },
                         .native_closure => |nc| {
-                            cache.syncSp(vm);
                             const f: *const fn (*Runtime, *heap.Object, []const Value) Error!Value = @ptrCast(@alignCast(nc.func));
                             vm.stack[base] = try f(rt, nc.env, args_slice);
                             cache.sp = base + 1;
                         },
                         .bound => |b| {
-                            cache.syncSp(vm);
-                            if (try vm.callBound(cache, b, base, args_slice, next)) return .running;
+                            if (try vm.callBound(b, base, args_slice, next)) return true;
+                            cache.sp = base + 1;
                         },
                         .vm => |v_impl| {
                             const this: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
-                            cache.syncSp(vm);
                             const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
                             if (callee_proto.is_async) {
                                 vm.stack[base] = try vm.startAsyncFromVm(c, this, args_slice);
                                 cache.sp = base + 1;
                             } else {
                                 try vm.enterSlice(c, base, args_slice, next, this, false, false, null);
-                                cache.* = FrameCache.fromVm(vm, 0);
-                                return .running;
+                                return true;
                             }
                         },
                         .tree => return vm.bug("a non-VM closure in the VM"),
@@ -1270,230 +1543,22 @@ pub const Vm = struct {
                     else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
                 }
             },
-
-            .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in, .instanceof => {
-                // M10.2b/M10.2c: fast path when both operands are already `.number` (`f64`),
-                // matching IEEE-754 / JS semantics for NaN, infinities, and -0. All mixed or
-                // out-of-domain cases fall back to `ops.binary`.
-                const lhs = try cache.peek(vm, 1);
-                const rhs = try cache.peek(vm, 0);
-                const r: Value = if (lhs == .number and rhs == .number) switch (op) {
-                    .add => .{ .number = lhs.number + rhs.number },
-                    .sub => .{ .number = lhs.number - rhs.number },
-                    .mul => .{ .number = lhs.number * rhs.number },
-                    .div => .{ .number = lhs.number / rhs.number },
-                    .mod => .{ .number = fastRemainder(lhs.number, rhs.number) },
-                    .shl => .{ .number = ops.bitShl(lhs.number, rhs.number) },
-                    .shr => .{ .number = ops.bitShr(lhs.number, rhs.number) },
-                    .ushr => .{ .number = ops.bitUshr(lhs.number, rhs.number) },
-                    .bit_and => .{ .number = ops.bitAnd(lhs.number, rhs.number) },
-                    .bit_xor => .{ .number = ops.bitXor(lhs.number, rhs.number) },
-                    .bit_or => .{ .number = ops.bitOr(lhs.number, rhs.number) },
-                    .lt => .{ .boolean = lhs.number < rhs.number },
-                    .le => .{ .boolean = lhs.number <= rhs.number },
-                    .gt => .{ .boolean = lhs.number > rhs.number },
-                    .ge => .{ .boolean = lhs.number >= rhs.number },
-                    .strict_eq => .{ .boolean = lhs.number == rhs.number },
-                    .strict_ne => .{ .boolean = lhs.number != rhs.number },
-                    .pow, .in, .instanceof => try ops.binary(rt, binaryOp(op), lhs, rhs),
-                    else => unreachable,
-                } else try ops.binary(rt, binaryOp(op), lhs, rhs);
-                cache.sp -= 1;
-                vm.stack[cache.sp - 1] = r;
-            },
-            // Compute into a local, then store. `top().* = .{ .number = f(peek(0)) }` would
-            // be wrong: Zig builds the union in place, so the slot's tag changes *before*
-            // f reads the old value through peek (result-location aliasing).
-            .neg, .to_number, .not, .bit_not, .typeof => {
-                const v = try cache.peek(vm, 0);
-                const r: Value = switch (op) {
-                    .neg => .{ .number = if (v == .number) -v.number else -(try ops.toNumber(rt, v)) },
-                    .to_number => if (v == .number) v else .{ .number = try ops.toNumber(rt, v) },
-                    .not => .{ .boolean = !ops.toBoolean(v) },
-                    .bit_not => .{ .number = ops.bitNot(if (v == .number) v.number else try ops.toNumber(rt, v)) },
-                    .typeof => try ops.typeOf(rt, v),
-                    else => unreachable,
-                };
-                (try cache.top(vm)).* = r;
-            },
-            .inc, .dec => {
-                const t = try cache.top(vm);
-                if (t.* != .number) return vm.bug("inc/dec on a non-number"); // always after to_number
-                t.number += if (op == .inc) 1 else -1;
-            },
-
-            .jump => next = try cache.target(vm),
-            .jump_if_false, .jump_if_true => {
-                const truthy = ops.toBoolean(try cache.peek(vm, 0));
-                try cache.drop(vm, 1);
-                if (truthy == (op == .jump_if_true)) next = try cache.target(vm);
-            },
-            .get_iter => {
-                const iterable = try cache.peek(vm, 0);
-                cache.syncSp(vm);
-                const iter = try builtins.getIterator(rt, iterable);
-                vm.stack[cache.sp - 1] = .{ .object = iter };
-            },
-            .iter_next => {
+            .iter_close, .iter_close_throw => {
                 const iter_val = try cache.peek(vm, 0);
-                if (iter_val != .object or iter_val.object.kind != .iterator) return vm.bug("iter_next on non-iterator");
-                cache.syncSp(vm);
-                const next_v = try builtins.iteratorNextVal(rt, iter_val.object);
-                vm.stack[cache.sp - 1] = next_v orelse .undefined;
-                try cache.push(vm, .{ .boolean = next_v == null });
-            },
-            .new_call => {
-                const argc = cache.operand(0);
-                const group = argc + 1;
-                if (group > cache.sp - cache.stack_base) return vm.bug("stack underflow");
-                const base = cache.sp - group;
-                const args = cache.sp - argc;
-                cache.syncSp(vm);
-                const callee = vm.stack[base];
-                if (try vm.callConstruct(cache, base, callee, args, vm.stack[args..cache.sp], false, next)) {
-                    return .running;
+                if (iter_val != .undefined) {
+                    if (iter_val != .object or iter_val.object.kind != .iterator) return vm.bug("iter_close on non-iterator");
+                    try builtins.iteratorClose(rt, iter_val.object, op == .iter_close_throw);
                 }
+                try cache.drop(vm, 1);
             },
-            .call, .call_method => {
-                // Stack: [callee, args…] or [receiver, callee, args…], arguments in source
-                // order. The result replaces the whole group, from `base`.
-                const argc = cache.operand(0);
-                const group = argc + @as(u32, if (op == .call_method) 2 else 1);
-                if (group > cache.sp - cache.stack_base) return vm.bug("stack underflow");
-                const base = cache.sp - group;
-                const args = cache.sp - argc;
-                const receiver: ?Value = if (op == .call_method) vm.stack[base] else null;
-                switch (vm.stack[args - 1]) {
-                    // A built-in native *borrows* the argument slice: valid only during the call; it
-                    // cannot call back into JS, so the stack cannot move under it. A host native
-                    // (D53) receives temporary handles owned by its native-call record. If either
-                    // fails, nothing has been popped: the stack is still a valid pre-call state (D35).
-                    .native => |n| {
-                        cache.syncSp(vm);
-                        const this_obj: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
-                        const result = (if (n.host) |h|
-                            h.call(rt, h.ctx, this_obj, vm.stack[args..cache.sp])
-                        else
-                            n.call(rt, receiver orelse .undefined, vm.stack[args..cache.sp])) catch |e| {
-                            if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
-                                return rt.limit(.steps);
-                            return e;
-                        };
-                        if (rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
-                            return rt.limit(.steps);
-                        vm.stack[base] = result;
-                        cache.sp = base + 1;
-                    },
-                    .closure => |c| switch (c.impl) {
-                        .promise_cap => |cap| {
-                            cache.syncSp(vm);
-                            vm.stack[base] = try @import("../runtime/builtins.zig").callPromiseCapability(rt, cap.promise, cap.is_reject, vm.stack[args..cache.sp]);
-                            cache.sp = base + 1;
-                        },
-                        .native_closure => |nc| {
-                            cache.syncSp(vm);
-                            const f: *const fn (*Runtime, *heap.Object, []const Value) Error!Value = @ptrCast(@alignCast(nc.func));
-                            vm.stack[base] = try f(rt, nc.env, vm.stack[args..cache.sp]);
-                            cache.sp = base + 1;
-                        },
-                        .bound => |b| {
-                            cache.syncSp(vm);
-                            if (try vm.callBound(cache, b, base, vm.stack[args..cache.sp], next)) return .running;
-                        },
-                        .vm => |v_impl| {
-                            // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
-                            const this: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
-                            cache.syncSp(vm);
-                            const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
-                            if (callee_proto.is_async) {
-                                vm.stack[base] = try vm.startAsyncFromVm(c, this, vm.stack[args..cache.sp]);
-                                cache.sp = base + 1;
-                            } else {
-                                try vm.enter(c, base, args, argc, next, this, false, false, null);
-                                cache.* = FrameCache.fromVm(vm, 0);
-                                return .running; // pc is the callee's 0
-                            }
-                        },
-                        .tree => return vm.bug("a non-VM closure in the VM"),
-                    },
-                    else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
-                }
-            },
-            .@"return" => {
-                if (vm.frames.items.len < 2) {
-                    // A nested call's body returned (D51): the value is the call's
-                    // result, and the call ends here — no caller frame to unwind to.
-                    if (vm.nested and vm.frames.items.len == 1) {
-                        const ret_v = try cache.peek(vm, 0);
-                        const f = vm.frame();
-                        cache.syncSp(vm);
-                        vm.nested_result = if (f.is_construct and !ret_v.isObjectLike()) f.this.? else ret_v;
-                        vm.halted = true;
-                        return .halted;
-                    }
-                    return vm.bug("return in the script");
-                }
-                const ret_v = try cache.peek(vm, 0);
-                const cur_f = vm.frame();
-                const v: Value = if (!cur_f.is_construct)
-                    ret_v
-                else if (cur_f.proto.has_super_ctor) blk: {
-                    if (ret_v.isObjectLike()) break :blk ret_v;
-                    if (ret_v == .undefined) {
-                        break :blk cur_f.this orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
-                    }
-                    return rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
-                } else if (!ret_v.isObjectLike())
-                    .{ .object = cur_f.construct_instance.? }
-                else
-                    ret_v;
-                const f = vm.frames.pop().?;
-                if (f.is_super_call) {
-                    vm.frames.items[vm.frames.items.len - 1].this = v;
-                }
-                if (vm.chain) |cx| cx.call_depth -= 1; // the frame died (D51 #2)
-                vm.locals_len = f.locals_base;
-                vm.reserved -= f.proto.slot_count + f.proto.max_stack;
-                vm.sp = f.result_index;
-                vm.stack[vm.sp] = v; // replaces the callee (and receiver); arguments and callee operands are gone
-                vm.sp += 1;
-                vm.pc = f.return_pc;
-                if (f.is_super_call) {
-                    if (vm.frames.items[vm.frames.items.len - 1].closure) |dc| {
-                        try builtins.runInstanceInits(rt, @constCast(dc), v);
-                    }
-                }
-                cache.* = FrameCache.fromVm(vm, f.return_pc);
-                return .running;
-            },
-            .halt => {
-                if (vm.frames.items.len != 1) return vm.bug("halt in a function");
-                if (cache.sp != 0) return vm.bug("stack not empty at halt");
-                vm.halted = true;
-                return .halted; // pc stays on `halt`
-            },
-            .await => {
-                const v = try cache.peek(vm, 0);
-                cache.sp -= 1;
-                cache.syncSp(vm);
-                vm.pc = pc;
-                vm.awaited = v;
-                return .awaiting;
-            },
-            .throw => {
-                const v = try cache.peek(vm, 0);
-                return rt.throwValue(v);
-            },
+            else => unreachable,
         }
-        if (next >= code.len) return vm.bug("pc outside the code");
-        vm.pc = next;
-        cache.pc = next;
-        return .running;
+        cache.syncSp(vm);
+        return false;
     }
 
-    // ---- calls
-
-    fn callBound(vm: *Vm, cache: *FrameCache, b: *const heap.BoundClosure, base: u32, call_args: []const Value, next: u32) Error!bool {
+    // Keep FrameCache out of non-inlined helpers so LLVM keeps `cache` in registers (e2b1fd2).
+    noinline fn callBound(vm: *Vm, b: *const heap.BoundClosure, base: u32, call_args: []const Value, next: u32) Error!bool {
         const rt = vm.rt;
         const combined = try rt.gpa.alloc(Value, b.bound_args.len + call_args.len);
         defer rt.gpa.free(combined);
@@ -1514,19 +1579,16 @@ pub const Vm = struct {
                 if (rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
                     return rt.limit(.steps);
                 vm.stack[base] = result;
-                cache.sp = base + 1;
                 return false;
             },
             .closure => |tc| switch (tc.impl) {
                 .promise_cap => |cap| {
                     vm.stack[base] = try builtins.callPromiseCapability(rt, cap.promise, cap.is_reject, combined);
-                    cache.sp = base + 1;
                     return false;
                 },
                 .native_closure => |nc| {
                     const f: *const fn (*Runtime, *heap.Object, []const Value) Error!Value = @ptrCast(@alignCast(nc.func));
                     vm.stack[base] = try f(rt, nc.env, combined);
-                    cache.sp = base + 1;
                     return false;
                 },
                 .vm => |v_impl| {
@@ -1534,11 +1596,9 @@ pub const Vm = struct {
                     const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
                     if (callee_proto.is_async) {
                         vm.stack[base] = try vm.startAsyncFromVm(tc, this, combined);
-                        cache.sp = base + 1;
                         return false;
                     }
                     try vm.enterSlice(tc, base, combined, next, this, false, false, null);
-                    cache.* = FrameCache.fromVm(vm, 0);
                     return true;
                 },
                 .tree, .bound => return vm.bug("invalid bound target in the VM"),
@@ -1547,15 +1607,13 @@ pub const Vm = struct {
         }
     }
 
-    fn callConstruct(vm: *Vm, cache: *FrameCache, base: u32, callee: Value, args_start: u32, args_slice: []const Value, is_spread: bool, next: u32) Error!bool {
+    noinline fn callConstruct(vm: *Vm, base: u32, callee: Value, args_start: u32, args_slice: []const Value, is_spread: bool, next: u32) Error!bool {
         const rt = vm.rt;
         var target = callee;
-        var is_bound = false;
         var combined: []Value = &.{};
         defer if (combined.len > 0) rt.gpa.free(combined);
 
         if (callee == .closure and callee.closure.impl == .bound) {
-            is_bound = true;
             const b = callee.closure.impl.bound;
             target = b.target;
             if (b.bound_args.len > 0) {
@@ -1571,7 +1629,6 @@ pub const Vm = struct {
         if (target == .native) {
             const result = try builtins.construct(rt, target, effective_args);
             vm.stack[base] = result;
-            cache.sp = base + 1;
             return false;
         }
         const tc = target.closure;
@@ -1583,12 +1640,11 @@ pub const Vm = struct {
         const r = try builtins.realm(rt);
         const instance = try rt.heap.newObject(if (proto_val == .object) proto_val.object else r.object_prototype);
         const init_this: ?Value = if (tc_proto.has_super_ctor) null else .{ .object = instance };
-        if (!is_spread and !is_bound) {
+        if (!is_spread and combined.len == 0) {
             try vm.enter(tc, base, args_start, @intCast(args_slice.len), next, init_this, true, false, instance);
         } else {
             try vm.enterSlice(tc, base, effective_args, next, init_this, true, false, instance);
         }
-        cache.* = FrameCache.fromVm(vm, 0);
         return true;
     }
 
@@ -1601,7 +1657,7 @@ pub const Vm = struct {
         return vm.rt.fail(.sloppy_this);
     }
 
-    fn callSuper(vm: *Vm, cache: *FrameCache, base: u32, args_slice: []const Value, is_spread: bool, next: u32) Error!bool {
+    noinline fn callSuper(vm: *Vm, base: u32, args_slice: []const Value, is_spread: bool, next: u32) Error!bool {
         const rt = vm.rt;
         const f = vm.frame();
         if (f.this != null) {
@@ -1609,12 +1665,10 @@ pub const Vm = struct {
         }
         const cur_closure = f.closure orelse return vm.bug("super() without closure");
         var target = try object.getPrototypeOfValue(rt, .{ .closure = cur_closure });
-        var is_bound = false;
         var combined: []Value = &.{};
         defer if (combined.len > 0) rt.gpa.free(combined);
 
         if (target == .closure and target.closure.impl == .bound) {
-            is_bound = true;
             const b = target.closure.impl.bound;
             target = b.target;
             if (b.bound_args.len > 0) {
@@ -1633,8 +1687,7 @@ pub const Vm = struct {
             if (res == .object) rt.heap.storeObjectProto(res.object, inst.proto);
             vm.frames.items[vm.frames.items.len - 1].this = res;
             vm.stack[base] = res;
-            cache.sp = base + 1;
-            cache.syncSp(vm);
+            vm.sp = base + 1;
             try builtins.runInstanceInits(rt, @constCast(cur_closure), res);
             return false;
         }
@@ -1644,12 +1697,11 @@ pub const Vm = struct {
             else => return vm.bug("a non-VM closure in the VM"),
         };
         const child_this: ?Value = if (tc_proto.has_super_ctor) null else .{ .object = inst };
-        if (!is_spread and !is_bound) {
+        if (!is_spread and combined.len == 0) {
             try vm.enter(tc, base, base, @intCast(args_slice.len), next, child_this, true, true, inst);
         } else {
             try vm.enterSlice(tc, base, effective_args, next, child_this, true, true, inst);
         }
-        cache.* = FrameCache.fromVm(vm, 0);
         return true;
     }
 
@@ -1913,6 +1965,7 @@ fn keyEq(a: object.Key, b: object.Key) bool {
     return switch (a) {
         .index => |ia| b == .index and b.index == ia,
         .atom => |aa| b == .atom and b.atom == aa,
+        .symbol => |sa| b == .symbol and b.symbol == sa,
     };
 }
 
@@ -1931,25 +1984,32 @@ fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []c
                 try object.define(rt, dst, k, .{ .string = ch });
             }
         },
-        .object => |o| {
-            const keys = try object.ownKeys(rt, o);
+        .object, .closure => {
+            const keys = if (src == .object)
+                try object.ownAllKeys(rt, src.object)
+            else
+                try object.ownAllKeysClosure(rt, src.closure);
             defer rt.gpa.free(keys);
+            const root_vals = try rt.gpa.alloc(Value, 2 + keys.len);
+            defer rt.gpa.free(root_vals);
+            root_vals[0] = .{ .object = dst };
+            root_vals[1] = src;
+            for (keys, root_vals[2..]) |k, *rv| rv.* = switch (k) {
+                .atom => |a| .{ .string = a },
+                .symbol => |s| .{ .symbol = s },
+                .index => .undefined,
+            };
+            var roots: rt_mod.ValueRoots = .{ .values = root_vals };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+
             for (keys) |k| {
                 if (keyIn(k, excluded)) continue;
                 const v = try object.get(rt, src, k);
                 try object.define(rt, dst, k, v);
             }
         },
-        .closure => |c| {
-            const keys = try object.ownKeysClosure(rt, c);
-            defer rt.gpa.free(keys);
-            for (keys) |k| {
-                if (keyIn(k, excluded)) continue;
-                const v = try object.get(rt, src, k);
-                try object.define(rt, dst, k, v);
-            }
-        },
-        .undefined, .null, .boolean, .number, .native => {},
+        .undefined, .null, .boolean, .number, .symbol, .native => {},
     }
 }
 

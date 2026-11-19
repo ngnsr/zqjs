@@ -321,6 +321,8 @@ test "every rule rejects malformed code" {
     try expectInvalid(enc(.{ .push_null, .bit_xor, .pop, .halt }), 1, "stack underflow");
     try expectInvalid(enc(.{ .push_null, .bit_or, .pop, .halt }), 1, "stack underflow");
     try expectInvalid(enc(.{ .bit_not, .pop, .halt }), 1, "stack underflow");
+    try expectInvalid(enc(.{ .iter_close, .halt }), 0, "stack underflow");
+    try expectInvalid(enc(.{ .iter_close_throw, .halt }), 0, "stack underflow");
 }
 
 test "limits are checked again, and constants must be numbers or strings" {

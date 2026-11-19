@@ -322,7 +322,7 @@ const Stringifier = struct {
     fn writeValue(s: *Stringifier, v: Value) Error!bool {
         heap_mod.checkValue(v);
         switch (v) {
-            .undefined, .native, .closure => return false,
+            .undefined, .native, .closure, .symbol => return false,
             .null => {
                 try s.writeAscii("null");
                 return true;
@@ -360,7 +360,7 @@ const Stringifier = struct {
         var cur: ?*Object = obj;
         while (cur) |c| : (cur = c.proto) {
             c.obj.checkLive();
-            if (c.props.get(s.to_json_atom)) |p| {
+            if (c.props.get(heap_mod.PropKey.fromAtom(s.to_json_atom))) |p| {
                 if (p.value == .native or p.value == .closure) return s.rt.fail(.user_conversion);
                 return;
             }
@@ -412,6 +412,7 @@ const Stringifier = struct {
                     try s.writeAscii(idx_str);
                     try s.writeUnit('"');
                 },
+                .symbol => unreachable,
             }
             try s.writeUnit(':');
             if (try s.writeValue(val)) {

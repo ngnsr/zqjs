@@ -123,6 +123,7 @@ pub const CHandleKind = enum(c_int) {
     function = 5,
     object = 6,
     array = 7,
+    symbol = 8,
 };
 
 pub const CPromiseState = enum(c_int) {
@@ -727,6 +728,7 @@ fn mapHandleKind(k: zqjs.HandleKind) CHandleKind {
         .boolean => .boolean,
         .number => .number,
         .string => .string,
+        .symbol => .symbol,
         .function => .function,
         .object => .object,
         .array => .array,

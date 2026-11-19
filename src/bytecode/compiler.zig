@@ -110,6 +110,8 @@ const Loop = struct {
     breaks: std.ArrayList(u32) = .empty,
     /// Same for `continue`, patched to the loop's continue point.
     continues: std.ArrayList(u32) = .empty,
+    /// Set for `for...of` loops so `return`/outer jumps close the iterator.
+    iter_slot: ?u32 = null,
 };
 
 const JumpTarget = union(enum) {
@@ -582,6 +584,7 @@ const Compiler = struct {
             .for_of => |f| {
                 // Store iterator in a hidden local slot so the operand stack stays empty
                 // across `body` (preserving `return`/`try`/`break`/`continue` stack invariants).
+                const loop_depth = c.depth;
                 const iter_slot = c.allocTemp();
                 defer c.freeTemp();
 
@@ -596,13 +599,14 @@ const Compiler = struct {
                 try c.expr(f.iterable);
                 try c.emit(.get_iter, &.{});
                 try c.emit(.init_local, &.{iter_slot});
-                var loop: Loop = .{};
+                var loop: Loop = .{ .iter_slot = iter_slot };
                 defer c.deinitLoop(&loop);
                 c.attachLabelsToLoop(&loop);
                 const top = c.here();
                 try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
                 try c.emit(.iter_next, &.{});
                 const to_end = try c.jumpForward(.jump_if_true);
+                const body_bind_start = c.here();
                 switch (f.target) {
                     .declaration => |decl| {
                         try c.perIteration(copies);
@@ -613,14 +617,42 @@ const Compiler = struct {
                     },
                 }
                 const body_completes = try c.loopBody(&loop, f.body.*);
+                const body_end = c.here();
                 if (body_completes) try c.emit(.jump, &.{top});
                 for (loop.continues.items) |j| c.patch(j, top);
-                c.patch(to_end, c.here());
-                // At `to_end` (reached only from `jump_if_true` after `iter_next`), the
-                // stack holds `[undefined]` (`depth + 1` relative to body).
-                c.depth += 1;
-                try c.emit(.pop, &.{});
-                for (loop.breaks.items) |j| c.patch(j, c.here());
+                if (body_end > body_bind_start) {
+                    const catch_pc = c.here();
+                    c.depth = loop_depth + 1;
+                    c.max_stack = @max(c.max_stack, c.depth);
+                    try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
+                    try c.emit(.iter_close_throw, &.{});
+                    try c.emit(.clear_local, &.{iter_slot});
+                    try c.emit(.throw, &.{});
+                    try c.handlers.append(c.s.gpa, .{
+                        .try_start = body_bind_start,
+                        .try_end = body_end,
+                        .catch_pc = catch_pc,
+                        .stack_depth = loop_depth,
+                        .has_binding = true,
+                    });
+                }
+                if (loop.breaks.items.len > 0) {
+                    c.depth = loop_depth;
+                    for (loop.breaks.items) |j| c.patch(j, c.here());
+                    try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
+                    try c.emit(.iter_close, &.{});
+                    const after_break = try c.jumpForward(.jump);
+                    c.patch(to_end, c.here());
+                    // At `to_end` (reached only from `jump_if_true` after `iter_next`), the
+                    // stack holds `[undefined]` (`depth + 1` relative to body).
+                    c.depth = loop_depth + 1;
+                    try c.emit(.pop, &.{});
+                    c.patch(after_break, c.here());
+                } else {
+                    c.patch(to_end, c.here());
+                    c.depth = loop_depth + 1;
+                    try c.emit(.pop, &.{});
+                }
                 try c.emit(.clear_local, &.{iter_slot});
                 return true;
             },
@@ -677,6 +709,15 @@ const Compiler = struct {
         return true;
     }
 
+    fn emitIterClose(c: *Compiler, slot: u32) Error!void {
+        // Clear `slot` before closing so throwing in `return()` does not double-close.
+        try c.emit(.get_local, &.{ slot, try c.name("<iter>") });
+        try c.emit(.push_undefined, &.{});
+        try c.emit(.init_local, &.{slot});
+        try c.emit(.iter_close, &.{});
+        try c.emit(.clear_local, &.{slot});
+    }
+
     fn emitReturn(c: *Compiler) Error!void {
         var i = c.controls.items.len;
         while (i > 0) {
@@ -694,7 +735,8 @@ const Compiler = struct {
                     try fr.to_finally.append(c.s.gpa, try c.jumpForward(.jump));
                     return;
                 },
-                .loop, .@"switch", .label => {},
+                .loop => |l| if (l.iter_slot) |slot| try c.emitIterClose(slot),
+                .@"switch", .label => {},
             }
         }
         try c.emit(.@"return", &.{});
@@ -720,12 +762,12 @@ const Compiler = struct {
                     .loop_break => |tl| if (l == tl) {
                         try jt.append(c.s.gpa, try c.jumpForward(.jump));
                         return;
-                    },
+                    } else if (l.iter_slot) |slot| try c.emitIterClose(slot),
                     .loop_continue => |tl| if (l == tl) {
                         try jt.append(c.s.gpa, try c.jumpForward(.jump));
                         return;
-                    },
-                    .switch_break => {},
+                    } else if (l.iter_slot) |slot| try c.emitIterClose(slot),
+                    .switch_break => if (l.iter_slot) |slot| try c.emitIterClose(slot),
                 },
                 .@"switch" => |sb| switch (jt) {
                     .switch_break => |ts| if (sb == ts) {
@@ -1679,6 +1721,8 @@ const Compiler = struct {
                 const iter_slot = c.allocTemp();
                 defer c.freeTemp();
                 try c.emit(.init_local, &.{iter_slot});
+                const base_depth = c.depth;
+                const elems_start = c.here();
                 for (arr.elems) |maybe_el| {
                     const el = maybe_el orelse {
                         try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
@@ -1705,7 +1749,31 @@ const Compiler = struct {
                     try c.emit(.iter_rest, &.{});
                     if (ms) |slots| try c.storeMemberSlots(slots) else try c.bindPattern(rest, mode);
                 }
+                const elems_end = c.here();
+                if (arr.rest == null) {
+                    try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
+                    try c.emit(.iter_close, &.{});
+                }
                 try c.emit(.clear_local, &.{iter_slot});
+                if (elems_end > elems_start) {
+                    const to_after = try c.jumpForward(.jump);
+                    const catch_pc = c.here();
+                    c.depth = base_depth + 1;
+                    c.max_stack = @max(c.max_stack, c.depth);
+                    try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
+                    try c.emit(.iter_close_throw, &.{});
+                    try c.emit(.clear_local, &.{iter_slot});
+                    try c.emit(.throw, &.{});
+                    try c.handlers.append(c.s.gpa, .{
+                        .try_start = elems_start,
+                        .try_end = elems_end,
+                        .catch_pc = catch_pc,
+                        .stack_depth = base_depth,
+                        .has_binding = true,
+                    });
+                    c.patch(to_after, c.here());
+                    c.depth = base_depth;
+                }
             },
             .object => |obj| {
                 try c.emit(.require_obj, &.{});

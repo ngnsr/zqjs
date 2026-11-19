@@ -1,0 +1,43 @@
+uniq: false true true symbol symbol
+desc: undefined desc true  undefined 123 null true
+str: Symbol() Symbol(desc) Symbol() Symbol(desc) Symbol()
+valueOf: true
+print: Symbol() Symbol(desc)
+proto: true true [object Symbol]
+new Symbol: TypeError
+extends Symbol: TypeError
+Symbol(Symbol()): TypeError
+bool: false false true true 1
+unary+: TypeError
+add: TypeError
+template: TypeError
+lt: TypeError
+join: TypeError
+for eq: true alpha true true true
+keyFor: alpha true undefined undefined undefined
+keyFor non-sym: TypeError TypeError TypeError
+for sym: TypeError
+obj reads: 10 20 17 10 true false
+obj mutated: 20 10 15
+delete: true false undefined
+class: 100 200 Base:100->Sub BaseS:200->SubS 101
+arr: 2 99
+fn: 1 77 true true false
+inherit: 15 true 0
+keys: 0,x,y
+values: z,1,2
+entries: [["0","z"],["x",1],["y",2]]
+ownSyms: 3 true true true
+ownSyms prim: 0 0
+ownSyms fn: 1
+descHidden: secret false true true
+allDescs: 1 one secret false
+defineProps: 1 2 3 2
+assign: 1 one two false 2
+spread: 1 one two false 2
+rest: one false two false 1
+json obj: {"a":1}
+json arr: [1,null,"x",null]
+json top: undefined
+map: 3 A B G undefined
+set: 3 true true false

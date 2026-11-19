@@ -176,9 +176,35 @@ const Task = union(enum) {
     // ---- Calls & barriers
     call_bind_param: struct { func: *const ast.Function, idx: u32, args_base: u32, argc: u32 },
     call_enter_body: struct { func: *const ast.Function, args_base: u32 },
-    call_return: struct { saved_env: ?*Env, saved_this: Value, has_this: bool, values_base: u32, construct_instance: ?*heap.Object = null },
+    call_return: struct {
+        saved_env: ?*Env,
+        saved_this: Value,
+        has_this: bool,
+        values_base: u32,
+        construct_instance: ?*heap.Object = null,
+        saved_closure: ?*const heap.Closure = null,
+        saved_func: ?*const ast.Function = null,
+        saved_construct_instance: ?*heap.Object = null,
+        callee_func: ?*const ast.Function = null,
+        is_super_call: bool = false,
+    },
     barrier: u32,
     await_suspend,
+
+    // ---- Classes & super (M33, D63)
+    class_decl_init: u32,
+    class_setup: struct { cls: *const ast.Class, is_expr: bool },
+    class_method_next: struct { cls: *const ast.Class, idx: usize },
+    class_method_finish: struct { cls: *const ast.Class, idx: usize, named: ?[]const u8 },
+    invoke_super_call: usize,
+    super_get_elem,
+    super_assign_plain: ?[]const u8,
+    super_assign_after_key: struct { op: ast.AssignOp, value: *const ast.Expr, named: ?[]const u8 },
+    super_assign_compound: struct { op: ast.BinaryOp, named: ?[]const u8 },
+    super_assign_logical: struct { op: ast.AssignOp, named: ?[]const u8 },
+    super_update_finish: struct { op: UpdateOp, prefix: bool, named: ?[]const u8 },
+    super_call_member_key: struct { named: ?[]const u8, args: []const *const ast.Expr, tagged: ?*const ast.Expr.TaggedTemplate = null },
+    bind_target_super_finish: ?[]const u8,
 
     // ---- Patterns
     bind_pattern: struct { pat: *const ast.Pattern, mode: BindMode },
@@ -209,6 +235,9 @@ const Machine = struct {
     calls: u32 = 0,
     ret: Value = .undefined,
     this: ?Value = null,
+    current_closure: ?*const heap.Closure = null,
+    current_func: ?*const ast.Function = null,
+    construct_instance: ?*heap.Object = null,
     is_coroutine: bool = false,
     awaited: Value = .undefined,
     tasks: std.ArrayList(Task) = .empty,
@@ -260,6 +289,8 @@ const Machine = struct {
         for (m.values.items) |v| heap.visitValue(v, ctx, visit);
         if (m.env) |e| visit(ctx, &e.obj);
         if (m.this) |t| heap.visitValue(t, ctx, visit);
+        if (m.current_closure) |c| visit(ctx, @constCast(&c.obj));
+        if (m.construct_instance) |ci| visit(ctx, &ci.obj);
         heap.visitValue(m.ret, ctx, visit);
         heap.visitValue(m.awaited, ctx, visit);
         for (m.tasks.items) |t| switch (t) {
@@ -279,6 +310,8 @@ const Machine = struct {
                 if (cr.saved_env) |e| visit(ctx, &e.obj);
                 if (cr.has_this) heap.visitValue(cr.saved_this, ctx, visit);
                 if (cr.construct_instance) |inst| visit(ctx, &inst.obj);
+                if (cr.saved_closure) |sc| visit(ctx, @constCast(&sc.obj));
+                if (cr.saved_construct_instance) |sci| visit(ctx, &sci.obj);
             },
             else => {},
         };
@@ -345,6 +378,7 @@ const Machine = struct {
                 if (m.patternScope(d.pattern)) |sc| return sc;
             },
             .function => |f| return m.res.bindings[f.name.?.binding].scope,
+            .class => |c| return m.res.bindings[c.name.?.binding].scope,
             else => {},
         };
         return null;
@@ -419,7 +453,10 @@ const Machine = struct {
                 else => return err,
             };
             if (maybe_unwind) |kind| {
-                try m.unwind(kind, stop_len);
+                m.unwind(kind, stop_len) catch |uerr| switch (uerr) {
+                    error.Thrown => try m.unwind(.throw, stop_len),
+                    else => return uerr,
+                };
             }
         }
         return false;
@@ -466,18 +503,31 @@ const Machine = struct {
                 },
                 .call_return => |cr| {
                     _ = m.tasks.pop();
+                    const cur_this = m.this;
                     m.env = cr.saved_env;
                     m.this = if (cr.has_this) cr.saved_this else null;
+                    m.current_closure = cr.saved_closure;
+                    m.current_func = cr.saved_func;
+                    m.construct_instance = cr.saved_construct_instance;
                     m.calls -= 1;
                     m.depth -= 1;
                     m.values.shrinkRetainingCapacity(cr.values_base);
                     if (kind == .@"return") {
                         const rv = m.ret;
                         m.ret = .undefined;
-                        const out_v: Value = if (cr.construct_instance) |inst|
-                            (if (rv.isObjectLike()) rv else .{ .object = inst })
+                        const out_v: Value = if (cr.construct_instance == null)
+                            rv
+                        else if (cr.callee_func != null and cr.callee_func.?.has_super_ctor) blk: {
+                            if (rv.isObjectLike()) break :blk rv;
+                            if (rv == .undefined) {
+                                break :blk cur_this orelse return m.rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
+                            }
+                            return m.rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
+                        } else if (rv.isObjectLike())
+                            rv
                         else
-                            rv;
+                            .{ .object = cr.construct_instance.? };
+                        if (cr.is_super_call) m.this = out_v;
                         try m.pushVal(out_v);
                         return;
                     }
@@ -650,7 +700,7 @@ const Machine = struct {
                 m.safepoint();
                 try m.rt.step();
                 m.depth -= 1;
-                try m.pushVal(m.this orelse return m.rt.fail(.sloppy_this));
+                try m.pushVal(try m.requireThis());
             },
             .update => |u| switch (u.target) {
                 .ref => |ref| {
@@ -663,7 +713,7 @@ const Machine = struct {
                     m.depth -= 1;
                     try m.pushVal(.{ .number = if (u.prefix) new else old });
                 },
-                .member => try m.pushTask(.{ .eval = e }),
+                .member, .super_member => try m.pushTask(.{ .eval = e }),
             },
             else => try m.pushTask(.{ .eval = e }),
         }
@@ -1353,7 +1403,39 @@ const Machine = struct {
                 const proto_val = try object.get(rt, target, try object.named(rt, "prototype"));
                 const r = try builtins.realm(rt);
                 const instance = try rt.heap.newObject(if (proto_val == .object) proto_val.object else r.object_prototype);
-                try m.pushClosureCallSync(tc, f, t.env, .{ .object = instance }, args_base, args_base - 1, instance);
+                const init_this: ?Value = if (f.has_super_ctor) null else .{ .object = instance };
+                try m.pushClosureCallSync(tc, f, t.env, init_this, args_base, args_base - 1, instance, false);
+            },
+            .invoke_super_call => |args_base| {
+                if (m.this != null) {
+                    return rt.throw(.ReferenceError, &.{.{ .ascii = "Super constructor may only be called once" }});
+                }
+                const cur_closure = m.current_closure orelse return rt.bug("super() without closure");
+                var target = try object.getPrototypeOfValue(rt, .{ .closure = cur_closure });
+                if (target == .closure and target.closure.impl == .bound) {
+                    const b = target.closure.impl.bound;
+                    target = b.target;
+                    if (b.bound_args.len > 0) {
+                        try m.values.insertSlice(rt.gpa, args_base, b.bound_args);
+                    }
+                }
+                if (!builtins.isConstructor(target)) {
+                    return rt.throw(.TypeError, &.{.{ .ascii = "Super constructor is not a constructor" }});
+                }
+                const inst = m.construct_instance orelse return rt.bug("super() without construct_instance");
+                if (target == .native) {
+                    const res_v = try builtins.construct(rt, target, m.values.items[args_base..]);
+                    if (res_v == .object) rt.heap.storeObjectProto(res_v.object, inst.proto);
+                    m.values.shrinkRetainingCapacity(args_base);
+                    m.this = res_v;
+                    try m.pushVal(res_v);
+                    return null;
+                }
+                const tc = target.closure;
+                const t = tc.impl.tree;
+                const f: *const ast.Function = @ptrCast(@alignCast(t.func));
+                const init_this: ?Value = if (f.has_super_ctor) null else .{ .object = inst };
+                try m.pushClosureCallSync(tc, f, t.env, init_this, args_base, args_base, inst, true);
             },
 
             // ---- Calls
@@ -1391,13 +1473,170 @@ const Machine = struct {
             },
             .call_return => |cr| {
                 // Normal return (body fell off the end without `return`).
+                const cur_this = m.this;
                 m.env = cr.saved_env;
                 m.this = if (cr.has_this) cr.saved_this else null;
+                m.current_closure = cr.saved_closure;
+                m.current_func = cr.saved_func;
+                m.construct_instance = cr.saved_construct_instance;
                 m.calls -= 1;
                 m.depth -= 1;
                 m.values.shrinkRetainingCapacity(cr.values_base);
-                const out_v: Value = if (cr.construct_instance) |inst| .{ .object = inst } else .undefined;
+                const out_v: Value = if (cr.construct_instance) |inst| blk: {
+                    if (cr.callee_func != null and cr.callee_func.?.has_super_ctor) {
+                        break :blk cur_this orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
+                    }
+                    break :blk .{ .object = inst };
+                } else .undefined;
+                if (cr.is_super_call) m.this = out_v;
                 try m.pushVal(out_v);
+            },
+            .class_decl_init => |b| {
+                const v = m.popVal();
+                m.store(b, v);
+            },
+            .class_setup => |cs| {
+                const super_val = m.popVal();
+                const saved_env = m.env;
+                const has_inner = cs.is_expr and cs.cls.name != null;
+                if (has_inner) {
+                    const nd = cs.cls.name.?;
+                    const own = try rt.heap.newEnv(m.env, m.res.bindings[nd.binding].scope, 1);
+                    m.env = own;
+                }
+                const ctor_val = try m.evalFunction(cs.cls.constructor);
+                if (has_inner) {
+                    m.store(cs.cls.name.?.binding, ctor_val);
+                }
+                try m.pushVal(ctor_val);
+                const proto_obj = try builtins.setupClass(rt, ctor_val, cs.cls.super_class != null, super_val);
+                if (cs.cls.methods.len > 0) {
+                    if (has_inner) try m.pushTask(.{ .scope_exit = saved_env });
+                    try m.pushVal(.{ .object = proto_obj });
+                    try m.pushTask(.{ .class_method_next = .{ .cls = cs.cls, .idx = 0 } });
+                } else if (has_inner) {
+                    m.env = saved_env;
+                }
+            },
+            .class_method_next => |cm| {
+                if (cm.idx >= cm.cls.methods.len) {
+                    _ = m.popVal(); // pop proto_obj, leaving ctor on top
+                    return null;
+                }
+                const meth = cm.cls.methods[cm.idx];
+                switch (meth.key) {
+                    .name => |n| try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = cm.idx, .named = n } }),
+                    .string => |units| {
+                        const s = try rt.heap.newString(&.{.{ .utf16 = units }});
+                        try m.pushVal(.{ .string = s });
+                        try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = cm.idx, .named = null } });
+                    },
+                    .number => |num| {
+                        try m.pushVal(.{ .number = num });
+                        try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = cm.idx, .named = null } });
+                    },
+                    .computed => |k| {
+                        try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = cm.idx, .named = null } });
+                        try m.pushEval(k);
+                    },
+                }
+            },
+            .class_method_finish => |cm| {
+                const meth = cm.cls.methods[cm.idx];
+                const kv: KeyValue = if (cm.named) |n| .{ .named = n } else .{ .value = m.popVal() };
+                const k = try m.toKey(kv);
+                const proto_val = m.values.items[m.values.items.len - 1];
+                const ctor_val = m.values.items[m.values.items.len - 2];
+                const target = if (meth.is_static) ctor_val else proto_val;
+                const fn_val = try m.evalFunction(meth.func);
+                try builtins.defineClassMethod(rt, target, k, fn_val);
+                try m.pushTask(.{ .class_method_next = .{ .cls = cm.cls, .idx = cm.idx + 1 } });
+            },
+            .super_get_elem => {
+                _ = try m.requireThis();
+                const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_get_elem without home_object");
+                const k = try m.toKey(.{ .value = m.popVal() });
+                try m.pushVal(try object.getSuper(rt, home, k));
+            },
+            .super_assign_plain => |named| {
+                const this_val = try m.requireThis();
+                const val = m.popVal();
+                const kv: KeyValue = if (named) |n| .{ .named = n } else .{ .value = m.popVal() };
+                try object.set(rt, this_val, try m.toKey(kv), val);
+                try m.pushVal(val);
+            },
+            .super_assign_after_key => |sa| {
+                _ = try m.requireThis();
+                const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_assign without home_object");
+                const kv: KeyValue = if (sa.named) |n| .{ .named = n } else .{ .value = m.values.items[m.values.items.len - 1] };
+                const k = try m.toKey(kv);
+                const old = try object.getSuper(rt, home, k);
+                switch (sa.op) {
+                    .plain => unreachable,
+                    .compound => |op| {
+                        try m.pushVal(old);
+                        try m.pushTask(.{ .super_assign_compound = .{ .op = op, .named = sa.named } });
+                        try m.pushEval(sa.value);
+                    },
+                    .logical_and, .logical_or, .nullish => {
+                        if (!logicalAssignShouldWrite(sa.op, old)) {
+                            if (sa.named == null) _ = m.popVal(); // key
+                            try m.pushVal(old);
+                        } else {
+                            try m.pushTask(.{ .super_assign_logical = .{ .op = sa.op, .named = sa.named } });
+                            try m.pushEval(sa.value);
+                        }
+                    },
+                }
+            },
+            .super_assign_compound => |sc| {
+                const this_val = try m.requireThis();
+                const rhs = m.popVal();
+                const old = m.popVal();
+                const kv: KeyValue = if (sc.named) |n| .{ .named = n } else .{ .value = m.popVal() };
+                const new_val = try ops.binary(rt, sc.op, old, rhs);
+                try object.set(rt, this_val, try m.toKey(kv), new_val);
+                try m.pushVal(new_val);
+            },
+            .super_assign_logical => |sl| {
+                const this_val = try m.requireThis();
+                const rhs = m.popVal();
+                const kv: KeyValue = if (sl.named) |n| .{ .named = n } else .{ .value = m.popVal() };
+                try object.set(rt, this_val, try m.toKey(kv), rhs);
+                try m.pushVal(rhs);
+            },
+            .super_update_finish => |su| {
+                const this_val = try m.requireThis();
+                const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_update without home_object");
+                const kv: KeyValue = if (su.named) |n| .{ .named = n } else .{ .value = m.popVal() };
+                const k = try m.toKey(kv);
+                const old = try ops.toNumber(rt, try object.getSuper(rt, home, k));
+                const new = if (su.op == .inc) old + 1 else old - 1;
+                try object.set(rt, this_val, k, .{ .number = new });
+                try m.pushVal(.{ .number = if (su.prefix) new else old });
+            },
+            .super_call_member_key => |sm| {
+                const this_val = try m.requireThis();
+                _ = this_val;
+                const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_call_member_key without home_object");
+                const kv: KeyValue = if (sm.named) |n| .{ .named = n } else .{ .value = m.popVal() };
+                const callee = try object.getSuper(rt, home, try m.toKey(kv));
+                try m.pushVal(callee);
+                const args_base = m.values.items.len;
+                if (sm.tagged) |tt| {
+                    const tpl = try builtins.getTemplateObjectFromUnits(rt, @intFromPtr(tt), tt.cooked, tt.raw);
+                    try m.pushVal(tpl);
+                }
+                try m.pushTask(.{ .invoke_call = .{ .has_receiver = true, .args_base = args_base } });
+                if (sm.args.len > 0) {
+                    try m.pushTask(.{ .eval_args_next = .{ .args = sm.args, .idx = 0, .args_base = args_base } });
+                }
+            },
+            .bind_target_super_finish => |named| {
+                const this_val = try m.requireThis();
+                const kv: KeyValue = if (named) |n| .{ .named = n } else .{ .value = m.popVal() };
+                const val = m.popVal();
+                try object.set(rt, this_val, try m.toKey(kv), val);
             },
 
             // ---- Patterns
@@ -1732,6 +1971,16 @@ const Machine = struct {
                     try m.pushTask(.{ .decl_next = .{ .decls = decl.declarators, .idx = 0 } });
                 }
             },
+            .class => |cls| {
+                try m.pushTask(.depth_pop);
+                try m.pushTask(.{ .class_decl_init = cls.name.?.binding });
+                try m.pushTask(.{ .class_setup = .{ .cls = cls, .is_expr = false } });
+                if (cls.super_class) |sc| {
+                    try m.pushEval(sc);
+                } else {
+                    try m.pushVal(.undefined);
+                }
+            },
             .block => |stmts| {
                 const saved = m.env;
                 if (try m.pushScope(m.scopeOf(stmts))) {
@@ -1892,12 +2141,46 @@ const Machine = struct {
             },
             .this => {
                 m.depth -= 1;
-                try m.pushVal(m.this orelse return rt.fail(.sloppy_this));
+                try m.pushVal(try m.requireThis());
             },
             .function => |f| {
                 m.depth -= 1;
                 try m.pushVal(try m.evalFunction(f));
             },
+            .class => |cls| {
+                try m.pushTask(.depth_pop);
+                try m.pushTask(.{ .class_setup = .{ .cls = cls, .is_expr = true } });
+                if (cls.super_class) |sc| {
+                    try m.pushEval(sc);
+                } else {
+                    try m.pushVal(.undefined);
+                }
+            },
+            .super_call => |args| {
+                try m.pushTask(.depth_pop);
+                const args_base = m.values.items.len;
+                try m.pushTask(.{ .invoke_super_call = args_base });
+                if (args.len > 0) {
+                    try m.pushTask(.{ .eval_args_next = .{ .args = args, .idx = 0, .args_base = args_base } });
+                }
+            },
+            .super_member => |k| {
+                _ = try m.requireThis();
+                const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_member without home_object");
+                switch (k) {
+                    .name => |n| {
+                        m.depth -= 1;
+                        try m.pushVal(try object.getSuper(rt, home, try m.toKey(.{ .named = n })));
+                    },
+                    .computed => |ke| {
+                        try m.pushTask(.depth_pop);
+                        try m.pushTask(.super_get_elem);
+                        try m.pushEval(ke);
+                    },
+                    .string, .number => unreachable,
+                }
+            },
+            .delete_super => return rt.throw(.ReferenceError, &.{.{ .ascii = "Unsupported reference to 'super'" }}),
             .await => |inner| {
                 try m.pushTask(.await_suspend);
                 try m.pushEval(inner);
@@ -1961,6 +2244,31 @@ const Machine = struct {
                     try m.pushTask(.{ .assign_member_base = .{ .op = a.op, .key = mem.key, .value = a.value } });
                     try m.pushEval(mem.object);
                 },
+                .super_member => |k| {
+                    if (a.op == .plain) {
+                        switch (k) {
+                            .name => |n| {
+                                try m.pushTask(.{ .super_assign_plain = n });
+                                try m.pushEval(a.value);
+                            },
+                            .computed => |ke| {
+                                try m.pushTask(.{ .super_assign_plain = null });
+                                try m.pushTask(.{ .eval = a.value });
+                                try m.pushEval(ke);
+                            },
+                            .string, .number => unreachable,
+                        }
+                    } else {
+                        switch (k) {
+                            .name => |n| try m.pushTask(.{ .super_assign_after_key = .{ .op = a.op, .value = a.value, .named = n } }),
+                            .computed => |ke| {
+                                try m.pushTask(.{ .super_assign_after_key = .{ .op = a.op, .value = a.value, .named = null } });
+                                try m.pushEval(ke);
+                            },
+                            .string, .number => unreachable,
+                        }
+                    }
+                },
             },
             .assign_pattern => |ap| {
                 try m.pushTask(.depth_pop);
@@ -1980,6 +2288,17 @@ const Machine = struct {
                     try m.pushTask(.depth_pop);
                     try m.pushTask(.{ .update_member_base = .{ .op = u.op, .prefix = u.prefix, .key = mem.key } });
                     try m.pushTask(.{ .eval = mem.object });
+                },
+                .super_member => |k| {
+                    try m.pushTask(.depth_pop);
+                    switch (k) {
+                        .name => |n| try m.pushTask(.{ .super_update_finish = .{ .op = u.op, .prefix = u.prefix, .named = n } }),
+                        .computed => |ke| {
+                            try m.pushTask(.{ .super_update_finish = .{ .op = u.op, .prefix = u.prefix, .named = null } });
+                            try m.pushEval(ke);
+                        },
+                        .string, .number => unreachable,
+                    }
                 },
             },
             .member => |mem| {
@@ -2018,6 +2337,17 @@ const Machine = struct {
                     const mem = c.callee.data.member;
                     try m.pushTask(.{ .call_member_base = .{ .key = mem.key, .args = c.args } });
                     try m.pushEval(mem.object);
+                } else if (c.callee.data == .super_member) {
+                    const this_val = try m.requireThis();
+                    try m.pushVal(this_val);
+                    switch (c.callee.data.super_member) {
+                        .name => |n| try m.pushTask(.{ .super_call_member_key = .{ .named = n, .args = c.args } }),
+                        .computed => |ke| {
+                            try m.pushTask(.{ .super_call_member_key = .{ .named = null, .args = c.args } });
+                            try m.pushEval(ke);
+                        },
+                        .string, .number => unreachable,
+                    }
                 } else {
                     try m.pushTask(.{ .call_after_callee = .{ .args = c.args, .has_receiver = false } });
                     try m.pushEval(c.callee);
@@ -2029,6 +2359,17 @@ const Machine = struct {
                     const mem = tt.callee.data.member;
                     try m.pushTask(.{ .call_member_base = .{ .key = mem.key, .args = tt.exprs, .tagged = tt } });
                     try m.pushEval(mem.object);
+                } else if (tt.callee.data == .super_member) {
+                    const this_val = try m.requireThis();
+                    try m.pushVal(this_val);
+                    switch (tt.callee.data.super_member) {
+                        .name => |n| try m.pushTask(.{ .super_call_member_key = .{ .named = n, .args = tt.exprs, .tagged = tt } }),
+                        .computed => |ke| {
+                            try m.pushTask(.{ .super_call_member_key = .{ .named = null, .args = tt.exprs, .tagged = tt } });
+                            try m.pushEval(ke);
+                        },
+                        .string, .number => unreachable,
+                    }
                 } else {
                     try m.pushTask(.{ .call_after_callee = .{ .args = tt.exprs, .has_receiver = false, .tagged = tt } });
                     try m.pushEval(tt.callee);
@@ -2075,8 +2416,21 @@ const Machine = struct {
         } else try rt.heap.newTreeClosure(f, m.env);
         if (f.is_arrow) {
             if (m.this) |t| try rt.heap.storeClosureLexicalThis(c, t);
+            if (m.current_closure) |pc| {
+                if (pc.meta) |pm| {
+                    if (pm.home_object) |ho| try rt.heap.storeClosureHomeObject(c, ho);
+                }
+            }
         }
         return .{ .closure = c };
+    }
+
+    fn requireThis(m: *Machine) Error!Value {
+        if (m.this) |t| return t;
+        if (m.current_func) |cf| if (cf.has_super_ctor) {
+            return m.rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
+        };
+        return m.rt.fail(.sloppy_this);
     }
 
     fn invokeCallable(m: *Machine, callee: Value, receiver: ?Value, args_base: usize, result_base: usize) Error!void {
@@ -2123,16 +2477,19 @@ const Machine = struct {
             .vm, .bound => return m.rt.bug("a non-tree-walker closure in the tree-walker"),
         };
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
+        if (f.is_class_constructor) {
+            return m.rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
+        }
         if (f.is_async) {
             const p = try startAsync(m.rt, m, closure, this, m.values.items[args_base..]);
             m.values.shrinkRetainingCapacity(result_base);
             try m.pushVal(p);
             return;
         }
-        return m.pushClosureCallSync(closure, f, t.env, this, args_base, result_base, null);
+        return m.pushClosureCallSync(closure, f, t.env, this, args_base, result_base, null, false);
     }
 
-    fn pushClosureCallSync(m: *Machine, closure: *const heap.Closure, f: *const ast.Function, env: ?*Env, this: ?Value, args_base: usize, result_base: usize, construct_instance: ?*heap.Object) Error!void {
+    fn pushClosureCallSync(m: *Machine, closure: *const heap.Closure, f: *const ast.Function, env: ?*Env, this: ?Value, args_base: usize, result_base: usize, construct_instance: ?*heap.Object, is_super_call: bool) Error!void {
         if (m.calls >= m.rt.limits.max_call_depth) return m.rt.limit(.call_depth);
         try m.enter();
         m.calls += 1;
@@ -2145,10 +2502,18 @@ const Machine = struct {
             .has_this = saved_this != null,
             .values_base = @intCast(result_base),
             .construct_instance = construct_instance,
+            .saved_closure = m.current_closure,
+            .saved_func = m.current_func,
+            .saved_construct_instance = m.construct_instance,
+            .callee_func = f,
+            .is_super_call = is_super_call,
         } });
 
         m.env = env;
-        m.this = if (f.is_arrow) (if (closure.meta) |meta| meta.lexical_this else null) else this;
+        m.this = if (f.has_super_ctor) null else if (f.is_arrow) (if (closure.meta) |meta| meta.lexical_this else null) else this;
+        m.current_closure = closure;
+        m.current_func = f;
+        m.construct_instance = construct_instance;
         if (m.res.functions[f.id].param_scope) |ps| {
             if (m.res.scopes[ps].len > 0) _ = try m.pushScope(ps);
         }
@@ -2173,6 +2538,7 @@ const Machine = struct {
             .vm, .bound => return m.rt.bug("a non-tree-walker closure in the tree-walker"),
         };
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
+        if (f.is_class_constructor) return m.rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
         if (f.is_async) return startAsync(m.rt, m, closure, this, args);
 
         const values_base = m.values.items.len;
@@ -2184,7 +2550,7 @@ const Machine = struct {
         try m.pushTask(.{ .barrier = @intCast(values_base) });
         const args_base = m.values.items.len;
         try m.values.appendSlice(m.rt.gpa, args);
-        try m.pushClosureCallSync(closure, f, t.env, this, args_base, values_base, null);
+        try m.pushClosureCallSync(closure, f, t.env, this, args_base, values_base, null, false);
         // Run until `.barrier` is reached (either via normal return from `call_return`
         // or via `unwind` hitting `.barrier`).
         _ = try m.runLoop(stop_len);
@@ -2230,7 +2596,7 @@ const Machine = struct {
         const t = ctx.closure.impl.tree;
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
         try m_ptr.values.appendSlice(rt.gpa, ctx.args);
-        try m_ptr.pushClosureCallSync(ctx.closure, f, t.env, ctx.this, 0, 0, null);
+        try m_ptr.pushClosureCallSync(ctx.closure, f, t.env, ctx.this, 0, 0, null, false);
         co.engine = m_ptr;
         co.state = .running;
         return runCoroMachine(m_ptr, ctx.caller.calls, ctx.caller.depth, .start);
@@ -2344,6 +2710,17 @@ const Machine = struct {
                     try m.pushVal(val);
                     try m.pushTask(.{ .bind_target_member_base = mem.key });
                     try m.pushEval(mem.object);
+                },
+                .super_member => |k| {
+                    try m.pushVal(val);
+                    switch (k) {
+                        .name => |n| try m.pushTask(.{ .bind_target_super_finish = n }),
+                        .computed => |ke| {
+                            try m.pushTask(.{ .bind_target_super_finish = null });
+                            try m.pushEval(ke);
+                        },
+                        .string, .number => unreachable,
+                    }
                 },
             },
             .array => {

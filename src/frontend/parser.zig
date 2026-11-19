@@ -128,6 +128,9 @@ const Parser = struct {
     /// When probing `async (...)` at `.none`, defer `await` identifier error until we know if `=>` follows.
     in_async_paren: bool = false,
     async_paren_await_span: ?ast.Span = null,
+    in_derived_ctor: enum { none, direct, arrow } = .none,
+    in_class_method: bool = false,
+    class_count: u32 = 0,
 
     fn advance(p: *Parser) Error!void {
         p.tok = try p.lexer.next();
@@ -175,6 +178,10 @@ const Parser = struct {
                 return .{ .span = .{ .start = t.start, .end = f.span.end }, .data = .{ .function = f } };
             }
         }
+        if (p.isText(p.tok, "class")) {
+            const c = try p.parseClass(.declaration);
+            return .{ .span = c.span, .data = .{ .class = c } };
+        }
         if (p.tok.tag == .kw_const) return p.declarationStatement(.@"const");
         if (p.isText(p.tok, "let") and try p.letStartsDeclaration()) return p.declarationStatement(.let);
         return p.statement();
@@ -221,6 +228,7 @@ const Parser = struct {
         if (p.isText(t, "try")) return p.tryStatement();
         if (p.isText(t, "do")) return p.doWhileStatement();
         if (p.isText(t, "switch")) return p.switchStatement();
+        if (p.isText(t, "class")) return p.fail(.{ .syntax_error = "class declaration cannot appear in a single-statement context" }, t);
         if (p.isText(t, "let")) {
             const next = try p.peek();
             // `if (c) let x` is an error, but `if (c) let\nx` may be ASI + two statements.
@@ -620,15 +628,21 @@ const Parser = struct {
         const outer_loops = p.loop_depth;
         const outer_switches = p.switch_depth;
         const outer_labels = p.labels;
+        const outer_derived = p.in_derived_ctor;
+        const outer_method = p.in_class_method;
         p.loop_depth = 0;
         p.switch_depth = 0;
         p.labels = .empty;
+        p.in_derived_ctor = .none;
+        p.in_class_method = false;
         p.function_depth += 1;
         p.async_ctx = if (is_async) .body else .none;
         defer {
             p.loop_depth = outer_loops;
             p.switch_depth = outer_switches;
             p.labels = outer_labels;
+            p.in_derived_ctor = outer_derived;
+            p.in_class_method = outer_method;
             p.function_depth -= 1;
         }
         const parsed_body = try p.parseFunctionBody();
@@ -1183,15 +1197,18 @@ const Parser = struct {
         const outer_switches = p.switch_depth;
         const outer_labels = p.labels;
         const outer_async_ctx = p.async_ctx;
+        const outer_derived = p.in_derived_ctor;
         p.loop_depth = 0;
         p.switch_depth = 0;
         p.labels = .empty;
+        if (p.in_derived_ctor == .direct) p.in_derived_ctor = .arrow;
         p.function_depth += 1;
         p.async_ctx = if (is_async) .body else .none;
         defer {
             p.loop_depth = outer_loops;
             p.switch_depth = outer_switches;
             p.labels = outer_labels;
+            p.in_derived_ctor = outer_derived;
             p.function_depth -= 1;
             p.async_ctx = outer_async_ctx;
         }
@@ -1262,6 +1279,7 @@ const Parser = struct {
         return switch (e.data) {
             .identifier => |r| .{ .ref = r },
             .member => |m| .{ .member = m },
+            .super_member => |k| .{ .super_member = k },
             else => p.invalidTarget(e, msg),
         };
     }
@@ -1374,6 +1392,7 @@ const Parser = struct {
                 // only member (and optional member) deletion is part of ZQJS.
                 switch (operand.data) {
                     .member => |m| return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .delete = m }, operand.depth),
+                    .super_member => return p.node(.{ .start = t.start, .end = operand.span.end }, .delete_super, operand.depth),
                     .optional_chain => |oc| {
                         if (oc.steps[oc.steps.len - 1].kind == .call) return p.fail(.{ .unsupported = .syntax }, t);
                         return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .delete_optional = oc }, operand.depth);
@@ -1889,6 +1908,36 @@ const Parser = struct {
                     const f = try p.function(.expression, false, t.start);
                     return p.node(f.span, .{ .function = f }, 0);
                 }
+                if (std.mem.eql(u8, name, "class")) {
+                    const c = try p.parseClass(.expression);
+                    return p.node(c.span, .{ .class = c }, 0);
+                }
+                if (std.mem.eql(u8, name, "super")) {
+                    try p.advance();
+                    if (p.tok.tag == .l_paren) {
+                        switch (p.in_derived_ctor) {
+                            .none => return p.fail(.{ .syntax_error = "'super' keyword unexpected here" }, t),
+                            .arrow => return p.fail(.{ .unsupported = .syntax }, t),
+                            .direct => {},
+                        }
+                        const parsed = try p.parseCallArgs(0);
+                        return p.node(.{ .start = t.start, .end = parsed.end }, .{ .super_call = parsed.args }, parsed.depth);
+                    }
+                    if (!p.in_class_method) return p.fail(.{ .syntax_error = "'super' keyword unexpected here" }, t);
+                    if (p.tok.tag == .dot) {
+                        try p.advance();
+                        const prop = try p.expectPropertyName();
+                        return p.node(.{ .start = t.start, .end = prop.end }, .{ .super_member = .{ .name = prop.text(p.source()) } }, 0);
+                    }
+                    if (p.tok.tag == .l_bracket) {
+                        try p.advance();
+                        const k = try p.nested();
+                        const close = p.tok;
+                        try p.expectAfterExpression(.r_bracket);
+                        return p.node(.{ .start = t.start, .end = close.end }, .{ .super_member = .{ .computed = k } }, k.depth);
+                    }
+                    return p.fail(.{ .syntax_error = "'super' keyword unexpected here" }, t);
+                }
                 if (std.mem.eql(u8, name, "async")) {
                     const next = try p.peek();
                     if (!next.newline_before and p.isText(next, "function")) {
@@ -2085,7 +2134,7 @@ const Parser = struct {
                     const d = try p.refToDeclarator(r);
                     return p.patNode(pat.span, .{ .binding = d }, 0);
                 },
-                .member => return p.failAt(.{ .syntax_error = "invalid binding pattern" }, pat.span.start, pat.span.end),
+                .member, .super_member => return p.failAt(.{ .syntax_error = "invalid binding pattern" }, pat.span.start, pat.span.end),
             },
             .array => |arr| {
                 var elems: std.ArrayList(?ast.Pattern.Elem) = .empty;
@@ -2470,6 +2519,229 @@ const Parser = struct {
             return p.failAt(.{ .unsupported = .invalid_utf8 }, base + i, base + i + len);
         return .{ cp, len };
     }
+
+    fn parseClass(p: *Parser, kind: @FieldType(ast.Class, "kind")) Error!*const ast.Class {
+        try p.enter();
+        defer p.depth -= 1;
+
+        const start = p.tok.start;
+        try p.advance(); // `class`
+        const class_id = p.class_count;
+        p.class_count += 1;
+
+        var name_decl: ?ast.Declarator = null;
+        if (kind == .declaration) {
+            name_decl = try p.bindingName(true);
+        } else if (p.tok.tag == .identifier and !p.isText(p.tok, "extends")) {
+            name_decl = try p.bindingName(true);
+        }
+
+        var super_class: ?*const ast.Expr = null;
+        if (p.isText(p.tok, "extends")) {
+            try p.advance();
+            const base = if (p.tok.tag == .identifier and p.isText(p.tok, "new"))
+                try p.newExpr()
+            else
+                try p.members(try p.primary());
+            super_class = try p.calls(base);
+        }
+        const has_super = super_class != null;
+
+        if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{'" }, p.tok);
+        const open_brace = p.tok;
+        try p.advance(); // `{`
+
+        var explicit_ctor: ?*const ast.Function = null;
+        var methods: std.ArrayList(ast.ClassMethod) = .empty;
+
+        while (p.tok.tag != .r_brace) {
+            if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated class body" }, open_brace);
+            if (p.tok.tag == .semicolon) {
+                try p.advance();
+                continue;
+            }
+            const elem_start = p.tok.start;
+            var is_static = false;
+            if (p.isText(p.tok, "static")) {
+                const next = try p.peek();
+                if (next.tag != .l_paren and next.tag != .semicolon and next.tag != .r_brace) {
+                    is_static = true;
+                    try p.advance();
+                }
+            }
+            var is_async = false;
+            if (p.isText(p.tok, "async")) {
+                const next = try p.peek();
+                if (!next.newline_before and next.tag != .l_paren) {
+                    is_async = true;
+                    try p.advance();
+                }
+            }
+            const key_tok = p.tok;
+            const key: ast.PropertyKey = switch (p.tok.tag) {
+                .l_bracket => try p.computedPropertyKey(),
+                .string => blk: {
+                    const units = try p.decodeString(p.tok);
+                    try p.advance();
+                    break :blk .{ .string = units };
+                },
+                .number => blk: {
+                    const val = try number.literalValue(p.arena, p.tok.text(p.source()));
+                    try p.advance();
+                    break :blk .{ .number = val };
+                },
+                else => blk: {
+                    const prop_tok = try p.expectPropertyName();
+                    break :blk .{ .name = prop_tok.text(p.source()) };
+                },
+            };
+
+            const is_ctor = !is_static and key == .name and std.mem.eql(u8, key.name, "constructor");
+            if (is_ctor and is_async) {
+                return p.fail(.{ .syntax_error = "class constructor may not be an async method" }, key_tok);
+            }
+            if (is_ctor and explicit_ctor != null) {
+                return p.fail(.{ .syntax_error = "a class may only have one constructor" }, key_tok);
+            }
+            if (is_static and key == .name and std.mem.eql(u8, key.name, "prototype")) {
+                return p.fail(.{ .syntax_error = "classes may not have a static property named 'prototype'" }, key_tok);
+            }
+            if (p.tok.tag != .l_paren) return p.fail(.{ .syntax_error = "expected '('" }, p.tok);
+
+            const fn_id = p.function_count;
+            p.function_count += 1;
+
+            const outer_async_ctx = p.async_ctx;
+            p.async_ctx = if (is_async) .params else .none;
+            defer p.async_ctx = outer_async_ctx;
+            const params = try p.parseParams();
+
+            if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{'" }, p.tok);
+            const outer_loops = p.loop_depth;
+            const outer_switches = p.switch_depth;
+            const outer_labels = p.labels;
+            const outer_derived = p.in_derived_ctor;
+            const outer_method = p.in_class_method;
+            p.loop_depth = 0;
+            p.switch_depth = 0;
+            p.labels = .empty;
+            p.in_derived_ctor = if (is_ctor and has_super) .direct else .none;
+            p.in_class_method = true;
+            p.function_depth += 1;
+            p.async_ctx = if (is_async) .body else .none;
+            defer {
+                p.loop_depth = outer_loops;
+                p.switch_depth = outer_switches;
+                p.labels = outer_labels;
+                p.in_derived_ctor = outer_derived;
+                p.in_class_method = outer_method;
+                p.function_depth -= 1;
+            }
+            const parsed_body = try p.parseFunctionBody();
+
+            const f = try p.arena.create(ast.Function);
+            f.* = .{
+                .span = .{ .start = elem_start, .end = parsed_body.end },
+                .id = fn_id,
+                .kind = .expression,
+                .is_arrow = false,
+                .is_async = is_async,
+                .is_method = !is_ctor,
+                .is_class_constructor = is_ctor,
+                .has_super_ctor = is_ctor and has_super,
+                .has_home_object = true,
+                .length = paramLength(params),
+                .name = null,
+                .inferred_name = switch (key) {
+                    .name => |n| n,
+                    else => "",
+                },
+                .params = params,
+                .body = parsed_body.body,
+            };
+            if (is_ctor) {
+                if (name_decl) |nd| f.inferred_name = nd.name;
+                explicit_ctor = f;
+            } else {
+                try methods.append(p.arena, .{
+                    .key = key,
+                    .is_static = is_static,
+                    .func = f,
+                    .span = .{ .start = elem_start, .end = parsed_body.end },
+                });
+            }
+        }
+        const close_brace = p.tok;
+        try p.advance(); // `}`
+
+        const ctor = explicit_ctor orelse try p.synthDefaultCtor(.{ .start = start, .end = close_brace.end }, name_decl, has_super);
+        const cls = try p.arena.create(ast.Class);
+        cls.* = .{
+            .span = .{ .start = start, .end = close_brace.end },
+            .id = class_id,
+            .kind = kind,
+            .name = name_decl,
+            .super_class = super_class,
+            .constructor = ctor,
+            .methods = methods.items,
+        };
+        return cls;
+    }
+
+    fn synthDefaultCtor(p: *Parser, sp: ast.Span, name_decl: ?ast.Declarator, has_super: bool) Error!*const ast.Function {
+        const fn_id = p.function_count;
+        p.function_count += 1;
+        const f = try p.arena.create(ast.Function);
+        if (!has_super) {
+            f.* = .{
+                .span = sp,
+                .id = fn_id,
+                .kind = .expression,
+                .is_class_constructor = true,
+                .has_home_object = true,
+                .name = null,
+                .inferred_name = if (name_decl) |nd| nd.name else "",
+                .params = &.{},
+                .body = &.{},
+            };
+            return f;
+        }
+        // Derived default constructor: `constructor(...args) { super(...args); }`
+        const rest_decl: ast.Declarator = .{
+            .name = "args",
+            .span = sp,
+            .binding = p.binding_count,
+            .init = null,
+        };
+        p.binding_count += 1;
+        const pat = try p.patNode(sp, .{ .binding = rest_decl }, 0);
+        const params = try p.arena.alloc(ast.Param, 1);
+        params[0] = .{ .pattern = pat, .default = null, .is_rest = true, .span = sp };
+
+        const ref_id = p.ref_count;
+        p.ref_count += 1;
+        const args_ident = try p.node(sp, .{ .identifier = .{ .name = "args", .span = sp, .id = ref_id } }, 0);
+        const spread_arg = try p.node(sp, .{ .spread = args_ident }, 0);
+        const call_args = try p.arena.alloc(*const ast.Expr, 1);
+        call_args[0] = spread_arg;
+        const super_expr = try p.node(sp, .{ .super_call = call_args }, 0);
+        const body = try p.arena.alloc(ast.Stmt, 1);
+        body[0] = .{ .span = sp, .data = .{ .expression = super_expr } };
+
+        f.* = .{
+            .span = sp,
+            .id = fn_id,
+            .kind = .expression,
+            .is_class_constructor = true,
+            .has_super_ctor = true,
+            .has_home_object = true,
+            .name = null,
+            .inferred_name = if (name_decl) |nd| nd.name else "",
+            .params = params,
+            .body = body,
+        };
+        return f;
+    }
 };
 
 fn span(first: Token, last: Token) ast.Span {
@@ -2484,11 +2756,14 @@ fn paramLength(params: []const ast.Param) u16 {
 }
 
 fn inferExprName(e: *const ast.Expr, name: []const u8) void {
-    if (e.data == .function) {
-        const f = e.data.function;
-        if (f.name == null and f.inferred_name.len == 0) {
+    switch (e.data) {
+        .function => |f| if (f.name == null and f.inferred_name.len == 0) {
             @constCast(f).inferred_name = name;
-        }
+        },
+        .class => |c| if (c.name == null and c.constructor.inferred_name.len == 0) {
+            @constCast(c.constructor).inferred_name = name;
+        },
+        else => {},
     }
 }
 

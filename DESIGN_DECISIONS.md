@@ -1459,3 +1459,63 @@ functions — the foundation required for `class` in M32.
   receiver). If the enclosing non-arrow function was called without an object receiver
   (`c.lexical_this == null`), reading `this` inside the arrow reports `Unsupported(sloppy_this)`
   at the point of use, matching D41.
+
+## D63. Classes, `extends`, and `super` *(M33; approved 2026-11-19)*
+`class` builds directly on M31's function-object model (`ClosureMeta`, constructability, and
+`new F()`), adding class semantics across both engines without changing `Object`'s data-only
+property model (`get`/`set` accessors and `#private` / public class fields remain out of scope
+until a follow-up milestone).
+
+**1. `ClosureMeta` extensions (`src/runtime/heap.zig`, `src/runtime/object.zig`).**
+- `ClosureMeta` gains two lazily allocated, GC-traced fields with write barriers:
+  - `proto: ?Value = null`: custom `[[Prototype]]` for a derived class constructor
+    (`Object.getPrototypeOf(Derived) === Base` when `Base` is non-null; `null` means the
+    default `Function.prototype`, including for `class D extends null`). Property lookup
+    (`object.get` / `object.has`) on a `.closure` walks `m.proto` before `Function.prototype`,
+    giving static method inheritance (`Derived.staticMethod()`).
+  - `home_object: ?Value = null`: `[[HomeObject]]` for class methods (prototype methods
+    bind `C.prototype` as `.object`, static methods bind `C` as `.closure`), traced by
+    `forEachChild` / `RememberedScan` and set via `rt.heap.storeClosureHomeObject`.
+- Class constructors set `is_class_constructor = true` on `ast.Function`, `bytecode.Proto`, and
+  `Closure` checks: calling a class constructor without `new` (`C()`) throws `TypeError`, while
+  `new C(...)` works as in D62.
+
+**2. Class declarations, expressions, and body elements (`src/frontend/`).**
+- `class Name [extends Expr] { ... }` declarations are lexically scoped with TDZ (`let`-like
+  semantics; disallowed in single-statement positions like `if (c) class A {}`).
+- `class [Name] [extends Expr] { ... }` expressions bind optional `Name` only inside the class
+  body (immutable binding, like named function expressions).
+- Body elements: `constructor(...)`, prototype methods (`m() {}`, `async m() {}`, `[expr]() {}`,
+  string/number keys), `static` methods (`static m() {}`, `static async m() {}`,
+  `static [expr]() {}`), and `;` empty elements. All class methods have `is_method = true` (not
+  constructable, no `.prototype`, D62).
+- Static `SyntaxError` checks at parse/resolve time: duplicate `constructor`, `async constructor`,
+  `super(...)` outside a derived `constructor`, `super.prop`/`super[expr]` outside a class
+  method/constructor, `delete super.x` (throws `ReferenceError` at runtime per spec).
+- Implicit default constructor: base classes synthesize `constructor() {}`; derived classes
+  synthesize `constructor(...args) { super(...args); }`.
+
+**3. Class initialization (`defineClass`) & `super` (`src/runtime/builtins.zig`, `src/vm/vm.zig`, `src/interp/machine.zig`).**
+- Evaluating a class:
+  1. Evaluates `extends` expression (if any); throws `TypeError` if non-null and not a
+     constructable function (`is_constructor`) or if `super_val.prototype` is neither an object
+     nor `null`.
+  2. Links `C.prototype` (`Object.create(super_proto)` or `null` for `extends null`), sets
+     `C.prototype.constructor = C`, and sets `C`'s `[[Prototype]]` to `Base` (when non-null).
+  3. Evaluates computed method keys in source order, defines prototype methods on `C.prototype`
+     with `home_object = C.prototype` and static methods on `C` with `home_object = C`.
+- **Derived constructors & `this` TDZ:**
+  - A derived constructor (`has_super_ctor = true`) enters with `this` uninitialized
+    (`this_val = null`, distinct from `sloppy_this`: reading `this` before `super()` throws
+    `ReferenceError`).
+  - `super(...args)` checks `this` has not already been initialized (calling `super()` twice
+    throws `ReferenceError`), constructs the superclass (`Base`) using the pending
+    `construct_instance` (inheriting `NewTarget.prototype`), binds `this` to the resulting
+    object, and evaluates to `this`.
+  - Returning from a derived constructor: returning an object/function returns it; returning
+    `undefined` (or falling off the end) returns `this` (throwing `ReferenceError` if `super()`
+    was never called); returning any other primitive throws `TypeError`.
+- **`super.prop` / `super[expr]` / `super.m(...)`:**
+  - Looks up `Object.getPrototypeOf(home_object)` (via `home_object`'s `proto`), reads the
+    property (data properties only in ZQJS), and for `super.m(...)` binds `this` to the current
+    frame's `this`. Setting `super.prop = v` writes onto `this` (`object.set(rt, this_val, key, v)`).

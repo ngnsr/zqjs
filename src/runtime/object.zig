@@ -165,9 +165,25 @@ pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
             if (c.meta) |m| if (m.props.count() > 0) {
                 if (m.props.get(try atomOf(rt, k))) |p| return p.value;
             };
+            if (c.meta) |m| if (m.proto) |p| return get(rt, p, k);
             return getFrom(rt, (try builtins.realm(rt)).function_prototype, k);
         },
     }
+}
+
+pub fn getPrototypeOfValue(rt: *Runtime, v: Value) Error!Value {
+    return switch (v) {
+        .object => |o| if (o.proto) |p| .{ .object = p } else .null,
+        .closure => |c| if (c.meta) |m| (m.proto orelse .{ .object = (try builtins.realm(rt)).function_prototype }) else .{ .object = (try builtins.realm(rt)).function_prototype },
+        .native => .{ .object = (try builtins.realm(rt)).function_prototype },
+        else => .null,
+    };
+}
+
+pub fn getSuper(rt: *Runtime, home: Value, k: Key) Error!Value {
+    const proto = try getPrototypeOfValue(rt, home);
+    if (proto == .null or proto == .undefined) return .undefined;
+    return get(rt, proto, k);
 }
 
 /// [[Get]] along the prototype chain (cycles can't be built: see Object.proto).
@@ -292,6 +308,15 @@ pub fn define(rt: *Runtime, o: *Object, k: Key, v: Value) Error!void {
     try putOwn(rt, o, k, v);
 }
 
+pub fn defineNonEnumerable(rt: *Runtime, target: Value, k: Key, v: Value) Error!void {
+    const a = try atomOf(rt, k);
+    switch (target) {
+        .object => |o| try rt.heap.defineProperty(o, a, .{ .value = v, .enumerable = false }),
+        .closure => |c| try rt.heap.defineClosureProperty(@constCast(c), a, .{ .value = v, .enumerable = false }),
+        else => unreachable,
+    }
+}
+
 fn putOwn(rt: *Runtime, o: *Object, k: Key, v: Value) Error!void {
     try rt.heap.storeProperty(o, try atomOf(rt, k), v);
 }
@@ -351,6 +376,7 @@ pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
             if (isNamed(k, "name") or isNamed(k, "length")) return true;
             if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return true;
             if (c.meta) |m| if (m.props.count() > 0) if (m.props.contains(try atomOf(rt, k))) return true;
+            if (c.meta) |m| if (m.proto) |p| return has(rt, k, p);
             return hasInChain(rt, (try builtins.realm(rt)).function_prototype, k);
         },
         else => {
@@ -379,11 +405,8 @@ pub fn instanceOf(rt: *Runtime, lhs: Value, rhs: Value) Error!bool {
     if (!target.isFunction()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Right-hand side of 'instanceof' is not callable" }});
     }
-    var cur: ?*Object = switch (lhs) {
-        .object => |o| o.proto,
-        .native, .closure => (try builtins.realm(rt)).function_prototype,
-        else => return false,
-    };
+    var cur: Value = try getPrototypeOfValue(rt, lhs);
+    if (lhs != .object and lhs != .closure and lhs != .native) return false;
     while (target == .closure and target.closure.impl == .bound) {
         target = target.closure.impl.bound.target;
     }
@@ -399,9 +422,11 @@ pub fn instanceOf(rt: *Runtime, lhs: Value, rhs: Value) Error!bool {
         },
         else => unreachable,
     };
-    while (cur) |o| : (cur = o.proto) {
-        o.obj.checkLive();
-        if (o == target_proto) return true;
+    while (cur != .null) : (cur = try getPrototypeOfValue(rt, cur)) {
+        if (cur == .object) {
+            cur.object.obj.checkLive();
+            if (cur.object == target_proto) return true;
+        }
     }
     return false;
 }

@@ -200,6 +200,7 @@ const Resolver = struct {
         for (stmts) |s| switch (s.data) {
             .declaration => |decl| for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", kind == .script, true, param_range),
             .function => |f| try r.declare(f.name.?, .function, kind == .script, true, param_range),
+            .class => |c| try r.declare(c.name.?, .let, kind == .script, true, param_range),
             else => {},
         };
         for (stmts) |s| try r.stmt(s);
@@ -277,6 +278,7 @@ const Resolver = struct {
                 try r.resolvePatternExprs(d.pattern);
             },
             .function => |f| try r.function(f),
+            .class => |c| try r.resolveClass(c, false),
             .@"return" => |v| if (v) |e| try r.expr(e),
             .throw => |e| try r.expr(e),
             .@"try" => |t| {
@@ -288,6 +290,7 @@ const Resolver = struct {
                     for (cb) |cs| switch (cs.data) {
                         .declaration => |decl| for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", false, true, null),
                         .function => |f| try r.declare(f.name.?, .function, false, true, null),
+                        .class => |c| try r.declare(c.name.?, .let, false, true, null),
                         else => {},
                     };
                     if (t.catch_param) |cp| try r.resolvePatternExprs(cp);
@@ -471,6 +474,26 @@ const Resolver = struct {
                 for (c.args) |arg| try r.expr(arg);
             },
             .function => |f| try r.function(f),
+            .class => |c| try r.resolveClass(c, true),
+            .super_call => |args| for (args) |arg| try r.expr(arg),
+            .super_member => |k| if (k == .computed) try r.expr(k.computed),
+            .delete_super => {},
+        }
+    }
+
+    fn resolveClass(r: *Resolver, c: *const ast.Class, is_expr: bool) Error!void {
+        if (c.super_class) |sc| try r.expr(sc);
+        const saved: ?Saved = if (is_expr and c.name != null) blk: {
+            const s = try r.enterScope();
+            try r.declare(c.name.?, .@"const", false, false, null);
+            break :blk s;
+        } else null;
+        defer if (saved) |s| r.exitScope(s);
+
+        try r.function(c.constructor);
+        for (c.methods) |m| {
+            if (m.key == .computed) try r.expr(m.key.computed);
+            try r.function(m.func);
         }
     }
 
@@ -492,6 +515,7 @@ const Resolver = struct {
         switch (t) {
             .ref => |ref| try r.target(ref),
             .member => |m| try r.member(m),
+            .super_member => |k| if (k == .computed) try r.expr(k.computed),
         }
     }
 

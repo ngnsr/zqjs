@@ -39,6 +39,7 @@ const Dumper = struct {
             .@"break" => |lbl| if (lbl) |l| try w.print("(break {s})", .{l}) else try w.writeAll("(break)"),
             .@"continue" => |lbl| if (lbl) |l| try w.print("(continue {s})", .{l}) else try w.writeAll("(continue)"),
             .function => |f| try d.function(f),
+            .class => |c| try d.class(c),
             .@"return" => |v| {
                 try w.writeAll("(return");
                 if (v) |e| {
@@ -291,7 +292,26 @@ const Dumper = struct {
         switch (t) {
             .ref => |r| try d.ref(r),
             .member => |m| try d.member(m),
+            .super_member => |k| {
+                try d.w.writeAll("(super. ");
+                try d.key(k);
+                try d.w.writeByte(')');
+            },
         }
+    }
+
+    fn class(d: Dumper, c: *const ast.Class) Error!void {
+        const w = d.w;
+        try w.writeAll("(class");
+        if (c.name) |n| {
+            try w.writeByte(' ');
+            try d.binding(n);
+        }
+        if (c.super_class) |sc| {
+            try w.writeAll(" extends ");
+            try d.expr(sc);
+        }
+        try w.writeByte(')');
     }
 
     fn member(d: Dumper, m: ast.Member) Error!void {
@@ -448,6 +468,7 @@ const Dumper = struct {
                 try w.writeByte(')');
             },
             .function => |f| try d.function(f),
+            .class => |c| try d.class(c),
             .this => try w.writeAll("this"),
             .await => |inner| {
                 try w.writeAll("(await ");
@@ -455,6 +476,20 @@ const Dumper = struct {
                 try w.writeByte(')');
             },
             .member => |m| try d.member(m),
+            .super_member => |k| {
+                try w.writeAll("(super. ");
+                try d.key(k);
+                try w.writeByte(')');
+            },
+            .super_call => |args| {
+                try w.writeAll("(super");
+                for (args) |a| {
+                    try w.writeByte(' ');
+                    try d.expr(a);
+                }
+                try w.writeByte(')');
+            },
+            .delete_super => try w.writeAll("(delete super)"),
             .optional_chain => |oc| try d.optionalChain(oc),
             .delete => |m| {
                 try w.writeAll("(delete ");

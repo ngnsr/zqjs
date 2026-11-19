@@ -106,6 +106,10 @@ pub const ClosureMeta = struct {
     prototype: ?Value = null,
     /// Lexical `this` captured when an arrow function closure is created inside a method/ctor.
     lexical_this: ?Value = null,
+    /// Custom `[[Prototype]]` for derived class constructors (`Object.getPrototypeOf(Derived) === Base`).
+    proto: ?Value = null,
+    /// `[[HomeObject]]` for class methods (`C.prototype` or `C` for static methods), used by `super.prop`.
+    home_object: ?Value = null,
 };
 
 /// Bound function payload created by `Function.prototype.bind` (M31, D62).
@@ -1229,12 +1233,16 @@ pub const Heap = struct {
     }
 
     pub fn storeClosureProperty(h: *Heap, c: *Closure, key: *String, value: Value) Error!void {
+        try h.defineClosureProperty(c, key, .{ .value = value });
+    }
+
+    pub fn defineClosureProperty(h: *Heap, c: *Closure, key: *String, prop: Property) Error!void {
         const m = try h.ensureClosureMeta(c);
         const gop = m.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
         const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
-        if (gop.found_existing) gop.value_ptr.value = value else gop.value_ptr.* = .{ .value = value };
+        if (gop.found_existing) gop.value_ptr.value = prop.value else gop.value_ptr.* = prop;
         if (!gop.found_existing) h.barrier(&c.obj, null, .{ .string = key });
-        h.barrier(&c.obj, old, value);
+        h.barrier(&c.obj, old, prop.value);
     }
 
     pub fn removeClosureProperty(h: *Heap, c: *Closure, key: *String) void {
@@ -1251,6 +1259,26 @@ pub const Heap = struct {
         const old = m.lexical_this;
         m.lexical_this = this;
         h.barrier(&c.obj, old, this);
+    }
+
+    pub fn storeClosureProto(h: *Heap, c: *Closure, proto_val: Value) Error!void {
+        const m = try h.ensureClosureMeta(c);
+        const old = m.proto;
+        m.proto = proto_val;
+        h.barrier(&c.obj, old, proto_val);
+    }
+
+    pub fn storeClosureHomeObject(h: *Heap, c: *Closure, home: Value) Error!void {
+        const m = try h.ensureClosureMeta(c);
+        const old = m.home_object;
+        m.home_object = home;
+        h.barrier(&c.obj, old, home);
+    }
+
+    pub fn storeObjectProto(h: *Heap, o: *Object, proto: ?*Object) void {
+        const old: ?Value = if (o.proto) |p| .{ .object = p } else null;
+        o.proto = proto;
+        h.barrier(&o.obj, old, if (proto) |p| .{ .object = p } else null);
     }
 
     /// The write barrier: `owner` now holds `new` where it held `old` (GC_DESIGN §7). M8.1:
@@ -1714,6 +1742,8 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
             if (c.meta) |m| {
                 if (m.prototype) |p| visitValue(p, ctx, visit);
                 if (m.lexical_this) |lt| visitValue(lt, ctx, visit);
+                if (m.proto) |pr| visitValue(pr, ctx, visit);
+                if (m.home_object) |ho| visitValue(ho, ctx, visit);
                 for (m.props.keys(), m.props.values()) |k, p| {
                     visit(ctx, &k.obj);
                     visitValue(p.value, ctx, visit);

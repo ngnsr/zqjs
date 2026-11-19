@@ -84,6 +84,10 @@ pub const Frame = struct {
     argc: u32,
     /// True when entered via `new` (returns `this` unless body returns an object-like value).
     is_construct: bool = false,
+    /// True when entered via `super(...)` from a derived class constructor.
+    is_super_call: bool = false,
+    /// Pre-allocated instance for `new` / `super(...)` (traced by GC).
+    construct_instance: ?*heap.Object = null,
 };
 
 pub const Vm = struct {
@@ -207,6 +211,7 @@ pub const Vm = struct {
             .tree, .promise_cap, .native_closure, .bound => return rt.bug("a non-VM closure in a nested call"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
+        if (callee.is_class_constructor) return rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
         if (callee.is_async) return startAsync(rt, caller_vm, c, this, args);
 
         const own_chain = !rt.exec_ctx.active;
@@ -615,6 +620,7 @@ pub const Vm = struct {
         for (vm.frames.items) |f| {
             if (f.closure) |c| visit(ctx, @constCast(&c.obj));
             if (f.this) |t| heap.visitValue(t, ctx, visit);
+            if (f.construct_instance) |ci| visit(ctx, &ci.obj);
         }
         heap.visitValue(vm.awaited, ctx, visit);
     }
@@ -796,6 +802,11 @@ pub const Vm = struct {
                 };
                 if (child.is_arrow) {
                     if (vm.frame().this) |t| try rt.heap.storeClosureLexicalThis(c, t);
+                    if (vm.frame().closure) |parent_c| {
+                        if (parent_c.meta) |pm| {
+                            if (pm.home_object) |ho| try rt.heap.storeClosureHomeObject(c, ho);
+                        }
+                    }
                 }
                 try cache.push(vm, .{ .closure = c });
             },
@@ -855,6 +866,65 @@ pub const Vm = struct {
                 const obj = try builtins.getTemplateObjectFromConsts(rt, @intFromPtr(site), site.cooked, site.raw, p.consts);
                 try cache.push(vm, obj);
             },
+            .setup_class => {
+                const has_super = cache.operand(0) != 0;
+                const super_val = try cache.peek(vm, 0);
+                const ctor_val = try cache.peek(vm, 1);
+                const proto_obj = try builtins.setupClass(rt, ctor_val, has_super, super_val);
+                try cache.drop(vm, 1);
+                try cache.push(vm, .{ .object = proto_obj });
+            },
+            .define_method => {
+                const method_val = try cache.peek(vm, 0);
+                const target = try cache.peek(vm, 1);
+                try builtins.defineClassMethod(rt, target, try vm.nameKey(cache.operand(0)), method_val);
+                try cache.drop(vm, 1);
+            },
+            .define_elem_method => {
+                const method_val = try cache.peek(vm, 0);
+                const key_val = try cache.peek(vm, 1);
+                const target = try cache.peek(vm, 2);
+                try builtins.defineClassMethod(rt, target, try object.key(rt, key_val), method_val);
+                try cache.drop(vm, 2);
+            },
+            .super_call => {
+                const argc = cache.operand(0);
+                const args_start = cache.sp - argc;
+                const base = args_start;
+                if (try vm.callSuper(cache, base, vm.stack[args_start..cache.sp], false, next)) return .running;
+            },
+            .super_call_spread => {
+                const arr_val = try cache.peek(vm, 0);
+                const base = cache.sp - 1;
+                if (arr_val != .object or arr_val.object.kind != .array) return vm.bug("super_call_spread expects array");
+                if (try vm.callSuper(cache, base, arr_val.object.kind.array.items, true, next)) return .running;
+            },
+            .super_get_prop => {
+                _ = try vm.requireThis();
+                const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_get_prop without home_object");
+                try cache.ensurePush(vm);
+                try cache.push(vm, try object.getSuper(rt, home, try vm.nameKey(cache.operand(0))));
+            },
+            .super_get_elem => {
+                _ = try vm.requireThis();
+                const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_get_elem without home_object");
+                const k = try object.key(rt, try cache.peek(vm, 0));
+                (try cache.top(vm)).* = try object.getSuper(rt, home, k);
+            },
+            .super_set_prop => {
+                const this_val = try vm.requireThis();
+                const val = try cache.peek(vm, 0);
+                try object.set(rt, this_val, try vm.nameKey(cache.operand(0)), val);
+            },
+            .super_set_elem => {
+                const this_val = try vm.requireThis();
+                const val = try cache.peek(vm, 0);
+                const key_val = try cache.peek(vm, 1);
+                try object.set(rt, this_val, try object.key(rt, key_val), val);
+                try cache.drop(vm, 1);
+                (try cache.top(vm)).* = val;
+            },
+            .throw_delete_super => return rt.throw(.ReferenceError, &.{.{ .ascii = "Unsupported reference to 'super'" }}),
             .define_prop => {
                 const o = try cache.peek(vm, 1);
                 if (o != .object) return vm.bug("define on a non-object");
@@ -906,7 +976,7 @@ pub const Vm = struct {
             },
             .push_this => {
                 try cache.ensurePush(vm);
-                try cache.push(vm, vm.frame().this orelse return rt.fail(.sloppy_this));
+                try cache.push(vm, try vm.requireThis());
             },
             .get_arg => {
                 const idx = cache.operand(0);
@@ -1046,7 +1116,7 @@ pub const Vm = struct {
                                 vm.stack[base] = try vm.startAsyncFromVm(c, this, args_slice);
                                 cache.sp = base + 1;
                             } else {
-                                try vm.enterSlice(c, base, args_slice, next, this, false);
+                                try vm.enterSlice(c, base, args_slice, next, this, false, false, null);
                                 cache.* = FrameCache.fromVm(vm, 0);
                                 return .running;
                             }
@@ -1195,7 +1265,7 @@ pub const Vm = struct {
                                 vm.stack[base] = try vm.startAsyncFromVm(c, this, vm.stack[args..cache.sp]);
                                 cache.sp = base + 1;
                             } else {
-                                try vm.enter(c, base, args, argc, next, this, false);
+                                try vm.enter(c, base, args, argc, next, this, false, false, null);
                                 cache.* = FrameCache.fromVm(vm, 0);
                                 return .running; // pc is the callee's 0
                             }
@@ -1220,8 +1290,23 @@ pub const Vm = struct {
                     return vm.bug("return in the script");
                 }
                 const ret_v = try cache.peek(vm, 0);
+                const cur_f = vm.frame();
+                const v: Value = if (!cur_f.is_construct)
+                    ret_v
+                else if (cur_f.proto.has_super_ctor) blk: {
+                    if (ret_v.isObjectLike()) break :blk ret_v;
+                    if (ret_v == .undefined) {
+                        break :blk cur_f.this orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
+                    }
+                    return rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
+                } else if (!ret_v.isObjectLike())
+                    .{ .object = cur_f.construct_instance.? }
+                else
+                    ret_v;
                 const f = vm.frames.pop().?;
-                const v = if (f.is_construct and !ret_v.isObjectLike()) f.this.? else ret_v;
+                if (f.is_super_call) {
+                    vm.frames.items[vm.frames.items.len - 1].this = v;
+                }
                 if (vm.chain) |cx| cx.call_depth -= 1; // the frame died (D51 #2)
                 vm.locals_len = f.locals_base;
                 vm.reserved -= f.proto.slot_count + f.proto.max_stack;
@@ -1303,7 +1388,7 @@ pub const Vm = struct {
                         cache.sp = base + 1;
                         return false;
                     }
-                    try vm.enterSlice(tc, base, combined, next, this, false);
+                    try vm.enterSlice(tc, base, combined, next, this, false, false, null);
                     cache.* = FrameCache.fromVm(vm, 0);
                     return true;
                 },
@@ -1341,13 +1426,77 @@ pub const Vm = struct {
             return false;
         }
         const tc = target.closure;
+        const tc_proto: *const Proto = switch (tc.impl) {
+            .vm => |v| @ptrCast(@alignCast(v.proto)),
+            else => return vm.bug("a non-VM closure in the VM"),
+        };
         const proto_val = try object.get(rt, target, try object.named(rt, "prototype"));
         const r = try builtins.realm(rt);
         const instance = try rt.heap.newObject(if (proto_val == .object) proto_val.object else r.object_prototype);
+        const init_this: ?Value = if (tc_proto.has_super_ctor) null else .{ .object = instance };
         if (!is_spread and !is_bound) {
-            try vm.enter(tc, base, args_start, @intCast(args_slice.len), next, .{ .object = instance }, true);
+            try vm.enter(tc, base, args_start, @intCast(args_slice.len), next, init_this, true, false, instance);
         } else {
-            try vm.enterSlice(tc, base, effective_args, next, .{ .object = instance }, true);
+            try vm.enterSlice(tc, base, effective_args, next, init_this, true, false, instance);
+        }
+        cache.* = FrameCache.fromVm(vm, 0);
+        return true;
+    }
+
+    fn requireThis(vm: *Vm) Error!Value {
+        const f = vm.frame();
+        if (f.this) |t| return t;
+        if (f.proto.has_super_ctor) {
+            return vm.rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
+        }
+        return vm.rt.fail(.sloppy_this);
+    }
+
+    fn callSuper(vm: *Vm, cache: *FrameCache, base: u32, args_slice: []const Value, is_spread: bool, next: u32) Error!bool {
+        const rt = vm.rt;
+        const f = vm.frame();
+        if (f.this != null) {
+            return rt.throw(.ReferenceError, &.{.{ .ascii = "Super constructor may only be called once" }});
+        }
+        const cur_closure = f.closure orelse return vm.bug("super() without closure");
+        var target = try object.getPrototypeOfValue(rt, .{ .closure = cur_closure });
+        var is_bound = false;
+        var combined: []Value = &.{};
+        defer if (combined.len > 0) rt.gpa.free(combined);
+
+        if (target == .closure and target.closure.impl == .bound) {
+            is_bound = true;
+            const b = target.closure.impl.bound;
+            target = b.target;
+            if (b.bound_args.len > 0) {
+                combined = try rt.gpa.alloc(Value, b.bound_args.len + args_slice.len);
+                @memcpy(combined[0..b.bound_args.len], b.bound_args);
+                @memcpy(combined[b.bound_args.len..], args_slice);
+            }
+        }
+        const effective_args = if (combined.len > 0) combined else args_slice;
+        if (!builtins.isConstructor(target)) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Super constructor is not a constructor" }});
+        }
+        const inst = f.construct_instance orelse return vm.bug("super() without construct_instance");
+        if (target == .native) {
+            const res = try builtins.construct(rt, target, effective_args);
+            if (res == .object) rt.heap.storeObjectProto(res.object, inst.proto);
+            vm.frames.items[vm.frames.items.len - 1].this = res;
+            vm.stack[base] = res;
+            cache.sp = base + 1;
+            return false;
+        }
+        const tc = target.closure;
+        const tc_proto: *const Proto = switch (tc.impl) {
+            .vm => |v| @ptrCast(@alignCast(v.proto)),
+            else => return vm.bug("a non-VM closure in the VM"),
+        };
+        const child_this: ?Value = if (tc_proto.has_super_ctor) null else .{ .object = inst };
+        if (!is_spread and !is_bound) {
+            try vm.enter(tc, base, base, @intCast(args_slice.len), next, child_this, true, true, inst);
+        } else {
+            try vm.enterSlice(tc, base, effective_args, next, child_this, true, true, inst);
         }
         cache.* = FrameCache.fromVm(vm, 0);
         return true;
@@ -1356,13 +1505,16 @@ pub const Vm = struct {
     /// Enters closure `c`: its `argc` arguments start at `stack[args]`, and the result will
     /// replace everything from `stack[base]`. Transactional: everything that can fail
     /// happens before anything is committed.
-    fn enter(vm: *Vm, c: *const Closure, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value, is_construct: bool) Error!void {
+    fn enter(vm: *Vm, c: *const Closure, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value, is_construct: bool, is_super_call: bool, construct_instance: ?*heap.Object) Error!void {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
             .tree, .promise_cap, .native_closure, .bound => return vm.bug("a non-VM closure in the VM"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
+        if (!is_construct and callee.is_class_constructor) {
+            return vm.rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
+        }
         const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else this;
         const limits = vm.rt.limits;
         // 1. limits — a chained VM checks the chain's shared depth (D51 #2: every VM's
@@ -1394,6 +1546,8 @@ pub const Vm = struct {
             .args_start = args,
             .argc = argc,
             .is_construct = is_construct,
+            .is_super_call = is_super_call,
+            .construct_instance = construct_instance,
         });
         vm.locals_len += callee.slot_count;
         vm.reserved += callee.slot_count + callee.max_stack;
@@ -1401,13 +1555,16 @@ pub const Vm = struct {
         if (vm.chain) |cx| cx.call_depth += 1; // the frame is live now (D51 #2)
     }
 
-    fn enterSlice(vm: *Vm, c: *const Closure, base: u32, args_slice: []const Value, return_pc: u32, this: ?Value, is_construct: bool) Error!void {
+    fn enterSlice(vm: *Vm, c: *const Closure, base: u32, args_slice: []const Value, return_pc: u32, this: ?Value, is_construct: bool, is_super_call: bool, construct_instance: ?*heap.Object) Error!void {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
             .tree, .promise_cap, .native_closure, .bound => return vm.bug("a non-VM closure in the VM"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
+        if (!is_construct and callee.is_class_constructor) {
+            return vm.rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
+        }
         const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else this;
         const limits = vm.rt.limits;
         if (vm.chain) |cx| {
@@ -1437,6 +1594,8 @@ pub const Vm = struct {
             .args_start = args_start,
             .argc = argc,
             .is_construct = is_construct,
+            .is_super_call = is_super_call,
+            .construct_instance = construct_instance,
         });
         vm.locals_len += callee.slot_count;
         vm.reserved += callee.slot_count + callee.max_stack;

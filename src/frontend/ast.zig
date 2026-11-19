@@ -137,6 +137,7 @@ pub const OptionalChain = struct {
 pub const Target = union(enum) {
     ref: Ref,
     member: Member,
+    super_member: PropertyKey,
 };
 
 pub const PropertyDef = union(enum) {
@@ -272,7 +273,32 @@ pub const Expr = struct {
         await: *const Expr,
         /// `function [name](params) { body }` as an expression.
         function: *const Function,
+        /// `class [Name] [extends Expr] { ... }` as an expression (M33, D63).
+        class: *const Class,
+        /// `super(args...)` inside a derived constructor.
+        super_call: []const *const Expr,
+        /// `super.prop` or `super[expr]` inside a class method/constructor.
+        super_member: PropertyKey,
+        /// `delete super.prop` / `delete super[expr]` (throws ReferenceError at runtime).
+        delete_super,
     };
+};
+
+pub const ClassMethod = struct {
+    key: PropertyKey,
+    is_static: bool,
+    func: *const Function,
+    span: Span,
+};
+
+pub const Class = struct {
+    span: Span,
+    id: u32,
+    kind: enum { declaration, expression },
+    name: ?Declarator,
+    super_class: ?*const Expr,
+    constructor: *const Function,
+    methods: []const ClassMethod,
 };
 
 /// A function parameter (M26: pattern, optional default, optional rest).
@@ -293,6 +319,12 @@ pub const Function = struct {
     is_async: bool = false,
     /// Concise object-literal method (`{ m() {} }`): not constructable and has no `.prototype` (D62).
     is_method: bool = false,
+    /// Class constructor (`class C { constructor() {} }`): requires `new` (D63).
+    is_class_constructor: bool = false,
+    /// Derived class constructor (`extends`): `super()` allowed, `this` starts in TDZ (D63).
+    has_super_ctor: bool = false,
+    /// Class method or constructor: `super.prop` allowed via `[[HomeObject]]` (D63).
+    has_home_object: bool = false,
     /// Number of parameters before the first default or rest parameter (`F.length`, D62).
     length: u16 = 0,
     /// Required for declarations (bound in the enclosing scope); optional for
@@ -335,6 +367,7 @@ pub const Stmt = struct {
         empty,
         expression: *const Expr,
         declaration: Declaration,
+        class: *const Class,
         block: []const Stmt,
         @"if": struct { cond: *const Expr, then: *const Stmt, @"else": ?*const Stmt },
         @"while": struct { cond: *const Expr, body: *const Stmt },

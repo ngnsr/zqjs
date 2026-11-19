@@ -266,6 +266,9 @@ const Compiler = struct {
             .is_arrow = if (f) |func| func.is_arrow else false,
             .is_async = if (f) |func| func.is_async else false,
             .is_method = if (f) |func| func.is_method else false,
+            .is_class_constructor = if (f) |func| func.is_class_constructor else false,
+            .has_super_ctor = if (f) |func| func.has_super_ctor else false,
+            .has_home_object = if (f) |func| func.has_home_object else false,
             .length = if (f) |func| func.length else 0,
             .name = name_copy,
             .inferred_name = inferred_copy,
@@ -406,6 +409,7 @@ const Compiler = struct {
         for (stmts) |s| switch (s.data) {
             .declaration => |decl| for (decl.declarators) |d| try c.enterPatternBindings(d.pattern),
             .function => |f| if (c.binding(f.name.?.binding).captured) try c.emit(.new_cell, &.{c.slotOf(f.name.?.binding)}),
+            .class => |cls| try c.enterBinding(cls.name.?.binding),
             else => {},
         };
         for (stmts) |s| if (s.data == .function) {
@@ -471,6 +475,10 @@ const Compiler = struct {
                 try c.emit(.pop, &.{});
             },
             .declaration => |decl| try c.declare(decl),
+            .class => |cls| {
+                try c.compileClass(cls, false);
+                try c.initBinding(cls.name.?.binding);
+            },
             .block => |stmts| return c.statements(stmts, s.span),
             .@"return" => |v| {
                 if (v) |e| try c.expr(e) else try c.emit(.push_undefined, &.{});
@@ -1028,6 +1036,28 @@ const Compiler = struct {
             },
             .identifier => |ref| try c.read(ref),
             .function => |f| try c.closure(f),
+            .class => |cls| try c.compileClass(cls, true),
+            .super_call => |args| {
+                const has_spread = for (args) |a| {
+                    if (a.data == .spread) break true;
+                } else false;
+                if (has_spread) {
+                    try c.compileArgsArray(args);
+                    try c.emit(.super_call_spread, &.{});
+                } else {
+                    for (args) |a| try c.expr(a);
+                    try c.emit(.super_call, &.{@intCast(args.len)});
+                }
+            },
+            .super_member => |k| switch (k) {
+                .name => |n| try c.emit(.super_get_prop, &.{try c.name(n)}),
+                .computed => |ke| {
+                    try c.expr(ke);
+                    try c.emit(.super_get_elem, &.{});
+                },
+                .string, .number => unreachable,
+            },
+            .delete_super => try c.emit(.throw_delete_super, &.{}),
             .await => |inner| {
                 try c.expr(inner);
                 try c.emit(.await, &.{});
@@ -1175,6 +1205,59 @@ const Compiler = struct {
                         },
                     }
                 },
+                .super_member => |k| {
+                    const named = switch (k) {
+                        .name => |n| n,
+                        .computed => |ke| blk: {
+                            try c.expr(ke);
+                            break :blk null;
+                        },
+                        .string, .number => unreachable,
+                    };
+                    switch (a.op) {
+                        .plain => {
+                            try c.expr(a.value);
+                            if (named) |n| try c.emit(.super_set_prop, &.{try c.name(n)}) else try c.emit(.super_set_elem, &.{});
+                        },
+                        .compound => |op| {
+                            if (named) |n| {
+                                try c.emit(.super_get_prop, &.{try c.name(n)});
+                                try c.expr(a.value);
+                                try c.emit(binaryOp(op), &.{});
+                                try c.emit(.super_set_prop, &.{try c.name(n)});
+                            } else {
+                                try c.emit(.dup, &.{});
+                                try c.emit(.super_get_elem, &.{});
+                                try c.expr(a.value);
+                                try c.emit(binaryOp(op), &.{});
+                                try c.emit(.super_set_elem, &.{});
+                            }
+                        },
+                        .logical_and, .logical_or, .nullish => {
+                            if (named) |n| {
+                                try c.emit(.super_get_prop, &.{try c.name(n)});
+                                const to_short = try c.jumpIfLogicalAssignShortCircuit(a.op);
+                                try c.emit(.pop, &.{});
+                                try c.expr(a.value);
+                                try c.emit(.super_set_prop, &.{try c.name(n)});
+                                c.patch(to_short, c.here());
+                            } else {
+                                const k_slot = c.allocTemp();
+                                defer c.freeTemp();
+                                try c.emit(.init_local, &.{k_slot});
+                                try c.emit(.get_local, &.{ k_slot, try c.name("<key>") });
+                                try c.emit(.super_get_elem, &.{});
+                                const to_short = try c.jumpIfLogicalAssignShortCircuit(a.op);
+                                try c.emit(.pop, &.{});
+                                try c.emit(.get_local, &.{ k_slot, try c.name("<key>") });
+                                try c.expr(a.value);
+                                try c.emit(.super_set_elem, &.{});
+                                c.patch(to_short, c.here());
+                                try c.emit(.clear_local, &.{k_slot});
+                            }
+                        },
+                    }
+                },
             },
             .update => |u| switch (u.target) {
                 .ref => |ref| {
@@ -1215,6 +1298,51 @@ const Compiler = struct {
                     try c.emit(if (u.op == .inc) .inc else .dec, &.{});
                     if (named) |n| try c.emit(.set_prop, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
                     if (!u.prefix) try c.emit(.pop, &.{});
+                },
+                .super_member => |k| {
+                    const named = switch (k) {
+                        .name => |n| n,
+                        .computed => |ke| blk: {
+                            try c.expr(ke);
+                            break :blk null;
+                        },
+                        .string, .number => unreachable,
+                    };
+                    if (named) |n| {
+                        try c.emit(.super_get_prop, &.{try c.name(n)});
+                        try c.emit(.to_number, &.{});
+                        if (!u.prefix) try c.emit(.dup, &.{});
+                        try c.emit(if (u.op == .inc) .inc else .dec, &.{});
+                        try c.emit(.super_set_prop, &.{try c.name(n)});
+                        if (!u.prefix) try c.emit(.pop, &.{});
+                    } else {
+                        const k_slot = c.allocTemp();
+                        defer c.freeTemp();
+                        const val_slot = c.allocTemp();
+                        defer c.freeTemp();
+                        try c.emit(.init_local, &.{k_slot});
+                        try c.emit(.get_local, &.{ k_slot, try c.name("<key>") });
+                        try c.emit(.super_get_elem, &.{});
+                        try c.emit(.to_number, &.{});
+                        if (!u.prefix) {
+                            try c.emit(.dup, &.{});
+                            try c.emit(.init_local, &.{val_slot});
+                        }
+                        try c.emit(if (u.op == .inc) .inc else .dec, &.{});
+                        const new_slot = c.allocTemp();
+                        defer c.freeTemp();
+                        try c.emit(.init_local, &.{new_slot});
+                        try c.emit(.get_local, &.{ k_slot, try c.name("<key>") });
+                        try c.emit(.get_local, &.{ new_slot, try c.name("<val>") });
+                        try c.emit(.super_set_elem, &.{});
+                        if (!u.prefix) {
+                            try c.emit(.pop, &.{});
+                            try c.emit(.get_local, &.{ val_slot, try c.name("<old>") });
+                            try c.emit(.clear_local, &.{val_slot});
+                        }
+                        try c.emit(.clear_local, &.{new_slot});
+                        try c.emit(.clear_local, &.{k_slot});
+                    }
                 },
             },
             .member => |m| try c.member(m, .get),
@@ -1493,6 +1621,25 @@ const Compiler = struct {
                     try c.emit(.pop, &.{});
                     try c.emit(.clear_local, &.{val_slot});
                 },
+                .super_member => |k| {
+                    const val_slot = c.allocTemp();
+                    defer c.freeTemp();
+                    try c.emit(.init_local, &.{val_slot});
+                    switch (k) {
+                        .name => |n| {
+                            try c.emit(.get_local, &.{ val_slot, try c.name("<val>") });
+                            try c.emit(.super_set_prop, &.{try c.name(n)});
+                        },
+                        .computed => |ke| {
+                            try c.expr(ke);
+                            try c.emit(.get_local, &.{ val_slot, try c.name("<val>") });
+                            try c.emit(.super_set_elem, &.{});
+                        },
+                        .string, .number => unreachable,
+                    }
+                    try c.emit(.pop, &.{});
+                    try c.emit(.clear_local, &.{val_slot});
+                },
             },
             .array => |arr| {
                 try c.emit(.get_iter, &.{});
@@ -1673,6 +1820,18 @@ const Compiler = struct {
 
     fn compileCallee(c: *Compiler, callee: *const ast.Expr) Error!bool {
         // A member callee is a method call: [receiver, callee] (D41).
+        if (callee.data == .super_member) {
+            try c.emit(.push_this, &.{});
+            switch (callee.data.super_member) {
+                .name => |n| try c.emit(.super_get_prop, &.{try c.name(n)}),
+                .computed => |k| {
+                    try c.expr(k);
+                    try c.emit(.super_get_elem, &.{});
+                },
+                .string, .number => unreachable,
+            }
+            return true;
+        }
         const method = callee.data == .member;
         if (method) {
             const m = callee.data.member;
@@ -1688,6 +1847,64 @@ const Compiler = struct {
             }
         } else try c.expr(callee);
         return method;
+    }
+
+    fn compileClass(c: *Compiler, cls: *const ast.Class, is_expr: bool) Error!void {
+        const ctor_slot = c.allocTemp();
+        defer c.freeTemp();
+        const proto_slot = c.allocTemp();
+        defer c.freeTemp();
+
+        if (is_expr) {
+            if (cls.name) |nd| try c.enterBinding(nd.binding);
+        }
+        try c.closure(cls.constructor);
+        if (cls.super_class) |sc| {
+            try c.expr(sc);
+        } else {
+            try c.emit(.push_undefined, &.{});
+        }
+        try c.emit(.setup_class, &.{if (cls.super_class != null) 1 else 0});
+        // Stack: [ctor, ctor_proto]
+        try c.emit(.init_local, &.{proto_slot});
+        if (is_expr) {
+            if (cls.name) |nd| {
+                try c.emit(.dup, &.{});
+                try c.initBinding(nd.binding);
+            }
+        }
+        try c.emit(.init_local, &.{ctor_slot});
+
+        for (cls.methods) |m| {
+            const target_slot = if (m.is_static) ctor_slot else proto_slot;
+            try c.emit(.get_local, &.{ target_slot, try c.name("<class>") });
+            switch (m.key) {
+                .name => |n| {
+                    try c.closure(m.func);
+                    try c.emit(.define_method, &.{try c.name(n)});
+                },
+                .string => |units| {
+                    try c.emit(.push_const, &.{try c.string(units)});
+                    try c.closure(m.func);
+                    try c.emit(.define_elem_method, &.{});
+                },
+                .number => |num| {
+                    try c.emit(.push_const, &.{try c.number(num)});
+                    try c.closure(m.func);
+                    try c.emit(.define_elem_method, &.{});
+                },
+                .computed => |k| {
+                    try c.expr(k);
+                    try c.closure(m.func);
+                    try c.emit(.define_elem_method, &.{});
+                },
+            }
+            try c.emit(.pop, &.{});
+        }
+
+        try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });
+        try c.emit(.clear_local, &.{ctor_slot});
+        try c.emit(.clear_local, &.{proto_slot});
     }
 };
 

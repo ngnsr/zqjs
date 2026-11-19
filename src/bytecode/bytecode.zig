@@ -115,6 +115,26 @@ pub const Op = enum(u8) {
     new_regexp,
     /// Push the cached TemplateStringsArray for templates[idx] (tagged template literal).
     get_template_obj,
+    /// [ctor, super_val] → [ctor, ctor_proto] (M33, D63).
+    setup_class,
+    /// [obj, method_closure] → [obj]: sets home_object = obj and defines non-enumerable obj[name].
+    define_method,
+    /// [obj, key, method_closure] → [obj]: sets home_object = obj and defines non-enumerable obj[key].
+    define_elem_method,
+    /// [arg0 … arg(argc-1)] → [this]: `super(...args)` in derived constructor.
+    super_call,
+    /// [args_arr] → [this]: `super(...args)` with spread.
+    super_call_spread,
+    /// [] → [val]: `super.name`.
+    super_get_prop,
+    /// [key] → [val]: `super[key]`.
+    super_get_elem,
+    /// [val] → [val]: `super.name = val`.
+    super_set_prop,
+    /// [key, val] → [val]: `super[key] = val`.
+    super_set_elem,
+    /// [] → [val] (always throws ReferenceError for `delete super.x`).
+    throw_delete_super,
     /// [obj, value] → [obj]: define obj.name (an object literal's `name: value`).
     define_prop,
     /// [obj, key, value] → [obj]: the same with a computed or literal key.
@@ -274,6 +294,16 @@ pub const Op = enum(u8) {
             .new_array => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
             .new_regexp => .{ .operands = &.{ .@"const", .@"const" }, .pops = 0, .pushes = 1 },
             .get_template_obj => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
+            .setup_class => .{ .operands = &.{.argc}, .pops = 2, .pushes = 2 },
+            .define_method => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
+            .define_elem_method => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
+            .super_call => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
+            .super_call_spread => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .super_get_prop => .{ .operands = &.{.name}, .pops = 0, .pushes = 1 },
+            .super_get_elem => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .super_set_prop => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
+            .super_set_elem => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
+            .throw_delete_super => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
             .define_prop => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
             .define_elem => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
             .get_prop, .delete_prop => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
@@ -306,7 +336,7 @@ pub const Op = enum(u8) {
     /// `call_method` and `new_array` pop their arguments too.
     pub fn popsWith(op: Op, argc: u32) u64 {
         const extra: u64 = switch (op) {
-            .call, .call_method, .new_call, .new_array, .object_rest => argc,
+            .call, .call_method, .new_call, .super_call, .new_array, .object_rest => argc,
             else => 0,
         };
         return op.info().pops + extra;
@@ -354,6 +384,9 @@ pub const Proto = struct {
     is_arrow: bool = false,
     is_async: bool = false,
     is_method: bool = false,
+    is_class_constructor: bool = false,
+    has_super_ctor: bool = false,
+    has_home_object: bool = false,
     length: u16 = 0,
     /// The function's name, for listings and traces ("" if anonymous or the script).
     name: []const u8 = "",

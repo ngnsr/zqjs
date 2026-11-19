@@ -519,6 +519,54 @@ pub fn closureLength(c: *const heap_mod.Closure) u16 {
     };
 }
 
+pub fn isClassConstructor(v: Value) bool {
+    if (v != .closure) return false;
+    return switch (v.closure.impl) {
+        .vm => |vm_impl| @as(*const bytecode.Proto, @ptrCast(@alignCast(vm_impl.proto))).is_class_constructor,
+        .tree => |tr| @as(*const ast.Function, @ptrCast(@alignCast(tr.func))).is_class_constructor,
+        .bound, .promise_cap, .native_closure => false,
+    };
+}
+
+pub fn setupClass(rt: *Runtime, ctor_val: Value, has_super: bool, super_val: Value) Error!*Object {
+    var root_buf = [_]Value{ ctor_val, super_val, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const ctor = @constCast(ctor_val.closure);
+    const r = try realm(rt);
+    const super_proto: ?*Object = if (!has_super)
+        r.object_prototype
+    else if (super_val == .null)
+        null
+    else blk: {
+        if (!isConstructor(super_val)) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Class extends value is not a constructor or null" }});
+        }
+        const sp = try object.get(rt, super_val, try object.named(rt, "prototype"));
+        if (sp == .null) break :blk null;
+        if (sp != .object) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Class extends value has non-object prototype" }});
+        }
+        try rt.heap.storeClosureProto(ctor, super_val);
+        break :blk sp.object;
+    };
+
+    const proto_obj = try rt.heap.newObject(super_proto);
+    root_buf[2] = .{ .object = proto_obj };
+    const ctor_key = try rt.heap.internAscii("constructor");
+    try rt.heap.defineProperty(proto_obj, ctor_key, .{ .value = ctor_val, .enumerable = false });
+    try rt.heap.storeClosurePrototype(ctor, .{ .object = proto_obj });
+    try rt.heap.storeClosureHomeObject(ctor, .{ .object = proto_obj });
+    return proto_obj;
+}
+
+pub fn defineClassMethod(rt: *Runtime, target: Value, k: object.Key, method_val: Value) Error!void {
+    try rt.heap.storeClosureHomeObject(@constCast(method_val.closure), target);
+    try object.defineNonEnumerable(rt, target, k, method_val);
+}
+
 pub fn materializeClosurePrototype(rt: *Runtime, c: *heap_mod.Closure) Error!*Object {
     const r = try realm(rt);
     const proto_obj = try rt.heap.newObject(r.object_prototype);
@@ -1770,15 +1818,14 @@ fn objectCreate(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 
 fn objectGetPrototypeOf(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const r = try realm(rt);
-    const p: ?*Object = switch (arg(args, 0)) {
-        .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .boolean => r.boolean_prototype,
-        .number => r.number_prototype,
-        .string => r.string_prototype,
-        .native, .closure => r.function_prototype,
-        .object => |o| o.proto,
+    const v = arg(args, 0);
+    return switch (v) {
+        .undefined, .null => rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
+        .boolean => .{ .object = r.boolean_prototype },
+        .number => .{ .object = r.number_prototype },
+        .string => .{ .object = r.string_prototype },
+        .native, .closure, .object => object.getPrototypeOfValue(rt, v),
     };
-    return if (p) |o| .{ .object = o } else .null;
 }
 
 fn arrayIsArray(_: *Runtime, _: Value, args: []const Value) Error!Value {

@@ -1,0 +1,16 @@
+tdz: ReferenceError
+double-super: ReferenceError
+Rex Lab Rex speaks (Lab) hi Rex 42 Rex speaks
+true true true
+true Animal->Dog Animal
+0 0
+Dog 2 Animal 1
+no-new: TypeError
+true Max true true
+true y
+ret-prim: TypeError
+Inner Inner Anon
+null true
+true true boom 99
+7 undefined
+del-super: ReferenceError

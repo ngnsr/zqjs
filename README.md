@@ -7,15 +7,19 @@ Inspired by QuickJS and Crafting Interpreters; it does not reuse their code.
 Priorities: correctness, simplicity, inspectability. Speed comes last.
 
 ## Status
-Milestones 1–18 done (tags `m1` … `m18`, plus `p1` for accurate `**`) ([ROADMAP.md](ROADMAP.md)). ZQJS has:
+Milestones 1–41 done ([ROADMAP.md](ROADMAP.md), [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md)). ZQJS has:
 
-- **the language so far:** `let`/`const`, blocks, `if`/`while`/`for`, `for...of`, `break`/`continue`;
-  functions, closures and recursion; objects, arrays, prototypes, `new`, methods with `this`;
-  numbers, UTF-16 strings, `-0`, the temporal dead zone, `const`; `Map`, `Set`, built-in
-  iterators, `JSON.parse`/`JSON.stringify`, `Promise` (`.then`/`.catch` and microtask
-  checkpoints), and callback-taking built-ins (`Array` methods, `Object.keys/create/getPrototypeOf`,
-  `print`, etc.). Everything else node has is reported as `Unsupported(…)`, never silently wrong
-  ([LANGUAGE.md](LANGUAGE.md)).
+- **the language so far:** `let`/`const`, destructuring, blocks, `if`/`while`/`for`, `for...of`, `for...in`, `switch`,
+  `break`/`continue`, `try`/`catch`/`finally`/`throw`; functions, arrows, classes (inheritance, `super`, private
+  fields/methods), closures, recursion, generators (`function*`/`yield`/`yield*`), `async`/`await`, and async
+  generators (`async function*`/`for await`); numbers, UTF-16 strings, template literals, `RegExp`, `Symbol`
+  (`Symbol.for`/`keyFor`, well-known symbols), `-0`, the temporal dead zone, `const`; `Map`, `Set`, built-in
+  iterators, `JSON.parse`/`JSON.stringify`, `Promise` (`.then`/`.catch` and microtask checkpoints), and `Object` /
+  `Array` / `String` / `Number` / `Math` / `Error` built-ins. Everything else node has is reported as
+  `Unsupported(…)`, never silently wrong ([LANGUAGE.md](LANGUAGE.md)).
+- **interactive REPL (`zqjs`):** persistent `let`/`const`/`function`/`class` bindings across lines, top-level
+  `await`/`for await`, cycle-safe Node-style value inspector, raw-mode UTF-8 line editor with `Ctrl-R` history
+  search, live syntax highlighting, read-only `Tab` completion, and dot-commands (`.help`, `.ast`, `.bc`, `.gc`, …).
 - **two engines that must agree:** a bytecode compiler, verifier and stack VM (the default),
   and a tree-walking reference interpreter (`--engine=treewalk`). Their output is checked byte
   for byte against node, and against each other under fuzzing.
@@ -59,7 +63,8 @@ node gives different ones (26 prints `1e-29` where 22 prints `1.0000000000000001
 
 ## Usage
 ```sh
-zig build                                   # builds zig-out/bin/zqjs
+zig build                                   # builds zig-out/bin/zqjs (or -Doptimize=ReleaseSafe)
+zig-out/bin/zqjs                            # start interactive REPL (--repl, --no-color)
 zig-out/bin/zqjs program.js                 # run a script (stops after 200M steps; --max-steps N, 0 = no limit)
 zig-out/bin/zqjs -e "let s = ''; for (let i = 0; i < 3; i++) { s += i; } print(s, 0.1 + 0.2);"
 # 012 0.30000000000000004

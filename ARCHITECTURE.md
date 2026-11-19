@@ -45,8 +45,12 @@ the runtime.
 | `src/vm/vm.zig` | the stack VM: frames, locals and operand stacks, transactional calls, cells and captures, `Vm.step()` / `run()`, defensive checks, precise faults (D35, D36) |
 | `src/run.zig` | source → parse → resolve → engine (VM: compile → verify → run; or tree-walker), with outcome reporting and `--trace` (CLI and tests share it) |
 | `src/limits.zig` | `Limits` (only the limits enforced so far, see DESIGN_DECISIONS D15) |
-| `src/root.zig` | library entry: `parse`, `resolve`, `dump`, `Runtime`, `interpret`, `runSource`, `compile`, `verify`, `disassemble` |
-| `src/main.zig` | CLI: `zqjs FILE`, `zqjs -e SRC`, `--test` (harness output), `--dump-ast`, `--dump-bytecode`, `--engine=vm\|treewalk`, `--trace` |
+| `src/root.zig` | library entry: `parse`, `resolve`, `dump`, `Runtime`, `interpret`, `runSource`, `compile`, `verify`, `disassemble`, `repl` |
+| `src/main.zig` | CLI: `zqjs` (REPL), `zqjs FILE`, `zqjs -e SRC`, `--repl`, `--no-color`, `--test` (harness output), `--dump-ast`, `--dump-bytecode`, `--engine=vm\|treewalk`, `--trace` |
+| `src/repl/session.zig` | interactive REPL session: persistent `ReplEnv`, `Proto` pool, top-level `await`, input heuristics, dot-commands (D71) |
+| `src/repl/inspect.zig` | cycle-safe, depth-bounded, ANSI-colorized value inspector (`util.inspect` style; never invokes getters) |
+| `src/repl/complete.zig` | `Lexer`-driven multi-line completeness check, read-only `Tab` completion, live syntax highlighting |
+| `src/repl/editor.zig` | pure-Zig POSIX `termios` raw-mode line editor, UTF-8 editing, persistent history, `Ctrl-R` search, piped non-TTY fallback |
 
 ### Ownership in the frontend
 - The lexer borrows the source and returns tokens by value; it allocates nothing.
@@ -90,6 +94,8 @@ tests/interpreter_test.zig limits, allocation failures, exception ownership, fuz
 tests/syntax_test.zig     tests/syntax/cases.jsonl: outcome + resolved dump per source
 tests/ops_test.zig        tests/ops/*.jsonl: conversions/operators vs node, bit for bit
 tests/diff_test.zig       tests/diff/*.js: program output must equal node's tests/diff/*.out
+tests/regex_test.zig      tests/regex/cases.jsonl: standalone regex compiler and matcher vs node
+tests/repl_test.zig       interactive REPL: session, inspector, completion, editor, GC stress
 tests/harness/            node scripts: golden.js (regenerate/check goldens), check_syntax_cases.js
 tools/gen_pow_data.js     generates src/runtime/pow_data.zig from musl's C (hash-pinned)
 tools/pow_reference.py    correctly rounded x ** y reference values (Python stdlib `decimal`)

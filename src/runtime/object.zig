@@ -21,6 +21,7 @@ const Value = @import("value.zig").Value;
 const heap_mod = @import("heap.zig");
 const Object = heap_mod.Object;
 const String = heap_mod.String;
+const Property = heap_mod.Property;
 const Piece = heap_mod.Piece;
 const rt_mod = @import("runtime.zig");
 const Runtime = rt_mod.Runtime;
@@ -74,7 +75,7 @@ pub fn namedAtom(a: *String) Key {
     return if (a.atom.?.index) |i| .{ .index = i } else .{ .atom = a };
 }
 
-fn atomOf(rt: *Runtime, k: Key) Error!*String {
+pub fn atomOf(rt: *Runtime, k: Key) Error!*String {
     return switch (k) {
         .atom => |a| a,
         .index => |i| blk: {
@@ -84,7 +85,7 @@ fn atomOf(rt: *Runtime, k: Key) Error!*String {
     };
 }
 
-fn isNamed(k: Key, text: []const u8) bool {
+pub fn isNamed(k: Key, text: []const u8) bool {
     const a = switch (k) {
         .atom => |a| a,
         .index => return false,
@@ -127,6 +128,10 @@ fn keyPiece(k: Key, buf: *[10]u8) Piece {
 
 /// `base[k]` / `base.k`.
 pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
+    return getWithReceiver(rt, base, base, k);
+}
+
+fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error!Value {
     heap_mod.checkValue(base);
     switch (base) {
         .undefined, .null => {
@@ -139,19 +144,19 @@ pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
                 .atom => if (isNamed(k, "length")) return .{ .number = @floatFromInt(s.units.len) },
             }
             const r = try builtins.realm(rt);
-            return getFrom(rt, r.string_prototype, k);
+            return getFrom(rt, r.string_prototype, receiver, k);
         },
-        .number => return getFrom(rt, (try builtins.realm(rt)).number_prototype, k),
-        .boolean => return getFrom(rt, (try builtins.realm(rt)).boolean_prototype, k),
-        .object => |o| return getFrom(rt, o, k),
+        .number => return getFrom(rt, (try builtins.realm(rt)).number_prototype, receiver, k),
+        .boolean => return getFrom(rt, (try builtins.realm(rt)).boolean_prototype, receiver, k),
+        .object => |o| return getFrom(rt, o, receiver, k),
         .native => |n| {
             if (isNamed(k, "name")) return .{ .string = try rt.heap.ascii(n.name) };
             if (isNamed(k, "length")) return .{ .number = @floatFromInt(n.length) };
             if (try builtins.namespaceObject(rt, n)) |ns| {
-                if (try ownGet(rt, ns, k)) |v| return v;
+                if (try ownProp(rt, ns, k)) |p| return resolvePropValue(rt, receiver, p);
                 if (nodeHas(ns.builtin.?, k)) return unsupportedBuiltin(rt, k);
             }
-            return getFrom(rt, (try builtins.realm(rt)).function_prototype, k);
+            return getFrom(rt, (try builtins.realm(rt)).function_prototype, receiver, k);
         },
         .closure => |c| {
             if (isNamed(k, "name")) return .{ .string = try builtins.closureName(rt, c) };
@@ -163,10 +168,10 @@ pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
                 }
             }
             if (c.meta) |m| if (m.props.count() > 0) {
-                if (m.props.get(try atomOf(rt, k))) |p| return p.value;
+                if (m.props.get(try atomOf(rt, k))) |p| return resolvePropValue(rt, receiver, p);
             };
-            if (c.meta) |m| if (m.proto) |p| return get(rt, p, k);
-            return getFrom(rt, (try builtins.realm(rt)).function_prototype, k);
+            if (c.meta) |m| if (m.proto) |p| return getWithReceiver(rt, p, receiver, k);
+            return getFrom(rt, (try builtins.realm(rt)).function_prototype, receiver, k);
         },
     }
 }
@@ -180,48 +185,53 @@ pub fn getPrototypeOfValue(rt: *Runtime, v: Value) Error!Value {
     };
 }
 
-pub fn getSuper(rt: *Runtime, home: Value, k: Key) Error!Value {
+pub fn getSuper(rt: *Runtime, home: Value, receiver: Value, k: Key) Error!Value {
     const proto = try getPrototypeOfValue(rt, home);
     if (proto == .null or proto == .undefined) return .undefined;
-    return get(rt, proto, k);
+    return getWithReceiver(rt, proto, receiver, k);
+}
+
+fn resolvePropValue(rt: *Runtime, receiver: Value, p: Property) Error!Value {
+    if (!p.is_accessor) return p.value;
+    if (p.value == .undefined) return .undefined;
+    return rt.callCallable(p.value, receiver, &.{});
 }
 
 /// [[Get]] along the prototype chain (cycles can't be built: see Object.proto).
-fn getFrom(rt: *Runtime, start: *Object, k: Key) Error!Value {
+fn getFrom(rt: *Runtime, start: *Object, receiver: Value, k: Key) Error!Value {
     var o: ?*Object = start;
     while (o) |cur| : (o = cur.proto) {
         cur.obj.checkLive(); // stress builds: a collected object or prototype
-        if (try ownGet(rt, cur, k)) |v| return v;
+        if (try ownProp(rt, cur, k)) |p| return resolvePropValue(rt, receiver, p);
         if (cur.builtin) |b| if (nodeHas(b, k)) return unsupportedBuiltin(rt, k);
     }
     return .undefined;
 }
 
-fn ownGet(rt: *Runtime, o: *Object, k: Key) Error!?Value {
+fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
     switch (o.kind) {
         .array => |elements| switch (k) {
-            .index => |i| return if (i < elements.items.len) elements.items[i] else null,
-            .atom => if (isNamed(k, "length")) return .{ .number = @floatFromInt(elements.items.len) },
+            .index => |i| return if (i < elements.items.len) .{ .value = elements.items[i] } else null,
+            .atom => if (isNamed(k, "length")) return .{ .value = .{ .number = @floatFromInt(elements.items.len) }, .enumerable = false, .configurable = false },
         },
-        .map, .set => |table| if (isNamed(k, "size")) return .{ .number = @floatFromInt(table.live_count) },
+        .map, .set => |table| if (isNamed(k, "size")) return .{ .value = .{ .number = @floatFromInt(table.live_count) }, .enumerable = false, .writable = false },
         .regexp => |re| {
-            if (isNamed(k, "lastIndex")) return re.last_index;
-            if (isNamed(k, "source")) return .{ .string = re.source };
-            if (isNamed(k, "flags")) return .{ .string = re.flags };
-            if (isNamed(k, "hasIndices")) return .{ .boolean = re.program.flags.has_indices };
-            if (isNamed(k, "global")) return .{ .boolean = re.global };
-            if (isNamed(k, "ignoreCase")) return .{ .boolean = re.program.flags.ignore_case };
-            if (isNamed(k, "multiline")) return .{ .boolean = re.program.flags.multiline };
-            if (isNamed(k, "dotAll")) return .{ .boolean = re.program.flags.dot_all };
-            if (isNamed(k, "unicode")) return .{ .boolean = re.program.flags.unicode };
-            if (isNamed(k, "unicodeSets")) return .{ .boolean = re.program.flags.unicode_sets };
-            if (isNamed(k, "sticky")) return .{ .boolean = re.program.flags.sticky };
+            if (isNamed(k, "lastIndex")) return .{ .value = re.last_index, .enumerable = false, .configurable = false };
+            if (isNamed(k, "source")) return .{ .value = .{ .string = re.source }, .enumerable = false, .writable = false };
+            if (isNamed(k, "flags")) return .{ .value = .{ .string = re.flags }, .enumerable = false, .writable = false };
+            if (isNamed(k, "hasIndices")) return .{ .value = .{ .boolean = re.program.flags.has_indices }, .enumerable = false, .writable = false };
+            if (isNamed(k, "global")) return .{ .value = .{ .boolean = re.global }, .enumerable = false, .writable = false };
+            if (isNamed(k, "ignoreCase")) return .{ .value = .{ .boolean = re.program.flags.ignore_case }, .enumerable = false, .writable = false };
+            if (isNamed(k, "multiline")) return .{ .value = .{ .boolean = re.program.flags.multiline }, .enumerable = false, .writable = false };
+            if (isNamed(k, "dotAll")) return .{ .value = .{ .boolean = re.program.flags.dot_all }, .enumerable = false, .writable = false };
+            if (isNamed(k, "unicode")) return .{ .value = .{ .boolean = re.program.flags.unicode }, .enumerable = false, .writable = false };
+            if (isNamed(k, "unicodeSets")) return .{ .value = .{ .boolean = re.program.flags.unicode_sets }, .enumerable = false, .writable = false };
+            if (isNamed(k, "sticky")) return .{ .value = .{ .boolean = re.program.flags.sticky }, .enumerable = false, .writable = false };
         },
         .ordinary, .iterator, .promise => {},
     }
     if (o.props.count() == 0) return null; // don't intern index keys just to miss
-    const p = o.props.get(try atomOf(rt, k)) orelse return null;
-    return p.value;
+    return o.props.get(try atomOf(rt, k));
 }
 
 fn isRegExpGetter(k: Key) bool {
@@ -248,11 +258,65 @@ fn own(o: *Object, k: Key) ?Value {
 
 // ---------------------------------------------------------------- set, define, delete
 
-/// `base[k] = v`. All properties are writable data properties, and the only accessor on
-/// a modelled prototype is `__proto__` (Unsupported), so a set either updates an own
-/// property or creates one.
+const ChainHit = union(enum) {
+    none,
+    accessor: Property,
+    data: struct { is_own: bool, writable: bool },
+};
+
+fn sameTarget(a: Value, b: ?Value) bool {
+    const bv = b orelse return false;
+    return switch (a) {
+        .object => |ao| bv == .object and bv.object == ao,
+        .closure => |ac| bv == .closure and bv.closure == ac,
+        else => false,
+    };
+}
+
+fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainHit {
+    var cur: Value = start;
+    while (true) {
+        switch (cur) {
+            .object => |o| {
+                o.obj.checkLive();
+                if (try ownProp(rt, o, k)) |p| {
+                    if (p.is_accessor) return .{ .accessor = p };
+                    return .{ .data = .{ .is_own = sameTarget(cur, base), .writable = p.writable } };
+                }
+                cur = if (o.proto) |p| .{ .object = p } else return .none;
+            },
+            .closure => |c| {
+                c.obj.checkLive();
+                if (isNamed(k, "name") or isNamed(k, "length")) {
+                    return .{ .data = .{ .is_own = sameTarget(cur, base), .writable = false } };
+                }
+                if (c.meta) |m| {
+                    if (m.props.count() > 0) {
+                        if (m.props.get(try atomOf(rt, k))) |p| {
+                            if (p.is_accessor) return .{ .accessor = p };
+                            return .{ .data = .{ .is_own = sameTarget(cur, base), .writable = p.writable } };
+                        }
+                    }
+                    if (m.proto) |p| {
+                        cur = p;
+                        continue;
+                    }
+                }
+                cur = .{ .object = (try builtins.realm(rt)).function_prototype };
+            },
+            else => return .none,
+        }
+    }
+}
+
+fn invokeSetter(rt: *Runtime, p: Property, receiver: Value, v: Value) Error!void {
+    if (p.setter == .undefined) return; // sloppy-mode no-op on getter-only accessor
+    _ = try rt.callCallable(p.setter, receiver, &.{v});
+}
+
+/// `base[k] = v` with prototype accessor/writable checks (D64).
 pub fn set(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
-    const o = switch (base) {
+    switch (base) {
         .undefined, .null => {
             var buf: [10]u8 = undefined;
             return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot set properties of " }, .{ .ascii = @tagName(base) }, .{ .ascii = " (setting '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
@@ -270,35 +334,82 @@ pub fn set(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
                 try rt.heap.storeClosurePrototype(@constCast(c), v);
                 return;
             }
-            try rt.heap.storeClosureProperty(@constCast(c), try atomOf(rt, k), v);
-            return;
         },
-        .object => |o| o,
-    };
-    if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
-    switch (o.kind) {
-        .array => |elements| switch (k) {
-            .index => |i| {
-                if (i < elements.items.len) {
-                    rt.heap.storeElement(o, i, v);
-                } else if (i == elements.items.len) {
-                    try rt.heap.appendElement(o, v);
-                } else return rt.fail(.sparse_array);
-                return;
-            },
-            .atom => if (isNamed(k, "length")) return setLength(rt, o, v),
+        .object => {
+            if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
         },
-        .map, .set => if (isNamed(k, "size")) return, // Map/Set size is a read-only getter
-        .regexp => {
-            if (isNamed(k, "lastIndex")) {
-                rt.heap.storeRegExpLastIndex(o, v);
-                return;
-            }
-            if (isRegExpGetter(k)) return;
-        },
-        .ordinary, .iterator, .promise => {},
     }
-    try putOwn(rt, o, k, v);
+    switch (try lookupSetChain(rt, base, base, k)) {
+        .accessor => |p| return invokeSetter(rt, p, base, v),
+        .data => |d| if (!d.writable) return, // sloppy-mode no-op on non-writable property
+        .none => {},
+    }
+    try setOwnData(rt, base, k, v);
+}
+
+pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value) Error!void {
+    const proto = try getPrototypeOfValue(rt, home);
+    if (proto != .null and proto != .undefined) {
+        switch (try lookupSetChain(rt, proto, null, k)) {
+            .accessor => |p| return invokeSetter(rt, p, receiver, v),
+            .data => |d| if (!d.writable) return,
+            .none => {},
+        }
+    }
+    // Check own property on receiver before writing own data property.
+    switch (receiver) {
+        .object => |o| if (try ownProp(rt, o, k)) |p| {
+            if (p.is_accessor) return invokeSetter(rt, p, receiver, v);
+            if (!p.writable) return;
+        },
+        .closure => |c| {
+            if (isNamed(k, "name") or isNamed(k, "length")) return;
+            if (c.meta) |m| if (m.props.get(try atomOf(rt, k))) |p| {
+                if (p.is_accessor) return invokeSetter(rt, p, receiver, v);
+                if (!p.writable) return;
+            };
+        },
+        .undefined, .null => {
+            var buf: [10]u8 = undefined;
+            return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot set properties of " }, .{ .ascii = @tagName(receiver) }, .{ .ascii = " (setting '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
+        },
+        else => return rt.fail(.primitive_write),
+    }
+    try setOwnData(rt, receiver, k, v);
+}
+
+fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
+    switch (base) {
+        .closure => |c| {
+            try rt.heap.storeClosureProperty(@constCast(c), try atomOf(rt, k), v);
+        },
+        .object => |o| {
+            switch (o.kind) {
+                .array => |elements| switch (k) {
+                    .index => |i| {
+                        if (i < elements.items.len) {
+                            rt.heap.storeElement(o, i, v);
+                        } else if (i == elements.items.len) {
+                            try rt.heap.appendElement(o, v);
+                        } else return rt.fail(.sparse_array);
+                        return;
+                    },
+                    .atom => if (isNamed(k, "length")) return setLength(rt, o, v),
+                },
+                .map, .set => if (isNamed(k, "size")) return, // Map/Set size is a read-only getter
+                .regexp => {
+                    if (isNamed(k, "lastIndex")) {
+                        rt.heap.storeRegExpLastIndex(o, v);
+                        return;
+                    }
+                    if (isRegExpGetter(k)) return;
+                },
+                .ordinary, .iterator, .promise => {},
+            }
+            try putOwn(rt, o, k, v);
+        },
+        else => unreachable,
+    }
 }
 
 /// CreateDataProperty for literals: like `set` on a fresh ordinary object, but `__proto__`
@@ -313,6 +424,29 @@ pub fn defineNonEnumerable(rt: *Runtime, target: Value, k: Key, v: Value) Error!
     switch (target) {
         .object => |o| try rt.heap.defineProperty(o, a, .{ .value = v, .enumerable = false }),
         .closure => |c| try rt.heap.defineClosureProperty(@constCast(c), a, .{ .value = v, .enumerable = false }),
+        else => unreachable,
+    }
+}
+
+pub fn defineAccessor(rt: *Runtime, target: Value, k: Key, fn_val: Value, is_setter: bool, enumerable: bool) Error!void {
+    const a = try atomOf(rt, k);
+    const existing: ?Property = switch (target) {
+        .object => |o| o.props.get(a),
+        .closure => |c| if (c.meta) |m| m.props.get(a) else null,
+        else => unreachable,
+    };
+    const keep_other = existing != null and existing.?.is_accessor;
+    const prop: Property = .{
+        .is_accessor = true,
+        .value = if (is_setter) (if (keep_other) existing.?.value else .undefined) else fn_val,
+        .setter = if (is_setter) fn_val else (if (keep_other) existing.?.setter else .undefined),
+        .enumerable = enumerable,
+        .configurable = true,
+        .writable = false,
+    };
+    switch (target) {
+        .object => |o| try rt.heap.defineProperty(o, a, prop),
+        .closure => |c| try rt.heap.defineClosureProperty(@constCast(c), a, prop),
         else => unreachable,
     }
 }
@@ -340,7 +474,9 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
             if (isNamed(k, "name") or isNamed(k, "length")) return true;
             if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return false;
             if (c.meta == null or c.meta.?.props.count() == 0) return true;
-            rt.heap.removeClosureProperty(@constCast(c), try atomOf(rt, k));
+            const a = try atomOf(rt, k);
+            if (c.meta.?.props.get(a)) |p| if (!p.configurable) return false;
+            rt.heap.removeClosureProperty(@constCast(c), a);
             return true;
         },
         .object => |o| o,
@@ -355,7 +491,9 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
         .ordinary, .map, .set, .iterator, .promise => {},
     }
     if (o.props.count() == 0) return true;
-    rt.heap.removeProperty(o, try atomOf(rt, k));
+    const a = try atomOf(rt, k);
+    if (o.props.get(a)) |p| if (!p.configurable) return false;
+    rt.heap.removeProperty(o, a);
     return true;
 }
 
@@ -367,7 +505,7 @@ pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
         .native => |n| {
             if (isNamed(k, "name") or isNamed(k, "length")) return true;
             if (try builtins.namespaceObject(rt, n)) |ns| {
-                if (try ownGet(rt, ns, k) != null) return true;
+                if (try ownProp(rt, ns, k) != null) return true;
                 if (nodeHas(ns.builtin.?, k)) return true;
             }
             return hasInChain(rt, (try builtins.realm(rt)).function_prototype, k);
@@ -390,7 +528,7 @@ pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
 fn hasInChain(rt: *Runtime, start: *Object, k: Key) Error!bool {
     var o: ?*Object = start;
     while (o) |cur| : (o = cur.proto) {
-        if (try ownGet(rt, cur, k) != null) return true;
+        if (try ownProp(rt, cur, k) != null) return true;
         // node has it there, so the answer is known even if the value isn't.
         if (cur.builtin) |b| if (nodeHas(b, k)) return true;
     }

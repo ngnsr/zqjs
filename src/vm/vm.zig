@@ -887,6 +887,29 @@ pub const Vm = struct {
                 try builtins.defineClassMethod(rt, target, try object.key(rt, key_val), method_val);
                 try cache.drop(vm, 2);
             },
+            .define_accessor => {
+                const fn_val = try cache.peek(vm, 0);
+                const target = try cache.peek(vm, 1);
+                const flags = cache.operand(1);
+                const is_setter = (flags & 1) != 0;
+                const enumerable = (flags & 2) != 0;
+                if (fn_val != .closure) return vm.bug("define_accessor expects closure");
+                try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), target);
+                try object.defineAccessor(rt, target, try vm.nameKey(cache.operand(0)), fn_val, is_setter, enumerable);
+                try cache.drop(vm, 1);
+            },
+            .define_elem_accessor => {
+                const fn_val = try cache.peek(vm, 0);
+                const key_val = try cache.peek(vm, 1);
+                const target = try cache.peek(vm, 2);
+                const flags = cache.operand(0);
+                const is_setter = (flags & 1) != 0;
+                const enumerable = (flags & 2) != 0;
+                if (fn_val != .closure) return vm.bug("define_elem_accessor expects closure");
+                try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), target);
+                try object.defineAccessor(rt, target, try object.key(rt, key_val), fn_val, is_setter, enumerable);
+                try cache.drop(vm, 2);
+            },
             .super_call => {
                 const argc = cache.operand(0);
                 const args_start = cache.sp - argc;
@@ -900,27 +923,34 @@ pub const Vm = struct {
                 if (try vm.callSuper(cache, base, arr_val.object.kind.array.items, true, next)) return .running;
             },
             .super_get_prop => {
-                _ = try vm.requireThis();
+                const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_get_prop without home_object");
                 try cache.ensurePush(vm);
-                try cache.push(vm, try object.getSuper(rt, home, try vm.nameKey(cache.operand(0))));
+                cache.syncSp(vm);
+                try cache.push(vm, try object.getSuper(rt, home, this_val, try vm.nameKey(cache.operand(0))));
             },
             .super_get_elem => {
-                _ = try vm.requireThis();
+                const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_get_elem without home_object");
                 const k = try object.key(rt, try cache.peek(vm, 0));
-                (try cache.top(vm)).* = try object.getSuper(rt, home, k);
+                cache.syncSp(vm);
+                (try cache.top(vm)).* = try object.getSuper(rt, home, this_val, k);
             },
             .super_set_prop => {
                 const this_val = try vm.requireThis();
+                const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_set_prop without home_object");
                 const val = try cache.peek(vm, 0);
-                try object.set(rt, this_val, try vm.nameKey(cache.operand(0)), val);
+                cache.syncSp(vm);
+                try object.setSuper(rt, home, this_val, try vm.nameKey(cache.operand(0)), val);
             },
             .super_set_elem => {
                 const this_val = try vm.requireThis();
+                const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_set_elem without home_object");
                 const val = try cache.peek(vm, 0);
                 const key_val = try cache.peek(vm, 1);
-                try object.set(rt, this_val, try object.key(rt, key_val), val);
+                const k = try object.key(rt, key_val);
+                cache.syncSp(vm);
+                try object.setSuper(rt, home, this_val, k, val);
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = val;
             },
@@ -938,6 +968,7 @@ pub const Vm = struct {
                 try cache.drop(vm, 2);
             },
             .get_prop => {
+                cache.syncSp(vm);
                 const r = try object.get(rt, try cache.peek(vm, 0), try vm.nameKey(cache.operand(0)));
                 (try cache.top(vm)).* = r;
             },
@@ -945,6 +976,7 @@ pub const Vm = struct {
                 const idx = try cache.peek(vm, 0);
                 const base = try cache.peek(vm, 1);
                 const r: Value = if (fastArrayGet(base, idx)) |v| v else blk: {
+                    cache.syncSp(vm);
                     const k = try object.key(rt, idx);
                     break :blk try object.get(rt, base, k);
                 };
@@ -953,6 +985,7 @@ pub const Vm = struct {
             },
             .set_prop => {
                 const v = try cache.peek(vm, 0);
+                cache.syncSp(vm);
                 try object.set(rt, try cache.peek(vm, 1), try vm.nameKey(cache.operand(0)), v);
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = v;
@@ -960,6 +993,7 @@ pub const Vm = struct {
             .set_elem => {
                 const v = try cache.peek(vm, 0);
                 const k = try object.key(rt, try cache.peek(vm, 1)); // after the value: JS's order for `=`
+                cache.syncSp(vm);
                 try object.set(rt, try cache.peek(vm, 2), k, v);
                 try cache.drop(vm, 2);
                 (try cache.top(vm)).* = v;

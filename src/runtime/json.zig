@@ -399,14 +399,7 @@ const Stringifier = struct {
         try s.writeUnit('{');
         var wrote = false;
         for (keys) |k| {
-            const val = switch (k) {
-                .atom => |a| obj.props.get(a).?.value,
-                .index => |i| blk: {
-                    var buf: [10]u8 = undefined;
-                    const idx_atom = try s.rt.heap.internAscii(std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
-                    break :blk obj.props.get(idx_atom).?.value;
-                },
-            };
+            const val = try object.get(s.rt, .{ .object = obj }, k);
             // Save position so if property value is omitted (undefined/function), no key/comma is left.
             const mark = s.out.items.len;
             if (wrote) try s.writeUnit(',');

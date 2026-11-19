@@ -1,0 +1,30 @@
+obj: 20 110 42 10
+after set x: 21 42
+after set dyn: 5 105
+keys: a,b,c
+values: 1,2,11
+entries: [["a",1],["b",2],["c",11]]
+spread: {"a":1,"b":2,"c":11}
+assign: {"a":1,"b":2,"c":11}
+json: {"a":1,"b":2,"c":11}
+sub.val: 4
+sub.val after set: 71 70
+static: Base:B Sub->Base:S
+static after set: B S Sub->Base:S
+ro desc: {"value":7,"writable":false,"enumerable":false,"configurable":false}
+ro after write: 7 false 7
+acc: 12 acc,_acc
+reconfigured: 123 {"value":123,"writable":false,"enumerable":true,"configurable":true}
+multi: 10 15 p1,p2
+descs: 10 true function false
+bad 0 TypeError
+bad 1 TypeError
+bad 2 TypeError
+bad 3 TypeError
+bad 4 TypeError
+bad 5 TypeError
+bad 6 TypeError
+bad 7 TypeError
+bad 8 TypeError
+bad 9 TypeError
+bad 10 TypeError

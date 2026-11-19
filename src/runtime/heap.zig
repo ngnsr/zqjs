@@ -161,11 +161,15 @@ pub const String = struct {
     } = null,
 };
 
-/// An own property. Everything is a data property (no getters/setters in ZQJS); all are
-/// writable and configurable. Built-in methods are not enumerable, as in node.
+/// An own property (data or accessor) with ECMAScript attributes (D64).
+/// Built-in methods are non-enumerable, as in node.
 pub const Property = struct {
-    value: Value,
+    value: Value = .undefined,
+    setter: Value = .undefined,
     enumerable: bool = true,
+    writable: bool = true,
+    configurable: bool = true,
+    is_accessor: bool = false,
 };
 
 /// Insertion-ordered hash table with SameValueZero key equality, shared by Map and Set (M14).
@@ -736,6 +740,7 @@ pub const Heap = struct {
             for (o.props.keys()[lo..hi], o.props.values()[lo..hi]) |k, p| {
                 c.child(&k.obj);
                 visitValue(p.value, c, child);
+                if (p.is_accessor) visitValue(p.setter, c, child);
             }
         }
         fn elements(c: *RememberedScan, o: *Object, lo: usize, hi: usize) void {
@@ -851,7 +856,8 @@ pub const Heap = struct {
     fn checkCards(h: *const Heap, o: *Object) VerifyError!void {
         if (h.prop_cards.get(o)) |words| {
             for (o.props.keys(), o.props.values(), 0..) |k, p, i| {
-                if ((!k.obj.old or isYoung(p.value)) and !cardSet(words, i)) return error.CleanCardOverYoungProperty;
+                const young_val = isYoung(p.value) or (p.is_accessor and isYoung(p.setter));
+                if ((!k.obj.old or young_val) and !cardSet(words, i)) return error.CleanCardOverYoungProperty;
             }
         }
         if (o.kind == .array) if (h.cards.get(o)) |words| {
@@ -1054,16 +1060,23 @@ pub const Heap = struct {
         h.propertyBarrier(o, gop.index, key, value);
     }
 
-    /// Adds or replaces a property with explicit attributes (built-in method tables).
+    /// Adds or replaces a property with explicit attributes (built-in method tables, defineProperty).
     pub fn defineProperty(h: *Heap, o: *Object, key: *String, p: Property) Error!void {
         o.obj.checkLive();
         try h.growPropCards(o);
         const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
-        const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
+        const old_val: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
+        const old_set: ?Value = if (gop.found_existing and gop.value_ptr.is_accessor) gop.value_ptr.setter else null;
         gop.value_ptr.* = p;
         if (!gop.found_existing) h.barrier(&o.obj, null, .{ .string = key }); // the key is a child too
-        h.barrier(&o.obj, old, p.value);
+        h.barrier(&o.obj, old_val, p.value);
         h.propertyBarrier(o, gop.index, key, p.value);
+        if (p.is_accessor) {
+            h.barrier(&o.obj, old_set, p.setter);
+            h.propertyBarrier(o, gop.index, key, p.setter);
+        } else if (old_set) |s| {
+            h.barrier(&o.obj, s, null);
+        }
     }
 
     /// `delete o[key]` for an own property; keeps the others' order (O(n), D13). Every
@@ -1075,6 +1088,7 @@ pub const Heap = struct {
         const old = o.props.values()[index];
         o.props.orderedRemoveAt(index);
         h.barrier(&o.obj, old.value, null);
+        if (old.is_accessor) h.barrier(&o.obj, old.setter, null);
         if (!o.obj.remembered or mutation == .no_dirty_on_remove) return;
         const words = h.prop_cards.get(o) orelse return;
         const first = index / card_elements;
@@ -1233,16 +1247,23 @@ pub const Heap = struct {
     }
 
     pub fn storeClosureProperty(h: *Heap, c: *Closure, key: *String, value: Value) Error!void {
-        try h.defineClosureProperty(c, key, .{ .value = value });
+        const m = try h.ensureClosureMeta(c);
+        const gop = m.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
+        const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
+        if (gop.found_existing) gop.value_ptr.value = value else gop.value_ptr.* = .{ .value = value };
+        if (!gop.found_existing) h.barrier(&c.obj, null, .{ .string = key });
+        h.barrier(&c.obj, old, value);
     }
 
     pub fn defineClosureProperty(h: *Heap, c: *Closure, key: *String, prop: Property) Error!void {
         const m = try h.ensureClosureMeta(c);
         const gop = m.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
-        const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
-        if (gop.found_existing) gop.value_ptr.value = prop.value else gop.value_ptr.* = prop;
+        const old_val: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
+        const old_set: ?Value = if (gop.found_existing and gop.value_ptr.is_accessor) gop.value_ptr.setter else null;
+        gop.value_ptr.* = prop;
         if (!gop.found_existing) h.barrier(&c.obj, null, .{ .string = key });
-        h.barrier(&c.obj, old, prop.value);
+        h.barrier(&c.obj, old_val, prop.value);
+        if (prop.is_accessor) h.barrier(&c.obj, old_set, prop.setter) else if (old_set) |s| h.barrier(&c.obj, s, null);
     }
 
     pub fn removeClosureProperty(h: *Heap, c: *Closure, key: *String) void {
@@ -1252,6 +1273,7 @@ pub const Heap = struct {
         const old = m.props.values()[index];
         m.props.orderedRemoveAt(index);
         h.barrier(&c.obj, old.value, null);
+        if (old.is_accessor) h.barrier(&c.obj, old.setter, null);
     }
 
     pub fn storeClosureLexicalThis(h: *Heap, c: *Closure, this: Value) Error!void {
@@ -1747,6 +1769,7 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                 for (m.props.keys(), m.props.values()) |k, p| {
                     visit(ctx, &k.obj);
                     visitValue(p.value, ctx, visit);
+                    if (p.is_accessor) visitValue(p.setter, ctx, visit);
                 }
             }
             switch (c.impl) {
@@ -1774,6 +1797,7 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
             for (o.props.keys(), o.props.values()) |k, p| {
                 visit(ctx, &k.obj);
                 visitValue(p.value, ctx, visit);
+                if (p.is_accessor) visitValue(p.setter, ctx, visit);
             }
             switch (o.kind) {
                 .ordinary => {},

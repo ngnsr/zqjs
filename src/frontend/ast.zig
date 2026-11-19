@@ -145,6 +145,7 @@ pub const PropertyDef = union(enum) {
         key: PropertyKey,
         value: *const Expr,
         shorthand: bool,
+        kind: enum { init, getter, setter } = .init,
         span: Span,
     },
     spread: struct {
@@ -287,6 +288,7 @@ pub const Expr = struct {
 pub const ClassMethod = struct {
     key: PropertyKey,
     is_static: bool,
+    kind: enum { method, getter, setter } = .method,
     func: *const Function,
     span: Span,
 };

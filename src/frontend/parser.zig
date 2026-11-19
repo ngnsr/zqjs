@@ -1682,6 +1682,32 @@ const Parser = struct {
     }
 
     /// `{ key: value, [expr]: value, name, method() {…}, ...rest, … }`.
+    fn parsePropertyKey(p: *Parser) Error!ast.PropertyKey {
+        const kt = p.tok;
+        return switch (kt.tag) {
+            .l_bracket => try p.computedPropertyKey(),
+            .string => try p.stringPropertyKey(kt),
+            .number => try p.numberPropertyKey(kt),
+            else => {
+                if (kt.tag != .identifier and !token.isKeyword(kt.tag)) {
+                    return p.fail(.{ .syntax_error = "expected property name" }, kt);
+                }
+                try p.advance();
+                return .{ .name = kt.text(p.source()) };
+            },
+        };
+    }
+
+    fn validateAccessorParams(p: *Parser, is_getter: bool, params: []const ast.Param, err_tok: token.Token) Error!void {
+        if (is_getter) {
+            if (params.len != 0) return p.fail(.{ .syntax_error = "Getter must not have any formal parameters" }, err_tok);
+        } else {
+            if (params.len != 1 or params[0].is_rest) {
+                return p.fail(.{ .syntax_error = "Setter must have exactly one formal parameter" }, err_tok);
+            }
+        }
+    }
+
     fn objectLiteral(p: *Parser) Error!*const ast.Expr {
         const open = p.tok;
         try p.advance();
@@ -1708,6 +1734,7 @@ const Parser = struct {
                 continue;
             }
             var is_async_method = false;
+            var prop_kind: @FieldType(@FieldType(ast.PropertyDef, "prop"), "kind") = .init;
             const k: ast.PropertyKey = switch (t.tag) {
                 .l_bracket => try p.computedPropertyKey(),
                 .string => try p.stringPropertyKey(t),
@@ -1719,7 +1746,11 @@ const Parser = struct {
                         const next = try p.peek();
                         switch (next.tag) {
                             .colon, .l_paren, .comma, .r_brace, .eq => {},
-                            else => return p.fail(.{ .unsupported = .syntax }, t),
+                            else => {
+                                prop_kind = if (std.mem.eql(u8, name, "get")) .getter else .setter;
+                                try p.advance(); // `get` / `set`
+                                break :blk try p.parsePropertyKey();
+                            },
                         }
                     } else if (std.mem.eql(u8, name, "async")) {
                         const next = try p.peek();
@@ -1730,18 +1761,7 @@ const Parser = struct {
                                 if (next.tag == .star) return p.fail(.{ .unsupported = .syntax }, next);
                                 is_async_method = true;
                                 try p.advance(); // `async`
-                                const kt = p.tok;
-                                break :blk switch (kt.tag) {
-                                    .l_bracket => try p.computedPropertyKey(),
-                                    .string => try p.stringPropertyKey(kt),
-                                    .number => try p.numberPropertyKey(kt),
-                                    else => kblk: {
-                                        if (kt.tag != .identifier and !token.isKeyword(kt.tag))
-                                            return p.fail(.{ .syntax_error = "expected method name after 'async'" }, kt);
-                                        try p.advance();
-                                        break :kblk .{ .name = kt.text(p.source()) };
-                                    },
-                                };
+                                break :blk try p.parsePropertyKey();
                             },
                         }
                     }
@@ -1749,8 +1769,8 @@ const Parser = struct {
                     break :blk .{ .name = name };
                 },
             };
-            if (is_async_method and p.tok.tag != .l_paren) {
-                return p.fail(.{ .syntax_error = "expected '(' after async method name" }, p.tok);
+            if ((is_async_method or prop_kind != .init) and p.tok.tag != .l_paren) {
+                return p.fail(.{ .syntax_error = "expected '(' after method name" }, p.tok);
             }
             switch (p.tok.tag) {
                 .colon => {
@@ -1765,11 +1785,14 @@ const Parser = struct {
                 },
                 .l_paren => {
                     const f = try p.functionRest(t.start, .expression, null, is_async_method);
+                    if (prop_kind != .init) {
+                        try p.validateAccessorParams(prop_kind == .getter, f.params, t);
+                    }
                     const mut_f = @constCast(f);
                     mut_f.is_method = true;
                     if (try p.keyInferredName(k)) |inferred| mut_f.inferred_name = inferred;
                     const value = try p.node(f.span, .{ .function = f }, 0);
-                    try props.append(p.arena, .{ .prop = .{ .key = k, .value = value, .shorthand = false, .span = .{ .start = t.start, .end = value.span.end } } });
+                    try props.append(p.arena, .{ .prop = .{ .key = k, .value = value, .shorthand = false, .kind = prop_kind, .span = .{ .start = t.start, .end = value.span.end } } });
                 },
                 .comma, .r_brace => {
                     // Shorthand `{ x }` is a reference to the variable x.
@@ -2085,6 +2108,7 @@ const Parser = struct {
                             try out.append(p.arena, .{ .key = .{ .name = ci.ref.name }, .pattern = pat, .default = ci.default, .shorthand = true, .span = ci.span });
                         },
                         .prop => |pr| {
+                            if (pr.kind != .init) return p.failAt(.{ .syntax_error = "invalid destructuring assignment target" }, pr.span.start, pr.span.end);
                             if (pr.shorthand) {
                                 const pat = try p.exprToAssignPattern(pr.value);
                                 try out.append(p.arena, .{ .key = pr.key, .pattern = pat, .default = null, .shorthand = true, .span = pr.span });
@@ -2570,10 +2594,17 @@ const Parser = struct {
                 }
             }
             var is_async = false;
+            var method_kind: @FieldType(ast.ClassMethod, "kind") = .method;
             if (p.isText(p.tok, "async")) {
                 const next = try p.peek();
                 if (!next.newline_before and next.tag != .l_paren) {
                     is_async = true;
+                    try p.advance();
+                }
+            } else if (p.isText(p.tok, "get") or p.isText(p.tok, "set")) {
+                const next = try p.peek();
+                if (next.tag != .l_paren and next.tag != .semicolon and next.tag != .r_brace) {
+                    method_kind = if (p.isText(p.tok, "get")) .getter else .setter;
                     try p.advance();
                 }
             }
@@ -2600,6 +2631,9 @@ const Parser = struct {
             if (is_ctor and is_async) {
                 return p.fail(.{ .syntax_error = "class constructor may not be an async method" }, key_tok);
             }
+            if (is_ctor and method_kind != .method) {
+                return p.fail(.{ .syntax_error = "class constructor may not be an accessor" }, key_tok);
+            }
             if (is_ctor and explicit_ctor != null) {
                 return p.fail(.{ .syntax_error = "a class may only have one constructor" }, key_tok);
             }
@@ -2615,6 +2649,9 @@ const Parser = struct {
             p.async_ctx = if (is_async) .params else .none;
             defer p.async_ctx = outer_async_ctx;
             const params = try p.parseParams();
+            if (method_kind != .method) {
+                try p.validateAccessorParams(method_kind == .getter, params, key_tok);
+            }
 
             if (p.tok.tag != .l_brace) return p.fail(.{ .syntax_error = "expected '{'" }, p.tok);
             const outer_loops = p.loop_depth;
@@ -2666,6 +2703,7 @@ const Parser = struct {
                 try methods.append(p.arena, .{
                     .key = key,
                     .is_static = is_static,
+                    .kind = method_kind,
                     .func = f,
                     .span = .{ .start = elem_start, .end = parsed_body.end },
                 });

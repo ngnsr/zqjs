@@ -513,7 +513,11 @@ const Dumper = struct {
                 try w.writeAll("(object");
                 for (props) |prop| switch (prop) {
                     .prop => |pr| {
-                        try w.writeAll(" (");
+                        try w.writeAll(switch (pr.kind) {
+                            .init => " (",
+                            .getter => " (get ",
+                            .setter => " (set ",
+                        });
                         try d.key(pr.key);
                         try w.writeByte(' ');
                         try d.expr(pr.value);

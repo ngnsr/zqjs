@@ -1365,26 +1365,49 @@ const Compiler = struct {
                 // Each key (if computed), then its value, in source order.
                 try c.emit(.new_object, &.{});
                 for (props) |prop| switch (prop) {
-                    .prop => |pr| switch (pr.key) {
-                        .name => |n| {
-                            try c.expr(pr.value);
-                            try c.emit(.define_prop, &.{try c.name(n)});
-                        },
-                        .string => |units| {
-                            try c.emit(.push_const, &.{try c.string(units)});
-                            try c.expr(pr.value);
-                            try c.emit(.define_elem, &.{});
-                        },
-                        .number => |n| {
-                            try c.emit(.push_const, &.{try c.number(n)});
-                            try c.expr(pr.value);
-                            try c.emit(.define_elem, &.{});
-                        },
-                        .computed => |k| {
-                            try c.expr(k);
-                            try c.expr(pr.value);
-                            try c.emit(.define_elem, &.{});
-                        },
+                    .prop => |pr| {
+                        const acc_flags: ?u32 = switch (pr.kind) {
+                            .init => null,
+                            .getter => 2,
+                            .setter => 3,
+                        };
+                        switch (pr.key) {
+                            .name => |n| {
+                                try c.expr(pr.value);
+                                if (acc_flags) |f| {
+                                    try c.emit(.define_accessor, &.{ try c.name(n), f });
+                                } else {
+                                    try c.emit(.define_prop, &.{try c.name(n)});
+                                }
+                            },
+                            .string => |units| {
+                                try c.emit(.push_const, &.{try c.string(units)});
+                                try c.expr(pr.value);
+                                if (acc_flags) |f| {
+                                    try c.emit(.define_elem_accessor, &.{f});
+                                } else {
+                                    try c.emit(.define_elem, &.{});
+                                }
+                            },
+                            .number => |n| {
+                                try c.emit(.push_const, &.{try c.number(n)});
+                                try c.expr(pr.value);
+                                if (acc_flags) |f| {
+                                    try c.emit(.define_elem_accessor, &.{f});
+                                } else {
+                                    try c.emit(.define_elem, &.{});
+                                }
+                            },
+                            .computed => |k| {
+                                try c.expr(k);
+                                try c.expr(pr.value);
+                                if (acc_flags) |f| {
+                                    try c.emit(.define_elem_accessor, &.{f});
+                                } else {
+                                    try c.emit(.define_elem, &.{});
+                                }
+                            },
+                        }
                     },
                     .spread => |sp| {
                         try c.expr(sp.expr);
@@ -1878,25 +1901,46 @@ const Compiler = struct {
         for (cls.methods) |m| {
             const target_slot = if (m.is_static) ctor_slot else proto_slot;
             try c.emit(.get_local, &.{ target_slot, try c.name("<class>") });
+            const acc_flags: ?u32 = switch (m.kind) {
+                .method => null,
+                .getter => 0,
+                .setter => 1,
+            };
             switch (m.key) {
                 .name => |n| {
                     try c.closure(m.func);
-                    try c.emit(.define_method, &.{try c.name(n)});
+                    if (acc_flags) |f| {
+                        try c.emit(.define_accessor, &.{ try c.name(n), f });
+                    } else {
+                        try c.emit(.define_method, &.{try c.name(n)});
+                    }
                 },
                 .string => |units| {
                     try c.emit(.push_const, &.{try c.string(units)});
                     try c.closure(m.func);
-                    try c.emit(.define_elem_method, &.{});
+                    if (acc_flags) |f| {
+                        try c.emit(.define_elem_accessor, &.{f});
+                    } else {
+                        try c.emit(.define_elem_method, &.{});
+                    }
                 },
                 .number => |num| {
                     try c.emit(.push_const, &.{try c.number(num)});
                     try c.closure(m.func);
-                    try c.emit(.define_elem_method, &.{});
+                    if (acc_flags) |f| {
+                        try c.emit(.define_elem_accessor, &.{f});
+                    } else {
+                        try c.emit(.define_elem_method, &.{});
+                    }
                 },
                 .computed => |k| {
                     try c.expr(k);
                     try c.closure(m.func);
-                    try c.emit(.define_elem_method, &.{});
+                    if (acc_flags) |f| {
+                        try c.emit(.define_elem_accessor, &.{f});
+                    } else {
+                        try c.emit(.define_elem_method, &.{});
+                    }
                 },
             }
             try c.emit(.pop, &.{});

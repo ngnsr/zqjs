@@ -227,6 +227,10 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.object_namespace, "assign", &object_assign);
     try method(rt, r.object_namespace, "create", &object_create);
     try method(rt, r.object_namespace, "getPrototypeOf", &object_get_prototype_of);
+    try method(rt, r.object_namespace, "defineProperty", &object_define_property);
+    try method(rt, r.object_namespace, "defineProperties", &object_define_properties);
+    try method(rt, r.object_namespace, "getOwnPropertyDescriptor", &object_get_own_property_descriptor);
+    try method(rt, r.object_namespace, "getOwnPropertyDescriptors", &object_get_own_property_descriptors);
     try method(rt, r.array_namespace, "isArray", &array_is_array);
     try method(rt, r.array_namespace, "from", &array_from);
     try method(rt, r.array_namespace, "of", &array_of);
@@ -565,6 +569,11 @@ pub fn setupClass(rt: *Runtime, ctor_val: Value, has_super: bool, super_val: Val
 pub fn defineClassMethod(rt: *Runtime, target: Value, k: object.Key, method_val: Value) Error!void {
     try rt.heap.storeClosureHomeObject(@constCast(method_val.closure), target);
     try object.defineNonEnumerable(rt, target, k, method_val);
+}
+
+pub fn defineClassAccessor(rt: *Runtime, target: Value, k: object.Key, fn_val: Value, is_setter: bool) Error!void {
+    try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), target);
+    try object.defineAccessor(rt, target, k, fn_val, is_setter, false);
 }
 
 pub fn materializeClosurePrototype(rt: *Runtime, c: *heap_mod.Closure) Error!*Object {
@@ -1764,6 +1773,10 @@ const object_entries: Native = .{ .name = "entries", .call = objectEntries };
 const object_assign: Native = .{ .name = "assign", .call = objectAssign };
 const object_create: Native = .{ .name = "create", .call = objectCreate };
 const object_get_prototype_of: Native = .{ .name = "getPrototypeOf", .call = objectGetPrototypeOf };
+const object_define_property: Native = .{ .name = "defineProperty", .length = 3, .call = objectDefineProperty };
+const object_define_properties: Native = .{ .name = "defineProperties", .length = 2, .call = objectDefineProperties };
+const object_get_own_property_descriptor: Native = .{ .name = "getOwnPropertyDescriptor", .length = 2, .call = objectGetOwnPropertyDescriptor };
+const object_get_own_property_descriptors: Native = .{ .name = "getOwnPropertyDescriptors", .length = 1, .call = objectGetOwnPropertyDescriptors };
 const array_is_array: Native = .{ .name = "isArray", .call = arrayIsArray };
 const array_from: Native = .{ .name = "from", .call = arrayFrom };
 const array_of: Native = .{ .name = "of", .call = arrayOf };
@@ -1826,6 +1839,311 @@ fn objectGetPrototypeOf(rt: *Runtime, _: Value, args: []const Value) Error!Value
         .string => .{ .object = r.string_prototype },
         .native, .closure, .object => object.getPrototypeOfValue(rt, v),
     };
+}
+
+fn sameValue(a: Value, b: Value) bool {
+    if (a == .number and b == .number) {
+        if (std.math.isNan(a.number) and std.math.isNan(b.number)) return true;
+        return @as(u64, @bitCast(a.number)) == @as(u64, @bitCast(b.number));
+    }
+    return sameValueZero(a, b);
+}
+
+fn descriptorToObject(rt: *Runtime, p: heap_mod.Property) Error!Value {
+    const r = try realm(rt);
+    const out = try rt.heap.newObject(r.object_prototype);
+    var root_buf = [_]Value{ .{ .object = out }, p.value, p.setter };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    if (p.is_accessor) {
+        try rt.heap.storeProperty(out, try rt.heap.internAscii("get"), p.value);
+        try rt.heap.storeProperty(out, try rt.heap.internAscii("set"), p.setter);
+    } else {
+        try rt.heap.storeProperty(out, try rt.heap.internAscii("value"), p.value);
+        try rt.heap.storeProperty(out, try rt.heap.internAscii("writable"), .{ .boolean = p.writable });
+    }
+    try rt.heap.storeProperty(out, try rt.heap.internAscii("enumerable"), .{ .boolean = p.enumerable });
+    try rt.heap.storeProperty(out, try rt.heap.internAscii("configurable"), .{ .boolean = p.configurable });
+    return .{ .object = out };
+}
+
+fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod.Property {
+    switch (target) {
+        .object => |o| {
+            switch (o.kind) {
+                .array => |elements| switch (k) {
+                    .index => |i| return if (i < elements.items.len) .{ .value = elements.items[i] } else null,
+                    .atom => if (object.isNamed(k, "length")) {
+                        return .{ .value = .{ .number = @floatFromInt(elements.items.len) }, .enumerable = false, .configurable = false };
+                    },
+                },
+                .regexp => |re| if (object.isNamed(k, "lastIndex")) {
+                    return .{ .value = re.last_index, .enumerable = false, .configurable = false };
+                },
+                .ordinary, .map, .set, .iterator, .promise => {},
+            }
+            if (o.props.count() == 0) return null;
+            return o.props.get(try object.atomOf(rt, k));
+        },
+        .closure => |c| {
+            if (object.isNamed(k, "length")) return .{ .value = .{ .number = @floatFromInt(closureLength(c)) }, .enumerable = false, .writable = false };
+            if (object.isNamed(k, "name")) return .{ .value = .{ .string = try closureName(rt, c) }, .enumerable = false, .writable = false };
+            if (object.isNamed(k, "prototype")) {
+                if (c.meta) |m| if (m.prototype) |p| {
+                    return .{ .value = p, .enumerable = false, .configurable = false };
+                };
+                if (hasAutoPrototype(c)) {
+                    const p = try materializeClosurePrototype(rt, @constCast(c));
+                    return .{ .value = .{ .object = p }, .enumerable = false, .configurable = false };
+                }
+            }
+            if (c.meta) |m| if (m.props.count() > 0) return m.props.get(try object.atomOf(rt, k));
+            return null;
+        },
+        .string => |s| switch (k) {
+            .index => |i| if (i < s.units.len) {
+                const ch = try rt.heap.newString(&.{.{ .utf16 = s.units[i..][0..1] }});
+                return .{ .value = .{ .string = ch }, .writable = false, .configurable = false };
+            },
+            .atom => if (object.isNamed(k, "length")) {
+                return .{ .value = .{ .number = @floatFromInt(s.units.len) }, .enumerable = false, .writable = false, .configurable = false };
+            },
+        },
+        .native => |n| {
+            if (object.isNamed(k, "length")) return .{ .value = .{ .number = @floatFromInt(n.length) }, .enumerable = false, .writable = false };
+            if (object.isNamed(k, "name")) return .{ .value = .{ .string = try rt.heap.ascii(n.name) }, .enumerable = false, .writable = false };
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn objectGetOwnPropertyDescriptor(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = arg(args, 0);
+    if (target == .undefined or target == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    const k = try object.key(rt, arg(args, 1));
+    const p = (try getOwnPropertyRaw(rt, target, k)) orelse return .undefined;
+    return descriptorToObject(rt, p);
+}
+
+fn objectGetOwnPropertyDescriptors(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = arg(args, 0);
+    if (target == .undefined or target == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    const r = try realm(rt);
+    const out = try rt.heap.newObject(r.object_prototype);
+    var root_buf = [_]Value{ target, .{ .object = out }, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    switch (target) {
+        .object => |o| {
+            for (o.props.keys(), o.props.values()) |a, p| {
+                const desc = try descriptorToObject(rt, p);
+                root_buf[2] = desc;
+                try rt.heap.storeProperty(out, a, desc);
+                root_buf[2] = .undefined;
+            }
+        },
+        .closure => |c| if (c.meta) |m| {
+            for (m.props.keys(), m.props.values()) |a, p| {
+                const desc = try descriptorToObject(rt, p);
+                root_buf[2] = desc;
+                try rt.heap.storeProperty(out, a, desc);
+                root_buf[2] = .undefined;
+            }
+        },
+        else => {},
+    }
+    return .{ .object = out };
+}
+
+fn defineOwnPropertyFromDesc(rt: *Runtime, target: Value, k: object.Key, desc: Value) Error!void {
+    if (desc != .object and desc != .closure and desc != .native) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Property description must be an object" }});
+    }
+    var root_buf = [_]Value{ target, desc, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const has_enum = try object.has(rt, .{ .atom = try rt.heap.internAscii("enumerable") }, desc);
+    const enum_val = if (has_enum) ops.toBoolean(try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("enumerable") })) else false;
+    const has_conf = try object.has(rt, .{ .atom = try rt.heap.internAscii("configurable") }, desc);
+    const conf_val = if (has_conf) ops.toBoolean(try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("configurable") })) else false;
+
+    const has_val = try object.has(rt, .{ .atom = try rt.heap.internAscii("value") }, desc);
+    const val = if (has_val) try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("value") }) else .undefined;
+    root_buf[2] = val;
+    const has_writ = try object.has(rt, .{ .atom = try rt.heap.internAscii("writable") }, desc);
+    const writ_val = if (has_writ) ops.toBoolean(try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("writable") })) else false;
+
+    const has_get = try object.has(rt, .{ .atom = try rt.heap.internAscii("get") }, desc);
+    const get_val = if (has_get) try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("get") }) else .undefined;
+    root_buf[3] = get_val;
+    if (has_get and get_val != .undefined and !get_val.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Getter must be a function" }});
+    }
+
+    const has_set = try object.has(rt, .{ .atom = try rt.heap.internAscii("set") }, desc);
+    const set_val = if (has_set) try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("set") }) else .undefined;
+    root_buf[4] = set_val;
+    if (has_set and set_val != .undefined and !set_val.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Setter must be a function" }});
+    }
+
+    const is_data_desc = has_val or has_writ;
+    const is_acc_desc = has_get or has_set;
+    if (is_data_desc and is_acc_desc) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute" }});
+    }
+
+    if (target == .object and target.object.kind == .array and k == .index) {
+        return unsupportedReceiver(rt, "defineProperty");
+    }
+
+    const current = try getOwnPropertyRaw(rt, target, k);
+    var next: heap_mod.Property = undefined;
+
+    if (current == null) {
+        if (is_acc_desc) {
+            next = .{
+                .is_accessor = true,
+                .value = if (has_get) get_val else .undefined,
+                .setter = if (has_set) set_val else .undefined,
+                .enumerable = if (has_enum) enum_val else false,
+                .configurable = if (has_conf) conf_val else false,
+                .writable = false,
+            };
+        } else {
+            next = .{
+                .is_accessor = false,
+                .value = if (has_val) val else .undefined,
+                .writable = if (has_writ) writ_val else false,
+                .enumerable = if (has_enum) enum_val else false,
+                .configurable = if (has_conf) conf_val else false,
+            };
+        }
+    } else {
+        const cur = current.?;
+        if (!cur.configurable) {
+            if (has_conf and conf_val) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
+            if (has_enum and enum_val != cur.enumerable) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
+        }
+        if (!is_data_desc and !is_acc_desc) {
+            next = cur;
+        } else if (cur.is_accessor != is_acc_desc) {
+            if (!cur.configurable) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
+            if (is_acc_desc) {
+                next = .{
+                    .is_accessor = true,
+                    .value = if (has_get) get_val else .undefined,
+                    .setter = if (has_set) set_val else .undefined,
+                    .enumerable = cur.enumerable,
+                    .configurable = cur.configurable,
+                    .writable = false,
+                };
+            } else {
+                next = .{
+                    .is_accessor = false,
+                    .value = if (has_val) val else .undefined,
+                    .writable = if (has_writ) writ_val else false,
+                    .enumerable = cur.enumerable,
+                    .configurable = cur.configurable,
+                };
+            }
+        } else if (!cur.is_accessor) {
+            if (!cur.configurable and !cur.writable) {
+                if (has_writ and writ_val) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
+                if (has_val and !sameValue(val, cur.value)) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
+            }
+            next = .{
+                .is_accessor = false,
+                .value = if (has_val) val else cur.value,
+                .writable = if (has_writ) writ_val else cur.writable,
+                .enumerable = if (has_enum) enum_val else cur.enumerable,
+                .configurable = if (has_conf) conf_val else cur.configurable,
+            };
+        } else {
+            if (!cur.configurable) {
+                if (has_get and !sameValue(get_val, cur.value)) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
+                if (has_set and !sameValue(set_val, cur.setter)) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
+            }
+            next = .{
+                .is_accessor = true,
+                .value = if (has_get) get_val else cur.value,
+                .setter = if (has_set) set_val else cur.setter,
+                .enumerable = if (has_enum) enum_val else cur.enumerable,
+                .configurable = if (has_conf) conf_val else cur.configurable,
+                .writable = false,
+            };
+        }
+        if (has_enum) next.enumerable = enum_val;
+        if (has_conf) next.configurable = conf_val;
+    }
+
+    const a = try object.atomOf(rt, k);
+    switch (target) {
+        .object => |o| try rt.heap.defineProperty(o, a, next),
+        .closure => |c| try rt.heap.defineClosureProperty(@constCast(c), a, next),
+        else => unreachable,
+    }
+}
+
+fn objectDefineProperty(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = arg(args, 0);
+    if (target != .object and target != .closure) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Object.defineProperty called on non-object" }});
+    }
+    const k = try object.key(rt, arg(args, 1));
+    try defineOwnPropertyFromDesc(rt, target, k, arg(args, 2));
+    return target;
+}
+
+fn objectDefineProperties(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = arg(args, 0);
+    if (target != .object and target != .closure) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Object.defineProperties called on non-object" }});
+    }
+    const props = arg(args, 1);
+    if (props == .undefined or props == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    var root_buf = [_]Value{ target, props, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    switch (props) {
+        .object => |o| {
+            const keys = try object.ownKeys(rt, o);
+            defer rt.gpa.free(keys);
+            for (keys) |k| {
+                const desc = try object.get(rt, props, k);
+                root_buf[2] = desc;
+                try defineOwnPropertyFromDesc(rt, target, k, desc);
+                root_buf[2] = .undefined;
+            }
+        },
+        .closure => |c| {
+            const keys = try object.ownKeysClosure(rt, c);
+            defer rt.gpa.free(keys);
+            for (keys) |k| {
+                const desc = try object.get(rt, props, k);
+                root_buf[2] = desc;
+                try defineOwnPropertyFromDesc(rt, target, k, desc);
+                root_buf[2] = .undefined;
+            }
+        },
+        else => {},
+    }
+    return target;
 }
 
 fn arrayIsArray(_: *Runtime, _: Value, args: []const Value) Error!Value {

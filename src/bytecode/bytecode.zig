@@ -121,6 +121,10 @@ pub const Op = enum(u8) {
     define_method,
     /// [obj, key, method_closure] → [obj]: sets home_object = obj and defines non-enumerable obj[key].
     define_elem_method,
+    /// [obj, fn_closure] → [obj]: sets home_object = obj and defines accessor (flags: bit0=is_setter, bit1=enumerable).
+    define_accessor,
+    /// [obj, key, fn_closure] → [obj]: same with a computed/non-identifier key.
+    define_elem_accessor,
     /// [arg0 … arg(argc-1)] → [this]: `super(...args)` in derived constructor.
     super_call,
     /// [args_arr] → [this]: `super(...args)` with spread.
@@ -297,6 +301,8 @@ pub const Op = enum(u8) {
             .setup_class => .{ .operands = &.{.argc}, .pops = 2, .pushes = 2 },
             .define_method => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
             .define_elem_method => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
+            .define_accessor => .{ .operands = &.{ .name, .argc }, .pops = 2, .pushes = 1 },
+            .define_elem_accessor => .{ .operands = &.{.argc}, .pops = 3, .pushes = 1 },
             .super_call => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
             .super_call_spread => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .super_get_prop => .{ .operands = &.{.name}, .pops = 0, .pushes = 1 },

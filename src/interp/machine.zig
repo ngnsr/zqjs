@@ -1285,7 +1285,15 @@ const Machine = struct {
             .object_prop_val => |op| {
                 const v = m.popVal();
                 const o = m.values.items[m.values.items.len - 1].object;
-                try object.define(rt, o, op.key, v);
+                const pr = op.props[op.idx].prop;
+                switch (pr.kind) {
+                    .init => try object.define(rt, o, op.key, v),
+                    .getter, .setter => {
+                        if (v != .closure) return rt.bug("object accessor expects closure");
+                        try rt.heap.storeClosureHomeObject(@constCast(v.closure), .{ .object = o });
+                        try object.defineAccessor(rt, .{ .object = o }, op.key, v, pr.kind == .setter, true);
+                    },
+                }
                 if (op.idx + 1 < op.props.len) {
                     try m.pushTask(.{ .object_next = .{ .props = op.props, .idx = op.idx + 1 } });
                 }
@@ -1549,28 +1557,32 @@ const Machine = struct {
                 const ctor_val = m.values.items[m.values.items.len - 2];
                 const target = if (meth.is_static) ctor_val else proto_val;
                 const fn_val = try m.evalFunction(meth.func);
-                try builtins.defineClassMethod(rt, target, k, fn_val);
+                switch (meth.kind) {
+                    .method => try builtins.defineClassMethod(rt, target, k, fn_val),
+                    .getter, .setter => try builtins.defineClassAccessor(rt, target, k, fn_val, meth.kind == .setter),
+                }
                 try m.pushTask(.{ .class_method_next = .{ .cls = cm.cls, .idx = cm.idx + 1 } });
             },
             .super_get_elem => {
-                _ = try m.requireThis();
+                const this_val = try m.requireThis();
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_get_elem without home_object");
                 const k = try m.toKey(.{ .value = m.popVal() });
-                try m.pushVal(try object.getSuper(rt, home, k));
+                try m.pushVal(try object.getSuper(rt, home, this_val, k));
             },
             .super_assign_plain => |named| {
                 const this_val = try m.requireThis();
+                const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_assign without home_object");
                 const val = m.popVal();
                 const kv: KeyValue = if (named) |n| .{ .named = n } else .{ .value = m.popVal() };
-                try object.set(rt, this_val, try m.toKey(kv), val);
+                try object.setSuper(rt, home, this_val, try m.toKey(kv), val);
                 try m.pushVal(val);
             },
             .super_assign_after_key => |sa| {
-                _ = try m.requireThis();
+                const this_val = try m.requireThis();
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_assign without home_object");
                 const kv: KeyValue = if (sa.named) |n| .{ .named = n } else .{ .value = m.values.items[m.values.items.len - 1] };
                 const k = try m.toKey(kv);
-                const old = try object.getSuper(rt, home, k);
+                const old = try object.getSuper(rt, home, this_val, k);
                 switch (sa.op) {
                     .plain => unreachable,
                     .compound => |op| {
@@ -1591,18 +1603,20 @@ const Machine = struct {
             },
             .super_assign_compound => |sc| {
                 const this_val = try m.requireThis();
+                const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_assign without home_object");
                 const rhs = m.popVal();
                 const old = m.popVal();
                 const kv: KeyValue = if (sc.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const new_val = try ops.binary(rt, sc.op, old, rhs);
-                try object.set(rt, this_val, try m.toKey(kv), new_val);
+                try object.setSuper(rt, home, this_val, try m.toKey(kv), new_val);
                 try m.pushVal(new_val);
             },
             .super_assign_logical => |sl| {
                 const this_val = try m.requireThis();
+                const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_assign without home_object");
                 const rhs = m.popVal();
                 const kv: KeyValue = if (sl.named) |n| .{ .named = n } else .{ .value = m.popVal() };
-                try object.set(rt, this_val, try m.toKey(kv), rhs);
+                try object.setSuper(rt, home, this_val, try m.toKey(kv), rhs);
                 try m.pushVal(rhs);
             },
             .super_update_finish => |su| {
@@ -1610,17 +1624,16 @@ const Machine = struct {
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_update without home_object");
                 const kv: KeyValue = if (su.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const k = try m.toKey(kv);
-                const old = try ops.toNumber(rt, try object.getSuper(rt, home, k));
+                const old = try ops.toNumber(rt, try object.getSuper(rt, home, this_val, k));
                 const new = if (su.op == .inc) old + 1 else old - 1;
-                try object.set(rt, this_val, k, .{ .number = new });
+                try object.setSuper(rt, home, this_val, k, .{ .number = new });
                 try m.pushVal(.{ .number = if (su.prefix) new else old });
             },
             .super_call_member_key => |sm| {
                 const this_val = try m.requireThis();
-                _ = this_val;
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_call_member_key without home_object");
                 const kv: KeyValue = if (sm.named) |n| .{ .named = n } else .{ .value = m.popVal() };
-                const callee = try object.getSuper(rt, home, try m.toKey(kv));
+                const callee = try object.getSuper(rt, home, this_val, try m.toKey(kv));
                 try m.pushVal(callee);
                 const args_base = m.values.items.len;
                 if (sm.tagged) |tt| {
@@ -2165,12 +2178,12 @@ const Machine = struct {
                 }
             },
             .super_member => |k| {
-                _ = try m.requireThis();
+                const this_val = try m.requireThis();
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_member without home_object");
                 switch (k) {
                     .name => |n| {
                         m.depth -= 1;
-                        try m.pushVal(try object.getSuper(rt, home, try m.toKey(.{ .named = n })));
+                        try m.pushVal(try object.getSuper(rt, home, this_val, try m.toKey(.{ .named = n })));
                     },
                     .computed => |ke| {
                         try m.pushTask(.depth_pop);

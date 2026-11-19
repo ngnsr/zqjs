@@ -1519,3 +1519,24 @@ until a follow-up milestone).
   - Looks up `Object.getPrototypeOf(home_object)` (via `home_object`'s `proto`), reads the
     property (data properties only in ZQJS), and for `super.m(...)` binds `this` to the current
     frame's `this`. Setting `super.prop = v` writes onto `this` (`object.set(rt, this_val, key, v)`).
+
+---
+
+## D64. Getters, Setters, and Property Descriptors (M34)
+
+**Decision:** Extend `Property` in `heap.zig` to carry full ECMAScript property attributes (`enumerable`, `writable`, `configurable`, `is_accessor`, and `setter: Value`) without adding a separate heap object kind, and support `get`/`set` accessors in object literals and classes plus `Object.defineProperty`, `Object.defineProperties`, `Object.getOwnPropertyDescriptor`, and `Object.getOwnPropertyDescriptors` across both engines.
+
+- **GC & Property representation:**
+  - `Property` stores `value` (data value, or getter callable/`.undefined` when `is_accessor`), `setter` (setter callable/`.undefined` when `is_accessor`), `enumerable`, `writable`, `configurable`, and `is_accessor`.
+  - Both `value` and `setter` (when `is_accessor`) are traced in `forEachChild`, `RememberedScan.entries`, `checkCards`, and protected by `defineProperty` / `defineClosureProperty` / `removeProperty` / `removeClosureProperty` write barriers.
+  - `storeProperty` / `storeClosureProperty` preserve existing attributes (`enumerable`, `writable`, `configurable`) when updating an existing data property.
+- **Property access & mutation (`object.zig`):**
+  - `get` / `getSuper`: when an accessor is found on the receiver or prototype chain, invoke the getter with `this = receiver` via `rt.callCallable` (reentrant across both `.vm` and `.treewalk`), or return `undefined` if the getter is `undefined`.
+  - `set` / `setSuper`: walk the prototype chain first; if an accessor is found anywhere on the chain, invoke its setter with `this = receiver` (throwing `TypeError` if `setter` is `undefined`). If an own data property is not `writable`, or an inherited data property is not `writable`, throw `TypeError`.
+  - `delete`: throwing `TypeError` if an own property has `configurable: false`.
+  - `Object.values`, `Object.entries`, `Object.assign`, `{ ...spread }`, and `JSON.stringify` read values via `object.get`, so enumerable getters are invoked consistently.
+- **Syntax & Compilation:**
+  - Object literals (`{ get x() {}, set x(v) {}, get [e]() {}, set [e](v) {} }`) and class bodies (`get`/`set`/`static get`/`static set`, including computed keys) parse as accessor methods with `home_object` support for `super`.
+  - Defining a getter on an existing accessor property preserves its `setter` (and vice versa), matching ECMAScript `DefineOwnProperty` merging.
+- **Built-ins (`Object`):**
+  - `Object.defineProperty(obj, key, desc)`, `Object.defineProperties(obj, props)`, `Object.getOwnPropertyDescriptor(obj, key)`, and `Object.getOwnPropertyDescriptors(obj)` implement ECMAScript descriptor validation (rejecting mixed data+accessor descriptors, non-callable `get`/`set`, and invalid redefinitions of non-configurable/non-writable properties with `TypeError`).

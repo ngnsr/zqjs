@@ -477,6 +477,7 @@ const Resolver = struct {
                 } else return r.fail(.{ .unsupported = .sloppy_this }, e.span);
             },
             .await => |inner| try r.expr(inner),
+            .yield => |y| if (y.value) |v| try r.expr(v),
             .call, .new_call => |c| {
                 try r.expr(c.callee);
                 for (c.args) |arg| try r.expr(arg);

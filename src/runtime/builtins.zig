@@ -25,6 +25,7 @@ const Native = @import("value.zig").Native;
 const heap_mod = @import("heap.zig");
 const Object = heap_mod.Object;
 const rt_mod = @import("runtime.zig");
+const coroutine = @import("coroutine.zig");
 const Runtime = rt_mod.Runtime;
 const Error = rt_mod.Error;
 const ops = @import("ops.zig");
@@ -48,6 +49,8 @@ pub const Realm = struct {
     set_prototype: *Object,
     promise_prototype: *Object,
     iterator_prototype: *Object,
+    /// %GeneratorPrototype% (D67).
+    generator_prototype: *Object,
     error_prototype: *Object,
     type_error_prototype: *Object,
     range_error_prototype: *Object,
@@ -81,7 +84,7 @@ pub const Realm = struct {
     json: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [40]*Object {
+    pub fn objects(r: *const Realm) [41]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -94,6 +97,7 @@ pub const Realm = struct {
             r.set_prototype,
             r.promise_prototype,
             r.iterator_prototype,
+            r.generator_prototype,
             r.error_prototype,
             r.type_error_prototype,
             r.range_error_prototype,
@@ -132,6 +136,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     const h = &rt.heap;
     const object_prototype = try builtin(h, null, .object_prototype);
     const error_prototype = try builtin(h, object_prototype, .error_prototype);
+    const iterator_prototype = try builtin(h, object_prototype, .iterator_prototype);
     var r: Realm = .{
         .object_prototype = object_prototype,
         .array_prototype = try builtin(h, object_prototype, .array_prototype),
@@ -143,7 +148,8 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .map_prototype = try builtin(h, object_prototype, .map_prototype),
         .set_prototype = try builtin(h, object_prototype, .set_prototype),
         .promise_prototype = try builtin(h, object_prototype, .promise_prototype),
-        .iterator_prototype = try builtin(h, object_prototype, .iterator_prototype),
+        .iterator_prototype = iterator_prototype,
+        .generator_prototype = try builtin(h, iterator_prototype, .generator_prototype),
         .error_prototype = error_prototype,
         .type_error_prototype = try builtin(h, error_prototype, .type_error_prototype),
         .range_error_prototype = try builtin(h, error_prototype, .range_error_prototype),
@@ -287,6 +293,9 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try symbolMethod(rt, r.map_prototype, r.sym_iterator, &map_entries);
     try symbolMethod(rt, r.set_prototype, r.sym_iterator, &set_values);
     try symbolMethod(rt, r.iterator_prototype, r.sym_iterator, &iterator_self);
+    try method(rt, r.generator_prototype, "next", &generator_next);
+    try method(rt, r.generator_prototype, "return", &generator_return);
+    try method(rt, r.generator_prototype, "throw", &generator_throw);
     try registerMath(rt, r.math);
     try method(rt, r.json, "parse", &json.parse_native);
     try method(rt, r.json, "stringify", &json.stringify_native);
@@ -512,16 +521,26 @@ pub fn construct(rt: *Runtime, callee: Value, args: []const Value) Error!Value {
 
 // ---------------------------------------------------------------- Functions (M31, D62)
 
+/// Whether closure `c` has an own, lazily created `.prototype`: constructable functions
+/// and generator functions (including generator methods, D67).
 pub fn hasAutoPrototype(c: *const heap_mod.Closure) bool {
     return switch (c.impl) {
         .vm => |v| blk: {
             const p: *const bytecode.Proto = @ptrCast(@alignCast(v.proto));
-            break :blk !p.is_arrow and !p.is_async and !p.is_method;
+            break :blk p.is_generator or (!p.is_arrow and !p.is_async and !p.is_method);
         },
         .tree => |t| blk: {
             const f: *const ast.Function = @ptrCast(@alignCast(t.func));
-            break :blk !f.is_arrow and !f.is_async and !f.is_method;
+            break :blk f.is_generator or (!f.is_arrow and !f.is_async and !f.is_method);
         },
+        .promise_cap, .native_closure, .bound => false,
+    };
+}
+
+pub fn isGeneratorFunction(c: *const heap_mod.Closure) bool {
+    return switch (c.impl) {
+        .vm => |v| @as(*const bytecode.Proto, @ptrCast(@alignCast(v.proto))).is_generator,
+        .tree => |t| @as(*const ast.Function, @ptrCast(@alignCast(t.func))).is_generator,
         .promise_cap, .native_closure, .bound => false,
     };
 }
@@ -530,7 +549,7 @@ pub fn isConstructor(v: Value) bool {
     return switch (v) {
         .native => |n| n.construct != null or (n.namespace != null and n.namespace.? != .symbol),
         .closure => |c| switch (c.impl) {
-            .vm, .tree => hasAutoPrototype(c),
+            .vm, .tree => hasAutoPrototype(c) and !isGeneratorFunction(c),
             .bound => |b| isConstructor(b.target),
             .promise_cap, .native_closure => false,
         },
@@ -651,6 +670,11 @@ pub fn defineClassAccessor(rt: *Runtime, target: Value, k: object.Key, fn_val: V
 
 pub fn materializeClosurePrototype(rt: *Runtime, c: *heap_mod.Closure) Error!*Object {
     const r = try realm(rt);
+    if (isGeneratorFunction(c)) { // inherits %GeneratorPrototype%, no `constructor` (D67)
+        const gen_proto = try rt.heap.newObject(r.generator_prototype);
+        try rt.heap.storeClosurePrototype(c, .{ .object = gen_proto });
+        return gen_proto;
+    }
     const proto_obj = try rt.heap.newObject(r.object_prototype);
     const ctor_key = try rt.heap.internAscii("constructor");
     try rt.heap.defineProperty(proto_obj, ctor_key, .{ .value = .{ .closure = c }, .enumerable = false });
@@ -808,6 +832,7 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
             },
             .promise => "Promise",
             .regexp => "RegExp",
+            .generator => "Generator",
             .ordinary => "Object",
         },
     };
@@ -1991,7 +2016,7 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                 .regexp => |re| if (object.isNamed(k, "lastIndex")) {
                     return .{ .value = re.last_index, .enumerable = false, .configurable = false };
                 },
-                .ordinary, .map, .set, .iterator, .promise => {},
+                .ordinary, .map, .set, .iterator, .promise, .generator => {},
             }
             if (o.props.count() == 0) return null;
             return o.props.get(try object.propKey(rt, k));
@@ -3824,6 +3849,78 @@ pub fn iteratorClose(rt: *Runtime, iter: *Object, is_throw: bool) Error!void {
     if (!is_throw and !res.isObjectLike()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
     }
+}
+
+/// `{ value, done }`.
+pub fn iterResult(rt: *Runtime, value: Value, done: bool) Error!Value {
+    const r = try realm(rt);
+    const out = try rt.heap.newObject(r.object_prototype);
+    try object.define(rt, out, try object.named(rt, "value"), value);
+    try object.define(rt, out, try object.named(rt, "done"), .{ .boolean = done });
+    return .{ .object = out };
+}
+
+/// One round of `yield*` (D67, spec 14.4.14): forwards `received` to the inner iterator's
+/// next/throw/return per `mode`. Shared by both engines.
+pub const YieldStarStep = struct {
+    value: Value,
+    kind: enum { yield, done, @"return" },
+};
+
+pub fn yieldStarStep(rt: *Runtime, iter: *Object, received: Value, mode: coroutine.ResumeMode) Error!YieldStarStep {
+    if (iter.kind != .iterator) return rt.bug("yield* on a non-iterator");
+    const it = &iter.kind.iterator;
+    const inner: Value = if (it.kind == .custom) it.target else .{ .object = iter };
+    var root_buf = [_]Value{ .{ .object = iter }, received, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const method_fn: Value = switch (mode) {
+        .next => if (it.kind == .custom) it.next_method else .{ .native = &iterator_next },
+        .throw, .@"return" => try object.get(rt, inner, try object.named(rt, if (mode == .throw) "throw" else "return")),
+    };
+    root_buf[2] = method_fn;
+    if (method_fn == .undefined or method_fn == .null) switch (mode) {
+        .next => {},
+        .throw => {
+            try iteratorClose(rt, iter, false);
+            return rt.throw(.TypeError, &.{.{ .ascii = "The iterator does not provide a 'throw' method." }});
+        },
+        .@"return" => return .{ .value = received, .kind = .@"return" },
+    };
+    if (!method_fn.isFunction()) return rt.throw(.TypeError, &.{.{ .ascii = "iterator method is not a function" }});
+    const res = try rt.callCallable(method_fn, inner, &.{received});
+    root_buf[3] = res;
+    if (!res.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
+    if (!ops.toBoolean(try object.get(rt, res, try object.named(rt, "done")))) return .{ .value = res, .kind = .yield };
+    const v = try object.get(rt, res, try object.named(rt, "value"));
+    return .{ .value = v, .kind = if (mode == .@"return") .@"return" else .done };
+}
+
+// ---------------------------------------------------------------- Generators (M37, D67)
+
+const generator_next: Native = .{ .name = "next", .length = 1, .call = generatorNext };
+const generator_return: Native = .{ .name = "return", .length = 1, .call = generatorReturn };
+const generator_throw: Native = .{ .name = "throw", .length = 1, .call = generatorThrow };
+
+fn generatorResume(rt: *Runtime, this: Value, args: []const Value, mode: coroutine.ResumeMode, name: []const u8) Error!Value {
+    if (this != .object or this.object.kind != .generator) {
+        return rt.throw(.TypeError, &.{ .{ .ascii = name }, .{ .ascii = " method called on incompatible receiver" } });
+    }
+    return coroutine.resumeGenerator(rt, this.object, mode, arg(args, 0));
+}
+
+fn generatorNext(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return generatorResume(rt, this, args, .next, "next");
+}
+
+fn generatorReturn(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return generatorResume(rt, this, args, .@"return", "return");
+}
+
+fn generatorThrow(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return generatorResume(rt, this, args, .throw, "throw");
 }
 
 fn iteratorNext(rt: *Runtime, this: Value, _: []const Value) Error!Value {

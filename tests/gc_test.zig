@@ -2019,3 +2019,93 @@ test "M36: custom iterators, spread, destructuring, and IteratorClose survive fo
         try testing.expectEqualStrings("15 item-1,item-2,item-3 ok-item-1 item-1,item-2 item-1 brk-item-1|brk-item-2|closed-2|closed-1|closed-1|thr-item-1|closed-1\n", got);
     }
 }
+
+test "M37: an old suspended generator holding young values survives minor GC and yields them (both engines)" {
+    // Collections at every safepoint promote the generator's coroutine; each resumption
+    // then stores young objects in its suspended frame (remembered at the yield).
+    const src =
+        \\function* gen() {
+        \\    const keep = [];
+        \\    for (let i = 0; i < 5; i++) {
+        \\        const young = { tag: "y" + i };
+        \\        keep.push(young);
+        \\        const got = yield young;
+        \\        keep.push({ tag: "r" + got });
+        \\    }
+        \\    return keep.map(o => o.tag).join(",");
+        \\}
+        \\const g = gen();
+        \\const seen = [];
+        \\let r = g.next();
+        \\let n = 0;
+        \\while (!r.done) {
+        \\    for (let i = 0; i < 50; i++) { let junk = { a: i, b: "x" + i }; }
+        \\    seen.push(r.value.tag);
+        \\    r = g.next(n++);
+        \\}
+        \\print(seen.join(","), r.value);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("y0,y1,y2,y3,y4 y0,r0,y1,r1,y2,r2,y3,r3,y4,r4\n", got);
+    }
+}
+
+test "M37: unreachable suspended generators (started, unstarted, in yield*) are collected with no leak" {
+    const src =
+        \\function spawn() {
+        \\    function* g() {
+        \\        let local = { x: 123 };
+        \\        try { yield local; yield 2; } finally { print("never"); }
+        \\    }
+        \\    const started = g();
+        \\    started.next();
+        \\    g();
+        \\    const it = [1, 2, 3][Symbol.iterator]();
+        \\    function* d() { yield* it; }
+        \\    d().next();
+        \\}
+        \\spawn();
+        \\for (let i = 0; i < 100; i++) { let junk = { k: i }; }
+        \\print("ok");
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("ok\n", got);
+    }
+}
+
+test "M37: yield, yield* and IteratorClose of generators survive forced GC on both engines" {
+    const src =
+        \\const log = [];
+        \\function* inner(n) {
+        \\    try {
+        \\        for (let i = 0; i < n; i++) yield { v: "i" + i };
+        \\    } finally {
+        \\        log.push("inner-closed");
+        \\    }
+        \\}
+        \\function* outer() {
+        \\    try {
+        \\        const r = yield* inner(3);
+        \\        yield* [{ v: "arr" + r }];
+        \\    } finally {
+        \\        log.push("outer-closed");
+        \\    }
+        \\}
+        \\const all = [...outer()].map(x => x.v);
+        \\for (const x of outer()) { if (x.v === "i1") break; }
+        \\const [a] = outer();
+        \\const g = outer();
+        \\g.next();
+        \\const ret = g.return({ v: "early" });
+        \\print(all.join(","), a.v, ret.value.v, log.join("|"));
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("i0,i1,i2,arrundefined i0 early inner-closed|outer-closed|inner-closed|outer-closed|inner-closed|outer-closed|inner-closed|outer-closed\n", got);
+    }
+}

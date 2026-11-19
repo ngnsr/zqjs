@@ -399,11 +399,18 @@ pub const CoroutineVTable = struct {
 
 pub const Coroutine = struct {
     obj: Obj,
-    promise: *Object,
+    /// The async call's result promise; null for a generator (D67).
+    promise: ?*Object,
     state: enum { starting, running, suspended, done } = .starting,
     engine: ?*anyopaque = null,
     vtable: *const CoroutineVTable,
     charge: usize = 0,
+};
+
+/// A generator object's state (D67). `co` is null once completed.
+pub const GeneratorState = struct {
+    co: ?*Coroutine,
+    state: enum { suspended_start, suspended_yield, executing, completed } = .suspended_start,
 };
 
 pub const PromiseReaction = struct {
@@ -452,6 +459,8 @@ pub const Object = struct {
         promise: PromiseState,
         /// Compiled RegExp state (M30, D61); boxed so `Object` stays small.
         regexp: *RegExpState,
+        /// Generator object state (M37, D67).
+        generator: GeneratorState,
     } = .ordinary,
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
@@ -808,6 +817,7 @@ pub const Heap = struct {
                     RememberedScan.child(&scan, @constCast(&re.flags.obj));
                     visitValue(re.last_index, &scan, RememberedScan.child);
                 },
+                .generator => |g| if (g.co) |co| RememberedScan.child(&scan, &co.obj),
             }
         }
     }
@@ -1083,6 +1093,13 @@ pub const Heap = struct {
         const o = try h.newObject(proto);
         o.kind = .{ .iterator = .{ .target = target, .kind = kind } };
         h.barrier(&o.obj, null, target);
+        return o;
+    }
+
+    /// A generator object (D67) owning the suspended coroutine `co`.
+    pub fn newGenerator(h: *Heap, proto: ?*Object, co: *Coroutine) Error!*Object {
+        const o = try h.newObject(proto);
+        o.kind = .{ .generator = .{ .co = co } }; // a new object is young: no barrier
         return o;
     }
 
@@ -1553,7 +1570,7 @@ pub const Heap = struct {
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
         return switch (arr.kind) {
             .array => |*elements| elements,
-            .ordinary, .map, .set, .iterator, .promise, .regexp => unreachable, // only arrays have elements
+            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => unreachable, // only arrays have elements
         };
     }
 
@@ -1739,7 +1756,7 @@ pub const Heap = struct {
         return e;
     }
 
-    pub fn newCoroutine(h: *Heap, promise: *Object, vtable: *const CoroutineVTable) Error!*Coroutine {
+    pub fn newCoroutine(h: *Heap, promise: ?*Object, vtable: *const CoroutineVTable) Error!*Coroutine {
         const charge = try h.reserve(@sizeOf(Coroutine), 0, 1);
         errdefer h.bytes -= charge;
         const co = try h.gpa.create(Coroutine);
@@ -1876,7 +1893,7 @@ pub const Heap = struct {
                         if (h.cards.fetchRemove(o)) |kv| h.allocator().free(kv.value);
                     },
                     .map, .set => |*table| table.deinit(h.allocator()),
-                    .iterator => {},
+                    .iterator, .generator => {},
                     .promise => |*pr| pr.reactions.deinit(h.allocator()),
                     .regexp => |re| {
                         re.program.deinit(h.allocator());
@@ -2077,11 +2094,12 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                     visit(ctx, @constCast(&re.flags.obj));
                     visitValue(re.last_index, ctx, visit);
                 },
+                .generator => |g| if (g.co) |co| visit(ctx, &co.obj),
             }
         },
         .coroutine => {
             const co: *Coroutine = @fieldParentPtr("obj", obj);
-            visit(ctx, &co.promise.obj);
+            if (co.promise) |p| visit(ctx, &p.obj);
             if (co.state == .suspended) {
                 if (co.engine) |eng| {
                     const Ctx = @TypeOf(ctx);

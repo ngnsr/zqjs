@@ -245,7 +245,7 @@ fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
             if (isNamed(k, "unicodeSets")) return .{ .value = .{ .boolean = re.program.flags.unicode_sets }, .enumerable = false, .writable = false };
             if (isNamed(k, "sticky")) return .{ .value = .{ .boolean = re.program.flags.sticky }, .enumerable = false, .writable = false };
         },
-        .ordinary, .iterator, .promise => {},
+        .ordinary, .iterator, .promise, .generator => {},
     }
     if (o.props.count() == 0) return null; // don't intern index keys just to miss
     return o.props.get(try propKey(rt, k));
@@ -422,7 +422,7 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
                     }
                     if (isRegExpGetter(k)) return;
                 },
-                .ordinary, .iterator, .promise => {},
+                .ordinary, .iterator, .promise, .generator => {},
             }
             try putOwn(rt, o, k, v);
         },
@@ -598,7 +598,7 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
             .symbol => {},
         },
         .regexp => if (isNamed(k, "lastIndex")) return false, // non-configurable
-        .ordinary, .map, .set, .iterator, .promise => {},
+        .ordinary, .map, .set, .iterator, .promise, .generator => {},
     }
     if (o.props.count() == 0) return true;
     const pk = try propKey(rt, k);
@@ -737,7 +737,7 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
         .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
-        .ordinary, .map, .set, .iterator, .promise, .regexp => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => {},
     }
     const first_named = out.items.len;
     try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false);
@@ -750,7 +750,7 @@ pub fn ownAllKeys(rt: *Runtime, o: *Object) Error![]Key {
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
         .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
-        .ordinary, .map, .set, .iterator, .promise, .regexp => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => {},
     }
     const first_named = out.items.len;
     try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, true);

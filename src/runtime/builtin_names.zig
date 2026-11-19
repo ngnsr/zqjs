@@ -23,6 +23,7 @@ pub const Builtin = enum {
     promise_constructor,
     promise_prototype,
     iterator_prototype,
+    generator_prototype,
     math,
     json,
     error_constructor,
@@ -69,6 +70,7 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .promise_constructor => promise_constructor.has(name),
         .promise_prototype => promise_prototype.has(name),
         .iterator_prototype => iterator_prototype.has(name),
+        .generator_prototype => generator_prototype.has(name),
         .math => math.has(name),
         .json => json.has(name),
         .error_constructor => error_constructor.has(name),
@@ -463,6 +465,13 @@ const iterator_prototype = std.StaticStringMap(void).initComptime(.{
     .{"some"},
     .{"take"},
     .{"toArray"},
+});
+
+const generator_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"next"},
+    .{"return"},
+    .{"throw"},
 });
 
 const math = std.StaticStringMap(void).initComptime(.{

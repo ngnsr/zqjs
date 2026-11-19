@@ -191,6 +191,16 @@ const Task = union(enum) {
     },
     barrier: u32,
     await_suspend,
+    /// A generator's suspension after its parameters are bound (D67).
+    generator_start,
+    /// Suspends the generator yielding the top value; `true`: `yield*`'s raw inner result.
+    yield_suspend: bool,
+    /// `yield* e` (D67): turns the evaluated `e` into an iterator, then loops
+    /// `yield_star_step` → (raw yield, `yield_star_wait`) → resume → `yield_star_step`.
+    yield_star_init,
+    yield_star_step: struct { iter: *heap.Object, received: Value, mode: coroutine.ResumeMode },
+    /// On top while a `yield*` is suspended: the resume feeds its value and mode to the next step.
+    yield_star_wait: *heap.Object,
 
     // ---- Classes & super (M33, D63)
     class_decl_init: u32,
@@ -246,6 +256,11 @@ const Machine = struct {
     current_func: ?*const ast.Function = null,
     construct_instance: ?*heap.Object = null,
     is_coroutine: bool = false,
+    /// A generator's engine (D67): a suspension is a yield, not an await.
+    is_generator: bool = false,
+    /// Suspended at `generator_start`: the first resume pushes nothing.
+    at_start: bool = false,
+    yield_raw: bool = false,
     awaited: Value = .undefined,
     tasks: std.ArrayList(Task) = .empty,
     values: std.ArrayList(Value) = .empty,
@@ -303,6 +318,11 @@ const Machine = struct {
         for (m.tasks.items) |t| switch (t) {
             .scope_exit, .scope_exit_depth => |e| if (e) |rec| visit(ctx, &rec.obj),
             .for_of_iter => |f| visit(ctx, &f.iter.obj),
+            .yield_star_step => |ys| {
+                visit(ctx, &ys.iter.obj);
+                heap.visitValue(ys.received, ctx, visit);
+            },
+            .yield_star_wait => |it| visit(ctx, &it.obj),
             .array_iter_close => |ac| visit(ctx, &ac.iter.obj),
             .try_catch => |tc| if (tc.saved_env) |e| visit(ctx, &e.obj),
             .try_finally => |tf| if (tf.saved_env) |e| visit(ctx, &e.obj),
@@ -462,6 +482,18 @@ const Machine = struct {
                     m.depth -= 1;
                     return true;
                 },
+                .generator_start => {
+                    m.awaited = .undefined;
+                    m.yield_raw = false;
+                    m.at_start = true;
+                    return true;
+                },
+                .yield_suspend => |raw| {
+                    m.awaited = m.popVal();
+                    m.yield_raw = raw;
+                    if (!raw) m.depth -= 1; // a raw yield's depth belongs to its `yield*`
+                    return true;
+                },
                 else => {},
             }
             const maybe_unwind = m.stepTask(task) catch |err| switch (err) {
@@ -507,6 +539,10 @@ const Machine = struct {
                 .assign_member_compound_finish,
                 .member_base,
                 .member_finish,
+                .yield_suspend, // only the non-raw form is ever below an evaluation
+                .yield_star_init,
+                .yield_star_step,
+                .yield_star_wait,
                 => {
                     _ = m.tasks.pop();
                     m.depth -= 1;
@@ -763,7 +799,29 @@ const Machine = struct {
                 m.depth -= 1;
             },
             .pop_value => _ = m.popVal(),
-            .barrier, .await_suspend => unreachable, // handled in runLoop
+            .barrier, .await_suspend, .generator_start, .yield_suspend => unreachable, // handled in runLoop
+            .yield_star_wait => unreachable, // consumed by the resume
+            .yield_star_init => {
+                const iter = try builtins.getIterator(rt, m.popVal());
+                try m.pushTask(.{ .yield_star_step = .{ .iter = iter, .received = .undefined, .mode = .next } });
+            },
+            .yield_star_step => |ys| {
+                m.depth -= 1; // re-counted below while the `yield*` stays suspended
+                const r = try builtins.yieldStarStep(rt, ys.iter, ys.received, ys.mode);
+                switch (r.kind) {
+                    .yield => {
+                        m.depth += 1;
+                        try m.pushTask(.{ .yield_star_wait = ys.iter });
+                        try m.pushTask(.{ .yield_suspend = true });
+                        try m.pushVal(r.value);
+                    },
+                    .done => try m.pushVal(r.value),
+                    .@"return" => {
+                        m.ret = r.value;
+                        return .@"return";
+                    },
+                }
+            },
             .exec => |s| return m.execStmt(s),
             .stmt_list => |sl| {
                 if (sl.idx + 1 < sl.stmts.len) {
@@ -1771,6 +1829,8 @@ const Machine = struct {
                 m.values.shrinkRetainingCapacity(cb.args_base);
                 _ = try m.pushScope(m.scopeOf(cb.func.body));
                 try m.pushBody(cb.func.body);
+                // Parameters bind on the call; the generator object is returned here (D67).
+                if (cb.func.is_generator) try m.pushTask(.generator_start);
             },
             .call_return => |cr| {
                 // Normal return (body fell off the end without `return`).
@@ -2595,6 +2655,15 @@ const Machine = struct {
                 try m.pushTask(.await_suspend);
                 try m.pushEval(inner);
             },
+            .yield => |y| {
+                if (y.star) {
+                    try m.pushTask(.yield_star_init);
+                    try m.pushEval(y.value.?);
+                } else {
+                    try m.pushTask(.{ .yield_suspend = false });
+                    if (y.value) |v| try m.pushEval(v) else try m.pushVal(.undefined);
+                }
+            },
             .template => |t| {
                 const first: Value = .{ .string = try rt.heap.newString(&.{.{ .utf16 = t.quasis[0] }}) };
                 try m.pushVal(first);
@@ -2899,7 +2968,7 @@ const Machine = struct {
         if (f.is_class_constructor) {
             return m.rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
         }
-        if (f.is_async) {
+        if (f.is_async or f.is_generator) {
             const p = try startAsync(m.rt, m, closure, this, m.values.items[args_base..]);
             m.values.shrinkRetainingCapacity(result_base);
             try m.pushVal(p);
@@ -2961,7 +3030,7 @@ const Machine = struct {
         };
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
         if (f.is_class_constructor) return m.rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
-        if (f.is_async) return startAsync(m.rt, m, closure, this, args);
+        if (f.is_async or f.is_generator) return startAsync(m.rt, m, closure, this, args);
 
         var ret_root = [_]Value{m.ret};
         var ret_roots: rt_mod.ValueRoots = .{ .values = &ret_root };
@@ -2998,11 +3067,14 @@ const Machine = struct {
 
     const CoroAction = union(enum) {
         start,
-        @"resume": struct { val: Value, rejected: bool },
+        @"resume": struct { val: Value, mode: coroutine.ResumeMode },
     };
 
+    /// Async functions and generators (D67) both run on a coroutine Machine.
     fn startAsync(rt: *Runtime, caller: *Machine, closure: *const heap.Closure, this: ?Value, args: []const Value) Error!Value {
         const ctx: StartAsyncCtx = .{ .rt = rt, .caller = caller, .closure = closure, .this = this, .args = args };
+        if (@as(*const ast.Function, @ptrCast(@alignCast(closure.impl.tree.func))).is_generator)
+            return coroutine.startGenerator(rt, &coro_vtable, .{ .closure = closure }, ctx, createAndRunCoro);
         return coroutine.start(rt, &coro_vtable, ctx, createAndRunCoro);
     }
 
@@ -3013,6 +3085,7 @@ const Machine = struct {
             .rt = rt,
             .res = ctx.caller.res,
             .is_coroutine = true,
+            .is_generator = @as(*const ast.Function, @ptrCast(@alignCast(ctx.closure.impl.tree.func))).is_generator,
             .calls = ctx.caller.calls,
             .depth = ctx.caller.depth,
             .stack_top = if (builtin.is_test) @frameAddress() else 0,
@@ -3046,33 +3119,53 @@ const Machine = struct {
             .start => {},
             .@"resume" => |res| {
                 m.awaited = .undefined;
-                if (res.rejected) {
-                    _ = rt.throwValue(res.val) catch {};
-                    m.unwind(.throw, 0) catch |ue| {
-                        if (ue == error.Thrown) return .threw;
-                        return ue;
-                    };
-                } else {
-                    try m.pushVal(res.val);
+                const top: ?Task = if (m.tasks.items.len > 0) m.tasks.items[m.tasks.items.len - 1] else null;
+                if (m.at_start) {
+                    m.at_start = false; // the first `next()`: its value is dropped (D67)
+                } else if (top != null and top.? == .yield_star_wait) {
+                    _ = m.tasks.pop();
+                    try m.pushTask(.{ .yield_star_step = .{ .iter = top.?.yield_star_wait, .received = res.val, .mode = res.mode } });
+                } else switch (res.mode) {
+                    .next => try m.pushVal(res.val),
+                    .throw => {
+                        _ = rt.throwValue(res.val) catch {};
+                        m.unwind(.throw, 0) catch |ue| {
+                            if (ue == error.Thrown) return .threw;
+                            return ue;
+                        };
+                    },
+                    .@"return" => {
+                        // The same completion a `return` statement produces (D67).
+                        m.ret = res.val;
+                        m.unwind(.@"return", 0) catch |ue| {
+                            if (ue != error.Thrown) return ue;
+                            m.ret = .undefined;
+                            m.unwind(.throw, 0) catch |ue2| {
+                                if (ue2 == error.Thrown) return .threw;
+                                return ue2;
+                            };
+                        };
+                    },
                 }
             },
         }
 
-        const awaiting = m.runLoop(0) catch |e| {
+        const suspended = m.runLoop(0) catch |e| {
             if (e == error.Thrown) return .threw;
             return e;
         };
-        if (awaiting) {
+        if (suspended) {
             m.calls -= caller_calls;
             m.depth -= caller_depth;
+            if (m.is_generator) return .{ .yielded = .{ .value = m.awaited, .raw = m.yield_raw } };
             return .{ .awaiting = m.awaited };
         }
         return .{ .returned = m.popVal() };
     }
 
-    fn coroResume(eng: *anyopaque, val: Value, rejected: bool) Error!coroutine.Outcome {
+    fn coroResume(eng: *anyopaque, val: Value, mode: coroutine.ResumeMode) Error!coroutine.Outcome {
         const m: *Machine = @ptrCast(@alignCast(eng));
-        return runCoroMachine(m, 0, 0, .{ .@"resume" = .{ .val = val, .rejected = rejected } });
+        return runCoroMachine(m, 0, 0, .{ .@"resume" = .{ .val = val, .mode = mode } });
     }
 
     fn coroTrace(eng: *anyopaque, visit_ctx: *anyopaque, visit: *const fn (*anyopaque, *heap.Obj) void) void {

@@ -124,7 +124,10 @@ const Parser = struct {
     cover_init_span: ast.Span = .{ .start = 0, .end = 0 },
     hole_span: ast.Span = .{ .start = 0, .end = 0 },
     async_ctx: enum { none, params, body } = .none,
+    yield_ctx: enum { none, params, body } = .none,
     await_count: u32 = 0,
+    /// Yield expressions parsed so far: arrow parameters must not contain one.
+    yield_count: u32 = 0,
     /// When probing `async (...)` at `.none`, defer `await` identifier error until we know if `=>` follows.
     in_async_paren: bool = false,
     async_paren_await_span: ?ast.Span = null,
@@ -592,16 +595,26 @@ const Parser = struct {
         };
     }
 
-    /// `function [name](a, b, …) { body }`, starting at `function`.
+    /// `function [*][name](a, b, …) { body }`, starting at `function`.
     fn function(p: *Parser, kind: @FieldType(ast.Function, "kind"), is_async: bool, start: u32) Error!*const ast.Function {
         try p.enter();
         defer p.depth -= 1;
         try p.advance(); // `function`
-        if (p.tok.tag == .star) return p.fail(.{ .unsupported = .syntax }, p.tok); // generator
+        var is_generator = false;
+        if (p.tok.tag == .star) {
+            if (is_async) return p.fail(.{ .unsupported = .syntax }, p.tok); // async generator
+            is_generator = true;
+            try p.advance();
+        }
 
         const outer_async_ctx = p.async_ctx;
-        defer p.async_ctx = outer_async_ctx;
+        const outer_yield_ctx = p.yield_ctx;
+        defer {
+            p.async_ctx = outer_async_ctx;
+            p.yield_ctx = outer_yield_ctx;
+        }
         if (is_async and kind == .expression) p.async_ctx = .params;
+        if (is_generator and kind == .expression) p.yield_ctx = .params;
 
         var name: ?ast.Declarator = null;
         if (p.tok.tag != .l_paren) {
@@ -609,18 +622,23 @@ const Parser = struct {
         } else if (kind == .declaration) {
             return p.fail(.{ .syntax_error = "function declaration needs a name" }, p.tok);
         }
-        return p.functionRest(start, kind, name, is_async);
+        return p.functionRest(start, kind, name, is_async, is_generator);
     }
 
     /// From the parameter list on: shared by `function` and object-literal methods
     /// (`{ f(a) { … } }`, an anonymous function expression whose name is not bound).
-    fn functionRest(p: *Parser, start: u32, kind: @FieldType(ast.Function, "kind"), name: ?ast.Declarator, is_async: bool) Error!*const ast.Function {
+    fn functionRest(p: *Parser, start: u32, kind: @FieldType(ast.Function, "kind"), name: ?ast.Declarator, is_async: bool, is_generator: bool) Error!*const ast.Function {
         const id = p.function_count;
         p.function_count += 1;
 
         const outer_async_ctx = p.async_ctx;
+        const outer_yield_ctx = p.yield_ctx;
         p.async_ctx = if (is_async) .params else .none;
-        defer p.async_ctx = outer_async_ctx;
+        p.yield_ctx = if (is_generator) .params else .none;
+        defer {
+            p.async_ctx = outer_async_ctx;
+            p.yield_ctx = outer_yield_ctx;
+        }
 
         const params = try p.parseParams();
 
@@ -637,6 +655,7 @@ const Parser = struct {
         p.in_class_method = false;
         p.function_depth += 1;
         p.async_ctx = if (is_async) .body else .none;
+        p.yield_ctx = if (is_generator) .body else .none;
         defer {
             p.loop_depth = outer_loops;
             p.switch_depth = outer_switches;
@@ -653,6 +672,7 @@ const Parser = struct {
             .id = id,
             .kind = kind,
             .is_async = is_async,
+            .is_generator = is_generator,
             .length = paramLength(params),
             .name = name,
             .params = params,
@@ -726,6 +746,9 @@ const Parser = struct {
                 .none => p.fail(.{ .unsupported = .syntax }, t),
                 .params, .body => p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t),
             };
+        }
+        if (std.mem.eql(u8, name, "yield") and p.yield_ctx != .none) {
+            return p.fail(.{ .syntax_error = "'yield' is not a valid identifier name in a generator" }, t);
         }
         try p.advance();
         const d: ast.Declarator = .{ .name = name, .span = span(t, t), .binding = p.binding_count, .init = null };
@@ -863,6 +886,9 @@ const Parser = struct {
                         .params, .body => p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t),
                     };
                 }
+                if (std.mem.eql(u8, name, "yield") and p.yield_ctx != .none) {
+                    return p.fail(.{ .syntax_error = "'yield' is not a valid identifier name in a generator" }, t);
+                }
                 const d: ast.Declarator = .{ .name = name, .span = span(t, t), .binding = p.binding_count, .init = null };
                 p.binding_count += 1;
                 const pat = try p.patNode(d.span, .{ .binding = d }, 0);
@@ -935,6 +961,28 @@ const Parser = struct {
         defer p.depth -= 1;
         p.last_was_paren = false;
         if (p.tok.tag == .identifier) {
+            if (p.isText(p.tok, "yield") and p.yield_ctx != .none) {
+                if (p.yield_ctx == .params) {
+                    return p.fail(.{ .syntax_error = "yield is not valid in generator parameters" }, p.tok);
+                }
+                const yield_tok = p.tok;
+                p.yield_count += 1;
+                try p.advance(); // `yield`
+                if (!p.tok.newline_before and p.tok.tag == .star) {
+                    try p.advance(); // `*`
+                    const operand = try p.assignment();
+                    return p.node(.{ .start = yield_tok.start, .end = operand.span.end }, .{ .yield = .{ .star = true, .value = operand } }, operand.depth);
+                }
+                const no_operand = p.tok.newline_before or switch (p.tok.tag) {
+                    .r_paren, .r_bracket, .r_brace, .comma, .semicolon, .colon, .eof => true,
+                    else => false,
+                };
+                if (no_operand) {
+                    return p.node(.{ .start = yield_tok.start, .end = yield_tok.end }, .{ .yield = .{ .star = false, .value = null } }, 0);
+                }
+                const operand = try p.assignment();
+                return p.node(.{ .start = yield_tok.start, .end = operand.span.end }, .{ .yield = .{ .star = false, .value = operand } }, operand.depth);
+            }
             if (p.isText(p.tok, "async")) {
                 var copy = p.lexer;
                 const t1 = try copy.next();
@@ -951,6 +999,7 @@ const Parser = struct {
                     const async_tok = p.tok;
                     try p.advance(); // `async`
                     const await_before = p.await_count;
+                    const yield_before = p.yield_count;
                     const saved_in_async_paren = p.in_async_paren;
                     const saved_await_span = p.async_paren_await_span;
                     p.in_async_paren = (p.async_ctx == .none);
@@ -967,6 +1016,8 @@ const Parser = struct {
                         if (p.tok.newline_before) return p.fail(.{ .syntax_error = "line terminator before '=>'" }, p.tok);
                         if (p.await_count != await_before or paren_await != null)
                             return p.failAt(.{ .syntax_error = "await is not valid in async arrow parameters" }, res.start, res.end);
+                        if (p.yield_count != yield_before)
+                            return p.failAt(.{ .syntax_error = "yield is not valid in arrow parameters" }, res.start, res.end);
                         return p.arrowFromParenList(res, true, async_tok.start);
                     }
                     if (paren_await) |sp| return p.failAt(.{ .unsupported = .syntax }, sp.start, sp.end);
@@ -982,10 +1033,12 @@ const Parser = struct {
         var lhs_was_paren = false;
         const lhs = if (p.tok.tag == .l_paren) blk: {
             const await_before = p.await_count;
+            const yield_before = p.yield_count;
             const res = try p.parseParenList();
             if (p.tok.tag == .arrow) {
                 if (p.tok.newline_before) return p.fail(.{ .syntax_error = "line terminator before '=>'" }, p.tok);
                 if (p.await_count != await_before) return p.failAt(.{ .syntax_error = "await is not valid in arrow parameters" }, res.start, res.end);
+                if (p.yield_count != yield_before) return p.failAt(.{ .syntax_error = "yield is not valid in arrow parameters" }, res.start, res.end);
                 return p.arrowFromParenList(res, false, res.start);
             }
             const inner = try p.finishParenAsExpr(res);
@@ -1197,6 +1250,7 @@ const Parser = struct {
         const outer_switches = p.switch_depth;
         const outer_labels = p.labels;
         const outer_async_ctx = p.async_ctx;
+        const outer_yield_ctx = p.yield_ctx;
         const outer_derived = p.in_derived_ctor;
         p.loop_depth = 0;
         p.switch_depth = 0;
@@ -1204,6 +1258,7 @@ const Parser = struct {
         if (p.in_derived_ctor == .direct) p.in_derived_ctor = .arrow;
         p.function_depth += 1;
         p.async_ctx = if (is_async) .body else .none;
+        p.yield_ctx = .none;
         defer {
             p.loop_depth = outer_loops;
             p.switch_depth = outer_switches;
@@ -1211,6 +1266,7 @@ const Parser = struct {
             p.in_derived_ctor = outer_derived;
             p.function_depth -= 1;
             p.async_ctx = outer_async_ctx;
+            p.yield_ctx = outer_yield_ctx;
         }
 
         var body: []const ast.Stmt = undefined;
@@ -1772,11 +1828,17 @@ const Parser = struct {
                 continue;
             }
             var is_async_method = false;
+            var is_generator_method = false;
             var prop_kind: @FieldType(@FieldType(ast.PropertyDef, "prop"), "kind") = .init;
             const k: ast.PropertyKey = switch (t.tag) {
                 .l_bracket => try p.computedPropertyKey(),
                 .string => try p.stringPropertyKey(t),
                 .number => try p.numberPropertyKey(t),
+                .star => blk: {
+                    is_generator_method = true;
+                    try p.advance(); // `*`
+                    break :blk try p.parsePropertyKey();
+                },
                 else => blk: {
                     if (t.tag != .identifier and !token.isKeyword(t.tag)) return p.fail(.{ .unsupported = .syntax }, t);
                     const name = t.text(p.source());
@@ -1807,7 +1869,7 @@ const Parser = struct {
                     break :blk .{ .name = name };
                 },
             };
-            if ((is_async_method or prop_kind != .init) and p.tok.tag != .l_paren) {
+            if ((is_async_method or is_generator_method or prop_kind != .init) and p.tok.tag != .l_paren) {
                 return p.fail(.{ .syntax_error = "expected '(' after method name" }, p.tok);
             }
             switch (p.tok.tag) {
@@ -1822,7 +1884,7 @@ const Parser = struct {
                     depth = @max(depth, value.depth);
                 },
                 .l_paren => {
-                    const f = try p.functionRest(t.start, .expression, null, is_async_method);
+                    const f = try p.functionRest(t.start, .expression, null, is_async_method, is_generator_method);
                     if (prop_kind != .init) {
                         try p.validateAccessorParams(prop_kind == .getter, f.params, t);
                     }
@@ -1844,6 +1906,9 @@ const Parser = struct {
                             .params, .body => p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t),
                         };
                     }
+                    if (std.mem.eql(u8, k.name, "yield") and p.yield_ctx != .none) {
+                        return p.fail(.{ .syntax_error = "'yield' is not a valid identifier name in a generator" }, t);
+                    }
                     const id = p.ref_count;
                     p.ref_count += 1;
                     const value = try p.node(span(t, t), .{ .identifier = .{ .name = k.name, .span = span(t, t), .id = id } }, 0);
@@ -1860,6 +1925,9 @@ const Parser = struct {
                             .none => p.fail(.{ .unsupported = .syntax }, t),
                             .params, .body => p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t),
                         };
+                    }
+                    if (std.mem.eql(u8, k.name, "yield") and p.yield_ctx != .none) {
+                        return p.fail(.{ .syntax_error = "'yield' is not a valid identifier name in a generator" }, t);
                     }
                     const eq_tok = p.tok;
                     try p.advance();
@@ -2018,6 +2086,9 @@ const Parser = struct {
                         .none => if (!p.in_async_paren) return p.fail(.{ .unsupported = .syntax }, t),
                         .params, .body => return p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t),
                     }
+                }
+                if (std.mem.eql(u8, name, "yield") and p.yield_ctx != .none) {
+                    return p.fail(.{ .syntax_error = "'yield' is not a valid identifier name in a generator" }, t);
                 }
                 // `this`, `new`, `typeof`, `function`, … start constructs ZQJS lacks;
                 // `let` as a variable name is legal sloppy JS we choose not to support.
@@ -2645,12 +2716,14 @@ const Parser = struct {
                 const outer_derived = p.in_derived_ctor;
                 const outer_method = p.in_class_method;
                 const outer_async_ctx = p.async_ctx;
+                const outer_yield_ctx = p.yield_ctx;
                 p.loop_depth = 0;
                 p.switch_depth = 0;
                 p.labels = .empty;
                 p.in_derived_ctor = .none;
                 p.in_class_method = true;
                 p.async_ctx = .none;
+                p.yield_ctx = .none;
                 p.function_depth += 1;
                 defer {
                     p.loop_depth = outer_loops;
@@ -2659,6 +2732,7 @@ const Parser = struct {
                     p.in_derived_ctor = outer_derived;
                     p.in_class_method = outer_method;
                     p.async_ctx = outer_async_ctx;
+                    p.yield_ctx = outer_yield_ctx;
                     p.function_depth -= 1;
                 }
                 const parsed_body = try p.parseFunctionBody();
@@ -2681,6 +2755,7 @@ const Parser = struct {
                 continue;
             }
             var is_async = false;
+            var is_generator = false;
             var method_kind: @FieldType(ast.ClassMethod, "kind") = .method;
             if (p.isText(p.tok, "async")) {
                 const next = try p.peek();
@@ -2694,6 +2769,12 @@ const Parser = struct {
                     method_kind = if (p.isText(p.tok, "get")) .getter else .setter;
                     try p.advance();
                 }
+            }
+            if (p.tok.tag == .star) {
+                if (is_async) return p.fail(.{ .unsupported = .syntax }, p.tok);
+                if (method_kind != .method) return p.fail(.{ .syntax_error = "unexpected '*'" }, p.tok);
+                is_generator = true;
+                try p.advance();
             }
             const key_tok = p.tok;
             const is_private = p.tok.tag == .private_ident;
@@ -2727,6 +2808,9 @@ const Parser = struct {
             if (is_ctor and is_async) {
                 return p.fail(.{ .syntax_error = "class constructor may not be an async method" }, key_tok);
             }
+            if (is_ctor and is_generator) {
+                return p.fail(.{ .syntax_error = "class constructor may not be a generator method" }, key_tok);
+            }
             if (is_ctor and method_kind != .method) {
                 return p.fail(.{ .syntax_error = "class constructor may not be an accessor" }, key_tok);
             }
@@ -2737,7 +2821,7 @@ const Parser = struct {
                 return p.fail(.{ .syntax_error = "classes may not have a static property named 'prototype'" }, key_tok);
             }
             if (p.tok.tag != .l_paren) {
-                if (is_async or method_kind != .method) {
+                if (is_async or is_generator or method_kind != .method) {
                     return p.fail(.{ .syntax_error = "expected '('" }, p.tok);
                 }
                 if (is_ctor) {
@@ -2752,14 +2836,17 @@ const Parser = struct {
                     const outer_derived = p.in_derived_ctor;
                     const outer_method = p.in_class_method;
                     const outer_async_ctx = p.async_ctx;
+                    const outer_yield_ctx = p.yield_ctx;
                     p.in_derived_ctor = .none;
                     p.in_class_method = true;
                     p.async_ctx = .none;
+                    p.yield_ctx = .none;
                     p.function_depth += 1;
                     defer {
                         p.in_derived_ctor = outer_derived;
                         p.in_class_method = outer_method;
                         p.async_ctx = outer_async_ctx;
+                        p.yield_ctx = outer_yield_ctx;
                         p.function_depth -= 1;
                     }
                     const init_expr = try p.nested();
@@ -2810,8 +2897,13 @@ const Parser = struct {
             p.function_count += 1;
 
             const outer_async_ctx = p.async_ctx;
+            const outer_yield_ctx = p.yield_ctx;
             p.async_ctx = if (is_async) .params else .none;
-            defer p.async_ctx = outer_async_ctx;
+            p.yield_ctx = if (is_generator) .params else .none;
+            defer {
+                p.async_ctx = outer_async_ctx;
+                p.yield_ctx = outer_yield_ctx;
+            }
             const params = try p.parseParams();
             if (method_kind != .method) {
                 try p.validateAccessorParams(method_kind == .getter, params, key_tok);
@@ -2830,6 +2922,7 @@ const Parser = struct {
             p.in_class_method = true;
             p.function_depth += 1;
             p.async_ctx = if (is_async) .body else .none;
+            p.yield_ctx = if (is_generator) .body else .none;
             defer {
                 p.loop_depth = outer_loops;
                 p.switch_depth = outer_switches;
@@ -2847,6 +2940,7 @@ const Parser = struct {
                 .kind = .expression,
                 .is_arrow = false,
                 .is_async = is_async,
+                .is_generator = is_generator,
                 .is_method = !is_ctor,
                 .is_class_constructor = is_ctor,
                 .has_super_ctor = is_ctor and has_super,

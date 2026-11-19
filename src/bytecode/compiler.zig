@@ -92,6 +92,8 @@ const Shared = struct {
                     try c.bindPattern(p.pattern, .init);
                 }
             }
+            // Parameters bind on the call; the generator object is returned here (D67).
+            if (func.is_generator) try c.emit(.generator_start, &.{});
         }
         const completes = try c.statements(body, .{ .start = 0, .end = 0 });
         if (completes) switch (kind) {
@@ -266,7 +268,8 @@ const Compiler = struct {
         return .{
             .kind = kind,
             .is_arrow = if (f) |func| func.is_arrow else false,
-            .is_async = if (f) |func| func.is_async else false,
+            .is_async = if (f) |func| func.is_async or func.is_generator else false,
+            .is_generator = if (f) |func| func.is_generator else false,
             .is_method = if (f) |func| func.is_method else false,
             .is_class_constructor = if (f) |func| func.is_class_constructor else false,
             .has_super_ctor = if (f) |func| func.has_super_ctor else false,
@@ -742,6 +745,55 @@ const Compiler = struct {
         try c.emit(.@"return", &.{});
     }
 
+    /// A `return` of the value on top of the stack from inside an expression (a generator
+    /// resumed with `return()`, D67): drops the operands below it first, since statements
+    /// run on an empty stack and `return` (or a `finally` jump) expects only the value.
+    fn returnFromExpr(c: *Compiler) Error!void {
+        if (c.depth > 1) {
+            const tmp = c.allocTemp();
+            defer c.freeTemp();
+            try c.emit(.init_local, &.{tmp});
+            while (c.depth > 0) try c.emit(.pop, &.{});
+            try c.emit(.get_local, &.{ tmp, try c.name("<yield>") });
+            try c.emit(.clear_local, &.{tmp});
+        }
+        try c.emitReturn();
+    }
+
+    /// `yield* e` (D67): a loop around `yield_star_step`, the inner iterator in a hidden
+    /// slot; inner results are yielded raw, and the resume's [value, mode] feeds the next round.
+    fn yieldStar(c: *Compiler, operand: *const ast.Expr) Error!void {
+        const iter_slot = c.allocTemp();
+        defer c.freeTemp();
+        try c.expr(operand);
+        try c.emit(.get_iter, &.{});
+        try c.emit(.init_local, &.{iter_slot});
+        try c.emit(.push_undefined, &.{});
+        try c.emit(.push_const, &.{try c.number(0)});
+        const top = c.here();
+        const round = c.depth; // [received, mode]
+        try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
+        try c.emit(.rot3, &.{});
+        try c.emit(.yield_star_step, &.{});
+        try c.emit(.dup, &.{});
+        const to_yield = try c.jumpForward(.jump_if_false);
+        try c.emit(.push_const, &.{try c.number(1)});
+        try c.emit(.strict_eq, &.{});
+        const to_return = try c.jumpForward(.jump_if_false);
+        const to_done = try c.jumpForward(.jump);
+        c.patch(to_return, c.here());
+        try c.emit(.clear_local, &.{iter_slot});
+        try c.returnFromExpr();
+        c.patch(to_yield, c.here());
+        c.depth = round; // [value, kind]
+        try c.emit(.pop, &.{});
+        try c.emit(.yield, &.{1});
+        try c.emit(.jump, &.{top});
+        c.patch(to_done, c.here());
+        c.depth = round - 1; // [value]
+        try c.emit(.clear_local, &.{iter_slot});
+    }
+
     fn attachLabelsToLoop(c: *Compiler, loop: *Loop) void {
         var i = c.controls.items.len;
         while (i > 0) {
@@ -1107,6 +1159,25 @@ const Compiler = struct {
             .await => |inner| {
                 try c.expr(inner);
                 try c.emit(.await, &.{});
+            },
+            .yield => |y| {
+                if (y.star) return c.yieldStar(y.value.?);
+                if (y.value) |v| try c.expr(v) else try c.emit(.push_undefined, &.{});
+                try c.emit(.yield, &.{0});
+                // [value, mode]: next → value; throw → throw value; return → `return value`.
+                const resumed = c.depth;
+                try c.emit(.dup, &.{});
+                const to_next = try c.jumpForward(.jump_if_false);
+                try c.emit(.push_const, &.{try c.number(1)});
+                try c.emit(.strict_eq, &.{});
+                const to_return = try c.jumpForward(.jump_if_false);
+                try c.emit(.throw, &.{});
+                c.patch(to_return, c.here());
+                c.depth = resumed - 1;
+                try c.returnFromExpr();
+                c.patch(to_next, c.here());
+                c.depth = resumed;
+                try c.emit(.pop, &.{});
             },
             .unary => |u| {
                 if (u.op == .typeof and u.operand.data == .identifier) {

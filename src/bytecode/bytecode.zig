@@ -271,6 +271,17 @@ pub const Op = enum(u8) {
     halt,
     /// [val] → [resumed_val]: suspend the async coroutine awaiting `val` (D56).
     await,
+    /// Generator call (D67): suspend after the parameter prologue so the call can
+    /// return the generator object. The first `next()` resumes past it.
+    generator_start,
+    /// [val] → [resumed_val, mode]: suspend the generator yielding `val` (D67); the resume
+    /// pushes its value and mode (0 next, 1 throw, 2 return), which compiled code dispatches.
+    /// Operand (argc kind): 1 for `yield*`'s raw inner result, returned to `next()` as is.
+    yield,
+    /// [iterator, received, mode] → [value, kind]: one round of `yield*` (D67): call the
+    /// inner iterator's next/throw/return. kind 0: not done, value is the inner result to
+    /// yield raw; 1: done, value is the `yield*` result; 2: done in return mode, return value.
+    yield_star_step,
 
     pub const Info = struct {
         operands: []const Operand,
@@ -372,6 +383,9 @@ pub const Op = enum(u8) {
             .call, .new_call => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
             .halt => .{ .operands = &.{}, .pops = 0, .pushes = 0 },
             .await => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .generator_start => .{ .operands = &.{}, .pops = 0, .pushes = 0 },
+            .yield => .{ .operands = &.{.argc}, .pops = 1, .pushes = 2 },
+            .yield_star_step => .{ .operands = &.{}, .pops = 3, .pushes = 2 },
             .throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
         };
     }
@@ -426,7 +440,10 @@ pub fn readU32(code: []const u8, pos: usize) u32 {
 pub const Proto = struct {
     kind: enum { script, function } = .script,
     is_arrow: bool = false,
+    /// Calls run as a coroutine (D56): async functions and, with `is_generator`, generators
+    /// (D67), so every call path's coroutine check covers both.
     is_async: bool = false,
+    is_generator: bool = false,
     is_method: bool = false,
     is_class_constructor: bool = false,
     has_super_ctor: bool = false,

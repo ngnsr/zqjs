@@ -104,7 +104,8 @@ const Verifier = struct {
                 .@"return" => if (p.kind != .function) return v.fail(p, at, "return outside a function"),
                 .push_callee => if (p.kind != .function) return v.fail(p, at, "push_callee outside a function"),
                 .get_arg, .rest_array => if (p.kind != .function) return v.fail(p, at, "function-only instruction outside a function"),
-                .await => if (p.kind != .function or !p.is_async) return v.fail(p, at, "await outside an async function"),
+                .await => if (p.kind != .function or !p.is_async or p.is_generator) return v.fail(p, at, "await outside an async function"),
+                .generator_start, .yield, .yield_star_step => if (p.kind != .function or !p.is_generator) return v.fail(p, at, "generator instruction outside a generator"),
                 .new_regexp => {
                     const k0 = bc.readU32(p.code, pc + 1);
                     const k1 = bc.readU32(p.code, pc + 5);

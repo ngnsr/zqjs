@@ -112,8 +112,14 @@ pub const Vm = struct {
     /// The nested call's result, set when its frame 0 returns. Null until then; a halt
     /// without one is an engine bug (a function's proto always ends in `return`).
     nested_result: ?Value = null,
-    /// The value passed to `await` when this VM is suspended in `.awaiting` (D56).
+    /// The value passed to `await` when this VM is suspended in `.awaiting` (D56), or the
+    /// value a generator yielded (D67).
     awaited: Value = .undefined,
+    /// Set by `yield`/`generator_start` (in `executeCold`) to stop the run loop; the
+    /// suspension is then reported as `.yielded`, not `.awaiting` (D67).
+    yielding: bool = false,
+    /// The pending yield is `yield*`'s raw inner result.
+    yield_raw: bool = false,
     /// The execution context this VM charges (M9.1, D51): set while a chain runs it —
     /// the embedding API's resume, or a nested call — so frames check the chain's shared
     /// `call_depth` instead of a per-VM limit. Null for a chain-less VM (the CLI's),
@@ -260,7 +266,7 @@ pub const Vm = struct {
 
     const CoroAction = union(enum) {
         start,
-        @"resume": struct { val: Value, rejected: bool },
+        @"resume": struct { val: Value, mode: coroutine.ResumeMode },
     };
 
     noinline fn startAsyncFromVm(vm: *Vm, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
@@ -268,9 +274,12 @@ pub const Vm = struct {
         return startAsync(vm.rt, vm, c, this, args);
     }
 
+    /// Every `is_async` call lands here: async functions and generators (D67).
     noinline fn startAsync(rt: *Runtime, caller_vm: ?*Vm, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
         @branchHint(.cold);
         const ctx: StartAsyncCtx = .{ .rt = rt, .caller_vm = caller_vm, .c = c, .this = this, .args = args };
+        if (@as(*const Proto, @ptrCast(@alignCast(c.impl.vm.proto))).is_generator)
+            return coroutine.startGenerator(rt, &coro_vtable, .{ .closure = c }, ctx, createAndRunCoro);
         return coroutine.start(rt, &coro_vtable, ctx, createAndRunCoro);
     }
 
@@ -327,7 +336,17 @@ pub const Vm = struct {
             .start => {},
             .@"resume" => |res| {
                 vm.awaited = .undefined;
-                if (res.rejected) {
+                const at = vm.frame().proto.code[vm.pc];
+                if (at == @backingInt(Op.generator_start)) {
+                    vm.pc += Op.generator_start.size(); // the first `next()`: its value is dropped
+                } else if (at == @backingInt(Op.yield)) {
+                    // [value, mode]: the code after `yield` dispatches on the mode (D67).
+                    if (vm.sp + 2 > vm.stack.len) return vm.bug("stack overflow on generator resume");
+                    vm.stack[vm.sp] = res.val;
+                    vm.stack[vm.sp + 1] = .{ .number = @floatFromInt(@backingInt(res.mode)) };
+                    vm.sp += 2;
+                    vm.pc += Op.yield.size();
+                } else if (res.mode == .throw) {
                     _ = rt.throwValue(res.val) catch {};
                     vm.unwind(vm.pc) catch |ue| {
                         if (ue == error.Thrown) return .threw;
@@ -350,14 +369,17 @@ pub const Vm = struct {
         if (rt.exec_ctx.budget_fault != null) return rt.limit(.steps);
         return switch (state) {
             .halted => .{ .returned = vm.nested_result orelse return rt.bug("a nested call ended without a result") },
-            .awaiting => .{ .awaiting = vm.awaited },
+            .awaiting => if (vm.yielding) blk: {
+                vm.yielding = false;
+                break :blk .{ .yielded = .{ .value = vm.awaited, .raw = vm.yield_raw } };
+            } else .{ .awaiting = vm.awaited },
             .running => unreachable,
         };
     }
 
-    fn coroResume(eng: *anyopaque, val: Value, rejected: bool) Error!coroutine.Outcome {
+    fn coroResume(eng: *anyopaque, val: Value, mode: coroutine.ResumeMode) Error!coroutine.Outcome {
         const vm: *Vm = @ptrCast(@alignCast(eng));
-        return runCoroVm(vm, null, .{ .@"resume" = .{ .val = val, .rejected = rejected } });
+        return runCoroVm(vm, null, .{ .@"resume" = .{ .val = val, .mode = mode } });
     }
 
     fn coroTrace(eng: *anyopaque, visit_ctx: *anyopaque, visit: *const fn (*anyopaque, *heap.Obj) void) void {
@@ -890,9 +912,16 @@ pub const Vm = struct {
             .call_method_spread,
             .iter_close,
             .iter_close_throw,
+            .generator_start,
+            .yield,
+            .yield_star_step,
             => {
                 cache.syncSp(vm);
                 if (try vm.executeCold(op, pc, next)) {
+                    if (vm.yielding) {
+                        cache.sp = vm.sp;
+                        return .awaiting; // a generator suspends like `await` (D67)
+                    }
                     cache.* = FrameCache.fromVm(vm, 0);
                     return .running;
                 }
@@ -1542,6 +1571,34 @@ pub const Vm = struct {
                     },
                     else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
                 }
+            },
+            .generator_start, .yield => {
+                // Suspends with `pc` on the instruction; the resume steps past it (D67).
+                var v: Value = .undefined;
+                if (op == .yield) {
+                    v = try cache.peek(vm, 0);
+                    try cache.drop(vm, 1);
+                }
+                cache.syncSp(vm);
+                vm.pc = pc;
+                vm.awaited = v;
+                vm.yield_raw = op == .yield and cache.operand(0) != 0;
+                vm.yielding = true;
+                return true;
+            },
+            .yield_star_step => {
+                const iter_val = try cache.peek(vm, 2);
+                const mode_val = try cache.peek(vm, 0);
+                if (iter_val != .object or iter_val.object.kind != .iterator or mode_val != .number) return vm.bug("yield_star_step operands");
+                const mode: coroutine.ResumeMode = switch (@as(u32, @intFromFloat(mode_val.number))) {
+                    0 => .next,
+                    1 => .throw,
+                    else => .@"return",
+                };
+                const r = try builtins.yieldStarStep(rt, iter_val.object, try cache.peek(vm, 1), mode);
+                try cache.drop(vm, 3);
+                try cache.push(vm, r.value);
+                try cache.push(vm, .{ .number = @floatFromInt(@backingInt(r.kind)) });
             },
             .iter_close, .iter_close_throw => {
                 const iter_val = try cache.peek(vm, 0);

@@ -228,7 +228,13 @@ const Dumper = struct {
         if (f.is_arrow) {
             try w.writeAll(if (f.is_async) "(async-arrow (" else "(arrow (");
         } else {
-            try w.writeAll(if (f.is_async) "(async-function " else "(function ");
+            if (f.is_async) {
+                try w.writeAll("(async-function ");
+            } else if (f.is_generator) {
+                try w.writeAll("(generator ");
+            } else {
+                try w.writeAll("(function ");
+            }
             if (f.name) |n| try d.binding(n) else try w.writeByte('_');
             try w.writeAll(" (");
         }
@@ -477,6 +483,14 @@ const Dumper = struct {
             .await => |inner| {
                 try w.writeAll("(await ");
                 try d.expr(inner);
+                try w.writeByte(')');
+            },
+            .yield => |y| {
+                try w.writeAll(if (y.star) "(yield*" else "(yield");
+                if (y.value) |v| {
+                    try w.writeByte(' ');
+                    try d.expr(v);
+                }
                 try w.writeByte(')');
             },
             .member => |m| try d.member(m),

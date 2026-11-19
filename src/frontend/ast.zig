@@ -274,6 +274,11 @@ pub const Expr = struct {
         this,
         /// `await operand` inside an async function body (M28).
         await: *const Expr,
+        /// `yield [operand]` / `yield* operand` inside a generator body (M37).
+        yield: struct {
+            star: bool,
+            value: ?*const Expr,
+        },
         /// `function [name](params) { body }` as an expression.
         function: *const Function,
         /// `class [Name] [extends Expr] { ... }` as an expression (M33, D63).
@@ -344,6 +349,7 @@ pub const Function = struct {
     kind: enum { declaration, expression },
     is_arrow: bool = false,
     is_async: bool = false,
+    is_generator: bool = false,
     /// Concise object-literal method (`{ m() {} }`): not constructable and has no `.prototype` (D62).
     is_method: bool = false,
     /// Class constructor (`class C { constructor() {} }`): requires `new` (D63).

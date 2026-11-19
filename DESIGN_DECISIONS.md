@@ -1581,3 +1581,90 @@ until a follow-up milestone).
 - **`IteratorClose` (`builtins.zig`, `bytecode.zig`, `compiler.zig`, `vm.zig`, `machine.zig`):**
   - `builtins.iteratorClose(rt, iter, is_throw)` invokes `iter.return()` on abrupt exits (normal `break`/`return`/outer-jump/partial destructuring or exception unwind), validating callable `return` and object result when `!is_throw` while preserving original exceptions when `is_throw` is true; built-in iterators preserve their remaining cursor state after `break`.
   - Bytecode adds `.iter_close` and `.iter_close_throw` with `for_of` and array-destructuring catch-all exception handlers and unwind handling in `Machine`; `Machine.callFromBuiltin` saves and roots `m.ret` so calling `iter.return()` during a `return` unwind preserves the enclosing return value.
+
+---
+
+## D67. Synchronous generators (`function*`, `yield`, `yield*`) (M37)
+
+**Decision:** A generator call is a D56 coroutine without a promise. `yield` is a second way
+for a coroutine engine (VM or Machine) to suspend; `next`/`throw`/`return` resume it with a
+*mode*, and the compiled code after each `yield` turns the mode into an ordinary `throw` or
+`return`, so D55's `finally` records do all unwinding. No new unwind machinery, no new
+verifier rules.
+
+- **Coroutine reuse (`heap.zig`, `coroutine.zig`).** `Coroutine.promise` becomes
+  `?*Object` (`null` for generators; every reader handles `null`). `coroutine.Outcome` gains
+  `.yielded: Value`. A resume carries `mode: enum { next, throw, @"return" }` (the async path
+  keeps using `next`/`throw` for fulfilled/rejected). Suspension at a `yield` does exactly what
+  an `await` suspension does for memory and GC: `shrink`, recompute and `adjustCharge` the
+  charge (against `max_heap_bytes`), `remember` the coroutine if old, `state = suspended`.
+  Completion (`return`, uncaught throw, or fault) goes to `done` and destroys the engine, as in
+  D56 invariant 3. Steps, call depth and stack slots are charged through the shared execution
+  context exactly like an async resume.
+- **Generator object (`heap.zig`, `builtins.zig`).** `Object.kind.generator { co: ?*Coroutine,
+  state: enum { suspended_start, suspended_yield, executing, completed } }`, traced by
+  `forEachChild`/`RememberedScan`; `co` is `null` once completed. Its `[[Prototype]]` is
+  `genFn.prototype` if that is an object, else `%GeneratorPrototype%`.
+- **Call order.** Parameter binding and defaults run **on the call** (spec
+  FunctionDeclarationInstantiation; Node agrees). The compiler emits `generator_start` right
+  after the parameter prologue; the call runs the coroutine to it, the engine reports
+  `.yielded`, and the call returns the generator object in `suspended_start`. A throw from a
+  default propagates from the call, and no generator object is created.
+- **`yield` (VM).** Op `yield` pops the value and stops the run loop with state `.yielding`
+  (like `.awaiting`), `pc` on the `yield`. Resume pushes `[value, mode]` and advances `pc`
+  past it. The compiler then emits a dispatch: mode `throw` → `throw value`; mode `return` →
+  an ordinary compiled `return value` (through every enclosing `finally`, so a `finally` that
+  yields leaves the generator suspended, and one that throws or returns wins); mode `next` →
+  `value` is the expression's result. Resuming `suspended_start` with `throw`/`return` never
+  enters the engine: the generator goes to `completed` (engine destroyed), and `throw`
+  rethrows / `return` gives `{ value, done: true }`.
+- **`yield` (Machine).** A `yield_suspend` task (like `await_suspend`) and, on resume, a
+  `yield_resume` that maps `throw` to the Machine's throw path and `return` to the same
+  completion a `return` statement produces (unwinding through `finally` tasks). New `Task`
+  variants are fully traced in `visitRoots` and never hold `undefined` payloads.
+- **`yield* e`.** Compiled (and interpreted) as a loop: `GetIterator(e)` into a hidden local
+  (like for-of's `iter_slot`), `received = undefined, mode = next`; each round calls
+  `inner.next(received)` / `inner.throw(received)` / `inner.return(received)` according to
+  `mode`; a result with `done` truthy ends the loop (for `return` mode it becomes a `return`
+  of its value through `finally`); otherwise the inner result object itself is yielded **as
+  is** (spec GeneratorYield(innerResult): `outer.next()` returns that same object and its
+  `value` is not read), so `yield` carries a `raw` operand and a raw yield is returned
+  unwrapped by `next`/`throw`/`return`. An inner iterator without `throw`: call
+  `IteratorClose(inner)` then throw `TypeError`. Without `return`: perform the outer `return`.
+  The expression's value is the final `value`.
+- **`%GeneratorPrototype%`** inherits `%IteratorPrototype%` (so `g[Symbol.iterator]() === g`)
+  and has `next`, `return`, `throw` (other node names stay `Unsupported(builtin)`, D39). Calling
+  any of them on an `executing` generator throws `TypeError: Generator is already running`;
+  on a non-generator receiver, `TypeError`. `completed`: `next` → `{undefined, done: true}`,
+  `return(v)` → `{v, done: true}`, `throw(e)` → throws `e`.
+- **Generator functions** are not constructable (`new g()`, `extends g` → `TypeError`) but
+  have an own `.prototype`: a fresh object inheriting `%GeneratorPrototype%`, with no
+  `constructor` property. Methods (`*m()`, `static *m()`, `*[k]()`, `#*m()` / `*#m()`) are
+  generators too. `async function*` stays `Unsupported(syntax)`.
+- **Iteration protocol.** Generators go through `getIterator`'s custom path (D66):
+  `for...of`, spread, array destructuring, `Array.from`, `Map`/`Set` constructors and
+  `Promise.all` work unchanged, and `IteratorClose` calls `gen.return()`, running the
+  generator's `finally` blocks.
+- **Syntax.** `yield` is an assignment-expression-level operator in generator bodies only
+  (`yield`, `yield e`, `yield* e`; no operand before `)`, `]`, `}`, `,`, `;`, `:`, or a line
+  break). `yield` in a generator's parameter defaults, or as an identifier inside a generator,
+  is a `SyntaxError`; outside generators sloppy-mode `yield` as an identifier keeps today's
+  behavior.
+- **VM performance.** Generator ops live in `executeCold`; no non-inlined helper takes
+  `*FrameCache`.
+
+**Implementation notes (M37 review, 2026-11-19).**
+- `Proto.is_async` is set for generators too (`is_generator` tells them apart), so every
+  existing call path (VM call ops, `api.zig`) routes a generator call into `startAsync`, which
+  dispatches to `coroutine.startGenerator`. The VM has no `.yielding` run state: `yield` stops
+  the loop as `.awaiting` with `vm.yielding` set, and the driver reports `.yielded`.
+- `yield*` compiles to a loop around one helper op, `yield_star_step`, which calls the shared
+  `builtins.yieldStarStep` (next/throw/return forwarding) on both engines; the Machine maps a
+  resume's `throw`/`return` inline in `runCoroMachine`, with no separate `yield_resume` task.
+- A `return()` resume at a `yield` nested inside an expression pops the operands below it
+  before the compiled `return` (statements start on an empty operand stack; the verifier
+  checks that at `return`).
+- Each `yield*` level nests a native resume, so nesting depth is bounded by D60's native-stack
+  limit (`LimitExceeded(native_stack)`; between 500 and 1000 levels in ReleaseSafe CLI builds).
+- Not in M37: `%GeneratorFunction.prototype%` and `%GeneratorPrototype%.constructor`
+  (`Unsupported(builtin)`), async generators.

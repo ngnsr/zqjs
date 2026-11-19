@@ -1,0 +1,43 @@
+decl: {1,false} {2,false} {3,true} {undefined,true}
+expr: a 0,1,2,3 inner anon
+obj methods: m c
+class methods: 10,11 2,3,4 k 5
+next(v): {first,false} {got x,false} {end y,true} {undefined,true}
+yield in expr: {a,false} {b,false} {1|2|3|4,true}
+return through finally: {42,true} cleanup {undefined,true}
+yield in finally: {in finally,false} {r,true} {undefined,true}
+finally overrides return: {override,true}
+finally throws: from finally {undefined,true}
+return mid-expression: {mid,true} expr finally
+throw caught: {caught boom,false} {waiting,false} {caught again,false}
+throw through finally: passes throw finally {undefined,true}
+return at start: {early,true} {undefined,true} false
+throw at start: start throw {undefined,true}
+completed: {undefined,true} {7,true}
+throw on completed: after
+re-entrancy: {true Generator is already running,false}
+new genFn: true
+proto chain: true true true function function function false 0
+Symbol.iterator: true [object Generator]
+null prototype: true
+bad receiver: true
+defaults on call: default,created,body
+default throws at call: bad default
+for-of closes: closed break,closed return,closed throw
+spread: 1,2 3
+destructuring: 1 closed destructure 0 1 2,3,4,5
+Array.from: 1,2,3 10,20
+Set: first|got undefined
+Map: 1 2 2
+yield* array: 1,2,
+yield* string: h,é,!
+yield* custom: {1,false} {2,false} {result inner-done,false} next:undefined,next:b,next:c
+forward throw: {recovered,false} {ret:bye,true} next:undefined,throw:t,return:bye
+missing throw: true next:undefined,return:undefined {undefined,true}
+missing return: {outer,true} {undefined,true}
+nested: {i1,false} {i2:v,false} {outer got inner-ret,false} {undefined,true}
+nested return: {stop,true} inner finally,outer finally
+nested throw: deep inner finally,outer finally
+identity: true kept
+lazy: 0,1,2,3,4
+recursive yield*: 8

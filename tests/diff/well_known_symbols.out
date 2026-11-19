@@ -1,0 +1,29 @@
+toPrimitive symbol Symbol(Symbol.toPrimitive) undefined false false false
+toStringTag symbol Symbol(Symbol.toStringTag) undefined false false false
+hasInstance symbol Symbol(Symbol.hasInstance) undefined false false false
+Map.prototype Map false false true
+Set.prototype Set false false true
+Promise.prototype Promise false false true
+Symbol.prototype Symbol false false true
+Math Math false false true
+JSON JSON false false true
+GeneratorPrototype Generator false false true
+AsyncGeneratorPrototype AsyncGenerator false false true
+GeneratorFunctionPrototype GeneratorFunction false false true
+AsyncGeneratorFunctionPrototype AsyncGeneratorFunction false false true
+AsyncFunctionPrototype AsyncFunction false false true
+[object Undefined] [object Null] [object Boolean] [object Number] [object String] [object Symbol] [object Array] [object Function] [object Error] [object Error] [object RegExp] [object Map] [object Set] [object Promise] [object Generator] [object AsyncGenerator] [object GeneratorFunction] [object AsyncGeneratorFunction] [object AsyncFunction]
+[object CustomClass]
+[object Plain]
+[object Object]
+[object Object]
+[object MyArr]
+[object Object]
+fhi: function false false false
+fhi.call: true false
+true false
+true true false
+true false
+noncall-hi: TypeError
+nonobj-hi: TypeError
+throw-hi: RangeError hi-err

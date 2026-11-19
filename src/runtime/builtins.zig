@@ -91,8 +91,9 @@ pub const Realm = struct {
     sym_iterator: *heap_mod.Symbol,
     /// `Symbol.asyncIterator` (D68).
     sym_async_iterator: *heap_mod.Symbol,
-    /// `Symbol.toStringTag` (D71).
+    sym_to_primitive: *heap_mod.Symbol,
     sym_to_string_tag: *heap_mod.Symbol,
+    sym_has_instance: *heap_mod.Symbol,
     math: *Object,
     json: *Object,
 
@@ -206,7 +207,9 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .symbol_namespace = try builtin(h, null, .symbol_constructor),
         .sym_iterator = try h.newSymbol(try h.ascii("Symbol.iterator"), false),
         .sym_async_iterator = try h.newSymbol(try h.ascii("Symbol.asyncIterator"), false),
+        .sym_to_primitive = try h.newSymbol(try h.ascii("Symbol.toPrimitive"), false),
         .sym_to_string_tag = try h.newSymbol(try h.ascii("Symbol.toStringTag"), false),
+        .sym_has_instance = try h.newSymbol(try h.ascii("Symbol.hasInstance"), false),
         .math = try builtin(h, object_prototype, .math),
         .json = try builtin(h, object_prototype, .json),
     };
@@ -399,8 +402,37 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .writable = false,
         .configurable = false,
     });
+    try rt.heap.defineProperty(r.symbol_namespace, try rt.heap.internAscii("toPrimitive"), .{
+        .value = .{ .symbol = r.sym_to_primitive },
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
     try rt.heap.defineProperty(r.symbol_namespace, try rt.heap.internAscii("toStringTag"), .{
         .value = .{ .symbol = r.sym_to_string_tag },
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
+    try rt.heap.defineProperty(r.symbol_namespace, try rt.heap.internAscii("hasInstance"), .{
+        .value = .{ .symbol = r.sym_has_instance },
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
+    try defineToStringTag(rt, r.map_prototype, r.sym_to_string_tag, "Map");
+    try defineToStringTag(rt, r.set_prototype, r.sym_to_string_tag, "Set");
+    try defineToStringTag(rt, r.promise_prototype, r.sym_to_string_tag, "Promise");
+    try defineToStringTag(rt, r.symbol_prototype, r.sym_to_string_tag, "Symbol");
+    try defineToStringTag(rt, r.math, r.sym_to_string_tag, "Math");
+    try defineToStringTag(rt, r.json, r.sym_to_string_tag, "JSON");
+    try defineToStringTag(rt, r.generator_prototype, r.sym_to_string_tag, "Generator");
+    try defineToStringTag(rt, r.async_generator_prototype, r.sym_to_string_tag, "AsyncGenerator");
+    try defineToStringTag(rt, r.generator_function_prototype, r.sym_to_string_tag, "GeneratorFunction");
+    try defineToStringTag(rt, r.async_generator_function_prototype, r.sym_to_string_tag, "AsyncGeneratorFunction");
+    try defineToStringTag(rt, r.async_function_prototype, r.sym_to_string_tag, "AsyncFunction");
+    try rt.heap.definePropKey(r.function_prototype, heap_mod.PropKey.fromSymbol(r.sym_has_instance), .{
+        .value = .{ .native = &function_has_instance },
         .enumerable = false,
         .writable = false,
         .configurable = false,
@@ -431,6 +463,15 @@ fn symbolMethod(rt: *Runtime, o: *Object, sym: *heap_mod.Symbol, n: *const Nativ
     try rt.heap.definePropKey(o, heap_mod.PropKey.fromSymbol(sym), .{ .value = .{ .native = n }, .enumerable = false });
 }
 
+fn defineToStringTag(rt: *Runtime, o: *Object, sym: *heap_mod.Symbol, tag: []const u8) Error!void {
+    try rt.heap.definePropKey(o, heap_mod.PropKey.fromSymbol(sym), .{
+        .value = .{ .string = try rt.heap.ascii(tag) },
+        .enumerable = false,
+        .writable = false,
+        .configurable = true,
+    });
+}
+
 fn link(rt: *Runtime, o: *Object, name: []const u8, target: *Object) Error!void {
     const k = try rt.heap.internAscii(name);
     try rt.heap.defineProperty(o, k, .{ .value = .{ .object = target }, .enumerable = false, .writable = false });
@@ -441,9 +482,10 @@ fn constant(rt: *Runtime, o: *Object, name: []const u8, v: Value) Error!void {
     try rt.heap.defineProperty(o, k, .{ .value = v, .enumerable = false });
 }
 
-/// The natives ToPrimitive may call (D40); anything else found there is user code.
-pub fn isConversion(n: *const Native) bool {
-    return n == &object_to_string or n == &object_value_of or n == &array_to_string or n == &error_to_string or n == &regexp_to_string;
+pub const function_has_instance: Native = .{ .name = "[Symbol.hasInstance]", .length = 1, .call = functionHasInstance };
+
+fn functionHasInstance(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return .{ .boolean = try object.ordinaryHasInstance(rt, this, arg(args, 0)) };
 }
 
 pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
@@ -915,18 +957,17 @@ const object_to_string: Native = .{ .name = "toString", .call = objectToString }
 const object_value_of: Native = .{ .name = "valueOf", .call = objectValueOf };
 
 fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
-    const tag: []const u8 = switch (this) {
-        .undefined => "Undefined",
-        .null => "Null",
+    if (this == .undefined) return .{ .string = try rt.heap.ascii("[object Undefined]") };
+    if (this == .null) return .{ .string = try rt.heap.ascii("[object Null]") };
+    const builtin_tag: []const u8 = switch (this) {
+        .undefined, .null => unreachable,
         .boolean => "Boolean",
         .number => "Number",
         .string => "String",
-        .symbol => "Symbol",
+        .symbol => "Object",
         .native, .closure => "Function",
         .object => |o| switch (o.kind) {
             .array => "Array",
-            .map => "Map",
-            .set => "Set",
             .iterator => |it| switch (it.kind) {
                 .map_entries, .map_keys, .map_values => "Map Iterator",
                 .set_values, .set_entries => "Set Iterator",
@@ -934,21 +975,29 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
                 .string_chars => "String Iterator",
                 .custom, .async_from_sync, .for_in => "Object",
             },
-            .promise => "Promise",
             .regexp => "RegExp",
-            .generator => |g| if (g.is_async) "AsyncGenerator" else "Generator",
             .module_namespace => "Module",
-            .ordinary => "Object",
+            .ordinary => if (o.is_error) "Error" else "Object",
+            else => "Object",
         },
     };
-    return .{ .string = try rt.heap.newString(&.{ .{ .ascii = "[object " }, .{ .ascii = tag }, .{ .ascii = "]" } }) };
+    const r = try realm(rt);
+    var roots_buf = [_]Value{this};
+    var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const tag_val = try object.get(rt, this, .{ .symbol = r.sym_to_string_tag });
+    if (tag_val == .string) {
+        roots_buf[0] = tag_val;
+        return .{ .string = try rt.heap.newString(&.{ .{ .ascii = "[object " }, .{ .utf16 = tag_val.string.units }, .{ .ascii = "]" } }) };
+    }
+    return .{ .string = try rt.heap.newString(&.{ .{ .ascii = "[object " }, .{ .ascii = builtin_tag }, .{ .ascii = "]" } }) };
 }
 
 fn objectValueOf(rt: *Runtime, this: Value, _: []const Value) Error!Value {
-    return switch (this) {
-        .object => this,
-        else => unsupportedReceiver(rt, "valueOf"), // ToObject: a wrapper object
-    };
+    if (this.isObjectLike()) return this;
+    return unsupportedReceiver(rt, "valueOf"); // ToObject: a wrapper object
 }
 
 // ---------------------------------------------------------------- Array.prototype
@@ -1096,20 +1145,28 @@ fn arrayJoin(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const a = try thisArray(rt, this, "join");
     const sep = arg(args, 0);
     if (sep == .undefined) return .{ .string = try object.join(rt, a, &.{','}) };
+    var roots_buf = [_]Value{ .{ .object = a }, .undefined };
+    var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     var buf: ops.NumberBuf = undefined;
     const piece = try ops.toPiece(rt, sep, &buf);
-    const s = switch (piece) {
-        .utf16 => |u| u,
-        .ascii => (try rt.heap.newString(&.{piece})).units,
-    };
-    return .{ .string = try object.join(rt, a, s) };
+    const sep_str = try rt.heap.newString(&.{piece});
+    roots_buf[1] = .{ .string = sep_str };
+    return .{ .string = try object.join(rt, a, sep_str.units) };
 }
 
-/// Array.prototype.toString calls `this.join`; a user-replaced join is user code.
+/// Array.prototype.toString calls `this.join`, falling back to Object.prototype.toString.
 fn arrayToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    var roots_buf = [_]Value{this};
+    var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     const j = try object.get(rt, this, try object.named(rt, "join"));
     if (j == .native and j.native == &array_join) return arrayJoin(rt, this, &.{});
-    if (j == .closure or j == .native) return rt.fail(.user_conversion);
+    if (j.isFunction()) return rt.callCallable(j, this, &.{});
     return objectToString(rt, this, &.{}); // join not callable: the Object.prototype one
 }
 
@@ -2255,6 +2312,7 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
         .native => |n| {
             if (object.isNamed(k, "length")) return .{ .value = .{ .number = @floatFromInt(n.length) }, .enumerable = false, .writable = false };
             if (object.isNamed(k, "name")) return .{ .value = .{ .string = try rt.heap.ascii(n.name) }, .enumerable = false, .writable = false };
+            if (try namespaceObject(rt, n)) |ns| return ns.props.get(try object.propKey(rt, k));
         },
         else => {},
     }
@@ -4176,6 +4234,7 @@ fn makeAggregateError(rt: *Runtime, errors_arr_val: Value) Error!Value {
     defer roots.unregister(rt);
 
     const err_obj = try rt.heap.newObject(r.aggregate_error_prototype);
+    err_obj.is_error = true;
     root_buf[1] = .{ .object = err_obj };
     const msg_str = try rt.heap.newString(&.{.{ .ascii = "All promises were rejected" }});
     root_buf[2] = .{ .string = msg_str };
@@ -4211,6 +4270,7 @@ pub fn resolvePromiseValue(rt: *Runtime, p_obj: *Object, val: Value) Error!void 
         defer err_roots.unregister(rt);
 
         const err_obj = try rt.heap.newObject(r.type_error_prototype);
+        err_obj.is_error = true;
         err_roots_buf[1] = .{ .object = err_obj };
         const msg_str = try rt.heap.newString(&.{.{ .ascii = "Chaining cycle detected for promise" }});
         err_roots_buf[2] = .{ .string = msg_str };
@@ -4897,6 +4957,7 @@ fn buildError(rt: *Runtime, proto: *Object, msg_arg: Value, opts_arg: Value) Err
     defer roots.unregister(rt);
 
     const err_obj = try rt.heap.newObject(proto);
+    err_obj.is_error = true;
     root_buf[2] = .{ .object = err_obj };
 
     if (msg_arg != .undefined) {
@@ -4929,6 +4990,7 @@ pub fn makeEngineError(rt: *Runtime, name: rt_mod.ErrorName, msg: *const heap_mo
     defer roots.unregister(rt);
 
     const err_obj = try rt.heap.newObject(proto);
+    err_obj.is_error = true;
     root_buf[1] = .{ .object = err_obj };
     try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("message"), .{ .value = root_buf[0], .enumerable = false });
     return root_buf[1];

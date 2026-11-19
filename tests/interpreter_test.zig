@@ -353,11 +353,17 @@ test "prototypes can't form a cycle: __proto__ is the only way, and it is Unsupp
     }
 }
 
-test "conversions call only the built-in methods" {
-    try expectUnsupported("let o = { toString() { return 'mine'; } }; print('ok'); print(o);", "ok\n", "Unsupported(user_conversion)");
-    try expectUnsupported("let o = { valueOf() { return 1; } }; o + 1;", "", "Unsupported(user_conversion)");
-    try expectUnsupported("let a = [1]; a.join = function () { return 'j'; }; '' + a;", "", "Unsupported(user_conversion)");
-    try expectUnsupported("let o = { toString: print }; '' + o;", "", "Unsupported(user_conversion)");
+test "user conversions work on both engines" {
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator,
+            \\let o1 = { toString() { return 'mine'; } };
+            \\let o2 = { valueOf() { return 1; } };
+            \\let a = [1]; a.join = function () { return 'j'; };
+            \\print(o1, o2 + 1, '' + a);
+        , .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("mine 2 j\n", r.out);
+    }
     try expectUnsupported("print.x = 1;", "", "Unsupported(function_properties)");
 }
 
@@ -394,7 +400,7 @@ test "M14.3: Set unsupported methods, non-Set receivers, and non-array iterables
 
 test "M14.4: unsupported iterables, Iterator.prototype methods, and member for-of targets" {
     try expectUnsupported("[1].values().map;", "", "('map')");
-    try expectUnsupported("Symbol.toPrimitive;", "", "('toPrimitive')");
+    try expectUnsupported("Symbol.match;", "", "('match')");
 }
 
 test "M15.1: JSON.parse reviver exclusion, new JSON(), nesting limit, and OOM" {
@@ -423,13 +429,10 @@ test "M15.1: JSON.parse reviver exclusion, new JSON(), nesting limit, and OOM" {
     try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
 }
 
-test "M15.2: JSON.stringify replacer/space/toJSON exclusions, nesting limit, and OOM" {
+test "M15.2: JSON.stringify replacer/space exclusions, nesting limit, and OOM" {
     try expectUnsupported("JSON.stringify({}, function () {});", "", "Unsupported(user_conversion)");
     try expectUnsupported("JSON.stringify({}, ['a']);", "", "Unsupported(builtin)");
     try expectUnsupported("JSON.stringify({}, null, 2);", "", "Unsupported(builtin)");
-    try expectUnsupported("JSON.stringify({ toJSON: function () { return 1; } });", "", "Unsupported(user_conversion)");
-    try expectUnsupported("const p = { toJSON: function () { return 1; } }; const o = Object.create(p); JSON.stringify(o);", "", "Unsupported(user_conversion)");
-    try expectUnsupported("JSON.stringify({ nested: { toJSON: function () { return 1; } } });", "", "Unsupported(user_conversion)");
 
     for (support.engines) |engine| {
         var r_lim = try support.run(testing.allocator, "JSON.stringify([[[1]]]);", .{ .max_nesting_depth = 2 }, engine, .normal);
@@ -444,6 +447,20 @@ test "M15.2: JSON.stringify replacer/space/toJSON exclusions, nesting limit, and
         }
     };
     try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
+
+    const UserConvOomCtx = struct {
+        fn runOnce(alloc: std.mem.Allocator) !void {
+            var r = try support.run(alloc,
+                \\const p = { [Symbol.toPrimitive](h) { return h === 'string' ? 's' : 1; } };
+                \\const t = { get [Symbol.toStringTag]() { return 'T'; } };
+                \\const h = { [Symbol.hasInstance](x) { return x === t; } };
+                \\const j = { a: { toJSON(k) { return k; } } };
+                \\p + 1; `${p}`; Object.prototype.toString.call(t); t instanceof h; JSON.stringify(j);
+            , .{}, .vm, .normal);
+            defer r.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing.allocator, UserConvOomCtx.runOnce, .{});
 }
 
 test "M16.1: ClosureCaller, callCallable, ValueRoots, exception propagation, depth/step limits, and OOM" {

@@ -56,7 +56,11 @@ pub fn key(rt: *Runtime, v: Value) Error!Key {
             return .{ .atom = try rt.heap.internAscii((try ops.toPiece(rt, v, &buf)).ascii) };
         },
         .object => return key(rt, try toPrimitive(rt, v, .string)),
-        .native, .closure => return rt.fail(.function_to_string),
+        .native, .closure => {
+            const prim = try toPrimitive(rt, v, .string);
+            if (prim.isFunction()) return rt.fail(.function_to_string);
+            return key(rt, prim);
+        },
     }
 }
 
@@ -142,6 +146,16 @@ fn keyPiece(k: Key, buf: *[10]u8) Piece {
 /// `base[k]` / `base.k`.
 pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
     return getWithReceiver(rt, base, base, k);
+}
+
+/// ES GetMethod(V, P): returns null for undefined/null, throws TypeError if non-callable.
+pub fn getMethod(rt: *Runtime, v: Value, k: Key) Error!?Value {
+    const func = try get(rt, v, k);
+    if (func == .undefined or func == .null) return null;
+    if (!func.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Property is not a function" }});
+    }
+    return func;
 }
 
 fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error!Value {
@@ -778,24 +792,48 @@ fn hasInChain(rt: *Runtime, start: *Object, k: Key) Error!bool {
     return false;
 }
 
-/// `lhs instanceof rhs` (M25, M31 D62).
+/// `lhs instanceof rhs` (ES InstanceofOperator).
 pub fn instanceOf(rt: *Runtime, lhs: Value, rhs: Value) Error!bool {
     heap_mod.checkValue(lhs);
     heap_mod.checkValue(rhs);
-    var target = rhs;
-    if (!target.isFunction()) {
+    if (!rhs.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Right-hand side of 'instanceof' is not an object" }});
+    }
+    const r = try builtins.realm(rt);
+    var roots_buf = [_]Value{ lhs, rhs };
+    var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    if (try getMethod(rt, rhs, .{ .symbol = r.sym_has_instance })) |handler| {
+        if (handler == .native and handler.native == &builtins.function_has_instance) {
+            return ordinaryHasInstance(rt, rhs, lhs);
+        }
+        const res = try rt.callCallable(handler, rhs, &.{lhs});
+        return ops.toBoolean(res);
+    }
+    if (!rhs.isFunction()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Right-hand side of 'instanceof' is not callable" }});
     }
-    var cur: Value = try getPrototypeOfValue(rt, lhs);
-    if (lhs != .object and lhs != .closure and lhs != .native) return false;
-    while (target == .closure and target.closure.impl == .bound) {
-        target = target.closure.impl.bound.target;
+    return ordinaryHasInstance(rt, rhs, lhs);
+}
+
+/// ES OrdinaryHasInstance(C, O).
+pub fn ordinaryHasInstance(rt: *Runtime, c_val: Value, o_val: Value) Error!bool {
+    if (!c_val.isFunction()) return false;
+    if (c_val == .closure and c_val.closure.impl == .bound) {
+        return instanceOf(rt, o_val, c_val.closure.impl.bound.target);
     }
-    const target_proto: *Object = switch (target) {
+    if (!o_val.isObjectLike()) return false;
+    const target_proto: *Object = switch (c_val) {
         .native => |n| (try builtins.constructorPrototype(rt, n)) orelse
             return rt.throw(.TypeError, &.{.{ .ascii = "Function has non-object prototype 'undefined' in instanceof check" }}),
         .closure => blk: {
-            const proto_val = try get(rt, target, try named(rt, "prototype"));
+            var roots_buf = [_]Value{o_val};
+            var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+            const proto_val = try get(rt, c_val, try named(rt, "prototype"));
             if (proto_val != .object) {
                 return rt.throw(.TypeError, &.{.{ .ascii = "Function has non-object prototype in instanceof check" }});
             }
@@ -803,6 +841,7 @@ pub fn instanceOf(rt: *Runtime, lhs: Value, rhs: Value) Error!bool {
         },
         else => unreachable,
     };
+    var cur: Value = try getPrototypeOfValue(rt, o_val);
     while (cur != .null) : (cur = try getPrototypeOfValue(rt, cur)) {
         if (cur == .object) {
             cur.object.obj.checkLive();
@@ -951,22 +990,46 @@ fn indexPosition(keys: []const Key, i: u32) usize {
 
 // ---------------------------------------------------------------- conversions
 
-pub const Hint = enum { number, string };
+pub const Hint = enum { default, number, string };
 
-/// ToPrimitive. Only the built-in methods are called (D40).
+/// ES ToPrimitive(input, preferredType).
 pub fn toPrimitive(rt: *Runtime, v: Value, hint: Hint) Error!Value {
-    if (v != .object) return v;
+    if (!v.isObjectLike()) return v;
+    const r = try builtins.realm(rt);
+    var roots_buf = [_]Value{v};
+    var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    if (try getMethod(rt, v, .{ .symbol = r.sym_to_primitive })) |exotic_to_prim| {
+        const hint_str: Value = .{ .string = try rt.heap.ascii(switch (hint) {
+            .default => "default",
+            .number => "number",
+            .string => "string",
+        }) };
+        const res = try rt.callCallable(exotic_to_prim, v, &.{hint_str});
+        if (!res.isObjectLike()) return res;
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert object to primitive value" }});
+    }
+    return ordinaryToPrimitive(rt, v, if (hint == .string) .string else .number);
+}
+
+fn ordinaryToPrimitive(rt: *Runtime, v: Value, hint: Hint) Error!Value {
     const order: [2][]const u8 = if (hint == .string) .{ "toString", "valueOf" } else .{ "valueOf", "toString" };
     for (order) |method| {
-        const f = try get(rt, v, try named(rt, method));
-        switch (f) {
-            .native => |n| {
-                if (!builtins.isConversion(n)) return rt.fail(.user_conversion);
-                const r = try n.call(rt, v, &.{});
-                if (r != .object) return r;
-            },
-            .closure => return rt.fail(.user_conversion),
-            else => {}, // not callable: try the other method
+        const f = get(rt, v, try named(rt, method)) catch |err| {
+            // Unoverridden Function.prototype.toString is Unsupported(builtin) in builtin_names.zig;
+            // return the function unchanged so callers preserve existing function_to_string semantics.
+            if (err == error.Unsupported and v.isFunction() and std.mem.eql(u8, method, "toString")) {
+                rt.unsupported = null;
+                rt.unsupported_name = null;
+                return v;
+            }
+            return err;
+        };
+        if (f.isFunction()) {
+            const res = try rt.callCallable(f, v, &.{});
+            if (!res.isObjectLike()) return res;
         }
     }
     return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert object to primitive value" }});
@@ -974,17 +1037,27 @@ pub fn toPrimitive(rt: *Runtime, v: Value, hint: Hint) Error!Value {
 
 /// Array.prototype.join (and toString): elements' ToString, `null`/`undefined` as "".
 /// An array already being joined (a cycle) contributes "", as in node.
-pub fn join(rt: *Runtime, arr: *Object, sep: []const u16) Error!*String {
+pub fn join(rt: *Runtime, arr: *Object, sep_in: []const u16) Error!*String {
     for (rt.joining.items) |a| if (a == arr) return rt.heap.ascii("");
     if (rt.joining.items.len >= rt.limits.max_conversion_depth) return rt.limit(.conversion_depth);
     try rt.joining.append(rt.gpa, arr);
     defer _ = rt.joining.pop();
 
+    // Copy separator out of GC memory so user conversions on elements can't invalidate it.
+    var sep_stack: [64]u16 = undefined;
+    const sep_heap = if (sep_in.len > sep_stack.len) try rt.gpa.dupe(u16, sep_in) else null;
+    defer if (sep_heap) |s| rt.gpa.free(s);
+    const sep: []const u16 = if (sep_heap) |s| s else blk: {
+        @memcpy(sep_stack[0..sep_in.len], sep_in);
+        break :blk sep_stack[0..sep_in.len];
+    };
+
     var out: std.ArrayList(u16) = .empty;
     defer out.deinit(rt.gpa);
-    // Converting elements can't change the array: conversions never run JS (D40).
-    for (arr.kind.array.items, 0..) |e, i| {
+    const len = arr.kind.array.items.len;
+    for (0..len) |i| {
         if (i > 0) try append(rt, &out, sep);
+        const e: Value = if (i < arr.kind.array.items.len) arr.kind.array.items[i] else .undefined;
         switch (e) {
             .undefined, .null => {},
             else => {

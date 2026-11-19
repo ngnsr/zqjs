@@ -1802,6 +1802,26 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
 
 ---
 
+## D70. User Conversions & Well-Known Symbols (M40; D40 retired for conversions)
+
+**Decision:** Retire D40's `Unsupported(user_conversion)` for `ToPrimitive`, `Array.prototype.toString`, and `JSON.stringify` `toJSON` (reviver/replacer in `JSON.parse`/`JSON.stringify` remain `Unsupported(user_conversion)`), and implement `Symbol.toPrimitive`, `Symbol.toStringTag`, and `Symbol.hasInstance` across both engines.
+
+- **Well-known symbols (`builtins.zig`, `runtime.zig`, `heap.zig`):**
+  - `Realm` adds `sym_to_primitive`, `sym_to_string_tag`, and `sym_has_instance` (`is_global = false`), installed as non-writable/non-enumerable/non-configurable properties on `Symbol` and marked in `Runtime.markRoots`.
+  - `[Symbol.toStringTag]` (non-writable, non-enumerable, configurable) is installed on `Map.prototype`, `Set.prototype`, `Promise.prototype`, `Symbol.prototype`, `Math`, `JSON`, `%GeneratorPrototype%`, `%AsyncGeneratorPrototype%`, `%GeneratorFunction.prototype%`, `%AsyncGeneratorFunction.prototype%`, and `%AsyncFunction.prototype%`.
+  - `Function.prototype[Symbol.hasInstance]` (non-writable, non-enumerable, non-configurable) implements `OrdinaryHasInstance` (with `Object.prototype.toString` and `getOwnPropertyRaw` supporting `namespaceObject` for `Symbol` and `Object.is_error` for `[[ErrorData]]`).
+- **`ToPrimitive`, `ToString`, and `Array.prototype.toString` (`object.zig`, `ops.zig`, `bytecode.zig`, `compiler.zig`, `vm.zig`, `machine.zig`, `builtins.zig`):**
+  - `object.Hint` gains `.default` alongside `.number` and `.string`: `ToPrimitive` checks `GetMethod(input, Symbol.toPrimitive)` first, then falls back to `OrdinaryToPrimitive` (`valueOf`/`toString`). `+` uses `.default`, relational/numeric ops use `.number`, and `ToString` / property keys / template literals use `.string` (via new VM opcode `.to_string` and `Machine.template_next` calling `ops.toStringValue`).
+  - `Function.prototype.toString` without a user override preserves `Unsupported(function_to_string)`, while functions with user-defined `[Symbol.toPrimitive]`, `valueOf`, or `toString` convert via `ToPrimitive`.
+  - `Array.prototype.toString` invokes callable `this.join` via `rt.callCallable` or falls back to `Object.prototype.toString`. `object.join` copies the separator out of GC memory, snapshots `len`, and `Runtime.markRoots` marks `rt.joining.items`.
+- **`instanceof` & `JSON.stringify` `toJSON` (`object.zig`, `json.zig`):**
+  - `object.instanceOf` implements `InstanceofOperator` (`GetMethod(rhs, Symbol.hasInstance)`, fast-pathing untouched `Function.prototype[Symbol.hasInstance]`, supporting custom objects and bound functions).
+  - `json.Stringifier` invokes callable `Get(v, "toJSON")` with `this = v` and the stringified key (`""` at root, property name, or array index string), rooting `to_json_atom`, active ancestors, active `keys` slices, and current values across re-entrant JS calls.
+- **GC & stack safety (`vm.zig`, `ops.zig`, `object.zig`, `builtins.zig`, `json.zig`):**
+  - Every `rt.callCallable` site roots live `Value`s via `rt_mod.ValueRoots`, and `vm.zig` calls `cache.syncSp(vm)` before any opcode that can invoke `ToPrimitive` / `object.key` / `ops.binary` / `ops.toNumber` / `ops.toStringValue` (plus rooting converted keys in `.object_rest`).
+
+---
+
 ## D71. Interactive REPL (`zqjs`) (M41)
 
 **Decision:** Implement a full-featured, zero-dependency interactive REPL in `src/repl/` (`session.zig`, `inspect.zig`, `complete.zig`, `editor.zig`) wired into `src/main.zig` (when invoked with no file/`-e` or `--repl`), supporting both the bytecode VM and the tree-walker oracle (`--engine=vm|treewalk`).

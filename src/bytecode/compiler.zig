@@ -1298,6 +1298,7 @@ const Compiler = struct {
                 try c.emit(.push_const, &.{try c.string(t.quasis[0])});
                 for (t.exprs, 0..) |ex, i| {
                     try c.expr(ex);
+                    try c.emit(.to_string, &.{});
                     try c.emit(.add, &.{});
                     if (t.quasis[i + 1].len > 0) {
                         try c.emit(.push_const, &.{try c.string(t.quasis[i + 1])});

@@ -38,8 +38,11 @@ pub fn toNumber(rt: *Runtime, v: Value) Error!f64 {
         .number => |n| n,
         .string => |s| stringToNumber(gpa, s.units),
         .symbol => rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert a Symbol value to a number" }}),
-        // ToPrimitive gives the source text, which is never a numeric string.
-        .native, .closure => std.math.nan(f64),
+        .native, .closure => {
+            const prim = try object.toPrimitive(rt, v, .number);
+            if (prim.isFunction()) return std.math.nan(f64);
+            return toNumber(rt, prim);
+        },
         .object => toNumber(rt, try object.toPrimitive(rt, v, .number)),
     };
 }
@@ -167,10 +170,20 @@ pub fn toPiece(rt: *Runtime, v: Value, buf: *NumberBuf) Error!Piece {
         .number => |n| .{ .ascii = formatNumber(buf, n) },
         .string => |s| .{ .utf16 = s.units },
         .symbol => rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert a Symbol value to a string" }}),
-        // Node prints the function's source text; ZQJS has none to show (yet).
-        .native, .closure => rt.fail(.function_to_string),
+        .native, .closure => {
+            const prim = try object.toPrimitive(rt, v, .string);
+            if (prim.isFunction()) return rt.fail(.function_to_string);
+            return toPiece(rt, prim, buf);
+        },
         .object => toPiece(rt, try object.toPrimitive(rt, v, .string), buf),
     };
+}
+
+pub fn toStringValue(rt: *Runtime, v: Value) Error!Value {
+    if (v == .string) return v;
+    var buf: NumberBuf = undefined;
+    const piece = try toPiece(rt, v, &buf);
+    return .{ .string = try rt.heap.newString(&.{piece}) };
 }
 
 /// Writes UTF-16 as UTF-8. A lone surrogate becomes U+FFFD, as node does on output.
@@ -247,15 +260,25 @@ pub fn strictEquals(a: Value, b: Value) bool {
 /// All binary operators except `&&`/`||` (which short-circuit, so they are control
 /// flow in the evaluator). Both operands have already been evaluated, left first.
 pub fn binary(rt: *Runtime, op: ast.BinaryOp, a_in: Value, b_in: Value) Error!Value {
-    // `+` and the relational operators convert objects first, left then right (ToPrimitive
-    // with the default/number hint); the arithmetic ones convert through toNumber.
-    const converts = switch (op) {
-        .add, .lt, .gt, .le, .ge => true,
-        else => false,
+    var roots_buf = [_]Value{ a_in, b_in };
+    var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+    const may_call = a_in.isObjectLike() or b_in.isObjectLike();
+    if (may_call) try roots.register(rt);
+    defer if (may_call) roots.unregister(rt);
+
+    // `+` converts with `.default`; relational operators convert with `.number`, left then right.
+    const a = switch (op) {
+        .add => if (a_in.isObjectLike()) try object.toPrimitive(rt, a_in, .default) else a_in,
+        .lt, .gt, .le, .ge => if (a_in.isObjectLike()) try object.toPrimitive(rt, a_in, .number) else a_in,
+        else => a_in,
     };
-    // (Tested here rather than inside toPrimitive: the common case stays call-free.)
-    const a = if (converts and a_in == .object) try object.toPrimitive(rt, a_in, .number) else a_in;
-    const b = if (converts and b_in == .object) try object.toPrimitive(rt, b_in, .number) else b_in;
+    if (may_call) roots_buf[0] = a;
+    const b = switch (op) {
+        .add => if (b_in.isObjectLike()) try object.toPrimitive(rt, b_in, .default) else b_in,
+        .lt, .gt, .le, .ge => if (b_in.isObjectLike()) try object.toPrimitive(rt, b_in, .number) else b_in,
+        else => b_in,
+    };
+    if (may_call) roots_buf[1] = b;
     return switch (op) {
         .add => {
             if (a == .string or b == .string) {

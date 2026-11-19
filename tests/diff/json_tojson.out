@@ -1,0 +1,11 @@
+root key: ""
+b key: b
+{"a":1,"b":2}
+["e0",null,["2",10]]
+{"0":"idx:0","foo":"prop:foo"}
+{"c":{"fromProto":7,"key":"c"}}
+{"g":"getter:g","n":{"toJSON":123,"ok":true}}
+{"inner":"inner:inner"}
+err: TypeError json-boom
+["first",null]
+cyc: TypeError

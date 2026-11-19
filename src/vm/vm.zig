@@ -982,6 +982,7 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
             },
             .define_elem => {
+                cache.syncSp(vm);
                 const o = try cache.peek(vm, 2);
                 if (o != .object) return vm.bug("define on a non-object");
                 try object.define(rt, o.object, try object.key(rt, try cache.peek(vm, 1)), try cache.peek(vm, 0));
@@ -1011,9 +1012,9 @@ pub const Vm = struct {
                 (try cache.top(vm)).* = v;
             },
             .set_elem => {
+                cache.syncSp(vm);
                 const v = try cache.peek(vm, 0);
                 const k = try object.key(rt, try cache.peek(vm, 1)); // after the value: JS's order for `=`
-                cache.syncSp(vm);
                 try object.set(rt, try cache.peek(vm, 2), k, v);
                 try cache.drop(vm, 2);
                 (try cache.top(vm)).* = v;
@@ -1060,20 +1061,30 @@ pub const Vm = struct {
                     .ge => .{ .boolean = lhs.number >= rhs.number },
                     .strict_eq => .{ .boolean = lhs.number == rhs.number },
                     .strict_ne => .{ .boolean = lhs.number != rhs.number },
-                    .pow, .in, .instanceof => try ops.binary(rt, binaryOp(op), lhs, rhs),
+                    .pow, .in, .instanceof => blk: {
+                        cache.syncSp(vm);
+                        break :blk try ops.binary(rt, binaryOp(op), lhs, rhs);
+                    },
                     else => unreachable,
-                } else try ops.binary(rt, binaryOp(op), lhs, rhs);
+                } else blk: {
+                    cache.syncSp(vm);
+                    break :blk try ops.binary(rt, binaryOp(op), lhs, rhs);
+                };
                 cache.sp -= 1;
                 vm.stack[cache.sp - 1] = r;
             },
             // Compute into a local, then store. `top().* = .{ .number = f(peek(0)) }` would
             // be wrong: Zig builds the union in place, so the slot's tag changes *before*
             // f reads the old value through peek (result-location aliasing).
-            .neg, .to_number, .not, .bit_not, .typeof => {
+            .neg, .to_number, .to_string, .not, .bit_not, .typeof => {
                 const v = try cache.peek(vm, 0);
+                if (v.isObjectLike() and (op == .neg or op == .to_number or op == .to_string or op == .bit_not)) {
+                    cache.syncSp(vm);
+                }
                 const r: Value = switch (op) {
                     .neg => .{ .number = if (v == .number) -v.number else -(try ops.toNumber(rt, v)) },
                     .to_number => if (v == .number) v else .{ .number = try ops.toNumber(rt, v) },
+                    .to_string => if (v == .string) v else try ops.toStringValue(rt, v),
                     .not => .{ .boolean = !ops.toBoolean(v) },
                     .bit_not => .{ .number = ops.bitNot(if (v == .number) v.number else try ops.toNumber(rt, v)) },
                     .typeof => try ops.typeOf(rt, v),
@@ -1319,6 +1330,7 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
             },
             .define_elem_method => {
+                cache.syncSp(vm);
                 const method_val = try cache.peek(vm, 0);
                 const key_val = try cache.peek(vm, 1);
                 const target = try cache.peek(vm, 2);
@@ -1337,6 +1349,7 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
             },
             .define_elem_accessor => {
+                cache.syncSp(vm);
                 const fn_val = try cache.peek(vm, 0);
                 const key_val = try cache.peek(vm, 1);
                 const target = try cache.peek(vm, 2);
@@ -1370,6 +1383,7 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
             },
             .define_public_field => {
+                cache.syncSp(vm);
                 const val = try cache.peek(vm, 0);
                 const key_val = try cache.peek(vm, 1);
                 const target = try cache.peek(vm, 2);
@@ -1471,18 +1485,21 @@ pub const Vm = struct {
                 try cache.push(vm, try object.getSuper(rt, home, this_val, try vm.nameKey(cache.operand(0))));
             },
             .super_get_elem => {
+                cache.syncSp(vm);
                 const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_get_elem without home_object");
                 const k = try object.key(rt, try cache.peek(vm, 0));
                 (try cache.top(vm)).* = try object.getSuper(rt, home, this_val, k);
             },
             .super_set_prop => {
+                cache.syncSp(vm);
                 const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_set_prop without home_object");
                 const val = try cache.peek(vm, 0);
                 try object.setSuper(rt, home, this_val, try vm.nameKey(cache.operand(0)), val);
             },
             .super_set_elem => {
+                cache.syncSp(vm);
                 const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_set_elem without home_object");
                 const val = try cache.peek(vm, 0);
@@ -1498,6 +1515,7 @@ pub const Vm = struct {
                 (try cache.top(vm)).* = .{ .boolean = r };
             },
             .delete_elem => {
+                cache.syncSp(vm);
                 const k = try object.key(rt, try cache.peek(vm, 0));
                 const r = try object.delete(rt, try cache.peek(vm, 1), k);
                 try cache.drop(vm, 1);
@@ -1555,6 +1573,7 @@ pub const Vm = struct {
                 }
             },
             .object_rest => {
+                cache.syncSp(vm);
                 const n = cache.operand(0);
                 const group = n + 1;
                 if (group > cache.sp - cache.stack_base) return vm.bug("stack underflow");
@@ -1562,8 +1581,15 @@ pub const Vm = struct {
                 const src = vm.stack[base];
                 const excluded = try rt.gpa.alloc(object.Key, n);
                 defer rt.gpa.free(excluded);
-                for (vm.stack[base + 1 .. cache.sp], excluded) |kv, *dst| {
-                    dst.* = try object.key(rt, kv);
+                for (vm.stack[base + 1 .. cache.sp], excluded, 0..) |kv, *dst, idx| {
+                    const k = try object.key(rt, kv);
+                    dst.* = k;
+                    // Keep converted atom/symbol keys rooted on the VM stack across subsequent conversions.
+                    vm.stack[base + 1 + idx] = switch (k) {
+                        .atom => |a| .{ .string = a },
+                        .symbol => |s| .{ .symbol = s },
+                        .index => .undefined,
+                    };
                 }
                 const rest_obj = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
                 try copyDataProperties(rt, rest_obj, src, excluded);

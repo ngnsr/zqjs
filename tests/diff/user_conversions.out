@@ -1,0 +1,43 @@
+hint:default
+def1
+hint:number
+40
+hint:string
+str
+hint:string
+str
+hint:number
+true
+hint:string
+200
+nonprim: TypeError
+noncall: TypeError
+10
+get toPrimitive
+get toPrimitive
+10 gstr
+v
+plus: 11
+v
+minus: 9
+v
+lt: true
+s
+tpl: 20
+s
+str: 20
+s
+key: ok
+991 98
+55
+bothobj: TypeError
+joined:3 joined:3
+[object Array]
+5 L,R
+true L,R
+-1 L,R
+77 E,K
+err1: RangeError boom
+err2: TypeError jboom
+fn:default1 fn:string
+15 fn2

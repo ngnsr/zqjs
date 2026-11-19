@@ -1226,7 +1226,15 @@ const Machine = struct {
             .template_next => |tn| {
                 const v = m.popVal();
                 var acc = m.popVal();
-                acc = try ops.binary(rt, .add, acc, v);
+                var roots_buf = [_]Value{ acc, v };
+                var val_roots = rt_mod.ValueRoots{ .values = &roots_buf };
+                try val_roots.register(rt);
+                defer val_roots.unregister(rt);
+
+                const v_str = try ops.toStringValue(rt, v);
+                roots_buf[1] = v_str;
+                acc = try ops.binary(rt, .add, acc, v_str);
+                roots_buf[0] = acc;
                 if (tn.t.quasis[tn.idx + 1].len > 0) {
                     const q: Value = .{ .string = try rt.heap.newString(&.{.{ .utf16 = tn.t.quasis[tn.idx + 1] }}) };
                     acc = try ops.binary(rt, .add, acc, q);

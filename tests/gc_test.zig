@@ -2269,3 +2269,38 @@ test "M42: exported closures, classes, and namespace objects survive forced GC a
         try testing.expectEqualStrings("alive 11 Counter\n", out_buf.written());
     }
 }
+
+test "M40: GC inside Symbol.toPrimitive, toString/valueOf, join, Symbol.hasInstance, Symbol.toStringTag, and toJSON" {
+    const src =
+        \\function churn(tag) {
+        \\    let s = "";
+        \\    for (let i = 0; i < 60; i++) {
+        \\        const junk = { t: tag + i, arr: [i, i + 1] };
+        \\        if (i === 59) s = junk.t;
+        \\    }
+        \\    return s;
+        \\}
+        \\const lhs = { [Symbol.toPrimitive]() { return churn("L") + ":"; } };
+        \\const rhs = { valueOf() { return churn("R"); } };
+        \\const arr = [{ toString() { churn("J"); return "a"; } }, { toString() { return "b"; } }];
+        \\const tagObj = { get [Symbol.toStringTag]() { return churn("Tag"); } };
+        \\const hiObj = { [Symbol.hasInstance](x) { churn("HI"); return x === tagObj; } };
+        \\const jsonObj = {
+        \\    a: { toJSON(k) { return churn("J1") + "-" + k; } },
+        \\    b: [{ toJSON(k) { return churn("J2") + "-" + k; } }],
+        \\};
+        \\print(lhs + rhs);
+        \\print(arr.toString());
+        \\print(Object.prototype.toString.call(tagObj));
+        \\print(tagObj instanceof hiObj);
+        \\print(JSON.stringify(jsonObj));
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(
+            "L59:R59\na,b\n[object Tag59]\ntrue\n{\"a\":\"J159-a\",\"b\":[\"J259-0\"]}\n",
+            got,
+        );
+    }
+}

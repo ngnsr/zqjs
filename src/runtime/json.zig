@@ -297,16 +297,45 @@ pub fn stringify(rt: *Runtime, val: Value) Error!?Value {
     defer s.out.deinit(rt.gpa);
     defer s.stack.deinit(rt.gpa);
 
-    if (!try s.writeValue(val)) return null;
+    try rt.addRoots(.{ .ctx = &s, .mark = Stringifier.mark });
+    defer rt.removeRoots(&s);
+
+    var val_roots_buf = [_]Value{val};
+    var val_roots = rt_mod.ValueRoots{ .values = &val_roots_buf };
+    try val_roots.register(rt);
+    defer val_roots.unregister(rt);
+
+    const empty_key: Value = .{ .string = try rt.heap.ascii("") };
+    if (!try s.writeValue(val, empty_key)) return null;
     const str = try rt.heap.newString(&.{.{ .utf16 = s.out.items }});
     return .{ .string = str };
 }
 
 const Stringifier = struct {
+    const KeyNode = struct {
+        keys: []const object.Key,
+        prev: ?*KeyNode,
+    };
+
     rt: *Runtime,
     to_json_atom: *heap_mod.String,
     out: std.ArrayList(u16) = .empty,
     stack: std.ArrayList(*Object) = .empty,
+    key_nodes: ?*KeyNode = null,
+
+    fn mark(ctx: *anyopaque, h: *heap_mod.Heap) void {
+        const s: *Stringifier = @ptrCast(@alignCast(ctx));
+        h.markObj(@constCast(&s.to_json_atom.obj));
+        for (s.stack.items) |o| h.markObj(&o.obj);
+        var kn = s.key_nodes;
+        while (kn) |node| : (kn = node.prev) {
+            for (node.keys) |k| switch (k) {
+                .atom => |a| h.markObj(&a.obj),
+                .symbol => |sym| h.markObj(&sym.obj),
+                .index => {},
+            };
+        }
+    }
 
     fn writeUnit(s: *Stringifier, u: u16) Error!void {
         if (s.out.items.len >= s.rt.limits.max_string_length) return s.rt.limit(.string_length);
@@ -319,8 +348,23 @@ const Stringifier = struct {
         for (text) |c| s.out.appendAssumeCapacity(c);
     }
 
-    fn writeValue(s: *Stringifier, v: Value) Error!bool {
-        heap_mod.checkValue(v);
+    fn writeValue(s: *Stringifier, v_in: Value, key_val: Value) Error!bool {
+        heap_mod.checkValue(v_in);
+        var v = v_in;
+        var roots_buf = [_]Value{ v, key_val };
+        var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+        const may_call = v.isObjectLike();
+        if (may_call) try roots.register(s.rt);
+        defer if (may_call) roots.unregister(s.rt);
+
+        if (may_call) {
+            const to_json = try object.get(s.rt, v, object.namedAtom(s.to_json_atom));
+            if (to_json.isFunction()) {
+                v = try s.rt.callCallable(to_json, v, &.{key_val});
+                roots_buf[0] = v;
+            }
+        }
+
         switch (v) {
             .undefined, .native, .closure, .symbol => return false,
             .null => {
@@ -345,7 +389,6 @@ const Stringifier = struct {
                 return true;
             },
             .object => |o| {
-                try s.checkToJson(o);
                 if (o.kind == .array) {
                     try s.writeArray(o);
                 } else {
@@ -353,17 +396,6 @@ const Stringifier = struct {
                 }
                 return true;
             },
-        }
-    }
-
-    fn checkToJson(s: *Stringifier, obj: *Object) Error!void {
-        var cur: ?*Object = obj;
-        while (cur) |c| : (cur = c.proto) {
-            c.obj.checkLive();
-            if (c.props.get(heap_mod.PropKey.fromAtom(s.to_json_atom))) |p| {
-                if (p.value == .native or p.value == .closure) return s.rt.fail(.user_conversion);
-                return;
-            }
         }
     }
 
@@ -379,12 +411,21 @@ const Stringifier = struct {
         try s.pushAncestor(arr);
         defer _ = s.stack.pop();
 
+        var roots_buf = [_]Value{ .{ .object = arr }, .undefined };
+        var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+        try roots.register(s.rt);
+        defer roots.unregister(s.rt);
+
         try s.writeUnit('[');
         const len = arr.kind.array.items.len;
         for (0..len) |i| {
             if (i > 0) try s.writeUnit(',');
-            const elem = arr.kind.array.items[i];
-            if (!try s.writeValue(elem)) try s.writeAscii("null");
+            const elem: Value = if (i < arr.kind.array.items.len) arr.kind.array.items[i] else .undefined;
+            var buf: [20]u8 = undefined;
+            const idx_str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+            const key_val: Value = .{ .string = try s.rt.heap.ascii(idx_str) };
+            roots_buf[1] = key_val;
+            if (!try s.writeValue(elem, key_val)) try s.writeAscii("null");
         }
         try s.writeUnit(']');
     }
@@ -395,13 +436,31 @@ const Stringifier = struct {
 
         const keys = try object.ownKeys(s.rt, obj);
         defer s.rt.gpa.free(keys);
+        var key_node = KeyNode{ .keys = keys, .prev = s.key_nodes };
+        s.key_nodes = &key_node;
+        defer s.key_nodes = key_node.prev;
+
+        var roots_buf = [_]Value{ .{ .object = obj }, .undefined };
+        var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+        try roots.register(s.rt);
+        defer roots.unregister(s.rt);
 
         try s.writeUnit('{');
         var wrote = false;
         for (keys) |k| {
+            const key_val: Value = switch (k) {
+                .atom => |a| .{ .string = a },
+                .index => |i| blk: {
+                    var buf: [10]u8 = undefined;
+                    const idx_str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+                    break :blk .{ .string = try s.rt.heap.ascii(idx_str) };
+                },
+                .symbol => unreachable,
+            };
+            roots_buf[1] = key_val;
             const val = try object.get(s.rt, .{ .object = obj }, k);
             // Save position so if property value is omitted (undefined/function), no key/comma is left.
-            const mark = s.out.items.len;
+            const mark_pos = s.out.items.len;
             if (wrote) try s.writeUnit(',');
             switch (k) {
                 .atom => |a| try s.writeString(a.units),
@@ -415,10 +474,10 @@ const Stringifier = struct {
                 .symbol => unreachable,
             }
             try s.writeUnit(':');
-            if (try s.writeValue(val)) {
+            if (try s.writeValue(val, key_val)) {
                 wrote = true;
             } else {
-                s.out.items.len = mark;
+                s.out.items.len = mark_pos;
             }
         }
         try s.writeUnit('}');

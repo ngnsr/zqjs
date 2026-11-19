@@ -505,6 +505,7 @@ pub const Object = struct {
     array_elements_writable: bool = true,
     array_length_writable: bool = true,
     regexp_last_index_writable: bool = true,
+    is_error: bool = false,
 };
 
 /// A part of a string being built: either UTF-16 units or ASCII bytes (numbers,

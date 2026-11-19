@@ -423,7 +423,9 @@ pub const Runtime = struct {
             for (r.objects()) |o| h.markObj(&o.obj);
             h.markObj(&r.sym_iterator.obj);
             h.markObj(&r.sym_async_iterator.obj);
+            h.markObj(&r.sym_to_primitive.obj);
             h.markObj(&r.sym_to_string_tag.obj);
+            h.markObj(&r.sym_has_instance.obj);
         }
         var sym_it = rt.global_symbols.iterator();
         while (sym_it.next()) |e| {
@@ -434,8 +436,7 @@ pub const Runtime = struct {
         if (rt.thrown_value) |v| h.markValue(v);
         if (rt.unsupported_name) |n| h.markObj(@constCast(&n.obj));
         h.markValue(rt.repl_result);
-        // Only non-empty inside an instruction, never at a safepoint.
-        std.debug.assert(rt.joining.items.len == 0);
+        for (rt.joining.items) |arr| h.markObj(&arr.obj);
         if (rt.engine_roots) |e| e.mark(e.ctx, h);
         for (rt.extra_roots.items) |e| e.mark(e.ctx, h);
         // The chain's nested VMs (M9.1, D51 #4): registered while alive, so a collection

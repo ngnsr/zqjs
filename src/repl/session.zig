@@ -244,12 +244,14 @@ pub const Session = struct {
         const eff_source = parse_res.source;
         const script = parse_res.script orelse {
             try diag.render(eff_source, "<repl>", s.err);
+            try s.err.flush();
             return .failed;
         };
 
         const res = resolver.resolveWithRepl(arena.allocator(), script, s.replLookup(), &diag) catch |e| {
             if (e == error.OutOfMemory) return error.OutOfMemory;
             try diag.render(eff_source, "<repl>", s.err);
+            try s.err.flush();
             return .failed;
         };
 
@@ -286,6 +288,7 @@ pub const Session = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.LimitExceeded => {
                     try diag.render(eff_source, "<repl>", s.err);
+                    try s.err.flush();
                     return .failed;
                 },
             };
@@ -297,6 +300,7 @@ pub const Session = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidBytecode => {
                     try s.err.print("<repl>: internal error: invalid bytecode at {d}: {s}\n", .{ vfail.pc, vfail.reason });
+                    try s.err.flush();
                     return .failed;
                 },
             };

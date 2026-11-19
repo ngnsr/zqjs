@@ -274,6 +274,16 @@ pub const Vm = struct {
         return startAsync(vm.rt, vm, c, this, args);
     }
 
+    /// Starts a top-level REPL script compiled as an async body (D71).
+    pub fn startTopLevelAsync(rt: *Runtime, p: *const Proto) Error!Value {
+        const c = try rt.heap.newVmClosure(p, 0);
+        var held = [_]Value{.{ .closure = c }};
+        var val_roots: rt_mod.ValueRoots = .{ .values = &held };
+        try val_roots.register(rt);
+        defer val_roots.unregister(rt);
+        return startAsync(rt, null, c, null, &.{});
+    }
+
     /// Every `is_async` call lands here: async functions and generators (D67).
     noinline fn startAsync(rt: *Runtime, caller_vm: ?*Vm, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
         @branchHint(.cold);
@@ -809,6 +819,35 @@ pub const Vm = struct {
             .assign_const_capture => {
                 if ((try vm.capture(cache.operand(0))).value == null) return vm.tdz(cache.operand(1));
                 return vm.constAssignment();
+            },
+            .get_repl => {
+                const idx = cache.operand(0);
+                if (idx >= p.repl_cells.len) return vm.bug("repl cell index out of range");
+                const v = p.repl_cells[idx].value orelse return vm.tdz(cache.operand(1));
+                try cache.push(vm, v);
+            },
+            .set_repl => {
+                const idx = cache.operand(0);
+                if (idx >= p.repl_cells.len) return vm.bug("repl cell index out of range");
+                const c = p.repl_cells[idx];
+                if (c.value == null) return vm.tdz(cache.operand(1));
+                rt.heap.storeCell(c, try cache.peek(vm, 0));
+            },
+            .init_repl => {
+                const idx = cache.operand(0);
+                if (idx >= p.repl_cells.len) return vm.bug("repl cell index out of range");
+                rt.heap.storeCell(p.repl_cells[idx], try cache.peek(vm, 0));
+                try cache.drop(vm, 1);
+            },
+            .assign_const_repl => {
+                const idx = cache.operand(0);
+                if (idx >= p.repl_cells.len) return vm.bug("repl cell index out of range");
+                if (p.repl_cells[idx].value == null) return vm.tdz(cache.operand(1));
+                return vm.constAssignment();
+            },
+            .save_repl_result => {
+                rt.repl_result = try cache.peek(vm, 0);
+                try cache.drop(vm, 1);
             },
 
             .make_closure => {

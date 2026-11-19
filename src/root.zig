@@ -33,6 +33,13 @@ pub const Engine = @import("run.zig").Engine;
 pub const Vm = @import("vm/vm.zig").Vm;
 pub const Value = @import("runtime/value.zig").Value;
 pub const Native = @import("runtime/value.zig").Native;
+pub const repl = struct {
+    pub const session = @import("repl/session.zig");
+    pub const inspect = @import("repl/inspect.zig");
+    pub const complete = @import("repl/complete.zig");
+    pub const editor = @import("repl/editor.zig");
+    pub const Session = session.Session;
+};
 
 // Small unit tests live next to the code they test (`test` blocks in each file);
 // integration, golden and fuzz tests live in tests/ (one test binary per file, build.zig).

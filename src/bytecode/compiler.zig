@@ -36,13 +36,22 @@ const Proto = bc.Proto;
 
 pub const Error = error{ LimitExceeded, OutOfMemory };
 
+pub const CompileOptions = struct {
+    repl: bool = false,
+    top_level_await: bool = false,
+};
+
 /// Compiles a resolved script. String constants are allocated on `heap` (see Proto for
 /// ownership); everything else with `gpa`. On LimitExceeded, `diag` says which limit
 /// and where. On any error nothing is leaked and the heap is as before.
 pub fn compile(gpa: Allocator, heap: *Heap, script: ast.Script, res: Resolution, limits: Limits, diag: *Diagnostic) Error!Proto {
+    return compileWithOptions(gpa, heap, script, res, limits, .{}, diag);
+}
+
+pub fn compileWithOptions(gpa: Allocator, heap: *Heap, script: ast.Script, res: Resolution, limits: Limits, options: CompileOptions, diag: *Diagnostic) Error!Proto {
     const heap_mark = heap.mark();
     errdefer heap.rollback(heap_mark);
-    var shared: Shared = .{ .gpa = gpa, .heap = heap, .res = res, .limits = limits, .diag = diag };
+    var shared: Shared = .{ .gpa = gpa, .heap = heap, .res = res, .limits = limits, .options = options, .diag = diag };
     return shared.proto(.script, null, script.statements);
 }
 
@@ -52,6 +61,7 @@ const Shared = struct {
     heap: *Heap,
     res: Resolution,
     limits: Limits,
+    options: CompileOptions = .{},
     diag: *Diagnostic,
     /// Code bytes of all Protos so far (Limits.max_code_bytes bounds the whole script).
     code_bytes: usize = 0,
@@ -99,9 +109,14 @@ const Shared = struct {
             // Parameters bind on the call; the generator object is returned here (D67).
             if (func.is_generator) try c.emit(.generator_start, &.{});
         }
-        const completes = try c.statements(body, .{ .start = 0, .end = 0 });
+        const completes = try c.statementsImpl(body, .{ .start = 0, .end = 0 }, kind == .script and s.options.repl);
         if (completes) switch (kind) {
-            .script => try c.emit(.halt, &.{}),
+            .script => if (s.options.top_level_await) {
+                try c.emit(.push_undefined, &.{});
+                try c.emit(.@"return", &.{});
+            } else {
+                try c.emit(.halt, &.{});
+            },
             .function => {
                 try c.emit(.push_undefined, &.{});
                 try c.emit(.@"return", &.{});
@@ -276,7 +291,7 @@ const Compiler = struct {
         return .{
             .kind = kind,
             .is_arrow = if (f) |func| func.is_arrow else false,
-            .is_async = if (f) |func| func.is_async or func.is_generator else false,
+            .is_async = if (f) |func| func.is_async or func.is_generator else c.s.options.top_level_await,
             .is_generator = if (f) |func| func.is_generator else false,
             .is_async_generator = if (f) |func| func.is_async and func.is_generator else false,
             .is_method = if (f) |func| func.is_method else false,
@@ -298,6 +313,7 @@ const Compiler = struct {
             .functions = functions,
             .handlers = handlers,
             .templates = templates,
+            .repl_count = @intCast(c.s.res.repl_bindings.len),
         };
     }
 
@@ -419,10 +435,17 @@ const Compiler = struct {
     }
 
     fn statements(c: *Compiler, stmts: []const ast.Stmt, span: ast.Span) Error!bool {
+        return c.statementsImpl(stmts, span, false);
+    }
+
+    fn statementsImpl(c: *Compiler, stmts: []const ast.Stmt, span: ast.Span, repl_top: bool) Error!bool {
         c.span = span;
         for (stmts) |s| switch (s.data) {
             .declaration => |decl| for (decl.declarators) |d| try c.enterPatternBindings(d.pattern),
-            .function => |f| if (c.binding(f.name.?.binding).captured) try c.emit(.new_cell, &.{c.slotOf(f.name.?.binding)}),
+            .function => |f| {
+                const b = c.binding(f.name.?.binding);
+                if (b.repl_index == null and b.captured) try c.emit(.new_cell, &.{c.slotOf(f.name.?.binding)});
+            },
             .class => |cls| try c.enterBinding(cls.name.?.binding),
             else => {},
         };
@@ -431,7 +454,19 @@ const Compiler = struct {
             try c.closure(f);
             try c.initBinding(f.name.?.binding);
         };
-        for (stmts) |s| if (!try c.stmt(s)) return false;
+        for (stmts, 0..) |s, idx| {
+            if (repl_top and idx + 1 == stmts.len and s.data == .expression) {
+                c.span = s.span;
+                try c.expr(s.data.expression);
+                if (c.s.options.top_level_await) {
+                    try c.emit(.@"return", &.{});
+                    return false;
+                }
+                try c.emit(.save_repl_result, &.{});
+                continue;
+            }
+            if (!try c.stmt(s)) return false;
+        }
         return true;
     }
 
@@ -452,11 +487,16 @@ const Compiler = struct {
 
     /// The binding's scope is being entered: TDZ (a fresh cell if captured).
     fn enterBinding(c: *Compiler, b: u32) Error!void {
+        if (c.binding(b).repl_index != null) return;
         try c.emit(if (c.binding(b).captured) .new_cell else .clear_local, &.{c.slotOf(b)});
     }
 
     /// Pops the top of the stack into binding `b` of this function (no TDZ/const check).
     fn initBinding(c: *Compiler, b: u32) Error!void {
+        if (c.binding(b).repl_index) |repl_idx| {
+            try c.emit(.init_repl, &.{repl_idx});
+            return;
+        }
         try c.emit(if (c.binding(b).captured) .init_cell else .init_local, &.{c.slotOf(b)});
     }
 
@@ -2036,6 +2076,7 @@ const Compiler = struct {
             .local => |b| try c.emit(if (c.binding(b).captured) .get_cell else .get_local, &.{ c.slotOf(b), try c.name(ref.name) }),
             .capture => |cap| try c.emit(.get_capture, &.{ cap.index, try c.name(ref.name) }),
             .global => try c.emit(.get_global, &.{try c.name(ref.name)}),
+            .repl => |idx| try c.emit(.get_repl, &.{ idx, try c.name(ref.name) }),
         }
     }
 
@@ -2056,6 +2097,10 @@ const Compiler = struct {
                 try c.emit(op, &.{ cap.index, try c.name(ref.name) });
             },
             .global => unreachable,
+            .repl => |idx| {
+                const op: Op = if (c.s.res.repl_bindings[idx].kind == .@"const") .assign_const_repl else .set_repl;
+                try c.emit(op, &.{ idx, try c.name(ref.name) });
+            },
         }
     }
 

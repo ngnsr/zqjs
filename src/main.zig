@@ -14,9 +14,12 @@ const zqjs = @import("zqjs_internal");
 const api = @import("zqjs");
 
 const usage =
-    \\usage: zqjs [--test | --dump-ast | --dump-bytecode] [options] FILE
+    \\usage: zqjs [--repl] [options]
+    \\       zqjs [--test | --dump-ast | --dump-bytecode] [options] FILE
     \\       zqjs [--test | --dump-ast | --dump-bytecode] [options] -e SOURCE
     \\
+    \\  --repl             start the interactive REPL
+    \\  --no-color         disable ANSI colors in REPL output
     \\  --max-steps N      stop after N execution steps (0 = unlimited, default 200000000)
     \\  --engine=vm        run on the bytecode VM (default)
     \\  --engine=treewalk  run on the tree-walking reference interpreter
@@ -51,12 +54,17 @@ pub fn main(init: std.process.Init) !u8 {
     defer out.flush() catch {}; // runs first: program output before the error report
 
     var rest = args[1..];
-    const Command = enum { run, @"test", dump, dump_bytecode };
+    const Command = enum { run, @"test", dump, dump_bytecode, repl };
     var command: Command = .run;
+    var no_color = false;
     var limits: zqjs.Limits = .{ .max_steps = cli_default_steps };
     var options: zqjs.RunOptions = .{};
     while (rest.len > 0 and std.mem.startsWith(u8, rest[0], "--")) {
-        if (std.mem.eql(u8, rest[0], "--test")) {
+        if (std.mem.eql(u8, rest[0], "--repl")) {
+            command = .repl;
+        } else if (std.mem.eql(u8, rest[0], "--no-color")) {
+            no_color = true;
+        } else if (std.mem.eql(u8, rest[0], "--test")) {
             command = .@"test";
         } else if (std.mem.eql(u8, rest[0], "--dump-ast")) {
             command = .dump;
@@ -83,6 +91,33 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
         rest = rest[1..];
+    }
+
+    if (command == .repl or (command == .run and rest.len == 0)) {
+        if (rest.len != 0) {
+            try err.writeAll(usage);
+            return 2;
+        }
+        const env_no_color = init.environ_map.get("NO_COLOR") != null;
+        const color = !no_color and !env_no_color and zqjs.repl.editor.LineEditor.isTty();
+        const history_path: ?[]const u8 = if (init.environ_map.get("ZQJS_REPL_HISTORY")) |hp|
+            (if (hp.len == 0) null else hp)
+        else if (init.environ_map.get("HOME")) |home|
+            try std.fmt.allocPrint(arena, "{s}/.zqjs_history", .{home})
+        else
+            null;
+
+        const session = try zqjs.repl.Session.create(gpa, out, err, .{
+            .limits = limits,
+            .engine = options.engine,
+            .trace = options.trace != null,
+            .verify_heap = options.verify_heap,
+            .color = color,
+            .io = io,
+            .history_path = history_path,
+        });
+        defer session.destroy();
+        return session.runLoop();
     }
 
     const name: []const u8, const source: []const u8 = blk: {
@@ -114,6 +149,7 @@ pub fn main(init: std.process.Init) !u8 {
         },
         .dump => return dump(arena, name, source, limits, out, err),
         .dump_bytecode => return dumpBytecode(gpa, arena, name, source, limits, out, err),
+        .repl => unreachable,
     }
 }
 

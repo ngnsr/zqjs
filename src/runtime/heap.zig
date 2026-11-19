@@ -150,7 +150,7 @@ pub const Closure = struct {
         /// `proto: *const bytecode.Proto`; `captures` filled by `make_closure`.
         vm: struct { proto: *const anyopaque, captures: []*Cell },
         /// `func: *const ast.Function`; `env` is the environment it was created in.
-        tree: struct { func: *const anyopaque, env: ?*Env },
+        tree: struct { func: *const anyopaque, env: ?*Env, res: ?*const anyopaque = null, repl_cells: []*Cell = &.{} },
         /// Native Promise resolve/reject capability (M18).
         promise_cap: struct { promise: *Object, is_reject: bool },
         /// Native closure with a bound environment object (M19).
@@ -2095,7 +2095,10 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
             switch (c.impl) {
                 // The Proto (and its string constants) is not a heap object yet; M8 roots it.
                 .vm => |v| for (v.captures) |cell| visit(ctx, &cell.obj),
-                .tree => |t| if (t.env) |e| visit(ctx, &e.obj),
+                .tree => |t| {
+                    if (t.env) |e| visit(ctx, &e.obj);
+                    for (t.repl_cells) |cell| visit(ctx, &cell.obj);
+                },
                 .promise_cap => |pc| visit(ctx, &pc.promise.obj),
                 .native_closure => |nc| visit(ctx, &nc.env.obj),
                 .bound => |b| {

@@ -12,4 +12,5 @@ comptime {
     _ = @import("ops_test.zig");
     _ = @import("frontend_test.zig");
     _ = @import("regex_test.zig");
+    _ = @import("repl_test.zig");
 }

@@ -89,6 +89,7 @@ pub fn instruction(p: Proto, pc: usize, w: *Writer) Writer.Error!void {
             .argc => line.print("{d}", .{x}) catch unreachable,
             .function => line.print("#{d}", .{x + 1}) catch unreachable, // the listing numbers from 1
             .capture => line.print("^{d}", .{x}) catch unreachable,
+            .repl => line.print("r{d}", .{x}) catch unreachable,
         }
     }
     if (comment == null and comment_name == null) return w.writeAll(std.mem.trimEnd(u8, line.buffered(), " "));

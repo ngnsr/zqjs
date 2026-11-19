@@ -301,6 +301,7 @@ const Dumper = struct {
             .local => |b| try d.w.print("{s}#{d}", .{ r.name, b }),
             .capture => |c| try d.w.print("{s}#{d}^{d}", .{ r.name, c.binding, c.index }),
             .global => try d.w.print("{s}@global", .{r.name}),
+            .repl => |idx| try d.w.print("{s}@repl{d}", .{ r.name, idx }),
         }
     }
 

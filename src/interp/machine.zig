@@ -40,6 +40,74 @@ pub fn run(rt: *Runtime, script: ast.Script, res: Resolution) Error!void {
     return runMeasured(rt, script, res, null);
 }
 
+/// Runs a resolved script in REPL mode with persistent bindings and completion value.
+pub fn runRepl(rt: *Runtime, script: ast.Script, res: *const Resolution, repl_cells: []*heap.Cell) Error!void {
+    var m: Machine = .{
+        .rt = rt,
+        .res = res.*,
+        .res_ptr = res,
+        .repl_cells = repl_cells,
+        .repl_mode = true,
+        .repl_top_stmts = script.statements,
+        .stack_top = if (builtin.is_test) @frameAddress() else 0,
+        .lowest_frame = if (builtin.is_test) @frameAddress() else 0,
+    };
+    defer m.deinit();
+    const prev_roots = rt.engine_roots;
+    rt.engine_roots = m.roots();
+    defer rt.engine_roots = prev_roots;
+    const prev_caller = rt.closure_caller;
+    rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin };
+    defer rt.closure_caller = prev_caller;
+
+    try m.pushBlock(script.statements);
+    _ = try m.runLoop(0);
+    try rt.drainMicrotasks();
+}
+
+/// Starts a top-level-await REPL script as an async coroutine on the tree-walker.
+pub fn runReplTopLevelAsync(rt: *Runtime, script: ast.Script, res: *const Resolution, repl_cells: []*heap.Cell) Error!Value {
+    const ReplAsyncCtx = struct {
+        rt: *Runtime,
+        script: ast.Script,
+        res: *const Resolution,
+        repl_cells: []*heap.Cell,
+    };
+    const create_and_run = struct {
+        fn call(ctx: ReplAsyncCtx, co: *heap.Coroutine) Error!coroutine.Outcome {
+            const m_ptr = try ctx.rt.gpa.create(Machine);
+            m_ptr.* = .{
+                .rt = ctx.rt,
+                .res = ctx.res.*,
+                .res_ptr = ctx.res,
+                .repl_cells = ctx.repl_cells,
+                .repl_mode = true,
+                .repl_top_stmts = ctx.script.statements,
+                .is_coroutine = true,
+                .stack_top = if (builtin.is_test) @frameAddress() else 0,
+                .lowest_frame = if (builtin.is_test) @frameAddress() else 0,
+            };
+            errdefer {
+                if (co.engine == null) {
+                    m_ptr.deinit();
+                    ctx.rt.gpa.destroy(m_ptr);
+                }
+            }
+            try m_ptr.pushVal(.undefined);
+            try m_ptr.pushBlock(ctx.script.statements);
+            co.engine = m_ptr;
+            co.state = .running;
+            return Machine.runCoroMachine(m_ptr, 0, 0, .start);
+        }
+    }.call;
+    return coroutine.start(rt, &Machine.coro_vtable, ReplAsyncCtx{
+        .rt = rt,
+        .script = script,
+        .res = res,
+        .repl_cells = repl_cells,
+    }, create_and_run);
+}
+
 const StackUse = struct { depth: u32 = 0, bytes: usize = 0 };
 
 fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUse) Error!void {
@@ -103,6 +171,8 @@ const Task = union(enum) {
     pop_value_depth,
     /// Pops and discards one value from `m.values`.
     pop_value,
+    /// Pops top of `m.values` into `rt.repl_result` (or coroutine return slot).
+    save_repl_result,
 
     // ---- Statements
     exec: *const ast.Stmt,
@@ -191,6 +261,9 @@ const Task = union(enum) {
         saved_construct_instance: ?*heap.Object = null,
         callee_func: ?*const ast.Function = null,
         is_super_call: bool = false,
+        saved_res: Resolution = undefined,
+        saved_res_ptr: ?*const Resolution = null,
+        saved_repl_cells: []*heap.Cell = &.{},
     },
     barrier: u32,
     await_suspend,
@@ -263,6 +336,10 @@ const BindMode = enum { init, assign };
 const Machine = struct {
     rt: *Runtime,
     res: Resolution,
+    res_ptr: ?*const Resolution = null,
+    repl_cells: []*heap.Cell = &.{},
+    repl_mode: bool = false,
+    repl_top_stmts: ?[]const ast.Stmt = null,
     env: ?*Env = null,
     depth: u32 = 0,
     calls: u32 = 0,
@@ -329,6 +406,7 @@ const Machine = struct {
         if (m.this) |t| heap.visitValue(t, ctx, visit);
         if (m.current_closure) |c| visit(ctx, @constCast(&c.obj));
         if (m.construct_instance) |ci| visit(ctx, &ci.obj);
+        for (m.repl_cells) |cell| visit(ctx, &cell.obj);
         heap.visitValue(m.ret, ctx, visit);
         heap.visitValue(m.awaited, ctx, visit);
         for (m.tasks.items) |t| switch (t) {
@@ -414,10 +492,15 @@ const Machine = struct {
     }
 
     fn load(m: *const Machine, b: u32) ?Value {
+        if (m.res.bindings[b].repl_index) |ri| return m.repl_cells[ri].value;
         return m.envOf(b).values[m.res.bindings[b].index];
     }
 
     fn store(m: *Machine, b: u32, v: Value) void {
+        if (m.res.bindings[b].repl_index) |ri| {
+            m.rt.heap.storeCell(m.repl_cells[ri], v);
+            return;
+        }
         m.rt.heap.storeEnv(m.envOf(b), m.res.bindings[b].index, v);
     }
 
@@ -429,7 +512,7 @@ const Machine = struct {
 
     fn patternScope(m: *const Machine, pat: *const ast.Pattern) ?u32 {
         switch (pat.data) {
-            .binding => |d| return m.res.bindings[d.binding].scope,
+            .binding => |d| return if (m.res.bindings[d.binding].repl_index != null) null else m.res.bindings[d.binding].scope,
             .target => return null,
             .array => |arr| {
                 for (arr.elems) |maybe| if (maybe) |el| if (m.patternScope(el.pattern)) |s| return s;
@@ -449,8 +532,8 @@ const Machine = struct {
             .declaration => |decl| for (decl.declarators) |d| {
                 if (m.patternScope(d.pattern)) |sc| return sc;
             },
-            .function => |f| return m.res.bindings[f.name.?.binding].scope,
-            .class => |c| return m.res.bindings[c.name.?.binding].scope,
+            .function => |f| if (m.res.bindings[f.name.?.binding].repl_index == null) return m.res.bindings[f.name.?.binding].scope,
+            .class => |c| if (m.res.bindings[c.name.?.binding].repl_index == null) return m.res.bindings[c.name.?.binding].scope,
             else => {},
         };
         return null;
@@ -471,10 +554,17 @@ const Machine = struct {
         try m.pushBody(stmts);
     }
 
+    fn makeTreeClosure(m: *Machine, f: *const ast.Function, env: ?*Env) Error!*heap.Closure {
+        const cl = try m.rt.heap.newTreeClosure(f, env);
+        cl.impl.tree.res = if (m.res_ptr) |rp| @ptrCast(rp) else null;
+        cl.impl.tree.repl_cells = m.repl_cells;
+        return cl;
+    }
+
     fn pushBody(m: *Machine, stmts: []const ast.Stmt) Error!void {
         for (stmts) |s| if (s.data == .function) {
             const f = s.data.function;
-            m.store(f.name.?.binding, .{ .closure = try m.rt.heap.newTreeClosure(f, m.env) });
+            m.store(f.name.?.binding, .{ .closure = try m.makeTreeClosure(f, m.env) });
         };
         if (stmts.len > 0) {
             try m.pushTask(.{ .stmt_list = .{ .stmts = stmts, .idx = 0 } });
@@ -485,16 +575,28 @@ const Machine = struct {
         return switch (m.res.refs[ref.id]) {
             .local => |b| b,
             .capture => |c| c.binding,
-            .global => null,
+            .global, .repl => null,
         };
     }
 
     fn read(m: *Machine, ref: ast.Ref) Error!Value {
+        if (m.res.refs[ref.id] == .repl) {
+            const ri = m.res.refs[ref.id].repl;
+            return m.repl_cells[ri].value orelse m.tdz(ref);
+        }
         const b = m.bindingOf(ref) orelse return builtins.global(m.rt, ref.name);
         return m.load(b) orelse m.tdz(ref);
     }
 
     fn write(m: *Machine, ref: ast.Ref, v: Value) Error!void {
+        if (m.res.refs[ref.id] == .repl) {
+            const ri = m.res.refs[ref.id].repl;
+            if (m.repl_cells[ri].value == null) return m.tdz(ref);
+            if (m.res.repl_bindings[ri].kind == .@"const")
+                return m.rt.throw(.TypeError, &.{.{ .ascii = "Assignment to constant variable." }});
+            m.rt.heap.storeCell(m.repl_cells[ri], v);
+            return;
+        }
         const b = m.bindingOf(ref).?;
         if (m.load(b) == null) return m.tdz(ref);
         if (m.res.bindings[b].kind == .@"const")
@@ -607,6 +709,9 @@ const Machine = struct {
                     m.current_closure = cr.saved_closure;
                     m.current_func = cr.saved_func;
                     m.construct_instance = cr.saved_construct_instance;
+                    m.res = cr.saved_res;
+                    m.res_ptr = cr.saved_res_ptr;
+                    m.repl_cells = cr.saved_repl_cells;
                     m.calls -= 1;
                     m.depth -= 1;
                     m.values.shrinkRetainingCapacity(cr.values_base);
@@ -978,10 +1083,24 @@ const Machine = struct {
                     },
                 }
             },
+            .save_repl_result => {
+                const v = m.popVal();
+                if (m.is_coroutine) {
+                    // Replace the initial `.undefined` slot at values[0] with `v`.
+                    m.values.shrinkRetainingCapacity(0);
+                    try m.pushVal(v);
+                } else {
+                    m.rt.repl_result = v;
+                }
+            },
             .exec => |s| return m.execStmt(s),
             .stmt_list => |sl| {
                 if (sl.idx + 1 < sl.stmts.len) {
                     try m.pushTask(.{ .stmt_list = .{ .stmts = sl.stmts, .idx = sl.idx + 1 } });
+                } else if (m.repl_mode and m.repl_top_stmts != null and sl.stmts.ptr == m.repl_top_stmts.?.ptr and sl.stmts[sl.idx].data == .expression) {
+                    try m.pushTask(.save_repl_result);
+                    try m.pushTask(.{ .eval = sl.stmts[sl.idx].data.expression });
+                    return null;
                 }
                 return m.execStmt(&sl.stmts[sl.idx]);
             },
@@ -2032,6 +2151,9 @@ const Machine = struct {
                 m.current_closure = cr.saved_closure;
                 m.current_func = cr.saved_func;
                 m.construct_instance = cr.saved_construct_instance;
+                m.res = cr.saved_res;
+                m.res_ptr = cr.saved_res_ptr;
+                m.repl_cells = cr.saved_repl_cells;
                 m.calls -= 1;
                 m.depth -= 1;
                 m.values.shrinkRetainingCapacity(cr.values_base);
@@ -2652,7 +2774,7 @@ const Machine = struct {
                 }
                 for (stmts) |st| if (st.data == .function) {
                     const f = st.data.function;
-                    m.store(f.name.?.binding, .{ .closure = try m.rt.heap.newTreeClosure(f, m.env) });
+                    m.store(f.name.?.binding, .{ .closure = try m.makeTreeClosure(f, m.env) });
                 };
                 if (stmts.len > 0) {
                     if (stmts.len > 1) {
@@ -3108,10 +3230,10 @@ const Machine = struct {
         const rt = m.rt;
         const c = if (f.name) |n| blk: {
             const own = try rt.heap.newEnv(m.env, m.res.bindings[n.binding].scope, 1);
-            const cl = try rt.heap.newTreeClosure(f, own);
+            const cl = try m.makeTreeClosure(f, own);
             rt.heap.storeEnv(own, 0, .{ .closure = cl });
             break :blk cl;
-        } else try rt.heap.newTreeClosure(f, m.env);
+        } else try m.makeTreeClosure(f, m.env);
         if (f.is_arrow) {
             if (m.this) |t| try rt.heap.storeClosureLexicalThis(c, t);
             if (m.current_closure) |pc| {
@@ -3210,8 +3332,17 @@ const Machine = struct {
             .saved_construct_instance = m.construct_instance,
             .callee_func = f,
             .is_super_call = is_super_call,
+            .saved_res = m.res,
+            .saved_res_ptr = m.res_ptr,
+            .saved_repl_cells = m.repl_cells,
         } });
 
+        if (closure.impl.tree.res) |rp| {
+            const res_ptr: *const Resolution = @ptrCast(@alignCast(rp));
+            m.res = res_ptr.*;
+            m.res_ptr = res_ptr;
+            m.repl_cells = closure.impl.tree.repl_cells;
+        }
         m.env = env;
         m.this = if (f.has_super_ctor) null else if (f.is_arrow) (if (closure.meta) |meta| meta.lexical_this else null) else this;
         m.current_closure = closure;
@@ -3313,6 +3444,12 @@ const Machine = struct {
             }
         }
         const t = ctx.closure.impl.tree;
+        if (t.res) |rp| {
+            const res_ptr: *const Resolution = @ptrCast(@alignCast(rp));
+            m_ptr.res = res_ptr.*;
+            m_ptr.res_ptr = res_ptr;
+            m_ptr.repl_cells = t.repl_cells;
+        }
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
         try m_ptr.values.appendSlice(rt.gpa, ctx.args);
         try m_ptr.pushClosureCallSync(ctx.closure, f, t.env, ctx.this, 0, 0, null, false);

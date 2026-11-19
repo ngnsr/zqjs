@@ -452,4 +452,6 @@ pub const Script = struct {
     binding_count: u32,
     /// Number of functions plus one (the script is function 0).
     function_count: u32,
+    /// True when the top-level script itself uses `await` or `for await` (REPL mode).
+    has_top_level_await: bool = false,
 };

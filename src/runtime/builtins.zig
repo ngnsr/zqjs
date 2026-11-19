@@ -91,6 +91,8 @@ pub const Realm = struct {
     sym_iterator: *heap_mod.Symbol,
     /// `Symbol.asyncIterator` (D68).
     sym_async_iterator: *heap_mod.Symbol,
+    /// `Symbol.toStringTag` (D71).
+    sym_to_string_tag: *heap_mod.Symbol,
     math: *Object,
     json: *Object,
 
@@ -204,6 +206,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .symbol_namespace = try builtin(h, null, .symbol_constructor),
         .sym_iterator = try h.newSymbol(try h.ascii("Symbol.iterator"), false),
         .sym_async_iterator = try h.newSymbol(try h.ascii("Symbol.asyncIterator"), false),
+        .sym_to_string_tag = try h.newSymbol(try h.ascii("Symbol.toStringTag"), false),
         .math = try builtin(h, object_prototype, .math),
         .json = try builtin(h, object_prototype, .json),
     };
@@ -392,6 +395,12 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     });
     try rt.heap.defineProperty(r.symbol_namespace, try rt.heap.internAscii("asyncIterator"), .{
         .value = .{ .symbol = r.sym_async_iterator },
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
+    try rt.heap.defineProperty(r.symbol_namespace, try rt.heap.internAscii("toStringTag"), .{
+        .value = .{ .symbol = r.sym_to_string_tag },
         .enumerable = false,
         .writable = false,
         .configurable = false,

@@ -34,7 +34,7 @@ const Allocator = std.mem.Allocator;
 const Value = @import("../runtime/value.zig").Value;
 const heap = @import("../runtime/heap.zig");
 
-pub const Operand = enum { slot, @"const", name, target, argc, function, capture };
+pub const Operand = enum { slot, @"const", name, target, argc, function, capture, repl };
 
 pub const Op = enum(u8) {
     // ---- constants: push one value
@@ -86,6 +86,14 @@ pub const Op = enum(u8) {
     get_capture,
     set_capture,
     assign_const_capture,
+
+    // ---- REPL persistent top-level bindings (D71)
+    get_repl,
+    set_repl,
+    init_repl,
+    assign_const_repl,
+    /// Pop top of stack into `rt.repl_result`.
+    save_repl_result,
 
     // ---- functions
     /// Push a new closure of functions[f], capturing as its `captures` describe: from
@@ -343,6 +351,10 @@ pub const Op = enum(u8) {
             .init_cell => .{ .operands = &.{.slot}, .pops = 1, .pushes = 0 },
             .get_capture => .{ .operands = &.{ .capture, .name }, .pops = 0, .pushes = 1 },
             .set_capture, .assign_const_capture => .{ .operands = &.{ .capture, .name }, .pops = 1, .pushes = 1 },
+            .get_repl => .{ .operands = &.{ .repl, .name }, .pops = 0, .pushes = 1 },
+            .set_repl, .assign_const_repl => .{ .operands = &.{ .repl, .name }, .pops = 1, .pushes = 1 },
+            .init_repl => .{ .operands = &.{.repl}, .pops = 1, .pushes = 0 },
+            .save_repl_result => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
             .make_closure => .{ .operands = &.{.function}, .pops = 0, .pushes = 1 },
             .push_callee => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
             .@"return" => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
@@ -500,6 +512,10 @@ pub const Proto = struct {
     handlers: []const ExceptionHandler = &.{},
     /// Tagged template call sites (M32b).
     templates: []const TemplateSite = &.{},
+    /// Number of REPL top-level bindings referenced by this script/function (D71).
+    repl_count: u32 = 0,
+    /// Borrowed from REPL Session for the lifetime of the chunk (D71).
+    repl_cells: []*heap.Cell = &.{},
 
     pub const TemplateSite = struct {
         /// Indices into `consts` (`std.math.maxInt(u32)` means `undefined` for invalid escapes).

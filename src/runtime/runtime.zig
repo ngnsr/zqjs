@@ -250,6 +250,8 @@ pub const Runtime = struct {
     internal_reason: ?[]const u8 = null,
     /// Per-runtime PRNG state for `Math.random()` (M11.3: deterministic by default).
     rng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(default_random_seed),
+    /// Last top-level expression statement value in REPL mode (D71).
+    repl_result: Value = .undefined,
 
     pub const default_random_seed: u64 = 0x9e3779b97f4a7c15;
 
@@ -417,6 +419,7 @@ pub const Runtime = struct {
             for (r.objects()) |o| h.markObj(&o.obj);
             h.markObj(&r.sym_iterator.obj);
             h.markObj(&r.sym_async_iterator.obj);
+            h.markObj(&r.sym_to_string_tag.obj);
         }
         var sym_it = rt.global_symbols.iterator();
         while (sym_it.next()) |e| {
@@ -426,6 +429,7 @@ pub const Runtime = struct {
         if (rt.exception) |e| h.markObj(@constCast(&e.message.obj));
         if (rt.thrown_value) |v| h.markValue(v);
         if (rt.unsupported_name) |n| h.markObj(@constCast(&n.obj));
+        h.markValue(rt.repl_result);
         // Only non-empty inside an instruction, never at a safepoint.
         std.debug.assert(rt.joining.items.len == 0);
         if (rt.engine_roots) |e| e.mark(e.ctx, h);

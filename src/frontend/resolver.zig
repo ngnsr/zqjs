@@ -48,11 +48,25 @@ const Diagnostic = @import("diag.zig").Diagnostic;
 
 pub const Error = error{ SyntaxError, Unsupported, OutOfMemory };
 
+pub const ReplKind = enum { let, @"const", function };
+
+pub const ReplLookup = struct {
+    ctx: *const anyopaque,
+    get: *const fn (ctx: *const anyopaque, name: []const u8) ?ReplKind,
+};
+
+pub const ReplBinding = struct {
+    name: []const u8,
+    kind: ReplKind,
+    is_decl: bool,
+};
+
 pub const Resolution = struct {
     refs: []const Ref,
     bindings: []const Binding,
     scopes: []const Scope,
     functions: []const Function,
+    repl_bindings: []const ReplBinding = &.{},
 
     pub const Ref = union(enum) {
         /// A binding of the function containing the reference (binding id).
@@ -62,6 +76,8 @@ pub const Resolution = struct {
         capture: struct { binding: u32, index: u32 },
         /// Not declared anywhere in the script; looked up by name at runtime.
         global,
+        /// A top-level REPL binding (index into `Resolution.repl_bindings`).
+        repl: u32,
     };
 
     pub const BindingKind = enum {
@@ -84,6 +100,7 @@ pub const Resolution = struct {
         index: u32,
         function: u32,
         captured: bool = false,
+        repl_index: ?u32 = null,
     };
 
     pub const Scope = struct { len: u32 = 0 };
@@ -117,19 +134,30 @@ pub const Resolution = struct {
 
 /// `arena` also owns the returned tables; they live exactly as long as the AST.
 pub fn resolve(arena: Allocator, script: ast.Script, diag: *Diagnostic) Error!Resolution {
+    return resolveWithRepl(arena, script, null, diag);
+}
+
+pub fn resolveWithRepl(arena: Allocator, script: ast.Script, repl_lookup: ?ReplLookup, diag: *Diagnostic) Error!Resolution {
     var r: Resolver = .{
         .arena = arena,
         .diag = diag,
         .refs = try arena.alloc(Resolution.Ref, script.ref_count),
         .bindings = try arena.alloc(Resolution.Binding, script.binding_count),
         .functions = try arena.alloc(Resolution.Function, script.function_count),
+        .repl_lookup = repl_lookup,
     };
     @memset(r.refs, .global);
     @memset(r.functions, .{});
     try r.fns.append(arena, .{ .id = 0, .live_start = 0 });
     try r.block(script.statements, .script);
     r.finishFunction();
-    return .{ .refs = r.refs, .bindings = r.bindings, .scopes = r.scopes.items, .functions = r.functions };
+    return .{
+        .refs = r.refs,
+        .bindings = r.bindings,
+        .scopes = r.scopes.items,
+        .functions = r.functions,
+        .repl_bindings = r.repl_bindings.items,
+    };
 }
 
 const Live = struct { name: []const u8, binding: u32 };
@@ -161,6 +189,8 @@ const Resolver = struct {
     fns: std.ArrayList(FnState) = .empty,
     live: std.ArrayList(Live) = .empty,
     private_scopes: std.ArrayList(std.StringHashMapUnmanaged(PrivateDecl)) = .empty,
+    repl_lookup: ?ReplLookup = null,
+    repl_bindings: std.ArrayList(ReplBinding) = .empty,
     scope_start: usize = 0,
     scope: u32 = 0,
     /// Index in `r.live` where the enclosing parameter scope starts (for checking
@@ -267,8 +297,29 @@ const Resolver = struct {
             return r.fail(.{ .syntax_error = "cannot redeclare a non-configurable global at script level" }, d.span);
         }
         const f = r.current();
-        const slot: u32 = @intCast(r.live.items.len - f.live_start);
         const scope = &r.scopes.items[r.scope];
+        if (script_scope) {
+            if (r.repl_lookup) |rl| {
+                if (rl.get(rl.ctx, d.name)) |existing_kind| {
+                    if (existing_kind == .@"const") {
+                        return r.fail(.{ .syntax_error = "identifier has already been declared" }, d.span);
+                    }
+                }
+                const repl_idx: u32 = @intCast(r.repl_bindings.items.len);
+                const repl_kind: ReplKind = switch (kind) {
+                    .let => .let,
+                    .@"const" => .@"const",
+                    .function => .function,
+                    else => unreachable,
+                };
+                try r.repl_bindings.append(r.arena, .{ .name = d.name, .kind = repl_kind, .is_decl = true });
+                r.bindings[d.binding] = .{ .kind = kind, .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .repl_index = repl_idx };
+                scope.len += 1;
+                try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
+                return;
+            }
+        }
+        const slot: u32 = @intCast(r.live.items.len - f.live_start);
         r.bindings[d.binding] = .{ .kind = kind, .slot = slot, .scope = r.scope, .index = scope.len, .function = f.id };
         scope.len += 1;
         try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
@@ -615,6 +666,10 @@ const Resolver = struct {
             .global => return r.fail(.{ .unsupported = .global_assignment }, ref.span),
             .local => |b| b,
             .capture => |c| c.binding,
+            .repl => {
+                r.refs[ref.id] = res;
+                return;
+            },
         };
         if (r.bindings[b].kind == .function_name) return r.fail(.{ .unsupported = .function_name_assignment }, ref.span);
         r.refs[ref.id] = res;
@@ -626,9 +681,20 @@ const Resolver = struct {
             i -= 1;
             if (!std.mem.eql(u8, r.live.items[i].name, name)) continue;
             const b = r.live.items[i].binding;
+            if (r.bindings[b].repl_index) |repl_idx| return .{ .repl = repl_idx };
             if (r.bindings[b].function == r.current().id) return .{ .local = b };
             r.bindings[b].captured = true;
             return .{ .capture = .{ .binding = b, .index = try r.captureIndex(r.fns.items.len - 1, b) } };
+        }
+        if (r.repl_lookup) |rl| {
+            if (rl.get(rl.ctx, name)) |rk| {
+                for (r.repl_bindings.items, 0..) |rb, idx| {
+                    if (!rb.is_decl and std.mem.eql(u8, rb.name, name)) return .{ .repl = @intCast(idx) };
+                }
+                const idx: u32 = @intCast(r.repl_bindings.items.len);
+                try r.repl_bindings.append(r.arena, .{ .name = name, .kind = rk, .is_decl = false });
+                return .{ .repl = idx };
+            }
         }
         return .global;
     }
@@ -681,7 +747,7 @@ fn refBinding(r: Resolved, n: u32) ?u32 {
     return switch (r.res.refs[n]) {
         .local => |b| b,
         .capture => |c| c.binding,
-        .global => null,
+        .global, .repl => null,
     };
 }
 

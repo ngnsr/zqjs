@@ -1799,3 +1799,26 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
   - `{ __proto__: p }` and `Object.prototype.__proto__` remain `Unsupported(builtin)` per D39.
 - **`for...in` Execution (`parser.zig`, `resolver.zig`, `compiler.zig`, `vm.zig`, `machine.zig`):**
   - Cold VM opcodes `for_in_init` and `for_in_next`, and `Machine` tasks `for_in_start` / `for_in_iter`, share `builtins.forInInit` and `builtins.forInNext` (D16): `null`/`undefined`/booleans/numbers/symbols yield 0 keys; strings yield `"0"`..`"N-1"`; objects walk the prototype chain in spec key order, skipping symbols, shadowing higher-chain keys with both enumerable and non-enumerable own keys, and re-checking enumerability on each step to honor dynamic `delete`. `for...in` does not call `IteratorClose`.
+
+---
+
+## D71. Interactive REPL (`zqjs`) (M41)
+
+**Decision:** Implement a full-featured, zero-dependency interactive REPL in `src/repl/` (`session.zig`, `inspect.zig`, `complete.zig`, `editor.zig`) wired into `src/main.zig` (when invoked with no file/`-e` or `--repl`), supporting both the bytecode VM and the tree-walker oracle (`--engine=vm|treewalk`).
+
+- **Persistent Top-Level Bindings (`ReplEnv`, revising D23 for REPL sessions only):**
+  - `Session` maintains `repl_env: name -> { cell: *heap.Cell, kind: enum { let, @"const", function } }`, strongly rooted via `Runtime.addRoots` (`EngineRoots`).
+  - `resolver.resolveWithRepl` resolves top-level `let`/`const`/`function`/`class` and destructuring declarations to `Resolution.Ref.repl` indices. Same-chunk redeclaration remains `SyntaxError`; cross-chunk `let`/`function`/`class` replaces the `ReplEnv` entry (preserving old cells for existing closures), while cross-chunk `const` redeclaration remains `SyntaxError`.
+  - Bytecode adds `get_repl`, `set_repl`, `init_repl`, `assign_const_repl`, and `save_repl_result` (verified by `verify.zig` with `repl_count` bounds). `Machine` supports the same `repl_cells` and per-chunk `Resolution` switching on `Closure.impl.tree` so closures across chunks work identically on `--engine=treewalk`.
+  - **Transactional error recovery:** parse/resolve/compile/verify errors leave `ReplEnv` untouched; runtime throws or `LimitExceeded(steps)` roll back any uninitialized (`null`) TDZ cells added by the failed chunk so they do not poison the session.
+- **Proto Pool & Completion Values:**
+  - `Session` owns heap-allocated `*Proto`s (so pointers never relocate) and marks their constants, `name_atoms`, and `repl_cells` in its `EngineRoots` callback.
+  - `rt.repl_result` captures the last top-level expression statement's value; `_` and `_error` are maintained as GC-rooted `ReplEnv` bindings.
+- **Top-Level `await` & `for await`:**
+  - `parser.parseWithOptions(.{ .allow_top_level_await = true })` permits `await` and `for await` at `function_depth == 0` and records `Script.has_top_level_await`. Both engines execute such chunks via `coroutine.start`, drain microtasks, and report the fulfilled value, rejection, or `Promise { <pending> }`.
+- **Input Ergonomics (REPL-only, preserving D18/core script contract):**
+  - `{ ... }` is tried as `({ ... });` first and falls back to block parsing on `SyntaxError`; `Unsupported(asi)` at EOF retries once with `;` appended; `rt.steps` is reset before each chunk.
+- **Value Inspector, Completeness/Completion, and Raw-Mode Editor:**
+  - `inspect.zig` formats all JS value kinds with `<ref *N>` / `[Circular *N]` cycle detection, depth/item bounds, `[Getter]`/`[Setter]` safety (never invokes getters), `[Symbol.toStringTag]`, and optional ANSI colors (`--no-color` / `NO_COLOR`).
+  - `complete.zig` reuses `Lexer` for zero-allocation multi-line completeness checking, read-only Tab completion (dot-commands, keywords, globals, `ReplEnv`, and prototype-chain properties), and live syntax highlighting.
+  - `editor.zig` uses pure-Zig `std.posix.tcgetattr`/`tcsetattr` and `std.c.isatty` with `defer` + `SIGINT`/`SIGTERM` termios restoration, UTF-8 cursor/editing, persistent history (`~/.zqjs_history` / `ZQJS_REPL_HISTORY`), `Ctrl-R` reverse search, and automatic piped non-TTY fallback.

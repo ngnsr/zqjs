@@ -22,19 +22,39 @@ pub const Error = error{ SyntaxError, Unsupported, LimitExceeded, OutOfMemory };
 
 /// Parses a whole script. `arena` must be an arena-style allocator: nodes are never
 /// freed individually; the caller frees everything at once, also after an error.
+pub const ParseOptions = struct {
+    allow_top_level_await: bool = false,
+};
+
 /// On any error other than OutOfMemory, `diag` describes the problem.
 /// The returned AST borrows names from `source`.
 pub fn parse(arena: Allocator, source: []const u8, limits: Limits, diag: *Diagnostic) Error!ast.Script {
+    return parseWithOptions(arena, source, limits, .{}, diag);
+}
+
+pub fn parseWithOptions(arena: Allocator, source: []const u8, limits: Limits, options: ParseOptions, diag: *Diagnostic) Error!ast.Script {
     if (source.len > limits.max_source_bytes) {
         diag.* = .{ .detail = .{ .limit_exceeded = .source_bytes } };
         return error.LimitExceeded;
     }
-    var p: Parser = .{ .lexer = .init(source, diag), .arena = arena, .limits = limits, .tok = undefined };
+    var p: Parser = .{
+        .lexer = .init(source, diag),
+        .arena = arena,
+        .limits = limits,
+        .tok = undefined,
+        .async_ctx = if (options.allow_top_level_await) .body else .none,
+    };
     p.tok = try p.lexer.next();
 
     var statements: std.ArrayList(ast.Stmt) = .empty;
     while (p.tok.tag != .eof) try statements.append(arena, try p.statementListItem(.body));
-    return .{ .statements = statements.items, .ref_count = p.ref_count, .binding_count = p.binding_count, .function_count = p.function_count };
+    return .{
+        .statements = statements.items,
+        .ref_count = p.ref_count,
+        .binding_count = p.binding_count,
+        .function_count = p.function_count,
+        .has_top_level_await = p.has_top_level_await,
+    };
 }
 
 const unary_bp = 12;
@@ -136,6 +156,7 @@ const Parser = struct {
     in_derived_ctor: enum { none, direct, arrow } = .none,
     in_class_method: bool = false,
     class_count: u32 = 0,
+    has_top_level_await: bool = false,
 
     fn advance(p: *Parser) Error!void {
         p.tok = try p.lexer.next();
@@ -386,6 +407,7 @@ const Parser = struct {
                 return p.fail(.{ .syntax_error = "for await is only valid in async functions" }, p.tok);
             }
             is_await = true;
+            if (p.function_depth == 0) p.has_top_level_await = true;
             try p.advance();
         }
         if (p.tok.tag != .l_paren) {
@@ -1530,6 +1552,7 @@ const Parser = struct {
                         if (p.tok.tag == .star_star)
                             return p.fail(.{ .syntax_error = "unary operator before '**' needs parentheses" }, t);
                         p.await_count += 1;
+                        if (p.function_depth == 0) p.has_top_level_await = true;
                         return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .await = operand }, operand.depth);
                     },
                 }

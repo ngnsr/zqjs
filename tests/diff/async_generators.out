@@ -1,0 +1,15 @@
+throw caught: {ready,false}
+finally return: {finally wins,true}
+bad receivers: true TypeError true TypeError true TypeError TypeError TypeError
+non-object inner: bad result TypeError
+return(rejected): {caught return rejection bad,false} {undefined,true}
+throw then return: {done,true}
+return through finally: {1,false} {from finally,false} {R,true} {undefined,true}
+queued after completion: {1,false} {undefined,true} {q1,true} {undefined,true} rejected q2 rejected q3 {undefined,true}
+yield operands: resolved operand,caught rejected operand,5
+ticks: g:start g:after a t1 n1:a g:after await t2 g:end t3 n2:b n3:true t4 ret:x t5 t6 t7 t8 t9 t10
+start/completed: {early,true} {undefined,true} rejected early-throw {undefined,true} {undefined,true} {after,true} rejected after-throw
+custom inner: {A1,false} {thrown-t,false} {ret-r,true} {undefined,true} {B1,false} {outer caught TypeError,false} {undefined,true} {C1,false} {noreturn,true} {undefined,true} {D1,false} {D2,false} {final D3,false} {undefined,true}
+yield*: i1,i2,outer saw inner result,s1,s2,10,20,sync done undefined
+forms: 1,2 / e / m / c / 10,11 / 2,3,4 / 7 named m
+log: created | body start | queued | A.next(undefined) | got A | res0 {y1,false} | awaited | inside caught boom | A.throw(t) | got B | finally runs | inner got fed | res1 {y2,false} | res2 {ret,true} | res3 {undefined,true} | after finally yield | A.return(r) | B.next(undefined) | B.return(undefined) | C.next(undefined) | D.next(undefined) | D.next(undefined) | D.next(undefined)

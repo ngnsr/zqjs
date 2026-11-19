@@ -409,7 +409,8 @@ pub const Stmt = struct {
         /// The head declaration (if any) lives in its own scope around the body. Its
         /// bindings are the ones the spec copies per iteration (DESIGN_DECISIONS D22).
         @"for": struct { init: ?ForInit, cond: ?*const Expr, update: ?*const Expr, body: *const Stmt },
-        for_of: struct { target: ForOfTarget, iterable: *const Expr, body: *const Stmt },
+        /// `is_await`: `for await (… of …)` in an async function (D68).
+        for_of: struct { target: ForOfTarget, iterable: *const Expr, body: *const Stmt, is_await: bool = false },
         labeled: struct { label: []const u8, body: *const Stmt },
         @"break": ?[]const u8,
         @"continue": ?[]const u8,

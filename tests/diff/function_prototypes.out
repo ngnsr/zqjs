@@ -1,0 +1,13 @@
+distinct: true true true true
+inherit Function.prototype: true true true
+same kind, same proto: true true true true true true true
+plain functions: true true true
+constructor links: true true
+prototype chains: true true true true true true true
+no own constructor on instances' protos: undefined undefined false undefined
+asyncIterator: symbol Symbol(Symbol.asyncIterator) true function true
+methods: function function function 1 next true
+toString tags: [object Generator] [object AsyncGenerator]
+functions inherit call/bind: function bound gen true
+own props: 1 undefined true true
+not constructable: true true

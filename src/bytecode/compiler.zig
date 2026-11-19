@@ -58,7 +58,11 @@ const Shared = struct {
 
     /// Compiles one script or function into a Proto (and, recursively, its functions).
     fn proto(s: *Shared, kind: @FieldType(Proto, "kind"), f: ?*const ast.Function, body: []const ast.Stmt) Error!Proto {
-        var c: Compiler = .{ .s = s, .function = if (f) |func| func.id else 0 };
+        var c: Compiler = .{
+            .s = s,
+            .function = if (f) |func| func.id else 0,
+            .is_async_generator = if (f) |func| func.is_async and func.is_generator else false,
+        };
         defer c.deinit();
 
         if (f) |func| {
@@ -114,6 +118,8 @@ const Loop = struct {
     continues: std.ArrayList(u32) = .empty,
     /// Set for `for...of` loops so `return`/outer jumps close the iterator.
     iter_slot: ?u32 = null,
+    /// `for await`: closing awaits `return()`'s result (AsyncIteratorClose, D68).
+    is_await: bool = false,
 };
 
 const JumpTarget = union(enum) {
@@ -178,6 +184,8 @@ const Compiler = struct {
     s: *Shared,
     /// Resolution.functions index of the function being compiled.
     function: u32,
+    /// `yield` and `return e` await their operand; `yield*` is async (D68).
+    is_async_generator: bool = false,
 
     code: std.ArrayList(u8) = .empty,
     consts: std.ArrayList(Value) = .empty,
@@ -270,6 +278,7 @@ const Compiler = struct {
             .is_arrow = if (f) |func| func.is_arrow else false,
             .is_async = if (f) |func| func.is_async or func.is_generator else false,
             .is_generator = if (f) |func| func.is_generator else false,
+            .is_async_generator = if (f) |func| func.is_async and func.is_generator else false,
             .is_method = if (f) |func| func.is_method else false,
             .is_class_constructor = if (f) |func| func.is_class_constructor else false,
             .has_super_ctor = if (f) |func| func.has_super_ctor else false,
@@ -486,7 +495,10 @@ const Compiler = struct {
             },
             .block => |stmts| return c.statements(stmts, s.span),
             .@"return" => |v| {
-                if (v) |e| try c.expr(e) else try c.emit(.push_undefined, &.{});
+                if (v) |e| {
+                    try c.expr(e);
+                    if (c.is_async_generator) try c.emit(.await, &.{}); // D68
+                } else try c.emit(.push_undefined, &.{});
                 try c.emitReturn();
                 return false;
             },
@@ -600,14 +612,18 @@ const Compiler = struct {
                     copies = &single_copy;
                 }
                 try c.expr(f.iterable);
-                try c.emit(.get_iter, &.{});
+                try c.emit(if (f.is_await) .get_async_iter else .get_iter, &.{});
                 try c.emit(.init_local, &.{iter_slot});
-                var loop: Loop = .{ .iter_slot = iter_slot };
+                var loop: Loop = .{ .iter_slot = iter_slot, .is_await = f.is_await };
                 defer c.deinitLoop(&loop);
                 c.attachLabelsToLoop(&loop);
                 const top = c.here();
                 try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
-                try c.emit(.iter_next, &.{});
+                if (f.is_await) { // `for await` (D68): await each `next()` result
+                    try c.emit(.async_iter_next, &.{});
+                    try c.emit(.await, &.{});
+                    try c.emit(.async_iter_result, &.{});
+                } else try c.emit(.iter_next, &.{});
                 const to_end = try c.jumpForward(.jump_if_true);
                 const body_bind_start = c.here();
                 switch (f.target) {
@@ -628,7 +644,7 @@ const Compiler = struct {
                     c.depth = loop_depth + 1;
                     c.max_stack = @max(c.max_stack, c.depth);
                     try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
-                    try c.emit(.iter_close_throw, &.{});
+                    if (f.is_await) try c.emitAsyncClose(true) else try c.emit(.iter_close_throw, &.{});
                     try c.emit(.clear_local, &.{iter_slot});
                     try c.emit(.throw, &.{});
                     try c.handlers.append(c.s.gpa, .{
@@ -643,7 +659,7 @@ const Compiler = struct {
                     c.depth = loop_depth;
                     for (loop.breaks.items) |j| c.patch(j, c.here());
                     try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
-                    try c.emit(.iter_close, &.{});
+                    if (f.is_await) try c.emitAsyncClose(false) else try c.emit(.iter_close, &.{});
                     const after_break = try c.jumpForward(.jump);
                     c.patch(to_end, c.here());
                     // At `to_end` (reached only from `jump_if_true` after `iter_next`), the
@@ -712,13 +728,45 @@ const Compiler = struct {
         return true;
     }
 
-    fn emitIterClose(c: *Compiler, slot: u32) Error!void {
+    fn emitIterClose(c: *Compiler, slot: u32, is_await: bool) Error!void {
         // Clear `slot` before closing so throwing in `return()` does not double-close.
         try c.emit(.get_local, &.{ slot, try c.name("<iter>") });
         try c.emit(.push_undefined, &.{});
         try c.emit(.init_local, &.{slot});
-        try c.emit(.iter_close, &.{});
+        if (is_await) try c.emitAsyncClose(false) else try c.emit(.iter_close, &.{});
         try c.emit(.clear_local, &.{slot});
+    }
+
+    /// AsyncIteratorClose of the record on top of the stack (D68): [record] → []. On a throw
+    /// completion (`is_throw`) a rejected `return()` promise is ignored, through a handler
+    /// around the `await`, so the original exception wins.
+    fn emitAsyncClose(c: *Compiler, is_throw: bool) Error!void {
+        const base = c.depth - 1;
+        try c.emit(if (is_throw) .async_iter_close_throw else .async_iter_close, &.{});
+        const to_skip = try c.jumpForward(.jump_if_false); // [result]
+        const await_pc = c.here();
+        try c.emit(.await, &.{});
+        if (is_throw) {
+            // The awaited value or the caught rejection: both are dropped.
+            const after = c.here();
+            try c.handlers.append(c.s.gpa, .{
+                .try_start = await_pc,
+                .try_end = after,
+                .catch_pc = after,
+                .stack_depth = base,
+                .has_binding = true,
+            });
+            c.patch(to_skip, c.here());
+            try c.emit(.pop, &.{});
+        } else {
+            try c.emit(.async_iter_close_check, &.{});
+            const to_end = try c.jumpForward(.jump);
+            c.patch(to_skip, c.here());
+            c.depth = base + 1;
+            try c.emit(.pop, &.{});
+            c.patch(to_end, c.here());
+        }
+        c.depth = base;
     }
 
     fn emitReturn(c: *Compiler) Error!void {
@@ -738,7 +786,7 @@ const Compiler = struct {
                     try fr.to_finally.append(c.s.gpa, try c.jumpForward(.jump));
                     return;
                 },
-                .loop => |l| if (l.iter_slot) |slot| try c.emitIterClose(slot),
+                .loop => |l| if (l.iter_slot) |slot| try c.emitIterClose(slot, l.is_await),
                 .@"switch", .label => {},
             }
         }
@@ -762,11 +810,13 @@ const Compiler = struct {
 
     /// `yield* e` (D67): a loop around `yield_star_step`, the inner iterator in a hidden
     /// slot; inner results are yielded raw, and the resume's [value, mode] feeds the next round.
+    /// In an async generator (D68) each round awaits the inner result between
+    /// `async_yield_star_call` and `async_yield_star_result`, and yields its value.
     fn yieldStar(c: *Compiler, operand: *const ast.Expr) Error!void {
         const iter_slot = c.allocTemp();
         defer c.freeTemp();
         try c.expr(operand);
-        try c.emit(.get_iter, &.{});
+        try c.emit(if (c.is_async_generator) .get_async_iter else .get_iter, &.{});
         try c.emit(.init_local, &.{iter_slot});
         try c.emit(.push_undefined, &.{});
         try c.emit(.push_const, &.{try c.number(0)});
@@ -774,7 +824,11 @@ const Compiler = struct {
         const round = c.depth; // [received, mode]
         try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
         try c.emit(.rot3, &.{});
-        try c.emit(.yield_star_step, &.{});
+        if (c.is_async_generator) {
+            try c.emit(.async_yield_star_call, &.{});
+            try c.emit(.await, &.{});
+            try c.emit(.async_yield_star_result, &.{});
+        } else try c.emit(.yield_star_step, &.{});
         try c.emit(.dup, &.{});
         const to_yield = try c.jumpForward(.jump_if_false);
         try c.emit(.push_const, &.{try c.number(1)});
@@ -787,7 +841,7 @@ const Compiler = struct {
         c.patch(to_yield, c.here());
         c.depth = round; // [value, kind]
         try c.emit(.pop, &.{});
-        try c.emit(.yield, &.{1});
+        try c.emit(.yield, &.{@intFromBool(!c.is_async_generator)});
         try c.emit(.jump, &.{top});
         c.patch(to_done, c.here());
         c.depth = round - 1; // [value]
@@ -814,12 +868,12 @@ const Compiler = struct {
                     .loop_break => |tl| if (l == tl) {
                         try jt.append(c.s.gpa, try c.jumpForward(.jump));
                         return;
-                    } else if (l.iter_slot) |slot| try c.emitIterClose(slot),
+                    } else if (l.iter_slot) |slot| try c.emitIterClose(slot, l.is_await),
                     .loop_continue => |tl| if (l == tl) {
                         try jt.append(c.s.gpa, try c.jumpForward(.jump));
                         return;
-                    } else if (l.iter_slot) |slot| try c.emitIterClose(slot),
-                    .switch_break => if (l.iter_slot) |slot| try c.emitIterClose(slot),
+                    } else if (l.iter_slot) |slot| try c.emitIterClose(slot, l.is_await),
+                    .switch_break => if (l.iter_slot) |slot| try c.emitIterClose(slot, l.is_await),
                 },
                 .@"switch" => |sb| switch (jt) {
                     .switch_break => |ts| if (sb == ts) {
@@ -1163,6 +1217,7 @@ const Compiler = struct {
             .yield => |y| {
                 if (y.star) return c.yieldStar(y.value.?);
                 if (y.value) |v| try c.expr(v) else try c.emit(.push_undefined, &.{});
+                if (c.is_async_generator) try c.emit(.await, &.{}); // AsyncGeneratorYield awaits (D68)
                 try c.emit(.yield, &.{0});
                 // [value, mode]: next → value; throw → throw value; return → `return value`.
                 const resumed = c.depth;

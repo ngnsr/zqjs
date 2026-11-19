@@ -377,6 +377,8 @@ pub const IteratorKind = enum {
     array_entries,
     string_chars,
     custom,
+    /// %AsyncFromSyncIteratorPrototype% object (D68): `target` is the sync iterator record.
+    async_from_sync,
 };
 
 pub const IteratorState = struct {
@@ -405,12 +407,28 @@ pub const Coroutine = struct {
     engine: ?*anyopaque = null,
     vtable: *const CoroutineVTable,
     charge: usize = 0,
+    /// The async generator this coroutine runs (D68): its `await` resumptions report to
+    /// the generator's request queue instead of a result promise.
+    generator: ?*Object = null,
+    /// Set while the driver awaits a `return(v)` request's `v` at a `yield`
+    /// (AsyncGeneratorUnwrapYieldResumption, D68): fulfilment resumes in return mode.
+    resume_return: bool = false,
 };
 
-/// A generator object's state (D67). `co` is null once completed.
+/// How a resume continues a coroutine (D67): an async resume uses `next` (fulfilled) and
+/// `throw` (rejected); a generator's `next`/`throw`/`return` use all three.
+pub const ResumeMode = enum { next, throw, @"return" };
+
+/// A queued `next`/`throw`/`return` call on an async generator (D68).
+pub const AsyncGenRequest = struct { mode: ResumeMode, value: Value, promise: *Object };
+
+/// A generator object's state (D67). `co` is null once completed. An async generator
+/// (D68) also owns its FIFO request queue, allocated through the heap allocator.
 pub const GeneratorState = struct {
     co: ?*Coroutine,
-    state: enum { suspended_start, suspended_yield, executing, completed } = .suspended_start,
+    state: enum { suspended_start, suspended_yield, executing, awaiting_return, completed } = .suspended_start,
+    is_async: bool = false,
+    queue: std.ArrayList(AsyncGenRequest) = .empty,
 };
 
 pub const PromiseReaction = struct {
@@ -817,7 +835,13 @@ pub const Heap = struct {
                     RememberedScan.child(&scan, @constCast(&re.flags.obj));
                     visitValue(re.last_index, &scan, RememberedScan.child);
                 },
-                .generator => |g| if (g.co) |co| RememberedScan.child(&scan, &co.obj),
+                .generator => |g| {
+                    if (g.co) |co| RememberedScan.child(&scan, &co.obj);
+                    for (g.queue.items) |rq| {
+                        visitValue(rq.value, &scan, RememberedScan.child);
+                        RememberedScan.child(&scan, &rq.promise.obj);
+                    }
+                },
             }
         }
     }
@@ -1096,11 +1120,24 @@ pub const Heap = struct {
         return o;
     }
 
-    /// A generator object (D67) owning the suspended coroutine `co`.
-    pub fn newGenerator(h: *Heap, proto: ?*Object, co: *Coroutine) Error!*Object {
+    /// A generator object (D67) owning the suspended coroutine `co`; `is_async`: an async
+    /// generator (D68), whose coroutine points back at it.
+    pub fn newGenerator(h: *Heap, proto: ?*Object, co: *Coroutine, is_async: bool) Error!*Object {
         const o = try h.newObject(proto);
-        o.kind = .{ .generator = .{ .co = co } }; // a new object is young: no barrier
+        o.kind = .{ .generator = .{ .co = co, .is_async = is_async } }; // a new object is young: no barrier
+        if (is_async) {
+            co.generator = o;
+            h.barrierObj(&co.obj, &o.obj);
+        }
         return o;
+    }
+
+    /// Appends a request to async generator `gen`'s queue (D68), with the write barrier.
+    pub fn pushAsyncGenRequest(h: *Heap, gen: *Object, rq: AsyncGenRequest) Error!void {
+        const g = &gen.kind.generator;
+        g.queue.append(h.allocator(), rq) catch |e| return h.failed(e);
+        h.barrier(&gen.obj, null, rq.value);
+        h.barrierObj(&gen.obj, &rq.promise.obj);
     }
 
     pub fn newCustomIterator(h: *Heap, proto: ?*Object, target: Value, next_method: Value) Error!*Object {
@@ -1893,7 +1930,8 @@ pub const Heap = struct {
                         if (h.cards.fetchRemove(o)) |kv| h.allocator().free(kv.value);
                     },
                     .map, .set => |*table| table.deinit(h.allocator()),
-                    .iterator, .generator => {},
+                    .iterator => {},
+                    .generator => |*g| g.queue.deinit(h.allocator()),
                     .promise => |*pr| pr.reactions.deinit(h.allocator()),
                     .regexp => |re| {
                         re.program.deinit(h.allocator());
@@ -2094,12 +2132,19 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                     visit(ctx, @constCast(&re.flags.obj));
                     visitValue(re.last_index, ctx, visit);
                 },
-                .generator => |g| if (g.co) |co| visit(ctx, &co.obj),
+                .generator => |g| {
+                    if (g.co) |co| visit(ctx, &co.obj);
+                    for (g.queue.items) |rq| {
+                        visitValue(rq.value, ctx, visit);
+                        visit(ctx, &rq.promise.obj);
+                    }
+                },
             }
         },
         .coroutine => {
             const co: *Coroutine = @fieldParentPtr("obj", obj);
             if (co.promise) |p| visit(ctx, &p.obj);
+            if (co.generator) |g| visit(ctx, &g.obj);
             if (co.state == .suspended) {
                 if (co.engine) |eng| {
                     const Ctx = @TypeOf(ctx);

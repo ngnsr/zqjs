@@ -1668,3 +1668,116 @@ verifier rules.
   limit (`LimitExceeded(native_stack)`; between 500 and 1000 levels in ReleaseSafe CLI builds).
 - Not in M37: `%GeneratorFunction.prototype%` and `%GeneratorPrototype%.constructor`
   (`Unsupported(builtin)`), async generators.
+
+---
+
+## D68. Async generators, `for await`, and the generator function prototypes (M38)
+
+**Decision:** An async generator is M37's generator (D67) whose coroutine may also suspend
+on `await` (D56). The generator object owns a FIFO **request queue**; the driver resolves or
+rejects the head request's promise at each `yield`, `return` or uncaught throw. No new engine
+machinery: the engines only gain implicit `await`s emitted by the compiler (or pushed as
+Machine tasks) and the async iterator protocol for `for await` and async `yield*`.
+Observable ordering (microtask ticks) must equal Node's, checked by differential tests.
+
+- **Syntax.** `async function*` declarations and expressions, `async *m()` in object
+  literals and classes (`static`, computed keys, private names as M37 allows). `await` and
+  `yield` (`yield`, `yield e`, `yield* e`) are both valid in async generator bodies; neither
+  may appear in its parameters (SyntaxError). `for await (<head> of e)` with every head
+  `for...of` accepts (`let`/`const`/`var`, identifier/member targets, destructuring) is valid
+  only directly in async functions and async generators (elsewhere: SyntaxError where Node
+  says so, `Unsupported(syntax)` at script top level per D56). `for await (x in o)` is a
+  SyntaxError.
+- **Objects (`heap.zig`).** `GeneratorState` gains `is_async: bool` and
+  `queue: std.ArrayList(Request) = .empty` with `Request { mode: ResumeMode, value: Value,
+  promise: *Object }` (heap-allocated through the heap allocator, so it counts against
+  `max_heap_bytes`; traced in `forEachChild`/`RememberedScan`; a push onto an old generator
+  goes through the write barrier; freed on sweep). States add `awaiting_return`.
+- **Realm (`builtins.zig`).** `Symbol.asyncIterator` (`Realm.sym_async_iterator`) becomes
+  the second supported well-known symbol. New intrinsics:
+  - `%AsyncIteratorPrototype%` with `[Symbol.asyncIterator]() { return this }`;
+  - `%AsyncGeneratorPrototype%` (inherits it) with `next`, `return`, `throw`: they never throw
+    synchronously, they enqueue a request and return its promise (a bad receiver gives a
+    promise rejected with `TypeError`);
+  - `%AsyncFromSyncIteratorPrototype%` (internal, not reachable by name): CreateAsyncFromSyncIterator
+    for `for await`/async `yield*` over sync iterables, awaiting each `value` as Node does
+    (including closing the sync iterator when a yielded promise rejects, if Node does);
+  - `%GeneratorFunction.prototype%`, `%AsyncGeneratorFunction.prototype%` and
+    `%AsyncFunction.prototype%`: the `[[Prototype]]` of generator, async generator and async
+    functions respectively (each inherits `Function.prototype`). `%GeneratorFunction.prototype%.prototype`
+    is `%GeneratorPrototype%` and `%GeneratorPrototype%.constructor` is
+    `%GeneratorFunction.prototype%` (same for the async pair). The `GeneratorFunction`,
+    `AsyncGeneratorFunction` and `AsyncFunction` constructors and `Symbol.toStringTag`
+    stay `Unsupported(builtin)` (D39). A function's default prototype is chosen from its
+    proto flags wherever `Function.prototype` is used today (`object.get`/`has`/
+    `getPrototypeOf`); `ClosureMeta.proto` (D63) still overrides it.
+- **Driver (`coroutine.zig`), following the spec's AsyncGeneratorStart / Enqueue /
+  ResumeNext / DrainQueue / AwaitReturn / CompleteStep.**
+  - `next/throw/return(v)`: create the promise, enqueue; if the generator is not
+    `executing`/`awaiting_return`, resume with the head request.
+  - Coroutine outcome `.awaiting` (explicit or implicit `await`): exactly D56's suspension
+    (reaction on the awaited promise, `.await_resume` microtask, shrink, charge, `remember`);
+    the generator stays `executing`.
+  - `.yielded v`: resolve the head request with `{ value: v, done: false }`, dequeue; if the
+    queue is non-empty, resume immediately with the next request, else `suspended_yield`.
+  - `.returned v` / `.threw`: `completed`, engine destroyed; resolve the head with
+    `{ value: v, done: true }` / reject it; then drain: later `next` requests resolve
+    `{ undefined, true }`, `throw` requests reject, `return(v)` requests go through
+    AwaitReturn (`awaiting_return`: await `v` via a promise reaction, then resolve
+    `{ v, true }` or reject).
+  - `return`/`throw` requests on `suspended_start` complete the generator without entering
+    the engine, then AwaitReturn / reject.
+  - An uncatchable fault leaves the request promises pending and propagates (D56's rule).
+- **Compilation (async generators only).** `yield e` → `await e; yield` (AsyncGeneratorYield
+  awaits its operand); `return e` → `await e; return` (also on the return-mode resume
+  dispatch after `yield`: AsyncGeneratorUnwrapYieldResumption, where a rejected await turns
+  into a throw at that point). Async `yield*`: GetIterator(e, async) (`Symbol.asyncIterator`,
+  else async-from-sync); each `inner.next/throw/return(received)` result is awaited and must
+  be an object (`TypeError`); `done` → the expression's value; otherwise yield
+  `IteratorValue(result)` **without** the implicit await and not raw; inner without `throw`:
+  AsyncIteratorClose then `TypeError`; inner without `return`: await the received value, then
+  return.
+- **`for await`.** GetIterator(e, async); each step `await next.call(iter)`, non-object →
+  `TypeError`, `done` → exit, else bind `value`. Abrupt exits (`break`, `return`, outer jumps,
+  throw, partial destructuring) perform AsyncIteratorClose: call `return` if present, await
+  its result, require an object unless the completion is a throw (original exception wins).
+  The VM lowers this to the existing `await` op plus cold iterator ops; the Machine to tasks.
+- **Invariants carried over.** D56/D67 GC, charging and limits apply unchanged; new
+  `Task` variants are traced and never hold `undefined`; new VM ops live in `executeCold` and
+  no non-inlined helper takes `*FrameCache`; the verifier reports `inexact_max_stack == 0` and
+  `unreachable_instructions == 0`.
+
+**Implementation notes (M38, 2026-11-19).**
+- AsyncGeneratorUnwrapYieldResumption is done by the driver, not by compiled code: a
+  `return(v)` request reaching a generator suspended at a `yield` (or continuing a `yield`
+  that found it queued) awaits `v` with D56's suspension and `Coroutine.resume_return` set,
+  then resumes the engine in `return` mode (fulfilled) or `throw` mode (rejected). That
+  one place covers `yield` and async `yield*` on both engines, so a rejected `v` turns into
+  a throw at the `yield` and, inside `yield*`, into `inner.throw(reason)`, as the spec's
+  `Completion(AsyncGeneratorYield(…))` does. Same ticks as an `await` in compiled code.
+  `return e` statements and `yield e` still get a compiled `await` (`await_suspend` task).
+- `Coroutine` gains `generator: ?*Object` (traced; set with a barrier when the generator
+  object is created), so `.await_resume` reactions on an async generator's coroutine report
+  to its request queue instead of a result promise. `Proto` gains `is_async_generator`
+  (`is_async`/`is_generator` alone can't tell it from a sync generator, D67's note).
+- AsyncGeneratorAwaitReturn's reactions are two native closures (env: the generator) on the
+  resolved promise, added with a new `builtins.performPromiseThen` (no result capability).
+- GetIterator(e, async) returns a `.custom` iterator record (the async iterator and its
+  cached `next`). A sync iterable is wrapped in an async-from-sync object: an `.iterator`
+  with the new `IteratorKind.async_from_sync` (target: the sync record) whose prototype is
+  the internal %AsyncFromSyncIteratorPrototype%. Node closes the sync iterator when a
+  yielded promise rejects (closeOnRejection), so ZQJS does too.
+- VM ops (all in `executeCold`): `get_async_iter`, `async_iter_next`, `async_iter_result`,
+  `async_iter_close`/`async_iter_close_throw` (up to the await; `called` says whether there
+  is one), `async_iter_close_check`, `async_yield_star_call`, `async_yield_star_result`. On
+  a throw completion the close's `await` sits in its own one-instruction handler that drops
+  the rejection, so the original exception wins. Async `yield*` yields with operand 0 (the
+  driver of an async generator wraps every yielded value; `raw` is ignored there).
+- Machine: `for_await_iter`/`for_await_after`/`for_await_close` and the
+  `async_yield_star_*` tasks; an abrupt exit through `for_await_iter` parks the completion
+  in a `finally_resume` task (as `finally` does) while `return()`'s result is awaited.
+  `Machine.is_generator` became `yielding` (set by `generator_start`/`yield_suspend`), since an
+  async generator suspends on both. Unwinding now releases the depth an `await_suspend` task
+  holds (a pre-existing leak when an `await` operand threw).
+- `for await` outside an async function is a SyntaxError (node agrees), except at script top
+  level (`Unsupported(syntax)`, D56); `for await (… in …)` and `for await (;;)` are SyntaxErrors.

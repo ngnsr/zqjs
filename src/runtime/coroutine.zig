@@ -24,9 +24,8 @@ pub const Outcome = union(enum) {
     yielded: struct { value: Value, raw: bool = false },
 };
 
-/// How a resume continues the coroutine: an async resume uses `next` (fulfilled) and
-/// `throw` (rejected); a generator's `next`/`throw`/`return` use all three (D67).
-pub const ResumeMode = enum { next, throw, @"return" };
+/// How a resume continues the coroutine (D67); defined in heap.zig for the request queue.
+pub const ResumeMode = heap.ResumeMode;
 
 pub const ResumeFn = *const fn (engine: *anyopaque, val: Value, mode: ResumeMode) Error!Outcome;
 
@@ -82,6 +81,11 @@ pub fn start(
 pub fn resumeCoroutine(rt: *Runtime, co: *Coroutine, val: Value, rejected: bool) Error!void {
     if (co.state == .done) return;
     std.debug.assert(co.state == .suspended);
+    if (co.generator) |gen| {
+        const mode: ResumeMode = if (rejected) .throw else if (co.resume_return) .@"return" else .next;
+        co.resume_return = false;
+        return runAsyncGenerator(rt, gen, mode, val);
+    }
     const eng = co.engine orelse return;
     try rt.checkNativeStack(); // D60; co stays suspended on a fault
     co.state = .running;
@@ -117,38 +121,42 @@ pub fn finishStep(rt: *Runtime, co: *Coroutine, outcome: Outcome) Error!void {
             destroyEngine(rt, co);
             return rt.bug("yield in an async function");
         },
-        .awaiting => |v| {
-            errdefer {
-                co.state = .done;
-                destroyEngine(rt, co);
-            }
-            const awaited_p_val = try builtins.resolveToPromise(rt, v);
-            const awaited_p = awaited_p_val.object;
-            try chargeSuspended(rt, co);
-
-            const pr = &awaited_p.kind.promise;
-            if (pr.state == .pending) {
-                pr.reactions.ensureUnusedCapacity(rt.heap.allocator(), 1) catch |e| return rt.heap.failed(e);
-                pr.reactions.appendAssumeCapacity(.{
-                    .child = null,
-                    .on_fulfilled = .undefined,
-                    .on_rejected = .undefined,
-                    .coroutine = co,
-                });
-                if (awaited_p.obj.old and !co.obj.old) rt.heap.remember(&awaited_p.obj);
-            } else {
-                try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
-                rt.microtasks.appendAssumeCapacity(.{
-                    .kind = .await_resume,
-                    .coroutine = co,
-                    .arg = pr.result,
-                    .adopt_rejected = (pr.state == .rejected),
-                });
-            }
-            if (co.obj.old) rt.heap.remember(&co.obj);
-            co.state = .suspended;
-        },
+        .awaiting => |v| try suspendAwait(rt, co, v),
     }
+}
+
+/// D56's `await` suspension: a reaction on the awaited promise resumes `co` from an
+/// `.await_resume` microtask. On a fault the coroutine is done.
+fn suspendAwait(rt: *Runtime, co: *Coroutine, v: Value) Error!void {
+    errdefer {
+        co.state = .done;
+        destroyEngine(rt, co);
+    }
+    const awaited_p_val = try builtins.resolveToPromise(rt, v);
+    const awaited_p = awaited_p_val.object;
+    try chargeSuspended(rt, co);
+
+    const pr = &awaited_p.kind.promise;
+    if (pr.state == .pending) {
+        pr.reactions.ensureUnusedCapacity(rt.heap.allocator(), 1) catch |e| return rt.heap.failed(e);
+        pr.reactions.appendAssumeCapacity(.{
+            .child = null,
+            .on_fulfilled = .undefined,
+            .on_rejected = .undefined,
+            .coroutine = co,
+        });
+        if (awaited_p.obj.old and !co.obj.old) rt.heap.remember(&awaited_p.obj);
+    } else {
+        try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
+        rt.microtasks.appendAssumeCapacity(.{
+            .kind = .await_resume,
+            .coroutine = co,
+            .arg = pr.result,
+            .adopt_rejected = (pr.state == .rejected),
+        });
+    }
+    if (co.obj.old) rt.heap.remember(&co.obj);
+    co.state = .suspended;
 }
 
 /// Shrinks a suspending engine and charges what it keeps against `max_heap_bytes` (D56).
@@ -167,12 +175,14 @@ fn suspendGenerator(rt: *Runtime, co: *Coroutine) Error!void {
 
 /// A generator call (D67): runs the engine through the parameter prologue to
 /// `generator_start` and returns the generator object, its `[[Prototype]]` the function's
-/// `.prototype` if that is an object, else %GeneratorPrototype%. A throw from a parameter
-/// default propagates, and no generator object is created.
+/// `.prototype` if that is an object, else %GeneratorPrototype% (%AsyncGeneratorPrototype%
+/// for an async generator, D68). A throw from a parameter default propagates, and no
+/// generator object is created.
 pub fn startGenerator(
     rt: *Runtime,
     vtable: *const CoroutineVTable,
     func: Value,
+    is_async: bool,
     ctx: anytype,
     comptime create_and_run: fn (@TypeOf(ctx), *Coroutine) Error!Outcome,
 ) Error!Value {
@@ -195,8 +205,8 @@ pub fn startGenerator(
     try suspendGenerator(rt, co);
     const r = try builtins.realm(rt);
     const proto_val = try object.get(rt, func, try object.named(rt, "prototype"));
-    const proto = if (proto_val == .object) proto_val.object else r.generator_prototype;
-    return .{ .object = try rt.heap.newGenerator(proto, co) };
+    const proto = if (proto_val == .object) proto_val.object else if (is_async) r.async_generator_prototype else r.generator_prototype;
+    return .{ .object = try rt.heap.newGenerator(proto, co, is_async) };
 }
 
 /// `%GeneratorPrototype%.next/throw/return` on generator `gen` (D67): the iterator result,
@@ -207,6 +217,7 @@ pub fn resumeGenerator(rt: *Runtime, gen: *heap.Object, mode: ResumeMode, val: V
         .executing => return rt.throw(.TypeError, &.{.{ .ascii = "Generator is already running" }}),
         .suspended_start => if (mode != .next) completeGenerator(rt, gen),
         .suspended_yield, .completed => {},
+        .awaiting_return => return rt.bug("a sync generator awaiting return"),
     }
     if (g.state == .completed) return switch (mode) {
         .next => builtins.iterResult(rt, .undefined, true),
@@ -233,6 +244,216 @@ pub fn resumeGenerator(rt: *Runtime, gen: *heap.Object, mode: ResumeMode, val: V
         .threw => return error.Thrown,
         .awaiting => return rt.bug("await in a generator"),
     }
+}
+
+// ---------------------------------------------------------------- Async generators (D68)
+
+/// `%AsyncGeneratorPrototype%.next/throw/return` (AsyncGeneratorEnqueue): never throws a
+/// JS exception; a bad receiver gives a rejected promise.
+pub fn asyncGeneratorRequest(rt: *Runtime, this: Value, mode: ResumeMode, val: Value) Error!Value {
+    const r = try builtins.realm(rt);
+    const p = try rt.heap.newPromise(r.promise_prototype);
+    var root_buf = [_]Value{ .{ .object = p }, this, val, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    if (this != .object or this.object.kind != .generator or !this.object.kind.generator.is_async) {
+        const name = switch (mode) {
+            .next => "next",
+            .throw => "throw",
+            .@"return" => "return",
+        };
+        const e = rt.throw(.TypeError, &.{ .{ .ascii = name }, .{ .ascii = " method called on incompatible receiver" } });
+        if (e != error.Thrown) return e;
+        try builtins.settlePromiseFromJob(rt, p, true, try rt.catchValue());
+        return root_buf[0];
+    }
+    const gen = this.object;
+    const g = &gen.kind.generator;
+    switch (mode) {
+        .next => if (g.state == .completed) {
+            root_buf[3] = try builtins.iterResult(rt, .undefined, true);
+            try builtins.resolvePromiseValue(rt, p, root_buf[3]);
+            return root_buf[0];
+        },
+        .throw => {
+            if (g.state == .suspended_start) completeGenerator(rt, gen);
+            if (g.state == .completed) {
+                try builtins.settlePromiseFromJob(rt, p, true, val);
+                return root_buf[0];
+            }
+        },
+        .@"return" => {},
+    }
+    try rt.heap.pushAsyncGenRequest(gen, .{ .mode = mode, .value = val, .promise = p });
+    switch (g.state) {
+        .suspended_start => if (mode == .@"return") {
+            completeGenerator(rt, gen);
+            try awaitReturn(rt, gen);
+        } else try resumeAsyncGenerator(rt, gen, mode, val),
+        .completed => try awaitReturn(rt, gen), // only `return` gets here
+        .suspended_yield => try resumeAsyncGenerator(rt, gen, mode, val),
+        .executing, .awaiting_return => {},
+    }
+    return root_buf[0];
+}
+
+/// AsyncGeneratorResume from `suspended_start`/`suspended_yield` with the head request. A
+/// `return(v)` at a `yield` first awaits `v` (AsyncGeneratorUnwrapYieldResumption): the
+/// driver does that await, so it covers `yield` and async `yield*` on both engines alike.
+fn resumeAsyncGenerator(rt: *Runtime, gen: *heap.Object, mode: ResumeMode, val: Value) Error!void {
+    const g = &gen.kind.generator;
+    const at_yield = g.state == .suspended_yield;
+    g.state = .executing;
+    if (mode == .@"return" and at_yield) {
+        const co = g.co.?;
+        co.resume_return = true;
+        suspendAwait(rt, co, val) catch |e| {
+            faultAsyncGenerator(rt, gen);
+            return e;
+        };
+        return;
+    }
+    return runAsyncGenerator(rt, gen, mode, val);
+}
+
+/// Runs the generator's engine with `mode`/`val` and handles each outcome, continuing
+/// without suspending while a `yield` finds more queued requests.
+fn runAsyncGenerator(rt: *Runtime, gen: *heap.Object, mode0: ResumeMode, val0: Value) Error!void {
+    const g = &gen.kind.generator;
+    var mode = mode0;
+    var val = val0;
+    while (true) {
+        const co = g.co orelse return rt.bug("an executing async generator without a coroutine");
+        const eng = co.engine orelse return rt.bug("an executing async generator without an engine");
+        rt.checkNativeStack() catch |e| { // D60
+            faultAsyncGenerator(rt, gen);
+            return e;
+        };
+        co.state = .running;
+        const resume_fn: ResumeFn = @ptrCast(@alignCast(co.vtable.@"resume"));
+        const outcome = resume_fn(eng, val, mode) catch |e| {
+            faultAsyncGenerator(rt, gen);
+            return e;
+        };
+        switch (outcome) {
+            .awaiting => |v| {
+                suspendAwait(rt, co, v) catch |e| {
+                    faultAsyncGenerator(rt, gen);
+                    return e;
+                };
+                return;
+            },
+            .yielded => |y| {
+                // AsyncGeneratorYield: settle the head request, then go on with the next one.
+                // `raw` (a `yield*` round) means nothing here: async `yield*` yields values.
+                suspendGenerator(rt, co) catch |e| {
+                    faultAsyncGenerator(rt, gen);
+                    return e;
+                };
+                g.state = .suspended_yield;
+                try completeStep(rt, gen, y.value, false, false);
+                if (g.state != .suspended_yield or g.queue.items.len == 0) return;
+                const next = g.queue.items[0];
+                if (next.mode == .@"return") return resumeAsyncGenerator(rt, gen, next.mode, next.value);
+                g.state = .executing;
+                mode = next.mode;
+                val = next.value;
+            },
+            .returned => |v| {
+                completeGenerator(rt, gen);
+                var root_buf = [_]Value{v};
+                var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+                try roots.register(rt);
+                defer roots.unregister(rt);
+                try completeStep(rt, gen, v, true, false);
+                return drainQueue(rt, gen);
+            },
+            .threw => {
+                completeGenerator(rt, gen);
+                const err_val = try rt.catchValue();
+                var root_buf = [_]Value{err_val};
+                var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+                try roots.register(rt);
+                defer roots.unregister(rt);
+                try completeStep(rt, gen, err_val, true, true);
+                return drainQueue(rt, gen);
+            },
+        }
+    }
+}
+
+/// AsyncGeneratorCompleteStep: removes the head request and resolves its promise with
+/// `{ value, done }`, or rejects it with `value`.
+fn completeStep(rt: *Runtime, gen: *heap.Object, value: Value, done: bool, rejected: bool) Error!void {
+    const g = &gen.kind.generator;
+    if (g.queue.items.len == 0) return rt.bug("an async generator step without a request");
+    const p = g.queue.items[0].promise;
+    var root_buf = [_]Value{ .{ .object = p }, value, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    if (!rejected) root_buf[2] = try builtins.iterResult(rt, value, done);
+    _ = g.queue.orderedRemove(0);
+    if (rejected) {
+        try builtins.settlePromiseFromJob(rt, p, true, value);
+    } else {
+        try builtins.resolvePromiseValue(rt, p, root_buf[2]);
+    }
+}
+
+/// AsyncGeneratorDrainQueue on a completed generator: `next` → `{ undefined, true }`,
+/// `throw` → rejected, `return(v)` → AsyncGeneratorAwaitReturn (which drains on after it).
+fn drainQueue(rt: *Runtime, gen: *heap.Object) Error!void {
+    const g = &gen.kind.generator;
+    while (g.queue.items.len > 0) {
+        const head = g.queue.items[0];
+        switch (head.mode) {
+            .@"return" => return awaitReturn(rt, gen),
+            .throw => try completeStep(rt, gen, head.value, true, true),
+            .next => try completeStep(rt, gen, .undefined, true, false),
+        }
+    }
+    g.state = .completed;
+}
+
+/// AsyncGeneratorAwaitReturn: awaits the head `return(v)` request's `v` with a promise
+/// reaction, then settles that request and drains the rest.
+fn awaitReturn(rt: *Runtime, gen: *heap.Object) Error!void {
+    const g = &gen.kind.generator;
+    g.state = .awaiting_return;
+    var root_buf = [_]Value{ .{ .object = gen }, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    root_buf[1] = try builtins.resolveToPromise(rt, g.queue.items[0].value);
+    root_buf[2] = .{ .closure = try rt.heap.newNativeClosure(@ptrCast(&awaitReturnFulfilled), gen) };
+    root_buf[3] = .{ .closure = try rt.heap.newNativeClosure(@ptrCast(&awaitReturnRejected), gen) };
+    try builtins.performPromiseThen(rt, root_buf[1].object, root_buf[2], root_buf[3]);
+}
+
+fn awaitReturnFulfilled(rt: *Runtime, gen: *heap.Object, args: []const Value) Error!Value {
+    try awaitReturnSettled(rt, gen, if (args.len > 0) args[0] else .undefined, false);
+    return .undefined;
+}
+
+fn awaitReturnRejected(rt: *Runtime, gen: *heap.Object, args: []const Value) Error!Value {
+    try awaitReturnSettled(rt, gen, if (args.len > 0) args[0] else .undefined, true);
+    return .undefined;
+}
+
+fn awaitReturnSettled(rt: *Runtime, gen: *heap.Object, v: Value, rejected: bool) Error!void {
+    const g = &gen.kind.generator;
+    if (g.state != .awaiting_return) return rt.bug("an AwaitReturn reaction on a generator not awaiting it");
+    try completeStep(rt, gen, v, true, rejected);
+    return drainQueue(rt, gen);
+}
+
+/// An uncatchable fault in an async generator: the engine is gone and the generator is
+/// completed; queued request promises stay pending (D56's rule).
+fn faultAsyncGenerator(rt: *Runtime, gen: *heap.Object) void {
+    completeGenerator(rt, gen);
 }
 
 fn completeGenerator(rt: *Runtime, gen: *heap.Object) void {

@@ -278,8 +278,9 @@ pub const Vm = struct {
     noinline fn startAsync(rt: *Runtime, caller_vm: ?*Vm, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
         @branchHint(.cold);
         const ctx: StartAsyncCtx = .{ .rt = rt, .caller_vm = caller_vm, .c = c, .this = this, .args = args };
-        if (@as(*const Proto, @ptrCast(@alignCast(c.impl.vm.proto))).is_generator)
-            return coroutine.startGenerator(rt, &coro_vtable, .{ .closure = c }, ctx, createAndRunCoro);
+        const p: *const Proto = @ptrCast(@alignCast(c.impl.vm.proto));
+        if (p.is_generator)
+            return coroutine.startGenerator(rt, &coro_vtable, .{ .closure = c }, p.is_async_generator, ctx, createAndRunCoro);
         return coroutine.start(rt, &coro_vtable, ctx, createAndRunCoro);
     }
 
@@ -915,6 +916,14 @@ pub const Vm = struct {
             .generator_start,
             .yield,
             .yield_star_step,
+            .get_async_iter,
+            .async_iter_next,
+            .async_iter_result,
+            .async_iter_close,
+            .async_iter_close_throw,
+            .async_iter_close_check,
+            .async_yield_star_call,
+            .async_yield_star_result,
             => {
                 cache.syncSp(vm);
                 if (try vm.executeCold(op, pc, next)) {
@@ -1599,6 +1608,56 @@ pub const Vm = struct {
                 try cache.drop(vm, 3);
                 try cache.push(vm, r.value);
                 try cache.push(vm, .{ .number = @floatFromInt(@backingInt(r.kind)) });
+            },
+            .get_async_iter => {
+                const rec = try builtins.getAsyncIterator(rt, try cache.peek(vm, 0));
+                vm.stack[cache.sp - 1] = .{ .object = rec };
+            },
+            .async_iter_next => {
+                const rec = try cache.peek(vm, 0);
+                if (rec != .object or rec.object.kind != .iterator) return vm.bug("async_iter_next on a non-iterator");
+                vm.stack[cache.sp - 1] = try builtins.asyncIterNext(rt, rec.object);
+            },
+            .async_iter_result => {
+                const v = try builtins.asyncIterValue(rt, try cache.peek(vm, 0));
+                vm.stack[cache.sp - 1] = v orelse .undefined;
+                try cache.push(vm, .{ .boolean = v == null });
+            },
+            .async_iter_close, .async_iter_close_throw => {
+                const rec = try cache.peek(vm, 0);
+                var res: ?Value = null;
+                if (rec != .undefined) {
+                    if (rec != .object or rec.object.kind != .iterator) return vm.bug("async_iter_close on a non-iterator");
+                    res = try builtins.asyncIterCloseStart(rt, rec.object, op == .async_iter_close_throw);
+                }
+                vm.stack[cache.sp - 1] = res orelse .undefined;
+                try cache.push(vm, .{ .boolean = res != null });
+            },
+            .async_iter_close_check => {
+                try builtins.asyncIterCloseCheck(rt, try cache.peek(vm, 0));
+                try cache.drop(vm, 1);
+            },
+            .async_yield_star_call => {
+                const rec = try cache.peek(vm, 2);
+                const mode_val = try cache.peek(vm, 0);
+                if (rec != .object or rec.object.kind != .iterator or mode_val != .number) return vm.bug("async_yield_star_call operands");
+                const mode: coroutine.ResumeMode = switch (@as(u32, @intFromFloat(mode_val.number))) {
+                    0 => .next,
+                    1 => .throw,
+                    else => .@"return",
+                };
+                const r = try builtins.asyncYieldStarCall(rt, rec.object, try cache.peek(vm, 1), mode);
+                try cache.drop(vm, 3);
+                try cache.push(vm, .{ .number = @floatFromInt(@backingInt(r.kind)) });
+                try cache.push(vm, r.value);
+            },
+            .async_yield_star_result => {
+                const kind_val = try cache.peek(vm, 1);
+                if (kind_val != .number or !(kind_val.number >= 0 and kind_val.number <= 3)) return vm.bug("async_yield_star_result operands");
+                const kind: @FieldType(builtins.AsyncYieldStar, "kind") = @fromBackingInt(@intCast(@as(u8, @intFromFloat(kind_val.number))));
+                const r = try builtins.asyncYieldStarResult(rt, kind, try cache.peek(vm, 0));
+                vm.stack[cache.sp - 2] = r.value;
+                vm.stack[cache.sp - 1] = .{ .number = @floatFromInt(@backingInt(r.kind)) };
             },
             .iter_close, .iter_close_throw => {
                 const iter_val = try cache.peek(vm, 0);

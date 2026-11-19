@@ -24,6 +24,11 @@ pub const Builtin = enum {
     promise_prototype,
     iterator_prototype,
     generator_prototype,
+    async_iterator_prototype,
+    async_generator_prototype,
+    generator_function_prototype,
+    async_generator_function_prototype,
+    async_function_prototype,
     math,
     json,
     error_constructor,
@@ -71,6 +76,11 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .promise_prototype => promise_prototype.has(name),
         .iterator_prototype => iterator_prototype.has(name),
         .generator_prototype => generator_prototype.has(name),
+        .async_iterator_prototype => async_iterator_prototype.has(name),
+        .async_generator_prototype => async_generator_prototype.has(name),
+        .generator_function_prototype => generator_function_prototype.has(name),
+        .async_generator_function_prototype => async_generator_function_prototype.has(name),
+        .async_function_prototype => async_function_prototype.has(name),
         .math => math.has(name),
         .json => json.has(name),
         .error_constructor => error_constructor.has(name),
@@ -472,6 +482,29 @@ const generator_prototype = std.StaticStringMap(void).initComptime(.{
     .{"next"},
     .{"return"},
     .{"throw"},
+});
+
+const async_iterator_prototype = std.StaticStringMap(void).initComptime(.{});
+
+const async_generator_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"next"},
+    .{"return"},
+    .{"throw"},
+});
+
+const generator_function_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"prototype"},
+});
+
+const async_generator_function_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"prototype"},
+});
+
+const async_function_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
 });
 
 const math = std.StaticStringMap(void).initComptime(.{

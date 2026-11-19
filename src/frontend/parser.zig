@@ -126,6 +126,8 @@ const Parser = struct {
     async_ctx: enum { none, params, body } = .none,
     yield_ctx: enum { none, params, body } = .none,
     await_count: u32 = 0,
+    /// Parsing a `for await (…` head: `in` there is a SyntaxError (D68).
+    for_await_head: bool = false,
     /// Yield expressions parsed so far: arrow parameters must not contain one.
     yield_count: u32 = 0,
     /// When probing `async (...)` at `.none`, defer `await` identifier error until we know if `=>` follows.
@@ -300,7 +302,10 @@ const Parser = struct {
         while (true) {
             const start_tok = p.tok;
             const pat = try p.parseBindingPattern(true);
-            if (p.isText(p.tok, "in")) return p.fail(.{ .unsupported = .syntax }, p.tok);
+            if (p.isText(p.tok, "in")) {
+                if (p.for_await_head) return p.fail(.{ .syntax_error = "for await requires 'of'" }, p.tok);
+                return p.fail(.{ .unsupported = .syntax }, p.tok);
+            }
             if (p.isText(p.tok, "of")) {
                 if (!allow_for_of or list.items.len > 0) return p.fail(.{ .syntax_error = "invalid for-of declaration" }, p.tok);
                 try list.append(p.arena, .{ .pattern = pat, .init = null, .span = pat.span });
@@ -371,14 +376,25 @@ const Parser = struct {
     fn forStatement(p: *Parser) Error!ast.Stmt {
         const start = p.tok.start;
         try p.advance();
+        var is_await = false;
+        if (p.isText(p.tok, "await")) {
+            // `for await` (D68): only directly in async functions; scripts have no top-level await (D56).
+            if (p.async_ctx != .body) {
+                if (p.function_depth == 0) return p.fail(.{ .unsupported = .syntax }, p.tok);
+                return p.fail(.{ .syntax_error = "for await is only valid in async functions" }, p.tok);
+            }
+            is_await = true;
+            try p.advance();
+        }
         if (p.tok.tag != .l_paren) {
-            // `for await (…)` is valid JS; `for x` is not, but we needn't be precise.
+            // `for x` is not valid JS, but we needn't be precise.
             return p.fail(.{ .unsupported = .syntax }, p.tok);
         }
         try p.advance();
 
         var init: ?ast.ForInit = null;
         p.no_in = true;
+        p.for_await_head = is_await;
         if (p.tok.tag == .kw_const) {
             init = .{ .declaration = try p.declaration(.@"const", true) };
         } else if (p.isText(p.tok, "let") and try p.letStartsDeclaration()) {
@@ -387,7 +403,11 @@ const Parser = struct {
             init = .{ .expression = try p.expression() };
         }
         p.no_in = false;
-        if (p.isText(p.tok, "in")) return p.fail(.{ .unsupported = .syntax }, p.tok);
+        p.for_await_head = false;
+        if (p.isText(p.tok, "in")) {
+            if (is_await) return p.fail(.{ .syntax_error = "for await requires 'of'" }, p.tok);
+            return p.fail(.{ .unsupported = .syntax }, p.tok);
+        }
         if (p.isText(p.tok, "of")) {
             const target: ast.ForOfTarget = switch (init orelse return p.fail(.{ .syntax_error = "missing left-hand side in for-of" }, p.tok)) {
                 .declaration => |decl| blk: {
@@ -409,8 +429,9 @@ const Parser = struct {
             const iterable = try p.expression();
             try p.expectAfterExpression(.r_paren);
             const body = try p.loopBody();
-            return .{ .span = .{ .start = start, .end = body.span.end }, .data = .{ .for_of = .{ .target = target, .iterable = iterable, .body = body } } };
+            return .{ .span = .{ .start = start, .end = body.span.end }, .data = .{ .for_of = .{ .target = target, .iterable = iterable, .body = body, .is_await = is_await } } };
         }
+        if (is_await) return p.fail(.{ .syntax_error = "for await requires 'of'" }, p.tok);
         try p.expectAfterExpression(.semicolon);
 
         const cond = if (p.tok.tag == .semicolon) null else try p.expression();
@@ -602,7 +623,6 @@ const Parser = struct {
         try p.advance(); // `function`
         var is_generator = false;
         if (p.tok.tag == .star) {
-            if (is_async) return p.fail(.{ .unsupported = .syntax }, p.tok); // async generator
             is_generator = true;
             try p.advance();
         }
@@ -1858,9 +1878,12 @@ const Parser = struct {
                             .colon, .l_paren, .comma, .r_brace, .eq => {},
                             else => {
                                 if (next.newline_before) return p.fail(.{ .syntax_error = "unexpected token in object literal" }, next);
-                                if (next.tag == .star) return p.fail(.{ .unsupported = .syntax }, next);
                                 is_async_method = true;
                                 try p.advance(); // `async`
+                                if (p.tok.tag == .star) { // `async *m() {}` (D68)
+                                    is_generator_method = true;
+                                    try p.advance();
+                                }
                                 break :blk try p.parsePropertyKey();
                             },
                         }
@@ -2771,7 +2794,6 @@ const Parser = struct {
                 }
             }
             if (p.tok.tag == .star) {
-                if (is_async) return p.fail(.{ .unsupported = .syntax }, p.tok);
                 if (method_kind != .method) return p.fail(.{ .syntax_error = "unexpected '*'" }, p.tok);
                 is_generator = true;
                 try p.advance();

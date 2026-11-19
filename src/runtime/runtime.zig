@@ -416,6 +416,7 @@ pub const Runtime = struct {
         if (rt.realm) |*r| {
             for (r.objects()) |o| h.markObj(&o.obj);
             h.markObj(&r.sym_iterator.obj);
+            h.markObj(&r.sym_async_iterator.obj);
         }
         var sym_it = rt.global_symbols.iterator();
         while (sym_it.next()) |e| {

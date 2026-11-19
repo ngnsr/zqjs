@@ -90,6 +90,7 @@ const SwitchTestTask = struct { cases: []const ast.SwitchCase, idx: u32, default
 const ArrayPatTask = struct { pat: *const ast.Pattern, idx: u32, mode: BindMode };
 const ObjectPatTask = struct { pat: *const ast.Pattern, idx: u32, mode: BindMode, excl_base: u32, excl_count: u32 };
 const none_idx: u32 = std.math.maxInt(u32);
+const ForAwaitTask = struct { stmt: *const ast.Stmt, iter: *heap.Object, has_scope: bool, values_base: u32 };
 
 const Task = union(enum) {
     /// Balances `m.depth` for a non-leaf `exec` or `eval`.
@@ -201,6 +202,19 @@ const Task = union(enum) {
     yield_star_step: struct { iter: *heap.Object, received: Value, mode: coroutine.ResumeMode },
     /// On top while a `yield*` is suspended: the resume feeds its value and mode to the next step.
     yield_star_wait: *heap.Object,
+    /// Async `yield*` (D68): like the sync tasks, with an `await` between the inner call
+    /// (`async_yield_star_step`) and its result (`async_yield_star_result`).
+    async_yield_star_init,
+    async_yield_star_step: struct { iter: *heap.Object, received: Value, mode: coroutine.ResumeMode },
+    async_yield_star_result: struct { iter: *heap.Object, kind: @FieldType(builtins.AsyncYieldStar, "kind") },
+    async_yield_star_wait: *heap.Object,
+    /// `for await` (D68): `for_await_iter` calls `next` and awaits; `for_await_after` checks
+    /// the result, then binds and runs the body above a new `for_await_iter`, which closes
+    /// the iterator on an abrupt exit (awaiting `return()`, then `for_await_close`).
+    for_await_iter: ForAwaitTask,
+    for_await_after: ForAwaitTask,
+    /// After AsyncIteratorClose's await; `true`: the completion is a throw (errors ignored).
+    for_await_close: bool,
 
     // ---- Classes & super (M33, D63)
     class_decl_init: u32,
@@ -256,10 +270,10 @@ const Machine = struct {
     current_func: ?*const ast.Function = null,
     construct_instance: ?*heap.Object = null,
     is_coroutine: bool = false,
-    /// A generator's engine (D67): a suspension is a yield, not an await.
-    is_generator: bool = false,
     /// Suspended at `generator_start`: the first resume pushes nothing.
     at_start: bool = false,
+    /// The current suspension is a yield; otherwise an `await` (async generators, D68).
+    yielding: bool = false,
     yield_raw: bool = false,
     awaited: Value = .undefined,
     tasks: std.ArrayList(Task) = .empty,
@@ -323,6 +337,13 @@ const Machine = struct {
                 heap.visitValue(ys.received, ctx, visit);
             },
             .yield_star_wait => |it| visit(ctx, &it.obj),
+            .async_yield_star_step => |ys| {
+                visit(ctx, &ys.iter.obj);
+                heap.visitValue(ys.received, ctx, visit);
+            },
+            .async_yield_star_result => |r| visit(ctx, &r.iter.obj),
+            .async_yield_star_wait => |it| visit(ctx, &it.obj),
+            .for_await_iter, .for_await_after => |f| visit(ctx, &f.iter.obj),
             .array_iter_close => |ac| visit(ctx, &ac.iter.obj),
             .try_catch => |tc| if (tc.saved_env) |e| visit(ctx, &e.obj),
             .try_finally => |tf| if (tf.saved_env) |e| visit(ctx, &e.obj),
@@ -355,6 +376,18 @@ const Machine = struct {
 
     fn pushTask(m: *Machine, t: Task) Error!void {
         try m.tasks.append(m.rt.gpa, t);
+    }
+
+    /// Awaits `v` from a task (D68): an `await` whose operand is already evaluated.
+    fn pushAwait(m: *Machine, v: Value) Error!void {
+        try m.enter();
+        try m.pushTask(.await_suspend);
+        try m.pushVal(v);
+    }
+
+    fn inAsyncGenerator(m: *const Machine) bool {
+        const f = m.current_func orelse return false;
+        return f.is_async and f.is_generator;
     }
 
     fn pushVal(m: *Machine, v: Value) Error!void {
@@ -486,11 +519,13 @@ const Machine = struct {
                     m.awaited = .undefined;
                     m.yield_raw = false;
                     m.at_start = true;
+                    m.yielding = true;
                     return true;
                 },
                 .yield_suspend => |raw| {
                     m.awaited = m.popVal();
                     m.yield_raw = raw;
+                    m.yielding = true;
                     if (!raw) m.depth -= 1; // a raw yield's depth belongs to its `yield*`
                     return true;
                 },
@@ -543,6 +578,11 @@ const Machine = struct {
                 .yield_star_init,
                 .yield_star_step,
                 .yield_star_wait,
+                .await_suspend, // holds the `await` expression's depth while its operand runs
+                .async_yield_star_init,
+                .async_yield_star_step,
+                .async_yield_star_result,
+                .async_yield_star_wait,
                 => {
                     _ = m.tasks.pop();
                     m.depth -= 1;
@@ -701,6 +741,44 @@ const Machine = struct {
                     m.values.shrinkRetainingCapacity(ac.values_base);
                     try builtins.iteratorClose(m.rt, ac.iter, kind == .throw);
                 },
+                .for_await_iter => |f| {
+                    if (kind == .@"continue" and loopMatchesLabel(m.tasks.items, m.tasks.items.len - 1, kind.@"continue")) {
+                        m.values.shrinkRetainingCapacity(f.values_base);
+                        return;
+                    }
+                    _ = m.tasks.pop();
+                    m.values.shrinkRetainingCapacity(f.values_base);
+                    // AsyncIteratorClose (D68): park the completion like `finally` does, await
+                    // `return()`'s result, then resume the completion.
+                    const pending: FinallyPending = switch (kind) {
+                        .@"break" => |lbl| if (lbl == null) .normal else .{ .@"break" = lbl },
+                        .@"continue" => |lbl| .{ .@"continue" = lbl },
+                        .@"return" => blk: {
+                            const rv = m.ret;
+                            m.ret = .undefined;
+                            break :blk .{ .@"return" = rv };
+                        },
+                        .throw => .{ .throw = try m.rt.catchValue() },
+                    };
+                    try m.pushTask(.{ .finally_resume = pending });
+                    const res = try builtins.asyncIterCloseStart(m.rt, f.iter, kind == .throw);
+                    if (res) |r| {
+                        try m.pushTask(.{ .for_await_close = kind == .throw });
+                        try m.pushAwait(r);
+                    }
+                    return;
+                },
+                .for_await_after => |f| {
+                    _ = m.tasks.pop(); // an awaited `next()` failed: no close
+                    m.values.shrinkRetainingCapacity(f.values_base);
+                },
+                .for_await_close => |is_throw| {
+                    _ = m.tasks.pop();
+                    if (is_throw) { // a rejected `return()` loses to the original throw
+                        m.rt.clearThrown();
+                        return;
+                    }
+                },
                 .switch_exec => |sw| {
                     if (kind == .@"break" and kind.@"break" == null) {
                         _ = m.tasks.pop();
@@ -800,7 +878,69 @@ const Machine = struct {
             },
             .pop_value => _ = m.popVal(),
             .barrier, .await_suspend, .generator_start, .yield_suspend => unreachable, // handled in runLoop
-            .yield_star_wait => unreachable, // consumed by the resume
+            .yield_star_wait, .async_yield_star_wait => unreachable, // consumed by the resume
+            .async_yield_star_init => {
+                const iter = try builtins.getAsyncIterator(rt, m.popVal());
+                try m.pushTask(.{ .async_yield_star_step = .{ .iter = iter, .received = .undefined, .mode = .next } });
+            },
+            .async_yield_star_step => |ys| {
+                m.depth -= 1; // re-counted below by the result task
+                const r = try builtins.asyncYieldStarCall(rt, ys.iter, ys.received, ys.mode);
+                m.depth += 1;
+                try m.pushTask(.{ .async_yield_star_result = .{ .iter = ys.iter, .kind = r.kind } });
+                try m.pushAwait(r.value);
+            },
+            .async_yield_star_result => |ar| {
+                m.depth -= 1; // re-counted below while the `yield*` stays suspended
+                var root_buf = [_]Value{ .{ .object = ar.iter }, m.popVal() }; // getters may collect
+                var vroots: rt_mod.ValueRoots = .{ .values = &root_buf };
+                try vroots.register(rt);
+                defer vroots.unregister(rt);
+                const r = try builtins.asyncYieldStarResult(rt, ar.kind, root_buf[1]);
+                switch (r.kind) {
+                    .yield => {
+                        m.depth += 1;
+                        try m.pushTask(.{ .async_yield_star_wait = ar.iter });
+                        try m.pushTask(.{ .yield_suspend = true }); // its depth stays with the wait
+                        try m.pushVal(r.value);
+                    },
+                    .done => try m.pushVal(r.value),
+                    .@"return" => {
+                        m.ret = r.value;
+                        return .@"return";
+                    },
+                }
+            },
+            .for_await_iter => |f| {
+                try rt.step();
+                try m.pushTask(.{ .for_await_after = f }); // roots the record during `next()`
+                try m.pushAwait(try builtins.asyncIterNext(rt, f.iter));
+            },
+            .for_await_after => |f| {
+                const fo = f.stmt.data.for_of;
+                var root_buf = [_]Value{ .{ .object = f.iter }, m.popVal() }; // getters may collect
+                var vroots: rt_mod.ValueRoots = .{ .values = &root_buf };
+                try vroots.register(rt);
+                defer vroots.unregister(rt);
+                const next_val = (try builtins.asyncIterValue(rt, root_buf[1])) orelse return null;
+                try m.pushTask(.{ .for_await_iter = f });
+                switch (fo.target) {
+                    .declaration => |decl| {
+                        if (f.has_scope) try m.copyScope();
+                        try m.pushTask(.{ .exec = fo.body });
+                        try m.pushTask(.{ .bind_pattern = .{ .pat = decl.pattern, .mode = .init } });
+                    },
+                    .target => |t| {
+                        try m.pushTask(.{ .exec = fo.body });
+                        try m.pushTask(.{ .bind_pattern = .{ .pat = t, .mode = .assign } });
+                    },
+                }
+                try m.pushVal(next_val);
+            },
+            .for_await_close => |is_throw| {
+                const v = m.popVal();
+                if (!is_throw) try builtins.asyncIterCloseCheck(rt, v);
+            },
             .yield_star_init => {
                 const iter = try builtins.getIterator(rt, m.popVal());
                 try m.pushTask(.{ .yield_star_step = .{ .iter = iter, .received = .undefined, .mode = .next } });
@@ -1188,6 +1328,11 @@ const Machine = struct {
             },
             .for_of_init => |f| {
                 const iterable = m.popVal();
+                if (f.stmt.data.for_of.is_await) {
+                    const rec = try builtins.getAsyncIterator(rt, iterable);
+                    try m.pushTask(.{ .for_await_iter = .{ .stmt = f.stmt, .iter = rec, .has_scope = f.has_scope, .values_base = f.values_base } });
+                    return null;
+                }
                 const iter = try builtins.getIterator(rt, iterable);
                 try m.pushTask(.{ .for_of_iter = .{
                     .stmt = f.stmt,
@@ -2472,6 +2617,10 @@ const Machine = struct {
             .@"return" => |v| {
                 if (v) |e| {
                     try m.pushTask(.return_finish);
+                    if (m.inAsyncGenerator()) { // `return e` awaits `e` (D68)
+                        try m.enter();
+                        try m.pushTask(.await_suspend);
+                    }
                     try m.pushEval(e);
                 } else {
                     m.depth -= 1;
@@ -2657,10 +2806,14 @@ const Machine = struct {
             },
             .yield => |y| {
                 if (y.star) {
-                    try m.pushTask(.yield_star_init);
+                    try m.pushTask(if (m.inAsyncGenerator()) .async_yield_star_init else .yield_star_init);
                     try m.pushEval(y.value.?);
                 } else {
                     try m.pushTask(.{ .yield_suspend = false });
+                    if (m.inAsyncGenerator()) { // AsyncGeneratorYield awaits its operand (D68)
+                        try m.enter();
+                        try m.pushTask(.await_suspend);
+                    }
                     if (y.value) |v| try m.pushEval(v) else try m.pushVal(.undefined);
                 }
             },
@@ -3073,8 +3226,9 @@ const Machine = struct {
     /// Async functions and generators (D67) both run on a coroutine Machine.
     fn startAsync(rt: *Runtime, caller: *Machine, closure: *const heap.Closure, this: ?Value, args: []const Value) Error!Value {
         const ctx: StartAsyncCtx = .{ .rt = rt, .caller = caller, .closure = closure, .this = this, .args = args };
-        if (@as(*const ast.Function, @ptrCast(@alignCast(closure.impl.tree.func))).is_generator)
-            return coroutine.startGenerator(rt, &coro_vtable, .{ .closure = closure }, ctx, createAndRunCoro);
+        const f: *const ast.Function = @ptrCast(@alignCast(closure.impl.tree.func));
+        if (f.is_generator)
+            return coroutine.startGenerator(rt, &coro_vtable, .{ .closure = closure }, f.is_async, ctx, createAndRunCoro);
         return coroutine.start(rt, &coro_vtable, ctx, createAndRunCoro);
     }
 
@@ -3085,7 +3239,6 @@ const Machine = struct {
             .rt = rt,
             .res = ctx.caller.res,
             .is_coroutine = true,
-            .is_generator = @as(*const ast.Function, @ptrCast(@alignCast(ctx.closure.impl.tree.func))).is_generator,
             .calls = ctx.caller.calls,
             .depth = ctx.caller.depth,
             .stack_top = if (builtin.is_test) @frameAddress() else 0,
@@ -3125,6 +3278,9 @@ const Machine = struct {
                 } else if (top != null and top.? == .yield_star_wait) {
                     _ = m.tasks.pop();
                     try m.pushTask(.{ .yield_star_step = .{ .iter = top.?.yield_star_wait, .received = res.val, .mode = res.mode } });
+                } else if (top != null and top.? == .async_yield_star_wait) {
+                    _ = m.tasks.pop();
+                    try m.pushTask(.{ .async_yield_star_step = .{ .iter = top.?.async_yield_star_wait, .received = res.val, .mode = res.mode } });
                 } else switch (res.mode) {
                     .next => try m.pushVal(res.val),
                     .throw => {
@@ -3157,7 +3313,10 @@ const Machine = struct {
         if (suspended) {
             m.calls -= caller_calls;
             m.depth -= caller_depth;
-            if (m.is_generator) return .{ .yielded = .{ .value = m.awaited, .raw = m.yield_raw } };
+            if (m.yielding) {
+                m.yielding = false;
+                return .{ .yielded = .{ .value = m.awaited, .raw = m.yield_raw } };
+            }
             return .{ .awaiting = m.awaited };
         }
         return .{ .returned = m.popVal() };

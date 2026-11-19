@@ -2109,3 +2109,83 @@ test "M37: yield, yield* and IteratorClose of generators survive forced GC on bo
         try testing.expectEqualStrings("i0,i1,i2,arrundefined i0 early inner-closed|outer-closed|inner-closed|outer-closed|inner-closed|outer-closed|inner-closed|outer-closed\n", got);
     }
 }
+
+test "M38: an old async generator with queued requests holding young values survives minor GC (both engines)" {
+    // The generator and its coroutine are promoted while suspended at a yield; then young
+    // request values are queued on it (write barrier) while it awaits a pending promise.
+    const src =
+        \\let release = null;
+        \\const gate = new Promise(r => { release = r; });
+        \\async function* gen() {
+        \\    let v = yield "start";
+        \\    await gate;
+        \\    for (let i = 0; i < 6; i++) v = yield v.tag;
+        \\    return "end";
+        \\}
+        \\const g = gen();
+        \\g.next();
+        \\for (let i = 0; i < 200; i++) { let junk = { a: i, b: "x" + i }; }
+        \\const ps = [g.next({ tag: "young-" + 1 })];
+        \\for (let i = 0; i < 5; i++) ps.push(g.next({ tag: "q" + i }));
+        \\ps.push(g.return({ tag: "r" }));
+        \\for (let i = 0; i < 200; i++) { let junk = { a: i, b: "y" + i }; }
+        \\release(1);
+        \\Promise.all(ps).then(rs => print(rs.map(r => (typeof r.value === "object" ? r.value.tag : r.value) + "/" + r.done).join(",")));
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("young-1/false,q0/false,q1/false,q2/false,q3/false,q4/false,r/true\n", got);
+    }
+}
+
+test "M38: an unreachable async generator awaiting a never-settled promise, with pending requests, is collected with no leak" {
+    const src =
+        \\function spawn() {
+        \\    async function* never() {
+        \\        let local = { x: 123 };
+        \\        await new Promise(() => {});
+        \\        yield local;
+        \\    }
+        \\    const g = never();
+        \\    g.next();
+        \\    g.next({ y: 1 });
+        \\    g.return({ z: 2 });
+        \\    g.throw({ w: 3 });
+        \\    const h = never();
+        \\    h.return(new Promise(() => {}));
+        \\}
+        \\spawn();
+        \\for (let i = 0; i < 100; i++) { let junk = { k: i }; }
+        \\print("ok");
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("ok\n", got);
+    }
+}
+
+test "M38: for await, async yield* and AsyncIteratorClose survive forced GC on both engines" {
+    const src =
+        \\const log = [];
+        \\async function* src(n) { try { for (let i = 0; i < n; i++) yield { v: "s" + i }; } finally { log.push("closed"); } }
+        \\(async () => {
+        \\    const out = [];
+        \\    for await (const x of src(3)) out.push(x.v);
+        \\    for await (const x of src(5)) { if (x.v === "s1") break; }
+        \\    try { for await (const x of src(5)) throw { m: "boom-" + x.v }; } catch (e) { out.push(e.m); }
+        \\    for await (const x of [Promise.resolve({ v: "p" }), { v: "q" }]) out.push(x.v);
+        \\    const custom = { [Symbol.asyncIterator]() { let i = 0; return { next() { return Promise.resolve({ value: { v: "c" + i }, done: i++ > 1 }); }, return() { log.push("c-ret"); return Promise.resolve({}); } }; } };
+        \\    for await (const x of custom) { out.push(x.v); break; }
+        \\    async function* outer() { const r = yield* src(2); yield { v: "r" + r }; }
+        \\    for await (const x of outer()) out.push(x.v);
+        \\    print(out.join(","), log.join("|"));
+        \\})();
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("s0,s1,s2,boom-s0,p,q,c0,s0,s1,rundefined closed|closed|closed|c-ret|closed\n", got);
+    }
+}

@@ -1,0 +1,8 @@
+async-from-sync: 1,sync return,caught second
+ticks: t1 fa1 t2 t3 fa2 t4 t5 t6 t7 g1 t8 t9 g2 t10 loop done t11 t12
+sources: 1,2,3,p1,plain,p2,s1,s2,a,b,c1,c2
+closes: gen finally | gen finally | next | next | next | gen finally | after break | next | next | return called | return settled | returned y | gen finally | caught body threw at 1 | next | return called | return settled | next | return called | return settled | after labeled jumps
+errors: next: TypeError | return: TypeError | return: return rejected | throw wins: original | throw wins: original2 | not iterable: TypeError | element: rej elem / next | next | return called | next | return called | next | return called | next | return called
+heads: 3,7,Xdflt,v1,v2,t,arr,destructure TypeError / gen finally | next | return called | return settled
+nested: 1x,1y,2x,2y 1
+per-iteration: 1,2,3

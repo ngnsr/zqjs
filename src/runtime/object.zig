@@ -186,7 +186,7 @@ fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error!Val
                 if (m.props.get(try propKey(rt, k))) |p| return resolvePropValue(rt, receiver, p);
             };
             if (c.meta) |m| if (m.proto) |p| return getWithReceiver(rt, p, receiver, k);
-            return getFrom(rt, (try builtins.realm(rt)).function_prototype, receiver, k);
+            return getFrom(rt, try builtins.closureDefaultProto(rt, c), receiver, k);
         },
     }
 }
@@ -194,7 +194,7 @@ fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error!Val
 pub fn getPrototypeOfValue(rt: *Runtime, v: Value) Error!Value {
     return switch (v) {
         .object => |o| if (o.proto) |p| .{ .object = p } else .null,
-        .closure => |c| if (c.meta) |m| (m.proto orelse .{ .object = (try builtins.realm(rt)).function_prototype }) else .{ .object = (try builtins.realm(rt)).function_prototype },
+        .closure => |c| if (c.meta) |m| (m.proto orelse .{ .object = try builtins.closureDefaultProto(rt, c) }) else .{ .object = try builtins.closureDefaultProto(rt, c) },
         .native => .{ .object = (try builtins.realm(rt)).function_prototype },
         .symbol => .{ .object = (try builtins.realm(rt)).symbol_prototype },
         else => .null,
@@ -319,7 +319,7 @@ fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainH
                         continue;
                     }
                 }
-                cur = .{ .object = (try builtins.realm(rt)).function_prototype };
+                cur = .{ .object = try builtins.closureDefaultProto(rt, c) };
             },
             else => return .none,
         }
@@ -625,7 +625,7 @@ pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
             if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return true;
             if (c.meta) |m| if (m.props.count() > 0) if (m.props.contains(try propKey(rt, k))) return true;
             if (c.meta) |m| if (m.proto) |p| return has(rt, k, p);
-            return hasInChain(rt, (try builtins.realm(rt)).function_prototype, k);
+            return hasInChain(rt, try builtins.closureDefaultProto(rt, c), k);
         },
         else => {
             var buf: [10]u8 = undefined;

@@ -51,6 +51,15 @@ pub const Realm = struct {
     iterator_prototype: *Object,
     /// %GeneratorPrototype% (D67).
     generator_prototype: *Object,
+    /// D68: %AsyncIteratorPrototype%, %AsyncGeneratorPrototype%, the internal
+    /// %AsyncFromSyncIteratorPrototype%, and the `[[Prototype]]`s of generator, async
+    /// generator and async functions.
+    async_iterator_prototype: *Object,
+    async_generator_prototype: *Object,
+    async_from_sync_iterator_prototype: *Object,
+    generator_function_prototype: *Object,
+    async_generator_function_prototype: *Object,
+    async_function_prototype: *Object,
     error_prototype: *Object,
     type_error_prototype: *Object,
     range_error_prototype: *Object,
@@ -80,11 +89,13 @@ pub const Realm = struct {
     symbol_prototype: *Object,
     symbol_namespace: *Object,
     sym_iterator: *heap_mod.Symbol,
+    /// `Symbol.asyncIterator` (D68).
+    sym_async_iterator: *heap_mod.Symbol,
     math: *Object,
     json: *Object,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [41]*Object {
+    pub fn objects(r: *const Realm) [47]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -98,6 +109,12 @@ pub const Realm = struct {
             r.promise_prototype,
             r.iterator_prototype,
             r.generator_prototype,
+            r.async_iterator_prototype,
+            r.async_generator_prototype,
+            r.async_from_sync_iterator_prototype,
+            r.generator_function_prototype,
+            r.async_generator_function_prototype,
+            r.async_function_prototype,
             r.error_prototype,
             r.type_error_prototype,
             r.range_error_prototype,
@@ -137,19 +154,27 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     const object_prototype = try builtin(h, null, .object_prototype);
     const error_prototype = try builtin(h, object_prototype, .error_prototype);
     const iterator_prototype = try builtin(h, object_prototype, .iterator_prototype);
+    const async_iterator_prototype = try builtin(h, object_prototype, .async_iterator_prototype);
+    const function_prototype = try builtin(h, object_prototype, .function_prototype);
     var r: Realm = .{
         .object_prototype = object_prototype,
         .array_prototype = try builtin(h, object_prototype, .array_prototype),
         .string_prototype = try builtin(h, object_prototype, .string_prototype),
         .number_prototype = try builtin(h, object_prototype, .number_prototype),
         .boolean_prototype = try builtin(h, object_prototype, .boolean_prototype),
-        .function_prototype = try builtin(h, object_prototype, .function_prototype),
+        .function_prototype = function_prototype,
         .function_namespace = try builtin(h, null, .function_constructor),
         .map_prototype = try builtin(h, object_prototype, .map_prototype),
         .set_prototype = try builtin(h, object_prototype, .set_prototype),
         .promise_prototype = try builtin(h, object_prototype, .promise_prototype),
         .iterator_prototype = iterator_prototype,
         .generator_prototype = try builtin(h, iterator_prototype, .generator_prototype),
+        .async_iterator_prototype = async_iterator_prototype,
+        .async_generator_prototype = try builtin(h, async_iterator_prototype, .async_generator_prototype),
+        .async_from_sync_iterator_prototype = try h.newObject(async_iterator_prototype),
+        .generator_function_prototype = try builtin(h, function_prototype, .generator_function_prototype),
+        .async_generator_function_prototype = try builtin(h, function_prototype, .async_generator_function_prototype),
+        .async_function_prototype = try builtin(h, function_prototype, .async_function_prototype),
         .error_prototype = error_prototype,
         .type_error_prototype = try builtin(h, error_prototype, .type_error_prototype),
         .range_error_prototype = try builtin(h, error_prototype, .range_error_prototype),
@@ -178,6 +203,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .symbol_prototype = try builtin(h, object_prototype, .symbol_prototype),
         .symbol_namespace = try builtin(h, null, .symbol_constructor),
         .sym_iterator = try h.newSymbol(try h.ascii("Symbol.iterator"), false),
+        .sym_async_iterator = try h.newSymbol(try h.ascii("Symbol.asyncIterator"), false),
         .math = try builtin(h, object_prototype, .math),
         .json = try builtin(h, object_prototype, .json),
     };
@@ -296,6 +322,19 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.generator_prototype, "next", &generator_next);
     try method(rt, r.generator_prototype, "return", &generator_return);
     try method(rt, r.generator_prototype, "throw", &generator_throw);
+    try symbolMethod(rt, r.async_iterator_prototype, r.sym_async_iterator, &async_iterator_self);
+    try method(rt, r.async_generator_prototype, "next", &async_generator_next);
+    try method(rt, r.async_generator_prototype, "return", &async_generator_return);
+    try method(rt, r.async_generator_prototype, "throw", &async_generator_throw);
+    try method(rt, r.async_from_sync_iterator_prototype, "next", &async_from_sync_next);
+    try method(rt, r.async_from_sync_iterator_prototype, "return", &async_from_sync_return);
+    try method(rt, r.async_from_sync_iterator_prototype, "throw", &async_from_sync_throw);
+    // %GeneratorFunction.prototype%.prototype ⇄ %GeneratorPrototype%.constructor (and the
+    // async pair); both non-writable and non-enumerable, as in node (D68).
+    try link(rt, r.generator_function_prototype, "prototype", r.generator_prototype);
+    try link(rt, r.generator_prototype, "constructor", r.generator_function_prototype);
+    try link(rt, r.async_generator_function_prototype, "prototype", r.async_generator_prototype);
+    try link(rt, r.async_generator_prototype, "constructor", r.async_generator_function_prototype);
     try registerMath(rt, r.math);
     try method(rt, r.json, "parse", &json.parse_native);
     try method(rt, r.json, "stringify", &json.stringify_native);
@@ -337,6 +376,12 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .writable = false,
         .configurable = false,
     });
+    try rt.heap.defineProperty(r.symbol_namespace, try rt.heap.internAscii("asyncIterator"), .{
+        .value = .{ .symbol = r.sym_async_iterator },
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
     try method(rt, r.symbol_namespace, "for", &symbol_for);
     try method(rt, r.symbol_namespace, "keyFor", &symbol_key_for);
     try constant(rt, r.symbol_prototype, "constructor", .{ .native = &symbol_global });
@@ -361,6 +406,11 @@ fn method(rt: *Runtime, o: *Object, name: []const u8, n: *const Native) Error!vo
 
 fn symbolMethod(rt: *Runtime, o: *Object, sym: *heap_mod.Symbol, n: *const Native) Error!void {
     try rt.heap.definePropKey(o, heap_mod.PropKey.fromSymbol(sym), .{ .value = .{ .native = n }, .enumerable = false });
+}
+
+fn link(rt: *Runtime, o: *Object, name: []const u8, target: *Object) Error!void {
+    const k = try rt.heap.internAscii(name);
+    try rt.heap.defineProperty(o, k, .{ .value = .{ .object = target }, .enumerable = false, .writable = false });
 }
 
 fn constant(rt: *Runtime, o: *Object, name: []const u8, v: Value) Error!void {
@@ -545,6 +595,37 @@ pub fn isGeneratorFunction(c: *const heap_mod.Closure) bool {
     };
 }
 
+pub const FunctionKind = enum { normal, generator, async_function, async_generator };
+
+pub fn functionKind(c: *const heap_mod.Closure) FunctionKind {
+    const is_async: bool, const is_gen: bool = switch (c.impl) {
+        .vm => |v| blk: {
+            const p: *const bytecode.Proto = @ptrCast(@alignCast(v.proto));
+            break :blk .{ p.is_async_generator or (p.is_async and !p.is_generator), p.is_generator };
+        },
+        .tree => |t| blk: {
+            const f: *const ast.Function = @ptrCast(@alignCast(t.func));
+            break :blk .{ f.is_async, f.is_generator };
+        },
+        .promise_cap, .native_closure, .bound => .{ false, false },
+    };
+    if (is_gen) return if (is_async) .async_generator else .generator;
+    return if (is_async) .async_function else .normal;
+}
+
+/// A closure's `[[Prototype]]` when `ClosureMeta.proto` doesn't set one (D68):
+/// %GeneratorFunction.prototype%, %AsyncGeneratorFunction.prototype%,
+/// %AsyncFunction.prototype% or %Function.prototype% by its kind.
+pub fn closureDefaultProto(rt: *Runtime, c: *const heap_mod.Closure) Error!*Object {
+    const r = try realm(rt);
+    return switch (functionKind(c)) {
+        .normal => r.function_prototype,
+        .generator => r.generator_function_prototype,
+        .async_function => r.async_function_prototype,
+        .async_generator => r.async_generator_function_prototype,
+    };
+}
+
 pub fn isConstructor(v: Value) bool {
     return switch (v) {
         .native => |n| n.construct != null or (n.namespace != null and n.namespace.? != .symbol),
@@ -670,8 +751,8 @@ pub fn defineClassAccessor(rt: *Runtime, target: Value, k: object.Key, fn_val: V
 
 pub fn materializeClosurePrototype(rt: *Runtime, c: *heap_mod.Closure) Error!*Object {
     const r = try realm(rt);
-    if (isGeneratorFunction(c)) { // inherits %GeneratorPrototype%, no `constructor` (D67)
-        const gen_proto = try rt.heap.newObject(r.generator_prototype);
+    if (isGeneratorFunction(c)) { // inherits %(Async)GeneratorPrototype%, no `constructor` (D67, D68)
+        const gen_proto = try rt.heap.newObject(if (functionKind(c) == .async_generator) r.async_generator_prototype else r.generator_prototype);
         try rt.heap.storeClosurePrototype(c, .{ .object = gen_proto });
         return gen_proto;
     }
@@ -828,11 +909,11 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
                 .set_values, .set_entries => "Set Iterator",
                 .array_values, .array_keys, .array_entries => "Array Iterator",
                 .string_chars => "String Iterator",
-                .custom => "Object",
+                .custom, .async_from_sync => "Object",
             },
             .promise => "Promise",
             .regexp => "RegExp",
-            .generator => "Generator",
+            .generator => |g| if (g.is_async) "AsyncGenerator" else "Generator",
             .ordinary => "Object",
         },
     };
@@ -3205,6 +3286,36 @@ fn promiseThen(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return .{ .object = child };
 }
 
+/// PerformPromiseThen without a result capability (internal reactions, D68): `p` must be
+/// a native promise; the handlers are callables.
+pub fn performPromiseThen(rt: *Runtime, p_obj: *Object, on_fulfilled: Value, on_rejected: Value) Error!void {
+    return performPromiseThenCap(rt, p_obj, on_fulfilled, on_rejected, null);
+}
+
+/// PerformPromiseThen with result promise `child` (or none): a non-callable handler
+/// passes the settlement through to `child`.
+pub fn performPromiseThenCap(rt: *Runtime, p_obj: *Object, on_fulfilled: Value, on_rejected: Value, child: ?*Object) Error!void {
+    const pr = &p_obj.kind.promise;
+    if (pr.state == .pending) {
+        pr.reactions.ensureUnusedCapacity(rt.heap.allocator(), 1) catch |e| return rt.heap.failed(e);
+        pr.reactions.appendAssumeCapacity(.{ .child = child, .on_fulfilled = on_fulfilled, .on_rejected = on_rejected });
+        if (child) |ch| rt.heap.barrierObj(&p_obj.obj, &ch.obj);
+        rt.heap.barrier(&p_obj.obj, null, on_fulfilled);
+        rt.heap.barrier(&p_obj.obj, null, on_rejected);
+    } else {
+        const is_rejected = (pr.state == .rejected);
+        const cb = if (is_rejected) on_rejected else on_fulfilled;
+        try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
+        rt.microtasks.appendAssumeCapacity(.{
+            .kind = if (cb == .native or cb == .closure) .reaction else .adopt,
+            .child = child,
+            .cb = cb,
+            .arg = pr.result,
+            .adopt_rejected = is_rejected,
+        });
+    }
+}
+
 fn promiseCatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     _ = try thisPromise(rt, this, "catch");
     return promiseThen(rt, this, &.{ .undefined, arg(args, 0) });
@@ -3760,6 +3871,7 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
                 return .{ .string = try rt.heap.newString(&.{.{ .utf16 = units[start .. start + step] }}) };
             }
         },
+        .async_from_sync => return rt.bug("a sync step on an async-from-sync iterator"),
         .custom => {
             var root_buf = [_]Value{ .{ .object = iter }, .undefined };
             var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
@@ -3905,10 +4017,294 @@ const generator_return: Native = .{ .name = "return", .length = 1, .call = gener
 const generator_throw: Native = .{ .name = "throw", .length = 1, .call = generatorThrow };
 
 fn generatorResume(rt: *Runtime, this: Value, args: []const Value, mode: coroutine.ResumeMode, name: []const u8) Error!Value {
-    if (this != .object or this.object.kind != .generator) {
+    if (this != .object or this.object.kind != .generator or this.object.kind.generator.is_async) {
         return rt.throw(.TypeError, &.{ .{ .ascii = name }, .{ .ascii = " method called on incompatible receiver" } });
     }
     return coroutine.resumeGenerator(rt, this.object, mode, arg(args, 0));
+}
+
+// ---------------------------------------------------------------- Async generators & iteration (M38, D68)
+
+const async_iterator_self: Native = .{ .name = "[Symbol.asyncIterator]", .call = iteratorSelf };
+const async_generator_next: Native = .{ .name = "next", .length = 1, .call = asyncGeneratorNext };
+const async_generator_return: Native = .{ .name = "return", .length = 1, .call = asyncGeneratorReturn };
+const async_generator_throw: Native = .{ .name = "throw", .length = 1, .call = asyncGeneratorThrow };
+const async_from_sync_next: Native = .{ .name = "next", .length = 1, .call = asyncFromSyncNext };
+const async_from_sync_return: Native = .{ .name = "return", .length = 1, .call = asyncFromSyncReturn };
+const async_from_sync_throw: Native = .{ .name = "throw", .length = 1, .call = asyncFromSyncThrow };
+
+fn asyncGeneratorNext(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return coroutine.asyncGeneratorRequest(rt, this, .next, arg(args, 0));
+}
+
+fn asyncGeneratorReturn(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return coroutine.asyncGeneratorRequest(rt, this, .@"return", arg(args, 0));
+}
+
+fn asyncGeneratorThrow(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return coroutine.asyncGeneratorRequest(rt, this, .throw, arg(args, 0));
+}
+
+/// GetMethod: `undefined` for a missing (undefined/null) method, TypeError if not callable.
+fn getMethod(rt: *Runtime, v: Value, name: []const u8) Error!Value {
+    const m = try object.get(rt, v, try object.named(rt, name));
+    if (m == .undefined or m == .null) return .undefined;
+    if (!m.isFunction()) return rt.throw(.TypeError, &.{ .{ .ascii = "iterator." }, .{ .ascii = name }, .{ .ascii = " is not a function" } });
+    return m;
+}
+
+/// GetIterator(e, async) (D68): an iterator record (a `.custom` iterator holding the
+/// async iterator and its cached `next`); a sync iterable is wrapped in an
+/// async-from-sync iterator.
+pub fn getAsyncIterator(rt: *Runtime, iterable: Value) Error!*Object {
+    if (iterable == .undefined or iterable == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "value is not async iterable" }});
+    }
+    const r = try realm(rt);
+    var root_buf = [_]Value{ iterable, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const method_fn = try object.get(rt, iterable, .{ .symbol = r.sym_async_iterator });
+    root_buf[1] = method_fn;
+    if (method_fn == .undefined or method_fn == .null) {
+        const sync = getIterator(rt, iterable) catch |e| {
+            if (e != error.Thrown) return e;
+            rt.clearThrown();
+            return rt.throw(.TypeError, &.{.{ .ascii = "value is not async iterable" }});
+        };
+        root_buf[2] = .{ .object = sync };
+        const afs = try rt.heap.newIterator(r.async_from_sync_iterator_prototype, root_buf[2], .async_from_sync);
+        root_buf[3] = .{ .object = afs };
+        return rt.heap.newCustomIterator(r.iterator_prototype, root_buf[3], .{ .native = &async_from_sync_next });
+    }
+    if (!method_fn.isFunction()) return rt.throw(.TypeError, &.{.{ .ascii = "value is not async iterable" }});
+    const iter_val = try rt.callCallable(method_fn, iterable, &.{});
+    root_buf[2] = iter_val;
+    if (!iter_val.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Result of the Symbol.asyncIterator method is not an object" }});
+    }
+    const next_fn = try object.get(rt, iter_val, try object.named(rt, "next"));
+    root_buf[3] = next_fn;
+    return rt.heap.newCustomIterator(r.iterator_prototype, iter_val, next_fn);
+}
+
+/// `for await` step, before the await: `Call(next, iterator)`.
+pub fn asyncIterNext(rt: *Runtime, rec: *Object) Error!Value {
+    if (rec.kind != .iterator) return rt.bug("asyncIterNext on a non-iterator");
+    const it = &rec.kind.iterator;
+    if (!it.next_method.isFunction()) return rt.throw(.TypeError, &.{.{ .ascii = "iterator.next is not a function" }});
+    return rt.callCallable(it.next_method, it.target, &.{});
+}
+
+/// `for await` step, after the await: the value, or null when done.
+pub fn asyncIterValue(rt: *Runtime, res: Value) Error!?Value {
+    if (!res.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
+    var root_buf = [_]Value{res};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    if (ops.toBoolean(try object.get(rt, res, try object.named(rt, "done")))) return null;
+    return try object.get(rt, res, try object.named(rt, "value"));
+}
+
+/// AsyncIteratorClose, before the await: `return()`'s result to await, or null when there
+/// is nothing to await. `is_throw`: the completion is a throw, so errors are swallowed
+/// (the original exception wins). Closes `rec` at most once.
+pub fn asyncIterCloseStart(rt: *Runtime, rec: *Object, is_throw: bool) Error!?Value {
+    if (rec.kind != .iterator) return rt.bug("asyncIterClose on a non-iterator");
+    const it = &rec.kind.iterator;
+    if (it.done) return null;
+    const target = it.target;
+    it.done = true;
+    it.target = .undefined;
+    it.next_method = .undefined;
+    var root_buf = [_]Value{ target, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const ret = getMethod(rt, target, "return") catch |e| {
+        if (e != error.Thrown or !is_throw) return e;
+        rt.clearThrown();
+        return null;
+    };
+    if (ret == .undefined) return null;
+    root_buf[1] = ret;
+    return rt.callCallable(ret, target, &.{}) catch |e| {
+        if (e != error.Thrown or !is_throw) return e;
+        rt.clearThrown();
+        return null;
+    };
+}
+
+/// AsyncIteratorClose, after the await (normal completions only).
+pub fn asyncIterCloseCheck(rt: *Runtime, v: Value) Error!void {
+    if (!v.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
+}
+
+/// Async `yield*` round, before its await (D68): `value` is the inner call's result, or for
+/// `missing_return` the received value (awaited, then returned), or for `missing_throw`
+/// the inner `return()`'s result (awaited, checked, then a TypeError).
+pub const AsyncYieldStar = struct {
+    value: Value,
+    kind: enum(u8) { call, call_return, missing_return, missing_throw },
+};
+
+pub fn asyncYieldStarCall(rt: *Runtime, rec: *Object, received: Value, mode: coroutine.ResumeMode) Error!AsyncYieldStar {
+    if (rec.kind != .iterator) return rt.bug("async yield* on a non-iterator");
+    const it = &rec.kind.iterator;
+    const inner = it.target;
+    var root_buf = [_]Value{ .{ .object = rec }, received, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    switch (mode) {
+        .next => {
+            if (!it.next_method.isFunction()) return rt.throw(.TypeError, &.{.{ .ascii = "iterator.next is not a function" }});
+            return .{ .value = try rt.callCallable(it.next_method, inner, &.{received}), .kind = .call };
+        },
+        .throw => {
+            const thr = try getMethod(rt, inner, "throw");
+            if (thr == .undefined) {
+                const ret = try getMethod(rt, inner, "return");
+                if (ret == .undefined) return rt.throw(.TypeError, &.{.{ .ascii = "The iterator does not provide a 'throw' method" }});
+                root_buf[2] = ret;
+                return .{ .value = try rt.callCallable(ret, inner, &.{}), .kind = .missing_throw };
+            }
+            root_buf[2] = thr;
+            return .{ .value = try rt.callCallable(thr, inner, &.{received}), .kind = .call };
+        },
+        .@"return" => {
+            const ret = try getMethod(rt, inner, "return");
+            if (ret == .undefined) return .{ .value = received, .kind = .missing_return };
+            root_buf[2] = ret;
+            return .{ .value = try rt.callCallable(ret, inner, &.{received}), .kind = .call_return };
+        },
+    }
+}
+
+/// Async `yield*` round, after its await: what the expression does next.
+pub fn asyncYieldStarResult(rt: *Runtime, kind: @FieldType(AsyncYieldStar, "kind"), v: Value) Error!YieldStarStep {
+    switch (kind) {
+        .missing_return => return .{ .value = v, .kind = .@"return" },
+        .missing_throw => {
+            try asyncIterCloseCheck(rt, v);
+            return rt.throw(.TypeError, &.{.{ .ascii = "The iterator does not provide a 'throw' method" }});
+        },
+        .call, .call_return => {
+            if (!v.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
+            var root_buf = [_]Value{v};
+            var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+            const done = ops.toBoolean(try object.get(rt, v, try object.named(rt, "done")));
+            const value = try object.get(rt, v, try object.named(rt, "value"));
+            if (!done) return .{ .value = value, .kind = .yield };
+            return .{ .value = value, .kind = if (kind == .call_return) .@"return" else .done };
+        },
+    }
+}
+
+/// The sync iterator record inside an async-from-sync iterator (`this`).
+fn asyncFromSyncRecord(this: Value) ?*Object {
+    if (this != .object or this.object.kind != .iterator) return null;
+    const it = &this.object.kind.iterator;
+    if (it.kind != .async_from_sync or it.target != .object) return null;
+    return it.target.object;
+}
+
+/// Runs `body` for an async-from-sync method: its abrupt completion rejects the promise
+/// (IfAbruptRejectPromise).
+fn asyncFromSync(rt: *Runtime, this: Value, args: []const Value, comptime mode: coroutine.ResumeMode) Error!Value {
+    const r = try realm(rt);
+    const p = try rt.heap.newPromise(r.promise_prototype);
+    var root_buf = [_]Value{ .{ .object = p }, this };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const rec = asyncFromSyncRecord(this) orelse return rt.bug("an async-from-sync method on a foreign receiver");
+    asyncFromSyncStep(rt, p, rec, args, mode) catch |e| {
+        if (e != error.Thrown) return e;
+        try settlePromiseFromJob(rt, p, true, try rt.catchValue());
+    };
+    return root_buf[0];
+}
+
+fn asyncFromSyncStep(rt: *Runtime, p: *Object, rec: *Object, args: []const Value, comptime mode: coroutine.ResumeMode) Error!void {
+    const it = &rec.kind.iterator;
+    const sync_iter: Value = if (it.kind == .custom) it.target else .{ .object = rec };
+    var root_buf = [_]Value{ .{ .object = rec }, sync_iter, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const res: Value = switch (mode) {
+        .next => blk: {
+            const next_fn: Value = if (it.kind == .custom) it.next_method else .{ .native = &iterator_next };
+            if (!next_fn.isFunction()) return rt.throw(.TypeError, &.{.{ .ascii = "iterator.next is not a function" }});
+            break :blk try rt.callCallable(next_fn, sync_iter, args[0..@min(args.len, 1)]);
+        },
+        .@"return" => blk: {
+            const ret = try getMethod(rt, sync_iter, "return");
+            if (ret == .undefined) {
+                root_buf[3] = try iterResult(rt, arg(args, 0), true);
+                return resolvePromiseValue(rt, p, root_buf[3]);
+            }
+            root_buf[2] = ret;
+            break :blk try rt.callCallable(ret, sync_iter, args[0..@min(args.len, 1)]);
+        },
+        .throw => blk: {
+            const thr = try getMethod(rt, sync_iter, "throw");
+            if (thr == .undefined) {
+                try iteratorClose(rt, rec, false);
+                return rt.throw(.TypeError, &.{.{ .ascii = "The iterator does not provide a 'throw' method" }});
+            }
+            root_buf[2] = thr;
+            break :blk try rt.callCallable(thr, sync_iter, args[0..@min(args.len, 1)]);
+        },
+    };
+    root_buf[3] = res;
+    if (!res.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
+    // AsyncFromSyncIteratorContinuation; a rejected value closes the sync iterator, except
+    // for `return` (closeOnRejection false) or a done result.
+    const done = ops.toBoolean(try object.get(rt, res, try object.named(rt, "done")));
+    const value = try object.get(rt, res, try object.named(rt, "value"));
+    root_buf[2] = value;
+    const wrapper = try resolveToPromise(rt, value);
+    root_buf[2] = wrapper;
+    const on_ful = try rt.heap.newNativeClosure(if (done) @ptrCast(&asyncFromSyncUnwrapDone) else @ptrCast(&asyncFromSyncUnwrap), rec);
+    root_buf[3] = .{ .closure = on_ful };
+    const on_rej: Value = if (done or mode == .@"return") .undefined else .{ .closure = try rt.heap.newNativeClosure(@ptrCast(&asyncFromSyncCloseOnReject), rec) };
+    try performPromiseThenCap(rt, wrapper.object, root_buf[3], on_rej, p);
+}
+
+fn asyncFromSyncUnwrap(rt: *Runtime, _: *Object, args: []const Value) Error!Value {
+    return iterResult(rt, arg(args, 0), false);
+}
+
+fn asyncFromSyncUnwrapDone(rt: *Runtime, _: *Object, args: []const Value) Error!Value {
+    return iterResult(rt, arg(args, 0), true);
+}
+
+fn asyncFromSyncCloseOnReject(rt: *Runtime, rec: *Object, args: []const Value) Error!Value {
+    var root_buf = [_]Value{arg(args, 0)};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    try iteratorClose(rt, rec, true);
+    return rt.throwValue(root_buf[0]);
+}
+
+fn asyncFromSyncNext(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return asyncFromSync(rt, this, args, .next);
+}
+
+fn asyncFromSyncReturn(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return asyncFromSync(rt, this, args, .@"return");
+}
+
+fn asyncFromSyncThrow(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return asyncFromSync(rt, this, args, .throw);
 }
 
 fn generatorNext(rt: *Runtime, this: Value, args: []const Value) Error!Value {

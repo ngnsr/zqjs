@@ -147,7 +147,7 @@ const Dumper = struct {
                 try w.writeByte(')');
             },
             .for_of => |f| {
-                try w.writeAll("(for-of ");
+                try w.writeAll(if (f.is_await) "(for-await-of " else "(for-of ");
                 switch (f.target) {
                     .declaration => |dc| {
                         try w.print("({s} ", .{@tagName(dc.kind)});
@@ -228,7 +228,9 @@ const Dumper = struct {
         if (f.is_arrow) {
             try w.writeAll(if (f.is_async) "(async-arrow (" else "(arrow (");
         } else {
-            if (f.is_async) {
+            if (f.is_async and f.is_generator) {
+                try w.writeAll("(async-generator ");
+            } else if (f.is_async) {
                 try w.writeAll("(async-function ");
             } else if (f.is_generator) {
                 try w.writeAll("(generator ");

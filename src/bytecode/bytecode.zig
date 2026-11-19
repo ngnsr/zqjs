@@ -282,6 +282,22 @@ pub const Op = enum(u8) {
     /// inner iterator's next/throw/return. kind 0: not done, value is the inner result to
     /// yield raw; 1: done, value is the `yield*` result; 2: done in return mode, return value.
     yield_star_step,
+    /// [iterable] → [record]: GetIterator(iterable, async) for `for await`/async `yield*` (D68).
+    get_async_iter,
+    /// [record] → [result]: `for await` step: call `next`; the result is then awaited (D68).
+    async_iter_next,
+    /// [result] → [value, done]: check the awaited `next` result (TypeError if not an object).
+    async_iter_result,
+    /// [record_or_undefined] → [result, called]: AsyncIteratorClose up to its await; `called`
+    /// false: nothing to await. The `_throw` form swallows errors (a throw completion).
+    async_iter_close,
+    async_iter_close_throw,
+    /// [result] → []: AsyncIteratorClose after its await: TypeError if not an object.
+    async_iter_close_check,
+    /// [record, received, mode] → [kind, value]: one async `yield*` round up to its await (D68).
+    async_yield_star_call,
+    /// [kind, awaited] → [value, kind]: the rest of the round; kinds as `yield_star_step`'s.
+    async_yield_star_result,
 
     pub const Info = struct {
         operands: []const Operand,
@@ -386,6 +402,11 @@ pub const Op = enum(u8) {
             .generator_start => .{ .operands = &.{}, .pops = 0, .pushes = 0 },
             .yield => .{ .operands = &.{.argc}, .pops = 1, .pushes = 2 },
             .yield_star_step => .{ .operands = &.{}, .pops = 3, .pushes = 2 },
+            .get_async_iter, .async_iter_next => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .async_iter_result, .async_iter_close, .async_iter_close_throw => .{ .operands = &.{}, .pops = 1, .pushes = 2 },
+            .async_iter_close_check => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
+            .async_yield_star_call => .{ .operands = &.{}, .pops = 3, .pushes = 2 },
+            .async_yield_star_result => .{ .operands = &.{}, .pops = 2, .pushes = 2 },
             .throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
         };
     }
@@ -444,6 +465,8 @@ pub const Proto = struct {
     /// (D67), so every call path's coroutine check covers both.
     is_async: bool = false,
     is_generator: bool = false,
+    /// An async generator (D68): `is_async` and `is_generator` are both set, and `await` is valid.
+    is_async_generator: bool = false,
     is_method: bool = false,
     is_class_constructor: bool = false,
     has_super_ctor: bool = false,

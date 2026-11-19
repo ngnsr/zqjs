@@ -1307,6 +1307,22 @@ const Parser = struct {
     }
 
     fn binary(p: *Parser, min_bp: u8) Error!*const ast.Expr {
+        if (min_bp <= 7 and !p.no_in and p.tok.tag == .private_ident) {
+            const next = try p.peek();
+            if (p.isText(next, "in")) {
+                const priv_tok = p.tok;
+                try p.advance(); // #name
+                try p.advance(); // in
+                const rhs = try p.binary(8);
+                try p.rejectCoverExpr(rhs);
+                const lhs = try p.node(
+                    .{ .start = priv_tok.start, .end = rhs.span.end },
+                    .{ .private_in = .{ .name = priv_tok.text(p.source()), .rhs = rhs, .span = .{ .start = priv_tok.start, .end = priv_tok.end } } },
+                    rhs.depth,
+                );
+                return p.binaryFrom(lhs, min_bp);
+            }
+        }
         return p.binaryFrom(try p.prefix(), min_bp);
     }
 
@@ -1391,10 +1407,15 @@ const Parser = struct {
                 // `delete x` (a variable) and `delete 1` mean something in sloppy JS, but
                 // only member (and optional member) deletion is part of ZQJS.
                 switch (operand.data) {
-                    .member => |m| return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .delete = m }, operand.depth),
+                    .member => |m| {
+                        if (m.is_private) return p.fail(.{ .syntax_error = "Private fields can not be deleted" }, t);
+                        return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .delete = m }, operand.depth);
+                    },
                     .super_member => return p.node(.{ .start = t.start, .end = operand.span.end }, .delete_super, operand.depth),
                     .optional_chain => |oc| {
-                        if (oc.steps[oc.steps.len - 1].kind == .call) return p.fail(.{ .unsupported = .syntax }, t);
+                        const last_kind = oc.steps[oc.steps.len - 1].kind;
+                        if (last_kind == .call) return p.fail(.{ .unsupported = .syntax }, t);
+                        if (last_kind == .private_prop) return p.fail(.{ .syntax_error = "Private fields can not be deleted" }, t);
                         return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .delete_optional = oc }, operand.depth);
                     },
                     else => return p.fail(.{ .unsupported = .syntax }, t),
@@ -1472,6 +1493,11 @@ const Parser = struct {
             .dot => blk: {
                 try p.rejectCoverExpr(callee);
                 try p.advance();
+                if (p.tok.tag == .private_ident) {
+                    const name = p.tok;
+                    try p.advance();
+                    break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = name.text(p.source()) }, .is_private = true } }, callee.depth);
+                }
                 const name = try p.expectPropertyName();
                 break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = name.text(p.source()) } } }, callee.depth);
             },
@@ -1535,6 +1561,11 @@ const Parser = struct {
                     try steps.append(p.arena, .{ .optional = true, .kind = .{ .elem = k } });
                     depth = @max(depth, k.depth);
                     end = close.end;
+                } else if (p.tok.tag == .private_ident) {
+                    const name = p.tok;
+                    try p.advance();
+                    try steps.append(p.arena, .{ .optional = true, .kind = .{ .private_prop = name.text(p.source()) } });
+                    end = name.end;
                 } else {
                     const name = try p.expectPropertyName();
                     try steps.append(p.arena, .{ .optional = true, .kind = .{ .prop = name.text(p.source()) } });
@@ -1555,9 +1586,16 @@ const Parser = struct {
                 end = close.end;
             } else if (p.tok.tag == .dot) {
                 try p.advance();
-                const name = try p.expectPropertyName();
-                try steps.append(p.arena, .{ .optional = false, .kind = .{ .prop = name.text(p.source()) } });
-                end = name.end;
+                if (p.tok.tag == .private_ident) {
+                    const name = p.tok;
+                    try p.advance();
+                    try steps.append(p.arena, .{ .optional = false, .kind = .{ .private_prop = name.text(p.source()) } });
+                    end = name.end;
+                } else {
+                    const name = try p.expectPropertyName();
+                    try steps.append(p.arena, .{ .optional = false, .kind = .{ .prop = name.text(p.source()) } });
+                    end = name.end;
+                }
             } else break;
         }
         if (p.tok.tag == .template_no_sub or p.tok.tag == .template_head) {
@@ -1949,6 +1987,7 @@ const Parser = struct {
                     if (!p.in_class_method) return p.fail(.{ .syntax_error = "'super' keyword unexpected here" }, t);
                     if (p.tok.tag == .dot) {
                         try p.advance();
+                        if (p.tok.tag == .private_ident) return p.fail(.{ .syntax_error = "Private fields cannot be accessed on super" }, p.tok);
                         const prop = try p.expectPropertyName();
                         return p.node(.{ .start = t.start, .end = prop.end }, .{ .super_member = .{ .name = prop.text(p.source()) } }, 0);
                     }
@@ -1999,6 +2038,7 @@ const Parser = struct {
             // Tokens that cannot begin an expression in any JavaScript.
             .eof, .semicolon, .r_paren, .r_bracket, .r_brace, .comma, .star, .star_star, .percent, .eq3, .neq3, .eq2, .neq2, .lt, .le, .gt, .ge, .shl, .shr, .ushr, .amp, .pipe, .caret, .amp_amp, .pipe_pipe, .question2, .question, .question_dot, .colon, .eq, .arrow, .plus_eq, .minus_eq, .star_eq, .percent_eq, .star_star_eq, .shl_eq, .shr_eq, .ushr_eq, .amp_eq, .pipe_eq, .caret_eq, .amp_amp_eq, .pipe_pipe_eq, .question2_eq => return p.fail(.{ .syntax_error = "unexpected token" }, t),
             // `[`, `{`, `...`, keywords, … may start valid JS.
+            .private_ident => return p.fail(.{ .syntax_error = "Private identifiers cannot be used here" }, t),
             else => return p.fail(.{ .unsupported = .syntax }, t),
         }
     }
@@ -2577,6 +2617,9 @@ const Parser = struct {
 
         var explicit_ctor: ?*const ast.Function = null;
         var methods: std.ArrayList(ast.ClassMethod) = .empty;
+        var instance_fields: std.ArrayList(ast.ClassField) = .empty;
+        var static_fields: std.ArrayList(ast.ClassField) = .empty;
+        var static_items: std.ArrayList(ast.ClassStaticItem) = .empty;
 
         while (p.tok.tag != .r_brace) {
             if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated class body" }, open_brace);
@@ -2588,28 +2631,81 @@ const Parser = struct {
             var is_static = false;
             if (p.isText(p.tok, "static")) {
                 const next = try p.peek();
-                if (next.tag != .l_paren and next.tag != .semicolon and next.tag != .r_brace) {
+                if (next.tag != .l_paren and next.tag != .semicolon and next.tag != .r_brace and next.tag != .eq) {
                     is_static = true;
                     try p.advance();
                 }
+            }
+            if (is_static and p.tok.tag == .l_brace) {
+                const fn_id = p.function_count;
+                p.function_count += 1;
+                const outer_loops = p.loop_depth;
+                const outer_switches = p.switch_depth;
+                const outer_labels = p.labels;
+                const outer_derived = p.in_derived_ctor;
+                const outer_method = p.in_class_method;
+                const outer_async_ctx = p.async_ctx;
+                p.loop_depth = 0;
+                p.switch_depth = 0;
+                p.labels = .empty;
+                p.in_derived_ctor = .none;
+                p.in_class_method = true;
+                p.async_ctx = .none;
+                p.function_depth += 1;
+                defer {
+                    p.loop_depth = outer_loops;
+                    p.switch_depth = outer_switches;
+                    p.labels = outer_labels;
+                    p.in_derived_ctor = outer_derived;
+                    p.in_class_method = outer_method;
+                    p.async_ctx = outer_async_ctx;
+                    p.function_depth -= 1;
+                }
+                const parsed_body = try p.parseFunctionBody();
+                const blk_fn = try p.arena.create(ast.Function);
+                blk_fn.* = .{
+                    .span = .{ .start = elem_start, .end = parsed_body.end },
+                    .id = fn_id,
+                    .kind = .expression,
+                    .is_arrow = false,
+                    .is_async = false,
+                    .is_method = true,
+                    .has_home_object = true,
+                    .length = 0,
+                    .name = null,
+                    .inferred_name = "<static_block>",
+                    .params = &.{},
+                    .body = parsed_body.body,
+                };
+                try static_items.append(p.arena, .{ .block = blk_fn });
+                continue;
             }
             var is_async = false;
             var method_kind: @FieldType(ast.ClassMethod, "kind") = .method;
             if (p.isText(p.tok, "async")) {
                 const next = try p.peek();
-                if (!next.newline_before and next.tag != .l_paren) {
+                if (!next.newline_before and next.tag != .l_paren and next.tag != .eq and next.tag != .semicolon and next.tag != .r_brace) {
                     is_async = true;
                     try p.advance();
                 }
             } else if (p.isText(p.tok, "get") or p.isText(p.tok, "set")) {
                 const next = try p.peek();
-                if (next.tag != .l_paren and next.tag != .semicolon and next.tag != .r_brace) {
+                if (next.tag != .l_paren and next.tag != .semicolon and next.tag != .r_brace and next.tag != .eq) {
                     method_kind = if (p.isText(p.tok, "get")) .getter else .setter;
                     try p.advance();
                 }
             }
             const key_tok = p.tok;
+            const is_private = p.tok.tag == .private_ident;
             const key: ast.PropertyKey = switch (p.tok.tag) {
+                .private_ident => blk: {
+                    const name = p.tok.text(p.source());
+                    if (std.mem.eql(u8, name, "#constructor")) {
+                        return p.fail(.{ .syntax_error = "Classes may not have a private element named '#constructor'" }, key_tok);
+                    }
+                    try p.advance();
+                    break :blk .{ .name = name };
+                },
                 .l_bracket => try p.computedPropertyKey(),
                 .string => blk: {
                     const units = try p.decodeString(p.tok);
@@ -2627,7 +2723,7 @@ const Parser = struct {
                 },
             };
 
-            const is_ctor = !is_static and key == .name and std.mem.eql(u8, key.name, "constructor");
+            const is_ctor = !is_static and !is_private and key == .name and std.mem.eql(u8, key.name, "constructor");
             if (is_ctor and is_async) {
                 return p.fail(.{ .syntax_error = "class constructor may not be an async method" }, key_tok);
             }
@@ -2637,10 +2733,78 @@ const Parser = struct {
             if (is_ctor and explicit_ctor != null) {
                 return p.fail(.{ .syntax_error = "a class may only have one constructor" }, key_tok);
             }
-            if (is_static and key == .name and std.mem.eql(u8, key.name, "prototype")) {
+            if (is_static and !is_private and key == .name and std.mem.eql(u8, key.name, "prototype")) {
                 return p.fail(.{ .syntax_error = "classes may not have a static property named 'prototype'" }, key_tok);
             }
-            if (p.tok.tag != .l_paren) return p.fail(.{ .syntax_error = "expected '('" }, p.tok);
+            if (p.tok.tag != .l_paren) {
+                if (is_async or method_kind != .method) {
+                    return p.fail(.{ .syntax_error = "expected '('" }, p.tok);
+                }
+                if (is_ctor) {
+                    return p.fail(.{ .syntax_error = "Classes may not have a field named 'constructor'" }, key_tok);
+                }
+                var init_fn: ?*const ast.Function = null;
+                var field_end = key_tok.end;
+                if (p.tok.tag == .eq) {
+                    try p.advance();
+                    const fn_id = p.function_count;
+                    p.function_count += 1;
+                    const outer_derived = p.in_derived_ctor;
+                    const outer_method = p.in_class_method;
+                    const outer_async_ctx = p.async_ctx;
+                    p.in_derived_ctor = .none;
+                    p.in_class_method = true;
+                    p.async_ctx = .none;
+                    p.function_depth += 1;
+                    defer {
+                        p.in_derived_ctor = outer_derived;
+                        p.in_class_method = outer_method;
+                        p.async_ctx = outer_async_ctx;
+                        p.function_depth -= 1;
+                    }
+                    const init_expr = try p.nested();
+                    field_end = init_expr.span.end;
+                    const body = try p.arena.alloc(ast.Stmt, 1);
+                    body[0] = .{ .span = init_expr.span, .data = .{ .@"return" = init_expr } };
+                    const f = try p.arena.create(ast.Function);
+                    f.* = .{
+                        .span = .{ .start = elem_start, .end = field_end },
+                        .id = fn_id,
+                        .kind = .expression,
+                        .is_arrow = false,
+                        .is_async = false,
+                        .is_method = true,
+                        .has_home_object = true,
+                        .length = 0,
+                        .name = null,
+                        .inferred_name = "",
+                        .params = &.{},
+                        .body = body,
+                    };
+                    init_fn = f;
+                }
+                if (p.tok.tag == .semicolon) {
+                    field_end = p.tok.end;
+                    try p.advance();
+                } else if (p.tok.tag != .r_brace and !p.tok.newline_before) {
+                    return p.fail(.{ .syntax_error = "expected ';' after class field" }, p.tok);
+                }
+                const field: ast.ClassField = .{
+                    .key = key,
+                    .is_static = is_static,
+                    .is_private = is_private,
+                    .init = init_fn,
+                    .span = .{ .start = elem_start, .end = field_end },
+                };
+                if (is_static) {
+                    const idx = static_fields.items.len;
+                    try static_fields.append(p.arena, field);
+                    try static_items.append(p.arena, .{ .field = idx });
+                } else {
+                    try instance_fields.append(p.arena, field);
+                }
+                continue;
+            }
 
             const fn_id = p.function_count;
             p.function_count += 1;
@@ -2703,6 +2867,7 @@ const Parser = struct {
                 try methods.append(p.arena, .{
                     .key = key,
                     .is_static = is_static,
+                    .is_private = is_private,
                     .kind = method_kind,
                     .func = f,
                     .span = .{ .start = elem_start, .end = parsed_body.end },
@@ -2722,6 +2887,9 @@ const Parser = struct {
             .super_class = super_class,
             .constructor = ctor,
             .methods = methods.items,
+            .instance_fields = instance_fields.items,
+            .static_fields = static_fields.items,
+            .static_items = static_items.items,
         };
         return cls;
     }

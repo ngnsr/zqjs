@@ -14,6 +14,7 @@ pub const Tag = enum {
     template_middle,
     template_tail,
     identifier,
+    private_ident,
     kw_true,
     kw_false,
     kw_null,

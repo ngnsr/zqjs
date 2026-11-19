@@ -1540,3 +1540,23 @@ until a follow-up milestone).
   - Defining a getter on an existing accessor property preserves its `setter` (and vice versa), matching ECMAScript `DefineOwnProperty` merging.
 - **Built-ins (`Object`):**
   - `Object.defineProperty(obj, key, desc)`, `Object.defineProperties(obj, props)`, `Object.getOwnPropertyDescriptor(obj, key)`, and `Object.getOwnPropertyDescriptors(obj)` implement ECMAScript descriptor validation (rejecting mixed data+accessor descriptors, non-callable `get`/`set`, and invalid redefinitions of non-configurable/non-writable properties with `TypeError`).
+
+---
+
+## D65. Class Fields, Private Members (`#`), and Static Blocks (M35)
+
+**Decision:** Support ECMAScript public/private class fields (`x = 1`, `static x = 1`, `#x = 1`, `static #x = 1`), private methods and accessors (`#m()`, `get #x()`, `set #x(v)`, static variants), ergonomic brand checks (`#x in obj`), and `static { ... }` initialization blocks across both engines.
+
+- **Lexer & Syntax (`token.zig`, `lexer.zig`, `parser.zig`, `resolver.zig`):**
+  - `#ident` lexes as `.private_ident`.
+  - `resolver.zig` maintains a stack of enclosing class private-name tables so undeclared `#x` references (`obj.#x` or `#x in obj`), duplicate private declarations (except matching `get #x` / `set #x`), `#constructor`, `delete obj.#x`, and `super.#x` are rejected as `SyntaxError`.
+  - Computed field keys (`[expr] = val`, `static [expr] = val`) are evaluated once at class definition time in source order; field initializer expressions (`= val`) are evaluated per instance (or once for `static`) with `this` and `super` bound appropriately.
+- **Runtime & GC (`heap.zig`, `object.zig`):**
+  - `ClosureMeta.brand` stores the owning class constructor `Closure` (inherited by arrow functions alongside `home_object`), giving each evaluation of a `class` a distinct runtime brand.
+  - `Object.private_props` and `ClosureMeta.private_props` store `{ brand: *Closure, name: *String } -> Property` entries (nullable / empty by default so objects without private members pay zero allocation), traced in `forEachChild` / `RememberedScan` and freed on sweep.
+  - Private reads/writes/brand-checks (`getPrivate`, `setPrivate`, `hasPrivate`) look up `(brand, name)` on the receiver (throwing `TypeError` on missing brand for reads/writes, returning `false` for `#x in obj`).
+  - Public class fields use `DefineOwnProperty` (`definePublicField`), creating writable, enumerable, configurable own data properties without invoking prototype setters.
+- **Initialization order:**
+  - Base classes run instance private-method installation and instance field initializers on `this` upon entering the constructor body.
+  - Derived classes run them immediately after `super(...)` initializes `this`.
+  - Static private methods, static fields, and `static { ... }` blocks execute in declaration order with `this = C` and `home_object = C` when the class is evaluated.

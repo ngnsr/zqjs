@@ -1058,6 +1058,10 @@ const Compiler = struct {
                 .string, .number => unreachable,
             },
             .delete_super => try c.emit(.throw_delete_super, &.{}),
+            .private_in => |pi| {
+                try c.expr(pi.rhs);
+                try c.emit(.in_private, &.{try c.name(pi.name)});
+            },
             .await => |inner| {
                 try c.expr(inner);
                 try c.emit(.await, &.{});
@@ -1153,6 +1157,8 @@ const Compiler = struct {
                 // for the write). `op=` reads before evaluating the right-hand side.
                 .member => |m| {
                     try c.expr(m.object);
+                    const get_op: Op = if (m.is_private) .get_private else .get_prop;
+                    const set_op: Op = if (m.is_private) .set_private else .set_prop;
                     const named = switch (m.key) {
                         .name => |n| n,
                         .computed => |k| blk: {
@@ -1164,25 +1170,25 @@ const Compiler = struct {
                     switch (a.op) {
                         .plain => {
                             try c.expr(a.value);
-                            if (named) |n| try c.emit(.set_prop, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
+                            if (named) |n| try c.emit(set_op, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
                         },
                         .compound => |op| {
                             if (named) |n| {
                                 try c.emit(.dup, &.{});
-                                try c.emit(.get_prop, &.{try c.name(n)});
+                                try c.emit(get_op, &.{try c.name(n)});
                             } else {
                                 try c.emit(.dup2, &.{});
                                 try c.emit(.get_elem, &.{});
                             }
                             try c.expr(a.value);
                             try c.emit(binaryOp(op), &.{});
-                            if (named) |n| try c.emit(.set_prop, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
+                            if (named) |n| try c.emit(set_op, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
                         },
                         .logical_and, .logical_or, .nullish => {
                             const computed = named == null;
                             if (named) |n| {
                                 try c.emit(.dup, &.{});
-                                try c.emit(.get_prop, &.{try c.name(n)});
+                                try c.emit(get_op, &.{try c.name(n)});
                             } else {
                                 try c.emit(.dup2, &.{});
                                 try c.emit(.get_elem, &.{});
@@ -1190,7 +1196,7 @@ const Compiler = struct {
                             const to_short = try c.jumpIfLogicalAssignShortCircuit(a.op);
                             try c.emit(.pop, &.{});
                             try c.expr(a.value);
-                            if (named) |n| try c.emit(.set_prop, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
+                            if (named) |n| try c.emit(set_op, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
                             const to_end = try c.jumpForward(.jump);
                             // Short-circuit path arrives with [o, old] or [o, k, old]; move `old`
                             // below the kept target parts and pop them.
@@ -1275,6 +1281,8 @@ const Compiler = struct {
                 // (rot moves a copy of the old value below base and key, for postfix).
                 .member => |m| {
                     try c.expr(m.object);
+                    const get_op: Op = if (m.is_private) .get_private else .get_prop;
+                    const set_op: Op = if (m.is_private) .set_private else .set_prop;
                     const named = switch (m.key) {
                         .name => |n| n,
                         .computed => |k| blk: {
@@ -1285,7 +1293,7 @@ const Compiler = struct {
                     };
                     if (named) |n| {
                         try c.emit(.dup, &.{});
-                        try c.emit(.get_prop, &.{try c.name(n)});
+                        try c.emit(get_op, &.{try c.name(n)});
                     } else {
                         try c.emit(.dup2, &.{});
                         try c.emit(.get_elem, &.{});
@@ -1296,7 +1304,7 @@ const Compiler = struct {
                         try c.emit(if (named == null) .rot4 else .rot3, &.{});
                     }
                     try c.emit(if (u.op == .inc) .inc else .dec, &.{});
-                    if (named) |n| try c.emit(.set_prop, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
+                    if (named) |n| try c.emit(set_op, &.{try c.name(n)}) else try c.emit(.set_elem, &.{});
                     if (!u.prefix) try c.emit(.pop, &.{});
                 },
                 .super_member => |k| {
@@ -1486,7 +1494,7 @@ const Compiler = struct {
             try c.expr(m.object);
             try c.emit(.dup, &.{});
             switch (m.key) {
-                .name => |n| try c.emit(.get_prop, &.{try c.name(n)}),
+                .name => |n| try c.emit(if (m.is_private) .get_private else .get_prop, &.{try c.name(n)}),
                 .computed => |k| {
                     try c.expr(k);
                     try c.emit(.get_elem, &.{});
@@ -1503,7 +1511,8 @@ const Compiler = struct {
                 try c.jumpIfNullish(if (has_receiver) &short_2 else &short_1);
             }
             switch (step.kind) {
-                .prop => |n| {
+                .prop, .private_prop => |n| {
+                    const is_priv = step.kind == .private_prop;
                     if (is_delete and i == oc.steps.len - 1) {
                         try c.emit(.delete_prop, &.{try c.name(n)});
                     } else {
@@ -1511,7 +1520,7 @@ const Compiler = struct {
                             try c.emit(.dup, &.{});
                             has_receiver = true;
                         }
-                        try c.emit(.get_prop, &.{try c.name(n)});
+                        try c.emit(if (is_priv) .get_private else .get_prop, &.{try c.name(n)});
                     }
                 },
                 .elem => |k| {
@@ -1573,6 +1582,7 @@ const Compiler = struct {
         base_slot: u32,
         key_slot: ?u32,
         prop_name: ?[]const u8,
+        is_private: bool = false,
     };
 
     fn preEvalMemberTarget(c: *Compiler, pat: *const ast.Pattern) Error!?MemberSlots {
@@ -1582,7 +1592,7 @@ const Compiler = struct {
         const base_slot = c.allocTemp();
         try c.emit(.init_local, &.{base_slot});
         switch (m.key) {
-            .name => |n| return .{ .base_slot = base_slot, .key_slot = null, .prop_name = n },
+            .name => |n| return .{ .base_slot = base_slot, .key_slot = null, .prop_name = n, .is_private = m.is_private },
             .computed => |k| {
                 try c.expr(k);
                 const key_slot = c.allocTemp();
@@ -1600,7 +1610,7 @@ const Compiler = struct {
         if (ms.key_slot) |ks| try c.emit(.get_local, &.{ ks, try c.name("<key>") });
         try c.emit(.get_local, &.{ val_slot, try c.name("<val>") });
         if (ms.prop_name) |n| {
-            try c.emit(.set_prop, &.{try c.name(n)});
+            try c.emit(if (ms.is_private) .set_private else .set_prop, &.{try c.name(n)});
         } else {
             try c.emit(.set_elem, &.{});
         }
@@ -1632,7 +1642,7 @@ const Compiler = struct {
                     switch (m.key) {
                         .name => |n| {
                             try c.emit(.get_local, &.{ val_slot, try c.name("<val>") });
-                            try c.emit(.set_prop, &.{try c.name(n)});
+                            try c.emit(if (m.is_private) .set_private else .set_prop, &.{try c.name(n)});
                         },
                         .computed => |k| {
                             try c.expr(k);
@@ -1775,7 +1785,10 @@ const Compiler = struct {
     fn member(c: *Compiler, m: ast.Member, comptime what: enum { get, delete }) Error!void {
         try c.expr(m.object);
         switch (m.key) {
-            .name => |n| try c.emit(if (what == .get) .get_prop else .delete_prop, &.{try c.name(n)}),
+            .name => |n| {
+                const op: Op = if (what == .get) (if (m.is_private) .get_private else .get_prop) else .delete_prop;
+                try c.emit(op, &.{try c.name(n)});
+            },
             .computed => |k| {
                 try c.expr(k);
                 try c.emit(if (what == .get) .get_elem else .delete_elem, &.{});
@@ -1861,7 +1874,7 @@ const Compiler = struct {
             try c.expr(m.object);
             try c.emit(.dup, &.{});
             switch (m.key) {
-                .name => |n| try c.emit(.get_prop, &.{try c.name(n)}),
+                .name => |n| try c.emit(if (m.is_private) .get_private else .get_prop, &.{try c.name(n)}),
                 .computed => |k| {
                     try c.expr(k);
                     try c.emit(.get_elem, &.{});
@@ -1870,6 +1883,20 @@ const Compiler = struct {
             }
         } else try c.expr(callee);
         return method;
+    }
+
+    fn emitPropertyKeyExpr(c: *Compiler, pk: ast.PropertyKey) Error!void {
+        switch (pk) {
+            .name => |n| {
+                const units = try c.s.gpa.alloc(u16, n.len);
+                defer c.s.gpa.free(units);
+                for (n, 0..) |ch, i| units[i] = ch;
+                try c.emit(.push_const, &.{try c.string(units)});
+            },
+            .string => |units| try c.emit(.push_const, &.{try c.string(units)}),
+            .number => |num| try c.emit(.push_const, &.{try c.number(num)}),
+            .computed => |k| try c.expr(k),
+        }
     }
 
     fn compileClass(c: *Compiler, cls: *const ast.Class, is_expr: bool) Error!void {
@@ -1899,6 +1926,7 @@ const Compiler = struct {
         try c.emit(.init_local, &.{ctor_slot});
 
         for (cls.methods) |m| {
+            if (m.is_private) continue; // installed via instance_inits / static block
             const target_slot = if (m.is_static) ctor_slot else proto_slot;
             try c.emit(.get_local, &.{ target_slot, try c.name("<class>") });
             const acc_flags: ?u32 = switch (m.kind) {
@@ -1908,7 +1936,9 @@ const Compiler = struct {
             };
             switch (m.key) {
                 .name => |n| {
+                    try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });
                     try c.closure(m.func);
+                    try c.emit(.set_brand, &.{});
                     if (acc_flags) |f| {
                         try c.emit(.define_accessor, &.{ try c.name(n), f });
                     } else {
@@ -1917,7 +1947,9 @@ const Compiler = struct {
                 },
                 .string => |units| {
                     try c.emit(.push_const, &.{try c.string(units)});
+                    try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });
                     try c.closure(m.func);
+                    try c.emit(.set_brand, &.{});
                     if (acc_flags) |f| {
                         try c.emit(.define_elem_accessor, &.{f});
                     } else {
@@ -1926,7 +1958,9 @@ const Compiler = struct {
                 },
                 .number => |num| {
                     try c.emit(.push_const, &.{try c.number(num)});
+                    try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });
                     try c.closure(m.func);
+                    try c.emit(.set_brand, &.{});
                     if (acc_flags) |f| {
                         try c.emit(.define_elem_accessor, &.{f});
                     } else {
@@ -1935,7 +1969,9 @@ const Compiler = struct {
                 },
                 .computed => |k| {
                     try c.expr(k);
+                    try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });
                     try c.closure(m.func);
+                    try c.emit(.set_brand, &.{});
                     if (acc_flags) |f| {
                         try c.emit(.define_elem_accessor, &.{f});
                     } else {
@@ -1944,6 +1980,99 @@ const Compiler = struct {
                 },
             }
             try c.emit(.pop, &.{});
+        }
+
+        // Private instance methods/accessors + instance fields (installed per `new C()`).
+        for (cls.methods) |m| {
+            if (m.is_static or !m.is_private) continue;
+            const kind_code: u32 = switch (m.kind) {
+                .method => 2, // private_method
+                .getter => 3, // private_getter
+                .setter => 4, // private_setter
+            };
+            try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });
+            try c.closure(m.func);
+            try c.emit(.add_instance_init, &.{ try c.name(m.key.name), kind_code << 16 });
+            try c.emit(.pop, &.{});
+        }
+        var field_key_count: u32 = 0;
+        for (cls.instance_fields) |f| {
+            var key_idx: u32 = 0;
+            if (!f.is_private) {
+                key_idx = field_key_count;
+                field_key_count += 1;
+                try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });
+                try c.emitPropertyKeyExpr(f.key);
+                try c.emit(.store_field_key, &.{});
+                try c.emit(.pop, &.{});
+            }
+            const kind_code: u32 = if (f.is_private) 1 else 0;
+            const name_str: []const u8 = if (f.is_private) f.key.name else "";
+            try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });
+            if (f.init) |init_fn| try c.closure(init_fn) else try c.emit(.push_undefined, &.{});
+            try c.emit(.add_instance_init, &.{ try c.name(name_str), (kind_code << 16) | key_idx });
+            try c.emit(.pop, &.{});
+        }
+
+        // Static private methods/accessors, static fields, and `static {}` blocks.
+        for (cls.methods) |m| {
+            if (!m.is_static or !m.is_private) continue;
+            try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });
+            try c.closure(m.func);
+            switch (m.kind) {
+                .method => try c.emit(.define_private_method, &.{try c.name(m.key.name)}),
+                .getter => try c.emit(.define_private_accessor, &.{ try c.name(m.key.name), 0 }),
+                .setter => try c.emit(.define_private_accessor, &.{ try c.name(m.key.name), 1 }),
+            }
+            try c.emit(.pop, &.{});
+        }
+        var static_key_slots = try c.s.gpa.alloc(?u32, cls.static_fields.len);
+        defer c.s.gpa.free(static_key_slots);
+        for (cls.static_fields, 0..) |f, i| {
+            if (!f.is_private) {
+                const slot = c.allocTemp();
+                static_key_slots[i] = slot;
+                try c.emitPropertyKeyExpr(f.key);
+                try c.emit(.init_local, &.{slot});
+            } else {
+                static_key_slots[i] = null;
+            }
+        }
+        for (cls.static_items) |item| switch (item) {
+            .field => |idx| {
+                const f = cls.static_fields[idx];
+                try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });
+                if (!f.is_private) {
+                    try c.emit(.get_local, &.{ static_key_slots[idx].?, try c.name("<key>") });
+                }
+                if (f.init) |init_fn| {
+                    try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });
+                    try c.closure(init_fn);
+                    try c.emit(.run_static_init, &.{});
+                } else {
+                    try c.emit(.push_undefined, &.{});
+                }
+                if (f.is_private) {
+                    try c.emit(.define_private_field, &.{try c.name(f.key.name)});
+                } else {
+                    try c.emit(.define_public_field, &.{});
+                }
+                try c.emit(.pop, &.{});
+            },
+            .block => |blk_fn| {
+                try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });
+                try c.closure(blk_fn);
+                try c.emit(.run_static_init, &.{});
+                try c.emit(.pop, &.{});
+            },
+        };
+        var si = cls.static_fields.len;
+        while (si > 0) {
+            si -= 1;
+            if (static_key_slots[si]) |slot| {
+                try c.emit(.clear_local, &.{slot});
+                c.freeTemp();
+            }
         }
 
         try c.emit(.get_local, &.{ ctor_slot, try c.name("<class>") });

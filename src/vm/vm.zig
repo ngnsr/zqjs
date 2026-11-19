@@ -808,6 +808,11 @@ pub const Vm = struct {
                         }
                     }
                 }
+                if (vm.frame().closure) |parent_c| {
+                    if (parent_c.meta) |pm| {
+                        if (pm.brand) |br| try rt.heap.storeClosureBrand(c, br);
+                    }
+                }
                 try cache.push(vm, .{ .closure = c });
             },
             .push_callee => {
@@ -909,6 +914,111 @@ pub const Vm = struct {
                 try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), target);
                 try object.defineAccessor(rt, target, try object.key(rt, key_val), fn_val, is_setter, enumerable);
                 try cache.drop(vm, 2);
+            },
+            .define_private_method => {
+                const fn_val = try cache.peek(vm, 0);
+                const target = try cache.peek(vm, 1);
+                if (fn_val != .closure or target != .closure) return vm.bug("define_private_method expects closures");
+                try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), target);
+                try rt.heap.storeClosureBrand(@constCast(fn_val.closure), target);
+                const name_str = (try vm.nameKey(cache.operand(0))).atom;
+                try object.definePrivateMethod(rt, target, target.closure, name_str, fn_val);
+                try cache.drop(vm, 1);
+            },
+            .define_private_accessor => {
+                const fn_val = try cache.peek(vm, 0);
+                const target = try cache.peek(vm, 1);
+                if (fn_val != .closure or target != .closure) return vm.bug("define_private_accessor expects closures");
+                try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), target);
+                try rt.heap.storeClosureBrand(@constCast(fn_val.closure), target);
+                const name_str = (try vm.nameKey(cache.operand(0))).atom;
+                const is_setter = (cache.operand(1) & 1) != 0;
+                try object.definePrivateAccessor(rt, target, target.closure, name_str, fn_val, is_setter);
+                try cache.drop(vm, 1);
+            },
+            .define_public_field => {
+                const val = try cache.peek(vm, 0);
+                const key_val = try cache.peek(vm, 1);
+                const target = try cache.peek(vm, 2);
+                try object.definePublicField(rt, target, try object.key(rt, key_val), val);
+                try cache.drop(vm, 2);
+            },
+            .define_private_field => {
+                const val = try cache.peek(vm, 0);
+                const target = try cache.peek(vm, 1);
+                const brand_val = if (target == .closure) target else (vm.frame().closure.?.meta.?.brand orelse return vm.bug("define_private_field without brand"));
+                const name_str = (try vm.nameKey(cache.operand(0))).atom;
+                try object.definePrivateField(rt, target, brand_val.closure, name_str, val);
+                try cache.drop(vm, 1);
+            },
+            .get_private => {
+                const brand_val = vm.frame().closure.?.meta.?.brand orelse return vm.bug("get_private without brand");
+                const name_str = (try vm.nameKey(cache.operand(0))).atom;
+                cache.syncSp(vm);
+                const r = try object.getPrivate(rt, try cache.peek(vm, 0), brand_val.closure, name_str);
+                (try cache.top(vm)).* = r;
+            },
+            .set_private => {
+                const v = try cache.peek(vm, 0);
+                const brand_val = vm.frame().closure.?.meta.?.brand orelse return vm.bug("set_private without brand");
+                const name_str = (try vm.nameKey(cache.operand(0))).atom;
+                cache.syncSp(vm);
+                try object.setPrivate(rt, try cache.peek(vm, 1), brand_val.closure, name_str, v);
+                try cache.drop(vm, 1);
+                (try cache.top(vm)).* = v;
+            },
+            .in_private => {
+                const brand_val = vm.frame().closure.?.meta.?.brand orelse return vm.bug("in_private without brand");
+                const name_str = (try vm.nameKey(cache.operand(0))).atom;
+                const b = try object.hasPrivate(rt, try cache.peek(vm, 0), brand_val.closure, name_str);
+                (try cache.top(vm)).* = .{ .boolean = b };
+            },
+            .store_field_key => {
+                const key_val = try cache.peek(vm, 0);
+                const ctor_val = try cache.peek(vm, 1);
+                if (ctor_val != .closure) return vm.bug("store_field_key expects closure");
+                try rt.heap.appendClosureFieldKey(@constCast(ctor_val.closure), key_val);
+                try cache.drop(vm, 1);
+            },
+            .add_instance_init => {
+                const fn_val = try cache.peek(vm, 0);
+                const ctor_val = try cache.peek(vm, 1);
+                if (ctor_val != .closure) return vm.bug("add_instance_init expects closure");
+                const packed_op = cache.operand(1);
+                const kind: @FieldType(heap.InstanceInit, "kind") = @fromBackingInt(@intCast(@as(u8, @intCast(packed_op >> 16))));
+                const key_idx: u32 = packed_op & 0xffff;
+                const name_str: ?*heap.String = if (kind == .public_field) null else (try vm.nameKey(cache.operand(0))).atom;
+                if (fn_val == .closure) {
+                    const proto_val = (ctor_val.closure.meta orelse return vm.bug("add_instance_init without meta")).prototype orelse return vm.bug("add_instance_init without prototype");
+                    try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), proto_val);
+                    try rt.heap.storeClosureBrand(@constCast(fn_val.closure), ctor_val);
+                }
+                try rt.heap.appendClosureInstanceInit(@constCast(ctor_val.closure), .{
+                    .kind = kind,
+                    .name = name_str,
+                    .key_idx = key_idx,
+                    .func = fn_val,
+                });
+                try cache.drop(vm, 1);
+            },
+            .run_static_init => {
+                const fn_val = try cache.peek(vm, 0);
+                const ctor_val = try cache.peek(vm, 1);
+                if (fn_val != .closure or ctor_val != .closure) return vm.bug("run_static_init expects closures");
+                try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), ctor_val);
+                try rt.heap.storeClosureBrand(@constCast(fn_val.closure), ctor_val);
+                cache.syncSp(vm);
+                const r = try rt.callCallable(fn_val, ctor_val, &.{});
+                try cache.drop(vm, 1);
+                (try cache.top(vm)).* = r;
+            },
+            .set_brand => {
+                const fn_val = try cache.peek(vm, 0);
+                const ctor_val = try cache.peek(vm, 1);
+                if (fn_val != .closure or ctor_val != .closure) return vm.bug("set_brand expects closures");
+                try rt.heap.storeClosureBrand(@constCast(fn_val.closure), ctor_val);
+                try cache.drop(vm, 1);
+                (try cache.top(vm)).* = fn_val;
             },
             .super_call => {
                 const argc = cache.operand(0);
@@ -1348,6 +1458,11 @@ pub const Vm = struct {
                 vm.stack[vm.sp] = v; // replaces the callee (and receiver); arguments and callee operands are gone
                 vm.sp += 1;
                 vm.pc = f.return_pc;
+                if (f.is_super_call) {
+                    if (vm.frames.items[vm.frames.items.len - 1].closure) |dc| {
+                        try builtins.runInstanceInits(rt, @constCast(dc), v);
+                    }
+                }
                 cache.* = FrameCache.fromVm(vm, f.return_pc);
                 return .running;
             },
@@ -1519,6 +1634,8 @@ pub const Vm = struct {
             vm.frames.items[vm.frames.items.len - 1].this = res;
             vm.stack[base] = res;
             cache.sp = base + 1;
+            cache.syncSp(vm);
+            try builtins.runInstanceInits(rt, @constCast(cur_closure), res);
             return false;
         }
         const tc = target.closure;
@@ -1587,6 +1704,9 @@ pub const Vm = struct {
         vm.reserved += callee.slot_count + callee.max_stack;
         vm.pc = 0;
         if (vm.chain) |cx| cx.call_depth += 1; // the frame is live now (D51 #2)
+        if (is_construct and !callee.has_super_ctor) {
+            try builtins.runInstanceInits(vm.rt, @constCast(c), .{ .object = construct_instance.? });
+        }
     }
 
     fn enterSlice(vm: *Vm, c: *const Closure, base: u32, args_slice: []const Value, return_pc: u32, this: ?Value, is_construct: bool, is_super_call: bool, construct_instance: ?*heap.Object) Error!void {
@@ -1635,6 +1755,9 @@ pub const Vm = struct {
         vm.reserved += callee.slot_count + callee.max_stack;
         vm.pc = 0;
         if (vm.chain) |cx| cx.call_depth += 1;
+        if (is_construct and !callee.has_super_ctor) {
+            try builtins.runInstanceInits(vm.rt, @constCast(c), .{ .object = construct_instance.? });
+        }
     }
 
     noinline fn growFrames(vm: *Vm) Error!void {

@@ -144,6 +144,13 @@ const FnState = struct {
     captures: std.ArrayList(Resolution.Capture) = .empty,
 };
 
+const PrivateDecl = struct {
+    has_get: bool = false,
+    has_set: bool = false,
+    is_static: bool = false,
+    is_field_or_method: bool = false,
+};
+
 const Resolver = struct {
     arena: Allocator,
     diag: *Diagnostic,
@@ -153,6 +160,7 @@ const Resolver = struct {
     scopes: std.ArrayList(Resolution.Scope) = .empty,
     fns: std.ArrayList(FnState) = .empty,
     live: std.ArrayList(Live) = .empty,
+    private_scopes: std.ArrayList(std.StringHashMapUnmanaged(PrivateDecl)) = .empty,
     scope_start: usize = 0,
     scope: u32 = 0,
     /// Index in `r.live` where the enclosing parameter scope starts (for checking
@@ -478,7 +486,39 @@ const Resolver = struct {
             .super_call => |args| for (args) |arg| try r.expr(arg),
             .super_member => |k| if (k == .computed) try r.expr(k.computed),
             .delete_super => {},
+            .private_in => |pi| {
+                if (!r.hasPrivateInScope(pi.name)) {
+                    return r.fail(.{ .syntax_error = "Private field must be declared in an enclosing class" }, pi.span);
+                }
+                try r.expr(pi.rhs);
+            },
         }
+    }
+
+    fn hasPrivateInScope(r: *const Resolver, name: []const u8) bool {
+        var i = r.private_scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (r.private_scopes.items[i].contains(name)) return true;
+        }
+        return false;
+    }
+
+    fn addPrivateDecl(r: *Resolver, map: *std.StringHashMapUnmanaged(PrivateDecl), name: []const u8, decl: PrivateDecl, s: ast.Span) Error!void {
+        const gop = try map.getOrPut(r.arena, name);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = decl;
+            return;
+        }
+        const cur = gop.value_ptr.*;
+        if (cur.is_field_or_method or decl.is_field_or_method or cur.is_static != decl.is_static) {
+            return r.fail(.{ .syntax_error = "Identifier has already been declared" }, s);
+        }
+        if ((decl.has_get and cur.has_get) or (decl.has_set and cur.has_set)) {
+            return r.fail(.{ .syntax_error = "Identifier has already been declared" }, s);
+        }
+        if (decl.has_get) gop.value_ptr.has_get = true;
+        if (decl.has_set) gop.value_ptr.has_set = true;
     }
 
     fn resolveClass(r: *Resolver, c: *const ast.Class, is_expr: bool) Error!void {
@@ -490,22 +530,64 @@ const Resolver = struct {
         } else null;
         defer if (saved) |s| r.exitScope(s);
 
+        var priv_map: std.StringHashMapUnmanaged(PrivateDecl) = .empty;
+        for (c.methods) |m| {
+            if (!m.is_private) continue;
+            try r.addPrivateDecl(&priv_map, m.key.name, .{
+                .has_get = m.kind == .getter,
+                .has_set = m.kind == .setter,
+                .is_static = m.is_static,
+                .is_field_or_method = m.kind == .method,
+            }, m.span);
+        }
+        for (c.instance_fields) |f| {
+            if (!f.is_private) continue;
+            try r.addPrivateDecl(&priv_map, f.key.name, .{ .is_static = false, .is_field_or_method = true }, f.span);
+        }
+        for (c.static_fields) |f| {
+            if (!f.is_private) continue;
+            try r.addPrivateDecl(&priv_map, f.key.name, .{ .is_static = true, .is_field_or_method = true }, f.span);
+        }
+        try r.private_scopes.append(r.arena, priv_map);
+        defer _ = r.private_scopes.pop();
+
         try r.function(c.constructor);
         for (c.methods) |m| {
             if (m.key == .computed) try r.expr(m.key.computed);
             try r.function(m.func);
         }
+        for (c.instance_fields) |f| {
+            if (f.key == .computed) try r.expr(f.key.computed);
+            if (f.init) |init_fn| try r.function(init_fn);
+        }
+        for (c.static_fields) |f| {
+            if (f.key == .computed) try r.expr(f.key.computed);
+            if (f.init) |init_fn| try r.function(init_fn);
+        }
+        for (c.static_items) |item| switch (item) {
+            .field => {},
+            .block => |blk_fn| try r.function(blk_fn),
+        };
     }
 
     fn member(r: *Resolver, m: ast.Member) Error!void {
         try r.expr(m.object);
-        if (m.key == .computed) try r.expr(m.key.computed);
+        if (m.is_private) {
+            if (!r.hasPrivateInScope(m.key.name)) {
+                return r.fail(.{ .syntax_error = "Private field must be declared in an enclosing class" }, m.object.span);
+            }
+        } else if (m.key == .computed) try r.expr(m.key.computed);
     }
 
     fn optionalChain(r: *Resolver, oc: ast.OptionalChain) Error!void {
         try r.expr(oc.base);
         for (oc.steps) |s| switch (s.kind) {
             .prop => {},
+            .private_prop => |name| {
+                if (!r.hasPrivateInScope(name)) {
+                    return r.fail(.{ .syntax_error = "Private field must be declared in an enclosing class" }, oc.base.span);
+                }
+            },
             .elem => |e| try r.expr(e),
             .call => |args| for (args) |arg| try r.expr(arg),
         };

@@ -110,6 +110,21 @@ pub const ClosureMeta = struct {
     proto: ?Value = null,
     /// `[[HomeObject]]` for class methods (`C.prototype` or `C` for static methods), used by `super.prop`.
     home_object: ?Value = null,
+    /// Owning class constructor for private member brand checks (M35, D65).
+    brand: ?Value = null,
+    /// Static private fields/methods/accessors on a class constructor (M35, D65).
+    private_props: PrivateMap = .empty,
+    /// Pre-evaluated computed keys for class fields (M35, D65).
+    field_keys: []Value = &.{},
+    /// Instance fields and private instance methods/accessors installed per `new C()` (M35, D65).
+    instance_inits: []InstanceInit = &.{},
+};
+
+pub const InstanceInit = struct {
+    kind: enum(u8) { public_field, private_field, private_method, private_getter, private_setter },
+    name: ?*String = null,
+    key_idx: u32 = 0,
+    func: Value = .undefined,
 };
 
 /// Bound function payload created by `Function.prototype.bind` (M31, D62).
@@ -160,6 +175,13 @@ pub const String = struct {
         index: ?u32,
     } = null,
 };
+
+pub const PrivateKey = struct {
+    brand: *Closure,
+    name: *String,
+};
+
+pub const PrivateMap = std.AutoArrayHashMapUnmanaged(PrivateKey, Property);
 
 /// An own property (data or accessor) with ECMAScript attributes (D64).
 /// Built-in methods are non-enumerable, as in node.
@@ -368,6 +390,8 @@ pub const Object = struct {
     /// Own properties in insertion order, keyed by atom. Index-like keys of ordinary
     /// objects live here too; `ownKeys` puts them first, ascending.
     props: std.AutoArrayHashMapUnmanaged(*String, Property) = .empty,
+    /// Private fields/methods/accessors keyed by `(class_ctor, atom_name)` (M35, D65).
+    private_props: ?*PrivateMap = null,
     kind: union(enum) {
         ordinary,
         /// Dense elements 0 … len-1: no holes, ever (D13).
@@ -701,6 +725,14 @@ pub const Heap = struct {
             if (h.prop_cards.get(o)) |words| {
                 scanDirty(words, o.props.count(), &scan, o, RememberedScan.entries);
             } else scan.entries(o, 0, o.props.count());
+            if (o.private_props) |pp| {
+                for (pp.keys(), pp.values()) |pk, pv| {
+                    scan.child(&pk.brand.obj);
+                    scan.child(&pk.name.obj);
+                    visitValue(pv.value, &scan, RememberedScan.child);
+                    if (pv.is_accessor) visitValue(pv.setter, &scan, RememberedScan.child);
+                }
+            }
             switch (o.kind) {
                 .ordinary => {},
                 .array => |elements| if (h.cards.get(o)) |words| {
@@ -1297,6 +1329,93 @@ pub const Heap = struct {
         h.barrier(&c.obj, old, home);
     }
 
+    pub fn storeClosureBrand(h: *Heap, c: *Closure, brand_val: Value) Error!void {
+        const m = try h.ensureClosureMeta(c);
+        const old = m.brand;
+        m.brand = brand_val;
+        h.barrier(&c.obj, old, brand_val);
+    }
+
+    pub fn appendClosureInstanceInit(h: *Heap, c: *Closure, entry: InstanceInit) Error!void {
+        const m = try h.ensureClosureMeta(c);
+        const old_len = m.instance_inits.len;
+        const new_buf = h.allocator().realloc(m.instance_inits, old_len + 1) catch |e| return h.failed(e);
+        new_buf[old_len] = entry;
+        m.instance_inits = new_buf;
+        if (entry.name) |n| h.barrier(&c.obj, null, .{ .string = n });
+        h.barrier(&c.obj, null, entry.func);
+    }
+
+    pub fn appendClosureFieldKey(h: *Heap, c: *Closure, key_val: Value) Error!void {
+        const m = try h.ensureClosureMeta(c);
+        const old_len = m.field_keys.len;
+        const new_buf = h.allocator().realloc(m.field_keys, old_len + 1) catch |e| return h.failed(e);
+        new_buf[old_len] = key_val;
+        m.field_keys = new_buf;
+        h.barrier(&c.obj, null, key_val);
+    }
+
+    pub fn definePrivateProperty(h: *Heap, target: Value, key: PrivateKey, prop: Property) Error!void {
+        switch (target) {
+            .object => |o| {
+                o.obj.checkLive();
+                const pp = o.private_props orelse blk: {
+                    const box = h.allocator().create(PrivateMap) catch |e| return h.failed(e);
+                    box.* = .empty;
+                    o.private_props = box;
+                    break :blk box;
+                };
+                const gop = pp.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
+                const old_val: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
+                const old_set: ?Value = if (gop.found_existing and gop.value_ptr.is_accessor) gop.value_ptr.setter else null;
+                gop.value_ptr.* = prop;
+                if (!gop.found_existing) {
+                    h.barrier(&o.obj, null, .{ .closure = key.brand });
+                    h.barrier(&o.obj, null, .{ .string = key.name });
+                }
+                h.barrier(&o.obj, old_val, prop.value);
+                if (prop.is_accessor) h.barrier(&o.obj, old_set, prop.setter) else if (old_set) |s| h.barrier(&o.obj, s, null);
+            },
+            .closure => |c| {
+                const mc = @constCast(c);
+                mc.obj.checkLive();
+                const m = try h.ensureClosureMeta(mc);
+                const gop = m.private_props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
+                const old_val: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
+                const old_set: ?Value = if (gop.found_existing and gop.value_ptr.is_accessor) gop.value_ptr.setter else null;
+                gop.value_ptr.* = prop;
+                if (!gop.found_existing) {
+                    h.barrier(&mc.obj, null, .{ .closure = key.brand });
+                    h.barrier(&mc.obj, null, .{ .string = key.name });
+                }
+                h.barrier(&mc.obj, old_val, prop.value);
+                if (prop.is_accessor) h.barrier(&mc.obj, old_set, prop.setter) else if (old_set) |s| h.barrier(&mc.obj, s, null);
+            },
+            else => unreachable,
+        }
+    }
+
+    pub fn updatePrivateProperty(h: *Heap, target: Value, key: PrivateKey, value: Value) void {
+        switch (target) {
+            .object => |o| {
+                o.obj.checkLive();
+                const p = o.private_props.?.getPtr(key).?;
+                const old = p.value;
+                p.value = value;
+                h.barrier(&o.obj, old, value);
+            },
+            .closure => |c| {
+                const mc = @constCast(c);
+                mc.obj.checkLive();
+                const p = mc.meta.?.private_props.getPtr(key).?;
+                const old = p.value;
+                p.value = value;
+                h.barrier(&mc.obj, old, value);
+            },
+            else => unreachable,
+        }
+    }
+
     pub fn storeObjectProto(h: *Heap, o: *Object, proto: ?*Object) void {
         const old: ?Value = if (o.proto) |p| .{ .object = p } else null;
         o.proto = proto;
@@ -1615,6 +1734,9 @@ pub const Heap = struct {
                 const c: *Closure = @fieldParentPtr("obj", obj);
                 if (c.meta) |m| {
                     m.props.deinit(h.allocator());
+                    m.private_props.deinit(h.allocator());
+                    h.allocator().free(m.field_keys);
+                    h.allocator().free(m.instance_inits);
                     h.allocator().destroy(m);
                     c.meta = null;
                 }
@@ -1641,6 +1763,11 @@ pub const Heap = struct {
                 const o: *Object = @fieldParentPtr("obj", obj);
                 o.props.deinit(h.allocator()); // refunds through the counting allocator
                 o.props = .empty;
+                if (o.private_props) |pp| {
+                    pp.deinit(h.allocator());
+                    h.allocator().destroy(pp);
+                    o.private_props = null;
+                }
                 if (h.prop_cards.fetchRemove(o)) |kv| h.allocator().free(kv.value);
                 switch (o.kind) {
                     .ordinary => {},
@@ -1766,10 +1893,22 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                 if (m.lexical_this) |lt| visitValue(lt, ctx, visit);
                 if (m.proto) |pr| visitValue(pr, ctx, visit);
                 if (m.home_object) |ho| visitValue(ho, ctx, visit);
+                if (m.brand) |br| visitValue(br, ctx, visit);
                 for (m.props.keys(), m.props.values()) |k, p| {
                     visit(ctx, &k.obj);
                     visitValue(p.value, ctx, visit);
                     if (p.is_accessor) visitValue(p.setter, ctx, visit);
+                }
+                for (m.private_props.keys(), m.private_props.values()) |pk, pv| {
+                    visit(ctx, &pk.brand.obj);
+                    visit(ctx, &pk.name.obj);
+                    visitValue(pv.value, ctx, visit);
+                    if (pv.is_accessor) visitValue(pv.setter, ctx, visit);
+                }
+                for (m.field_keys) |fk| visitValue(fk, ctx, visit);
+                for (m.instance_inits) |ii| {
+                    if (ii.name) |n| visit(ctx, &n.obj);
+                    visitValue(ii.func, ctx, visit);
                 }
             }
             switch (c.impl) {
@@ -1798,6 +1937,14 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                 visit(ctx, &k.obj);
                 visitValue(p.value, ctx, visit);
                 if (p.is_accessor) visitValue(p.setter, ctx, visit);
+            }
+            if (o.private_props) |pp| {
+                for (pp.keys(), pp.values()) |pk, pv| {
+                    visit(ctx, &pk.brand.obj);
+                    visit(ctx, &pk.name.obj);
+                    visitValue(pv.value, ctx, visit);
+                    if (pv.is_accessor) visitValue(pv.setter, ctx, visit);
+                }
             }
             switch (o.kind) {
                 .ordinary => {},

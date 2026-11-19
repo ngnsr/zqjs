@@ -114,6 +114,7 @@ pub const PropertyKey = union(enum) {
 pub const Member = struct {
     object: *const Expr,
     key: PropertyKey,
+    is_private: bool = false,
 };
 
 /// An optional chain starting at the first `?.` (M24).
@@ -128,6 +129,7 @@ pub const OptionalChain = struct {
 
     pub const Kind = union(enum) {
         prop: []const u8,
+        private_prop: []const u8,
         elem: *const Expr,
         call: []const *const Expr,
     };
@@ -282,15 +284,35 @@ pub const Expr = struct {
         super_member: PropertyKey,
         /// `delete super.prop` / `delete super[expr]` (throws ReferenceError at runtime).
         delete_super,
+        /// `#name in rhs` ergonomic brand check (M35, D65).
+        private_in: struct {
+            name: []const u8,
+            rhs: *const Expr,
+            span: Span,
+        },
     };
 };
 
 pub const ClassMethod = struct {
     key: PropertyKey,
     is_static: bool,
+    is_private: bool = false,
     kind: enum { method, getter, setter } = .method,
     func: *const Function,
     span: Span,
+};
+
+pub const ClassField = struct {
+    key: PropertyKey,
+    is_static: bool,
+    is_private: bool,
+    init: ?*const Function, // zero-param initializer function (is_method=true, has_home_object=true), or null => undefined
+    span: Span,
+};
+
+pub const ClassStaticItem = union(enum) {
+    field: usize, // index into Class.static_fields
+    block: *const Function,
 };
 
 pub const Class = struct {
@@ -301,6 +323,9 @@ pub const Class = struct {
     super_class: ?*const Expr,
     constructor: *const Function,
     methods: []const ClassMethod,
+    instance_fields: []const ClassField = &.{},
+    static_fields: []const ClassField = &.{},
+    static_items: []const ClassStaticItem = &.{},
 };
 
 /// A function parameter (M26: pattern, optional default, optional rest).

@@ -141,16 +141,17 @@ const Task = union(enum) {
     cond_branch: struct { then_expr: *const ast.Expr, else_expr: *const ast.Expr },
     assign_ref_finish: ast.Ref,
     assign_ref_compound: struct { ref: ast.Ref, op: ast.BinaryOp },
-    assign_member_base: struct { op: ast.AssignOp, key: ast.PropertyKey, value: *const ast.Expr },
-    assign_member_after_key: struct { op: ast.AssignOp, value: *const ast.Expr, named: ?[]const u8 },
-    assign_member_plain_finish: ?[]const u8,
+    assign_member_base: struct { op: ast.AssignOp, key: ast.PropertyKey, value: *const ast.Expr, is_private: bool = false },
+    assign_member_after_key: struct { op: ast.AssignOp, value: *const ast.Expr, named: ?[]const u8, is_private: bool = false },
+    assign_member_plain_finish: struct { named: ?[]const u8, is_private: bool = false },
     assign_member_plain_finish_key: object.Key,
-    assign_member_compound_finish: struct { op: ast.BinaryOp, key: object.Key },
+    assign_member_compound_finish: struct { op: ast.BinaryOp, key: object.Key, priv_name: ?[]const u8 = null },
     assign_pattern_keep: *const ast.Pattern,
-    update_member_base: struct { op: UpdateOp, prefix: bool, key: ast.PropertyKey },
-    update_member_finish: struct { op: UpdateOp, prefix: bool, named: ?[]const u8 },
-    member_base: struct { key: ast.PropertyKey, is_delete: bool },
-    member_finish: struct { named: ?[]const u8, is_delete: bool },
+    update_member_base: struct { op: UpdateOp, prefix: bool, key: ast.PropertyKey, is_private: bool = false },
+    update_member_finish: struct { op: UpdateOp, prefix: bool, named: ?[]const u8, is_private: bool = false },
+    member_base: struct { key: ast.PropertyKey, is_delete: bool, is_private: bool = false },
+    member_finish: struct { named: ?[]const u8, is_delete: bool, is_private: bool = false },
+    private_in_finish: []const u8,
     opt_after_base: struct { oc: ast.OptionalChain, is_delete: bool },
     opt_after_member_key: struct { oc: ast.OptionalChain, named: ?[]const u8, is_delete: bool },
     opt_step: struct { oc: ast.OptionalChain, idx: usize, is_delete: bool },
@@ -164,8 +165,8 @@ const Task = union(enum) {
     object_prop_val: struct { key: object.Key, props: []const ast.PropertyDef, idx: usize },
     object_prop_computed_val: struct { value: *const ast.Expr, props: []const ast.PropertyDef, idx: usize },
     object_spread_finish: struct { props: []const ast.PropertyDef, idx: usize },
-    call_member_base: struct { key: ast.PropertyKey, args: []const *const ast.Expr, tagged: ?*const ast.Expr.TaggedTemplate = null },
-    call_member_key: struct { named: ?[]const u8, args: []const *const ast.Expr, tagged: ?*const ast.Expr.TaggedTemplate = null },
+    call_member_base: struct { key: ast.PropertyKey, args: []const *const ast.Expr, tagged: ?*const ast.Expr.TaggedTemplate = null, is_private: bool = false },
+    call_member_key: struct { named: ?[]const u8, args: []const *const ast.Expr, tagged: ?*const ast.Expr.TaggedTemplate = null, is_private: bool = false },
     call_after_callee: struct { args: []const *const ast.Expr, has_receiver: bool, tagged: ?*const ast.Expr.TaggedTemplate = null },
     new_call_after_callee: []const *const ast.Expr,
     eval_args_next: struct { args: []const *const ast.Expr, idx: usize, args_base: usize },
@@ -196,6 +197,11 @@ const Task = union(enum) {
     class_setup: struct { cls: *const ast.Class, is_expr: bool },
     class_method_next: struct { cls: *const ast.Class, idx: usize },
     class_method_finish: struct { cls: *const ast.Class, idx: usize, named: ?[]const u8 },
+    class_inst_field_next: struct { cls: *const ast.Class, idx: usize, key_idx: u32 },
+    class_inst_field_finish: struct { cls: *const ast.Class, idx: usize, key_idx: u32, is_named: bool },
+    class_static_key_next: struct { cls: *const ast.Class, idx: usize },
+    class_static_key_finish: struct { cls: *const ast.Class, idx: usize },
+    class_static_item_next: struct { cls: *const ast.Class, idx: usize, keys_base: usize },
     invoke_super_call: usize,
     super_get_elem,
     super_assign_plain: ?[]const u8,
@@ -208,8 +214,8 @@ const Task = union(enum) {
 
     // ---- Patterns
     bind_pattern: struct { pat: *const ast.Pattern, mode: BindMode },
-    bind_target_member_base: ast.PropertyKey,
-    bind_target_member_finish: ?[]const u8,
+    bind_target_member_base: struct { key: ast.PropertyKey, is_private: bool = false },
+    bind_target_member_finish: struct { named: ?[]const u8, is_private: bool = false },
     bind_array_elem: ArrayPatTask,
     bind_array_elem_pre_member: struct { pat: *const ast.Pattern, idx: u32, mode: BindMode, key: ast.PropertyKey },
     bind_array_elem_pre_member_key: struct { pat: *const ast.Pattern, idx: u32, mode: BindMode, named: ?[]const u8 },
@@ -527,7 +533,10 @@ const Machine = struct {
                             rv
                         else
                             .{ .object = cr.construct_instance.? };
-                        if (cr.is_super_call) m.this = out_v;
+                        if (cr.is_super_call) {
+                            m.this = out_v;
+                            if (m.current_closure) |dc| try builtins.runInstanceInits(m.rt, @constCast(dc), out_v);
+                        }
                         try m.pushVal(out_v);
                         return;
                     }
@@ -1028,7 +1037,7 @@ const Machine = struct {
             },
             .assign_member_base => |am| {
                 switch (am.key) {
-                    .name => |n| try m.pushTask(.{ .assign_member_after_key = .{ .op = am.op, .value = am.value, .named = n } }),
+                    .name => |n| try m.pushTask(.{ .assign_member_after_key = .{ .op = am.op, .value = am.value, .named = n, .is_private = am.is_private } }),
                     .computed => |e| {
                         try m.pushTask(.{ .assign_member_after_key = .{ .op = am.op, .value = am.value, .named = null } });
                         try m.pushEval(e);
@@ -1042,35 +1051,62 @@ const Machine = struct {
                 switch (am.op) {
                     .plain => {
                         if (kv == .value) try m.pushVal(kv.value);
-                        try m.pushTask(.{ .assign_member_plain_finish = am.named });
+                        try m.pushTask(.{ .assign_member_plain_finish = .{ .named = am.named, .is_private = am.is_private } });
                         try m.pushEval(am.value);
                     },
                     .compound => |op| {
-                        const k = try m.toKey(kv);
-                        const old = try object.get(rt, base, k);
-                        try m.pushVal(old);
-                        try m.pushTask(.{ .assign_member_compound_finish = .{ .op = op, .key = k } });
-                        try m.pushEval(am.value);
+                        if (am.is_private) {
+                            const brand = m.current_closure.?.meta.?.brand.?.closure;
+                            const old = try object.getPrivate(rt, base, brand, try rt.heap.internAscii(am.named.?));
+                            try m.pushVal(old);
+                            try m.pushTask(.{ .assign_member_compound_finish = .{ .op = op, .key = undefined, .priv_name = am.named.? } });
+                            try m.pushEval(am.value);
+                        } else {
+                            const k = try m.toKey(kv);
+                            const old = try object.get(rt, base, k);
+                            try m.pushVal(old);
+                            try m.pushTask(.{ .assign_member_compound_finish = .{ .op = op, .key = k } });
+                            try m.pushEval(am.value);
+                        }
                     },
                     .logical_and, .logical_or, .nullish => {
-                        const k = try m.toKey(kv);
-                        const old = try object.get(rt, base, k);
-                        if (!logicalAssignShouldWrite(am.op, old)) {
-                            _ = m.popVal(); // base
-                            m.depth -= 1;
-                            try m.pushVal(old);
+                        if (am.is_private) {
+                            const brand = m.current_closure.?.meta.?.brand.?.closure;
+                            const old = try object.getPrivate(rt, base, brand, try rt.heap.internAscii(am.named.?));
+                            if (!logicalAssignShouldWrite(am.op, old)) {
+                                _ = m.popVal();
+                                m.depth -= 1;
+                                try m.pushVal(old);
+                            } else {
+                                try m.pushTask(.{ .assign_member_plain_finish = .{ .named = am.named, .is_private = true } });
+                                try m.pushEval(am.value);
+                            }
                         } else {
-                            try m.pushTask(.{ .assign_member_plain_finish_key = k });
-                            try m.pushEval(am.value);
+                            const k = try m.toKey(kv);
+                            const old = try object.get(rt, base, k);
+                            if (!logicalAssignShouldWrite(am.op, old)) {
+                                _ = m.popVal(); // base
+                                m.depth -= 1;
+                                try m.pushVal(old);
+                            } else {
+                                try m.pushTask(.{ .assign_member_plain_finish_key = k });
+                                try m.pushEval(am.value);
+                            }
                         }
                     },
                 }
             },
-            .assign_member_plain_finish => |named| {
+            .assign_member_plain_finish => |am| {
                 const v = m.popVal();
-                const kv: KeyValue = if (named) |n| .{ .named = n } else .{ .value = m.popVal() };
-                const base = m.popVal();
-                try object.set(rt, base, try m.toKey(kv), v);
+                if (am.is_private) {
+                    const base = m.popVal();
+                    const brand = m.current_closure.?.meta.?.brand.?.closure;
+                    try object.setPrivate(rt, base, brand, try rt.heap.internAscii(am.named.?), v);
+                } else {
+                    const kv: KeyValue = if (am.named) |n| .{ .named = n } else .{ .value = m.popVal() };
+                    const base = m.popVal();
+                    try object.set(rt, base, try m.toKey(kv), v);
+                }
                 m.depth -= 1;
                 try m.pushVal(v);
             },
@@ -1086,7 +1122,12 @@ const Machine = struct {
                 const old = m.popVal();
                 const base = m.popVal();
                 const v = try ops.binary(rt, ac.op, old, rhs);
-                try object.set(rt, base, ac.key, v);
+                if (ac.priv_name) |pn| {
+                    const brand = m.current_closure.?.meta.?.brand.?.closure;
+                    try object.setPrivate(rt, base, brand, try rt.heap.internAscii(pn), v);
+                } else {
+                    try object.set(rt, base, ac.key, v);
+                }
                 m.depth -= 1;
                 try m.pushVal(v);
             },
@@ -1097,7 +1138,7 @@ const Machine = struct {
             },
             .update_member_base => |um| {
                 switch (um.key) {
-                    .name => |n| try m.pushTask(.{ .update_member_finish = .{ .op = um.op, .prefix = um.prefix, .named = n } }),
+                    .name => |n| try m.pushTask(.{ .update_member_finish = .{ .op = um.op, .prefix = um.prefix, .named = n, .is_private = um.is_private } }),
                     .computed => |e| {
                         try m.pushTask(.{ .update_member_finish = .{ .op = um.op, .prefix = um.prefix, .named = null } });
                         try m.pushTask(.{ .eval = e });
@@ -1108,18 +1149,32 @@ const Machine = struct {
             .update_member_finish => |um| {
                 const kv: KeyValue = if (um.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.popVal();
-                const k = try m.toKey(kv);
-                const old = try ops.toNumber(rt, try object.get(rt, base, k));
-                const new = if (um.op == .inc) old + 1 else old - 1;
-                try object.set(rt, base, k, .{ .number = new });
-                try m.pushVal(.{ .number = if (um.prefix) new else old });
+                if (um.is_private) {
+                    const brand = m.current_closure.?.meta.?.brand.?.closure;
+                    const name_str = try rt.heap.internAscii(um.named.?);
+                    const old = try ops.toNumber(rt, try object.getPrivate(rt, base, brand, name_str));
+                    const new = if (um.op == .inc) old + 1 else old - 1;
+                    try object.setPrivate(rt, base, brand, name_str, .{ .number = new });
+                    try m.pushVal(.{ .number = if (um.prefix) new else old });
+                } else {
+                    const k = try m.toKey(kv);
+                    const old = try ops.toNumber(rt, try object.get(rt, base, k));
+                    const new = if (um.op == .inc) old + 1 else old - 1;
+                    try object.set(rt, base, k, .{ .number = new });
+                    try m.pushVal(.{ .number = if (um.prefix) new else old });
+                }
             },
             .member_base => |mb| {
                 switch (mb.key) {
                     .name => |n| {
                         const base = m.popVal();
-                        const k = try object.named(rt, n);
-                        const res_v: Value = if (mb.is_delete) .{ .boolean = try object.delete(rt, base, k) } else try object.get(rt, base, k);
+                        const res_v: Value = if (mb.is_private) blk: {
+                            const brand = m.current_closure.?.meta.?.brand.?.closure;
+                            break :blk try object.getPrivate(rt, base, brand, try rt.heap.internAscii(n));
+                        } else blk: {
+                            const k = try object.named(rt, n);
+                            break :blk if (mb.is_delete) .{ .boolean = try object.delete(rt, base, k) } else try object.get(rt, base, k);
+                        };
                         m.depth -= 1;
                         try m.pushVal(res_v);
                     },
@@ -1137,6 +1192,13 @@ const Machine = struct {
                 const res_v: Value = if (mf.is_delete) .{ .boolean = try object.delete(rt, base, k) } else try object.get(rt, base, k);
                 m.depth -= 1;
                 try m.pushVal(res_v);
+            },
+            .private_in_finish => |name| {
+                const rhs = m.popVal();
+                const brand = m.current_closure.?.meta.?.brand.?.closure;
+                const b = try object.hasPrivate(rt, rhs, brand, try rt.heap.internAscii(name));
+                m.depth -= 1;
+                try m.pushVal(.{ .boolean = b });
             },
             .opt_after_base => |oa| {
                 const mem = oa.oc.base.data.member;
@@ -1182,6 +1244,14 @@ const Machine = struct {
                             return null;
                         }
                         const next_val = try object.get(rt, val, key);
+                        const vals = m.values.items;
+                        vals[vals.len - 2] = val; // receiver = val
+                        vals[vals.len - 1] = next_val;
+                        try m.pushTask(.{ .opt_step = .{ .oc = os.oc, .idx = os.idx + 1, .is_delete = os.is_delete } });
+                    },
+                    .private_prop => |n| {
+                        const brand = m.current_closure.?.meta.?.brand.?.closure;
+                        const next_val = try object.getPrivate(rt, val, brand, try rt.heap.internAscii(n));
                         const vals = m.values.items;
                         vals[vals.len - 2] = val; // receiver = val
                         vals[vals.len - 1] = next_val;
@@ -1308,7 +1378,7 @@ const Machine = struct {
             },
             .call_member_base => |cm| {
                 switch (cm.key) {
-                    .name => |n| try m.pushTask(.{ .call_member_key = .{ .named = n, .args = cm.args, .tagged = cm.tagged } }),
+                    .name => |n| try m.pushTask(.{ .call_member_key = .{ .named = n, .args = cm.args, .tagged = cm.tagged, .is_private = cm.is_private } }),
                     .computed => |e| {
                         try m.pushTask(.{ .call_member_key = .{ .named = null, .args = cm.args, .tagged = cm.tagged } });
                         try m.pushTask(.{ .eval = e });
@@ -1319,7 +1389,10 @@ const Machine = struct {
             .call_member_key => |cm| {
                 const kv: KeyValue = if (cm.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.values.items[m.values.items.len - 1];
-                const callee = try object.get(rt, base, try m.toKey(kv));
+                const callee = if (cm.is_private) blk: {
+                    const brand = m.current_closure.?.meta.?.brand.?.closure;
+                    break :blk try object.getPrivate(rt, base, brand, try rt.heap.internAscii(cm.named.?));
+                } else try object.get(rt, base, try m.toKey(kv));
                 try m.pushVal(callee);
                 // values: [..., receiver (base), callee]
                 const args_base = m.values.items.len;
@@ -1436,6 +1509,7 @@ const Machine = struct {
                     if (res_v == .object) rt.heap.storeObjectProto(res_v.object, inst.proto);
                     m.values.shrinkRetainingCapacity(args_base);
                     m.this = res_v;
+                    try builtins.runInstanceInits(rt, @constCast(cur_closure), res_v);
                     try m.pushVal(res_v);
                     return null;
                 }
@@ -1496,7 +1570,10 @@ const Machine = struct {
                     }
                     break :blk .{ .object = inst };
                 } else .undefined;
-                if (cr.is_super_call) m.this = out_v;
+                if (cr.is_super_call) {
+                    m.this = out_v;
+                    if (m.current_closure) |dc| try builtins.runInstanceInits(rt, @constCast(dc), out_v);
+                }
                 try m.pushVal(out_v);
             },
             .class_decl_init => |b| {
@@ -1518,7 +1595,7 @@ const Machine = struct {
                 }
                 try m.pushVal(ctor_val);
                 const proto_obj = try builtins.setupClass(rt, ctor_val, cs.cls.super_class != null, super_val);
-                if (cs.cls.methods.len > 0) {
+                if (cs.cls.methods.len > 0 or cs.cls.instance_fields.len > 0 or cs.cls.static_fields.len > 0 or cs.cls.static_items.len > 0) {
                     if (has_inner) try m.pushTask(.{ .scope_exit = saved_env });
                     try m.pushVal(.{ .object = proto_obj });
                     try m.pushTask(.{ .class_method_next = .{ .cls = cs.cls, .idx = 0 } });
@@ -1527,24 +1604,55 @@ const Machine = struct {
                 }
             },
             .class_method_next => |cm| {
-                if (cm.idx >= cm.cls.methods.len) {
-                    _ = m.popVal(); // pop proto_obj, leaving ctor on top
+                var idx = cm.idx;
+                while (idx < cm.cls.methods.len and cm.cls.methods[idx].is_private) : (idx += 1) {}
+                if (idx >= cm.cls.methods.len) {
+                    const proto_val = m.popVal();
+                    const ctor_val = m.values.items[m.values.items.len - 1];
+                    const ctor_c = @constCast(ctor_val.closure);
+                    // Register private instance methods/accessors in instance_inits, and install static private methods on ctor.
+                    for (cm.cls.methods) |meth| {
+                        if (!meth.is_private) continue;
+                        const fn_val = try m.evalFunction(meth.func);
+                        try rt.heap.storeClosureBrand(@constCast(fn_val.closure), ctor_val);
+                        const name_str = try rt.heap.internAscii(meth.key.name);
+                        if (meth.is_static) {
+                            try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), ctor_val);
+                            switch (meth.kind) {
+                                .method => try object.definePrivateMethod(rt, ctor_val, ctor_c, name_str, fn_val),
+                                .getter, .setter => try object.definePrivateAccessor(rt, ctor_val, ctor_c, name_str, fn_val, meth.kind == .setter),
+                            }
+                        } else {
+                            try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), proto_val);
+                            try rt.heap.appendClosureInstanceInit(ctor_c, .{
+                                .kind = switch (meth.kind) {
+                                    .method => .private_method,
+                                    .getter => .private_getter,
+                                    .setter => .private_setter,
+                                },
+                                .name = name_str,
+                                .func = fn_val,
+                            });
+                        }
+                    }
+                    try m.pushVal(proto_val);
+                    try m.pushTask(.{ .class_inst_field_next = .{ .cls = cm.cls, .idx = 0, .key_idx = 0 } });
                     return null;
                 }
-                const meth = cm.cls.methods[cm.idx];
+                const meth = cm.cls.methods[idx];
                 switch (meth.key) {
-                    .name => |n| try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = cm.idx, .named = n } }),
+                    .name => |n| try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = idx, .named = n } }),
                     .string => |units| {
                         const s = try rt.heap.newString(&.{.{ .utf16 = units }});
                         try m.pushVal(.{ .string = s });
-                        try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = cm.idx, .named = null } });
+                        try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = idx, .named = null } });
                     },
                     .number => |num| {
                         try m.pushVal(.{ .number = num });
-                        try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = cm.idx, .named = null } });
+                        try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = idx, .named = null } });
                     },
                     .computed => |k| {
-                        try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = cm.idx, .named = null } });
+                        try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = idx, .named = null } });
                         try m.pushEval(k);
                     },
                 }
@@ -1557,11 +1665,137 @@ const Machine = struct {
                 const ctor_val = m.values.items[m.values.items.len - 2];
                 const target = if (meth.is_static) ctor_val else proto_val;
                 const fn_val = try m.evalFunction(meth.func);
+                try rt.heap.storeClosureBrand(@constCast(fn_val.closure), ctor_val);
                 switch (meth.kind) {
                     .method => try builtins.defineClassMethod(rt, target, k, fn_val),
                     .getter, .setter => try builtins.defineClassAccessor(rt, target, k, fn_val, meth.kind == .setter),
                 }
                 try m.pushTask(.{ .class_method_next = .{ .cls = cm.cls, .idx = cm.idx + 1 } });
+            },
+            .class_inst_field_next => |cf| {
+                if (cf.idx >= cf.cls.instance_fields.len) {
+                    _ = m.popVal(); // pop proto_obj, leaving ctor on top
+                    const keys_base = m.values.items.len;
+                    try m.pushTask(.{ .class_static_item_next = .{ .cls = cf.cls, .idx = 0, .keys_base = keys_base } });
+                    try m.pushTask(.{ .class_static_key_next = .{ .cls = cf.cls, .idx = 0 } });
+                    return null;
+                }
+                const f = cf.cls.instance_fields[cf.idx];
+                if (f.is_private) {
+                    try m.pushTask(.{ .class_inst_field_finish = .{ .cls = cf.cls, .idx = cf.idx, .key_idx = cf.key_idx, .is_named = true } });
+                    return null;
+                }
+                switch (f.key) {
+                    .name => |n| {
+                        const s = try rt.heap.internAscii(n);
+                        try m.pushVal(.{ .string = s });
+                        try m.pushTask(.{ .class_inst_field_finish = .{ .cls = cf.cls, .idx = cf.idx, .key_idx = cf.key_idx, .is_named = false } });
+                    },
+                    .string => |units| {
+                        const s = try rt.heap.newString(&.{.{ .utf16 = units }});
+                        try m.pushVal(.{ .string = s });
+                        try m.pushTask(.{ .class_inst_field_finish = .{ .cls = cf.cls, .idx = cf.idx, .key_idx = cf.key_idx, .is_named = false } });
+                    },
+                    .number => |num| {
+                        try m.pushVal(.{ .number = num });
+                        try m.pushTask(.{ .class_inst_field_finish = .{ .cls = cf.cls, .idx = cf.idx, .key_idx = cf.key_idx, .is_named = false } });
+                    },
+                    .computed => |k| {
+                        try m.pushTask(.{ .class_inst_field_finish = .{ .cls = cf.cls, .idx = cf.idx, .key_idx = cf.key_idx, .is_named = false } });
+                        try m.pushEval(k);
+                    },
+                }
+            },
+            .class_inst_field_finish => |cf| {
+                const f = cf.cls.instance_fields[cf.idx];
+                const key_val: Value = if (cf.is_named) .undefined else m.popVal();
+                const proto_val = m.values.items[m.values.items.len - 1];
+                const ctor_val = m.values.items[m.values.items.len - 2];
+                const ctor_c = @constCast(ctor_val.closure);
+                const init_val: Value = if (f.init) |init_fn| blk: {
+                    const iv = try m.evalFunction(init_fn);
+                    try rt.heap.storeClosureHomeObject(@constCast(iv.closure), proto_val);
+                    try rt.heap.storeClosureBrand(@constCast(iv.closure), ctor_val);
+                    break :blk iv;
+                } else .undefined;
+                var next_key_idx = cf.key_idx;
+                if (f.is_private) {
+                    try rt.heap.appendClosureInstanceInit(ctor_c, .{
+                        .kind = .private_field,
+                        .name = try rt.heap.internAscii(f.key.name),
+                        .func = init_val,
+                    });
+                } else {
+                    try rt.heap.appendClosureFieldKey(ctor_c, key_val);
+                    try rt.heap.appendClosureInstanceInit(ctor_c, .{
+                        .kind = .public_field,
+                        .key_idx = cf.key_idx,
+                        .func = init_val,
+                    });
+                    next_key_idx += 1;
+                }
+                try m.pushTask(.{ .class_inst_field_next = .{ .cls = cf.cls, .idx = cf.idx + 1, .key_idx = next_key_idx } });
+            },
+            .class_static_key_next => |cs| {
+                if (cs.idx >= cs.cls.static_fields.len) return null;
+                const f = cs.cls.static_fields[cs.idx];
+                if (f.is_private) {
+                    try m.pushVal(.undefined);
+                    try m.pushTask(.{ .class_static_key_next = .{ .cls = cs.cls, .idx = cs.idx + 1 } });
+                    return null;
+                }
+                switch (f.key) {
+                    .name => |n| {
+                        try m.pushVal(.{ .string = try rt.heap.internAscii(n) });
+                        try m.pushTask(.{ .class_static_key_next = .{ .cls = cs.cls, .idx = cs.idx + 1 } });
+                    },
+                    .string => |units| {
+                        try m.pushVal(.{ .string = try rt.heap.newString(&.{.{ .utf16 = units }}) });
+                        try m.pushTask(.{ .class_static_key_next = .{ .cls = cs.cls, .idx = cs.idx + 1 } });
+                    },
+                    .number => |num| {
+                        try m.pushVal(.{ .number = num });
+                        try m.pushTask(.{ .class_static_key_next = .{ .cls = cs.cls, .idx = cs.idx + 1 } });
+                    },
+                    .computed => |k| {
+                        try m.pushTask(.{ .class_static_key_finish = .{ .cls = cs.cls, .idx = cs.idx } });
+                        try m.pushEval(k);
+                    },
+                }
+            },
+            .class_static_key_finish => |cs| {
+                try m.pushTask(.{ .class_static_key_next = .{ .cls = cs.cls, .idx = cs.idx + 1 } });
+            },
+            .class_static_item_next => |cs| {
+                if (cs.idx >= cs.cls.static_items.len) {
+                    m.values.shrinkRetainingCapacity(cs.keys_base); // leave ctor on top
+                    return null;
+                }
+                const ctor_val = m.values.items[cs.keys_base - 1];
+                switch (cs.cls.static_items[cs.idx]) {
+                    .field => |fidx| {
+                        const f = cs.cls.static_fields[fidx];
+                        const val: Value = if (f.init) |init_fn| blk: {
+                            const iv = try m.evalFunction(init_fn);
+                            try rt.heap.storeClosureHomeObject(@constCast(iv.closure), ctor_val);
+                            try rt.heap.storeClosureBrand(@constCast(iv.closure), ctor_val);
+                            break :blk try rt.callCallable(iv, ctor_val, &.{});
+                        } else .undefined;
+                        if (f.is_private) {
+                            try object.definePrivateField(rt, ctor_val, ctor_val.closure, try rt.heap.internAscii(f.key.name), val);
+                        } else {
+                            const key_val = m.values.items[cs.keys_base + fidx];
+                            try object.definePublicField(rt, ctor_val, try object.key(rt, key_val), val);
+                        }
+                    },
+                    .block => |blk_fn| {
+                        const bv = try m.evalFunction(blk_fn);
+                        try rt.heap.storeClosureHomeObject(@constCast(bv.closure), ctor_val);
+                        try rt.heap.storeClosureBrand(@constCast(bv.closure), ctor_val);
+                        _ = try rt.callCallable(bv, ctor_val, &.{});
+                    },
+                }
+                try m.pushTask(.{ .class_static_item_next = .{ .cls = cs.cls, .idx = cs.idx + 1, .keys_base = cs.keys_base } });
             },
             .super_get_elem => {
                 const this_val = try m.requireThis();
@@ -1657,23 +1891,28 @@ const Machine = struct {
                 const val = m.popVal();
                 try m.stepBindPattern(bp.pat, val, bp.mode);
             },
-            .bind_target_member_base => |mem_key| {
+            .bind_target_member_base => |mb| {
                 // values: [..., val, base]
-                switch (mem_key) {
-                    .name => |n| try m.pushTask(.{ .bind_target_member_finish = n }),
+                switch (mb.key) {
+                    .name => |n| try m.pushTask(.{ .bind_target_member_finish = .{ .named = n, .is_private = mb.is_private } }),
                     .computed => |e| {
-                        try m.pushTask(.{ .bind_target_member_finish = null });
+                        try m.pushTask(.{ .bind_target_member_finish = .{ .named = null } });
                         try m.pushTask(.{ .eval = e });
                     },
                     .string, .number => unreachable,
                 }
             },
-            .bind_target_member_finish => |named| {
-                const kv: KeyValue = if (named) |n| .{ .named = n } else .{ .value = m.popVal() };
+            .bind_target_member_finish => |bf| {
+                const kv: KeyValue = if (bf.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.popVal();
                 const val = m.popVal();
-                const k = try m.toKey(kv);
-                try object.set(rt, base, k, val);
+                if (bf.is_private) {
+                    const brand = m.current_closure.?.meta.?.brand.?.closure;
+                    try object.setPrivate(rt, base, brand, try rt.heap.internAscii(bf.named.?), val);
+                } else {
+                    const k = try m.toKey(kv);
+                    try object.set(rt, base, k, val);
+                }
             },
             .bind_array_elem => |ba| {
                 // values: [..., iter]
@@ -1763,21 +2002,31 @@ const Machine = struct {
                 };
                 const kv: KeyValue = if (ba.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.popVal();
-                try object.set(rt, base, try m.toKey(kv), v);
+                if (el.pattern.data.target.member.is_private) {
+                    const brand = m.current_closure.?.meta.?.brand.?.closure;
+                    try object.setPrivate(rt, base, brand, try rt.heap.internAscii(ba.named.?), v);
+                } else {
+                    try object.set(rt, base, try m.toKey(kv), v);
+                }
                 try m.pushTask(.{ .bind_array_elem = .{ .pat = ba.pat, .idx = ba.idx + 1, .mode = ba.mode } });
             },
             .bind_array_elem_after_default => |ba| {
                 const v = m.popVal();
                 const el = ba.pat.data.array.elems[ba.idx].?;
                 if (ba.has_mv) {
-                    const mem_key = el.pattern.data.target.member.key;
-                    const kv: KeyValue = switch (mem_key) {
+                    const mem = el.pattern.data.target.member;
+                    const kv: KeyValue = switch (mem.key) {
                         .name => |n| .{ .named = n },
                         .computed => .{ .value = m.popVal() },
                         .string, .number => unreachable,
                     };
                     const base = m.popVal();
-                    try object.set(rt, base, try m.toKey(kv), v);
+                    if (mem.is_private) {
+                        const brand = m.current_closure.?.meta.?.brand.?.closure;
+                        try object.setPrivate(rt, base, brand, try rt.heap.internAscii(mem.key.name), v);
+                    } else {
+                        try object.set(rt, base, try m.toKey(kv), v);
+                    }
                     try m.pushTask(.{ .bind_array_elem = .{ .pat = ba.pat, .idx = ba.idx + 1, .mode = ba.mode } });
                 } else {
                     try m.pushTask(.{ .bind_array_elem = .{ .pat = ba.pat, .idx = ba.idx + 1, .mode = ba.mode } });
@@ -2254,7 +2503,7 @@ const Machine = struct {
                     },
                 },
                 .member => |mem| {
-                    try m.pushTask(.{ .assign_member_base = .{ .op = a.op, .key = mem.key, .value = a.value } });
+                    try m.pushTask(.{ .assign_member_base = .{ .op = a.op, .key = mem.key, .value = a.value, .is_private = mem.is_private } });
                     try m.pushEval(mem.object);
                 },
                 .super_member => |k| {
@@ -2299,7 +2548,7 @@ const Machine = struct {
                 },
                 .member => |mem| {
                     try m.pushTask(.depth_pop);
-                    try m.pushTask(.{ .update_member_base = .{ .op = u.op, .prefix = u.prefix, .key = mem.key } });
+                    try m.pushTask(.{ .update_member_base = .{ .op = u.op, .prefix = u.prefix, .key = mem.key, .is_private = mem.is_private } });
                     try m.pushTask(.{ .eval = mem.object });
                 },
                 .super_member => |k| {
@@ -2315,8 +2564,12 @@ const Machine = struct {
                 },
             },
             .member => |mem| {
-                try m.pushTask(.{ .member_base = .{ .key = mem.key, .is_delete = false } });
+                try m.pushTask(.{ .member_base = .{ .key = mem.key, .is_delete = false, .is_private = mem.is_private } });
                 try m.pushEval(mem.object);
+            },
+            .private_in => |pi| {
+                try m.pushTask(.{ .private_in_finish = pi.name });
+                try m.pushEval(pi.rhs);
             },
             .delete => |mem| {
                 try m.pushTask(.{ .member_base = .{ .key = mem.key, .is_delete = true } });
@@ -2348,7 +2601,7 @@ const Machine = struct {
                 try m.pushTask(.depth_pop);
                 if (c.callee.data == .member) {
                     const mem = c.callee.data.member;
-                    try m.pushTask(.{ .call_member_base = .{ .key = mem.key, .args = c.args } });
+                    try m.pushTask(.{ .call_member_base = .{ .key = mem.key, .args = c.args, .is_private = mem.is_private } });
                     try m.pushEval(mem.object);
                 } else if (c.callee.data == .super_member) {
                     const this_val = try m.requireThis();
@@ -2370,7 +2623,7 @@ const Machine = struct {
                 try m.pushTask(.depth_pop);
                 if (tt.callee.data == .member) {
                     const mem = tt.callee.data.member;
-                    try m.pushTask(.{ .call_member_base = .{ .key = mem.key, .args = tt.exprs, .tagged = tt } });
+                    try m.pushTask(.{ .call_member_base = .{ .key = mem.key, .args = tt.exprs, .tagged = tt, .is_private = mem.is_private } });
                     try m.pushEval(mem.object);
                 } else if (tt.callee.data == .super_member) {
                     const this_val = try m.requireThis();
@@ -2433,6 +2686,11 @@ const Machine = struct {
                 if (pc.meta) |pm| {
                     if (pm.home_object) |ho| try rt.heap.storeClosureHomeObject(c, ho);
                 }
+            }
+        }
+        if (m.current_closure) |pc| {
+            if (pc.meta) |pm| {
+                if (pm.brand) |br| try rt.heap.storeClosureBrand(c, br);
             }
         }
         return .{ .closure = c };
@@ -2535,6 +2793,9 @@ const Machine = struct {
             try m.pushTask(.{ .call_bind_param = .{ .func = f, .idx = 0, .args_base = @intCast(args_base), .argc = argc } });
         } else {
             try m.pushTask(.{ .call_enter_body = .{ .func = f, .args_base = @intCast(args_base) } });
+        }
+        if (construct_instance != null and !f.has_super_ctor) {
+            try builtins.runInstanceInits(m.rt, @constCast(closure), .{ .object = construct_instance.? });
         }
     }
 
@@ -2721,7 +2982,7 @@ const Machine = struct {
                 },
                 .member => |mem| {
                     try m.pushVal(val);
-                    try m.pushTask(.{ .bind_target_member_base = mem.key });
+                    try m.pushTask(.{ .bind_target_member_base = .{ .key = mem.key, .is_private = mem.is_private } });
                     try m.pushEval(mem.object);
                 },
                 .super_member => |k| {

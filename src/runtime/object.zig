@@ -451,6 +451,97 @@ pub fn defineAccessor(rt: *Runtime, target: Value, k: Key, fn_val: Value, is_set
     }
 }
 
+pub fn definePublicField(rt: *Runtime, target: Value, k: Key, v: Value) Error!void {
+    const a = try atomOf(rt, k);
+    const prop: Property = .{ .value = v, .enumerable = true, .writable = true, .configurable = true };
+    switch (target) {
+        .object => |o| try rt.heap.defineProperty(o, a, prop),
+        .closure => |c| try rt.heap.defineClosureProperty(@constCast(c), a, prop),
+        else => unreachable,
+    }
+}
+
+fn privateLookup(target: Value, pk: heap_mod.PrivateKey) ?Property {
+    return switch (target) {
+        .object => |o| if (o.private_props) |pp| pp.get(pk) else null,
+        .closure => |c| if (c.meta) |m| m.private_props.get(pk) else null,
+        else => null,
+    };
+}
+
+pub fn definePrivateField(rt: *Runtime, target: Value, brand: *const heap_mod.Closure, name_str: *String, v: Value) Error!void {
+    const pk: heap_mod.PrivateKey = .{ .brand = @constCast(brand), .name = name_str };
+    if (privateLookup(target, pk) != null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot initialize private member twice on the same object" }});
+    }
+    try rt.heap.definePrivateProperty(target, pk, .{ .value = v, .enumerable = false, .writable = true, .configurable = false });
+}
+
+pub fn definePrivateMethod(rt: *Runtime, target: Value, brand: *const heap_mod.Closure, name_str: *String, fn_val: Value) Error!void {
+    const pk: heap_mod.PrivateKey = .{ .brand = @constCast(brand), .name = name_str };
+    if (privateLookup(target, pk) != null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot initialize private member twice on the same object" }});
+    }
+    try rt.heap.definePrivateProperty(target, pk, .{ .value = fn_val, .enumerable = false, .writable = false, .configurable = false });
+}
+
+pub fn definePrivateAccessor(rt: *Runtime, target: Value, brand: *const heap_mod.Closure, name_str: *String, fn_val: Value, is_setter: bool) Error!void {
+    const pk: heap_mod.PrivateKey = .{ .brand = @constCast(brand), .name = name_str };
+    const existing = privateLookup(target, pk);
+    const keep_other = existing != null and existing.?.is_accessor;
+    const prop: Property = .{
+        .is_accessor = true,
+        .value = if (is_setter) (if (keep_other) existing.?.value else .undefined) else fn_val,
+        .setter = if (is_setter) fn_val else (if (keep_other) existing.?.setter else .undefined),
+        .enumerable = false,
+        .configurable = false,
+        .writable = false,
+    };
+    try rt.heap.definePrivateProperty(target, pk, prop);
+}
+
+pub fn getPrivate(rt: *Runtime, base: Value, brand: *const heap_mod.Closure, name_str: *String) Error!Value {
+    heap_mod.checkValue(base);
+    if (base == .undefined or base == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot read private member from undefined or null" }});
+    }
+    const pk: heap_mod.PrivateKey = .{ .brand = @constCast(brand), .name = name_str };
+    const p = privateLookup(base, pk) orelse {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot read private member from an object whose class did not declare it" }});
+    };
+    return resolvePropValue(rt, base, p);
+}
+
+pub fn setPrivate(rt: *Runtime, base: Value, brand: *const heap_mod.Closure, name_str: *String, v: Value) Error!void {
+    heap_mod.checkValue(base);
+    if (base == .undefined or base == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot write private member to undefined or null" }});
+    }
+    const pk: heap_mod.PrivateKey = .{ .brand = @constCast(brand), .name = name_str };
+    const p = privateLookup(base, pk) orelse {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot write private member to an object whose class did not declare it" }});
+    };
+    if (p.is_accessor) {
+        if (p.setter == .undefined) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Private property has only a getter" }});
+        }
+        _ = try rt.callCallable(p.setter, base, &.{v});
+        return;
+    }
+    if (!p.writable) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Private method is not writable" }});
+    }
+    rt.heap.updatePrivateProperty(base, pk, v);
+}
+
+pub fn hasPrivate(rt: *Runtime, base: Value, brand: *const heap_mod.Closure, name_str: *String) Error!bool {
+    heap_mod.checkValue(base);
+    if (base != .object and base != .closure and base != .native) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot use 'in' operator to search for private member in a non-object" }});
+    }
+    return privateLookup(base, .{ .brand = @constCast(brand), .name = name_str }) != null;
+}
+
 fn putOwn(rt: *Runtime, o: *Object, k: Key, v: Value) Error!void {
     try rt.heap.storeProperty(o, try atomOf(rt, k), v);
 }

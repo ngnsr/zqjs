@@ -38,6 +38,11 @@ pub const Lexer = struct {
             while (isIdentPart(l.peekAt(l.pos))) l.pos += 1;
             return l.make(keyword(l.source[start..l.pos]), start, newline_before);
         }
+        if (c == '#' and isIdentStart(l.peekAt(start + 1))) {
+            l.pos += 1;
+            while (isIdentPart(l.peekAt(l.pos))) l.pos += 1;
+            return l.make(.private_ident, start, newline_before);
+        }
         if (c == '\'' or c == '"') {
             try l.string(c);
             return l.make(.string, start, newline_before);

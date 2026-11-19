@@ -563,7 +563,40 @@ pub fn setupClass(rt: *Runtime, ctor_val: Value, has_super: bool, super_val: Val
     try rt.heap.defineProperty(proto_obj, ctor_key, .{ .value = ctor_val, .enumerable = false });
     try rt.heap.storeClosurePrototype(ctor, .{ .object = proto_obj });
     try rt.heap.storeClosureHomeObject(ctor, .{ .object = proto_obj });
+    try rt.heap.storeClosureBrand(ctor, ctor_val);
     return proto_obj;
+}
+
+pub fn runInstanceInits(rt: *Runtime, ctor: *heap_mod.Closure, this_val: Value) Error!void {
+    const m = ctor.meta orelse return;
+    if (m.instance_inits.len == 0) return;
+    var root_buf = [_]Value{ .{ .closure = ctor }, this_val, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    for (0..m.instance_inits.len) |i| {
+        const entry = ctor.meta.?.instance_inits[i];
+        switch (entry.kind) {
+            .private_method => try object.definePrivateMethod(rt, this_val, ctor, entry.name.?, entry.func),
+            .private_getter => try object.definePrivateAccessor(rt, this_val, ctor, entry.name.?, entry.func, false),
+            .private_setter => try object.definePrivateAccessor(rt, this_val, ctor, entry.name.?, entry.func, true),
+            .public_field => {
+                const key_val = ctor.meta.?.field_keys[entry.key_idx];
+                const val: Value = if (entry.func == .undefined) .undefined else try rt.callCallable(entry.func, this_val, &.{});
+                root_buf[2] = val;
+                const k = try object.key(rt, key_val);
+                try object.definePublicField(rt, this_val, k, val);
+                root_buf[2] = .undefined;
+            },
+            .private_field => {
+                const val: Value = if (entry.func == .undefined) .undefined else try rt.callCallable(entry.func, this_val, &.{});
+                root_buf[2] = val;
+                try object.definePrivateField(rt, this_val, ctor, entry.name.?, val);
+                root_buf[2] = .undefined;
+            },
+        }
+    }
 }
 
 pub fn defineClassMethod(rt: *Runtime, target: Value, k: object.Key, method_val: Value) Error!void {

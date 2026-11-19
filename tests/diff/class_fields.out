@@ -1,0 +1,12 @@
+in ctor: 10 undefined 15 1 2 3 99
+keys: x,y,comp,static,get,set
+after super: base:Sub 123
+box read: 10,,15,20
+box mutate: 42 77
+brand check: true false undefined 42
+prim in: TypeError
+wrong brand: TypeError
+same brand: 1 2
+diff brand: TypeError
+static: 1 21 81 82
+closure field: 12

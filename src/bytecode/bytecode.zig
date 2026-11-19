@@ -125,6 +125,28 @@ pub const Op = enum(u8) {
     define_accessor,
     /// [obj, key, fn_closure] → [obj]: same with a computed/non-identifier key.
     define_elem_accessor,
+    /// [target, fn_closure] → [target]: defines private method on target under current brand.
+    define_private_method,
+    /// [target, fn_closure] → [target]: defines private accessor (argc bit0=is_setter) on target under current brand.
+    define_private_accessor,
+    /// [target, key, val] → [target]: DefineOwnProperty(target, key, val) for public class fields.
+    define_public_field,
+    /// [target, val] → [target]: defines private field on target under current brand.
+    define_private_field,
+    /// [obj] → [val]: reads private member `#name` using current closure's brand.
+    get_private,
+    /// [obj, val] → [val]: writes private member `#name` using current closure's brand.
+    set_private,
+    /// [obj] → [bool]: `#name in obj` using current closure's brand.
+    in_private,
+    /// [ctor, key] → [ctor]: appends pre-evaluated computed field key to ctor.meta.field_keys.
+    store_field_key,
+    /// [ctor, fn_or_undef] → [ctor]: appends an InstanceInit entry (operands: name, packed kind+key_idx).
+    add_instance_init,
+    /// [ctor, static_fn] → [val]: invokes static_fn with this = ctor, home_object = ctor, brand = ctor.
+    run_static_init,
+    /// [ctor, fn_closure] → [fn_closure]: sets fn_closure.meta.brand = ctor.
+    set_brand,
     /// [arg0 … arg(argc-1)] → [this]: `super(...args)` in derived constructor.
     super_call,
     /// [args_arr] → [this]: `super(...args)` with spread.
@@ -303,6 +325,17 @@ pub const Op = enum(u8) {
             .define_elem_method => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
             .define_accessor => .{ .operands = &.{ .name, .argc }, .pops = 2, .pushes = 1 },
             .define_elem_accessor => .{ .operands = &.{.argc}, .pops = 3, .pushes = 1 },
+            .define_private_method => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
+            .define_private_accessor => .{ .operands = &.{ .name, .argc }, .pops = 2, .pushes = 1 },
+            .define_public_field => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
+            .define_private_field => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
+            .get_private => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
+            .set_private => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
+            .in_private => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
+            .store_field_key => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
+            .add_instance_init => .{ .operands = &.{ .name, .argc }, .pops = 2, .pushes = 1 },
+            .run_static_init => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
+            .set_brand => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .super_call => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
             .super_call_spread => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .super_get_prop => .{ .operands = &.{.name}, .pops = 0, .pushes = 1 },

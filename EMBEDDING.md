@@ -282,3 +282,9 @@ zqjs_handle_release(rt, state);
   - **Prerequisites:** Raylib installed (auto-detected at `/opt/homebrew/opt/raylib` on macOS, via `pkg-config` elsewhere, or with `-Draylib-prefix=<path>`). Default `zig build` and `zig build test` do not require Raylib.
   - **Headless smoke test:** `zig build raylib-smoke` (runs `--frames 60 --verify-errors` without opening a GUI window).
   - **Interactive GUI:** `zig build raylib-demo` (opens the 800x480 Raylib window).
+
+### 12. ES Modules & Host Module Loader (`setModuleLoader`, `runModule`, C ABI 1.3.0, D72)
+- Register a host `ModuleLoader` via `rt.setModuleLoader(loader)` (or `zqjs_set_module_loader(rt, loader, ctx)` in C). The callback receives `(ctx, referrer_id, specifier)` and returns `{ canonical_id, source }` (or `error.ModuleNotFound` / `error.HostError`). The engine copies both strings immediately and invokes the optional `free` callback if provided.
+- `rt.runModule(specifier, source, &diag, &failure)` (or `zqjs_eval_module` in C) loads, links, and evaluates the module graph on the VM, returning an owned `Handle` to the entry module's namespace object (`getProperty(ns, "exportedFn", ...)` + `rt.call(...)` to invoke exported JS functions directly).
+- `rt.getModuleNamespace(specifier, &failure)` retrieves the namespace `Handle` for any already-loaded module in the runtime.
+- Loaded modules and their exported closures/classes/cells remain GC-rooted by the `Runtime` until `Runtime.destroy()`.

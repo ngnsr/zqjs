@@ -39,6 +39,7 @@ pub const Error = error{ LimitExceeded, OutOfMemory };
 pub const CompileOptions = struct {
     repl: bool = false,
     top_level_await: bool = false,
+    is_module: bool = false,
 };
 
 /// Compiles a resolved script. String constants are allocated on `heap` (see Proto for
@@ -314,6 +315,7 @@ const Compiler = struct {
             .handlers = handlers,
             .templates = templates,
             .repl_count = @intCast(c.s.res.repl_bindings.len),
+            .is_module = if (f == null) c.s.options.is_module else false,
         };
     }
 
@@ -440,6 +442,7 @@ const Compiler = struct {
 
     fn statementsImpl(c: *Compiler, stmts: []const ast.Stmt, span: ast.Span, repl_top: bool) Error!bool {
         c.span = span;
+        const is_module_top = c.function == 0 and c.s.options.is_module;
         for (stmts) |s| switch (s.data) {
             .declaration => |decl| for (decl.declarators) |d| try c.enterPatternBindings(d.pattern),
             .function => |f| {
@@ -449,10 +452,25 @@ const Compiler = struct {
             .class => |cls| try c.enterBinding(cls.name.?.binding),
             else => {},
         };
-        for (stmts) |s| if (s.data == .function) {
-            const f = s.data.function;
-            try c.closure(f);
-            try c.initBinding(f.name.?.binding);
+        for (stmts) |s| switch (s.data) {
+            .function => |f| {
+                if (is_module_top) {
+                    _ = try c.compileTopFunction(f);
+                } else {
+                    try c.closure(f);
+                    try c.initBinding(f.name.?.binding);
+                }
+            },
+            .export_decl => |exp| switch (exp) {
+                .function => |f| {
+                    _ = try c.compileTopFunction(f);
+                },
+                .default_function => |df| {
+                    _ = try c.compileTopFunction(df.func);
+                },
+                else => {},
+            },
+            else => {},
         };
         for (stmts, 0..) |s, idx| {
             if (repl_top and idx + 1 == stmts.len and s.data == .expression) {
@@ -507,8 +525,9 @@ const Compiler = struct {
         }
     }
 
-    /// `make_closure` for a nested function, compiling it first.
-    fn closure(c: *Compiler, f: *const ast.Function) Error!void {
+    /// Compiles a nested function and appends its Proto without emitting `make_closure`
+    /// (used for module top-level functions hoisted at Link time, D72).
+    fn compileTopFunction(c: *Compiler, f: *const ast.Function) Error!u32 {
         const outer_span = c.span;
         var child = try c.s.proto(.function, f, f.body);
         {
@@ -516,7 +535,13 @@ const Compiler = struct {
             try c.functions.append(c.s.gpa, child);
         }
         c.span = outer_span;
-        try c.emit(.make_closure, &.{@intCast(c.functions.items.len - 1)});
+        return @intCast(c.functions.items.len - 1);
+    }
+
+    /// `make_closure` for a nested function, compiling it first.
+    fn closure(c: *Compiler, f: *const ast.Function) Error!void {
+        const idx = try c.compileTopFunction(f);
+        try c.emit(.make_closure, &.{idx});
     }
 
     /// Returns whether control can reach the end of the statement.
@@ -754,6 +779,33 @@ const Compiler = struct {
                 for (loop.breaks.items) |j| c.patch(j, c.here());
                 try c.emit(.clear_local, &.{iter_slot});
                 return true;
+            },
+            .import_decl => return true,
+            .export_decl => |exp| switch (exp) {
+                .declaration => |decl| {
+                    try c.declare(decl);
+                    return true;
+                },
+                .class => |cls| {
+                    try c.compileClass(cls, false);
+                    try c.initBinding(cls.name.?.binding);
+                    return true;
+                },
+                .default_expr => |de| {
+                    try c.expr(de.expr);
+                    try c.initBinding(de.binding);
+                    return true;
+                },
+                .default_class => |dc| {
+                    try c.compileClass(dc.cls, false);
+                    if (dc.cls.name) |n| {
+                        try c.emit(.dup, &.{});
+                        try c.initBinding(n.binding);
+                    }
+                    try c.initBinding(dc.binding);
+                    return true;
+                },
+                .function, .default_function, .named, .reexport_named, .reexport_all => return true,
             },
             .labeled => |l| {
                 var target: LabelTarget = .{ .name = l.label };

@@ -2224,3 +2224,48 @@ test "M39: for...in iterator holding keys and target survives forced GC on both 
         try testing.expectEqualStrings("a=10,b=20,p1=1,p2=2\n", got);
     }
 }
+
+test "M42: exported closures, classes, and namespace objects survive forced GC across modules on both engines" {
+    const Lib = struct {
+        fn load(_: ?*anyopaque, _: ?[]const u8, specifier: []const u8) zqjs.module.LoadError!zqjs.module.LoadedModule {
+            if (std.mem.eql(u8, specifier, "./dep.js")) {
+                return .{
+                    .canonical_id = "dep.js",
+                    .source =
+                    \\let secret = { tag: "alive" };
+                    \\export function makeReader() {
+                    \\    return function() { return secret.tag; };
+                    \\}
+                    \\export class Counter {
+                    \\    constructor(n) { this.n = n; }
+                    \\    inc() { this.n += 1; return this.n; }
+                    \\}
+                    ,
+                };
+            }
+            return error.ModuleNotFound;
+        }
+    };
+    const main_src =
+        \\import * as ns from './dep.js';
+        \\import { makeReader, Counter } from './dep.js';
+        \\const r = makeReader();
+        \\const c = new Counter(10);
+        \\for (let i = 0; i < 150; i++) {
+        \\    let junk = { i: i, arr: [i, i + 1] };
+        \\}
+        \\print(r(), c.inc(), ns.Counter.name);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var out_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out_buf.deinit();
+        var rt = zqjs.Runtime.init(testing.allocator, .{}, &out_buf.writer);
+        defer rt.deinit();
+        rt.stack_base = @frameAddress();
+        rt.heap.collect_always = true;
+        rt.modules.loader = .{ .ctx = null, .load = Lib.load };
+        var diag: zqjs.module.ModuleDiag = .{};
+        _ = try zqjs.module.runEntry(&rt, "main.js", main_src, engine, &diag);
+        try testing.expectEqualStrings("alive 11 Counter\n", out_buf.written());
+    }
+}

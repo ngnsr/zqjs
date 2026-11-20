@@ -47,6 +47,10 @@ pub const Status = enum { finished, suspended };
 pub const CompileError = error{ Source, Busy, OutOfMemory, Internal };
 pub const StartError = error{ Busy, LimitExceeded, OutOfMemory, Internal };
 pub const RunError = error{ Thrown, HostError, LimitExceeded, Unsupported, OutOfMemory, OutputFailed, Internal };
+pub const ModuleLoadError = internal.module.LoadError;
+pub const LoadedModule = internal.module.LoadedModule;
+pub const ModuleLoader = internal.module.ModuleLoader;
+pub const ModuleError = error{ Source, ModuleNotFound, Busy } || RunError;
 
 /// A host native (M9.1, D53): runs with the guard held at depth ≥ 1 and may call back
 /// into JS through the sanctioned API (D52).
@@ -287,6 +291,71 @@ pub const Runtime = opaque {
         const ex = try r.startImpl(p);
         defer ex.free();
         _ = try ex.resumeImpl(std.math.maxInt(u64), failure);
+    }
+
+    /// Registers (or clears) the host ES Module loader callback (M42, D72).
+    pub fn setModuleLoader(rt: *Runtime, loader: ?ModuleLoader) error{Busy}!void {
+        const r = rt.impl();
+        const guard = try Guard.enterTopLevel(r);
+        defer guard.exit();
+        r.rt.modules.loader = loader;
+    }
+
+    /// Loads, links, and executes an ES Module graph on the VM, returning an owned
+    /// `Handle` to the entry module's namespace object (M42, D72).
+    pub fn runModule(rt: *Runtime, specifier: []const u8, source: []const u8, diag: ?*Diagnostic, failure: ?*Failure) ModuleError!Handle {
+        const r = rt.impl();
+        const guard = try Guard.enterTopLevel(r);
+        defer guard.exit();
+        if (r.rt.poisoned) {
+            if (failure) |out| out.* = internalFailure();
+            return error.Internal;
+        }
+        prepareRun(&r.rt);
+        r.rt.steps = 0;
+        r.rt.max_steps = r.rt.limits.max_steps;
+        r.rt.stack_base = @frameAddress();
+
+        var mod_diag: internal.module.ModuleDiag = .{};
+        const ns_obj = internal.module.runEntry(&r.rt, specifier, source, .vm, &mod_diag) catch |e| switch (e) {
+            error.SyntaxError, error.Unsupported => {
+                return sourceError(e, mod_diag.diag, mod_diag.source, diag);
+            },
+            error.ModuleNotFound => {
+                if (failure) |out| {
+                    out.* = .{ .kind = .host };
+                    var w = TextWriter.init(&out.text, &out.text_len, &out.truncated);
+                    w.utf8("ModuleNotFound: ");
+                    w.utf8(mod_diag.name);
+                }
+                return error.ModuleNotFound;
+            },
+            error.InvalidBytecode => {
+                return failRun(&r.rt, r.rt.bug("invalid module bytecode"), failure);
+            },
+            error.LimitExceeded => {
+                if (mod_diag.diag.detail == .limit_exceeded) {
+                    _ = sourceError(e, mod_diag.diag, mod_diag.source, diag) catch {};
+                }
+                return failRun(&r.rt, error.LimitExceeded, failure);
+            },
+            error.Thrown, error.HostError, error.OutOfMemory, error.WriteFailed, error.Internal => |re| return failRun(&r.rt, re, failure),
+        };
+        return mintHandle(r, .{ .object = ns_obj }, failure);
+    }
+
+    /// Returns an owned `Handle` to the namespace object of an already-loaded module.
+    pub fn getModuleNamespace(rt: *Runtime, specifier: []const u8, failure: ?*Failure) (error{ModuleNotFound} || RunError)!Handle {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) {
+            if (failure) |out| out.* = internalFailure();
+            return error.Internal;
+        }
+        const mod = r.rt.modules.map.get(specifier) orelse return error.ModuleNotFound;
+        const ns_obj = internal.module.getNamespace(&r.rt, mod) catch |e| return failRun(&r.rt, e, failure);
+        return mintHandle(r, .{ .object = ns_obj }, failure);
     }
 
     /// A major collection, now (between calls or inside a native callback: no script is

@@ -22,6 +22,7 @@ const Diagnostic = @import("frontend/diag.zig").Diagnostic;
 const parse = @import("frontend/parser.zig").parse;
 const resolve = @import("frontend/resolver.zig").resolve;
 const Runtime = @import("runtime/runtime.zig").Runtime;
+const module = @import("runtime/module.zig");
 const ops = @import("runtime/ops.zig");
 const treewalk = @import("interp/machine.zig");
 const compile = @import("bytecode/compiler.zig").compile;
@@ -159,4 +160,82 @@ fn frontendFailure(e: anyerror, diag: Diagnostic, source: []const u8, name: []co
     if (e == error.OutOfMemory) return error.OutOfMemory;
     try diag.render(source, name, report);
     return 1;
+}
+
+/// Loads, links, and executes an ES Module graph from `name` (with optional `io` for
+/// filesystem imports), returning the process exit code.
+pub fn runModule(gpa: Allocator, name: []const u8, source: []const u8, io: std.Io, limits: Limits, options: Options, out: *Writer, err: *Writer) Error!u8 {
+    const mode = options.mode;
+    const report = if (mode == .harness) out else err;
+
+    var rt = Runtime.init(gpa, limits, out);
+    defer rt.deinit();
+    rt.stack_base = @frameAddress();
+    rt.heap.collect_always = options.collect_always or rt.heap.collect_always;
+    rt.heap.verify_always = options.verify_heap or rt.heap.verify_always;
+
+    var fs_loader: module.FsLoader = .{
+        .gpa = gpa,
+        .io = io,
+        .max_source_bytes = limits.max_source_bytes,
+    };
+    rt.modules.loader = fs_loader.loader();
+
+    const canonical = module.resolveFsPath(gpa, io, null, name) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ModuleNotFound => try gpa.dupe(u8, name),
+    };
+    defer gpa.free(canonical);
+
+    var mod_diag: module.ModuleDiag = .{};
+    _ = module.runEntry(&rt, canonical, source, options.engine, &mod_diag) catch |e| switch (e) {
+        error.OutOfMemory, error.WriteFailed => |host| return host,
+        error.InvalidBytecode, error.Internal => {
+            try report.print("{s}: internal error: {s}\n", .{ name, rt.internal_reason orelse "invalid bytecode" });
+            return 70;
+        },
+        error.SyntaxError, error.Unsupported => {
+            if (mod_diag.source.len > 0) {
+                try mod_diag.diag.render(mod_diag.source, name, report);
+            } else {
+                try report.print("{s}: {s}\n", .{ name, @errorName(e) });
+            }
+            return 1;
+        },
+        error.ModuleNotFound => {
+            try report.print("{s}: Cannot find module '{s}'\n", .{ name, mod_diag.name });
+            return 1;
+        },
+        error.Thrown => {
+            if (rt.thrown_value) |v| {
+                try report.writeAll("Uncaught ");
+                if (mode == .normal) {
+                    var buf: ops.NumberBuf = undefined;
+                    if (ops.toPiece(&rt, v, &buf)) |piece| switch (piece) {
+                        .ascii => |a| try report.writeAll(a),
+                        .utf16 => |u| try ops.writeUtf16(report, u),
+                    } else |_| try report.writeAll("[value]");
+                }
+                try report.writeByte('\n');
+            } else {
+                const ex = rt.exception.?;
+                try report.print("Uncaught {s}", .{@tagName(ex.name)});
+                if (mode == .normal) {
+                    try report.writeAll(": ");
+                    try ops.writeUtf16(report, ex.message.units);
+                }
+                try report.writeByte('\n');
+            }
+            return 1;
+        },
+        error.HostError => {
+            try report.print("{s}: {s}\n", .{ name, rt.host_message_buf[0..rt.host_message_len] });
+            return 1;
+        },
+        error.LimitExceeded => {
+            try report.print("{s}: LimitExceeded({s})\n", .{ name, @tagName(rt.limitHit().?) });
+            return 1;
+        },
+    };
+    return 0;
 }

@@ -659,3 +659,6 @@
 ["syntax", "class A { m() { return this.#missing; } }"]
 ["syntax", "class A { m(o) { return #missing in o; } }"]
 ["syntax", "let o = { a: 1 }; o.#x;"]
+["syntax", "import foo from './foo.js';"]
+["syntax", "export const a = 1;"]
+["syntax", "export default 42;"]

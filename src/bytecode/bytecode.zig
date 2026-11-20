@@ -512,10 +512,12 @@ pub const Proto = struct {
     handlers: []const ExceptionHandler = &.{},
     /// Tagged template call sites (M32b).
     templates: []const TemplateSite = &.{},
-    /// Number of REPL top-level bindings referenced by this script/function (D71).
+    /// Number of REPL / module top-level bindings referenced by this script/function (D71, D72).
     repl_count: u32 = 0,
-    /// Borrowed from REPL Session for the lifetime of the chunk (D71).
+    /// Borrowed from REPL Session or ModuleRecord for the lifetime of the chunk (D71, D72).
     repl_cells: []*heap.Cell = &.{},
+    /// True when compiled from an ES Module (`this` at top-level is `undefined`, D72).
+    is_module: bool = false,
 
     pub const TemplateSite = struct {
         /// Indices into `consts` (`std.math.maxInt(u32)` means `undefined` for invalid escapes).

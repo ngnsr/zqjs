@@ -19,6 +19,7 @@ const usage =
     \\       zqjs [--test | --dump-ast | --dump-bytecode] [options] -e SOURCE
     \\
     \\  --repl             start the interactive REPL
+    \\  --module           execute input as an ES Module (default for .mjs files)
     \\  --no-color         disable ANSI colors in REPL output
     \\  --max-steps N      stop after N execution steps (0 = unlimited, default 200000000)
     \\  --engine=vm        run on the bytecode VM (default)
@@ -57,11 +58,14 @@ pub fn main(init: std.process.Init) !u8 {
     const Command = enum { run, @"test", dump, dump_bytecode, repl };
     var command: Command = .run;
     var no_color = false;
+    var force_module = false;
     var limits: zqjs.Limits = .{ .max_steps = cli_default_steps };
     var options: zqjs.RunOptions = .{};
     while (rest.len > 0 and std.mem.startsWith(u8, rest[0], "--")) {
         if (std.mem.eql(u8, rest[0], "--repl")) {
             command = .repl;
+        } else if (std.mem.eql(u8, rest[0], "--module")) {
+            force_module = true;
         } else if (std.mem.eql(u8, rest[0], "--no-color")) {
             no_color = true;
         } else if (std.mem.eql(u8, rest[0], "--test")) {
@@ -120,8 +124,9 @@ pub fn main(init: std.process.Init) !u8 {
         return session.runLoop();
     }
 
+    const is_eval = rest.len == 2 and std.mem.eql(u8, rest[0], "-e");
     const name: []const u8, const source: []const u8 = blk: {
-        if (rest.len == 2 and std.mem.eql(u8, rest[0], "-e")) break :blk .{ "<eval>", rest[1] };
+        if (is_eval) break :blk .{ "<eval>", rest[1] };
         if (rest.len == 1) break :blk .{ rest[0], std.Io.Dir.cwd().readFileAlloc(io, rest[0], arena, .limited(limits.max_source_bytes + 1)) catch |e| switch (e) {
             error.StreamTooLong => {
                 try err.print("{s}: LimitExceeded(source_bytes)\n", .{rest[0]});
@@ -136,8 +141,13 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
 
+    const is_module = force_module or (!is_eval and std.mem.endsWith(u8, name, ".mjs"));
+
     switch (command) {
         .run => {
+            if (is_module) {
+                return zqjs.runModule(gpa, name, source, io, limits, options, out, err);
+            }
             if (options.engine == .vm and options.trace == null and !options.verify_heap) {
                 return runPublic(gpa, name, source, limits, out, err);
             }
@@ -145,6 +155,9 @@ pub fn main(init: std.process.Init) !u8 {
         },
         .@"test" => {
             options.mode = .harness;
+            if (is_module) {
+                return zqjs.runModule(gpa, name, source, io, limits, options, out, err);
+            }
             return zqjs.runSource(gpa, name, source, limits, options, out, err);
         },
         .dump => return dump(arena, name, source, limits, out, err),

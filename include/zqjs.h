@@ -17,7 +17,7 @@ extern "C" {
  * Callers can check `(zqjs_abi_version() >> 16) == (ZQJS_ABI_VERSION >> 16)`.
  */
 #define ZQJS_ABI_MAJOR 1u
-#define ZQJS_ABI_MINOR 2u
+#define ZQJS_ABI_MINOR 3u
 #define ZQJS_ABI_PATCH 0u
 #define ZQJS_ABI_VERSION ((ZQJS_ABI_MAJOR << 16) | (ZQJS_ABI_MINOR << 8) | ZQJS_ABI_PATCH)
 
@@ -51,7 +51,8 @@ typedef enum zqjs_status {
     ZQJS_ERR_INVALID_STATE = -12,
     ZQJS_ERR_STALE_HANDLE = -13,
     ZQJS_ERR_FOREIGN_HANDLE = -14,
-    ZQJS_ERR_TYPE = -15
+    ZQJS_ERR_TYPE = -15,
+    ZQJS_ERR_MODULE_NOT_FOUND = -16
 } zqjs_status;
 
 typedef enum zqjs_limit {
@@ -68,7 +69,8 @@ typedef enum zqjs_limit {
     ZQJS_LIMIT_INTERPRETER_DEPTH = 9,
     ZQJS_LIMIT_CONVERSION_DEPTH = 10,
     ZQJS_LIMIT_HANDLES = 11,
-    ZQJS_LIMIT_NATIVE_STACK = 12
+    ZQJS_LIMIT_NATIVE_STACK = 12,
+    ZQJS_LIMIT_MODULES = 13
 } zqjs_limit;
 
 typedef enum zqjs_failure_kind {
@@ -320,6 +322,43 @@ zqjs_status zqjs_runtime_call(
     size_t argc,
     zqjs_failure *out_fail,
     zqjs_handle *out_result
+);
+
+/* ES Modules (ABI 1.3.0, M42) */
+typedef void (*zqjs_module_free_fn)(void *ctx, const char *canonical_id, const char *source);
+
+typedef struct zqjs_loaded_module {
+    const char *canonical_id;
+    size_t canonical_id_len;
+    const char *source;
+    size_t source_len;
+    zqjs_module_free_fn free_fn;
+} zqjs_loaded_module;
+
+typedef zqjs_status (*zqjs_module_loader_fn)(
+    void *ctx,
+    const char *referrer_id,
+    size_t referrer_id_len,
+    const char *specifier,
+    size_t specifier_len,
+    zqjs_loaded_module *out_module
+);
+
+zqjs_status zqjs_set_module_loader(
+    zqjs_runtime *rt,
+    zqjs_module_loader_fn loader,
+    void *ctx
+);
+
+zqjs_status zqjs_eval_module(
+    zqjs_runtime *rt,
+    const char *specifier,
+    size_t specifier_len,
+    const char *source,
+    size_t source_len,
+    zqjs_diagnostic *out_diag,
+    zqjs_failure *out_fail,
+    zqjs_handle *opt_out_namespace
 );
 
 #ifdef __cplusplus

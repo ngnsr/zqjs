@@ -22,6 +22,7 @@ const Value = value_mod.Value;
 const Native = value_mod.Native;
 const builtins_mod = @import("builtins.zig");
 const object_mod = @import("object.zig");
+const module_mod = @import("module.zig");
 const Limits = @import("../limits.zig").Limits;
 const Limit = @import("../limits.zig").Limit;
 const Feature = @import("../frontend/diag.zig").Feature;
@@ -252,6 +253,8 @@ pub const Runtime = struct {
     rng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(default_random_seed),
     /// Last top-level expression statement value in REPL mode (D71).
     repl_result: Value = .undefined,
+    /// Loaded ES Modules and host loader (M42, D72).
+    modules: module_mod.ModuleRegistry = .{},
 
     pub const default_random_seed: u64 = 0x9e3779b97f4a7c15;
 
@@ -290,6 +293,7 @@ pub const Runtime = struct {
         rt.template_cache.deinit(rt.gpa);
         rt.global_symbols.deinit(rt.gpa);
         rt.microtasks.deinit(rt.gpa);
+        rt.modules.deinit(rt.gpa);
         rt.heap.deinit();
         rt.* = undefined;
     }
@@ -443,6 +447,7 @@ pub const Runtime = struct {
         var tpl_it = rt.template_cache.valueIterator();
         while (tpl_it.next()) |obj_ptr| h.markObj(&obj_ptr.*.obj);
         rt.handles.mark(h); // host handles (M9.1, D50): slots with a reference
+        rt.modules.markRoots(h); // ES module registry (M42, D72)
     }
 
     fn markMicrotask(h: *Heap, mt: Microtask) void {

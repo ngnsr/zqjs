@@ -136,7 +136,7 @@ pub const Vm = struct {
         try vm.reserve(script);
         try vm.frames.ensureTotalCapacity(rt.gpa, 1);
         vm.initLocals(script, &.{});
-        vm.frames.appendAssumeCapacity(.{ .proto = script, .closure = null, .return_pc = 0, .locals_base = 0, .stack_base = 0, .result_index = 0, .this = null, .stack_end = script.max_stack, .args_start = 0, .argc = 0 });
+        vm.frames.appendAssumeCapacity(.{ .proto = script, .closure = null, .return_pc = 0, .locals_base = 0, .stack_base = 0, .result_index = 0, .this = if (script.is_module) .undefined else null, .stack_end = script.max_stack, .args_start = 0, .argc = 0 });
         vm.locals_len = script.slot_count;
         vm.reserved = script.slot_count + script.max_stack;
         return vm;

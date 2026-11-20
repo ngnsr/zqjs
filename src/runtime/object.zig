@@ -259,6 +259,20 @@ fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
             if (isNamed(k, "unicodeSets")) return .{ .value = .{ .boolean = re.program.flags.unicode_sets }, .enumerable = false, .writable = false };
             if (isNamed(k, "sticky")) return .{ .value = .{ .boolean = re.program.flags.sticky }, .enumerable = false, .writable = false };
         },
+        .module_namespace => |ns| {
+            if (k == .atom) {
+                for (ns.entries) |e| {
+                    if (e.name == k.atom) {
+                        const v = e.cell.value orelse return rt.throw(.ReferenceError, &.{
+                            .{ .ascii = "Cannot access '" },
+                            .{ .utf16 = e.name.units },
+                            .{ .ascii = "' before initialization" },
+                        });
+                        return .{ .value = v, .enumerable = true, .writable = true, .configurable = false };
+                    }
+                }
+            }
+        },
         .ordinary, .iterator, .promise, .generator => {},
     }
     if (o.props.count() == 0) return null; // don't intern index keys just to miss
@@ -488,6 +502,10 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!v
                         return;
                     }
                 },
+                .module_namespace => {
+                    if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property of module namespace" }});
+                    return;
+                },
                 .ordinary, .iterator, .promise, .generator => {},
             }
             const pk = try propKey(rt, k);
@@ -686,6 +704,7 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
             .symbol => {},
         },
         .regexp => if (isNamed(k, "lastIndex")) return false, // non-configurable
+        .module_namespace => return false,
         .ordinary, .map, .set, .iterator, .promise, .generator => {},
     }
     if (o.props.count() == 0) return true;
@@ -862,6 +881,7 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
         .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
+        .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => {},
     }
     const first_named = out.items.len;
@@ -875,6 +895,7 @@ pub fn ownPropertyNames(rt: *Runtime, o: *Object) Error![]Key {
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
         .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
+        .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => {},
     }
     const first_named = out.items.len;
@@ -888,6 +909,7 @@ pub fn ownAllKeys(rt: *Runtime, o: *Object) Error![]Key {
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
         .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
+        .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => {},
     }
     const first_named = out.items.len;

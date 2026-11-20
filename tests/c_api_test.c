@@ -675,8 +675,8 @@ static zqjs_status native_track_promise(
 
 /* 7. M29 host promises (60-frame timer loop, leak & handle checks) + D60 C ABI 1.2.0 */
 static void test_m29_host_promises_60_frames_and_d60_native_stack(void) {
-    assert(ZQJS_ABI_VERSION == 0x00010200u);
-    assert(zqjs_abi_version() == 0x00010200u);
+    assert(ZQJS_ABI_VERSION == 0x00010300u);
+    assert(zqjs_abi_version() == 0x00010300u);
 
     /* 7a. 1.1 struct_size backward compatibility (without max_native_stack_bytes) */
     typedef struct zqjs_options_v1_1 {
@@ -914,6 +914,75 @@ static void test_m29_host_promises_60_frames_and_d60_native_stack(void) {
     assert(zqjs_runtime_destroy(rt) == ZQJS_OK);
 }
 
+static zqjs_status m42_test_loader(
+    void *ctx,
+    const char *referrer_id,
+    size_t referrer_id_len,
+    const char *specifier,
+    size_t specifier_len,
+    zqjs_loaded_module *out_module
+) {
+    (void)referrer_id;
+    (void)referrer_id_len;
+    int *hits = (int *)ctx;
+    *hits += 1;
+    if (specifier_len == 6 && memcmp(specifier, "./a.js", 6) == 0) {
+        static const char cid[] = "a.js";
+        static const char src[] = "export let val = 10; export function inc() { val += 5; return val; }";
+        out_module->canonical_id = cid;
+        out_module->canonical_id_len = sizeof(cid) - 1;
+        out_module->source = src;
+        out_module->source_len = sizeof(src) - 1;
+        out_module->free_fn = NULL;
+        return ZQJS_OK;
+    }
+    if (specifier_len == 9 && memcmp(specifier, "./hosterr", 9) == 0) {
+        return ZQJS_ERR_HOST;
+    }
+    return ZQJS_ERR_MODULE_NOT_FOUND;
+}
+
+static void test_m42_es_modules(void) {
+    assert(zqjs_abi_version() == ((1u << 16) | (3u << 8) | 0u));
+
+    /* Backward compatibility: 1.0/1.1/1.2 options struct_size still accepted */
+    zqjs_options opts = zqjs_options_default();
+    zqjs_runtime *rt = NULL;
+    assert(zqjs_runtime_create(&opts, &rt) == ZQJS_OK);
+
+    int hits = 0;
+    assert(zqjs_set_module_loader(rt, m42_test_loader, &hits) == ZQJS_OK);
+    assert(zqjs_set_module_loader(NULL, m42_test_loader, &hits) == ZQJS_ERR_INVALID_ARG);
+
+    const char *entry_src = "import { val, inc } from './a.js'; export function run() { return val + inc(); }";
+    zqjs_diagnostic diag;
+    zqjs_failure fail;
+    zqjs_handle ns = ZQJS_HANDLE_NULL;
+    assert(zqjs_eval_module(rt, "main.js", 7, entry_src, strlen(entry_src), &diag, &fail, &ns) == ZQJS_OK);
+    assert(hits == 1);
+
+    zqjs_handle run_fn = ZQJS_HANDLE_NULL;
+    assert(zqjs_handle_get_property(rt, ns, "run", 3, &fail, &run_fn) == ZQJS_OK);
+    zqjs_handle res = ZQJS_HANDLE_NULL;
+    assert(zqjs_runtime_call(rt, run_fn, NULL, NULL, 0, &fail, &res) == ZQJS_OK);
+    double n = 0.0;
+    assert(zqjs_handle_number(rt, res, &n) == ZQJS_OK);
+    assert(n == 25.0);
+
+    assert(zqjs_handle_release(rt, res) == ZQJS_OK);
+    assert(zqjs_handle_release(rt, run_fn) == ZQJS_OK);
+    assert(zqjs_handle_release(rt, ns) == ZQJS_OK);
+
+    /* Error paths */
+    const char *miss_src = "import './missing.js';";
+    assert(zqjs_eval_module(rt, "miss.js", 7, miss_src, strlen(miss_src), &diag, &fail, NULL) == ZQJS_ERR_MODULE_NOT_FOUND);
+
+    const char *host_src = "import './hosterr';";
+    assert(zqjs_eval_module(rt, "herr.js", 7, host_src, strlen(host_src), &diag, &fail, NULL) == ZQJS_ERR_HOST);
+
+    assert(zqjs_runtime_destroy(rt) == ZQJS_OK);
+}
+
 int main(void) {
     capture_buf cap = { .len = 0, .reenter_rt = NULL, .reenter_status = ZQJS_OK };
     cap.data[0] = '\0';
@@ -972,6 +1041,7 @@ int main(void) {
     test_mid_run_program_destroy_and_runtime_destroy_with_children();
     test_m12_3_abi_version_options_and_handles();
     test_m29_host_promises_60_frames_and_d60_native_stack();
+    test_m42_es_modules();
 
     return 0;
 }

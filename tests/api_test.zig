@@ -404,7 +404,11 @@ test "the public API declares exactly the approved names (D46: a new export is a
         "HandleKind",
         "Limit",
         "Limits",
+        "LoadedModule",
         "Memory",
+        "ModuleError",
+        "ModuleLoadError",
+        "ModuleLoader",
         "NativeError",
         "NativeFn",
         "NativeOut",
@@ -428,6 +432,76 @@ test "the public API declares exactly the approved names (D46: a new export is a
     }.lt);
     try testing.expectEqual(approved.len, names.len);
     for (approved, names) |want, got| try testing.expectEqualStrings(want, got);
+}
+
+test "M42: host module loader, runModule namespace handle, and calling exported JS function" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+
+    const Loader = struct {
+        fn load(_: ?*anyopaque, _: ?[]const u8, specifier: []const u8) zqjs.ModuleLoadError!zqjs.LoadedModule {
+            if (std.mem.eql(u8, specifier, "./math.js")) {
+                return .{
+                    .canonical_id = "math.js",
+                    .source =
+                    \\let factor = 10;
+                    \\export function mul(x) { return x * factor; }
+                    \\export function setFactor(f) { factor = f; }
+                    ,
+                };
+            }
+            if (std.mem.eql(u8, specifier, "./fail.js")) {
+                return error.HostError;
+            }
+            return error.ModuleNotFound;
+        }
+    };
+    try rt.setModuleLoader(.{ .ctx = null, .load = Loader.load });
+
+    var diag: zqjs.Diagnostic = .{};
+    var failure: zqjs.Failure = .{};
+    const ns = try rt.runModule(
+        "main.js",
+        \\export * from './math.js';
+        \\export function add(a, b) { return a + b; }
+    ,
+        &diag,
+        &failure,
+    );
+    defer ns.release();
+
+    const add_fn = try rt.getProperty(ns, "add", &failure);
+    defer add_fn.release();
+    const a1 = try rt.newNumber(3);
+    defer a1.release();
+    const a2 = try rt.newNumber(4);
+    defer a2.release();
+    const sum = try rt.call(add_fn, null, &.{ a1, a2 }, &failure);
+    defer sum.release();
+    try testing.expectEqual(@as(?f64, 7), sum.number());
+
+    // Force GC across exported closure calls via namespace handle
+    rt.collectGarbage();
+    const mul_fn = try rt.getProperty(ns, "mul", &failure);
+    defer mul_fn.release();
+    const set_fn = try rt.getProperty(ns, "setFactor", &failure);
+    defer set_fn.release();
+    const f5 = try rt.newNumber(5);
+    defer f5.release();
+    const res1 = try rt.call(set_fn, null, &.{f5}, &failure);
+    res1.release();
+    const res2 = try rt.call(mul_fn, null, &.{a1}, &failure);
+    defer res2.release();
+    try testing.expectEqual(@as(?f64, 15), res2.number());
+
+    // ModuleNotFound & HostError
+    try testing.expectError(error.ModuleNotFound, rt.runModule("m2.js", "import './missing.js';", &diag, &failure));
+    try testing.expectError(error.HostError, rt.runModule("m3.js", "import './fail.js';", &diag, &failure));
+
+    // getModuleNamespace
+    const math_ns = try rt.getModuleNamespace("math.js", &failure);
+    math_ns.release();
+    try testing.expectError(error.ModuleNotFound, rt.getModuleNamespace("nope.js", &failure));
 }
 
 test "lifecycle: create and destroy leak nothing" {

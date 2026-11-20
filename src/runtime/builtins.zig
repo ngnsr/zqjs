@@ -937,6 +937,7 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
             .promise => "Promise",
             .regexp => "RegExp",
             .generator => |g| if (g.is_async) "AsyncGenerator" else "Generator",
+            .module_namespace => "Module",
             .ordinary => "Object",
         },
     };
@@ -2195,6 +2196,20 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                         .writable = o.regexp_last_index_writable,
                         .configurable = false,
                     };
+                },
+                .module_namespace => |ns| {
+                    if (k == .atom) {
+                        for (ns.entries) |e| {
+                            if (e.name == k.atom) {
+                                const v = e.cell.value orelse return rt.throw(.ReferenceError, &.{
+                                    .{ .ascii = "Cannot access '" },
+                                    .{ .utf16 = e.name.units },
+                                    .{ .ascii = "' before initialization" },
+                                });
+                                return .{ .value = v, .enumerable = true, .writable = true, .configurable = false };
+                            }
+                        }
+                    }
                 },
                 .ordinary, .map, .set, .iterator, .promise, .generator => {},
             }

@@ -459,6 +459,15 @@ pub const RegExpState = struct {
     last_index: Value = .{ .number = 0 },
 };
 
+pub const ModuleExport = struct {
+    name: *String,
+    cell: *Cell,
+};
+
+pub const ModuleNamespace = struct {
+    entries: []ModuleExport,
+};
+
 /// An ordinary object or an array (DESIGN_DECISIONS D13).
 pub const Object = struct {
     obj: Obj,
@@ -485,6 +494,8 @@ pub const Object = struct {
         regexp: *RegExpState,
         /// Generator object state (M37, D67).
         generator: GeneratorState,
+        /// ES Module namespace exotic object (M42, D72).
+        module_namespace: ModuleNamespace,
     } = .ordinary,
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
@@ -853,6 +864,10 @@ pub const Heap = struct {
                         RememberedScan.child(&scan, &rq.promise.obj);
                     }
                 },
+                .module_namespace => |ns| for (ns.entries) |e| {
+                    RememberedScan.child(&scan, &e.name.obj);
+                    RememberedScan.child(&scan, &e.cell.obj);
+                },
             }
         }
     }
@@ -1067,6 +1082,15 @@ pub const Heap = struct {
         const o = try h.gpa.create(Object);
         o.* = .{ .obj = h.newHeader(.object), .proto = proto };
         h.young = &o.obj;
+        return o;
+    }
+
+    pub fn newModuleNamespace(h: *Heap, entries: []const ModuleExport) Error!*Object {
+        const duped = h.allocator().dupe(ModuleExport, entries) catch |e| return h.failed(e);
+        errdefer h.allocator().free(duped);
+        const o = try h.newObject(null);
+        o.extensible = false;
+        o.kind = .{ .module_namespace = .{ .entries = duped } };
         return o;
     }
 
@@ -1628,7 +1652,7 @@ pub const Heap = struct {
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
         return switch (arr.kind) {
             .array => |*elements| elements,
-            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => unreachable, // only arrays have elements
+            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .module_namespace => unreachable, // only arrays have elements
         };
     }
 
@@ -1958,6 +1982,7 @@ pub const Heap = struct {
                         re.program.deinit(h.allocator());
                         h.allocator().destroy(re);
                     },
+                    .module_namespace => |ns| h.allocator().free(ns.entries),
                 }
                 o.kind = .ordinary;
                 o.proto = null;
@@ -2132,6 +2157,10 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
             }
             switch (o.kind) {
                 .ordinary => {},
+                .module_namespace => |ns| for (ns.entries) |e| {
+                    visit(ctx, @constCast(&e.name.obj));
+                    visit(ctx, &e.cell.obj);
+                },
                 .array => |elements| for (elements.items) |v| visitValue(v, ctx, visit),
                 .map, .set => |table| for (table.entries.items) |e| {
                     if (!e.alive) continue;

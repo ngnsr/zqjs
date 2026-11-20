@@ -79,6 +79,7 @@ pub const Status = enum(c_int) {
     err_stale_handle = -13,
     err_foreign_handle = -14,
     err_type = -15,
+    err_module_not_found = -16,
 };
 
 pub const CLimit = enum(c_int) {
@@ -96,6 +97,7 @@ pub const CLimit = enum(c_int) {
     conversion_depth = 10,
     handles = 11,
     native_stack = 12,
+    modules = 13,
 };
 
 pub const CFailureKind = enum(c_int) {
@@ -187,7 +189,7 @@ pub const CLimits = extern struct {
 pub const OutputFn = *const fn (ctx: ?*anyopaque, bytes: [*c]const u8, len: usize) callconv(.c) bool;
 pub const ClockFn = *const fn (ctx: ?*anyopaque) callconv(.c) u64;
 
-pub const abi_version: u32 = (1 << 16) | (2 << 8) | 0;
+pub const abi_version: u32 = (1 << 16) | (3 << 8) | 0;
 
 pub const COptions = extern struct {
     struct_size: u32,
@@ -257,6 +259,7 @@ pub const CFailure = extern struct {
             .conversion_depth => .conversion_depth,
             .handles => .handles,
             .native_stack => .native_stack,
+            .modules => .modules,
         } else .none;
         const msg = f.message();
         const n = @min(msg.len, 256);
@@ -309,6 +312,7 @@ const CRuntime = struct {
     in_non_native_callback: bool = false,
     programs: std.ArrayList(*CProgram) = .empty,
     executions: std.ArrayList(*CExecution) = .empty,
+    module_loader_bridge: ?*anyopaque = null,
     natives: std.ArrayList(*CNativeEntry) = .empty,
 
     fn writerDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
@@ -515,6 +519,11 @@ pub export fn zqjs_runtime_destroy(raw_rt: ?*anyopaque) callconv(.c) Status {
 
     for (cr.natives.items) |ne| cr.gpa.destroy(ne);
     cr.natives.deinit(cr.gpa);
+
+    if (cr.module_loader_bridge) |ptr| {
+        const bridge: *CModuleLoaderBridge = @ptrCast(@alignCast(ptr));
+        cr.gpa.destroy(bridge);
+    }
 
     cr.rt.destroy();
     cr.gpa.destroy(cr);
@@ -1249,6 +1258,154 @@ pub export fn zqjs_runtime_call(
         return mapRunError(err);
     };
     out.* = ZqjsHandle.fromZig(res);
+    return .ok;
+}
+
+pub const ZqjsModuleFreeFn = ?*const fn (ctx: ?*anyopaque, canonical_id: ?[*]const u8, source: ?[*]const u8) callconv(.c) void;
+
+pub const CLoadedModule = extern struct {
+    canonical_id: ?[*]const u8 = null,
+    canonical_id_len: usize = 0,
+    source: ?[*]const u8 = null,
+    source_len: usize = 0,
+    free_fn: ZqjsModuleFreeFn = null,
+};
+
+pub const ZqjsModuleLoaderFn = ?*const fn (
+    ctx: ?*anyopaque,
+    referrer_id: ?[*]const u8,
+    referrer_id_len: usize,
+    specifier: ?[*]const u8,
+    specifier_len: usize,
+    out_module: ?*CLoadedModule,
+) callconv(.c) Status;
+
+const CModuleLoaderBridge = struct {
+    loader_fn: *const fn (
+        ctx: ?*anyopaque,
+        referrer_id: ?[*]const u8,
+        referrer_id_len: usize,
+        specifier: ?[*]const u8,
+        specifier_len: usize,
+        out_module: ?*CLoadedModule,
+    ) callconv(.c) Status,
+    user_ctx: ?*anyopaque,
+    free_fn: ZqjsModuleFreeFn = null,
+
+    fn load(ctx: ?*anyopaque, referrer_id: ?[]const u8, specifier: []const u8) zqjs.ModuleLoadError!zqjs.LoadedModule {
+        const self: *CModuleLoaderBridge = @ptrCast(@alignCast(ctx.?));
+        var c_mod: CLoadedModule = .{};
+        const ref_ptr: ?[*]const u8 = if (referrer_id) |r| r.ptr else null;
+        const ref_len: usize = if (referrer_id) |r| r.len else 0;
+        const st = self.loader_fn(self.user_ctx, ref_ptr, ref_len, specifier.ptr, specifier.len, &c_mod);
+        switch (st) {
+            .ok => {
+                const cid_ptr = c_mod.canonical_id orelse return error.HostError;
+                const src_ptr = c_mod.source orelse return error.HostError;
+                self.free_fn = c_mod.free_fn;
+                return .{
+                    .canonical_id = cid_ptr[0..c_mod.canonical_id_len],
+                    .source = src_ptr[0..c_mod.source_len],
+                    .free = if (c_mod.free_fn != null) freeBridge else null,
+                };
+            },
+            .err_module_not_found => return error.ModuleNotFound,
+            .err_out_of_memory => return error.OutOfMemory,
+            else => return error.HostError,
+        }
+    }
+
+    fn freeBridge(ctx: ?*anyopaque, canonical_id: []const u8, source: []const u8) void {
+        const self: *CModuleLoaderBridge = @ptrCast(@alignCast(ctx.?));
+        if (self.free_fn) |f| {
+            f(self.user_ctx, canonical_id.ptr, source.ptr);
+        }
+    }
+};
+
+pub export fn zqjs_set_module_loader(
+    raw_rt: ?*anyopaque,
+    loader: ZqjsModuleLoaderFn,
+    ctx: ?*anyopaque,
+) callconv(.c) Status {
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkHostEntry()) |st| return st;
+
+    if (loader) |lfn| {
+        const bridge = cr.gpa.create(CModuleLoaderBridge) catch return .err_out_of_memory;
+        bridge.* = .{ .loader_fn = lfn, .user_ctx = ctx };
+        cr.rt.setModuleLoader(.{
+            .ctx = bridge,
+            .load = CModuleLoaderBridge.load,
+        }) catch |err| {
+            cr.gpa.destroy(bridge);
+            return switch (err) {
+                error.Busy => .err_busy,
+            };
+        };
+        if (cr.module_loader_bridge) |old_ptr| {
+            const old: *CModuleLoaderBridge = @ptrCast(@alignCast(old_ptr));
+            cr.gpa.destroy(old);
+        }
+        cr.module_loader_bridge = bridge;
+    } else {
+        cr.rt.setModuleLoader(null) catch |err| return switch (err) {
+            error.Busy => .err_busy,
+        };
+        if (cr.module_loader_bridge) |old_ptr| {
+            const old: *CModuleLoaderBridge = @ptrCast(@alignCast(old_ptr));
+            cr.gpa.destroy(old);
+            cr.module_loader_bridge = null;
+        }
+    }
+    return .ok;
+}
+
+pub export fn zqjs_eval_module(
+    raw_rt: ?*anyopaque,
+    specifier_ptr: ?[*]const u8,
+    specifier_len: usize,
+    source_ptr: ?[*]const u8,
+    source_len: usize,
+    out_diag: ?*CDiagnostic,
+    out_fail: ?*CFailure,
+    opt_out_namespace: ?*ZqjsHandle,
+) callconv(.c) Status {
+    if (opt_out_namespace) |ons| ons.* = .{};
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkHostEntry()) |st| return st;
+    const spec_p = specifier_ptr orelse return .err_invalid_arg;
+    const src_p = source_ptr orelse if (source_len == 0) @as([*]const u8, "") else return .err_invalid_arg;
+
+    var diag: zqjs.Diagnostic = .{};
+    var failure: zqjs.Failure = .{};
+    const ns_handle = cr.rt.runModule(
+        spec_p[0..specifier_len],
+        src_p[0..source_len],
+        if (out_diag != null) &diag else null,
+        if (out_fail != null) &failure else null,
+    ) catch |err| {
+        if (out_diag) |od| od.writeFromZig(&diag);
+        if (out_fail) |of| of.writeFromZig(&failure);
+        return switch (err) {
+            error.Source => .err_source,
+            error.ModuleNotFound => .err_module_not_found,
+            error.Busy => .err_busy,
+            error.Thrown => .err_thrown,
+            error.HostError => .err_host,
+            error.LimitExceeded => .err_limit_exceeded,
+            error.Unsupported => .err_unsupported,
+            error.OutOfMemory => .err_out_of_memory,
+            error.OutputFailed => .err_output_failed,
+            error.Internal => .err_internal,
+        };
+    };
+
+    if (opt_out_namespace) |ons| {
+        ons.* = ZqjsHandle.fromZig(ns_handle);
+    } else {
+        ns_handle.release();
+    }
     return .ok;
 }
 

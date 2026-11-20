@@ -104,6 +104,7 @@ pub fn build(b: *std.Build) void {
         .{ .step = "test-frontend", .file = "frontend_test" }, // allocation-failure paths and fuzzing of parse, resolve, dump
         .{ .step = "test-regex", .file = "regex_test" }, // regex/cases.jsonl: standalone regex compiler and matcher vs node
         .{ .step = "test-repl", .file = "repl_test" }, // interactive REPL: session, inspector, completion, editor, GC
+        .{ .step = "test-module", .file = "module_test" }, // ES Modules: live bindings, re-exports, cycles, namespaces, both engines
     }) |entry| {
         const single = b.addRunArtifact(b.addTest(.{ .name = entry.file, .filters = filters, .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("tests/{s}.zig", .{entry.file})),

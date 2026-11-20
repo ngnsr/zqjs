@@ -64,6 +64,8 @@ pub const Limits = struct {
     /// table or hitting this cap. Exceeding it returns `LimitExceeded(handles)`,
     /// catchable, leaving the runtime usable (E6).
     max_handles: u32 = 1 << 18,
+    /// Maximum number of ES modules loaded in one Runtime (M42, D72).
+    max_modules: u32 = 1024,
 };
 
 /// Elements per card (M8.1): an array with at least this capacity records young stores
@@ -96,6 +98,7 @@ pub const Limit = enum {
     conversion_depth,
     handles,
     native_stack,
+    modules,
 };
 
 comptime {

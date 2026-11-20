@@ -390,6 +390,49 @@ pub const Declaration = struct {
     declarators: []const DeclItem,
 };
 
+pub const SourceKind = enum { script, module };
+
+pub const ImportSpecifier = struct {
+    /// Exported name in the source module (`"default"` for default import, or identifier name).
+    imported: []const u8,
+    /// Local binding in this module.
+    local: Declarator,
+    span: Span,
+};
+
+pub const ImportDecl = struct {
+    specifier: []const u8,
+    specifier_span: Span,
+    default_binding: ?Declarator = null,
+    namespace_binding: ?Declarator = null,
+    named: []const ImportSpecifier = &.{},
+    span: Span,
+};
+
+pub const ExportSpecifier = struct {
+    local: Ref,
+    exported: []const u8,
+    span: Span,
+};
+
+pub const ReexportSpecifier = struct {
+    imported: []const u8,
+    exported: []const u8,
+    span: Span,
+};
+
+pub const ExportDecl = union(enum) {
+    declaration: Declaration,
+    function: *const Function,
+    class: *const Class,
+    named: []const ExportSpecifier,
+    default_expr: struct { expr: *const Expr, binding: u32 },
+    default_function: struct { func: *const Function, binding: u32 },
+    default_class: struct { cls: *const Class, binding: u32 },
+    reexport_named: struct { specifiers: []const ReexportSpecifier, from: []const u8, from_span: Span },
+    reexport_all: struct { namespace: ?[]const u8, from: []const u8, from_span: Span },
+};
+
 pub const Stmt = struct {
     span: Span,
     data: Data,
@@ -426,6 +469,8 @@ pub const Stmt = struct {
             catch_body: ?[]const Stmt,
             finally_body: ?[]const Stmt,
         },
+        import_decl: ImportDecl,
+        export_decl: ExportDecl,
     };
 };
 
@@ -454,4 +499,5 @@ pub const Script = struct {
     function_count: u32,
     /// True when the top-level script itself uses `await` or `for await` (REPL mode).
     has_top_level_await: bool = false,
+    source_kind: SourceKind = .script,
 };

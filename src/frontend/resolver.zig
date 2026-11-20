@@ -145,6 +145,7 @@ pub fn resolveWithRepl(arena: Allocator, script: ast.Script, repl_lookup: ?ReplL
         .bindings = try arena.alloc(Resolution.Binding, script.binding_count),
         .functions = try arena.alloc(Resolution.Function, script.function_count),
         .repl_lookup = repl_lookup,
+        .module_mode = script.source_kind == .module,
     };
     @memset(r.refs, .global);
     @memset(r.functions, .{});
@@ -191,6 +192,8 @@ const Resolver = struct {
     private_scopes: std.ArrayList(std.StringHashMapUnmanaged(PrivateDecl)) = .empty,
     repl_lookup: ?ReplLookup = null,
     repl_bindings: std.ArrayList(ReplBinding) = .empty,
+    module_mode: bool = false,
+    exported_names: std.StringHashMapUnmanaged(void) = .empty,
     scope_start: usize = 0,
     scope: u32 = 0,
     /// Index in `r.live` where the enclosing parameter scope starts (for checking
@@ -239,6 +242,45 @@ const Resolver = struct {
             .declaration => |decl| for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", kind == .script, true, param_range),
             .function => |f| try r.declare(f.name.?, .function, kind == .script, true, param_range),
             .class => |c| try r.declare(c.name.?, .let, kind == .script, true, param_range),
+            .import_decl => |imp| {
+                if (imp.default_binding) |db| try r.declare(db, .@"const", true, true, null);
+                if (imp.namespace_binding) |nb| try r.declare(nb, .@"const", true, true, null);
+                for (imp.named) |sp| try r.declare(sp.local, .@"const", true, true, null);
+            },
+            .export_decl => |exp| switch (exp) {
+                .declaration => |decl| {
+                    const bk: Resolution.BindingKind = if (decl.kind == .let) .let else .@"const";
+                    for (decl.declarators) |d| {
+                        try r.declarePattern(d.pattern, bk, true, true, null);
+                        try r.exportPatternNames(d.pattern);
+                    }
+                },
+                .function => |f| {
+                    try r.declare(f.name.?, .function, true, true, null);
+                    try r.addExportName(f.name.?.name, f.name.?.span);
+                },
+                .class => |c| {
+                    try r.declare(c.name.?, .let, true, true, null);
+                    try r.addExportName(c.name.?.name, c.name.?.span);
+                },
+                .named => |specs| for (specs) |sp| try r.addExportName(sp.exported, sp.span),
+                .default_expr => |de| {
+                    try r.addExportName("default", s.span);
+                    try r.declareSyntheticDefault(de.binding);
+                },
+                .default_function => |df| {
+                    try r.addExportName("default", s.span);
+                    if (df.func.name) |n| try r.declare(n, .function, true, true, null);
+                    try r.declareSyntheticDefault(df.binding);
+                },
+                .default_class => |dc| {
+                    try r.addExportName("default", s.span);
+                    if (dc.cls.name) |n| try r.declare(n, .let, true, true, null);
+                    try r.declareSyntheticDefault(dc.binding);
+                },
+                .reexport_named => |rn| for (rn.specifiers) |sp| try r.addExportName(sp.exported, sp.span),
+                .reexport_all => |ra| if (ra.namespace) |ns| try r.addExportName(ns, s.span),
+            },
             else => {},
         };
         for (stmts) |s| try r.stmt(s);
@@ -292,13 +334,27 @@ const Resolver = struct {
         // At script level these would collide with non-configurable properties of the
         // global object: node rejects `let NaN` before running anything (SyntaxError);
         // for a function declaration it is less clear-cut, so Unsupported.
-        if (script_scope and isRestrictedGlobal(d.name)) {
+        if (script_scope and !r.module_mode and isRestrictedGlobal(d.name)) {
             if (kind == .function) return r.fail(.{ .unsupported = .duplicate_function }, d.span);
             return r.fail(.{ .syntax_error = "cannot redeclare a non-configurable global at script level" }, d.span);
         }
         const f = r.current();
         const scope = &r.scopes.items[r.scope];
         if (script_scope) {
+            if (r.module_mode) {
+                const repl_idx: u32 = @intCast(r.repl_bindings.items.len);
+                const repl_kind: ReplKind = switch (kind) {
+                    .let => .let,
+                    .@"const" => .@"const",
+                    .function => .function,
+                    else => unreachable,
+                };
+                try r.repl_bindings.append(r.arena, .{ .name = d.name, .kind = repl_kind, .is_decl = true });
+                r.bindings[d.binding] = .{ .kind = kind, .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .repl_index = repl_idx };
+                scope.len += 1;
+                try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
+                return;
+            }
             if (r.repl_lookup) |rl| {
                 if (rl.get(rl.ctx, d.name)) |existing_kind| {
                     if (existing_kind == .@"const") {
@@ -408,7 +464,53 @@ const Resolver = struct {
             },
             .for_of => |f| try r.resolveForEach(f.target, f.iterable, f.body),
             .for_in => |f| try r.resolveForEach(f.target, f.object, f.body),
+            .import_decl => {},
+            .export_decl => |exp| switch (exp) {
+                .declaration => |decl| for (decl.declarators) |d| {
+                    if (d.init) |init| try r.expr(init);
+                    try r.resolvePatternExprs(d.pattern);
+                },
+                .function => |f| try r.function(f),
+                .class => |c| try r.resolveClass(c, false),
+                .named => |specs| for (specs) |sp| {
+                    const ref_res = try r.lookup(sp.local.name);
+                    if (ref_res == .global) return r.fail(.{ .syntax_error = "Exported name is not defined" }, sp.local.span);
+                    r.refs[sp.local.id] = ref_res;
+                },
+                .default_expr => |de| try r.expr(de.expr),
+                .default_function => |df| try r.function(df.func),
+                .default_class => |dc| try r.resolveClass(dc.cls, false),
+                .reexport_named, .reexport_all => {},
+            },
         }
+    }
+
+    fn addExportName(r: *Resolver, name: []const u8, s: ast.Span) Error!void {
+        if (r.exported_names.contains(name)) {
+            return r.fail(.{ .syntax_error = "Duplicate export" }, s);
+        }
+        try r.exported_names.put(r.arena, name, {});
+    }
+
+    fn exportPatternNames(r: *Resolver, pat: *const ast.Pattern) Error!void {
+        switch (pat.data) {
+            .binding => |d| try r.addExportName(d.name, d.span),
+            .array => |arr| {
+                for (arr.elems) |maybe| if (maybe) |el| try r.exportPatternNames(el.pattern);
+                if (arr.rest) |rest| try r.exportPatternNames(rest);
+            },
+            .object => |obj| {
+                for (obj.props) |pr| try r.exportPatternNames(pr.pattern);
+                if (obj.rest) |rest| try r.exportPatternNames(rest);
+            },
+            .target => unreachable,
+        }
+    }
+
+    fn declareSyntheticDefault(r: *Resolver, binding_id: u32) Error!void {
+        const repl_idx: u32 = @intCast(r.repl_bindings.items.len);
+        try r.repl_bindings.append(r.arena, .{ .name = "*default*", .kind = .@"const", .is_decl = true });
+        r.bindings[binding_id] = .{ .kind = .@"const", .slot = 0, .scope = r.scope, .index = 0, .function = 0, .repl_index = repl_idx };
     }
 
     fn resolveForEach(r: *Resolver, for_target: ast.ForOfTarget, rhs: *const ast.Expr, body: *const ast.Stmt) Error!void {
@@ -525,7 +627,7 @@ const Resolver = struct {
                 .cover_init => unreachable,
             },
             .array => |items| for (items) |item| try r.expr(item),
-            .this => {
+            .this => if (!r.module_mode) {
                 for (r.fns.items[1..]) |fn_state| {
                     if (!fn_state.is_arrow) break;
                 } else return r.fail(.{ .unsupported = .sloppy_this }, e.span);

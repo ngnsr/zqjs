@@ -40,6 +40,31 @@ pub fn run(rt: *Runtime, script: ast.Script, res: Resolution) Error!void {
     return runMeasured(rt, script, res, null);
 }
 
+/// Runs a resolved ES Module with pre-linked cells (D72).
+pub fn runModule(rt: *Runtime, script: ast.Script, res: *const Resolution, module_cells: []*heap.Cell) Error!void {
+    var m: Machine = .{
+        .rt = rt,
+        .res = res.*,
+        .res_ptr = res,
+        .repl_cells = module_cells,
+        .is_module = true,
+        .this = .undefined,
+        .stack_top = if (builtin.is_test) @frameAddress() else 0,
+        .lowest_frame = if (builtin.is_test) @frameAddress() else 0,
+    };
+    defer m.deinit();
+    const prev_roots = rt.engine_roots;
+    rt.engine_roots = m.roots();
+    defer rt.engine_roots = prev_roots;
+    const prev_caller = rt.closure_caller;
+    rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin };
+    defer rt.closure_caller = prev_caller;
+
+    try m.pushBlock(script.statements);
+    _ = try m.runLoop(0);
+    try rt.drainMicrotasks();
+}
+
 /// Runs a resolved script in REPL mode with persistent bindings and completion value.
 pub fn runRepl(rt: *Runtime, script: ast.Script, res: *const Resolution, repl_cells: []*heap.Cell) Error!void {
     var m: Machine = .{
@@ -293,6 +318,7 @@ const Task = union(enum) {
 
     // ---- Classes & super (M33, D63)
     class_decl_init: u32,
+    export_default_init: struct { default_binding: u32, name_binding: ?u32 },
     class_setup: struct { cls: *const ast.Class, is_expr: bool },
     class_method_next: struct { cls: *const ast.Class, idx: usize },
     class_method_finish: struct { cls: *const ast.Class, idx: usize, named: ?[]const u8 },
@@ -339,6 +365,7 @@ const Machine = struct {
     res_ptr: ?*const Resolution = null,
     repl_cells: []*heap.Cell = &.{},
     repl_mode: bool = false,
+    is_module: bool = false,
     repl_top_stmts: ?[]const ast.Stmt = null,
     env: ?*Env = null,
     depth: u32 = 0,
@@ -562,10 +589,12 @@ const Machine = struct {
     }
 
     fn pushBody(m: *Machine, stmts: []const ast.Stmt) Error!void {
-        for (stmts) |s| if (s.data == .function) {
-            const f = s.data.function;
-            m.store(f.name.?.binding, .{ .closure = try m.makeTreeClosure(f, m.env) });
-        };
+        if (!(m.is_module and m.current_func == null)) {
+            for (stmts) |s| if (s.data == .function) {
+                const f = s.data.function;
+                m.store(f.name.?.binding, .{ .closure = try m.makeTreeClosure(f, m.env) });
+            };
+        }
         if (stmts.len > 0) {
             try m.pushTask(.{ .stmt_list = .{ .stmts = stmts, .idx = 0 } });
         }
@@ -1333,6 +1362,7 @@ const Machine = struct {
             => try m.stepCallTask(task),
 
             .class_decl_init,
+            .export_default_init,
             .class_setup,
             .class_method_next,
             .class_method_finish,
@@ -2180,6 +2210,11 @@ const Machine = struct {
                 const v = m.popVal();
                 m.store(b, v);
             },
+            .export_default_init => |ed| {
+                const v = m.popVal();
+                m.store(ed.default_binding, v);
+                if (ed.name_binding) |nb| m.store(nb, v);
+            },
             .class_setup => |cs| {
                 const super_val = m.popVal();
                 const saved_env = m.env;
@@ -2876,6 +2911,42 @@ const Machine = struct {
                 }
                 try m.pushTask(.{ .for_in_start = .{ .stmt = s, .has_scope = has_scope, .values_base = values_base } });
                 try m.pushEval(f.object);
+            },
+            .import_decl => m.depth -= 1,
+            .export_decl => |exp| switch (exp) {
+                .declaration => |decl| {
+                    m.depth -= 1;
+                    if (decl.declarators.len > 0) try m.pushTask(.{ .decl_next = .{ .decls = decl.declarators, .idx = 0 } });
+                },
+                .class => |cls| {
+                    try m.pushTask(.depth_pop);
+                    try m.pushTask(.{ .class_decl_init = cls.name.?.binding });
+                    try m.pushTask(.{ .class_setup = .{ .cls = cls, .is_expr = false } });
+                    if (cls.super_class) |sc| {
+                        try m.pushEval(sc);
+                    } else {
+                        try m.pushVal(.undefined);
+                    }
+                },
+                .default_expr => |de| {
+                    try m.pushTask(.depth_pop);
+                    try m.pushTask(.{ .export_default_init = .{ .default_binding = de.binding, .name_binding = null } });
+                    try m.pushEval(de.expr);
+                },
+                .default_class => |dc| {
+                    try m.pushTask(.depth_pop);
+                    try m.pushTask(.{ .export_default_init = .{
+                        .default_binding = dc.binding,
+                        .name_binding = if (dc.cls.name) |n| n.binding else null,
+                    } });
+                    try m.pushTask(.{ .class_setup = .{ .cls = dc.cls, .is_expr = false } });
+                    if (dc.cls.super_class) |sc| {
+                        try m.pushEval(sc);
+                    } else {
+                        try m.pushVal(.undefined);
+                    }
+                },
+                .function, .default_function, .named, .reexport_named, .reexport_all => m.depth -= 1,
             },
             .labeled => |l| {
                 const values_base: u32 = @intCast(m.values.items.len);

@@ -154,6 +154,72 @@ const Dumper = struct {
                 try w.writeAll("(for-in ");
                 try d.forEachHead(f.target, f.object, f.body.*);
             },
+            .import_decl => |imp| {
+                try w.print("(import \"{s}\"", .{imp.specifier});
+                if (imp.default_binding) |db| {
+                    try w.writeByte(' ');
+                    try d.binding(db);
+                }
+                if (imp.namespace_binding) |nb| {
+                    try w.writeAll(" * ");
+                    try d.binding(nb);
+                }
+                for (imp.named) |n| {
+                    try w.print(" ({s} ", .{n.imported});
+                    try d.binding(n.local);
+                    try w.writeByte(')');
+                }
+                try w.writeByte(')');
+            },
+            .export_decl => |exp| switch (exp) {
+                .declaration => |decl| {
+                    try w.writeAll("(export ");
+                    try d.declaration(decl);
+                    try w.writeByte(')');
+                },
+                .function => |f| {
+                    try w.writeAll("(export ");
+                    try d.function(f);
+                    try w.writeByte(')');
+                },
+                .class => |cls| {
+                    try w.writeAll("(export ");
+                    try d.class(cls);
+                    try w.writeByte(')');
+                },
+                .named => |specs| {
+                    try w.writeAll("(export");
+                    for (specs) |sp| try w.print(" ({s} as {s})", .{ sp.local.name, sp.exported });
+                    try w.writeByte(')');
+                },
+                .default_expr => |de| {
+                    try w.writeAll("(export-default ");
+                    try d.expr(de.expr);
+                    try w.writeByte(')');
+                },
+                .default_function => |df| {
+                    try w.writeAll("(export-default ");
+                    try d.function(df.func);
+                    try w.writeByte(')');
+                },
+                .default_class => |dc| {
+                    try w.writeAll("(export-default ");
+                    try d.class(dc.cls);
+                    try w.writeByte(')');
+                },
+                .reexport_named => |rn| {
+                    try w.print("(export-from \"{s}\"", .{rn.from});
+                    for (rn.specifiers) |sp| try w.print(" ({s} as {s})", .{ sp.imported, sp.exported });
+                    try w.writeByte(')');
+                },
+                .reexport_all => |ra| {
+                    if (ra.namespace) |ns| {
+                        try w.print("(export-all-as {s} \"{s}\")", .{ ns, ra.from });
+                    } else {
+                        try w.print("(export-all \"{s}\")", .{ra.from});
+                    }
+                },
+            },
         }
     }
 

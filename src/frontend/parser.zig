@@ -24,6 +24,7 @@ pub const Error = error{ SyntaxError, Unsupported, LimitExceeded, OutOfMemory };
 /// freed individually; the caller frees everything at once, also after an error.
 pub const ParseOptions = struct {
     allow_top_level_await: bool = false,
+    source_kind: ast.SourceKind = .script,
 };
 
 /// On any error other than OutOfMemory, `diag` describes the problem.
@@ -43,6 +44,7 @@ pub fn parseWithOptions(arena: Allocator, source: []const u8, limits: Limits, op
         .limits = limits,
         .tok = undefined,
         .async_ctx = if (options.allow_top_level_await) .body else .none,
+        .source_kind = options.source_kind,
     };
     p.tok = try p.lexer.next();
 
@@ -54,6 +56,7 @@ pub fn parseWithOptions(arena: Allocator, source: []const u8, limits: Limits, op
         .binding_count = p.binding_count,
         .function_count = p.function_count,
         .has_top_level_await = p.has_top_level_await,
+        .source_kind = options.source_kind,
     };
 }
 
@@ -157,6 +160,7 @@ const Parser = struct {
     in_class_method: bool = false,
     class_count: u32 = 0,
     has_top_level_await: bool = false,
+    source_kind: ast.SourceKind = .script,
 
     fn advance(p: *Parser) Error!void {
         p.tok = try p.lexer.next();
@@ -188,6 +192,19 @@ const Parser = struct {
     /// (`.body`) and blocks (`.block`). Function declarations only in `.body`: inside
     /// blocks sloppy-mode JS gives them Annex B semantics, which ZQJS doesn't implement.
     fn statementListItem(p: *Parser, context: enum { body, block }) Error!ast.Stmt {
+        if (p.isText(p.tok, "import")) {
+            const next = try p.peek();
+            if (next.tag != .l_paren and next.tag != .dot) {
+                if (p.source_kind == .script) return p.fail(.{ .syntax_error = "Cannot use import statement outside a module" }, p.tok);
+                if (context == .block or p.function_depth > 0) return p.fail(.{ .syntax_error = "'import' and 'export' may only appear at the top level" }, p.tok);
+                return p.importDeclaration();
+            }
+        }
+        if (p.isText(p.tok, "export")) {
+            if (p.source_kind == .script) return p.fail(.{ .syntax_error = "Unexpected token 'export'" }, p.tok);
+            if (context == .block or p.function_depth > 0) return p.fail(.{ .syntax_error = "'import' and 'export' may only appear at the top level" }, p.tok);
+            return p.exportDeclaration();
+        }
         if (p.isText(p.tok, "function")) {
             if (context == .block) return p.fail(.{ .unsupported = .block_function }, p.tok);
             const t = p.tok;
@@ -255,6 +272,17 @@ const Parser = struct {
         if (p.isText(t, "do")) return p.doWhileStatement();
         if (p.isText(t, "switch")) return p.switchStatement();
         if (p.isText(t, "class")) return p.fail(.{ .syntax_error = "class declaration cannot appear in a single-statement context" }, t);
+        if (p.isText(t, "import")) {
+            const next = try p.peek();
+            if (next.tag != .l_paren and next.tag != .dot) {
+                if (p.source_kind == .script) return p.fail(.{ .syntax_error = "Cannot use import statement outside a module" }, t);
+                return p.fail(.{ .syntax_error = "'import' and 'export' may only appear at the top level" }, t);
+            }
+        }
+        if (p.isText(t, "export")) {
+            if (p.source_kind == .script) return p.fail(.{ .syntax_error = "Unexpected token 'export'" }, t);
+            return p.fail(.{ .syntax_error = "'import' and 'export' may only appear at the top level" }, t);
+        }
         if (p.isText(t, "let")) {
             const next = try p.peek();
             // `if (c) let x` is an error, but `if (c) let\nx` may be ASI + two statements.
@@ -314,6 +342,309 @@ const Parser = struct {
         const end = p.tok;
         try p.endStatement();
         return .{ .span = .{ .start = start, .end = end.end }, .data = .{ .declaration = decl } };
+    }
+
+    fn parseModuleSpecifier(p: *Parser) Error!struct { spec: []const u8, span: ast.Span } {
+        if (p.tok.tag != .string) return p.fail(.{ .syntax_error = "expected module specifier string" }, p.tok);
+        const t = p.tok;
+        const units = try p.decodeString(t);
+        const utf8 = std.unicode.utf16LeToUtf8Alloc(p.arena, units) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.DanglingSurrogateHalf, error.ExpectedSecondSurrogateHalf, error.UnexpectedSecondSurrogateHalf => return p.fail(.{ .unsupported = .syntax }, t),
+        };
+        try p.advance();
+        return .{ .spec = utf8, .span = span(t, t) };
+    }
+
+    fn parseIdentifierName(p: *Parser) Error!struct { name: []const u8, tok: Token } {
+        const t = p.tok;
+        if (t.tag == .string) return p.fail(.{ .unsupported = .syntax }, t);
+        if (t.tag != .identifier and !token.isKeyword(t.tag)) {
+            return p.fail(.{ .syntax_error = "expected identifier" }, t);
+        }
+        const name = t.text(p.source());
+        try p.advance();
+        return .{ .name = name, .tok = t };
+    }
+
+    fn validateBindingToken(p: *Parser, t: Token) Error!ast.Declarator {
+        const name = t.text(p.source());
+        if (token.isKeyword(t.tag) or token.reserved_identifiers.has(name) or std.mem.eql(u8, name, "let"))
+            return p.fail(.{ .syntax_error = "reserved word cannot be a binding name" }, t);
+        const id = p.binding_count;
+        p.binding_count += 1;
+        return .{ .name = name, .span = span(t, t), .binding = id, .init = null };
+    }
+
+    fn parseNamedImports(p: *Parser) Error![]const ast.ImportSpecifier {
+        try p.advance(); // `{`
+        var list: std.ArrayList(ast.ImportSpecifier) = .empty;
+        while (p.tok.tag != .r_brace) {
+            if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated import clause" }, p.tok);
+            const first = try p.parseIdentifierName();
+            if (p.isText(p.tok, "as")) {
+                try p.advance(); // `as`
+                const local = try p.bindingName(true);
+                try list.append(p.arena, .{
+                    .imported = first.name,
+                    .local = local,
+                    .span = .{ .start = first.tok.start, .end = local.span.end },
+                });
+            } else {
+                const local = try p.validateBindingToken(first.tok);
+                try list.append(p.arena, .{
+                    .imported = first.name,
+                    .local = local,
+                    .span = local.span,
+                });
+            }
+            if (p.tok.tag == .comma) {
+                try p.advance();
+            } else break;
+        }
+        if (p.tok.tag != .r_brace) return p.fail(.{ .syntax_error = "expected '}'" }, p.tok);
+        try p.advance();
+        return list.items;
+    }
+
+    fn importDeclaration(p: *Parser) Error!ast.Stmt {
+        const start = p.tok.start;
+        try p.advance(); // `import`
+
+        if (p.tok.tag == .string) {
+            const mod = try p.parseModuleSpecifier();
+            const end = p.tok;
+            try p.endStatement();
+            return .{
+                .span = .{ .start = start, .end = end.end },
+                .data = .{ .import_decl = .{
+                    .specifier = mod.spec,
+                    .specifier_span = mod.span,
+                    .span = .{ .start = start, .end = end.end },
+                } },
+            };
+        }
+
+        var default_binding: ?ast.Declarator = null;
+        var namespace_binding: ?ast.Declarator = null;
+        var named: []const ast.ImportSpecifier = &.{};
+
+        if (p.tok.tag == .star) {
+            try p.advance();
+            if (!p.isText(p.tok, "as")) return p.fail(.{ .syntax_error = "expected 'as'" }, p.tok);
+            try p.advance();
+            namespace_binding = try p.bindingName(true);
+        } else if (p.tok.tag == .l_brace) {
+            named = try p.parseNamedImports();
+        } else if (p.tok.tag == .identifier) {
+            default_binding = try p.bindingName(true);
+            if (p.tok.tag == .comma) {
+                try p.advance();
+                if (p.tok.tag == .star) {
+                    try p.advance();
+                    if (!p.isText(p.tok, "as")) return p.fail(.{ .syntax_error = "expected 'as'" }, p.tok);
+                    try p.advance();
+                    namespace_binding = try p.bindingName(true);
+                } else if (p.tok.tag == .l_brace) {
+                    named = try p.parseNamedImports();
+                } else {
+                    return p.fail(.{ .syntax_error = "expected '{' or '*' after ',' in import" }, p.tok);
+                }
+            }
+        } else {
+            return p.fail(.{ .syntax_error = "unexpected token in import declaration" }, p.tok);
+        }
+
+        if (!p.isText(p.tok, "from")) return p.fail(.{ .syntax_error = "expected 'from'" }, p.tok);
+        try p.advance();
+        const mod = try p.parseModuleSpecifier();
+        const end = p.tok;
+        try p.endStatement();
+        return .{
+            .span = .{ .start = start, .end = end.end },
+            .data = .{ .import_decl = .{
+                .specifier = mod.spec,
+                .specifier_span = mod.span,
+                .default_binding = default_binding,
+                .namespace_binding = namespace_binding,
+                .named = named,
+                .span = .{ .start = start, .end = end.end },
+            } },
+        };
+    }
+
+    fn exportDeclaration(p: *Parser) Error!ast.Stmt {
+        const start = p.tok.start;
+        try p.advance(); // `export`
+
+        if (p.tok.tag == .star) {
+            try p.advance();
+            var ns: ?[]const u8 = null;
+            if (p.isText(p.tok, "as")) {
+                try p.advance();
+                const id = try p.parseIdentifierName();
+                ns = id.name;
+            }
+            if (!p.isText(p.tok, "from")) return p.fail(.{ .syntax_error = "expected 'from'" }, p.tok);
+            try p.advance();
+            const mod = try p.parseModuleSpecifier();
+            const end = p.tok;
+            try p.endStatement();
+            return .{
+                .span = .{ .start = start, .end = end.end },
+                .data = .{ .export_decl = .{ .reexport_all = .{
+                    .namespace = ns,
+                    .from = mod.spec,
+                    .from_span = mod.span,
+                } } },
+            };
+        }
+
+        if (p.tok.tag == .l_brace) {
+            const RawSpec = struct { first_name: []const u8, first_tok: Token, exported: []const u8, end: u32 };
+            try p.advance(); // `{`
+            var raw: std.ArrayList(RawSpec) = .empty;
+            while (p.tok.tag != .r_brace) {
+                if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated export clause" }, p.tok);
+                const first = try p.parseIdentifierName();
+                var exported = first.name;
+                var end_pos = first.tok.end;
+                if (p.isText(p.tok, "as")) {
+                    try p.advance();
+                    const second = try p.parseIdentifierName();
+                    exported = second.name;
+                    end_pos = second.tok.end;
+                }
+                try raw.append(p.arena, .{
+                    .first_name = first.name,
+                    .first_tok = first.tok,
+                    .exported = exported,
+                    .end = end_pos,
+                });
+                if (p.tok.tag == .comma) {
+                    try p.advance();
+                } else break;
+            }
+            if (p.tok.tag != .r_brace) return p.fail(.{ .syntax_error = "expected '}'" }, p.tok);
+            try p.advance();
+
+            if (p.isText(p.tok, "from")) {
+                try p.advance();
+                const mod = try p.parseModuleSpecifier();
+                const end = p.tok;
+                try p.endStatement();
+                const specs = try p.arena.alloc(ast.ReexportSpecifier, raw.items.len);
+                for (raw.items, specs) |item, *dst| {
+                    dst.* = .{
+                        .imported = item.first_name,
+                        .exported = item.exported,
+                        .span = .{ .start = item.first_tok.start, .end = item.end },
+                    };
+                }
+                return .{
+                    .span = .{ .start = start, .end = end.end },
+                    .data = .{ .export_decl = .{ .reexport_named = .{
+                        .specifiers = specs,
+                        .from = mod.spec,
+                        .from_span = mod.span,
+                    } } },
+                };
+            }
+
+            const end = p.tok;
+            try p.endStatement();
+            const specs = try p.arena.alloc(ast.ExportSpecifier, raw.items.len);
+            for (raw.items, specs) |item, *dst| {
+                if (token.isKeyword(item.first_tok.tag) or token.reserved_identifiers.has(item.first_name)) {
+                    return p.fail(.{ .syntax_error = "unexpected reserved word in export" }, item.first_tok);
+                }
+                const ref_id = p.ref_count;
+                p.ref_count += 1;
+                dst.* = .{
+                    .local = .{ .name = item.first_name, .span = span(item.first_tok, item.first_tok), .id = ref_id },
+                    .exported = item.exported,
+                    .span = .{ .start = item.first_tok.start, .end = item.end },
+                };
+            }
+            return .{
+                .span = .{ .start = start, .end = end.end },
+                .data = .{ .export_decl = .{ .named = specs } },
+            };
+        }
+
+        if (p.isText(p.tok, "default")) {
+            try p.advance();
+            const def_binding = p.binding_count;
+            p.binding_count += 1;
+            if (p.isText(p.tok, "function")) {
+                const f = try p.functionImpl(.declaration, false, p.tok.start, true);
+                if (f.name == null) @constCast(f).inferred_name = "default";
+                return .{
+                    .span = .{ .start = start, .end = f.span.end },
+                    .data = .{ .export_decl = .{ .default_function = .{ .func = f, .binding = def_binding } } },
+                };
+            }
+            if (p.isText(p.tok, "async")) {
+                const next = try p.peek();
+                if (!next.newline_before and p.isText(next, "function")) {
+                    const async_start = p.tok.start;
+                    try p.advance();
+                    const f = try p.functionImpl(.declaration, true, async_start, true);
+                    if (f.name == null) @constCast(f).inferred_name = "default";
+                    return .{
+                        .span = .{ .start = start, .end = f.span.end },
+                        .data = .{ .export_decl = .{ .default_function = .{ .func = f, .binding = def_binding } } },
+                    };
+                }
+            }
+            if (p.isText(p.tok, "class")) {
+                const cls = try p.parseClassImpl(.declaration, true);
+                if (cls.name == null) @constCast(cls.constructor).inferred_name = "default";
+                return .{
+                    .span = .{ .start = start, .end = cls.span.end },
+                    .data = .{ .export_decl = .{ .default_class = .{ .cls = cls, .binding = def_binding } } },
+                };
+            }
+            const e = try p.assignment();
+            inferExprName(e, "default");
+            const end = p.tok;
+            try p.endStatement();
+            return .{
+                .span = .{ .start = start, .end = end.end },
+                .data = .{ .export_decl = .{ .default_expr = .{ .expr = e, .binding = def_binding } } },
+            };
+        }
+
+        if (p.tok.tag == .kw_const) {
+            const decl = try p.declaration(.@"const", false);
+            const end = p.tok;
+            try p.endStatement();
+            return .{ .span = .{ .start = start, .end = end.end }, .data = .{ .export_decl = .{ .declaration = decl } } };
+        }
+        if (p.isText(p.tok, "let") and try p.letStartsDeclaration()) {
+            const decl = try p.declaration(.let, false);
+            const end = p.tok;
+            try p.endStatement();
+            return .{ .span = .{ .start = start, .end = end.end }, .data = .{ .export_decl = .{ .declaration = decl } } };
+        }
+        if (p.isText(p.tok, "function")) {
+            const f = try p.function(.declaration, false, p.tok.start);
+            return .{ .span = .{ .start = start, .end = f.span.end }, .data = .{ .export_decl = .{ .function = f } } };
+        }
+        if (p.isText(p.tok, "async")) {
+            const next = try p.peek();
+            if (!next.newline_before and p.isText(next, "function")) {
+                const async_start = p.tok.start;
+                try p.advance();
+                const f = try p.function(.declaration, true, async_start);
+                return .{ .span = .{ .start = start, .end = f.span.end }, .data = .{ .export_decl = .{ .function = f } } };
+            }
+        }
+        if (p.isText(p.tok, "class")) {
+            const cls = try p.parseClass(.declaration);
+            return .{ .span = .{ .start = start, .end = cls.span.end }, .data = .{ .export_decl = .{ .class = cls } } };
+        }
+        return p.fail(.{ .syntax_error = "unexpected token in export declaration" }, p.tok);
     }
 
     /// `let|const pattern [= init] (, pattern [= init])*` without the terminator.
@@ -651,6 +982,10 @@ const Parser = struct {
 
     /// `function [*][name](a, b, …) { body }`, starting at `function`.
     fn function(p: *Parser, kind: @FieldType(ast.Function, "kind"), is_async: bool, start: u32) Error!*const ast.Function {
+        return p.functionImpl(kind, is_async, start, false);
+    }
+
+    fn functionImpl(p: *Parser, kind: @FieldType(ast.Function, "kind"), is_async: bool, start: u32, allow_anonymous: bool) Error!*const ast.Function {
         try p.enter();
         defer p.depth -= 1;
         try p.advance(); // `function`
@@ -672,7 +1007,7 @@ const Parser = struct {
         var name: ?ast.Declarator = null;
         if (p.tok.tag != .l_paren) {
             name = try p.bindingName(false);
-        } else if (kind == .declaration) {
+        } else if (kind == .declaration and !allow_anonymous) {
             return p.fail(.{ .syntax_error = "function declaration needs a name" }, p.tok);
         }
         return p.functionRest(start, kind, name, is_async, is_generator);
@@ -2086,7 +2421,8 @@ const Parser = struct {
                 const name = t.text(p.source());
                 if (std.mem.eql(u8, name, "this")) {
                     // At script level `this` is the global object, which ZQJS doesn't have.
-                    if (p.function_depth == 0) return p.fail(.{ .unsupported = .sloppy_this }, t);
+                    // At module top level `this` is `undefined`.
+                    if (p.function_depth == 0 and p.source_kind == .script) return p.fail(.{ .unsupported = .sloppy_this }, t);
                     try p.advance();
                     return p.node(s, .this, 0);
                 }
@@ -2151,6 +2487,14 @@ const Parser = struct {
                 // `let` as a variable name is legal sloppy JS we choose not to support.
                 if (std.mem.eql(u8, name, "finally"))
                     return p.fail(.{ .syntax_error = "unexpected token 'finally'" }, t);
+                if (std.mem.eql(u8, name, "import")) {
+                    const next = try p.peek();
+                    if (next.tag == .l_paren or next.tag == .dot) return p.fail(.{ .unsupported = .syntax }, t);
+                    return p.fail(.{ .syntax_error = "Unexpected token 'import'" }, t);
+                }
+                if (std.mem.eql(u8, name, "export")) {
+                    return p.fail(.{ .syntax_error = "Unexpected token 'export'" }, t);
+                }
                 if (token.reserved_identifiers.has(name) or std.mem.eql(u8, name, "let"))
                     return p.fail(.{ .unsupported = .syntax }, t);
                 try p.advance();
@@ -2713,6 +3057,10 @@ const Parser = struct {
     }
 
     fn parseClass(p: *Parser, kind: @FieldType(ast.Class, "kind")) Error!*const ast.Class {
+        return p.parseClassImpl(kind, false);
+    }
+
+    fn parseClassImpl(p: *Parser, kind: @FieldType(ast.Class, "kind"), allow_anonymous: bool) Error!*const ast.Class {
         try p.enter();
         defer p.depth -= 1;
 
@@ -2722,7 +3070,7 @@ const Parser = struct {
         p.class_count += 1;
 
         var name_decl: ?ast.Declarator = null;
-        if (kind == .declaration) {
+        if (kind == .declaration and !allow_anonymous) {
             name_decl = try p.bindingName(true);
         } else if (p.tok.tag == .identifier and !p.isText(p.tok, "extends")) {
             name_decl = try p.bindingName(true);

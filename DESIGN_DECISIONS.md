@@ -1822,3 +1822,26 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
   - `inspect.zig` formats all JS value kinds with `<ref *N>` / `[Circular *N]` cycle detection, depth/item bounds, `[Getter]`/`[Setter]` safety (never invokes getters), `[Symbol.toStringTag]`, and optional ANSI colors (`--no-color` / `NO_COLOR`).
   - `complete.zig` reuses `Lexer` for zero-allocation multi-line completeness checking, read-only Tab completion (dot-commands, keywords, globals, `ReplEnv`, and prototype-chain properties), and live syntax highlighting.
   - `editor.zig` uses pure-Zig `std.posix.tcgetattr`/`tcsetattr` and `std.c.isatty` with `defer` + `SIGINT`/`SIGTERM` termios restoration, UTF-8 cursor/editing, persistent history (`~/.zqjs_history` / `ZQJS_REPL_HISTORY`), `Ctrl-R` reverse search, and automatic piped non-TTY fallback.
+
+---
+
+## D72. ES Modules (`import` / `export`) and Host Module Loader (M42)
+
+**Decision:** Implement ECMAScript Source Text Modules (`import` / `export`) across both engines (VM and tree-walking `Machine`), the CLI (`--module` or `.mjs`), the Zig embedding API (`src/api.zig`), and the C ABI (`1.3.0`), using `heap.Cell` env-cell live bindings and a host `ModuleLoader` callback.
+
+- **Frontend (`ast.zig`, `parser.zig`, `resolver.zig`, `dump.zig`):**
+  - `SourceKind = enum { script, module }` (default `.script`). `import` and `export` declarations are rejected with `SyntaxError` in `.script` mode and inside blocks/functions; dynamic `import(expr)`, `import.meta`, string-name specifiers, and module top-level `await` / `for await` report `Unsupported(syntax)`.
+  - Top-level `this` in `.module` mode evaluates to `undefined` (without triggering `sloppy_this`).
+  - Early errors (`SyntaxError`): duplicate export names (including two `export default`), `export { local }` for an undeclared binding, duplicate import bindings, and redeclaring an imported binding.
+  - `resolver.zig` maps all module top-level bindings (`import`, `let`, `const`, `function`, `class`, and synthetic `*default*`) into the existing `Resolution.Ref.repl` env-cell table (`ReplBinding`), with imports marked `const` so importer-side assignment throws `TypeError: Assignment to constant variable.`.
+- **Module Registry, Linking & Evaluation (`src/runtime/module.zig`, `limits.zig`, `runtime.zig`):**
+  - `Limits.max_modules: u32 = 1024` bounds loaded modules per `Runtime` (`LimitExceeded(modules)`).
+  - `ModuleRegistry` on `Runtime` deduplicates modules by `canonical_id`, owns their source/arena/AST/`Resolution`/`Proto` lifetimes, and roots all cells, namespaces, constants, atoms, and cached errors via `Runtime.markRoots`.
+  - **Link phase** resolves all `import` and `export ... from` / `export *` edges cycle-safely (missing or ambiguous `export *` → `SyntaxError`; diamond `export *` to the same `heap.Cell` is not ambiguous), allocates local cells (TDZ `null`), aliases import cells directly to the exporter's `*heap.Cell`, and hoists top-level `function` declarations into their cells before evaluation so circular function imports work.
+  - **Evaluate phase** runs DFS post-order at most once per module per `Runtime`, caching completion or thrown error.
+- **Module Namespace Exotic Object (`heap.zig`, `object.zig`, `builtins.zig`):**
+  - `Object.kind.module_namespace` stores sorted `(atom, *Cell)` entries (`proto = null`, `extensible = false`, `[Symbol.toStringTag] = "Module"`). Reads dereference the live cell with TDZ `ReferenceError`; writes/deletes fail; `ownKeys`/`ownPropertyNames`/`for...in` yield keys in lexicographical UTF-16 code-unit order.
+- **Embedding & CLI (`main.zig`, `api.zig`, `c_api.zig`, `include/zqjs.h`):**
+  - CLI uses `FsLoader` (relative `./` and `../` path resolution against `dirname(referrer)` with normalization) for `--module` or `.mjs` files.
+  - Zig API adds `setModuleLoader`, `runModule` (returns GC-safe namespace `Handle`), and `getModuleNamespace`.
+  - C ABI bumps to `1.3.0` (`ZQJS_ABI_MINOR = 3`) while preserving 1.0–1.2 `zqjs_options.struct_size` compatibility, adding `zqjs_set_module_loader`, `zqjs_eval_module`, `ZQJS_ERR_MODULE_NOT_FOUND`, and `ZQJS_LIMIT_MODULES`.

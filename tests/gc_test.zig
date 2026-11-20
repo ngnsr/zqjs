@@ -2356,3 +2356,52 @@ test "M43: ArrayBuffer respects max_heap_bytes and frees backing bytes on sweep"
         try testing.expectEqualStrings("ok\n", got);
     }
 }
+
+test "M44: JSON reviver/replacer, flatMap, groupBy, Set methods, matchAll survive GC on both engines" {
+    const src =
+        \\function churn(tag) {
+        \\    let s = "";
+        \\    for (let i = 0; i < 40; i++) {
+        \\        const t = { i: i, tag: tag };
+        \\        s = tag + t.i;
+        \\    }
+        \\    return s;
+        \\}
+        \\const rev = JSON.parse('{"a":1,"b":{"c":2}}', function (k, v) {
+        \\    churn("rev");
+        \\    return typeof v === "number" ? v + 10 : v;
+        \\});
+        \\const str = JSON.stringify({ x: 1, y: [2, 3] }, function (k, v) {
+        \\    churn("rep");
+        \\    return typeof v === "number" ? v * 2 : v;
+        \\}, 2);
+        \\const fm = [1, 2].flatMap(function (x) {
+        \\    return [churn("fm"), x];
+        \\});
+        \\const og = Object.groupBy([1, 2, 3], function (x) {
+        \\    churn("og");
+        \\    return x % 2 === 0 ? "even" : "odd";
+        \\});
+        \\const mg = Map.groupBy([1, 2], function (x) {
+        \\    churn("mg");
+        \\    return x % 2;
+        \\});
+        \\const setLike = {
+        \\    size: 2,
+        \\    has(v) { churn("has"); return v === 2; },
+        \\    keys() {
+        \\        let i = 0;
+        \\        const vals = [2, 3];
+        \\        return { next() { churn("k"); return i < 2 ? { value: vals[i++], done: false } : { done: true }; } };
+        \\    }
+        \\};
+        \\const su = new Set([1, 2]).union(setLike);
+        \\const ma = [..."a1a2".matchAll(/a\d/g)];
+        \\print(rev.a, rev.b.c, fm.length, og.odd.length, mg.get(0).length, su.size, ma.length, str.length > 0);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("11 12 4 2 1 3 2 true\n", got);
+    }
+}

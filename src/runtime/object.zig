@@ -247,7 +247,7 @@ fn getFrom(rt: *Runtime, start: *Object, receiver: Value, k: Key) Error!Value {
     return .undefined;
 }
 
-fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
+pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
     switch (o.kind) {
         .array => |elements| switch (k) {
             .index => |i| return if (i < elements.items.len) .{

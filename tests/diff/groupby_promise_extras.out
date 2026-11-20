@@ -1,0 +1,12 @@
+null
+{"x_0":[{"name":"a","cat":"x"},{"name":"c","cat":"x"}],"y_1":[{"name":"b","cat":"y"}]}
+true
+[2,4]
+[1,3]
+boom1 1
+boom2 2
+wr1: 42
+wr2: err2
+try1: 30
+try2: TypeError try-boom
+try3: TypeError

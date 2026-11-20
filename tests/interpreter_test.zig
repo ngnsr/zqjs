@@ -322,11 +322,11 @@ test "holes are Unsupported: arrays stay dense" {
 
 test "built-ins: known to node but not implemented is Unsupported, naming the member" {
     try expectUnsupported("print(Reflect === undefined);", "", "Unsupported(builtin): a built-in node has that ZQJS doesn't implement yet ('Reflect')");
-    try expectUnsupported("print([1].length); [1].flat;", "1\n", "Unsupported(builtin)");
-    try expectUnsupported("[1].flat;", "", "('flat')");
-    try expectUnsupported("'abc'.matchAll;", "", "('matchAll')");
+    try expectUnsupported("print([1].length); [1].toLocaleString;", "1\n", "Unsupported(builtin)");
+    try expectUnsupported("[1].toLocaleString;", "", "('toLocaleString')");
+    try expectUnsupported("'abc'.normalize;", "", "('normalize')");
     try expectUnsupported("(1).toFixed;", "", "('toFixed')");
-    try expectUnsupported("Object.groupBy;", "", "('groupBy')");
+    try expectUnsupported("Object.prototype.__defineGetter__;", "", "('__defineGetter__')");
     try expectUnsupported("({}).toLocaleString;", "", "('toLocaleString')");
     try expectUnsupported("({}).constructor;", "", "('constructor')");
     try expectUnsupported("console;", "", "('console')");
@@ -375,7 +375,7 @@ test "object limits: heap, string length of a join, conversion depth" {
 }
 
 test "M11.3b: Array/String unimplemented methods, non-matching receivers, and non-ASCII case report Unsupported" {
-    try expectUnsupported("[1].flat;", "", "('flat')");
+    try expectUnsupported("[1].toLocaleString;", "", "('toLocaleString')");
     try expectUnsupported("let o = { length: 1, slice: [].slice }; o.slice();", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { length: 1, indexOf: [].indexOf }; o.indexOf(1);", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { length: 1, includes: [].includes }; o.includes(1);", "", "Unsupported(builtin)");
@@ -403,8 +403,7 @@ test "M14.4: unsupported iterables, Iterator.prototype methods, and member for-o
     try expectUnsupported("Symbol.match;", "", "('match')");
 }
 
-test "M15.1: JSON.parse reviver exclusion, new JSON(), nesting limit, and OOM" {
-    try expectUnsupported("JSON.parse('{}', function () {});", "", "Unsupported(user_conversion)");
+test "M15.1: JSON.parse unsupported properties, new JSON(), nesting limit, and OOM" {
     try expectUnsupported("JSON.rawJSON;", "", "('rawJSON')");
     for (support.engines) |engine| {
         var r_bad = try support.run(testing.allocator, "JSON.parse('{', function () {});", .{}, engine, .normal);
@@ -429,11 +428,7 @@ test "M15.1: JSON.parse reviver exclusion, new JSON(), nesting limit, and OOM" {
     try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
 }
 
-test "M15.2: JSON.stringify replacer/space exclusions, nesting limit, and OOM" {
-    try expectUnsupported("JSON.stringify({}, function () {});", "", "Unsupported(user_conversion)");
-    try expectUnsupported("JSON.stringify({}, ['a']);", "", "Unsupported(builtin)");
-    try expectUnsupported("JSON.stringify({}, null, 2);", "", "Unsupported(builtin)");
-
+test "M15.2: JSON.stringify nesting limit and OOM" {
     for (support.engines) |engine| {
         var r_lim = try support.run(testing.allocator, "JSON.stringify([[[1]]]);", .{ .max_nesting_depth = 2 }, engine, .normal);
         defer r_lim.deinit(testing.allocator);
@@ -628,9 +623,6 @@ test "M17.1: documented ZQJS deviations on callback thisArg and detached receive
 }
 
 test "M18.1: Promise state, self-resolution, native adoption, queue fault preservation, and OOM" {
-    try expectUnsupported("Promise.withResolvers;", "", "('withResolvers')");
-    try expectUnsupported("Promise.try;", "", "('try')");
-
     for (support.engines) |engine| {
         // 1. Rejection, executor throw, self-resolution, and pending/settled native adoption
         var arena = std.heap.ArenaAllocator.init(testing.allocator);

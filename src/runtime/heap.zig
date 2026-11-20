@@ -385,6 +385,8 @@ pub const IteratorKind = enum {
     async_from_sync,
     /// `for...in` iterator (D69): `target` is the root object, `next_method` is an internal Array of snapshotted `*String` keys.
     for_in,
+    /// `String.prototype.matchAll` iterator (M44): `target` is the cloned RegExp, `next_method` is the target `*String`.
+    regexp_match_all,
 };
 
 pub const IteratorState = struct {
@@ -1253,6 +1255,17 @@ pub const Heap = struct {
         o.kind = .{ .iterator = .{ .target = target, .next_method = keys_val, .kind = .for_in } };
         h.barrier(&o.obj, null, target);
         h.barrier(&o.obj, null, keys_val);
+        return o;
+    }
+
+    /// Creates a `matchAll` iterator holding the cloned RegExp and target string (M44).
+    pub fn newMatchAllIterator(h: *Heap, proto: ?*Object, rx: *Object, str: *const String) Error!*Object {
+        const o = try h.newObject(proto);
+        const rx_val: Value = .{ .object = rx };
+        const str_val: Value = .{ .string = str };
+        o.kind = .{ .iterator = .{ .target = rx_val, .next_method = str_val, .kind = .regexp_match_all } };
+        h.barrier(&o.obj, null, rx_val);
+        h.barrier(&o.obj, null, str_val);
         return o;
     }
 

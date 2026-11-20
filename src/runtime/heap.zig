@@ -42,6 +42,7 @@ const Limits = limits_mod.Limits;
 const Limit = limits_mod.Limit;
 const card_elements = limits_mod.card_elements;
 const Value = @import("value.zig").Value;
+const Native = @import("value.zig").Native;
 const Builtin = @import("builtin_names.zig").Builtin;
 const regex = @import("../regex.zig");
 
@@ -523,6 +524,67 @@ pub const DataViewState = struct {
     byte_length: usize,
 };
 
+/// A key that can be held weakly by `WeakMap` / `WeakSet` (ES2023 `CanBeHeldWeakly`).
+/// Stores the pointer identity of a heap `*Obj` (object, closure, or non-global symbol)
+/// or a static `*const Native`.
+pub const WeakKey = union(enum) {
+    obj: *Obj,
+    native: *const Native,
+
+    pub fn fromValue(v: Value) ?WeakKey {
+        return switch (v) {
+            .object => |o| .{ .obj = &o.obj },
+            .closure => |c| .{ .obj = @constCast(&c.obj) },
+            .symbol => |s| if (!s.is_global) .{ .obj = @constCast(&s.obj) } else null,
+            .native => |n| .{ .native = n },
+            .undefined, .null, .boolean, .number, .string => null,
+        };
+    }
+
+    pub fn isAlive(k: WeakKey, in_minor: bool) bool {
+        return switch (k) {
+            .native => true,
+            .obj => |kobj| kobj.marked or (in_minor and kobj.old),
+        };
+    }
+
+    pub fn isYoung(k: WeakKey) bool {
+        return switch (k) {
+            .native => false,
+            .obj => |kobj| !kobj.old,
+        };
+    }
+};
+
+pub const WeakKeyContext = struct {
+    pub fn hash(_: WeakKeyContext, k: WeakKey) u64 {
+        const ptr: usize = switch (k) {
+            .obj => |o| @intFromPtr(o),
+            .native => |n| @intFromPtr(n),
+        };
+        return std.hash.Wyhash.hash(0, std.mem.asBytes(&ptr));
+    }
+
+    pub fn eql(_: WeakKeyContext, a: WeakKey, b: WeakKey) bool {
+        return switch (a) {
+            .obj => |oa| b == .obj and oa == b.obj,
+            .native => |na| b == .native and na == b.native,
+        };
+    }
+};
+
+pub const WeakMapState = struct {
+    entries: std.HashMapUnmanaged(WeakKey, Value, WeakKeyContext, 80) = .empty,
+    /// Intrusive list link for `Heap.marked_weak_maps` during GC (zero-alloc, D9/D75).
+    weak_next: ?*Object = null,
+};
+
+pub const WeakSetState = struct {
+    entries: std.HashMapUnmanaged(WeakKey, void, WeakKeyContext, 80) = .empty,
+    /// Intrusive list link for `Heap.marked_weak_sets` during GC (zero-alloc, D9/D75).
+    weak_next: ?*Object = null,
+};
+
 /// An ordinary object or an array (DESIGN_DECISIONS D13).
 pub const Object = struct {
     obj: Obj,
@@ -557,6 +619,9 @@ pub const Object = struct {
         typed_array: TypedArrayState,
         /// Unaligned binary DataView (M43, D73).
         data_view: DataViewState,
+        /// Ephemeron WeakMap and WeakSet (M45, D75).
+        weak_map: WeakMapState,
+        weak_set: WeakSetState,
     } = .ordinary,
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
@@ -643,6 +708,9 @@ pub const Heap = struct {
     tombstones: ?*Obj = null,
     /// The gray list while marking (empty otherwise).
     gray: ?*Obj = null,
+    /// Intrusive lists of marked WeakMap/WeakSet objects during collection (zero-alloc, D9/D75).
+    marked_weak_maps: ?*Object = null,
+    marked_weak_sets: ?*Object = null,
     stats: Stats = .{},
 
     /// An optional observer of collections (the GC report tool). The runtime has no
@@ -747,6 +815,31 @@ pub const Heap = struct {
         obj.marked = true;
         obj.gray_next = h.gray;
         h.gray = obj;
+        if (obj.kind == .object) {
+            const o: *Object = @fieldParentPtr("obj", obj);
+            switch (o.kind) {
+                .weak_map => |*wm| {
+                    std.debug.assert(wm.weak_next == null);
+                    wm.weak_next = h.marked_weak_maps;
+                    h.marked_weak_maps = o;
+                },
+                .weak_set => |*ws| {
+                    std.debug.assert(ws.weak_next == null);
+                    ws.weak_next = h.marked_weak_sets;
+                    h.marked_weak_sets = o;
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn drainGray(h: *Heap) void {
+        // Drain: each gray object's children (D38's edges), iteratively, never recursively.
+        while (h.gray) |obj| {
+            h.gray = obj.gray_next;
+            obj.gray_next = null;
+            forEachChild(obj, h, markObj);
+        }
     }
 
     pub fn markValue(h: *Heap, v: Value) void {
@@ -788,11 +881,39 @@ pub const Heap = struct {
             if (h.observer) |o| remembered_ns = o.clock(o.ctx) - t0;
         }
         markRoots(roots, h);
-        // Drain: each gray object's children (D38's edges), iteratively, never recursively.
-        while (h.gray) |obj| {
-            h.gray = obj.gray_next;
-            obj.gray_next = null;
-            forEachChild(obj, h, markObj);
+        h.drainGray();
+        // Ephemeron fixpoint (D75): trace WeakMap values whose keys are alive until no new
+        // objects are marked, then remove entries with dead keys before sweeping.
+        while (true) {
+            var wm_it = h.marked_weak_maps;
+            while (wm_it) |o| : (wm_it = o.kind.weak_map.weak_next) {
+                var it = o.kind.weak_map.entries.iterator();
+                while (it.next()) |entry| {
+                    if (entry.key_ptr.isAlive(h.in_minor)) h.markValue(entry.value_ptr.*);
+                }
+            }
+            if (h.gray == null) break;
+            h.drainGray();
+        }
+        while (h.marked_weak_maps) |o| {
+            const wm = &o.kind.weak_map;
+            h.marked_weak_maps = wm.weak_next;
+            wm.weak_next = null;
+            var it = wm.entries.iterator();
+            while (it.next()) |entry| {
+                if (!entry.key_ptr.isAlive(h.in_minor)) wm.entries.removeByPtr(entry.key_ptr);
+            }
+            if (wm.entries.count() == 0) wm.entries.clearAndFree(h.allocator());
+        }
+        while (h.marked_weak_sets) |o| {
+            const ws = &o.kind.weak_set;
+            h.marked_weak_sets = ws.weak_next;
+            ws.weak_next = null;
+            var it = ws.entries.iterator();
+            while (it.next()) |entry| {
+                if (!entry.key_ptr.isAlive(h.in_minor)) ws.entries.removeByPtr(entry.key_ptr);
+            }
+            if (ws.entries.count() == 0) ws.entries.clearAndFree(h.allocator());
         }
         h.in_minor = false;
         if (major) {
@@ -933,6 +1054,16 @@ pub const Heap = struct {
                 .array_buffer => {},
                 .typed_array => |ta| RememberedScan.child(&scan, &ta.buffer.obj),
                 .data_view => |dv| RememberedScan.child(&scan, &dv.buffer.obj),
+                .weak_map => |*wm| {
+                    std.debug.assert(wm.weak_next == null);
+                    wm.weak_next = h.marked_weak_maps;
+                    h.marked_weak_maps = o;
+                },
+                .weak_set => |*ws| {
+                    std.debug.assert(ws.weak_next == null);
+                    ws.weak_next = h.marked_weak_sets;
+                    h.marked_weak_sets = o;
+                },
             }
         }
     }
@@ -1012,7 +1143,7 @@ pub const Heap = struct {
     /// fixed charge + every buffer byte charged through `allocator()`; and the generational
     /// invariants I-gen1, 2 and 4 (GC_DESIGN.md §15). Allocates nothing.
     pub fn verify(h: *const Heap) VerifyError!void {
-        if (h.gray != null) return error.GrayListNotEmpty;
+        if (h.gray != null or h.marked_weak_maps != null or h.marked_weak_sets != null) return error.GrayListNotEmpty;
         var sum: usize = h.buffer_bytes;
         var remembered: usize = 0;
         const Check = struct {
@@ -1035,6 +1166,27 @@ pub const Heap = struct {
                 }
                 var c: Check = .{};
                 forEachChild(obj, &c, Check.edge);
+                if (obj.kind == .object) {
+                    const o: *Object = @fieldParentPtr("obj", obj);
+                    switch (o.kind) {
+                        .weak_map => |wm| {
+                            if (wm.weak_next != null) return error.GrayListNotEmpty;
+                            var wit = wm.entries.iterator();
+                            while (wit.next()) |entry| {
+                                if (entry.key_ptr.* == .obj) Check.edge(&c, entry.key_ptr.obj);
+                                visitValue(entry.value_ptr.*, &c, Check.edge);
+                            }
+                        },
+                        .weak_set => |ws| {
+                            if (ws.weak_next != null) return error.GrayListNotEmpty;
+                            var wit = ws.entries.iterator();
+                            while (wit.next()) |entry| {
+                                if (entry.key_ptr.* == .obj) Check.edge(&c, entry.key_ptr.obj);
+                            }
+                        },
+                        else => {},
+                    }
+                }
                 if (c.bad) return error.EdgeToCollectedObject;
                 if (old and c.young) {
                     if (!obj.remembered) return error.UnrememberedOldToYoungEdge;
@@ -1211,6 +1363,59 @@ pub const Heap = struct {
 
     pub fn setClear(o: *Object) void {
         o.kind.set.clear();
+    }
+
+    pub fn newWeakMap(h: *Heap, proto: ?*Object) Error!*Object {
+        const o = try h.newObject(proto);
+        o.kind = .{ .weak_map = .{} };
+        return o;
+    }
+
+    pub fn weakMapGet(o: *const Object, key: WeakKey) ?Value {
+        return o.kind.weak_map.entries.get(key);
+    }
+
+    pub fn weakMapHas(o: *const Object, key: WeakKey) bool {
+        return o.kind.weak_map.entries.contains(key);
+    }
+
+    pub fn weakMapSet(h: *Heap, o: *Object, key: WeakKey, val: Value) Error!void {
+        o.obj.checkLive();
+        switch (key) {
+            .obj => |kobj| kobj.checkLive(),
+            .native => {},
+        }
+        checkValue(val);
+        o.kind.weak_map.entries.put(h.allocator(), key, val) catch |e| return h.failed(e);
+        if (o.obj.old and (key.isYoung() or isYoung(val))) h.remember(&o.obj);
+    }
+
+    pub fn weakMapDelete(o: *Object, key: WeakKey) bool {
+        return o.kind.weak_map.entries.remove(key);
+    }
+
+    pub fn newWeakSet(h: *Heap, proto: ?*Object) Error!*Object {
+        const o = try h.newObject(proto);
+        o.kind = .{ .weak_set = .{} };
+        return o;
+    }
+
+    pub fn weakSetHas(o: *const Object, key: WeakKey) bool {
+        return o.kind.weak_set.entries.contains(key);
+    }
+
+    pub fn weakSetAdd(h: *Heap, o: *Object, key: WeakKey) Error!void {
+        o.obj.checkLive();
+        switch (key) {
+            .obj => |kobj| kobj.checkLive(),
+            .native => {},
+        }
+        o.kind.weak_set.entries.put(h.allocator(), key, {}) catch |e| return h.failed(e);
+        if (o.obj.old and key.isYoung()) h.remember(&o.obj);
+    }
+
+    pub fn weakSetDelete(o: *Object, key: WeakKey) bool {
+        return o.kind.weak_set.entries.remove(key);
     }
 
     pub fn newIterator(h: *Heap, proto: ?*Object, target: Value, kind: IteratorKind) Error!*Object {
@@ -1773,7 +1978,7 @@ pub const Heap = struct {
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
         return switch (arr.kind) {
             .array => |*elements| elements,
-            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .module_namespace, .array_buffer, .typed_array, .data_view => unreachable, // only arrays have elements
+            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .module_namespace, .array_buffer, .typed_array, .data_view, .weak_map, .weak_set => unreachable, // only arrays have elements
         };
     }
 
@@ -2106,6 +2311,8 @@ pub const Heap = struct {
                     .module_namespace => |ns| h.allocator().free(ns.entries),
                     .array_buffer => |ab| h.allocator().free(ab.data),
                     .typed_array, .data_view => {},
+                    .weak_map => |*wm| wm.entries.deinit(h.allocator()),
+                    .weak_set => |*ws| ws.entries.deinit(h.allocator()),
                 }
                 o.kind = .ordinary;
                 o.proto = null;
@@ -2287,6 +2494,9 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                 .array_buffer => {},
                 .typed_array => |ta| visit(ctx, &ta.buffer.obj),
                 .data_view => |dv| visit(ctx, &dv.buffer.obj),
+                // WeakMap/WeakSet keys and WeakMap values are traced by the ephemeron
+                // fixpoint loop in `collect`, never via `forEachChild` (D75).
+                .weak_map, .weak_set => {},
                 .array => |elements| for (elements.items) |v| visitValue(v, ctx, visit),
                 .map, .set => |table| for (table.entries.items) |e| {
                     if (!e.alive) continue;

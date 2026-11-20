@@ -56,6 +56,8 @@ pub const Native = struct {
         function,
         map,
         set,
+        weak_map,
+        weak_set,
         promise,
         @"error",
         type_error,

@@ -1884,3 +1884,26 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
 - **Embedding & C ABI (`api.zig`, `c_api.zig`, `include/zqjs.h`):**
   - Zig API adds `Runtime.newArrayBuffer(byte_len)` and `Runtime.bufferBytes(h)` (zero-copy mutable slice for `ArrayBuffer`, `TypedArray`, or `DataView`).
   - C ABI bumps to `1.4.0` (`ZQJS_ABI_MINOR = 4`), adding `zqjs_new_array_buffer` and `zqjs_handle_buffer_data`.
+
+---
+
+## D74. Everyday Built-ins Pack (M44)
+
+**Decision:** Implement `JSON.parse` reviver & `JSON.stringify` replacer/space, ES2024 `Object.groupBy` / `Map.groupBy`, `Promise.{withResolvers, try}`, ES2025 `Set` methods (`union`, `intersection`, `difference`, `symmetricDifference`, `isSubsetOf`, `isSupersetOf`, `isDisjointFrom`), `Array.prototype.{flat, flatMap, at, findLast, findLastIndex, toReversed, toSorted, toSpliced, with}`, `String.prototype.{at, matchAll, replaceAll, padStart, padEnd, trimStart, trimEnd, repeat}`, `RegExp.prototype.exec` `/g`/`/y` `lastIndex` advancement, and `encodeURI` / `decodeURI` / `encodeURIComponent` / `decodeURIComponent` across both engines.
+
+---
+
+## D75. `WeakMap` and `WeakSet` with Zero-Allocation Ephemeron GC (M45)
+
+**Decision:** Implement `WeakMap` and `WeakSet` (ES2023 `CanBeHeldWeakly` keys) across both engines and the REPL inspector (`src/repl/inspect.zig`), backed by zero-allocation ephemeron tracing in the generational mark-and-sweep collector (`src/runtime/heap.zig`).
+
+- **Weak Keys (`WeakKey`):**
+  - `WeakKey` stores the pointer identity of a heap `*Obj` (`Value.object`, `Value.closure`, or non-registered `Value.symbol` with `!sym.is_global`) or a static `*const Native` (`Value.native`). Primitives and registered symbols (`Symbol.for(...)`, `sym.is_global == true`) are rejected with `TypeError` on `set`/`add` and return `undefined`/`false` on `get`/`has`/`delete`.
+- **Zero-Allocation Ephemeron Worklists (D9, D42–D44):**
+  - `Object.kind.weak_map: WeakMapState` and `Object.kind.weak_set: WeakSetState` store entries in `HashMapUnmanaged` via `Heap.allocator()` (charging `Limits.max_heap_bytes`) and carry an intrusive `weak_next: ?*Object = null` link.
+  - Ordinary `forEachChild` does **not** trace weak keys or `WeakMap` values. Instead, `markObj` (and `scanRemembered` for old remembered weak tables during minor GC) links each visited weak table at most once per collection onto `Heap.marked_weak_maps` / `Heap.marked_weak_sets`.
+  - After draining the initial gray list, `Heap.collect` runs an iterative ephemeron fixpoint loop over `marked_weak_maps` (marking any `WeakMap` value whose key is alive — `.native`, `kobj.marked`, or `h.in_minor and kobj.old` — and draining `h.gray` until no new objects are marked), handling arbitrary ephemeron chains and cyclic `k -> k` references without allocating.
+  - Before sweeping, `Heap.collect` walks `marked_weak_maps` and `marked_weak_sets`, removes entries whose keys are not alive in place (`removeByPtr`, freeing empty buffers with `clearAndFree`), and resets `weak_next = null`.
+- **Generational Barrier & Verifier:**
+  - `heap.weakMapSet` and `heap.weakSetAdd` call `h.remember(&o.obj)` whenever `o.obj.old` and the key or value is young.
+  - `Heap.verify` independently inspects `WeakMap`/`WeakSet` entries for dead pointers and unremembered old-to-young edges.

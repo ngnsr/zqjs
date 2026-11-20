@@ -2405,3 +2405,135 @@ test "M44: JSON reviver/replacer, flatMap, groupBy, Set methods, matchAll surviv
         try testing.expectEqualStrings("11 12 4 2 1 3 2 true\n", got);
     }
 }
+
+test "M45: WeakMap and WeakSet ephemeron chains and unreachable keys on both engines" {
+    const src =
+        \\const wm1 = new WeakMap();
+        \\const wm2 = new WeakMap();
+        \\const wm3 = new WeakMap();
+        \\const ws = new WeakSet();
+        \\
+        \\// 1. Ephemeron chain: k1 -> k2 -> k3 -> payload (only k1 rooted)
+        \\const k1 = { name: "k1" };
+        \\{
+        \\    const k2 = { name: "k2" };
+        \\    const k3 = Symbol("k3");
+        \\    const payload = { secret: "alive" };
+        \\    wm1.set(k1, k2);
+        \\    wm2.set(k2, k3);
+        \\    wm3.set(k3, payload);
+        \\    ws.add(k3);
+        \\}
+        \\// Churn to force minor + major GC
+        \\for (let i = 0; i < 150; i++) {
+        \\    const tmp = { i: i };
+        \\    wm1.set(tmp, { big: "pad" + i });
+        \\    ws.add(Symbol("temp" + i));
+        \\}
+        \\const gotK2 = wm1.get(k1);
+        \\const gotK3 = wm2.get(gotK2);
+        \\const gotPayload = wm3.get(gotK3);
+        \\print(gotPayload.secret, ws.has(gotK3));
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("alive true\n", got);
+    }
+}
+
+test "M45: WeakMap/WeakSet collect 1000 temporary keys under small heap limit on both engines" {
+    const src =
+        \\const wm = new WeakMap();
+        \\const ws = new WeakSet();
+        \\for (let i = 0; i < 1000; i++) {
+        \\    const k = { id: i };
+        \\    const s = Symbol("s");
+        \\    wm.set(k, { buf: new ArrayBuffer(2048) });
+        \\    ws.add(s);
+        \\}
+        \\print("swept");
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{ .max_heap_bytes = 512 * 1024 });
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("swept\n", got);
+    }
+}
+
+test "M45: Heap ephemeron unit tests (unreachable keys, chains, generational barrier, cyclic k->k)" {
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+
+    // 1. Unreachable keys are collected (1000 entries)
+    const wm = try h.newWeakMap(null);
+    const ws = try h.newWeakSet(null);
+    collectMajor(&h, &.{ &wm.obj, &ws.obj });
+    const baseline = h.bytes;
+
+    for (0..1000) |_| {
+        const k = try h.newObject(null);
+        const v = try h.newArrayBuffer(null, 512);
+        try h.weakMapSet(wm, .{ .obj = &k.obj }, .{ .object = v });
+        const sym = try h.newSymbol(null, false);
+        try h.weakSetAdd(ws, .{ .obj = @constCast(&sym.obj) });
+    }
+    try testing.expect(h.bytes > baseline + 400_000);
+    collectMajor(&h, &.{ &wm.obj, &ws.obj });
+    try h.verifyCollected();
+    try testing.expectEqual(@as(usize, 0), wm.kind.weak_map.entries.count());
+    try testing.expectEqual(@as(usize, 0), ws.kind.weak_set.entries.count());
+    try testing.expectEqual(baseline, h.bytes);
+
+    // 2. Ephemeron chain: k1 -> k2 -> k3 -> payload
+    const wm_chain = try h.newWeakMap(null);
+    const k1 = try h.newObject(null);
+    const k2 = try h.newObject(null);
+    const k3 = try h.newSymbol(null, false);
+    const payload = try h.newObject(null);
+    try h.weakMapSet(wm_chain, .{ .obj = &k1.obj }, .{ .object = k2 });
+    try h.weakMapSet(wm_chain, .{ .obj = &k2.obj }, .{ .symbol = k3 });
+    try h.weakMapSet(wm_chain, .{ .obj = @constCast(&k3.obj) }, .{ .object = payload });
+
+    // Minor GC with only wm_chain and k1 rooted -> chain keeps payload alive
+    try collectMinor(&h, &.{ &wm_chain.obj, &k1.obj });
+    try h.verifyCollected();
+    try testing.expectEqual(@as(usize, 3), wm_chain.kind.weak_map.entries.count());
+
+    // Major GC with only wm_chain and k1 rooted -> chain still keeps payload alive
+    collectMajor(&h, &.{ &wm_chain.obj, &k1.obj });
+    try h.verifyCollected();
+    try testing.expectEqual(@as(usize, 3), wm_chain.kind.weak_map.entries.count());
+
+    // Drop k1, major GC -> all 3 entries and k1/k2/k3/payload are collected
+    collectMajor(&h, &.{&wm_chain.obj});
+    try h.verifyCollected();
+    try testing.expectEqual(@as(usize, 0), wm_chain.kind.weak_map.entries.count());
+
+    // 3. Generational barrier: old WeakMap + young rooted key/value + young unrooted key
+    const old_wm = try h.newWeakMap(null);
+    collectMajor(&h, &.{&old_wm.obj});
+    try testing.expect(old_wm.obj.old);
+
+    const young_keep = try h.newObject(null);
+    const young_val = try h.newObject(null);
+    const young_drop = try h.newObject(null);
+    const young_drop_val = try h.newObject(null);
+    try h.weakMapSet(old_wm, .{ .obj = &young_keep.obj }, .{ .object = young_val });
+    try h.weakMapSet(old_wm, .{ .obj = &young_drop.obj }, .{ .object = young_drop_val });
+    try h.verify();
+
+    try collectMinor(&h, &.{&young_keep.obj});
+    try h.verifyCollected();
+    try testing.expect(heap.Heap.weakMapHas(old_wm, .{ .obj = &young_keep.obj }));
+    try testing.expectEqual(young_val, heap.Heap.weakMapGet(old_wm, .{ .obj = &young_keep.obj }).?.object);
+    try testing.expectEqual(@as(usize, 1), old_wm.kind.weak_map.entries.count());
+
+    // 4. Cyclic ephemeron: wm.set(k, k) -> once k is unreachable, major GC collects both
+    const cyc_k = try h.newObject(null);
+    try h.weakMapSet(old_wm, .{ .obj = &cyc_k.obj }, .{ .object = cyc_k });
+    try h.verify();
+    collectMajor(&h, &.{&old_wm.obj});
+    try h.verifyCollected();
+    try testing.expect(!heap.Heap.weakMapHas(old_wm, .{ .obj = &cyc_k.obj }));
+}

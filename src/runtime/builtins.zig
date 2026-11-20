@@ -47,6 +47,8 @@ pub const Realm = struct {
     function_namespace: *Object,
     map_prototype: *Object,
     set_prototype: *Object,
+    weak_map_prototype: *Object,
+    weak_set_prototype: *Object,
     promise_prototype: *Object,
     iterator_prototype: *Object,
     /// %GeneratorPrototype% (D67).
@@ -76,6 +78,8 @@ pub const Realm = struct {
     number_namespace: *Object,
     map_namespace: *Object,
     set_namespace: *Object,
+    weak_map_namespace: *Object,
+    weak_set_namespace: *Object,
     promise_namespace: *Object,
     error_namespace: *Object,
     type_error_namespace: *Object,
@@ -99,7 +103,7 @@ pub const Realm = struct {
     views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [47]*Object {
+    pub fn objects(r: *const Realm) [51]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -110,6 +114,8 @@ pub const Realm = struct {
             r.function_namespace,
             r.map_prototype,
             r.set_prototype,
+            r.weak_map_prototype,
+            r.weak_set_prototype,
             r.promise_prototype,
             r.iterator_prototype,
             r.generator_prototype,
@@ -135,6 +141,8 @@ pub const Realm = struct {
             r.number_namespace,
             r.map_namespace,
             r.set_namespace,
+            r.weak_map_namespace,
+            r.weak_set_namespace,
             r.promise_namespace,
             r.error_namespace,
             r.type_error_namespace,
@@ -210,6 +218,8 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .function_namespace = try builtin(h, null, .function_constructor),
         .map_prototype = try builtin(h, object_prototype, .map_prototype),
         .set_prototype = try builtin(h, object_prototype, .set_prototype),
+        .weak_map_prototype = try builtin(h, object_prototype, .weak_map_prototype),
+        .weak_set_prototype = try builtin(h, object_prototype, .weak_set_prototype),
         .promise_prototype = try builtin(h, object_prototype, .promise_prototype),
         .iterator_prototype = iterator_prototype,
         .generator_prototype = try builtin(h, iterator_prototype, .generator_prototype),
@@ -234,6 +244,8 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .number_namespace = try builtin(h, null, .number_constructor),
         .map_namespace = try builtin(h, null, .map_constructor),
         .set_namespace = try builtin(h, null, .set_constructor),
+        .weak_map_namespace = try builtin(h, null, .weak_map_constructor),
+        .weak_set_namespace = try builtin(h, null, .weak_set_constructor),
         .promise_namespace = try builtin(h, null, .promise_constructor),
         .error_namespace = try builtin(h, null, .error_constructor),
         .type_error_namespace = try builtin(h, null, .type_error_constructor),
@@ -386,6 +398,15 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.set_prototype, "isSubsetOf", &set_is_subset_of);
     try method(rt, r.set_prototype, "isSupersetOf", &set_is_superset_of);
     try method(rt, r.set_prototype, "isDisjointFrom", &set_is_disjoint_from);
+    try constant(rt, r.weak_map_prototype, "constructor", .{ .native = &weak_map_global });
+    try method(rt, r.weak_map_prototype, "get", &weak_map_get);
+    try method(rt, r.weak_map_prototype, "set", &weak_map_set);
+    try method(rt, r.weak_map_prototype, "has", &weak_map_has);
+    try method(rt, r.weak_map_prototype, "delete", &weak_map_delete);
+    try constant(rt, r.weak_set_prototype, "constructor", .{ .native = &weak_set_global });
+    try method(rt, r.weak_set_prototype, "add", &weak_set_add);
+    try method(rt, r.weak_set_prototype, "has", &weak_set_has);
+    try method(rt, r.weak_set_prototype, "delete", &weak_set_delete);
     try method(rt, r.promise_prototype, "then", &promise_then);
     try method(rt, r.promise_prototype, "catch", &promise_catch);
     try method(rt, r.promise_prototype, "finally", &promise_finally);
@@ -444,6 +465,8 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try constant(rt, r.number_namespace, "prototype", .{ .object = r.number_prototype });
     try constant(rt, r.map_namespace, "prototype", .{ .object = r.map_prototype });
     try constant(rt, r.set_namespace, "prototype", .{ .object = r.set_prototype });
+    try constant(rt, r.weak_map_namespace, "prototype", .{ .object = r.weak_map_prototype });
+    try constant(rt, r.weak_set_namespace, "prototype", .{ .object = r.weak_set_prototype });
     try constant(rt, r.promise_namespace, "prototype", .{ .object = r.promise_prototype });
     try method(rt, r.function_prototype, "call", &function_call);
     try method(rt, r.function_prototype, "apply", &function_apply);
@@ -486,6 +509,8 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     });
     try defineToStringTag(rt, r.map_prototype, r.sym_to_string_tag, "Map");
     try defineToStringTag(rt, r.set_prototype, r.sym_to_string_tag, "Set");
+    try defineToStringTag(rt, r.weak_map_prototype, r.sym_to_string_tag, "WeakMap");
+    try defineToStringTag(rt, r.weak_set_prototype, r.sym_to_string_tag, "WeakSet");
     try defineToStringTag(rt, r.promise_prototype, r.sym_to_string_tag, "Promise");
     try defineToStringTag(rt, r.symbol_prototype, r.sym_to_string_tag, "Symbol");
     try defineToStringTag(rt, r.math, r.sym_to_string_tag, "Math");
@@ -563,6 +588,8 @@ pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
         .function => r.function_namespace,
         .map => r.map_namespace,
         .set => r.set_namespace,
+        .weak_map => r.weak_map_namespace,
+        .weak_set => r.weak_set_namespace,
         .promise => r.promise_namespace,
         .@"error" => r.error_namespace,
         .type_error => r.type_error_namespace,
@@ -617,6 +644,8 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
         .function => r.function_prototype,
         .map => r.map_prototype,
         .set => r.set_prototype,
+        .weak_map => r.weak_map_prototype,
+        .weak_set => r.weak_set_prototype,
         .promise => r.promise_prototype,
         .@"error" => r.error_prototype,
         .type_error => r.type_error_prototype,
@@ -661,6 +690,8 @@ pub const encode_uri_component_global: Native = .{ .name = "encodeURIComponent",
 pub const decode_uri_component_global: Native = .{ .name = "decodeURIComponent", .call = globalDecodeURIComponent };
 pub const map_global: Native = .{ .name = "Map", .call = mapWithoutNew, .construct = mapConstruct, .namespace = .map };
 pub const set_global: Native = .{ .name = "Set", .call = setWithoutNew, .construct = setConstruct, .namespace = .set };
+pub const weak_map_global: Native = .{ .name = "WeakMap", .call = weakMapWithoutNew, .construct = weakMapConstruct, .namespace = .weak_map };
+pub const weak_set_global: Native = .{ .name = "WeakSet", .call = weakSetWithoutNew, .construct = weakSetConstruct, .namespace = .weak_set };
 pub const promise_global: Native = .{ .name = "Promise", .call = promiseWithoutNew, .construct = promiseConstruct, .namespace = .promise };
 pub const error_global: Native = .{ .name = "Error", .call = errorCall, .construct = errorConstruct, .namespace = .@"error" };
 pub const type_error_global: Native = .{ .name = "TypeError", .call = typeErrorCall, .construct = typeErrorConstruct, .namespace = .type_error };
@@ -705,6 +736,8 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "decodeURIComponent")) return .{ .native = &decode_uri_component_global };
     if (std.mem.eql(u8, name, "Map")) return .{ .native = &map_global };
     if (std.mem.eql(u8, name, "Set")) return .{ .native = &set_global };
+    if (std.mem.eql(u8, name, "WeakMap")) return .{ .native = &weak_map_global };
+    if (std.mem.eql(u8, name, "WeakSet")) return .{ .native = &weak_set_global };
     if (std.mem.eql(u8, name, "Promise")) return .{ .native = &promise_global };
     if (std.mem.eql(u8, name, "Error")) return .{ .native = &error_global };
     if (std.mem.eql(u8, name, "TypeError")) return .{ .native = &type_error_global };
@@ -2675,7 +2708,7 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                         return null;
                     }
                 },
-                .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view => {},
+                .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set => {},
             }
             if (o.props.count() == 0) return null;
             return o.props.get(try object.propKey(rt, k));
@@ -4727,6 +4760,151 @@ fn setIsDisjointFrom(rt: *Runtime, this: Value, args: []const Value) Error!Value
         }
     }
     return .{ .boolean = true };
+}
+
+// ---------------------------------------------------------------- WeakMap & WeakSet (M45, D75)
+
+const weak_map_get: Native = .{ .name = "get", .length = 1, .call = weakMapGet };
+const weak_map_set: Native = .{ .name = "set", .length = 2, .call = weakMapSet };
+const weak_map_has: Native = .{ .name = "has", .length = 1, .call = weakMapHas };
+const weak_map_delete: Native = .{ .name = "delete", .length = 1, .call = weakMapDelete };
+
+fn weakMapWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "Constructor WeakMap requires 'new'" }});
+}
+
+fn weakMapConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    const wm = try rt.heap.newWeakMap(r.weak_map_prototype);
+    const iterable = arg(args, 0);
+    if (iterable == .undefined or iterable == .null) return .{ .object = wm };
+
+    var root_buf = [_]Value{ iterable, .{ .object = wm }, .undefined, .undefined, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const adder = try requireCallable(rt, try object.get(rt, .{ .object = wm }, try object.named(rt, "set")));
+    root_buf[2] = adder;
+
+    const iter = try getIterator(rt, iterable);
+    root_buf[3] = .{ .object = iter };
+
+    while (try iteratorNextVal(rt, iter)) |entry| {
+        root_buf[4] = entry;
+        if (!entry.isObjectLike()) {
+            try iteratorClose(rt, iter, true);
+            return rt.throw(.TypeError, &.{.{ .ascii = "Iterator value is not an entry object" }});
+        }
+        const k = object.get(rt, entry, .{ .index = 0 }) catch |e| {
+            if (e == error.Thrown) try iteratorClose(rt, iter, true);
+            return e;
+        };
+        root_buf[5] = k;
+        const v = object.get(rt, entry, .{ .index = 1 }) catch |e| {
+            if (e == error.Thrown) try iteratorClose(rt, iter, true);
+            return e;
+        };
+        root_buf[6] = v;
+        _ = rt.callCallable(adder, .{ .object = wm }, &.{ k, v }) catch |e| {
+            if (e == error.Thrown) try iteratorClose(rt, iter, true);
+            return e;
+        };
+        root_buf[4] = .undefined;
+        root_buf[5] = .undefined;
+        root_buf[6] = .undefined;
+    }
+    return .{ .object = wm };
+}
+
+fn thisWeakMap(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
+    if (this == .object and this.object.kind == .weak_map) return this.object;
+    return rt.throw(.TypeError, &.{ .{ .ascii = "Method WeakMap.prototype." }, .{ .ascii = name }, .{ .ascii = " called on incompatible receiver" } });
+}
+
+fn weakMapGet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const wm = try thisWeakMap(rt, this, "get");
+    const key = heap_mod.WeakKey.fromValue(arg(args, 0)) orelse return .undefined;
+    return heap_mod.Heap.weakMapGet(wm, key) orelse .undefined;
+}
+
+fn weakMapSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const wm = try thisWeakMap(rt, this, "set");
+    const key = heap_mod.WeakKey.fromValue(arg(args, 0)) orelse return rt.throw(.TypeError, &.{.{ .ascii = "Invalid value used as weak map key" }});
+    try rt.heap.weakMapSet(wm, key, arg(args, 1));
+    return this;
+}
+
+fn weakMapHas(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const wm = try thisWeakMap(rt, this, "has");
+    const key = heap_mod.WeakKey.fromValue(arg(args, 0)) orelse return .{ .boolean = false };
+    return .{ .boolean = heap_mod.Heap.weakMapHas(wm, key) };
+}
+
+fn weakMapDelete(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const wm = try thisWeakMap(rt, this, "delete");
+    const key = heap_mod.WeakKey.fromValue(arg(args, 0)) orelse return .{ .boolean = false };
+    return .{ .boolean = heap_mod.Heap.weakMapDelete(wm, key) };
+}
+
+const weak_set_add: Native = .{ .name = "add", .length = 1, .call = weakSetAdd };
+const weak_set_has: Native = .{ .name = "has", .length = 1, .call = weakSetHas };
+const weak_set_delete: Native = .{ .name = "delete", .length = 1, .call = weakSetDelete };
+
+fn weakSetWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "Constructor WeakSet requires 'new'" }});
+}
+
+fn weakSetConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    const ws = try rt.heap.newWeakSet(r.weak_set_prototype);
+    const iterable = arg(args, 0);
+    if (iterable == .undefined or iterable == .null) return .{ .object = ws };
+
+    var root_buf = [_]Value{ iterable, .{ .object = ws }, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const adder = try requireCallable(rt, try object.get(rt, .{ .object = ws }, try object.named(rt, "add")));
+    root_buf[2] = adder;
+
+    const iter = try getIterator(rt, iterable);
+    root_buf[3] = .{ .object = iter };
+
+    while (try iteratorNextVal(rt, iter)) |v| {
+        root_buf[4] = v;
+        _ = rt.callCallable(adder, .{ .object = ws }, &.{v}) catch |e| {
+            if (e == error.Thrown) try iteratorClose(rt, iter, true);
+            return e;
+        };
+        root_buf[4] = .undefined;
+    }
+    return .{ .object = ws };
+}
+
+fn thisWeakSet(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
+    if (this == .object and this.object.kind == .weak_set) return this.object;
+    return rt.throw(.TypeError, &.{ .{ .ascii = "Method WeakSet.prototype." }, .{ .ascii = name }, .{ .ascii = " called on incompatible receiver" } });
+}
+
+fn weakSetAdd(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const ws = try thisWeakSet(rt, this, "add");
+    const key = heap_mod.WeakKey.fromValue(arg(args, 0)) orelse return rt.throw(.TypeError, &.{.{ .ascii = "Invalid value used in weak set" }});
+    try rt.heap.weakSetAdd(ws, key);
+    return this;
+}
+
+fn weakSetHas(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const ws = try thisWeakSet(rt, this, "has");
+    const key = heap_mod.WeakKey.fromValue(arg(args, 0)) orelse return .{ .boolean = false };
+    return .{ .boolean = heap_mod.Heap.weakSetHas(ws, key) };
+}
+
+fn weakSetDelete(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const ws = try thisWeakSet(rt, this, "delete");
+    const key = heap_mod.WeakKey.fromValue(arg(args, 0)) orelse return .{ .boolean = false };
+    return .{ .boolean = heap_mod.Heap.weakSetDelete(ws, key) };
 }
 
 // ---------------------------------------------------------------- Promise (M18)

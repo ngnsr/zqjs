@@ -120,6 +120,7 @@ const Context = struct {
             .promise => |p| {
                 if (p.state != .pending) try ctx.scanCycles(p.result, depth + 1);
             },
+            .weak_map, .weak_set => {},
             else => {},
         }
 
@@ -330,6 +331,14 @@ const Context = struct {
                 try ctx.w.writeAll(" ]");
                 return;
             },
+            .weak_map => {
+                try ctx.w.print("WeakMap {{ {s}<items unknown>{s} }}", .{ ctx.style(Ansi.cyan), ctx.reset() });
+                return;
+            },
+            .weak_set => {
+                try ctx.w.print("WeakSet {{ {s}<items unknown>{s} }}", .{ ctx.style(Ansi.cyan), ctx.reset() });
+                return;
+            },
             else => {},
         }
 
@@ -338,6 +347,8 @@ const Context = struct {
                 .array => "[Array]",
                 .map => "[Map]",
                 .set => "[Set]",
+                .weak_map => "[WeakMap]",
+                .weak_set => "[WeakSet]",
                 else => "[Object]",
             };
             try ctx.w.print("{s}{s}{s}", .{ ctx.style(Ansi.cyan), label, ctx.reset() });

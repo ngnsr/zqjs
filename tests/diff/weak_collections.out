@@ -1,0 +1,24 @@
+wm no-new: TypeError
+ws no-new: TypeError
+wm1: 10 fn true sym true false
+ws1: true true true true false
+wm null: false false
+ws null: false false
+wm bad entry: TypeError closed: true
+wm bad key: TypeError closed: true
+ws bad key: TypeError closed: true
+invalids ok
+chain wm: true b cls nat
+del wm: true false false undefined
+chain ws: true true true
+del ws: true false false
+instanceof: true true
+toString: [object WeakMap] [object WeakSet]
+ctor: true true
+recv: TypeError
+recv: TypeError
+recv: TypeError
+recv: TypeError
+recv: TypeError
+recv: TypeError
+recv: TypeError

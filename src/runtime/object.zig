@@ -309,7 +309,7 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
                 return null;
             }
         },
-        .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view => {},
+        .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set => {},
     }
     if (o.props.count() == 0) return null; // don't intern index keys just to miss
     return o.props.get(try propKey(rt, k));
@@ -558,7 +558,7 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!v
                         return;
                     }
                 },
-                .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view => {},
+                .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set => {},
             }
             const pk = try propKey(rt, k);
             if (!o.extensible and !o.props.contains(pk)) {
@@ -762,7 +762,7 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
                 return validIntegerIndex(ta, n) == null;
             }
         },
-        .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view => {},
+        .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set => {},
     }
     if (o.props.count() == 0) return true;
     const pk = try propKey(rt, k);
@@ -972,7 +972,7 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
             for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
         .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
-        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set => {},
     }
     const first_named = out.items.len;
     try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false, false);
@@ -989,7 +989,7 @@ pub fn ownPropertyNames(rt: *Runtime, o: *Object) Error![]Key {
             for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
         .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
-        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set => {},
     }
     const first_named = out.items.len;
     try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false, true);
@@ -1006,7 +1006,7 @@ pub fn ownAllKeys(rt: *Runtime, o: *Object) Error![]Key {
             for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
         .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
-        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set => {},
     }
     const first_named = out.items.len;
     try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, true, false);

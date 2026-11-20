@@ -20,6 +20,10 @@ pub const Builtin = enum {
     map_prototype,
     set_constructor,
     set_prototype,
+    weak_map_constructor,
+    weak_map_prototype,
+    weak_set_constructor,
+    weak_set_prototype,
     promise_constructor,
     promise_prototype,
     iterator_prototype,
@@ -96,6 +100,10 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .map_prototype => map_prototype.has(name),
         .set_constructor => set_constructor.has(name),
         .set_prototype => set_prototype.has(name),
+        .weak_map_constructor => weak_map_constructor.has(name),
+        .weak_map_prototype => weak_map_prototype.has(name),
+        .weak_set_constructor => weak_set_constructor.has(name),
+        .weak_set_prototype => weak_set_prototype.has(name),
         .promise_constructor => promise_constructor.has(name),
         .promise_prototype => promise_prototype.has(name),
         .iterator_prototype => iterator_prototype.has(name),
@@ -487,6 +495,35 @@ const set_prototype = std.StaticStringMap(void).initComptime(.{
     .{"symmetricDifference"},
     .{"union"},
     .{"values"},
+});
+
+const weak_map_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const weak_map_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"delete"},
+    .{"get"},
+    .{"getOrInsert"},
+    .{"getOrInsertComputed"},
+    .{"has"},
+    .{"set"},
+});
+
+const weak_set_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const weak_set_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"add"},
+    .{"constructor"},
+    .{"delete"},
+    .{"has"},
 });
 
 const promise_constructor = std.StaticStringMap(void).initComptime(.{

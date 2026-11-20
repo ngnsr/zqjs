@@ -96,6 +96,7 @@ pub const Realm = struct {
     sym_has_instance: *heap_mod.Symbol,
     math: *Object,
     json: *Object,
+    views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
     pub fn objects(r: *const Realm) [47]*Object {
@@ -147,6 +148,46 @@ pub const Realm = struct {
             r.symbol_namespace,
             r.math,
             r.json,
+        };
+    }
+};
+
+pub const ViewsRealm = struct {
+    array_buffer_prototype: *Object,
+    array_buffer_namespace: *Object,
+    data_view_prototype: *Object,
+    data_view_namespace: *Object,
+    typed_array_prototype: *Object,
+    typed_array_namespace: *Object,
+    typed_array_prototypes: [9]*Object,
+    typed_array_namespaces: [9]*Object,
+
+    pub fn objects(v: *const ViewsRealm) [24]*Object {
+        return .{
+            v.array_buffer_prototype,
+            v.array_buffer_namespace,
+            v.data_view_prototype,
+            v.data_view_namespace,
+            v.typed_array_prototype,
+            v.typed_array_namespace,
+            v.typed_array_prototypes[0],
+            v.typed_array_prototypes[1],
+            v.typed_array_prototypes[2],
+            v.typed_array_prototypes[3],
+            v.typed_array_prototypes[4],
+            v.typed_array_prototypes[5],
+            v.typed_array_prototypes[6],
+            v.typed_array_prototypes[7],
+            v.typed_array_prototypes[8],
+            v.typed_array_namespaces[0],
+            v.typed_array_namespaces[1],
+            v.typed_array_namespaces[2],
+            v.typed_array_namespaces[3],
+            v.typed_array_namespaces[4],
+            v.typed_array_namespaces[5],
+            v.typed_array_namespaces[6],
+            v.typed_array_namespaces[7],
+            v.typed_array_namespaces[8],
         };
     }
 };
@@ -510,6 +551,35 @@ pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
         .aggregate_error => r.aggregate_error_namespace,
         .regexp => r.regexp_namespace,
         .symbol => r.symbol_namespace,
+        .array_buffer => (try viewsRealm(rt)).array_buffer_namespace,
+        .data_view => (try viewsRealm(rt)).data_view_namespace,
+        .typed_array => (try viewsRealm(rt)).typed_array_namespace,
+        .int8_array => (try viewsRealm(rt)).typed_array_namespaces[0],
+        .uint8_array => (try viewsRealm(rt)).typed_array_namespaces[1],
+        .uint8_clamped_array => (try viewsRealm(rt)).typed_array_namespaces[2],
+        .int16_array => (try viewsRealm(rt)).typed_array_namespaces[3],
+        .uint16_array => (try viewsRealm(rt)).typed_array_namespaces[4],
+        .int32_array => (try viewsRealm(rt)).typed_array_namespaces[5],
+        .uint32_array => (try viewsRealm(rt)).typed_array_namespaces[6],
+        .float32_array => (try viewsRealm(rt)).typed_array_namespaces[7],
+        .float64_array => (try viewsRealm(rt)).typed_array_namespaces[8],
+    };
+}
+
+pub fn nativeProto(rt: *Runtime, n: *const Native) Error!Value {
+    const ns = n.namespace orelse return .{ .object = (try realm(rt)).function_prototype };
+    return switch (ns) {
+        .int8_array,
+        .uint8_array,
+        .uint8_clamped_array,
+        .int16_array,
+        .uint16_array,
+        .int32_array,
+        .uint32_array,
+        .float32_array,
+        .float64_array,
+        => .{ .native = &typed_array_global },
+        else => .{ .object = (try realm(rt)).function_prototype },
     };
 }
 
@@ -535,6 +605,18 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
         .aggregate_error => r.aggregate_error_prototype,
         .regexp => r.regexp_prototype,
         .symbol => r.symbol_prototype,
+        .array_buffer => (try viewsRealm(rt)).array_buffer_prototype,
+        .data_view => (try viewsRealm(rt)).data_view_prototype,
+        .typed_array => (try viewsRealm(rt)).typed_array_prototype,
+        .int8_array => (try viewsRealm(rt)).typed_array_prototypes[0],
+        .uint8_array => (try viewsRealm(rt)).typed_array_prototypes[1],
+        .uint8_clamped_array => (try viewsRealm(rt)).typed_array_prototypes[2],
+        .int16_array => (try viewsRealm(rt)).typed_array_prototypes[3],
+        .uint16_array => (try viewsRealm(rt)).typed_array_prototypes[4],
+        .int32_array => (try viewsRealm(rt)).typed_array_prototypes[5],
+        .uint32_array => (try viewsRealm(rt)).typed_array_prototypes[6],
+        .float32_array => (try viewsRealm(rt)).typed_array_prototypes[7],
+        .float64_array => (try viewsRealm(rt)).typed_array_prototypes[8],
     };
 }
 
@@ -603,6 +685,17 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "AggregateError")) return .{ .native = &aggregate_error_global };
     if (std.mem.eql(u8, name, "RegExp")) return .{ .native = &regexp_global };
     if (std.mem.eql(u8, name, "Symbol")) return .{ .native = &symbol_global };
+    if (std.mem.eql(u8, name, "ArrayBuffer")) return .{ .native = &array_buffer_global };
+    if (std.mem.eql(u8, name, "DataView")) return .{ .native = &data_view_global };
+    if (std.mem.eql(u8, name, "Int8Array")) return .{ .native = &typed_array_ctors[0] };
+    if (std.mem.eql(u8, name, "Uint8Array")) return .{ .native = &typed_array_ctors[1] };
+    if (std.mem.eql(u8, name, "Uint8ClampedArray")) return .{ .native = &typed_array_ctors[2] };
+    if (std.mem.eql(u8, name, "Int16Array")) return .{ .native = &typed_array_ctors[3] };
+    if (std.mem.eql(u8, name, "Uint16Array")) return .{ .native = &typed_array_ctors[4] };
+    if (std.mem.eql(u8, name, "Int32Array")) return .{ .native = &typed_array_ctors[5] };
+    if (std.mem.eql(u8, name, "Uint32Array")) return .{ .native = &typed_array_ctors[6] };
+    if (std.mem.eql(u8, name, "Float32Array")) return .{ .native = &typed_array_ctors[7] };
+    if (std.mem.eql(u8, name, "Float64Array")) return .{ .native = &typed_array_ctors[8] };
     if (std.mem.eql(u8, name, "Math")) return .{ .object = (try realm(rt)).math };
     if (std.mem.eql(u8, name, "JSON")) return .{ .object = (try realm(rt)).json };
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return .{ .native = n };
@@ -2268,7 +2361,20 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                         }
                     }
                 },
-                .ordinary, .map, .set, .iterator, .promise, .generator => {},
+                .typed_array => |ta| {
+                    if (object.canonicalNumericIndex(k)) |n| {
+                        if (object.validIntegerIndex(ta, n)) |idx| {
+                            return .{
+                                .value = object.readTypedArrayElement(ta, idx),
+                                .enumerable = true,
+                                .writable = true,
+                                .configurable = true,
+                            };
+                        }
+                        return null;
+                    }
+                },
+                .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view => {},
             }
             if (o.props.count() == 0) return null;
             return o.props.get(try object.propKey(rt, k));
@@ -2826,6 +2932,9 @@ fn setIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!Value {
                 .regexp => if (freeze) {
                     o.regexp_last_index_writable = false;
                 },
+                .typed_array => |ta| if (ta.length > 0) {
+                    return rt.throw(.TypeError, &.{.{ .ascii = "Cannot freeze array buffer views with elements" }});
+                },
                 else => {},
             }
         },
@@ -2863,6 +2972,7 @@ fn testIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!bool {
                     if (freeze and o.array_length_writable) return false;
                 },
                 .regexp => if (freeze and o.regexp_last_index_writable) return false,
+                .typed_array => |ta| if (freeze and ta.length > 0) return false,
                 else => {},
             }
             return true;
@@ -4434,17 +4544,32 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
             }
         },
         .array_values, .array_keys, .array_entries => {
-            const items = it.target.object.kind.array.items;
-            if (it.cursor < items.len) {
-                const i = it.cursor;
-                it.cursor += 1;
-                const idx_val: Value = .{ .number = @floatFromInt(i) };
-                return switch (it.kind) {
-                    .array_values => items[i],
-                    .array_keys => idx_val,
-                    .array_entries => try makePairArray(rt, idx_val, items[i]),
-                    else => unreachable,
-                };
+            if (it.target.object.kind == .typed_array) {
+                const ta = it.target.object.kind.typed_array;
+                if (!ta.buffer.kind.array_buffer.detached and it.cursor < ta.length) {
+                    const i = it.cursor;
+                    it.cursor += 1;
+                    const idx_val: Value = .{ .number = @floatFromInt(i) };
+                    return switch (it.kind) {
+                        .array_values => object.readTypedArrayElement(ta, i),
+                        .array_keys => idx_val,
+                        .array_entries => try makePairArray(rt, idx_val, object.readTypedArrayElement(ta, i)),
+                        else => unreachable,
+                    };
+                }
+            } else {
+                const items = it.target.object.kind.array.items;
+                if (it.cursor < items.len) {
+                    const i = it.cursor;
+                    it.cursor += 1;
+                    const idx_val: Value = .{ .number = @floatFromInt(i) };
+                    return switch (it.kind) {
+                        .array_values => items[i],
+                        .array_keys => idx_val,
+                        .array_entries => try makePairArray(rt, idx_val, items[i]),
+                        else => unreachable,
+                    };
+                }
             }
         },
         .string_chars => {
@@ -5824,4 +5949,1355 @@ pub fn getTemplateObjectFromUnits(
     try object.define(rt, arr, try object.named(rt, "raw"), root_buf[1]);
     try rt.template_cache.put(rt.gpa, key, arr);
     return .{ .object = arr };
+}
+
+// ---------------------------------------------------------------- ArrayBuffer, TypedArray & DataView (M43, D73)
+
+pub const array_buffer_global: Native = .{
+    .name = "ArrayBuffer",
+    .length = 1,
+    .call = arrayBufferWithoutNew,
+    .construct = arrayBufferConstruct,
+    .namespace = .array_buffer,
+};
+
+pub const data_view_global: Native = .{
+    .name = "DataView",
+    .length = 1,
+    .call = dataViewWithoutNew,
+    .construct = dataViewConstruct,
+    .namespace = .data_view,
+};
+
+pub const typed_array_global: Native = .{
+    .name = "TypedArray",
+    .length = 0,
+    .call = typedArrayAbstractCall,
+    .construct = typedArrayAbstractConstruct,
+    .namespace = .typed_array,
+};
+
+pub const typed_array_ctors: [9]Native = .{
+    .{ .name = "Int8Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructInt8, .namespace = .int8_array },
+    .{ .name = "Uint8Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructUint8, .namespace = .uint8_array },
+    .{ .name = "Uint8ClampedArray", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructUint8Clamped, .namespace = .uint8_clamped_array },
+    .{ .name = "Int16Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructInt16, .namespace = .int16_array },
+    .{ .name = "Uint16Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructUint16, .namespace = .uint16_array },
+    .{ .name = "Int32Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructInt32, .namespace = .int32_array },
+    .{ .name = "Uint32Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructUint32, .namespace = .uint32_array },
+    .{ .name = "Float32Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructFloat32, .namespace = .float32_array },
+    .{ .name = "Float64Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructFloat64, .namespace = .float64_array },
+};
+
+pub fn viewsRealm(rt: *Runtime) Error!*const ViewsRealm {
+    _ = try realm(rt);
+    const r = &rt.realm.?;
+    if (r.views) |*v| return v;
+    const h = &rt.heap;
+    var v: ViewsRealm = .{
+        .array_buffer_prototype = try builtin(h, r.object_prototype, .array_buffer_prototype),
+        .array_buffer_namespace = try builtin(h, null, .array_buffer_constructor),
+        .data_view_prototype = try builtin(h, r.object_prototype, .data_view_prototype),
+        .data_view_namespace = try builtin(h, null, .data_view_constructor),
+        .typed_array_prototype = try builtin(h, r.object_prototype, .typed_array_prototype),
+        .typed_array_namespace = try builtin(h, null, .typed_array_constructor),
+        .typed_array_prototypes = undefined,
+        .typed_array_namespaces = undefined,
+    };
+    const ta_proto_builtins = [_]names.Builtin{
+        .int8_array_prototype,
+        .uint8_array_prototype,
+        .uint8_clamped_array_prototype,
+        .int16_array_prototype,
+        .uint16_array_prototype,
+        .int32_array_prototype,
+        .uint32_array_prototype,
+        .float32_array_prototype,
+        .float64_array_prototype,
+    };
+    const ta_ctor_builtins = [_]names.Builtin{
+        .int8_array_constructor,
+        .uint8_array_constructor,
+        .uint8_clamped_array_constructor,
+        .int16_array_constructor,
+        .uint16_array_constructor,
+        .int32_array_constructor,
+        .uint32_array_constructor,
+        .float32_array_constructor,
+        .float64_array_constructor,
+    };
+    for (0..9) |i| {
+        v.typed_array_prototypes[i] = try builtin(h, v.typed_array_prototype, ta_proto_builtins[i]);
+        v.typed_array_namespaces[i] = try builtin(h, null, ta_ctor_builtins[i]);
+    }
+    try initArrayBufferAndViews(rt, r, &v);
+    r.views = v;
+    return &r.views.?;
+}
+
+fn initArrayBufferAndViews(rt: *Runtime, r: *const Realm, v: *ViewsRealm) Error!void {
+    // ArrayBuffer
+    try rt.heap.defineProperty(v.array_buffer_namespace, try rt.heap.internAscii("prototype"), .{
+        .value = .{ .object = v.array_buffer_prototype },
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
+    try method(rt, v.array_buffer_namespace, "isView", &ab_is_view);
+    try constant(rt, v.array_buffer_prototype, "constructor", .{ .native = &array_buffer_global });
+    try object.defineAccessor(rt, .{ .object = v.array_buffer_prototype }, try object.named(rt, "byteLength"), .{ .native = &ab_byte_length_getter }, false, false);
+    try method(rt, v.array_buffer_prototype, "slice", &ab_slice);
+    try defineToStringTag(rt, v.array_buffer_prototype, r.sym_to_string_tag, "ArrayBuffer");
+
+    // DataView
+    try rt.heap.defineProperty(v.data_view_namespace, try rt.heap.internAscii("prototype"), .{
+        .value = .{ .object = v.data_view_prototype },
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
+    try constant(rt, v.data_view_prototype, "constructor", .{ .native = &data_view_global });
+    try object.defineAccessor(rt, .{ .object = v.data_view_prototype }, try object.named(rt, "buffer"), .{ .native = &dv_buffer_getter }, false, false);
+    try object.defineAccessor(rt, .{ .object = v.data_view_prototype }, try object.named(rt, "byteLength"), .{ .native = &dv_byte_length_getter }, false, false);
+    try object.defineAccessor(rt, .{ .object = v.data_view_prototype }, try object.named(rt, "byteOffset"), .{ .native = &dv_byte_offset_getter }, false, false);
+    try method(rt, v.data_view_prototype, "getInt8", &dv_get_int8);
+    try method(rt, v.data_view_prototype, "setInt8", &dv_set_int8);
+    try method(rt, v.data_view_prototype, "getUint8", &dv_get_uint8);
+    try method(rt, v.data_view_prototype, "setUint8", &dv_set_uint8);
+    try method(rt, v.data_view_prototype, "getInt16", &dv_get_int16);
+    try method(rt, v.data_view_prototype, "setInt16", &dv_set_int16);
+    try method(rt, v.data_view_prototype, "getUint16", &dv_get_uint16);
+    try method(rt, v.data_view_prototype, "setUint16", &dv_set_uint16);
+    try method(rt, v.data_view_prototype, "getInt32", &dv_get_int32);
+    try method(rt, v.data_view_prototype, "setInt32", &dv_set_int32);
+    try method(rt, v.data_view_prototype, "getUint32", &dv_get_uint32);
+    try method(rt, v.data_view_prototype, "setUint32", &dv_set_uint32);
+    try method(rt, v.data_view_prototype, "getFloat32", &dv_get_float32);
+    try method(rt, v.data_view_prototype, "setFloat32", &dv_set_float32);
+    try method(rt, v.data_view_prototype, "getFloat64", &dv_get_float64);
+    try method(rt, v.data_view_prototype, "setFloat64", &dv_set_float64);
+    try defineToStringTag(rt, v.data_view_prototype, r.sym_to_string_tag, "DataView");
+
+    // %TypedArray%
+    try rt.heap.defineProperty(v.typed_array_namespace, try rt.heap.internAscii("prototype"), .{
+        .value = .{ .object = v.typed_array_prototype },
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
+    try method(rt, v.typed_array_namespace, "from", &ta_from);
+    try method(rt, v.typed_array_namespace, "of", &ta_of);
+    try constant(rt, v.typed_array_prototype, "constructor", .{ .native = &typed_array_global });
+    try object.defineAccessor(rt, .{ .object = v.typed_array_prototype }, try object.named(rt, "buffer"), .{ .native = &ta_buffer_getter }, false, false);
+    try object.defineAccessor(rt, .{ .object = v.typed_array_prototype }, try object.named(rt, "byteLength"), .{ .native = &ta_byte_length_getter }, false, false);
+    try object.defineAccessor(rt, .{ .object = v.typed_array_prototype }, try object.named(rt, "byteOffset"), .{ .native = &ta_byte_offset_getter }, false, false);
+    try object.defineAccessor(rt, .{ .object = v.typed_array_prototype }, try object.named(rt, "length"), .{ .native = &ta_length_getter }, false, false);
+    try object.defineAccessor(rt, .{ .object = v.typed_array_prototype }, .{ .symbol = r.sym_to_string_tag }, .{ .native = &ta_to_string_tag_getter }, false, false);
+    try method(rt, v.typed_array_prototype, "set", &ta_set);
+    try method(rt, v.typed_array_prototype, "subarray", &ta_subarray);
+    try method(rt, v.typed_array_prototype, "slice", &ta_slice);
+    try method(rt, v.typed_array_prototype, "fill", &ta_fill);
+    try method(rt, v.typed_array_prototype, "copyWithin", &ta_copy_within);
+    try method(rt, v.typed_array_prototype, "reverse", &ta_reverse);
+    try method(rt, v.typed_array_prototype, "sort", &ta_sort);
+    try method(rt, v.typed_array_prototype, "indexOf", &ta_index_of);
+    try method(rt, v.typed_array_prototype, "lastIndexOf", &ta_last_index_of);
+    try method(rt, v.typed_array_prototype, "includes", &ta_includes);
+    try method(rt, v.typed_array_prototype, "find", &ta_find);
+    try method(rt, v.typed_array_prototype, "findIndex", &ta_find_index);
+    try method(rt, v.typed_array_prototype, "findLast", &ta_find_last);
+    try method(rt, v.typed_array_prototype, "findLastIndex", &ta_find_last_index);
+    try method(rt, v.typed_array_prototype, "every", &ta_every);
+    try method(rt, v.typed_array_prototype, "some", &ta_some);
+    try method(rt, v.typed_array_prototype, "forEach", &ta_for_each);
+    try method(rt, v.typed_array_prototype, "map", &ta_map);
+    try method(rt, v.typed_array_prototype, "filter", &ta_filter);
+    try method(rt, v.typed_array_prototype, "reduce", &ta_reduce);
+    try method(rt, v.typed_array_prototype, "reduceRight", &ta_reduce_right);
+    try method(rt, v.typed_array_prototype, "at", &ta_at);
+    try method(rt, v.typed_array_prototype, "join", &ta_join);
+    try method(rt, v.typed_array_prototype, "toString", &array_to_string);
+    try method(rt, v.typed_array_prototype, "keys", &ta_keys);
+    try method(rt, v.typed_array_prototype, "values", &ta_values);
+    try method(rt, v.typed_array_prototype, "entries", &ta_entries);
+    try symbolMethod(rt, v.typed_array_prototype, r.sym_iterator, &ta_values);
+
+    // 9 concrete TypedArray constructors & prototypes
+    const bpe_atom = try rt.heap.internAscii("BYTES_PER_ELEMENT");
+    const proto_atom = try rt.heap.internAscii("prototype");
+    const ctor_atom = try rt.heap.internAscii("constructor");
+    for (0..9) |i| {
+        const kind: heap_mod.TypedArrayKind = @fromBackingInt(@intCast(i));
+        const bpe_val: Value = .{ .number = @floatFromInt(kind.bytesPerElement()) };
+        const ns = v.typed_array_namespaces[i];
+        const proto = v.typed_array_prototypes[i];
+        try rt.heap.defineProperty(ns, proto_atom, .{
+            .value = .{ .object = proto },
+            .enumerable = false,
+            .writable = false,
+            .configurable = false,
+        });
+        try rt.heap.defineProperty(ns, bpe_atom, .{
+            .value = bpe_val,
+            .enumerable = false,
+            .writable = false,
+            .configurable = false,
+        });
+        try rt.heap.defineProperty(proto, ctor_atom, .{
+            .value = .{ .native = &typed_array_ctors[i] },
+            .enumerable = false,
+            .writable = true,
+            .configurable = true,
+        });
+        try rt.heap.defineProperty(proto, bpe_atom, .{
+            .value = bpe_val,
+            .enumerable = false,
+            .writable = false,
+            .configurable = false,
+        });
+    }
+}
+
+fn toIndex(rt: *Runtime, v: Value) Error!usize {
+    if (v == .undefined) return 0;
+    const n = try toIntegerOrInfinity(rt, v);
+    if (n < 0 or n > 9007199254740991.0) {
+        return rt.throw(.RangeError, &.{.{ .ascii = "Invalid array buffer length" }});
+    }
+    const max_usize_f: f64 = @floatFromInt(std.math.maxInt(usize));
+    if (n > max_usize_f) return rt.heap.exceeded(.heap_bytes);
+    return @intFromFloat(n);
+}
+
+fn relativeIndex(rt: *Runtime, v: Value, len: usize, default_val: usize) Error!usize {
+    if (v == .undefined) return default_val;
+    const n = try toIntegerOrInfinity(rt, v);
+    const len_f: f64 = @floatFromInt(len);
+    if (n < 0) {
+        const res = len_f + n;
+        return if (res <= 0) 0 else @intFromFloat(res);
+    }
+    return if (n >= len_f) len else @intFromFloat(n);
+}
+
+// ---- ArrayBuffer
+
+fn arrayBufferWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "Constructor ArrayBuffer requires 'new'" }});
+}
+
+fn arrayBufferConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const byte_len = try toIndex(rt, arg(args, 0));
+    const vr = try viewsRealm(rt);
+    return .{ .object = try rt.heap.newArrayBuffer(vr.array_buffer_prototype, byte_len) };
+}
+
+const ab_is_view: Native = .{ .name = "isView", .length = 1, .call = abIsView };
+const ab_byte_length_getter: Native = .{ .name = "get byteLength", .call = abByteLengthGetter };
+const ab_slice: Native = .{ .name = "slice", .length = 2, .call = abSlice };
+
+fn abIsView(_: *Runtime, _: Value, args: []const Value) Error!Value {
+    const v = arg(args, 0);
+    if (v != .object) return .{ .boolean = false };
+    return .{ .boolean = switch (v.object.kind) {
+        .typed_array, .data_view => true,
+        else => false,
+    } };
+}
+
+fn requireArrayBuffer(rt: *Runtime, v: Value) Error!*Object {
+    if (v != .object or v.object.kind != .array_buffer) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Method ArrayBuffer.prototype called on incompatible receiver" }});
+    }
+    return v.object;
+}
+
+fn abByteLengthGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireArrayBuffer(rt, this);
+    const ab = o.kind.array_buffer;
+    return .{ .number = if (ab.detached) 0 else @floatFromInt(ab.data.len) };
+}
+
+fn abSlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireArrayBuffer(rt, this);
+    var root_buf = [_]Value{this};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    if (o.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot slice a detached ArrayBuffer" }});
+    const len = o.kind.array_buffer.data.len;
+    const first = try relativeIndex(rt, arg(args, 0), len, 0);
+    const final = try relativeIndex(rt, arg(args, 1), len, len);
+    const new_len = if (final > first) final - first else 0;
+    const vr = try viewsRealm(rt);
+    const new_ab = try rt.heap.newArrayBuffer(vr.array_buffer_prototype, new_len);
+    if (new_len > 0) {
+        @memcpy(new_ab.kind.array_buffer.data, o.kind.array_buffer.data[first .. first + new_len]);
+    }
+    return .{ .object = new_ab };
+}
+
+// ---- DataView
+
+fn dataViewWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "Constructor DataView requires 'new'" }});
+}
+
+fn dataViewConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const buf_val = arg(args, 0);
+    if (buf_val != .object or buf_val.object.kind != .array_buffer) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "First argument to DataView constructor must be an ArrayBuffer" }});
+    }
+    var root_buf = [_]Value{buf_val};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const offset = try toIndex(rt, arg(args, 1));
+    const ab = buf_val.object.kind.array_buffer;
+    if (ab.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot construct DataView on a detached ArrayBuffer" }});
+    if (offset > ab.data.len) return rt.throw(.RangeError, &.{.{ .ascii = "Start offset is outside the bounds of the buffer" }});
+    const view_byte_len: usize = if (arg(args, 2) == .undefined)
+        ab.data.len - offset
+    else blk: {
+        const l = try toIndex(rt, arg(args, 2));
+        const end = std.math.add(usize, offset, l) catch return rt.throw(.RangeError, &.{.{ .ascii = "Invalid DataView length" }});
+        if (end > ab.data.len) return rt.throw(.RangeError, &.{.{ .ascii = "Invalid DataView length" }});
+        break :blk l;
+    };
+    const vr = try viewsRealm(rt);
+    return .{ .object = try rt.heap.newDataView(vr.data_view_prototype, buf_val.object, offset, view_byte_len) };
+}
+
+fn requireDataView(rt: *Runtime, this: Value) Error!*Object {
+    if (this != .object or this.object.kind != .data_view) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Method DataView.prototype called on incompatible receiver" }});
+    }
+    return this.object;
+}
+
+const dv_buffer_getter: Native = .{ .name = "get buffer", .call = dvBufferGetter };
+const dv_byte_length_getter: Native = .{ .name = "get byteLength", .call = dvByteLengthGetter };
+const dv_byte_offset_getter: Native = .{ .name = "get byteOffset", .call = dvByteOffsetGetter };
+
+fn dvBufferGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireDataView(rt, this);
+    return .{ .object = o.kind.data_view.buffer };
+}
+
+fn dvByteLengthGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireDataView(rt, this);
+    const dv = o.kind.data_view;
+    if (dv.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
+    return .{ .number = @floatFromInt(dv.byte_length) };
+}
+
+fn dvByteOffsetGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireDataView(rt, this);
+    const dv = o.kind.data_view;
+    if (dv.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
+    return .{ .number = @floatFromInt(dv.byte_offset) };
+}
+
+const DataViewElem = enum { int8, uint8, int16, uint16, int32, uint32, float32, float64 };
+
+fn dvElemSize(comptime elem: DataViewElem) usize {
+    return switch (elem) {
+        .int8, .uint8 => 1,
+        .int16, .uint16 => 2,
+        .int32, .uint32, .float32 => 4,
+        .float64 => 8,
+    };
+}
+
+fn dvGet(comptime elem: DataViewElem, rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireDataView(rt, this);
+    var root_buf = [_]Value{this};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const get_idx = try toIndex(rt, arg(args, 0));
+    const little = ops.toBoolean(arg(args, 1));
+    const dv = o.kind.data_view;
+    if (dv.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
+    const size = dvElemSize(elem);
+    const end = std.math.add(usize, get_idx, size) catch return rt.throw(.RangeError, &.{.{ .ascii = "Offset is outside the bounds of the DataView" }});
+    if (end > dv.byte_length) return rt.throw(.RangeError, &.{.{ .ascii = "Offset is outside the bounds of the DataView" }});
+    const bytes = dv.buffer.kind.array_buffer.data[dv.byte_offset + get_idx ..];
+    const endian: std.builtin.Endian = if (little) .little else .big;
+    return .{ .number = switch (elem) {
+        .int8 => @floatFromInt(@as(i8, @bitCast(bytes[0]))),
+        .uint8 => @floatFromInt(bytes[0]),
+        .int16 => @floatFromInt(std.mem.readInt(i16, bytes[0..2], endian)),
+        .uint16 => @floatFromInt(std.mem.readInt(u16, bytes[0..2], endian)),
+        .int32 => @floatFromInt(std.mem.readInt(i32, bytes[0..4], endian)),
+        .uint32 => @floatFromInt(std.mem.readInt(u32, bytes[0..4], endian)),
+        .float32 => @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, bytes[0..4], endian)))),
+        .float64 => @bitCast(std.mem.readInt(u64, bytes[0..8], endian)),
+    } };
+}
+
+fn dvSet(comptime elem: DataViewElem, rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireDataView(rt, this);
+    var root_buf = [_]Value{this};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const get_idx = try toIndex(rt, arg(args, 0));
+    const n = try ops.toNumber(rt, arg(args, 1));
+    const little = ops.toBoolean(arg(args, 2));
+    const dv = o.kind.data_view;
+    if (dv.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
+    const size = dvElemSize(elem);
+    const end = std.math.add(usize, get_idx, size) catch return rt.throw(.RangeError, &.{.{ .ascii = "Offset is outside the bounds of the DataView" }});
+    if (end > dv.byte_length) return rt.throw(.RangeError, &.{.{ .ascii = "Offset is outside the bounds of the DataView" }});
+    const bytes = dv.buffer.kind.array_buffer.data[dv.byte_offset + get_idx ..];
+    const endian: std.builtin.Endian = if (little) .little else .big;
+    switch (elem) {
+        .int8 => bytes[0] = @bitCast(@as(i8, @truncate(ops.toInt32(n)))),
+        .uint8 => bytes[0] = @truncate(ops.toUint32(n)),
+        .int16 => std.mem.writeInt(i16, bytes[0..2], @truncate(ops.toInt32(n)), endian),
+        .uint16 => std.mem.writeInt(u16, bytes[0..2], @truncate(ops.toUint32(n)), endian),
+        .int32 => std.mem.writeInt(i32, bytes[0..4], ops.toInt32(n), endian),
+        .uint32 => std.mem.writeInt(u32, bytes[0..4], ops.toUint32(n), endian),
+        .float32 => {
+            const f: f32 = @floatCast(n);
+            std.mem.writeInt(u32, bytes[0..4], @bitCast(f), endian);
+        },
+        .float64 => std.mem.writeInt(u64, bytes[0..8], @bitCast(n), endian),
+    }
+    return .undefined;
+}
+
+const dv_get_int8: Native = .{ .name = "getInt8", .length = 1, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvGet(.int8, rt, t, a);
+    }
+}.f };
+const dv_set_int8: Native = .{ .name = "setInt8", .length = 2, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvSet(.int8, rt, t, a);
+    }
+}.f };
+const dv_get_uint8: Native = .{ .name = "getUint8", .length = 1, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvGet(.uint8, rt, t, a);
+    }
+}.f };
+const dv_set_uint8: Native = .{ .name = "setUint8", .length = 2, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvSet(.uint8, rt, t, a);
+    }
+}.f };
+const dv_get_int16: Native = .{ .name = "getInt16", .length = 1, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvGet(.int16, rt, t, a);
+    }
+}.f };
+const dv_set_int16: Native = .{ .name = "setInt16", .length = 2, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvSet(.int16, rt, t, a);
+    }
+}.f };
+const dv_get_uint16: Native = .{ .name = "getUint16", .length = 1, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvGet(.uint16, rt, t, a);
+    }
+}.f };
+const dv_set_uint16: Native = .{ .name = "setUint16", .length = 2, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvSet(.uint16, rt, t, a);
+    }
+}.f };
+const dv_get_int32: Native = .{ .name = "getInt32", .length = 1, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvGet(.int32, rt, t, a);
+    }
+}.f };
+const dv_set_int32: Native = .{ .name = "setInt32", .length = 2, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvSet(.int32, rt, t, a);
+    }
+}.f };
+const dv_get_uint32: Native = .{ .name = "getUint32", .length = 1, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvGet(.uint32, rt, t, a);
+    }
+}.f };
+const dv_set_uint32: Native = .{ .name = "setUint32", .length = 2, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvSet(.uint32, rt, t, a);
+    }
+}.f };
+const dv_get_float32: Native = .{ .name = "getFloat32", .length = 1, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvGet(.float32, rt, t, a);
+    }
+}.f };
+const dv_set_float32: Native = .{ .name = "setFloat32", .length = 2, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvSet(.float32, rt, t, a);
+    }
+}.f };
+const dv_get_float64: Native = .{ .name = "getFloat64", .length = 1, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvGet(.float64, rt, t, a);
+    }
+}.f };
+const dv_set_float64: Native = .{ .name = "setFloat64", .length = 2, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvSet(.float64, rt, t, a);
+    }
+}.f };
+
+// ---- %TypedArray% & Concrete Constructors
+
+fn typedArrayAbstractCall(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "Abstract class TypedArray not directly constructable" }});
+}
+
+fn typedArrayAbstractConstruct(rt: *Runtime, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "Abstract class TypedArray not directly constructable" }});
+}
+
+fn typedArrayWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray constructor requires 'new'" }});
+}
+
+fn typedArrayConstructInt8(rt: *Runtime, args: []const Value) Error!Value {
+    return typedArrayConstructKind(rt, .int8, args);
+}
+fn typedArrayConstructUint8(rt: *Runtime, args: []const Value) Error!Value {
+    return typedArrayConstructKind(rt, .uint8, args);
+}
+fn typedArrayConstructUint8Clamped(rt: *Runtime, args: []const Value) Error!Value {
+    return typedArrayConstructKind(rt, .uint8_clamped, args);
+}
+fn typedArrayConstructInt16(rt: *Runtime, args: []const Value) Error!Value {
+    return typedArrayConstructKind(rt, .int16, args);
+}
+fn typedArrayConstructUint16(rt: *Runtime, args: []const Value) Error!Value {
+    return typedArrayConstructKind(rt, .uint16, args);
+}
+fn typedArrayConstructInt32(rt: *Runtime, args: []const Value) Error!Value {
+    return typedArrayConstructKind(rt, .int32, args);
+}
+fn typedArrayConstructUint32(rt: *Runtime, args: []const Value) Error!Value {
+    return typedArrayConstructKind(rt, .uint32, args);
+}
+fn typedArrayConstructFloat32(rt: *Runtime, args: []const Value) Error!Value {
+    return typedArrayConstructKind(rt, .float32, args);
+}
+fn typedArrayConstructFloat64(rt: *Runtime, args: []const Value) Error!Value {
+    return typedArrayConstructKind(rt, .float64, args);
+}
+
+fn allocateTypedArray(rt: *Runtime, kind: heap_mod.TypedArrayKind, len: usize) Error!*Object {
+    const vr = try viewsRealm(rt);
+    const bpe = kind.bytesPerElement();
+    const byte_len = std.math.mul(usize, len, bpe) catch return rt.throw(.RangeError, &.{.{ .ascii = "Invalid typed array length" }});
+    const ab = try rt.heap.newArrayBuffer(vr.array_buffer_prototype, byte_len);
+    var root_buf = [_]Value{.{ .object = ab }};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    return rt.heap.newTypedArray(vr.typed_array_prototypes[@backingInt(kind)], ab, kind, 0, len);
+}
+
+fn collectIterableToArray(rt: *Runtime, source: Value, method_fn: Value) Error!*Object {
+    const r = try realm(rt);
+    const arr = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ source, method_fn, .{ .object = arr }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const iter = try rt.callCallable(method_fn, source, &.{});
+    if (iter != .object) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
+    root_buf[3] = iter;
+    const next_fn = try object.get(rt, iter, try object.named(rt, "next"));
+    if (!next_fn.isFunction()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator next is not a function" }});
+    root_buf[4] = next_fn;
+
+    const done_key = try object.named(rt, "done");
+    const value_key = try object.named(rt, "value");
+    while (true) {
+        try rt.step();
+        const step = try rt.callCallable(next_fn, iter, &.{});
+        if (step != .object) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
+        var step_buf = [_]Value{step};
+        var step_roots: rt_mod.ValueRoots = .{ .values = &step_buf };
+        try step_roots.register(rt);
+        defer step_roots.unregister(rt);
+        if (ops.toBoolean(try object.get(rt, step, done_key))) break;
+        const val = try object.get(rt, step, value_key);
+        try rt.heap.appendElement(arr, val);
+    }
+    return arr;
+}
+
+fn typedArrayConstructKind(rt: *Runtime, kind: heap_mod.TypedArrayKind, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    const vr = try viewsRealm(rt);
+    const proto = vr.typed_array_prototypes[@backingInt(kind)];
+    if (args.len == 0) {
+        return .{ .object = try allocateTypedArray(rt, kind, 0) };
+    }
+    const arg0 = args[0];
+    if (arg0 != .object) {
+        const len = try toIndex(rt, arg0);
+        return .{ .object = try allocateTypedArray(rt, kind, len) };
+    }
+    switch (arg0.object.kind) {
+        .typed_array => |src| {
+            if (src.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Source TypedArray buffer is detached" }});
+            var root_buf = [_]Value{arg0};
+            var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+            const dst = try allocateTypedArray(rt, kind, src.length);
+            const dst_ta = dst.kind.typed_array;
+            for (0..src.length) |i| {
+                const v = object.readTypedArrayElement(src, i);
+                object.writeTypedArrayNumber(dst_ta, i, v.number);
+            }
+            return .{ .object = dst };
+        },
+        .array_buffer => {
+            var root_buf = [_]Value{arg0};
+            var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+            const bpe = kind.bytesPerElement();
+            const offset = try toIndex(rt, arg(args, 1));
+            if (offset % bpe != 0) {
+                return rt.throw(.RangeError, &.{.{ .ascii = "Start offset of TypedArray should be a multiple of element size" }});
+            }
+            const ab = arg0.object.kind.array_buffer;
+            if (ab.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
+            const buf_len = ab.data.len;
+            const new_len: usize = if (arg(args, 2) == .undefined) blk: {
+                if (buf_len % bpe != 0 or offset > buf_len) {
+                    return rt.throw(.RangeError, &.{.{ .ascii = "Byte length of TypedArray should be a multiple of element size" }});
+                }
+                break :blk (buf_len - offset) / bpe;
+            } else blk: {
+                const l = try toIndex(rt, arg(args, 2));
+                const needed = std.math.mul(usize, l, bpe) catch return rt.throw(.RangeError, &.{.{ .ascii = "Invalid typed array length" }});
+                const end = std.math.add(usize, offset, needed) catch return rt.throw(.RangeError, &.{.{ .ascii = "Invalid typed array length" }});
+                if (end > buf_len) return rt.throw(.RangeError, &.{.{ .ascii = "Invalid typed array length" }});
+                break :blk l;
+            };
+            return .{ .object = try rt.heap.newTypedArray(proto, arg0.object, kind, offset, new_len) };
+        },
+        else => {
+            var root_buf = [_]Value{ arg0, .undefined };
+            var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+
+            if (try object.getMethod(rt, arg0, .{ .symbol = r.sym_iterator })) |iter_fn| {
+                const arr = try collectIterableToArray(rt, arg0, iter_fn);
+                root_buf[1] = .{ .object = arr };
+                const len = arr.kind.array.items.len;
+                const dst = try allocateTypedArray(rt, kind, len);
+                root_buf[0] = .{ .object = dst };
+                for (0..len) |i| {
+                    try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, arr.kind.array.items[i]);
+                }
+                return .{ .object = dst };
+            }
+            const len_f = try toLength(rt, try object.get(rt, arg0, try object.named(rt, "length")));
+            const len: usize = @intFromFloat(len_f);
+            const dst = try allocateTypedArray(rt, kind, len);
+            root_buf[1] = .{ .object = dst };
+            for (0..len) |i| {
+                const v = try object.get(rt, arg0, .{ .index = @intCast(i) });
+                try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, v);
+            }
+            return .{ .object = dst };
+        },
+    }
+}
+
+fn constructorTypedArrayKind(v: Value) ?heap_mod.TypedArrayKind {
+    if (v != .native) return null;
+    for (&typed_array_ctors, 0..) |*ctor, i| {
+        if (v.native == ctor) return @fromBackingInt(@intCast(i));
+    }
+    return null;
+}
+
+const ta_from: Native = .{ .name = "from", .length = 1, .call = taFrom };
+const ta_of: Native = .{ .name = "of", .length = 0, .call = taOf };
+
+fn taFrom(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const kind = constructorTypedArrayKind(this) orelse {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray.from requires a TypedArray constructor" }});
+    };
+    const source = arg(args, 0);
+    if (source == .undefined or source == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    const map_fn = arg(args, 1);
+    const has_map = map_fn != .undefined;
+    if (has_map and !map_fn.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray.from mapFn is not a function" }});
+    }
+    const this_arg = arg(args, 2);
+    const r = try realm(rt);
+    var root_buf = [_]Value{ source, map_fn, this_arg, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    if (try object.getMethod(rt, source, .{ .symbol = r.sym_iterator })) |iter_fn| {
+        const arr = try collectIterableToArray(rt, source, iter_fn);
+        root_buf[3] = .{ .object = arr };
+        const len = arr.kind.array.items.len;
+        const dst = try allocateTypedArray(rt, kind, len);
+        root_buf[4] = .{ .object = dst };
+        for (0..len) |i| {
+            const elem = arr.kind.array.items[i];
+            const val = if (has_map)
+                try rt.callCallable(map_fn, this_arg, &.{ elem, .{ .number = @floatFromInt(i) } })
+            else
+                elem;
+            try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, val);
+        }
+        return .{ .object = dst };
+    }
+
+    const len_f = try toLength(rt, try object.get(rt, source, try object.named(rt, "length")));
+    const len: usize = @intFromFloat(len_f);
+    const dst = try allocateTypedArray(rt, kind, len);
+    root_buf[3] = .{ .object = dst };
+    for (0..len) |i| {
+        const elem = try object.get(rt, source, .{ .index = @intCast(i) });
+        const val = if (has_map)
+            try rt.callCallable(map_fn, this_arg, &.{ elem, .{ .number = @floatFromInt(i) } })
+        else
+            elem;
+        try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, val);
+    }
+    return .{ .object = dst };
+}
+
+fn taOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const kind = constructorTypedArrayKind(this) orelse {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray.of requires a TypedArray constructor" }});
+    };
+    const dst = try allocateTypedArray(rt, kind, args.len);
+    var root_buf = [_]Value{.{ .object = dst }};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    for (args, 0..) |a, i| {
+        try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, a);
+    }
+    return .{ .object = dst };
+}
+
+fn requireTypedArray(rt: *Runtime, this: Value) Error!*Object {
+    if (this != .object or this.object.kind != .typed_array) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Method TypedArray.prototype called on incompatible receiver" }});
+    }
+    return this.object;
+}
+
+fn requireLiveTypedArray(rt: *Runtime, this: Value) Error!*Object {
+    const o = try requireTypedArray(rt, this);
+    if (o.kind.typed_array.buffer.kind.array_buffer.detached) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
+    }
+    return o;
+}
+
+const ta_buffer_getter: Native = .{ .name = "get buffer", .call = taBufferGetter };
+const ta_byte_length_getter: Native = .{ .name = "get byteLength", .call = taByteLengthGetter };
+const ta_byte_offset_getter: Native = .{ .name = "get byteOffset", .call = taByteOffsetGetter };
+const ta_length_getter: Native = .{ .name = "get length", .call = taLengthGetter };
+const ta_to_string_tag_getter: Native = .{ .name = "get [Symbol.toStringTag]", .call = taToStringTagGetter };
+
+fn taBufferGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireTypedArray(rt, this);
+    return .{ .object = o.kind.typed_array.buffer };
+}
+
+fn taByteLengthGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    if (ta.buffer.kind.array_buffer.detached) return .{ .number = 0 };
+    return .{ .number = @floatFromInt(ta.length * ta.kind.bytesPerElement()) };
+}
+
+fn taByteOffsetGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    if (ta.buffer.kind.array_buffer.detached) return .{ .number = 0 };
+    return .{ .number = @floatFromInt(ta.byte_offset) };
+}
+
+fn taLengthGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    if (ta.buffer.kind.array_buffer.detached) return .{ .number = 0 };
+    return .{ .number = @floatFromInt(ta.length) };
+}
+
+fn taToStringTagGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    if (this != .object or this.object.kind != .typed_array) return .undefined;
+    return .{ .string = try rt.heap.ascii(this.object.kind.typed_array.kind.name()) };
+}
+
+const ta_set: Native = .{ .name = "set", .length = 1, .call = taSet };
+const ta_subarray: Native = .{ .name = "subarray", .length = 2, .call = taSubarray };
+const ta_slice: Native = .{ .name = "slice", .length = 2, .call = taSlice };
+const ta_fill: Native = .{ .name = "fill", .length = 1, .call = taFill };
+const ta_copy_within: Native = .{ .name = "copyWithin", .length = 2, .call = taCopyWithin };
+const ta_reverse: Native = .{ .name = "reverse", .length = 0, .call = taReverse };
+const ta_sort: Native = .{ .name = "sort", .length = 1, .call = taSort };
+const ta_index_of: Native = .{ .name = "indexOf", .length = 1, .call = taIndexOf };
+const ta_last_index_of: Native = .{ .name = "lastIndexOf", .length = 1, .call = taLastIndexOf };
+const ta_includes: Native = .{ .name = "includes", .length = 1, .call = taIncludes };
+const ta_find: Native = .{ .name = "find", .length = 1, .call = taFind };
+const ta_find_index: Native = .{ .name = "findIndex", .length = 1, .call = taFindIndex };
+const ta_find_last: Native = .{ .name = "findLast", .length = 1, .call = taFindLast };
+const ta_find_last_index: Native = .{ .name = "findLastIndex", .length = 1, .call = taFindLastIndex };
+const ta_every: Native = .{ .name = "every", .length = 1, .call = taEvery };
+const ta_some: Native = .{ .name = "some", .length = 1, .call = taSome };
+const ta_for_each: Native = .{ .name = "forEach", .length = 1, .call = taForEach };
+const ta_map: Native = .{ .name = "map", .length = 1, .call = taMap };
+const ta_filter: Native = .{ .name = "filter", .length = 1, .call = taFilter };
+const ta_reduce: Native = .{ .name = "reduce", .length = 1, .call = taReduce };
+const ta_reduce_right: Native = .{ .name = "reduceRight", .length = 1, .call = taReduceRight };
+const ta_at: Native = .{ .name = "at", .length = 1, .call = taAt };
+const ta_join: Native = .{ .name = "join", .length = 1, .call = taJoin };
+const ta_keys: Native = .{ .name = "keys", .length = 0, .call = taKeys };
+const ta_values: Native = .{ .name = "values", .length = 0, .call = taValues };
+const ta_entries: Native = .{ .name = "entries", .length = 0, .call = taEntries };
+
+fn taSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const dst = o.kind.typed_array;
+    const src_val = arg(args, 0);
+    var root_buf = [_]Value{ this, src_val };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const target_off_f = if (args.len > 1) try toIntegerOrInfinity(rt, arg(args, 1)) else 0.0;
+    if (target_off_f < 0.0) return rt.throw(.RangeError, &.{.{ .ascii = "offset is out of bounds" }});
+    if (dst.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
+
+    if (src_val == .object and src_val.object.kind == .typed_array) {
+        const src = src_val.object.kind.typed_array;
+        if (src.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Source TypedArray buffer is detached" }});
+        if (target_off_f + @as(f64, @floatFromInt(src.length)) > @as(f64, @floatFromInt(dst.length))) {
+            return rt.throw(.RangeError, &.{.{ .ascii = "offset is out of bounds" }});
+        }
+        const target_off: usize = @intFromFloat(target_off_f);
+        if (src.length == 0) return .undefined;
+        const dst_bpe = dst.kind.bytesPerElement();
+        const src_bpe = src.kind.bytesPerElement();
+        const dst_data = dst.buffer.kind.array_buffer.data[dst.byte_offset + target_off * dst_bpe ..][0 .. src.length * dst_bpe];
+        const src_data = src.buffer.kind.array_buffer.data[src.byte_offset..][0 .. src.length * src_bpe];
+        if (src.buffer == dst.buffer) {
+            if (src.kind == dst.kind) {
+                if (@intFromPtr(dst_data.ptr) < @intFromPtr(src_data.ptr)) {
+                    std.mem.copyForwards(u8, dst_data, src_data);
+                } else {
+                    std.mem.copyBackwards(u8, dst_data, src_data);
+                }
+            } else {
+                const tmp = try rt.gpa.alloc(f64, src.length);
+                defer rt.gpa.free(tmp);
+                for (0..src.length) |i| tmp[i] = object.readTypedArrayElement(src, i).number;
+                for (tmp, 0..) |n, i| object.writeTypedArrayNumber(dst, target_off + i, n);
+            }
+        } else if (src.kind == dst.kind) {
+            @memcpy(dst_data, src_data);
+        } else {
+            for (0..src.length) |i| {
+                object.writeTypedArrayNumber(dst, target_off + i, object.readTypedArrayElement(src, i).number);
+            }
+        }
+        return .undefined;
+    }
+
+    if (src_val == .undefined or src_val == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    const src_len_f = try toLength(rt, try object.get(rt, src_val, try object.named(rt, "length")));
+    if (target_off_f + src_len_f > @as(f64, @floatFromInt(dst.length))) {
+        return rt.throw(.RangeError, &.{.{ .ascii = "offset is out of bounds" }});
+    }
+    const target_off: usize = @intFromFloat(target_off_f);
+    const src_len: usize = @intFromFloat(src_len_f);
+    for (0..src_len) |i| {
+        const v = try object.get(rt, src_val, .{ .index = @intCast(i) });
+        try object.writeTypedArrayElement(rt, dst, target_off + i, v);
+    }
+    return .undefined;
+}
+
+fn taSubarray(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    var root_buf = [_]Value{this};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const begin_idx = try relativeIndex(rt, arg(args, 0), ta.length, 0);
+    const end_idx = try relativeIndex(rt, arg(args, 1), ta.length, ta.length);
+    const new_len = if (end_idx > begin_idx) end_idx - begin_idx else 0;
+    const new_off = ta.byte_offset + begin_idx * ta.kind.bytesPerElement();
+    const vr = try viewsRealm(rt);
+    return .{ .object = try rt.heap.newTypedArray(vr.typed_array_prototypes[@backingInt(ta.kind)], ta.buffer, ta.kind, new_off, new_len) };
+}
+
+fn taSlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    var root_buf = [_]Value{this};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const start_idx = try relativeIndex(rt, arg(args, 0), ta.length, 0);
+    const end_idx = try relativeIndex(rt, arg(args, 1), ta.length, ta.length);
+    const count = if (end_idx > start_idx) end_idx - start_idx else 0;
+    const dst = try allocateTypedArray(rt, ta.kind, count);
+    if (count > 0) {
+        const bpe = ta.kind.bytesPerElement();
+        const src_bytes = ta.buffer.kind.array_buffer.data[ta.byte_offset + start_idx * bpe ..][0 .. count * bpe];
+        @memcpy(dst.kind.typed_array.buffer.kind.array_buffer.data, src_bytes);
+    }
+    return .{ .object = dst };
+}
+
+fn taFill(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    var root_buf = [_]Value{this};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const val = try ops.toNumber(rt, arg(args, 0));
+    const start_idx = try relativeIndex(rt, arg(args, 1), ta.length, 0);
+    const end_idx = try relativeIndex(rt, arg(args, 2), ta.length, ta.length);
+    if (end_idx > start_idx) {
+        for (start_idx..end_idx) |i| object.writeTypedArrayNumber(ta, i, val);
+    }
+    return this;
+}
+
+fn taCopyWithin(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    var root_buf = [_]Value{this};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const to_idx = try relativeIndex(rt, arg(args, 0), ta.length, 0);
+    const from_idx = try relativeIndex(rt, arg(args, 1), ta.length, 0);
+    const end_idx = try relativeIndex(rt, arg(args, 2), ta.length, ta.length);
+    if (end_idx <= from_idx or to_idx >= ta.length) return this;
+    const count = @min(end_idx - from_idx, ta.length - to_idx);
+    const bpe = ta.kind.bytesPerElement();
+    const data = ta.buffer.kind.array_buffer.data;
+    const dst_bytes = data[ta.byte_offset + to_idx * bpe ..][0 .. count * bpe];
+    const src_bytes = data[ta.byte_offset + from_idx * bpe ..][0 .. count * bpe];
+    if (to_idx < from_idx) {
+        std.mem.copyForwards(u8, dst_bytes, src_bytes);
+    } else if (to_idx > from_idx) {
+        std.mem.copyBackwards(u8, dst_bytes, src_bytes);
+    }
+    return this;
+}
+
+fn taReverse(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    if (ta.length <= 1) return this;
+    const bpe = ta.kind.bytesPerElement();
+    const data = ta.buffer.kind.array_buffer.data[ta.byte_offset..][0 .. ta.length * bpe];
+    var i: usize = 0;
+    var j: usize = ta.length - 1;
+    var tmp: [8]u8 = undefined;
+    while (i < j) : ({
+        i += 1;
+        j -= 1;
+    }) {
+        const a_slice = data[i * bpe ..][0..bpe];
+        const b_slice = data[j * bpe ..][0..bpe];
+        @memcpy(tmp[0..bpe], a_slice);
+        @memcpy(a_slice, b_slice);
+        @memcpy(b_slice, tmp[0..bpe]);
+    }
+    return this;
+}
+
+fn numericSortLess(_: void, a: f64, b: f64) bool {
+    if (std.math.isNan(a)) return false;
+    if (std.math.isNan(b)) return true;
+    if (a < b) return true;
+    if (a > b) return false;
+    // -0 before +0
+    return std.math.signbit(a) and !std.math.signbit(b);
+}
+
+fn mergeSortTypedArray(
+    rt: *Runtime,
+    arr: []f64,
+    tmp: []f64,
+    cmp: Value,
+) Error!void {
+    if (arr.len <= 1) return;
+    const mid = arr.len / 2;
+    try mergeSortTypedArray(rt, arr[0..mid], tmp[0..mid], cmp);
+    try mergeSortTypedArray(rt, arr[mid..], tmp[mid..], cmp);
+    var i: usize = 0;
+    var j: usize = mid;
+    var k: usize = 0;
+    while (i < mid and j < arr.len) : (k += 1) {
+        try rt.step();
+        const res = try rt.callCallable(cmp, .undefined, &.{ .{ .number = arr[i] }, .{ .number = arr[j] } });
+        const order = try ops.toNumber(rt, res);
+        if (order <= 0 or std.math.isNan(order)) {
+            tmp[k] = arr[i];
+            i += 1;
+        } else {
+            tmp[k] = arr[j];
+            j += 1;
+        }
+    }
+    while (i < mid) : ({
+        i += 1;
+        k += 1;
+    }) tmp[k] = arr[i];
+    while (j < arr.len) : ({
+        j += 1;
+        k += 1;
+    }) tmp[k] = arr[j];
+    @memcpy(arr, tmp[0..arr.len]);
+}
+
+fn taSort(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const cmp = arg(args, 0);
+    if (cmp != .undefined and !cmp.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "The comparison function must be either a function or undefined" }});
+    }
+    const ta = o.kind.typed_array;
+    if (ta.length <= 1) return this;
+
+    const vals = try rt.gpa.alloc(f64, ta.length);
+    defer rt.gpa.free(vals);
+    for (0..ta.length) |i| vals[i] = object.readTypedArrayElement(ta, i).number;
+
+    if (cmp == .undefined) {
+        std.mem.sort(f64, vals, {}, numericSortLess);
+    } else {
+        var root_buf = [_]Value{ this, cmp };
+        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+        try roots.register(rt);
+        defer roots.unregister(rt);
+        const scratch = try rt.gpa.alloc(f64, ta.length);
+        defer rt.gpa.free(scratch);
+        try mergeSortTypedArray(rt, vals, scratch, cmp);
+    }
+    for (vals, 0..) |n, i| object.writeTypedArrayNumber(ta, i, n);
+    return this;
+}
+
+fn taIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    if (ta.length == 0) return .{ .number = -1 };
+    const search = arg(args, 0);
+    if (search != .number) return .{ .number = -1 };
+    const from_n = if (args.len > 1) try toIntegerOrInfinity(rt, arg(args, 1)) else 0.0;
+    const len_f: f64 = @floatFromInt(ta.length);
+    if (from_n >= len_f) return .{ .number = -1 };
+    const start: usize = if (from_n < 0) blk: {
+        const k = len_f + from_n;
+        break :blk if (k <= 0) 0 else @intFromFloat(k);
+    } else @intFromFloat(from_n);
+    for (start..ta.length) |i| {
+        const elem = object.readTypedArrayElement(ta, i).number;
+        if (elem == search.number) return .{ .number = @floatFromInt(i) };
+    }
+    return .{ .number = -1 };
+}
+
+fn taLastIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    if (ta.length == 0) return .{ .number = -1 };
+    const search = arg(args, 0);
+    if (search != .number) return .{ .number = -1 };
+    const len_f: f64 = @floatFromInt(ta.length);
+    const from_n = if (args.len > 1) try toIntegerOrInfinity(rt, arg(args, 1)) else len_f - 1.0;
+    const k_f = if (from_n >= 0) @min(from_n, len_f - 1.0) else len_f + from_n;
+    if (k_f < 0) return .{ .number = -1 };
+    var i: usize = @intFromFloat(k_f);
+    while (true) {
+        const elem = object.readTypedArrayElement(ta, i).number;
+        if (elem == search.number) return .{ .number = @floatFromInt(i) };
+        if (i == 0) break;
+        i -= 1;
+    }
+    return .{ .number = -1 };
+}
+
+fn taIncludes(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    if (ta.length == 0) return .{ .boolean = false };
+    const search = arg(args, 0);
+    if (search != .number) return .{ .boolean = false };
+    const from_n = if (args.len > 1) try toIntegerOrInfinity(rt, arg(args, 1)) else 0.0;
+    const len_f: f64 = @floatFromInt(ta.length);
+    if (from_n >= len_f) return .{ .boolean = false };
+    const start: usize = if (from_n < 0) blk: {
+        const k = len_f + from_n;
+        break :blk if (k <= 0) 0 else @intFromFloat(k);
+    } else @intFromFloat(from_n);
+    const target_nan = std.math.isNan(search.number);
+    for (start..ta.length) |i| {
+        const elem = object.readTypedArrayElement(ta, i).number;
+        if (target_nan and std.math.isNan(elem)) return .{ .boolean = true };
+        if (elem == search.number) return .{ .boolean = true };
+    }
+    return .{ .boolean = false };
+}
+
+fn taAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    const idx_f = try toIntegerOrInfinity(rt, arg(args, 0));
+    const len_f: f64 = @floatFromInt(ta.length);
+    const k = if (idx_f >= 0) idx_f else len_f + idx_f;
+    if (k < 0 or k >= len_f) return .undefined;
+    return object.readTypedArrayElement(ta, @intFromFloat(k));
+}
+
+fn taJoin(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    var sep_buf: ops.NumberBuf = undefined;
+    var sep_units_buf: [64]u16 = undefined;
+    const sep: []const u16 = if (arg(args, 0) == .undefined)
+        &.{','}
+    else switch (try ops.toPiece(rt, arg(args, 0), &sep_buf)) {
+        .utf16 => |u| u,
+        .ascii => |a| blk: {
+            for (a, 0..) |c, i| sep_units_buf[i] = c;
+            break :blk sep_units_buf[0..a.len];
+        },
+    };
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(rt.gpa);
+    for (0..ta.length) |i| {
+        if (i > 0) try out.appendSlice(rt.gpa, sep);
+        var buf: ops.NumberBuf = undefined;
+        const elem = object.readTypedArrayElement(ta, i);
+        const s = ops.formatNumber(&buf, elem.number);
+        for (s) |c| try out.append(rt.gpa, c);
+        if (out.items.len > rt.heap.max_string_length) return rt.limit(.string_length);
+    }
+    return .{ .string = try rt.heap.newString(&.{.{ .utf16 = out.items }}) };
+}
+
+fn taKeys(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    _ = try requireLiveTypedArray(rt, this);
+    return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .array_keys) };
+}
+
+fn taValues(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    _ = try requireLiveTypedArray(rt, this);
+    return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .array_values) };
+}
+
+fn taEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    _ = try requireLiveTypedArray(rt, this);
+    return .{ .object = try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .array_entries) };
+}
+
+fn taForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    const ta = o.kind.typed_array;
+    var root_buf = [_]Value{ this, cb, this_arg };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    for (0..ta.length) |i| {
+        const elem = object.readTypedArrayElement(ta, i);
+        _ = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
+    }
+    return .undefined;
+}
+
+fn taEvery(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    const ta = o.kind.typed_array;
+    var root_buf = [_]Value{ this, cb, this_arg };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    for (0..ta.length) |i| {
+        const elem = object.readTypedArrayElement(ta, i);
+        const res = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
+        if (!ops.toBoolean(res)) return .{ .boolean = false };
+    }
+    return .{ .boolean = true };
+}
+
+fn taSome(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    const ta = o.kind.typed_array;
+    var root_buf = [_]Value{ this, cb, this_arg };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    for (0..ta.length) |i| {
+        const elem = object.readTypedArrayElement(ta, i);
+        const res = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
+        if (ops.toBoolean(res)) return .{ .boolean = true };
+    }
+    return .{ .boolean = false };
+}
+
+fn taFindImpl(rt: *Runtime, this: Value, args: []const Value, reverse: bool, return_index: bool) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    const ta = o.kind.typed_array;
+    var root_buf = [_]Value{ this, cb, this_arg };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    if (ta.length == 0) return if (return_index) .{ .number = -1 } else .undefined;
+    var i: usize = if (reverse) ta.length - 1 else 0;
+    while (true) {
+        const elem = object.readTypedArrayElement(ta, i);
+        const res = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
+        if (ops.toBoolean(res)) return if (return_index) .{ .number = @floatFromInt(i) } else elem;
+        if (reverse) {
+            if (i == 0) break;
+            i -= 1;
+        } else {
+            i += 1;
+            if (i >= ta.length) break;
+        }
+    }
+    return if (return_index) .{ .number = -1 } else .undefined;
+}
+
+fn taFind(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return taFindImpl(rt, this, args, false, false);
+}
+fn taFindIndex(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return taFindImpl(rt, this, args, false, true);
+}
+fn taFindLast(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return taFindImpl(rt, this, args, true, false);
+}
+fn taFindLastIndex(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return taFindImpl(rt, this, args, true, true);
+}
+
+fn taMap(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    const ta = o.kind.typed_array;
+    const dst = try allocateTypedArray(rt, ta.kind, ta.length);
+    var root_buf = [_]Value{ this, cb, this_arg, .{ .object = dst } };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    for (0..ta.length) |i| {
+        const elem = object.readTypedArrayElement(ta, i);
+        const mapped = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
+        try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, mapped);
+    }
+    return .{ .object = dst };
+}
+
+fn taFilter(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const cb = try requireCallable(rt, arg(args, 0));
+    const this_arg = arg(args, 1);
+    const ta = o.kind.typed_array;
+    var kept: std.ArrayList(f64) = .empty;
+    defer kept.deinit(rt.gpa);
+    var root_buf = [_]Value{ this, cb, this_arg };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    for (0..ta.length) |i| {
+        const elem = object.readTypedArrayElement(ta, i);
+        const res = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
+        if (ops.toBoolean(res)) try kept.append(rt.gpa, elem.number);
+    }
+    const dst = try allocateTypedArray(rt, ta.kind, kept.items.len);
+    for (kept.items, 0..) |n, i| object.writeTypedArrayNumber(dst.kind.typed_array, i, n);
+    return .{ .object = dst };
+}
+
+fn taReduceImpl(rt: *Runtime, this: Value, args: []const Value, right: bool) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const cb = try requireCallable(rt, arg(args, 0));
+    const ta = o.kind.typed_array;
+    if (ta.length == 0 and args.len < 2) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty typed array with no initial value" }});
+    }
+    var acc: Value = undefined;
+    var start_i: usize = undefined;
+    if (args.len >= 2) {
+        acc = arg(args, 1);
+        start_i = if (right) ta.length else 0;
+    } else {
+        acc = object.readTypedArrayElement(ta, if (right) ta.length - 1 else 0);
+        start_i = if (right) ta.length - 1 else 1;
+    }
+    var root_buf = [_]Value{ this, cb, acc };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    if (right) {
+        var i = start_i;
+        while (i > 0) {
+            i -= 1;
+            const elem = object.readTypedArrayElement(ta, i);
+            root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, .{ .number = @floatFromInt(i) }, this });
+        }
+    } else {
+        for (start_i..ta.length) |i| {
+            const elem = object.readTypedArrayElement(ta, i);
+            root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, .{ .number = @floatFromInt(i) }, this });
+        }
+    }
+    return root_buf[2];
+}
+
+fn taReduce(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return taReduceImpl(rt, this, args, false);
+}
+fn taReduceRight(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return taReduceImpl(rt, this, args, true);
 }

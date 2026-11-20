@@ -288,3 +288,8 @@ zqjs_handle_release(rt, state);
 - `rt.runModule(specifier, source, &diag, &failure)` (or `zqjs_eval_module` in C) loads, links, and evaluates the module graph on the VM, returning an owned `Handle` to the entry module's namespace object (`getProperty(ns, "exportedFn", ...)` + `rt.call(...)` to invoke exported JS functions directly).
 - `rt.getModuleNamespace(specifier, &failure)` retrieves the namespace `Handle` for any already-loaded module in the runtime.
 - Loaded modules and their exported closures/classes/cells remain GC-rooted by the `Runtime` until `Runtime.destroy()`.
+
+### 13. Zero-Copy Binary Buffers (`newArrayBuffer`, `bufferBytes`, C ABI 1.4.0, D73)
+- **Zig:** `try rt.newArrayBuffer(byte_len)` allocates a zero-initialized `ArrayBuffer` (counted against `Limits.max_heap_bytes`) and returns an owned `Handle`. `rt.bufferBytes(h)` returns `?[]u8` for an `ArrayBuffer` (full backing buffer), `TypedArray` (its view subslice), or `DataView` (its view subslice), or `null` for non-buffer handles.
+- **C ABI:** `zqjs_new_array_buffer(rt, byte_len, &out_handle)` and `zqjs_handle_buffer_data(rt, handle, &out_ptr, &out_byte_len)` provide zero-copy pointer access (`ZQJS_ERR_TYPE` for non-buffer/detached handles, `ZQJS_ERR_STALE_HANDLE` for released handles).
+- **GC safety:** the returned slice/pointer points directly into the `ArrayBuffer`'s non-moving heap backing store and stays valid while the `Handle` (or any JS view referencing that buffer) remains live and no GC/re-entry invalidates it.

@@ -290,6 +290,46 @@ const Context = struct {
                 }
                 return;
             },
+            .array_buffer => |ab| {
+                if (ab.detached) {
+                    try ctx.w.print("ArrayBuffer {{ {s}(detached){s} }}", .{ ctx.style(Ansi.cyan), ctx.reset() });
+                } else {
+                    try ctx.w.print("ArrayBuffer {{ byteLength: {s}{d}{s} }}", .{ ctx.style(Ansi.yellow), ab.data.len, ctx.reset() });
+                }
+                return;
+            },
+            .data_view => |dv| {
+                if (dv.buffer.kind.array_buffer.detached) {
+                    try ctx.w.print("DataView {{ {s}(detached){s} }}", .{ ctx.style(Ansi.cyan), ctx.reset() });
+                } else {
+                    try ctx.w.print("DataView {{ byteLength: {s}{d}{s}, byteOffset: {s}{d}{s} }}", .{
+                        ctx.style(Ansi.yellow), dv.byte_length, ctx.reset(),
+                        ctx.style(Ansi.yellow), dv.byte_offset, ctx.reset(),
+                    });
+                }
+                return;
+            },
+            .typed_array => |ta| {
+                const type_name = ta.kind.name();
+                if (ta.buffer.kind.array_buffer.detached) {
+                    try ctx.w.print("{s}(0) []", .{type_name});
+                    return;
+                }
+                if (ta.length == 0) {
+                    try ctx.w.print("{s}(0) []", .{type_name});
+                    return;
+                }
+                try ctx.w.print("{s}({d}) [ ", .{ type_name, ta.length });
+                const n = @min(ta.length, ctx.options.max_items);
+                for (0..n) |i| {
+                    if (i > 0) try ctx.w.writeAll(", ");
+                    const elem = @import("../runtime/object.zig").readTypedArrayElement(ta, i);
+                    try ctx.writeValue(elem, depth + 1, indent);
+                }
+                if (ta.length > n) try ctx.w.print(", ... {d} more items", .{ta.length - n});
+                try ctx.w.writeAll(" ]");
+                return;
+            },
             else => {},
         }
 

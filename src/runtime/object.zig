@@ -17,6 +17,7 @@
 //! ever calls back into JS in M7.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Value = @import("value.zig").Value;
 const heap_mod = @import("heap.zig");
 const Object = heap_mod.Object;
@@ -185,7 +186,7 @@ fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error!Val
                 if (try ownProp(rt, ns, k)) |p| return resolvePropValue(rt, receiver, p);
                 if (nodeHas(ns.builtin.?, k)) return unsupportedBuiltin(rt, k);
             }
-            return getFrom(rt, (try builtins.realm(rt)).function_prototype, receiver, k);
+            return getWithReceiver(rt, try builtins.nativeProto(rt, n), receiver, k);
         },
         .closure => |c| {
             if (isNamed(k, "name")) return .{ .string = try builtins.closureName(rt, c) };
@@ -209,7 +210,7 @@ pub fn getPrototypeOfValue(rt: *Runtime, v: Value) Error!Value {
     return switch (v) {
         .object => |o| if (o.proto) |p| .{ .object = p } else .null,
         .closure => |c| if (c.meta) |m| (m.proto orelse .{ .object = try builtins.closureDefaultProto(rt, c) }) else .{ .object = try builtins.closureDefaultProto(rt, c) },
-        .native => .{ .object = (try builtins.realm(rt)).function_prototype },
+        .native => |n| try builtins.nativeProto(rt, n),
         .symbol => .{ .object = (try builtins.realm(rt)).symbol_prototype },
         else => .null,
     };
@@ -232,6 +233,14 @@ fn getFrom(rt: *Runtime, start: *Object, receiver: Value, k: Key) Error!Value {
     var o: ?*Object = start;
     while (o) |cur| : (o = cur.proto) {
         cur.obj.checkLive(); // stress builds: a collected object or prototype
+        if (cur.kind == .typed_array) {
+            if (canonicalNumericIndex(k)) |n| {
+                if (validIntegerIndex(cur.kind.typed_array, n)) |idx| {
+                    return readTypedArrayElement(cur.kind.typed_array, idx);
+                }
+                return .undefined;
+            }
+        }
         if (try ownProp(rt, cur, k)) |p| return resolvePropValue(rt, receiver, p);
         if (cur.builtin) |b| if (nodeHas(b, k)) return unsupportedBuiltin(rt, k);
     }
@@ -287,7 +296,20 @@ fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
                 }
             }
         },
-        .ordinary, .iterator, .promise, .generator => {},
+        .typed_array => |ta| {
+            if (canonicalNumericIndex(k)) |n| {
+                if (validIntegerIndex(ta, n)) |idx| {
+                    return .{
+                        .value = readTypedArrayElement(ta, idx),
+                        .enumerable = true,
+                        .writable = true,
+                        .configurable = true,
+                    };
+                }
+                return null;
+            }
+        },
+        .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view => {},
     }
     if (o.props.count() == 0) return null; // don't intern index keys just to miss
     return o.props.get(try propKey(rt, k));
@@ -420,8 +442,17 @@ fn setImpl(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!void
                 return;
             }
         },
-        .object => {
+        .object => |o| {
             if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
+            if (o.kind == .typed_array) {
+                if (canonicalNumericIndex(k)) |n| {
+                    const num = try ops.toNumber(rt, v);
+                    if (validIntegerIndex(o.kind.typed_array, n)) |idx| {
+                        writeTypedArrayNumber(o.kind.typed_array, idx, num);
+                    }
+                    return;
+                }
+            }
         },
     }
     switch (try lookupSetChain(rt, base, base, k)) {
@@ -520,7 +551,14 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!v
                     if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property of module namespace" }});
                     return;
                 },
-                .ordinary, .iterator, .promise, .generator => {},
+                .typed_array => |ta| {
+                    if (canonicalNumericIndex(k)) |n| {
+                        const num = try ops.toNumber(rt, v);
+                        if (validIntegerIndex(ta, n)) |idx| writeTypedArrayNumber(ta, idx, num);
+                        return;
+                    }
+                },
+                .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view => {},
             }
             const pk = try propKey(rt, k);
             if (!o.extensible and !o.props.contains(pk)) {
@@ -719,7 +757,12 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
         },
         .regexp => if (isNamed(k, "lastIndex")) return false, // non-configurable
         .module_namespace => return false,
-        .ordinary, .map, .set, .iterator, .promise, .generator => {},
+        .typed_array => |ta| {
+            if (canonicalNumericIndex(k)) |n| {
+                return validIntegerIndex(ta, n) == null;
+            }
+        },
+        .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view => {},
     }
     if (o.props.count() == 0) return true;
     const pk = try propKey(rt, k);
@@ -765,7 +808,7 @@ pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
                 if (try ownProp(rt, ns, k) != null) return true;
                 if (nodeHas(ns.builtin.?, k)) return true;
             }
-            return hasInChain(rt, (try builtins.realm(rt)).function_prototype, k);
+            return has(rt, k, try builtins.nativeProto(rt, n));
         },
         .closure => |c| {
             if (isNamed(k, "name") or isNamed(k, "length")) return true;
@@ -785,6 +828,11 @@ pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
 fn hasInChain(rt: *Runtime, start: *Object, k: Key) Error!bool {
     var o: ?*Object = start;
     while (o) |cur| : (o = cur.proto) {
+        if (cur.kind == .typed_array) {
+            if (canonicalNumericIndex(k)) |n| {
+                return validIntegerIndex(cur.kind.typed_array, n) != null;
+            }
+        }
         if (try ownProp(rt, cur, k) != null) return true;
         // node has it there, so the answer is known even if the value isn't.
         if (cur.builtin) |b| if (nodeHas(b, k)) return true;
@@ -920,8 +968,11 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
         .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
+        .typed_array => |ta| if (!ta.buffer.kind.array_buffer.detached) {
+            for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
+        },
         .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
-        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view => {},
     }
     const first_named = out.items.len;
     try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false, false);
@@ -934,8 +985,11 @@ pub fn ownPropertyNames(rt: *Runtime, o: *Object) Error![]Key {
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
         .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
+        .typed_array => |ta| if (!ta.buffer.kind.array_buffer.detached) {
+            for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
+        },
         .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
-        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view => {},
     }
     const first_named = out.items.len;
     try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false, true);
@@ -948,8 +1002,11 @@ pub fn ownAllKeys(rt: *Runtime, o: *Object) Error![]Key {
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
         .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
+        .typed_array => |ta| if (!ta.buffer.kind.array_buffer.detached) {
+            for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
+        },
         .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
-        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view => {},
     }
     const first_named = out.items.len;
     try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, true, false);
@@ -1075,4 +1132,95 @@ pub fn join(rt: *Runtime, arr: *Object, sep_in: []const u16) Error!*String {
 fn append(rt: *Runtime, out: *std.ArrayList(u16), units: []const u16) Error!void {
     if (out.items.len + units.len > rt.heap.max_string_length) return rt.limit(.string_length);
     try out.appendSlice(rt.gpa, units);
+}
+
+// ---------------------------------------------------------------- TypedArray element helpers (M43, D73)
+
+const native_endian: std.builtin.Endian = builtin.cpu.arch.endian();
+
+/// Returns the numeric value if `k` is a CanonicalNumericIndexString, else null.
+pub fn canonicalNumericIndex(k: Key) ?f64 {
+    switch (k) {
+        .index => |i| return @floatFromInt(i),
+        .symbol => return null,
+        .atom => |a| {
+            const u = a.units;
+            if (u.len == 0 or u.len > 64) return null;
+            if (u.len == 2 and u[0] == '-' and u[1] == '0') return -0.0;
+            var ascii_buf: [64]u8 = undefined;
+            for (u, 0..) |ch, i| {
+                if (ch > 0x7f) return null;
+                ascii_buf[i] = @intCast(ch);
+            }
+            const ascii = ascii_buf[0..u.len];
+            if (std.mem.eql(u8, ascii, "NaN")) return std.math.nan(f64);
+            if (std.mem.eql(u8, ascii, "Infinity")) return std.math.inf(f64);
+            if (std.mem.eql(u8, ascii, "-Infinity")) return -std.math.inf(f64);
+            const n = std.fmt.parseFloat(f64, ascii) catch return null;
+            var fmt_buf: ops.NumberBuf = undefined;
+            const formatted = ops.formatNumber(&fmt_buf, n);
+            if (std.mem.eql(u8, formatted, ascii)) return n;
+            return null;
+        },
+    }
+}
+
+pub fn validIntegerIndex(ta: heap_mod.TypedArrayState, n: f64) ?usize {
+    if (ta.buffer.kind.array_buffer.detached) return null;
+    if (std.math.isNan(n) or std.math.isInf(n)) return null;
+    if (n == 0.0 and std.math.signbit(n)) return null;
+    if (n < 0.0 or @floor(n) != n) return null;
+    if (n >= @as(f64, @floatFromInt(ta.length))) return null;
+    return @intFromFloat(n);
+}
+
+/// Round-half-to-even clamping to [0, 255] for Uint8ClampedArray (ES ToUint8Clamp).
+pub fn toUint8Clamp(n: f64) u8 {
+    if (std.math.isNan(n) or n <= 0.0) return 0;
+    if (n >= 255.0) return 255;
+    const f = @floor(n);
+    const diff = n - f;
+    if (diff < 0.5) return @intFromFloat(f);
+    if (diff > 0.5) return @intFromFloat(f + 1.0);
+    if (@mod(f, 2.0) == 0.0) return @intFromFloat(f);
+    return @intFromFloat(f + 1.0);
+}
+
+pub fn readTypedArrayElement(ta: heap_mod.TypedArrayState, idx: usize) Value {
+    const data = ta.buffer.kind.array_buffer.data;
+    const off = ta.byte_offset + idx * ta.kind.bytesPerElement();
+    return .{ .number = switch (ta.kind) {
+        .int8 => @floatFromInt(@as(i8, @bitCast(data[off]))),
+        .uint8, .uint8_clamped => @floatFromInt(data[off]),
+        .int16 => @floatFromInt(std.mem.readInt(i16, data[off..][0..2], native_endian)),
+        .uint16 => @floatFromInt(std.mem.readInt(u16, data[off..][0..2], native_endian)),
+        .int32 => @floatFromInt(std.mem.readInt(i32, data[off..][0..4], native_endian)),
+        .uint32 => @floatFromInt(std.mem.readInt(u32, data[off..][0..4], native_endian)),
+        .float32 => @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, data[off..][0..4], native_endian)))),
+        .float64 => @bitCast(std.mem.readInt(u64, data[off..][0..8], native_endian)),
+    } };
+}
+
+pub fn writeTypedArrayNumber(ta: heap_mod.TypedArrayState, idx: usize, n: f64) void {
+    const data = ta.buffer.kind.array_buffer.data;
+    const off = ta.byte_offset + idx * ta.kind.bytesPerElement();
+    switch (ta.kind) {
+        .int8 => data[off] = @bitCast(@as(i8, @truncate(ops.toInt32(n)))),
+        .uint8 => data[off] = @truncate(ops.toUint32(n)),
+        .uint8_clamped => data[off] = toUint8Clamp(n),
+        .int16 => std.mem.writeInt(i16, data[off..][0..2], @truncate(ops.toInt32(n)), native_endian),
+        .uint16 => std.mem.writeInt(u16, data[off..][0..2], @truncate(ops.toUint32(n)), native_endian),
+        .int32 => std.mem.writeInt(i32, data[off..][0..4], ops.toInt32(n), native_endian),
+        .uint32 => std.mem.writeInt(u32, data[off..][0..4], ops.toUint32(n), native_endian),
+        .float32 => {
+            const f: f32 = @floatCast(n);
+            std.mem.writeInt(u32, data[off..][0..4], @bitCast(f), native_endian);
+        },
+        .float64 => std.mem.writeInt(u64, data[off..][0..8], @bitCast(n), native_endian),
+    }
+}
+
+pub fn writeTypedArrayElement(rt: *Runtime, ta: heap_mod.TypedArrayState, idx: usize, v: Value) Error!void {
+    const n = try ops.toNumber(rt, v);
+    writeTypedArrayNumber(ta, idx, n);
 }

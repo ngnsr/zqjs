@@ -17,7 +17,7 @@ extern "C" {
  * Callers can check `(zqjs_abi_version() >> 16) == (ZQJS_ABI_VERSION >> 16)`.
  */
 #define ZQJS_ABI_MAJOR 1u
-#define ZQJS_ABI_MINOR 3u
+#define ZQJS_ABI_MINOR 4u
 #define ZQJS_ABI_PATCH 0u
 #define ZQJS_ABI_VERSION ((ZQJS_ABI_MAJOR << 16) | (ZQJS_ABI_MINOR << 8) | ZQJS_ABI_PATCH)
 
@@ -359,6 +359,20 @@ zqjs_status zqjs_eval_module(
     zqjs_diagnostic *out_diag,
     zqjs_failure *out_fail,
     zqjs_handle *opt_out_namespace
+);
+
+/* Binary buffers & views (ABI 1.4.0, M43) */
+zqjs_status zqjs_new_array_buffer(
+    zqjs_runtime *rt,
+    size_t byte_len,
+    zqjs_handle *out_handle
+);
+
+zqjs_status zqjs_handle_buffer_data(
+    const zqjs_runtime *rt,
+    zqjs_handle handle,
+    void **out_ptr,
+    size_t *out_byte_len
 );
 
 #ifdef __cplusplus

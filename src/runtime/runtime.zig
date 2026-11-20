@@ -421,6 +421,9 @@ pub const Runtime = struct {
     fn markRoots(rt: *Runtime, h: *Heap) void {
         if (rt.realm) |*r| {
             for (r.objects()) |o| h.markObj(&o.obj);
+            if (r.views) |*v| {
+                for (v.objects()) |o| h.markObj(&o.obj);
+            }
             h.markObj(&r.sym_iterator.obj);
             h.markObj(&r.sym_async_iterator.obj);
             h.markObj(&r.sym_to_primitive.obj);

@@ -51,6 +51,30 @@ pub const Builtin = enum {
     regexp_prototype,
     symbol_constructor,
     symbol_prototype,
+    array_buffer_constructor,
+    array_buffer_prototype,
+    data_view_constructor,
+    data_view_prototype,
+    typed_array_constructor,
+    typed_array_prototype,
+    int8_array_constructor,
+    int8_array_prototype,
+    uint8_array_constructor,
+    uint8_array_prototype,
+    uint8_clamped_array_constructor,
+    uint8_clamped_array_prototype,
+    int16_array_constructor,
+    int16_array_prototype,
+    uint16_array_constructor,
+    uint16_array_prototype,
+    int32_array_constructor,
+    int32_array_prototype,
+    uint32_array_constructor,
+    uint32_array_prototype,
+    float32_array_constructor,
+    float32_array_prototype,
+    float64_array_constructor,
+    float64_array_prototype,
 };
 
 /// Whether node gives `b` an own property called `name`.
@@ -103,6 +127,30 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .regexp_prototype => regexp_prototype.has(name),
         .symbol_constructor => symbol_constructor.has(name),
         .symbol_prototype => symbol_prototype.has(name),
+        .array_buffer_constructor => array_buffer_constructor.has(name),
+        .array_buffer_prototype => array_buffer_prototype.has(name),
+        .data_view_constructor => data_view_constructor.has(name),
+        .data_view_prototype => data_view_prototype.has(name),
+        .typed_array_constructor => typed_array_constructor.has(name),
+        .typed_array_prototype => typed_array_prototype.has(name),
+        .int8_array_constructor => int8_array_constructor.has(name),
+        .int8_array_prototype => int8_array_prototype.has(name),
+        .uint8_array_constructor => uint8_array_constructor.has(name),
+        .uint8_array_prototype => uint8_array_prototype.has(name),
+        .uint8_clamped_array_constructor => uint8_clamped_array_constructor.has(name),
+        .uint8_clamped_array_prototype => uint8_clamped_array_prototype.has(name),
+        .int16_array_constructor => int16_array_constructor.has(name),
+        .int16_array_prototype => int16_array_prototype.has(name),
+        .uint16_array_constructor => uint16_array_constructor.has(name),
+        .uint16_array_prototype => uint16_array_prototype.has(name),
+        .int32_array_constructor => int32_array_constructor.has(name),
+        .int32_array_prototype => int32_array_prototype.has(name),
+        .uint32_array_constructor => uint32_array_constructor.has(name),
+        .uint32_array_prototype => uint32_array_prototype.has(name),
+        .float32_array_constructor => float32_array_constructor.has(name),
+        .float32_array_prototype => float32_array_prototype.has(name),
+        .float64_array_constructor => float64_array_constructor.has(name),
+        .float64_array_prototype => float64_array_prototype.has(name),
     };
 }
 
@@ -733,4 +781,219 @@ const symbol_prototype = std.StaticStringMap(void).initComptime(.{
     .{"description"},
     .{"toString"},
     .{"valueOf"},
+});
+
+const array_buffer_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"isView"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const array_buffer_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"byteLength"},
+    .{"constructor"},
+    .{"detached"},
+    .{"maxByteLength"},
+    .{"resizable"},
+    .{"resize"},
+    .{"slice"},
+    .{"transfer"},
+    .{"transferToFixedLength"},
+});
+
+const data_view_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const data_view_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"buffer"},
+    .{"byteLength"},
+    .{"byteOffset"},
+    .{"constructor"},
+    .{"getBigInt64"},
+    .{"getBigUint64"},
+    .{"getFloat16"},
+    .{"getFloat32"},
+    .{"getFloat64"},
+    .{"getInt16"},
+    .{"getInt32"},
+    .{"getInt8"},
+    .{"getUint16"},
+    .{"getUint32"},
+    .{"getUint8"},
+    .{"setBigInt64"},
+    .{"setBigUint64"},
+    .{"setFloat16"},
+    .{"setFloat32"},
+    .{"setFloat64"},
+    .{"setInt16"},
+    .{"setInt32"},
+    .{"setInt8"},
+    .{"setUint16"},
+    .{"setUint32"},
+    .{"setUint8"},
+});
+
+const typed_array_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"from"},
+    .{"length"},
+    .{"name"},
+    .{"of"},
+    .{"prototype"},
+});
+
+const typed_array_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"at"},
+    .{"buffer"},
+    .{"byteLength"},
+    .{"byteOffset"},
+    .{"constructor"},
+    .{"copyWithin"},
+    .{"entries"},
+    .{"every"},
+    .{"fill"},
+    .{"filter"},
+    .{"find"},
+    .{"findIndex"},
+    .{"findLast"},
+    .{"findLastIndex"},
+    .{"forEach"},
+    .{"includes"},
+    .{"indexOf"},
+    .{"join"},
+    .{"keys"},
+    .{"lastIndexOf"},
+    .{"length"},
+    .{"map"},
+    .{"reduce"},
+    .{"reduceRight"},
+    .{"reverse"},
+    .{"set"},
+    .{"slice"},
+    .{"some"},
+    .{"sort"},
+    .{"subarray"},
+    .{"toLocaleString"},
+    .{"toReversed"},
+    .{"toSorted"},
+    .{"toString"},
+    .{"values"},
+    .{"with"},
+});
+
+const int8_array_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const int8_array_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"constructor"},
+});
+
+const uint8_array_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"fromBase64"},
+    .{"fromHex"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const uint8_array_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"constructor"},
+    .{"setFromBase64"},
+    .{"setFromHex"},
+    .{"toBase64"},
+    .{"toHex"},
+});
+
+const uint8_clamped_array_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const uint8_clamped_array_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"constructor"},
+});
+
+const int16_array_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const int16_array_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"constructor"},
+});
+
+const uint16_array_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const uint16_array_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"constructor"},
+});
+
+const int32_array_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const int32_array_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"constructor"},
+});
+
+const uint32_array_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const uint32_array_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"constructor"},
+});
+
+const float32_array_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const float32_array_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"constructor"},
+});
+
+const float64_array_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const float64_array_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"constructor"},
 });

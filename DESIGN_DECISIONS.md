@@ -1865,3 +1865,22 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
   - CLI uses `FsLoader` (relative `./` and `../` path resolution against `dirname(referrer)` with normalization) for `--module` or `.mjs` files.
   - Zig API adds `setModuleLoader`, `runModule` (returns GC-safe namespace `Handle`), and `getModuleNamespace`.
   - C ABI bumps to `1.3.0` (`ZQJS_ABI_MINOR = 3`) while preserving 1.0–1.2 `zqjs_options.struct_size` compatibility, adding `zqjs_set_module_loader`, `zqjs_eval_module`, `ZQJS_ERR_MODULE_NOT_FOUND`, and `ZQJS_LIMIT_MODULES`.
+
+---
+
+## D73. `ArrayBuffer`, `TypedArray`, and `DataView` (M43)
+
+**Decision:** Implement `ArrayBuffer`, the internal `%TypedArray%` hierarchy with all 9 numeric TypedArray constructors (`Int8Array`, `Uint8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array`), and `DataView` across both engines, the REPL inspector, the Zig embedding API, and the C ABI (`1.4.0`).
+
+- **Heap & GC (`heap.zig`):**
+  - `Object.kind` adds `array_buffer: ArrayBufferState` (`{ data: []u8, detached: bool }`), `typed_array: TypedArrayState` (`{ buffer: *Object, kind: TypedArrayKind, byte_offset: usize, length: usize }`), and `data_view: DataViewState` (`{ buffer: *Object, byte_offset: usize, byte_length: usize }`).
+  - Backing bytes are allocated through `Heap.allocator()` (so they count against `Limits.max_heap_bytes`), zero-initialized, and freed on sweep. Both `typed_array` and `data_view` trace `buffer` in `forEachChild` and `scanRemembered`.
+- **Built-ins & Exotic Semantics (`object.zig`, `builtins.zig`, `vm.zig`, `tools/gen_builtins.js`):**
+  - `ArrayBuffer(byteLength)`, `ArrayBuffer.isView`, `ArrayBuffer.prototype.{byteLength, slice}`.
+  - `%TypedArray%` (`from`, `of`, prototype getters `buffer`/`byteLength`/`byteOffset`/`length`/`[Symbol.toStringTag]`, and prototype methods `set` with safe overlapping-buffer handling, `subarray`, `slice`, `fill`, `copyWithin`, `reverse`, numeric `sort` with `-0` before `+0` and `NaN` last, `indexOf`/`lastIndexOf`/`includes`/`find*`/`every`/`some`/`forEach`/`map`/`filter`/`reduce*`/`at`/`join`/`toString`/`keys`/`values`/`entries`/`[Symbol.iterator]`).
+  - Integer-indexed exotic object semantics intercept any `CanonicalNumericIndexString` (`"-0"`, `"-1"`, `"1.5"`, `"NaN"`, `"Infinity"`, OOB indices) without walking the prototype chain; `Uint8ClampedArray` uses round-half-to-even (`ToUint8Clamp`). `Object.freeze`/`seal` on non-empty TypedArrays throw `TypeError`.
+  - `vm.zig` adds fast paths for `.typed_array` in `.get_elem` and `.set_elem`.
+  - `DataView` implements unaligned big-endian (default) and little-endian `get*`/`set*` for all 8 numeric types.
+- **Embedding & C ABI (`api.zig`, `c_api.zig`, `include/zqjs.h`):**
+  - Zig API adds `Runtime.newArrayBuffer(byte_len)` and `Runtime.bufferBytes(h)` (zero-copy mutable slice for `ArrayBuffer`, `TypedArray`, or `DataView`).
+  - C ABI bumps to `1.4.0` (`ZQJS_ABI_MINOR = 4`), adding `zqjs_new_array_buffer` and `zqjs_handle_buffer_data`.

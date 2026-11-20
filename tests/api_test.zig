@@ -3265,3 +3265,55 @@ fn checkHostPromiseAllocFailOnce(gpa: std.mem.Allocator) !void {
 test "M29: allocation failures across newPromise, promiseState, and capability settlement" {
     try testing.checkAllAllocationFailures(testing.allocator, checkHostPromiseAllocFailOnce, .{});
 }
+
+test "M43: newArrayBuffer and zero-copy bufferBytes across ArrayBuffer, TypedArray, and DataView" {
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    const rt = try zqjs.Runtime.create(testing.allocator, .{
+        .output = &out.writer,
+        .limits = .{ .max_heap_bytes = 128 * 1024 },
+    });
+    defer rt.destroy();
+
+    const ab = try rt.newArrayBuffer(16);
+    defer ab.release();
+    const bytes = rt.bufferBytes(ab).?;
+    try testing.expectEqual(@as(usize, 16), bytes.len);
+
+    // Host writes little-endian f32s and u32s
+    std.mem.writeInt(u32, bytes[0..4], @bitCast(@as(f32, 3.5)), .little);
+    std.mem.writeInt(u32, bytes[4..8], 0x11223344, .big);
+
+    const g_set = try rt.getGlobal("Object", null);
+    defer g_set.release();
+    try testing.expect(rt.bufferBytes(g_set) == null);
+
+    const ns = try rt.runModule("m43_fn.js",
+        \\export function runView(b) {
+        \\    const f32 = new Float32Array(b, 0, 2);
+        \\    const dv = new DataView(b, 4, 8);
+        \\    print(f32[0], dv.getUint32(0, false));
+        \\    f32[1] = -7.25;
+        \\    dv.setUint16(4, 0xabcd, true);
+        \\    return f32;
+        \\}
+    , null, null);
+    defer ns.release();
+
+    const run_view = try rt.getProperty(ns, "runView", null);
+    defer run_view.release();
+    const ta_h = try rt.call(run_view, null, &.{ab}, null);
+    defer ta_h.release();
+
+    try testing.expectEqualStrings("3.5 287454020\n", out.written());
+
+    // Host reads back zero-copy from both ab and returned TypedArray view
+    const ta_bytes = rt.bufferBytes(ta_h).?;
+    try testing.expectEqual(@as(usize, 8), ta_bytes.len);
+    try testing.expectEqual(@as(f32, -7.25), @as(f32, @bitCast(std.mem.readInt(u32, ta_bytes[4..8], .little))));
+    try testing.expectEqual(@as(u16, 0xabcd), std.mem.readInt(u16, bytes[8..10], .little));
+
+    // LimitExceeded(heap_bytes) on oversized ArrayBuffer
+    try testing.expectError(error.LimitExceeded, rt.newArrayBuffer(1024 * 1024));
+}

@@ -1,0 +1,18 @@
+call DataView: TypeError
+bad arg: TypeError
+dv props: true 2 12 true
+toStringTag: [object DataView]
+oob ctor: RangeError RangeError
+i8/u8: -42 250
+i16 BE: -12345 -12345 207 199
+i16 LE: -12345 199 207
+u16 BE/LE: 50000 20675
+i32 BE: -305419896 237 136
+u32 LE: 2309737967 239 137
+f32 BE: 1.5 3fc00000
+f32 -0: true 80000000
+f64 BE: true 400921fb 54442d18
+oob get: RangeError RangeError RangeError
+oob set: RangeError RangeError
+shared: 1 2 3 4
+shared back: ff020304

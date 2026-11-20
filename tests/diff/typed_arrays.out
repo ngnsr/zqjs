@@ -1,0 +1,52 @@
+bpe: 1:1,1:1,1:1,2:2,2:2,4:4,4:4,4:4,8:8
+TA name: TypedArray proto eq: true proto.proto eq: true
+call TA: TypeError
+new TA: TypeError
+call Uint8Array: TypeError
+call ArrayBuffer: TypeError
+instanceof: true true true
+toStringTag: [object Uint8Array] [object Object]
+empty: 0
+len: 0,0,0
+fromTA: 127,-128,127,-1
+fromIter: 10,20,0,65535
+fromArrayLike: 5,4,255
+ab byteLength: 12 isView(ab): false isView(u8): true
+view1: 4 8 2 true 100,-200
+bad offset align: RangeError
+bad offset oob: RangeError
+bad len oob: RangeError
+bad ab len align: RangeError
+bad ab neg: RangeError
+abSlice: 4 100 true
+clamped: 0,2,2,4,0,254,255,0,255,0
+f32 -0: true true true Infinity -Infinity
+f32 prec: true true
+Uint8Array.of: 1,2,1
+Int16Array.from: 10,21,32
+overlap fwd: 1,2,1,2,3,4
+overlap bwd: 1,2,3,4,3,4
+mixed overlap: 44 144
+sub vs slice: 10,99,30,40 true false
+sort f64: -Infinity,-1,-0,0,2,10,Infinity,NaN
+sort desc: 9,5,4,3,1,1
+fill: 1,7,7,7,5
+copyWithin: 1,3,4,4,5
+reverse: 5,4,4,3,1
+search: 1 2 true 1
+map/filter: 2,4,6 4,6 true
+reduce: 20
+reduceRight: 321
+find: 12 3
+every/some: true true
+iter: 7,8,9 0:7,1:8
+exo get: undefined undefined undefined undefined undefined 42
+exo in: true false false false true
+exo del: false true true 10
+keys: 0,1
+forIn own: 0,1
+desc0: 10 true true true
+freeze non-empty: TypeError
+seal non-empty: TypeError
+preventExt non-empty: false true false
+freeze empty: false true true

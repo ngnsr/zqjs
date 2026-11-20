@@ -2304,3 +2304,55 @@ test "M40: GC inside Symbol.toPrimitive, toString/valueOf, join, Symbol.hasInsta
         );
     }
 }
+
+test "M43: TypedArray/DataView/subarray keep ArrayBuffer alive and callbacks survive GC on both engines" {
+    const src =
+        \\function makeViews() {
+        \\    let ab = new ArrayBuffer(32);
+        \\    const u8 = new Uint8Array(ab);
+        \\    u8[4] = 42;
+        \\    u8[8] = 99;
+        \\    const sub = u8.subarray(4, 12);
+        \\    const dv = new DataView(ab, 8, 8);
+        \\    ab = null;
+        \\    return { sub, dv };
+        \\}
+        \\const { sub, dv } = makeViews();
+        \\for (let i = 0; i < 80; i++) { const junk = { i: i, s: "pad" + i }; }
+        \\const mapped = sub.map(function (x) {
+        \\    for (let j = 0; j < 20; j++) { const t = { j: j }; }
+        \\    return x + 1;
+        \\});
+        \\const fromArr = Uint16Array.from([1, 2, 3], function (x) {
+        \\    for (let j = 0; j < 20; j++) { const t = { j: j }; }
+        \\    return x * 10;
+        \\});
+        \\const toSort = new Int32Array([5, 1, 4, 2, 3]);
+        \\toSort.sort(function (a, b) {
+        \\    const t = { a: a, b: b };
+        \\    return a - b;
+        \\});
+        \\print(sub[0], dv.getUint8(0), mapped[0], fromArr.join(","), toSort.join(","));
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("42 99 43 10,20,30 1,2,3,4,5\n", got);
+    }
+}
+
+test "M43: ArrayBuffer respects max_heap_bytes and frees backing bytes on sweep" {
+    const src =
+        \\for (let i = 0; i < 16; i++) {
+        \\    const b = new ArrayBuffer(8192);
+        \\    const v = new Uint8Array(b);
+        \\    v[0] = i;
+        \\}
+        \\print("ok");
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{ .max_heap_bytes = 128 * 1024 });
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("ok\n", got);
+    }
+}

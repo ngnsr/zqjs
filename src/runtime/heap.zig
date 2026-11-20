@@ -468,6 +468,59 @@ pub const ModuleNamespace = struct {
     entries: []ModuleExport,
 };
 
+pub const TypedArrayKind = enum(u8) {
+    int8,
+    uint8,
+    uint8_clamped,
+    int16,
+    uint16,
+    int32,
+    uint32,
+    float32,
+    float64,
+
+    pub fn bytesPerElement(k: TypedArrayKind) usize {
+        return switch (k) {
+            .int8, .uint8, .uint8_clamped => 1,
+            .int16, .uint16 => 2,
+            .int32, .uint32, .float32 => 4,
+            .float64 => 8,
+        };
+    }
+
+    pub fn name(k: TypedArrayKind) []const u8 {
+        return switch (k) {
+            .int8 => "Int8Array",
+            .uint8 => "Uint8Array",
+            .uint8_clamped => "Uint8ClampedArray",
+            .int16 => "Int16Array",
+            .uint16 => "Uint16Array",
+            .int32 => "Int32Array",
+            .uint32 => "Uint32Array",
+            .float32 => "Float32Array",
+            .float64 => "Float64Array",
+        };
+    }
+};
+
+pub const ArrayBufferState = struct {
+    data: []u8,
+    detached: bool = false,
+};
+
+pub const TypedArrayState = struct {
+    buffer: *Object,
+    kind: TypedArrayKind,
+    byte_offset: usize,
+    length: usize,
+};
+
+pub const DataViewState = struct {
+    buffer: *Object,
+    byte_offset: usize,
+    byte_length: usize,
+};
+
 /// An ordinary object or an array (DESIGN_DECISIONS D13).
 pub const Object = struct {
     obj: Obj,
@@ -496,6 +549,12 @@ pub const Object = struct {
         generator: GeneratorState,
         /// ES Module namespace exotic object (M42, D72).
         module_namespace: ModuleNamespace,
+        /// Binary buffer backing TypedArray and DataView (M43, D73).
+        array_buffer: ArrayBufferState,
+        /// Integer-indexed TypedArray view (M43, D73).
+        typed_array: TypedArrayState,
+        /// Unaligned binary DataView (M43, D73).
+        data_view: DataViewState,
     } = .ordinary,
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
@@ -869,6 +928,9 @@ pub const Heap = struct {
                     RememberedScan.child(&scan, &e.name.obj);
                     RememberedScan.child(&scan, &e.cell.obj);
                 },
+                .array_buffer => {},
+                .typed_array => |ta| RememberedScan.child(&scan, &ta.buffer.obj),
+                .data_view => |dv| RememberedScan.child(&scan, &dv.buffer.obj),
             }
         }
     }
@@ -1206,6 +1268,51 @@ pub const Heap = struct {
     pub fn newPromise(h: *Heap, proto: ?*Object) Error!*Object {
         const o = try h.newObject(proto);
         o.kind = .{ .promise = .{} };
+        return o;
+    }
+
+    pub fn newArrayBuffer(h: *Heap, proto: ?*Object, byte_len: usize) Error!*Object {
+        const data = h.allocator().alloc(u8, byte_len) catch |e| return h.failed(e);
+        @memset(data, 0);
+        errdefer h.allocator().free(data);
+        const o = try h.newObject(proto);
+        o.kind = .{ .array_buffer = .{ .data = data } };
+        return o;
+    }
+
+    pub fn newTypedArray(
+        h: *Heap,
+        proto: ?*Object,
+        buffer: *Object,
+        kind: TypedArrayKind,
+        byte_offset: usize,
+        length: usize,
+    ) Error!*Object {
+        const o = try h.newObject(proto);
+        o.kind = .{ .typed_array = .{
+            .buffer = buffer,
+            .kind = kind,
+            .byte_offset = byte_offset,
+            .length = length,
+        } };
+        h.barrierObj(&o.obj, &buffer.obj);
+        return o;
+    }
+
+    pub fn newDataView(
+        h: *Heap,
+        proto: ?*Object,
+        buffer: *Object,
+        byte_offset: usize,
+        byte_length: usize,
+    ) Error!*Object {
+        const o = try h.newObject(proto);
+        o.kind = .{ .data_view = .{
+            .buffer = buffer,
+            .byte_offset = byte_offset,
+            .byte_length = byte_length,
+        } };
+        h.barrierObj(&o.obj, &buffer.obj);
         return o;
     }
 
@@ -1653,7 +1760,7 @@ pub const Heap = struct {
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
         return switch (arr.kind) {
             .array => |*elements| elements,
-            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .module_namespace => unreachable, // only arrays have elements
+            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .module_namespace, .array_buffer, .typed_array, .data_view => unreachable, // only arrays have elements
         };
     }
 
@@ -1984,6 +2091,8 @@ pub const Heap = struct {
                         h.allocator().destroy(re);
                     },
                     .module_namespace => |ns| h.allocator().free(ns.entries),
+                    .array_buffer => |ab| h.allocator().free(ab.data),
+                    .typed_array, .data_view => {},
                 }
                 o.kind = .ordinary;
                 o.proto = null;
@@ -2073,7 +2182,7 @@ pub const Heap = struct {
         return charge;
     }
 
-    fn exceeded(h: *Heap, which: Limit) Error {
+    pub fn exceeded(h: *Heap, which: Limit) Error {
         h.limit_hit = which;
         return error.LimitExceeded;
     }
@@ -2162,6 +2271,9 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                     visit(ctx, @constCast(&e.name.obj));
                     visit(ctx, &e.cell.obj);
                 },
+                .array_buffer => {},
+                .typed_array => |ta| visit(ctx, &ta.buffer.obj),
+                .data_view => |dv| visit(ctx, &dv.buffer.obj),
                 .array => |elements| for (elements.items) |v| visitValue(v, ctx, visit),
                 .map, .set => |table| for (table.entries.items) |e| {
                     if (!e.alive) continue;

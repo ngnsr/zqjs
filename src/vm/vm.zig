@@ -996,7 +996,7 @@ pub const Vm = struct {
             .get_elem => {
                 const idx = try cache.peek(vm, 0);
                 const base = try cache.peek(vm, 1);
-                const r: Value = if (fastArrayGet(base, idx)) |v| v else blk: {
+                const r: Value = fastArrayGet(base, idx) orelse fastTypedArrayGet(base, idx) orelse blk: {
                     cache.syncSp(vm);
                     const k = try object.key(rt, idx);
                     break :blk try object.get(rt, base, k);
@@ -1012,10 +1012,14 @@ pub const Vm = struct {
                 (try cache.top(vm)).* = v;
             },
             .set_elem => {
-                cache.syncSp(vm);
                 const v = try cache.peek(vm, 0);
-                const k = try object.key(rt, try cache.peek(vm, 1)); // after the value: JS's order for `=`
-                try object.set(rt, try cache.peek(vm, 2), k, v);
+                const idx = try cache.peek(vm, 1);
+                const base = try cache.peek(vm, 2);
+                if (!fastTypedArraySet(base, idx, v)) {
+                    cache.syncSp(vm);
+                    const k = try object.key(rt, idx); // after the value: JS's order for `=`
+                    try object.set(rt, base, k, v);
+                }
                 try cache.drop(vm, 2);
                 (try cache.top(vm)).* = v;
             },
@@ -2219,6 +2223,31 @@ fn fastArrayGet(base: Value, idx: Value) ?Value {
     const r = elems[@intFromFloat(n)];
     heap.checkValue(r);
     return r;
+}
+
+fn fastTypedArrayGet(base: Value, idx: Value) ?Value {
+    if (base != .object or idx != .number) return null;
+    const o = base.object;
+    if (o.kind != .typed_array) return null;
+    const ta = o.kind.typed_array;
+    if (ta.buffer.kind.array_buffer.detached) return null;
+    const n = idx.number;
+    if (!(n >= 0 and n < @as(f64, @floatFromInt(ta.length)) and @floor(n) == n)) return null;
+    o.obj.checkLive();
+    return object.readTypedArrayElement(ta, @intFromFloat(n));
+}
+
+fn fastTypedArraySet(base: Value, idx: Value, val: Value) bool {
+    if (base != .object or idx != .number or val != .number) return false;
+    const o = base.object;
+    if (o.kind != .typed_array) return false;
+    const ta = o.kind.typed_array;
+    if (ta.buffer.kind.array_buffer.detached) return false;
+    const n = idx.number;
+    if (!(n >= 0 and n < @as(f64, @floatFromInt(ta.length)) and @floor(n) == n)) return false;
+    o.obj.checkLive();
+    object.writeTypedArrayNumber(ta, @intFromFloat(n), val.number);
+    return true;
 }
 
 fn binaryOp(op: Op) BinaryOp {

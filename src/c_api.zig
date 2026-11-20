@@ -189,7 +189,7 @@ pub const CLimits = extern struct {
 pub const OutputFn = *const fn (ctx: ?*anyopaque, bytes: [*c]const u8, len: usize) callconv(.c) bool;
 pub const ClockFn = *const fn (ctx: ?*anyopaque) callconv(.c) u64;
 
-pub const abi_version: u32 = (1 << 16) | (3 << 8) | 0;
+pub const abi_version: u32 = (1 << 16) | (4 << 8) | 0;
 
 pub const COptions = extern struct {
     struct_size: u32,
@@ -803,6 +803,36 @@ pub export fn zqjs_new_array(raw_rt: ?*anyopaque, out_handle: ?*ZqjsHandle) call
 
     const zh = cr.rt.newArray() catch |err| return mapHandleError(err);
     out.* = ZqjsHandle.fromZig(zh);
+    return .ok;
+}
+
+pub export fn zqjs_new_array_buffer(raw_rt: ?*anyopaque, byte_len: usize, out_handle: ?*ZqjsHandle) callconv(.c) Status {
+    const out = out_handle orelse return .err_invalid_arg;
+    out.* = .{};
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkReentrantEntry()) |st| return st;
+
+    const zh = cr.rt.newArrayBuffer(byte_len) catch |err| return mapHandleError(err);
+    out.* = ZqjsHandle.fromZig(zh);
+    return .ok;
+}
+
+pub export fn zqjs_handle_buffer_data(
+    raw_rt: ?*const anyopaque,
+    h: ZqjsHandle,
+    out_ptr: ?*?[*]u8,
+    out_byte_len: ?*usize,
+) callconv(.c) Status {
+    const cr = validateRuntime(raw_rt) orelse return if (raw_rt == null) .err_invalid_arg else .err_invalid_state;
+    if (cr.checkReentrantEntry()) |st| return st;
+    if (out_ptr == null or out_byte_len == null) return .err_invalid_arg;
+    const zh = switch (validateHandle(cr, h)) {
+        .ok => |v| v,
+        .err => |st| return st,
+    };
+    const bytes = cr.rt.bufferBytes(zh) orelse return .err_type;
+    out_ptr.?.* = bytes.ptr;
+    out_byte_len.?.* = bytes.len;
     return .ok;
 }
 

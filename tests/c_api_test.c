@@ -675,8 +675,8 @@ static zqjs_status native_track_promise(
 
 /* 7. M29 host promises (60-frame timer loop, leak & handle checks) + D60 C ABI 1.2.0 */
 static void test_m29_host_promises_60_frames_and_d60_native_stack(void) {
-    assert(ZQJS_ABI_VERSION == 0x00010300u);
-    assert(zqjs_abi_version() == 0x00010300u);
+    assert(ZQJS_ABI_VERSION == 0x00010400u);
+    assert(zqjs_abi_version() == 0x00010400u);
 
     /* 7a. 1.1 struct_size backward compatibility (without max_native_stack_bytes) */
     typedef struct zqjs_options_v1_1 {
@@ -943,7 +943,7 @@ static zqjs_status m42_test_loader(
 }
 
 static void test_m42_es_modules(void) {
-    assert(zqjs_abi_version() == ((1u << 16) | (3u << 8) | 0u));
+    assert(zqjs_abi_version() == ((1u << 16) | (4u << 8) | 0u));
 
     /* Backward compatibility: 1.0/1.1/1.2 options struct_size still accepted */
     zqjs_options opts = zqjs_options_default();
@@ -980,6 +980,70 @@ static void test_m42_es_modules(void) {
     const char *host_src = "import './hosterr';";
     assert(zqjs_eval_module(rt, "herr.js", 7, host_src, strlen(host_src), &diag, &fail, NULL) == ZQJS_ERR_HOST);
 
+    assert(zqjs_runtime_destroy(rt) == ZQJS_OK);
+}
+
+static void test_m43_array_buffer_and_views(void) {
+    assert(((zqjs_abi_version() >> 8) & 0xffu) >= 4u);
+
+    zqjs_options opts = zqjs_options_default();
+    opts.limits.max_heap_bytes = 128u * 1024u;
+    zqjs_runtime *rt = NULL;
+    assert(zqjs_runtime_create(&opts, &rt) == ZQJS_OK);
+
+    zqjs_handle ab = ZQJS_HANDLE_NULL;
+    assert(zqjs_new_array_buffer(rt, 16, &ab) == ZQJS_OK);
+
+    void *ptr = NULL;
+    size_t byte_len = 0;
+    assert(zqjs_handle_buffer_data(rt, ab, &ptr, &byte_len) == ZQJS_OK);
+    assert(ptr != NULL);
+    assert(byte_len == 16);
+
+    /* Write bytes from C */
+    uint8_t *u8 = (uint8_t *)ptr;
+    u8[0] = 0x12;
+    u8[1] = 0x34;
+    u8[2] = 0x56;
+    u8[3] = 0x78;
+
+    const char *src =
+        "export function mutateBuf(ab) {"
+        "  const dv = new DataView(ab, 0, 8);"
+        "  if (dv.getUint32(0, false) !== 0x12345678) throw new Error('mismatch');"
+        "  const ta = new Uint8Array(ab, 4, 4);"
+        "  ta[0] = 0xaa; ta[1] = 0xbb;"
+        "  return ta;"
+        "}";
+    zqjs_diagnostic diag;
+    zqjs_failure fail;
+    zqjs_handle ns = ZQJS_HANDLE_NULL;
+    assert(zqjs_eval_module(rt, "m43.js", 6, src, strlen(src), &diag, &fail, &ns) == ZQJS_OK);
+
+    zqjs_handle fn = ZQJS_HANDLE_NULL;
+    assert(zqjs_handle_get_property(rt, ns, "mutateBuf", 9, &fail, &fn) == ZQJS_OK);
+    assert(zqjs_handle_release(rt, ns) == ZQJS_OK);
+    zqjs_handle ta = ZQJS_HANDLE_NULL;
+    assert(zqjs_runtime_call(rt, fn, NULL, &ab, 1, &fail, &ta) == ZQJS_OK);
+
+    /* Read back zero-copy from returned TypedArray view */
+    void *ta_ptr = NULL;
+    size_t ta_len = 0;
+    assert(zqjs_handle_buffer_data(rt, ta, &ta_ptr, &ta_len) == ZQJS_OK);
+    assert(ta_len == 4);
+    assert((uint8_t *)ta_ptr == u8 + 4);
+    assert(u8[4] == 0xaa && u8[5] == 0xbb);
+
+    /* Error cases: wrong type, stale handle, limit exceeded */
+    assert(zqjs_handle_buffer_data(rt, fn, &ta_ptr, &ta_len) == ZQJS_ERR_TYPE);
+    assert(zqjs_handle_release(rt, ta) == ZQJS_OK);
+    assert(zqjs_handle_buffer_data(rt, ta, &ta_ptr, &ta_len) == ZQJS_ERR_STALE_HANDLE);
+
+    zqjs_handle big = ZQJS_HANDLE_NULL;
+    assert(zqjs_new_array_buffer(rt, 1024u * 1024u, &big) == ZQJS_ERR_LIMIT_EXCEEDED);
+
+    assert(zqjs_handle_release(rt, fn) == ZQJS_OK);
+    assert(zqjs_handle_release(rt, ab) == ZQJS_OK);
     assert(zqjs_runtime_destroy(rt) == ZQJS_OK);
 }
 
@@ -1042,6 +1106,7 @@ int main(void) {
     test_m12_3_abi_version_options_and_handles();
     test_m29_host_promises_60_frames_and_d60_native_stack();
     test_m42_es_modules();
+    test_m43_array_buffer_and_views();
 
     return 0;
 }

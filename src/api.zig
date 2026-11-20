@@ -442,6 +442,41 @@ pub const Runtime = opaque {
         return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .object = arr }));
     }
 
+    /// Creates a zero-initialized `ArrayBuffer` of `byte_len` bytes and mints an owned handle.
+    pub fn newArrayBuffer(rt: *Runtime, byte_len: usize) HandleError!Handle {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        if (r.rt.poisoned) return error.Internal;
+        const vr = internal.builtins.viewsRealm(&r.rt) catch |e| return mapHandleInternalError(e);
+        const ab = r.rt.heap.newArrayBuffer(vr.array_buffer_prototype, byte_len) catch |e| return mapHandleInternalError(e);
+        return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .object = ab }));
+    }
+
+    /// Returns a zero-copy mutable byte slice for an `ArrayBuffer`, `TypedArray` (its view
+    /// subslice), or `DataView` (its view subslice), or `null` for any other handle kind.
+    pub fn bufferBytes(rt: *Runtime, h: Handle) ?[]u8 {
+        const r = rt.impl();
+        const guard = Guard.enterReentrant(r);
+        defer guard.exit();
+        const val = handles.Token.checkedValue(&r.rt, h.tok());
+        if (val != .object) return null;
+        return switch (val.object.kind) {
+            .array_buffer => |ab| if (ab.detached) null else ab.data,
+            .typed_array => |ta| blk: {
+                const ab = ta.buffer.kind.array_buffer;
+                if (ab.detached) break :blk null;
+                break :blk ab.data[ta.byte_offset .. ta.byte_offset + ta.length * ta.kind.bytesPerElement()];
+            },
+            .data_view => |dv| blk: {
+                const ab = dv.buffer.kind.array_buffer;
+                if (ab.detached) break :blk null;
+                break :blk ab.data[dv.byte_offset .. dv.byte_offset + dv.byte_length];
+            },
+            else => null,
+        };
+    }
+
     /// Creates a pending JS Promise along with its `resolve` and `reject` capability
     /// functions (`{ promise, resolve, reject }`, M29, D57). All three handles are owned
     /// by the caller; settle the promise by passing `resolve` or `reject` to `rt.call`.

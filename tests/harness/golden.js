@@ -159,7 +159,7 @@ function runInNode(source) {
   let out = '';
   const print = (...args) => { out += args.map(String).join(' ') + '\n'; };
   try {
-    vm.runInNewContext(source, { print }, { timeout: 5000, microtaskMode: 'afterEvaluate' }); // drain promise jobs like ZQJS's end-of-run checkpoint
+    vm.runInNewContext(source, { print, structuredClone }, { timeout: 5000, microtaskMode: 'afterEvaluate' }); // drain promise jobs like ZQJS's end-of-run checkpoint
   } catch (e) {
     out += `Uncaught ${e.name}\n`; // names only: messages are never compared
   }

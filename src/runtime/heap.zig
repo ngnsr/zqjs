@@ -1564,6 +1564,14 @@ pub const Heap = struct {
         return o;
     }
 
+    /// Detaches an ArrayBuffer in place, freeing any un-transferred backing slice.
+    pub fn detachArrayBuffer(h: *Heap, ab: *Object, free_data: bool) void {
+        if (ab.kind.array_buffer.detached) return;
+        if (free_data) h.allocator().free(ab.kind.array_buffer.data);
+        ab.kind.array_buffer.data = &.{};
+        ab.kind.array_buffer.detached = true;
+    }
+
     pub fn newTypedArray(
         h: *Heap,
         proto: ?*Object,

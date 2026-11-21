@@ -462,15 +462,15 @@ pub const Runtime = opaque {
         const val = handles.Token.checkedValue(&r.rt, h.tok());
         if (val != .object) return null;
         return switch (val.object.kind) {
-            .array_buffer => |ab| if (ab.detached) null else ab.data,
+            .array_buffer => |ab| if (ab.detached) @constCast(@as([]const u8, &.{})) else ab.data,
             .typed_array => |ta| blk: {
                 const ab = ta.buffer.kind.array_buffer;
-                if (ab.detached) break :blk null;
+                if (ab.detached) break :blk @constCast(@as([]const u8, &.{}));
                 break :blk ab.data[ta.byte_offset .. ta.byte_offset + ta.length * ta.kind.bytesPerElement()];
             },
             .data_view => |dv| blk: {
                 const ab = dv.buffer.kind.array_buffer;
-                if (ab.detached) break :blk null;
+                if (ab.detached) break :blk @constCast(@as([]const u8, &.{}));
                 break :blk ab.data[dv.byte_offset .. dv.byte_offset + dv.byte_length];
             },
             else => null,

@@ -27,7 +27,7 @@ const heap = @import("heap.zig");
 pub const Kind = enum { undefined, null, boolean, number, string, symbol, function, object, array, bigint };
 
 pub fn kindOf(v: Value) Kind {
-    return switch (v) {
+    return switch (v.unpack()) {
         .undefined => .undefined,
         .null => .null,
         .boolean => .boolean,
@@ -93,18 +93,14 @@ pub const Token = struct {
 
     pub fn number(t: Token) ?f64 {
         validate(t, null);
-        return switch (t.value()) {
-            .number => |n| n,
-            else => null,
-        };
+        const v = t.value();
+        return if (v.isNumber()) v.asNumber() else null;
     }
 
     pub fn boolean(t: Token) ?bool {
         validate(t, null);
-        return switch (t.value()) {
-            .boolean => |b| b,
-            else => null,
-        };
+        const v = t.value();
+        return if (v.isBool()) v.asBool() else null;
     }
 
     /// Wrong kind → null. Otherwise the string's full UTF-16 length; copies
@@ -112,8 +108,8 @@ pub const Token = struct {
     pub fn string(t: Token, buf: []u16) ?usize {
         validate(t, null);
         const v = t.value();
-        if (v != .string) return null;
-        const units = v.string.units;
+        if (!v.isString()) return null;
+        const units = v.asString().units;
         const n = @min(units.len, buf.len);
         @memcpy(buf[0..n], units[0..n]);
         return units.len;

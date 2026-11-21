@@ -382,7 +382,7 @@ pub const Session = struct {
             try s.rollbackTdz(undo);
             return try s.reportRuntimeError(e);
         };
-        const p_obj = promise_val.object;
+        const p_obj = promise_val.asObject();
         const ps = p_obj.kind.promise;
         switch (ps.state) {
             .fulfilled => {

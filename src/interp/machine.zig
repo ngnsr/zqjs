@@ -39,10 +39,10 @@ const module = @import("../runtime/module.zig");
 /// Helper for `++` / `--` supporting both Number and BigInt.
 fn stepNumeric(rt: *Runtime, old_in: Value, is_inc: bool) Error!struct { old: Value, new: Value } {
     const old = try ops.toNumeric(rt, old_in);
-    const new: Value = if (old == .bigint)
-        .{ .bigint = try bigint.addI64(rt, old.bigint, if (is_inc) 1 else -1) }
+    const new: Value = if (old.isBigInt())
+        Value.fromBigInt(try bigint.addI64(rt, old.asBigInt(), if (is_inc) 1 else -1))
     else
-        .{ .number = if (is_inc) old.number + 1 else old.number - 1 };
+        Value.fromNumber(if (is_inc) old.asNumber() + 1 else old.asNumber() - 1);
     return .{ .old = old, .new = new };
 }
 
@@ -651,7 +651,7 @@ const Machine = struct {
         if (m.current_closure) |pc| {
             if (pc.meta) |pm| {
                 if (pm.brand) |br| {
-                    var root_buf = [_]Value{.{ .closure = cl }};
+                    var root_buf = [_]Value{Value.fromClosure(cl)};
                     var val_roots: rt_mod.ValueRoots = .{ .values = &root_buf };
                     try val_roots.register(m.rt);
                     defer val_roots.unregister(m.rt);
@@ -666,7 +666,7 @@ const Machine = struct {
         if (!(m.is_module and m.current_func == null)) {
             for (stmts) |s| if (s.data == .function) {
                 const f = s.data.function;
-                m.store(f.name.?.binding, .{ .closure = try m.makeTreeClosure(f, m.env) });
+                m.store(f.name.?.binding, Value.fromClosure(try m.makeTreeClosure(f, m.env)));
             };
         }
         if (stmts.len > 0) {
@@ -826,14 +826,14 @@ const Machine = struct {
                             rv
                         else if (cr.callee_func != null and cr.callee_func.?.has_super_ctor) blk: {
                             if (rv.isObjectLike()) break :blk rv;
-                            if (rv == .undefined) {
+                            if (rv.isUndefined()) {
                                 break :blk cur_this orelse return m.rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
                             }
                             return m.rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
                         } else if (rv.isObjectLike())
                             rv
                         else
-                            .{ .object = cr.construct_instance.? };
+                            Value.fromObject(cr.construct_instance.?);
                         if (cr.is_super_call) {
                             m.this = out_v;
                             if (m.current_closure) |dc| try builtins.runInstanceInits(m.rt, @constCast(dc), out_v);
@@ -1041,21 +1041,21 @@ const Machine = struct {
                 m.safepoint();
                 try m.rt.step();
                 m.depth -= 1;
-                try m.pushVal(.{ .number = n });
+                try m.pushVal(Value.fromNumber(n));
             },
             .bigint => |raw| {
                 try m.enter();
                 m.safepoint();
                 try m.rt.step();
                 m.depth -= 1;
-                try m.pushVal(.{ .bigint = try bigint.parse(m.rt, raw, true) });
+                try m.pushVal(Value.fromBigInt(try bigint.parse(m.rt, raw, true)));
             },
             .boolean => |b| {
                 try m.enter();
                 m.safepoint();
                 try m.rt.step();
                 m.depth -= 1;
-                try m.pushVal(.{ .boolean = b });
+                try m.pushVal(Value.fromBool(b));
             },
             .null => {
                 try m.enter();
@@ -1113,7 +1113,7 @@ const Machine = struct {
                 const mod_ptr: ?*module.ModuleRecord = if (m.module_record) |mp| @ptrCast(@alignCast(mp)) else null;
                 const promise_obj = try module.dynamicImport(rt, mod_ptr, spec_val, .treewalk);
                 m.depth -= 1;
-                try m.pushVal(.{ .object = promise_obj });
+                try m.pushVal(Value.fromObject(promise_obj));
             },
             .barrier, .await_suspend, .generator_start, .yield_suspend => unreachable, // handled in runLoop
             .yield_star_wait, .async_yield_star_wait => unreachable, // consumed by the resume
@@ -1130,7 +1130,7 @@ const Machine = struct {
             },
             .async_yield_star_result => |ar| {
                 m.depth -= 1; // re-counted below while the `yield*` stays suspended
-                var root_buf = [_]Value{ .{ .object = ar.iter }, m.popVal() }; // getters may collect
+                var root_buf = [_]Value{ Value.fromObject(ar.iter), m.popVal() }; // getters may collect
                 var vroots: rt_mod.ValueRoots = .{ .values = &root_buf };
                 try vroots.register(rt);
                 defer vroots.unregister(rt);
@@ -1156,7 +1156,7 @@ const Machine = struct {
             },
             .for_await_after => |f| {
                 const fo = f.stmt.data.for_of;
-                var root_buf = [_]Value{ .{ .object = f.iter }, m.popVal() }; // getters may collect
+                var root_buf = [_]Value{ Value.fromObject(f.iter), m.popVal() }; // getters may collect
                 var vroots: rt_mod.ValueRoots = .{ .values = &root_buf };
                 try vroots.register(rt);
                 defer vroots.unregister(rt);
@@ -1324,7 +1324,7 @@ const Machine = struct {
                 acc = try ops.binary(rt, .add, acc, v_str);
                 roots_buf[0] = acc;
                 if (tn.t.quasis[tn.idx + 1].len > 0) {
-                    const q: Value = .{ .string = try rt.heap.newString(&.{.{ .utf16 = tn.t.quasis[tn.idx + 1] }}) };
+                    const q: Value = Value.fromString(try rt.heap.newString(&.{.{ .utf16 = tn.t.quasis[tn.idx + 1] }}));
                     acc = try ops.binary(rt, .add, acc, q);
                 }
                 try m.pushVal(acc);
@@ -1338,13 +1338,13 @@ const Machine = struct {
                 const res_v: Value = switch (op) {
                     .neg => blk: {
                         const nv = try ops.toNumeric(rt, v);
-                        break :blk if (nv == .bigint) .{ .bigint = try bigint.neg(rt, nv.bigint) } else .{ .number = -nv.number };
+                        break :blk if (nv.isBigInt()) Value.fromBigInt(try bigint.neg(rt, nv.asBigInt())) else Value.fromNumber(-nv.asNumber());
                     },
-                    .plus => .{ .number = try ops.toNumber(rt, v) },
-                    .not => .{ .boolean = !ops.toBoolean(v) },
+                    .plus => Value.fromNumber(try ops.toNumber(rt, v)),
+                    .not => Value.fromBool(!ops.toBoolean(v)),
                     .bit_not => blk: {
                         const nv = try ops.toNumeric(rt, v);
-                        break :blk if (nv == .bigint) .{ .bigint = try bigint.bitNot(rt, nv.bigint) } else .{ .number = ops.bitNot(nv.number) };
+                        break :blk if (nv.isBigInt()) Value.fromBigInt(try bigint.bitNot(rt, nv.asBigInt())) else Value.fromNumber(ops.bitNot(nv.asNumber()));
                     },
                     .typeof => try ops.typeOf(rt, v),
                 };
@@ -1368,7 +1368,7 @@ const Machine = struct {
                     } else {
                         m.depth -= 1;
                     },
-                    .nullish => if (lhs == .null or lhs == .undefined) {
+                    .nullish => if (lhs.isNull() or lhs.isUndefined()) {
                         _ = m.popVal();
                         try m.pushTask(.depth_pop);
                         try m.pushEval(br.rhs);
@@ -1687,7 +1687,7 @@ const Machine = struct {
                     },
                     .compound => |op| {
                         if (am.is_private) {
-                            const brand = m.current_closure.?.meta.?.brand.?.closure;
+                            const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                             const old = try object.getPrivate(rt, base, brand, try rt.heap.internAscii(am.named.?));
                             try m.pushVal(old);
                             try m.pushTask(.{ .assign_member_compound_finish = .{ .op = op, .key = .{ .index = 0 }, .priv_name = am.named.? } });
@@ -1702,7 +1702,7 @@ const Machine = struct {
                     },
                     .logical_and, .logical_or, .nullish => {
                         if (am.is_private) {
-                            const brand = m.current_closure.?.meta.?.brand.?.closure;
+                            const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                             const old = try object.getPrivate(rt, base, brand, try rt.heap.internAscii(am.named.?));
                             if (!logicalAssignShouldWrite(am.op, old)) {
                                 _ = m.popVal();
@@ -1731,7 +1731,7 @@ const Machine = struct {
                 const v = m.popVal();
                 if (am.is_private) {
                     const base = m.popVal();
-                    const brand = m.current_closure.?.meta.?.brand.?.closure;
+                    const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                     try object.setPrivate(rt, base, brand, try rt.heap.internAscii(am.named.?), v);
                 } else {
                     const kv: KeyValue = if (am.named) |n| .{ .named = n } else .{ .value = m.popVal() };
@@ -1754,7 +1754,7 @@ const Machine = struct {
                 const base = m.popVal();
                 const v = try ops.binary(rt, ac.op, old, rhs);
                 if (ac.priv_name) |pn| {
-                    const brand = m.current_closure.?.meta.?.brand.?.closure;
+                    const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                     try object.setPrivate(rt, base, brand, try rt.heap.internAscii(pn), v);
                 } else {
                     try object.set(rt, base, ac.key, v);
@@ -1776,7 +1776,7 @@ const Machine = struct {
                 const kv: KeyValue = if (um.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.popVal();
                 if (um.is_private) {
-                    const brand = m.current_closure.?.meta.?.brand.?.closure;
+                    const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                     const name_str = try rt.heap.internAscii(um.named.?);
                     const s = try stepNumeric(rt, try object.getPrivate(rt, base, brand, name_str), um.op == .inc);
                     try object.setPrivate(rt, base, brand, name_str, s.new);
@@ -1793,11 +1793,11 @@ const Machine = struct {
                     .name => |n| {
                         const base = m.popVal();
                         const res_v: Value = if (mb.is_private) blk: {
-                            const brand = m.current_closure.?.meta.?.brand.?.closure;
+                            const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                             break :blk try object.getPrivate(rt, base, brand, try rt.heap.internAscii(n));
                         } else blk: {
                             const k = try object.named(rt, n);
-                            break :blk if (mb.is_delete) .{ .boolean = try object.delete(rt, base, k) } else try object.get(rt, base, k);
+                            break :blk if (mb.is_delete) Value.fromBool(try object.delete(rt, base, k)) else try object.get(rt, base, k);
                         };
                         m.depth -= 1;
                         try m.pushVal(res_v);
@@ -1813,16 +1813,16 @@ const Machine = struct {
                 const kv: KeyValue = if (mf.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.popVal();
                 const k = try m.toKey(kv);
-                const res_v: Value = if (mf.is_delete) .{ .boolean = try object.delete(rt, base, k) } else try object.get(rt, base, k);
+                const res_v: Value = if (mf.is_delete) Value.fromBool(try object.delete(rt, base, k)) else try object.get(rt, base, k);
                 m.depth -= 1;
                 try m.pushVal(res_v);
             },
             .private_in_finish => |name| {
                 const rhs = m.popVal();
-                const brand = m.current_closure.?.meta.?.brand.?.closure;
+                const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                 const b = try object.hasPrivate(rt, rhs, brand, try rt.heap.internAscii(name));
                 m.depth -= 1;
-                try m.pushVal(.{ .boolean = b });
+                try m.pushVal(Value.fromBool(b));
             },
             .opt_after_base => |oa| {
                 const mem = oa.oc.base.data.member;
@@ -1852,10 +1852,10 @@ const Machine = struct {
                 }
                 const step = os.oc.steps[os.idx];
                 const val = m.values.items[m.values.items.len - 1];
-                if (step.optional and (val == .null or val == .undefined)) {
+                if (step.optional and val.isNullish()) {
                     _ = m.popVal(); // val
                     _ = m.popVal(); // receiver
-                    try m.pushVal(if (os.is_delete) .{ .boolean = true } else .undefined);
+                    try m.pushVal(if (os.is_delete) Value.fromBool(true) else .undefined);
                     return;
                 }
                 switch (step.kind) {
@@ -1864,7 +1864,7 @@ const Machine = struct {
                         if (os.is_delete and os.idx == os.oc.steps.len - 1) {
                             _ = m.popVal();
                             _ = m.popVal();
-                            try m.pushVal(.{ .boolean = try object.delete(rt, val, key) });
+                            try m.pushVal(Value.fromBool(try object.delete(rt, val, key)));
                             return;
                         }
                         const next_val = try object.get(rt, val, key);
@@ -1874,7 +1874,7 @@ const Machine = struct {
                         try m.pushTask(.{ .opt_step = .{ .oc = os.oc, .idx = os.idx + 1, .is_delete = os.is_delete } });
                     },
                     .private_prop => |n| {
-                        const brand = m.current_closure.?.meta.?.brand.?.closure;
+                        const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                         const next_val = try object.getPrivate(rt, val, brand, try rt.heap.internAscii(n));
                         const vals = m.values.items;
                         vals[vals.len - 2] = val; // receiver = val
@@ -1901,7 +1901,7 @@ const Machine = struct {
                 if (oe.is_delete and oe.idx == oe.oc.steps.len - 1) {
                     _ = m.popVal();
                     _ = m.popVal();
-                    try m.pushVal(.{ .boolean = try object.delete(rt, val, key) });
+                    try m.pushVal(Value.fromBool(try object.delete(rt, val, key)));
                     return;
                 }
                 const next_val = try object.get(rt, val, key);
@@ -1917,7 +1917,7 @@ const Machine = struct {
                 const receiver = vals[oc_call.args_base - 2];
                 vals[oc_call.args_base - 2] = .undefined;
                 try m.pushTask(.{ .opt_step = .{ .oc = oc_call.oc, .idx = oc_call.idx + 1, .is_delete = oc_call.is_delete } });
-                try m.invokeCallable(callee, if (receiver == .undefined) null else receiver, oc_call.args_base, oc_call.args_base - 1);
+                try m.invokeCallable(callee, if (receiver.isUndefined()) null else receiver, oc_call.args_base, oc_call.args_base - 1);
             },
             .super_get_elem => {
                 const this_val = try m.requireThis();
@@ -2022,14 +2022,14 @@ const Machine = struct {
             },
             .array_elem_push => {
                 const v = m.popVal();
-                const arr = m.values.items[m.values.items.len - 1].object;
+                const arr = m.values.items[m.values.items.len - 1].asObject();
                 try rt.heap.appendElement(arr, v);
             },
             .array_spread_push => {
                 const iterable = m.popVal();
-                const arr = m.values.items[m.values.items.len - 1].object;
+                const arr = m.values.items[m.values.items.len - 1].asObject();
                 const iter = try builtins.getIterator(rt, iterable);
-                try m.pushVal(.{ .object = iter }); // root iter across iteratorNextVal
+                try m.pushVal(Value.fromObject(iter)); // root iter across iteratorNextVal
                 defer _ = m.popVal();
                 while (try builtins.iteratorNextVal(rt, iter)) |elem| {
                     try rt.heap.appendElement(arr, elem);
@@ -2066,14 +2066,14 @@ const Machine = struct {
             .object_prop_key => unreachable,
             .object_prop_val => |op| {
                 const v = m.popVal();
-                const o = m.values.items[m.values.items.len - 1].object;
+                const o = m.values.items[m.values.items.len - 1].asObject();
                 const pr = op.props[op.idx].prop;
                 switch (pr.kind) {
                     .init => try object.define(rt, o, op.key, v),
                     .getter, .setter => {
-                        if (v != .closure) return rt.bug("object accessor expects closure");
-                        try rt.heap.storeClosureHomeObject(@constCast(v.closure), .{ .object = o });
-                        try object.defineAccessor(rt, .{ .object = o }, op.key, v, pr.kind == .setter, true);
+                        if (!v.isClosure()) return rt.bug("object accessor expects closure");
+                        try rt.heap.storeClosureHomeObject(@constCast(v.asClosure()), Value.fromObject(o));
+                        try object.defineAccessor(rt, Value.fromObject(o), op.key, v, pr.kind == .setter, true);
                     },
                 }
                 if (op.idx + 1 < op.props.len) {
@@ -2082,7 +2082,7 @@ const Machine = struct {
             },
             .object_spread_finish => |os| {
                 const src = m.popVal();
-                const o = m.values.items[m.values.items.len - 1].object;
+                const o = m.values.items[m.values.items.len - 1].asObject();
                 try copyDataProperties(rt, o, src, &.{});
                 if (os.idx + 1 < os.props.len) {
                     try m.pushTask(.{ .object_next = .{ .props = os.props, .idx = os.idx + 1 } });
@@ -2109,7 +2109,7 @@ const Machine = struct {
                 const kv: KeyValue = if (cm.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.values.items[m.values.items.len - 1];
                 const callee = if (cm.is_private) blk: {
-                    const brand = m.current_closure.?.meta.?.brand.?.closure;
+                    const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                     break :blk try object.getPrivate(rt, base, brand, try rt.heap.internAscii(cm.named.?));
                 } else try object.get(rt, base, try m.toKey(kv));
                 try m.pushVal(callee);
@@ -2160,7 +2160,7 @@ const Machine = struct {
             .eval_args_spread => {
                 const iterable = m.popVal();
                 const iter = try builtins.getIterator(rt, iterable);
-                try m.pushVal(.{ .object = iter });
+                try m.pushVal(Value.fromObject(iter));
                 var count: usize = 0;
                 errdefer m.values.shrinkRetainingCapacity(m.values.items.len - count - 1);
                 // Pop iter after reading? No, keep iter rooted while appending elements, then shift or remove!
@@ -2182,8 +2182,8 @@ const Machine = struct {
                 const callee = m.values.items[args_base - 1];
                 var target = callee;
                 var new_target = callee;
-                if (callee == .closure and callee.closure.impl == .bound) {
-                    const b = callee.closure.impl.bound;
+                if (callee.isClosure() and callee.asClosure().impl == .bound) {
+                    const b = callee.asClosure().impl.bound;
                     target = b.target;
                     new_target = b.target;
                     if (b.bound_args.len > 0) {
@@ -2193,25 +2193,25 @@ const Machine = struct {
                 if (!builtins.isConstructor(target)) {
                     return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
                 }
-                if (target == .object) {
-                    const res_v = try builtins.callProxyConstruct(rt, target.object, m.values.items[args_base..], new_target);
+                if (target.isObject()) {
+                    const res_v = try builtins.callProxyConstruct(rt, target.asObject(), m.values.items[args_base..], new_target);
                     m.values.shrinkRetainingCapacity(args_base - 1);
                     try m.pushVal(res_v);
                     return;
                 }
-                if (target == .native) {
+                if (target.isNative()) {
                     const res_v = try builtins.construct(rt, target, m.values.items[args_base..]);
                     m.values.shrinkRetainingCapacity(args_base - 1);
                     try m.pushVal(res_v);
                     return;
                 }
-                const tc = target.closure;
+                const tc = target.asClosure();
                 const t = tc.impl.tree;
                 const f: *const ast.Function = @ptrCast(@alignCast(t.func));
                 const proto_val = try object.get(rt, target, try object.named(rt, "prototype"));
                 const r = try builtins.realm(rt);
-                const instance = try rt.heap.newObject(if (proto_val == .object) proto_val.object else r.object_prototype);
-                const init_this: ?Value = if (f.has_super_ctor) null else .{ .object = instance };
+                const instance = try rt.heap.newObject(if (proto_val.isObject()) proto_val.asObject() else r.object_prototype);
+                const init_this: ?Value = if (f.has_super_ctor) null else Value.fromObject(instance);
                 try m.pushClosureCallSync(tc, f, t.env, init_this, args_base, args_base - 1, instance, false);
             },
             .invoke_super_call => |args_base| {
@@ -2219,9 +2219,9 @@ const Machine = struct {
                     return rt.throw(.ReferenceError, &.{.{ .ascii = "Super constructor may only be called once" }});
                 }
                 const cur_closure = m.current_closure orelse return rt.bug("super() without closure");
-                var target = try object.getPrototypeOfValue(rt, .{ .closure = cur_closure });
-                if (target == .closure and target.closure.impl == .bound) {
-                    const b = target.closure.impl.bound;
+                var target = try object.getPrototypeOfValue(rt, Value.fromClosure(cur_closure));
+                if (target.isClosure() and target.asClosure().impl == .bound) {
+                    const b = target.asClosure().impl.bound;
                     target = b.target;
                     if (b.bound_args.len > 0) {
                         try m.values.insertSlice(rt.gpa, args_base, b.bound_args);
@@ -2231,27 +2231,27 @@ const Machine = struct {
                     return rt.throw(.TypeError, &.{.{ .ascii = "Super constructor is not a constructor" }});
                 }
                 const inst = m.construct_instance orelse return rt.bug("super() without construct_instance");
-                if (target == .object) {
-                    const res_v = try builtins.callProxyConstruct(rt, target.object, m.values.items[args_base..], .{ .closure = cur_closure });
+                if (target.isObject()) {
+                    const res_v = try builtins.callProxyConstruct(rt, target.asObject(), m.values.items[args_base..], Value.fromClosure(cur_closure));
                     m.values.shrinkRetainingCapacity(args_base);
                     m.this = res_v;
                     try builtins.runInstanceInits(rt, @constCast(cur_closure), res_v);
                     try m.pushVal(res_v);
                     return;
                 }
-                if (target == .native) {
+                if (target.isNative()) {
                     const res_v = try builtins.construct(rt, target, m.values.items[args_base..]);
-                    if (res_v == .object) rt.heap.storeObjectProto(res_v.object, inst.proto);
+                    if (res_v.isObject()) rt.heap.storeObjectProto(res_v.asObject(), inst.proto);
                     m.values.shrinkRetainingCapacity(args_base);
                     m.this = res_v;
                     try builtins.runInstanceInits(rt, @constCast(cur_closure), res_v);
                     try m.pushVal(res_v);
                     return;
                 }
-                const tc = target.closure;
+                const tc = target.asClosure();
                 const t = tc.impl.tree;
                 const f: *const ast.Function = @ptrCast(@alignCast(t.func));
-                const init_this: ?Value = if (f.has_super_ctor) null else .{ .object = inst };
+                const init_this: ?Value = if (f.has_super_ctor) null else Value.fromObject(inst);
                 try m.pushClosureCallSync(tc, f, t.env, init_this, args_base, args_base, inst, true);
             },
             .call_bind_param => |bp| {
@@ -2266,11 +2266,11 @@ const Machine = struct {
                     const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
                     if (bp.idx < args.len) try rt.heap.appendElements(arr, args[bp.idx..]);
                     try m.pushTask(.{ .bind_pattern = .{ .pat = p.pattern, .mode = .init } });
-                    try m.pushVal(.{ .object = arr });
+                    try m.pushVal(Value.fromObject(arr));
                 } else {
                     const v: Value = if (bp.idx < args.len) args[bp.idx] else .undefined;
                     if (p.default) |def| {
-                        if (v == .undefined) {
+                        if (v.isUndefined()) {
                             try m.pushTask(.{ .bind_pattern = .{ .pat = p.pattern, .mode = .init } });
                             try m.pushEval(def);
                             return;
@@ -2307,7 +2307,7 @@ const Machine = struct {
                     if (cr.callee_func != null and cr.callee_func.?.has_super_ctor) {
                         break :blk cur_this orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
                     }
-                    break :blk .{ .object = inst };
+                    break :blk Value.fromObject(inst);
                 } else .undefined;
                 if (cr.is_super_call) {
                     m.this = out_v;
@@ -2348,7 +2348,7 @@ const Machine = struct {
                 const proto_obj = try builtins.setupClass(rt, ctor_val, cs.cls.super_class != null, super_val);
                 if (cs.cls.methods.len > 0 or cs.cls.instance_fields.len > 0 or cs.cls.static_fields.len > 0 or cs.cls.static_items.len > 0) {
                     if (has_inner) try m.pushTask(.{ .scope_exit = saved_env });
-                    try m.pushVal(.{ .object = proto_obj });
+                    try m.pushVal(Value.fromObject(proto_obj));
                     try m.pushTask(.{ .class_method_next = .{ .cls = cs.cls, .idx = 0 } });
                 } else if (has_inner) {
                     m.env = saved_env;
@@ -2360,21 +2360,21 @@ const Machine = struct {
                 if (idx >= cm.cls.methods.len) {
                     const proto_val = m.popVal();
                     const ctor_val = m.values.items[m.values.items.len - 1];
-                    const ctor_c = @constCast(ctor_val.closure);
+                    const ctor_c = @constCast(ctor_val.asClosure());
                     // Register private instance methods/accessors in instance_inits, and install static private methods on ctor.
                     for (cm.cls.methods) |meth| {
                         if (!meth.is_private) continue;
                         const fn_val = try m.evalFunction(meth.func);
-                        try rt.heap.storeClosureBrand(@constCast(fn_val.closure), ctor_val);
+                        try rt.heap.storeClosureBrand(@constCast(fn_val.asClosure()), ctor_val);
                         const name_str = try rt.heap.internAscii(meth.key.name);
                         if (meth.is_static) {
-                            try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), ctor_val);
+                            try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), ctor_val);
                             switch (meth.kind) {
                                 .method => try object.definePrivateMethod(rt, ctor_val, ctor_c, name_str, fn_val),
                                 .getter, .setter => try object.definePrivateAccessor(rt, ctor_val, ctor_c, name_str, fn_val, meth.kind == .setter),
                             }
                         } else {
-                            try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), proto_val);
+                            try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), proto_val);
                             try rt.heap.appendClosureInstanceInit(ctor_c, .{
                                 .kind = switch (meth.kind) {
                                     .method => .private_method,
@@ -2395,11 +2395,11 @@ const Machine = struct {
                     .name => |n| try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = idx, .named = n } }),
                     .string => |units| {
                         const s = try rt.heap.newString(&.{.{ .utf16 = units }});
-                        try m.pushVal(.{ .string = s });
+                        try m.pushVal(Value.fromString(s));
                         try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = idx, .named = null } });
                     },
                     .number => |num| {
-                        try m.pushVal(.{ .number = num });
+                        try m.pushVal(Value.fromNumber(num));
                         try m.pushTask(.{ .class_method_finish = .{ .cls = cm.cls, .idx = idx, .named = null } });
                     },
                     .computed => |k| {
@@ -2416,7 +2416,7 @@ const Machine = struct {
                 const ctor_val = m.values.items[m.values.items.len - 2];
                 const target = if (meth.is_static) ctor_val else proto_val;
                 const fn_val = try m.evalFunction(meth.func);
-                try rt.heap.storeClosureBrand(@constCast(fn_val.closure), ctor_val);
+                try rt.heap.storeClosureBrand(@constCast(fn_val.asClosure()), ctor_val);
                 switch (meth.kind) {
                     .method => try builtins.defineClassMethod(rt, target, k, fn_val),
                     .getter, .setter => try builtins.defineClassAccessor(rt, target, k, fn_val, meth.kind == .setter),
@@ -2439,16 +2439,16 @@ const Machine = struct {
                 switch (f.key) {
                     .name => |n| {
                         const s = try rt.heap.internAscii(n);
-                        try m.pushVal(.{ .string = s });
+                        try m.pushVal(Value.fromString(s));
                         try m.pushTask(.{ .class_inst_field_finish = .{ .cls = cf.cls, .idx = cf.idx, .key_idx = cf.key_idx, .is_named = false } });
                     },
                     .string => |units| {
                         const s = try rt.heap.newString(&.{.{ .utf16 = units }});
-                        try m.pushVal(.{ .string = s });
+                        try m.pushVal(Value.fromString(s));
                         try m.pushTask(.{ .class_inst_field_finish = .{ .cls = cf.cls, .idx = cf.idx, .key_idx = cf.key_idx, .is_named = false } });
                     },
                     .number => |num| {
-                        try m.pushVal(.{ .number = num });
+                        try m.pushVal(Value.fromNumber(num));
                         try m.pushTask(.{ .class_inst_field_finish = .{ .cls = cf.cls, .idx = cf.idx, .key_idx = cf.key_idx, .is_named = false } });
                     },
                     .computed => |k| {
@@ -2462,11 +2462,11 @@ const Machine = struct {
                 const key_val: Value = if (cf.is_named) .undefined else m.popVal();
                 const proto_val = m.values.items[m.values.items.len - 1];
                 const ctor_val = m.values.items[m.values.items.len - 2];
-                const ctor_c = @constCast(ctor_val.closure);
+                const ctor_c = @constCast(ctor_val.asClosure());
                 const init_val: Value = if (f.init) |init_fn| blk: {
                     const iv = try m.evalFunction(init_fn);
-                    try rt.heap.storeClosureHomeObject(@constCast(iv.closure), proto_val);
-                    try rt.heap.storeClosureBrand(@constCast(iv.closure), ctor_val);
+                    try rt.heap.storeClosureHomeObject(@constCast(iv.asClosure()), proto_val);
+                    try rt.heap.storeClosureBrand(@constCast(iv.asClosure()), ctor_val);
                     break :blk iv;
                 } else .undefined;
                 var next_key_idx = cf.key_idx;
@@ -2497,15 +2497,15 @@ const Machine = struct {
                 }
                 switch (f.key) {
                     .name => |n| {
-                        try m.pushVal(.{ .string = try rt.heap.internAscii(n) });
+                        try m.pushVal(Value.fromString(try rt.heap.internAscii(n)));
                         try m.pushTask(.{ .class_static_key_next = .{ .cls = cs.cls, .idx = cs.idx + 1 } });
                     },
                     .string => |units| {
-                        try m.pushVal(.{ .string = try rt.heap.newString(&.{.{ .utf16 = units }}) });
+                        try m.pushVal(Value.fromString(try rt.heap.newString(&.{.{ .utf16 = units }})));
                         try m.pushTask(.{ .class_static_key_next = .{ .cls = cs.cls, .idx = cs.idx + 1 } });
                     },
                     .number => |num| {
-                        try m.pushVal(.{ .number = num });
+                        try m.pushVal(Value.fromNumber(num));
                         try m.pushTask(.{ .class_static_key_next = .{ .cls = cs.cls, .idx = cs.idx + 1 } });
                     },
                     .computed => |k| {
@@ -2528,12 +2528,12 @@ const Machine = struct {
                         const f = cs.cls.static_fields[fidx];
                         const val: Value = if (f.init) |init_fn| blk: {
                             const iv = try m.evalFunction(init_fn);
-                            try rt.heap.storeClosureHomeObject(@constCast(iv.closure), ctor_val);
-                            try rt.heap.storeClosureBrand(@constCast(iv.closure), ctor_val);
+                            try rt.heap.storeClosureHomeObject(@constCast(iv.asClosure()), ctor_val);
+                            try rt.heap.storeClosureBrand(@constCast(iv.asClosure()), ctor_val);
                             break :blk try rt.callCallable(iv, ctor_val, &.{});
                         } else .undefined;
                         if (f.is_private) {
-                            try object.definePrivateField(rt, ctor_val, ctor_val.closure, try rt.heap.internAscii(f.key.name), val);
+                            try object.definePrivateField(rt, ctor_val, ctor_val.asClosure(), try rt.heap.internAscii(f.key.name), val);
                         } else {
                             const key_val = m.values.items[cs.keys_base + fidx];
                             try object.definePublicField(rt, ctor_val, try object.key(rt, key_val), val);
@@ -2541,8 +2541,8 @@ const Machine = struct {
                     },
                     .block => |blk_fn| {
                         const bv = try m.evalFunction(blk_fn);
-                        try rt.heap.storeClosureHomeObject(@constCast(bv.closure), ctor_val);
-                        try rt.heap.storeClosureBrand(@constCast(bv.closure), ctor_val);
+                        try rt.heap.storeClosureHomeObject(@constCast(bv.asClosure()), ctor_val);
+                        try rt.heap.storeClosureBrand(@constCast(bv.asClosure()), ctor_val);
                         _ = try rt.callCallable(bv, ctor_val, &.{});
                     },
                 }
@@ -2581,7 +2581,7 @@ const Machine = struct {
                 const base = m.popVal();
                 const val = m.popVal();
                 if (bf.is_private) {
-                    const brand = m.current_closure.?.meta.?.brand.?.closure;
+                    const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                     try object.setPrivate(rt, base, brand, try rt.heap.internAscii(bf.named.?), val);
                 } else {
                     const k = try m.toKey(kv);
@@ -2590,7 +2590,7 @@ const Machine = struct {
             },
             .bind_array_elem => |ba| {
                 // values: [..., iter]
-                const iter = m.values.items[m.values.items.len - 1].object;
+                const iter = m.values.items[m.values.items.len - 1].asObject();
                 const arr = ba.pat.data.array;
                 if (ba.idx < arr.elems.len) {
                     const maybe_el = arr.elems[ba.idx];
@@ -2611,8 +2611,8 @@ const Machine = struct {
                         try m.pushEval(mem.object);
                         return;
                     }
-                    const v = (try builtins.iteratorNextVal(rt, iter)) orelse .undefined;
-                    if (el.default) |def| if (v == .undefined) {
+                    const v: Value = (try builtins.iteratorNextVal(rt, iter)) orelse .undefined;
+                    if (el.default) |def| if (v.isUndefined()) {
                         try m.pushTask(.{ .bind_array_elem_after_default = .{
                             .pat = ba.pat,
                             .idx = ba.idx,
@@ -2635,7 +2635,7 @@ const Machine = struct {
                         return;
                     }
                     const rest_arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
-                    try m.pushVal(.{ .object = rest_arr });
+                    try m.pushVal(Value.fromObject(rest_arr));
                     while (try builtins.iteratorNextVal(rt, iter)) |elem| {
                         try rt.heap.appendElement(rest_arr, elem);
                     }
@@ -2661,10 +2661,10 @@ const Machine = struct {
             .bind_array_elem_pre_member_key => |ba| {
                 // values: [..., iter, base, (key_v?)]
                 const iter_idx = if (ba.named == null) m.values.items.len - 3 else m.values.items.len - 2;
-                const iter = m.values.items[iter_idx].object;
+                const iter = m.values.items[iter_idx].asObject();
                 const el = ba.pat.data.array.elems[ba.idx].?;
-                const v = (try builtins.iteratorNextVal(rt, iter)) orelse .undefined;
-                if (el.default) |def| if (v == .undefined) {
+                const v: Value = (try builtins.iteratorNextVal(rt, iter)) orelse .undefined;
+                if (el.default) |def| if (v.isUndefined()) {
                     try m.pushTask(.{ .bind_array_elem_after_default = .{
                         .pat = ba.pat,
                         .idx = ba.idx,
@@ -2677,7 +2677,7 @@ const Machine = struct {
                 const kv: KeyValue = if (ba.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.popVal();
                 if (el.pattern.data.target.member.is_private) {
-                    const brand = m.current_closure.?.meta.?.brand.?.closure;
+                    const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                     try object.setPrivate(rt, base, brand, try rt.heap.internAscii(ba.named.?), v);
                 } else {
                     try object.set(rt, base, try m.toKey(kv), v);
@@ -2696,7 +2696,7 @@ const Machine = struct {
                     };
                     const base = m.popVal();
                     if (mem.is_private) {
-                        const brand = m.current_closure.?.meta.?.brand.?.closure;
+                        const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                         try object.setPrivate(rt, base, brand, try rt.heap.internAscii(mem.key.name), v);
                     } else {
                         try object.set(rt, base, try m.toKey(kv), v);
@@ -2721,9 +2721,9 @@ const Machine = struct {
             .bind_array_rest_pre_member_key => |named| {
                 // values: [..., iter, base, (key_v?)]
                 const iter_idx = if (named == null) m.values.items.len - 3 else m.values.items.len - 2;
-                const iter = m.values.items[iter_idx].object;
+                const iter = m.values.items[iter_idx].asObject();
                 const rest_arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
-                try m.pushVal(.{ .object = rest_arr });
+                try m.pushVal(Value.fromObject(rest_arr));
                 while (try builtins.iteratorNextVal(rt, iter)) |elem| {
                     try rt.heap.appendElement(rest_arr, elem);
                 }
@@ -2759,7 +2759,7 @@ const Machine = struct {
                         return;
                     }
                     const rest_obj = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
-                    try m.pushVal(.{ .object = rest_obj });
+                    try m.pushVal(Value.fromObject(rest_obj));
                     const val = m.values.items[bo.excl_base - 1];
                     try m.copyExcludedDataProperties(rest_obj, val, bo.excl_base, bo.excl_count);
                     const ro = m.popVal();
@@ -2806,7 +2806,7 @@ const Machine = struct {
                 const key_idx = if (bo.named == null) m.values.items.len - 3 else m.values.items.len - 2;
                 const k = valueToKey(m.values.items[key_idx]);
                 const v = try object.get(rt, val, k);
-                if (pr.default) |def| if (v == .undefined) {
+                if (pr.default) |def| if (v.isUndefined()) {
                     try m.pushTask(.{ .bind_object_prop_after_default = .{
                         .pat = bo.pat,
                         .idx = bo.idx,
@@ -2877,10 +2877,10 @@ const Machine = struct {
                 const base = m.popVal();
                 const val = m.values.items[bo.excl_base - 1];
                 const rest_obj = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
-                try m.pushVal(.{ .object = rest_obj });
+                try m.pushVal(Value.fromObject(rest_obj));
                 try m.copyExcludedDataProperties(rest_obj, val, bo.excl_base, bo.excl_count);
                 _ = m.popVal(); // rest_obj
-                try object.set(rt, base, try m.toKey(kv), .{ .object = rest_obj });
+                try object.set(rt, base, try m.toKey(kv), Value.fromObject(rest_obj));
                 m.values.shrinkRetainingCapacity(bo.excl_base - 1);
             },
             .array_iter_close => |ac| try builtins.iteratorClose(rt, ac.iter, false),
@@ -2925,7 +2925,7 @@ const Machine = struct {
                 }
                 for (stmts) |st| if (st.data == .function) {
                     const f = st.data.function;
-                    m.store(f.name.?.binding, .{ .closure = try m.makeTreeClosure(f, m.env) });
+                    m.store(f.name.?.binding, Value.fromClosure(try m.makeTreeClosure(f, m.env)));
                 };
                 if (stmts.len > 0) {
                     if (stmts.len > 1) {
@@ -3107,15 +3107,15 @@ const Machine = struct {
         switch (e.data) {
             .number => |n| {
                 m.depth -= 1;
-                try m.pushVal(.{ .number = n });
+                try m.pushVal(Value.fromNumber(n));
             },
             .bigint => |raw| {
                 m.depth -= 1;
-                try m.pushVal(.{ .bigint = try bigint.parse(rt, raw, true) });
+                try m.pushVal(Value.fromBigInt(try bigint.parse(rt, raw, true)));
             },
             .string => |units| {
                 m.depth -= 1;
-                try m.pushVal(.{ .string = try rt.heap.newString(&.{.{ .utf16 = units }}) });
+                try m.pushVal(Value.fromString(try rt.heap.newString(&.{.{ .utf16 = units }})));
             },
             .regexp => |rx| {
                 m.depth -= 1;
@@ -3123,7 +3123,7 @@ const Machine = struct {
             },
             .boolean => |b| {
                 m.depth -= 1;
-                try m.pushVal(.{ .boolean = b });
+                try m.pushVal(Value.fromBool(b));
             },
             .null => {
                 m.depth -= 1;
@@ -3193,7 +3193,7 @@ const Machine = struct {
                 }
             },
             .template => |t| {
-                const first: Value = .{ .string = try rt.heap.newString(&.{.{ .utf16 = t.quasis[0] }}) };
+                const first: Value = Value.fromString(try rt.heap.newString(&.{.{ .utf16 = t.quasis[0] }}));
                 try m.pushVal(first);
                 if (t.exprs.len == 0) {
                     m.depth -= 1;
@@ -3321,7 +3321,7 @@ const Machine = struct {
                 const mod_ptr = m.module_record orelse return rt.bug("import.meta outside a module");
                 const meta_obj = try module.getImportMeta(rt, @ptrCast(@alignCast(mod_ptr)));
                 m.depth -= 1;
-                try m.pushVal(.{ .object = meta_obj });
+                try m.pushVal(Value.fromObject(meta_obj));
             },
             .dynamic_import => |spec| {
                 try m.pushTask(.dynamic_import);
@@ -3335,7 +3335,7 @@ const Machine = struct {
             .delete_optional => |oc| try m.startOptionalChain(oc, true),
             .array => |items| {
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
-                try m.pushVal(.{ .object = arr });
+                try m.pushVal(Value.fromObject(arr));
                 if (items.len == 0) {
                     m.depth -= 1;
                 } else {
@@ -3345,7 +3345,7 @@ const Machine = struct {
             },
             .object => |props| {
                 const o = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
-                try m.pushVal(.{ .object = o });
+                try m.pushVal(Value.fromObject(o));
                 if (props.len == 0) {
                     m.depth -= 1;
                 } else {
@@ -3433,7 +3433,7 @@ const Machine = struct {
         const c = if (f.name) |n| blk: {
             const own = try rt.heap.newEnv(m.env, m.res.bindings[n.binding].scope, 1);
             const cl = try m.makeTreeClosure(f, own);
-            rt.heap.storeEnv(own, 0, .{ .closure = cl });
+            rt.heap.storeEnv(own, 0, Value.fromClosure(cl));
             break :blk cl;
         } else try m.makeTreeClosure(f, m.env);
         if (f.is_arrow) {
@@ -3449,7 +3449,7 @@ const Machine = struct {
                 if (pm.brand) |br| try rt.heap.storeClosureBrand(c, br);
             }
         }
-        return .{ .closure = c };
+        return Value.fromClosure(c);
     }
 
     fn requireThis(m: *Machine) Error!Value {
@@ -3462,15 +3462,15 @@ const Machine = struct {
 
     fn invokeCallable(m: *Machine, callee: Value, receiver: ?Value, args_base: usize, result_base: usize) Error!void {
         const rt = m.rt;
-        if (callee == .closure and callee.closure.impl == .bound) {
-            const b = callee.closure.impl.bound;
+        if (callee.isClosure() and callee.asClosure().impl == .bound) {
+            const b = callee.asClosure().impl.bound;
             if (b.bound_args.len > 0) {
                 try m.values.insertSlice(rt.gpa, args_base, b.bound_args);
             }
             return m.invokeCallable(b.target, b.bound_this, args_base, result_base);
         }
         const args = m.values.items[args_base..];
-        switch (callee) {
+        switch (callee.unpack()) {
             .native => |n| {
                 const res_v = if (n.host != null) return rt.fail(.builtin) else try n.call(rt, receiver orelse .undefined, args);
                 m.values.shrinkRetainingCapacity(result_base);
@@ -3568,7 +3568,7 @@ const Machine = struct {
             try m.pushTask(.{ .call_enter_body = .{ .func = f, .args_base = @intCast(args_base) } });
         }
         if (construct_instance != null and !f.has_super_ctor) {
-            try builtins.runInstanceInits(m.rt, @constCast(closure), .{ .object = construct_instance.? });
+            try builtins.runInstanceInits(m.rt, @constCast(closure), Value.fromObject(construct_instance.?));
         }
     }
 
@@ -3584,7 +3584,7 @@ const Machine = struct {
             return m.rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
         }
 
-        var ret_root = [_]Value{ m.ret, .{ .closure = closure }, new_target, .undefined };
+        var ret_root = [_]Value{ m.ret, Value.fromClosure(closure), new_target, .undefined };
         var ret_roots: rt_mod.ValueRoots = .{ .values = &ret_root };
         try ret_roots.register(m.rt);
         m.ret = .undefined;
@@ -3595,9 +3595,9 @@ const Machine = struct {
 
         const proto_val = try object.get(m.rt, new_target, try object.named(m.rt, "prototype"));
         const r = try builtins.realm(m.rt);
-        const instance = try m.rt.heap.newObject(if (proto_val == .object) proto_val.object else r.object_prototype);
-        ret_root[3] = .{ .object = instance };
-        const init_this: ?Value = if (f.has_super_ctor) null else .{ .object = instance };
+        const instance = try m.rt.heap.newObject(if (proto_val.isObject()) proto_val.asObject() else r.object_prototype);
+        ret_root[3] = Value.fromObject(instance);
+        const init_this: ?Value = if (f.has_super_ctor) null else Value.fromObject(instance);
 
         const values_base = m.values.items.len;
         const stop_len = m.tasks.items.len;
@@ -3672,7 +3672,7 @@ const Machine = struct {
         const ctx: StartAsyncCtx = .{ .rt = rt, .caller = caller, .closure = closure, .this = this, .args = args };
         const f: *const ast.Function = @ptrCast(@alignCast(closure.impl.tree.func));
         if (f.is_generator)
-            return coroutine.startGenerator(rt, &coro_vtable, .{ .closure = closure }, f.is_async, ctx, createAndRunCoro);
+            return coroutine.startGenerator(rt, &coro_vtable, Value.fromClosure(closure), f.is_async, ctx, createAndRunCoro);
         return coroutine.start(rt, &coro_vtable, ctx, createAndRunCoro);
     }
 
@@ -3862,12 +3862,12 @@ const Machine = struct {
                 const values_base: u32 = @intCast(m.values.items.len);
                 const iter = try builtins.getIterator(rt, val);
                 try m.pushTask(.{ .array_iter_close = .{ .iter = iter, .values_base = values_base } });
-                try m.pushVal(.{ .object = iter });
+                try m.pushVal(Value.fromObject(iter));
                 try m.pushTask(.{ .bind_array_elem = .{ .pat = pat, .idx = 0, .mode = mode } });
             },
             .object => {
-                if (val == .undefined or val == .null) {
-                    return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot destructure '" }, .{ .ascii = @tagName(val) }, .{ .ascii = "'" } });
+                if (val.isUndefined() or val.isNull()) {
+                    return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot destructure '" }, .{ .ascii = @tagName(val.tag()) }, .{ .ascii = "'" } });
                 }
                 try m.pushVal(val);
                 const excl_base: u32 = @intCast(m.values.items.len);
@@ -3884,14 +3884,14 @@ const Machine = struct {
 
     fn keyToValue(k: object.Key) Value {
         return switch (k) {
-            .atom => |a| .{ .string = a },
-            .index => |i| .{ .number = @floatFromInt(i) },
-            .symbol => |s| .{ .symbol = s },
+            .atom => |a| Value.fromString(a),
+            .index => |i| Value.fromNumber(@floatFromInt(i)),
+            .symbol => |s| Value.fromSymbol(s),
         };
     }
 
     fn valueToKey(v: Value) object.Key {
-        return switch (v) {
+        return switch (v.unpack()) {
             .string => |s| .{ .atom = @constCast(s) },
             .number => |n| .{ .index = @intFromFloat(n) },
             .symbol => |s| .{ .symbol = @constCast(s) },
@@ -3924,7 +3924,7 @@ const Machine = struct {
             return;
         }
         const v = try object.get(rt, val, k);
-        if (pr.default) |def| if (v == .undefined) {
+        if (pr.default) |def| if (v.isUndefined()) {
             try m.pushTask(.{ .bind_object_prop_after_default = .{
                 .pat = bo.pat,
                 .idx = bo.idx,
@@ -3952,7 +3952,7 @@ const Machine = struct {
         const excluded = try rt.gpa.alloc(object.Key, excl_count);
         defer rt.gpa.free(excluded);
         for (m.values.items[excl_base .. excl_base + excl_count], 0..) |ev, i| {
-            excluded[i] = switch (ev) {
+            excluded[i] = switch (ev.unpack()) {
                 .string => |s| .{ .atom = @constCast(s) },
                 .number => |n| .{ .index = @intFromFloat(n) },
                 .symbol => |s| .{ .symbol = @constCast(s) },
@@ -3973,7 +3973,7 @@ const Machine = struct {
         return switch (k) {
             .name => |n| object.named(m.rt, n),
             .string => |units| object.keyUnits(m.rt, units),
-            .number => |n| object.key(m.rt, .{ .number = n }),
+            .number => |n| object.key(m.rt, Value.fromNumber(n)),
             .computed => unreachable,
         };
     }
@@ -3983,7 +3983,7 @@ fn logicalAssignShouldWrite(op: ast.AssignOp, old: Value) bool {
     return switch (op) {
         .logical_and => ops.toBoolean(old),
         .logical_or => !ops.toBoolean(old),
-        .nullish => old == .null or old == .undefined,
+        .nullish => old.isNull() or old.isUndefined(),
         .plain, .compound => unreachable,
     };
 }
@@ -4002,28 +4002,28 @@ fn keyIn(k: object.Key, list: []const object.Key) bool {
 }
 
 fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []const object.Key) Error!void {
-    switch (src) {
+    switch (src.unpack()) {
         .string => |s| {
             for (0..s.units.len) |i| {
                 const k: object.Key = .{ .index = @intCast(i) };
                 if (keyIn(k, excluded)) continue;
                 const ch = try rt.heap.newString(&.{.{ .utf16 = s.units[i..][0..1] }});
-                try object.define(rt, dst, k, .{ .string = ch });
+                try object.define(rt, dst, k, Value.fromString(ch));
             }
         },
         .object, .closure => {
-            const keys = if (src == .object)
-                try object.ownAllKeys(rt, src.object)
+            const keys = if (src.isObject())
+                try object.ownAllKeys(rt, src.asObject())
             else
-                try object.ownAllKeysClosure(rt, src.closure);
+                try object.ownAllKeysClosure(rt, src.asClosure());
             defer rt.gpa.free(keys);
             const root_vals = try rt.gpa.alloc(Value, 2 + keys.len);
             defer rt.gpa.free(root_vals);
-            root_vals[0] = .{ .object = dst };
+            root_vals[0] = Value.fromObject(dst);
             root_vals[1] = src;
             for (keys, root_vals[2..]) |k, *rv| rv.* = switch (k) {
-                .atom => |a| .{ .string = a },
-                .symbol => |s| .{ .symbol = s },
+                .atom => |a| Value.fromString(a),
+                .symbol => |s| Value.fromSymbol(s),
                 .index => .undefined,
             };
             var roots: rt_mod.ValueRoots = .{ .values = root_vals };

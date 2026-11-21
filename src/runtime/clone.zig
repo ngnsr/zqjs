@@ -73,22 +73,22 @@ pub fn throwDataCloneError(rt: *Runtime, msg: []const u8) Error {
 
     const err_obj = try rt.heap.newObject(r.error_prototype);
     err_obj.is_error = true;
-    root_buf[0] = .{ .object = err_obj };
+    root_buf[0] = Value.fromObject(err_obj);
 
     const name_str = try rt.heap.internAscii("DataCloneError");
-    root_buf[1] = .{ .string = name_str };
+    root_buf[1] = Value.fromString(name_str);
     try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("name"), .{ .value = root_buf[1], .enumerable = false });
 
     const msg_str = try rt.heap.ascii(msg);
-    root_buf[1] = .{ .string = msg_str };
+    root_buf[1] = Value.fromString(msg_str);
     try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("message"), .{ .value = root_buf[1], .enumerable = false });
 
     return rt.throwValue(root_buf[0]);
 }
 
 pub fn structuredCloneImpl(rt: *Runtime, args: []const Value) Error!Value {
-    const val = if (args.len > 0) args[0] else .undefined;
-    const opts = if (args.len > 1) args[1] else .undefined;
+    const val: Value = if (args.len > 0) args[0] else .undefined;
+    const opts: Value = if (args.len > 1) args[1] else .undefined;
 
     var ctx: CloneContext = .{ .rt = rt };
     defer ctx.deinit();
@@ -99,13 +99,13 @@ pub fn structuredCloneImpl(rt: *Runtime, args: []const Value) Error!Value {
     _ = try ctx.pushRoot(val);
     _ = try ctx.pushRoot(opts);
 
-    if (opts != .undefined and opts != .null) {
-        if (opts != .object) {
+    if (!opts.isUndefined() and !opts.isNull()) {
+        if (!opts.isObject()) {
             return rt.throw(.TypeError, &.{.{ .ascii = "structuredClone options must be an object" }});
         }
         const transfer_key = try object.named(rt, "transfer");
         const transfer_val = try object.get(rt, opts, transfer_key);
-        if (transfer_val != .undefined and transfer_val != .null) {
+        if (!transfer_val.isUndefined() and !transfer_val.isNull()) {
             try collectTransferList(&ctx, transfer_val);
         }
     }
@@ -138,18 +138,18 @@ pub fn structuredCloneImpl(rt: *Runtime, args: []const Value) Error!Value {
 fn collectTransferList(ctx: *CloneContext, transfer_val: Value) Error!void {
     const rt = ctx.rt;
     const iter = try builtins.getIterator(rt, transfer_val);
-    const saved = try ctx.pushRoot(.{ .object = iter });
+    const saved = try ctx.pushRoot(Value.fromObject(iter));
     defer ctx.popRoots(saved);
 
     while (try builtins.iteratorNextVal(rt, iter)) |entry| {
         const entry_saved = try ctx.pushRoot(entry);
         defer ctx.popRoots(entry_saved);
 
-        if (entry != .object or entry.object.kind != .array_buffer) {
+        if (!entry.isObject() or entry.asObject().kind != .array_buffer) {
             builtins.iteratorClose(rt, iter, true) catch {};
             return throwDataCloneError(rt, "Value in transfer list is not an ArrayBuffer");
         }
-        const ab = entry.object;
+        const ab = entry.asObject();
         if (ab.kind.array_buffer.detached) {
             builtins.iteratorClose(rt, iter, true) catch {};
             return throwDataCloneError(rt, "Cannot transfer a detached ArrayBuffer");
@@ -164,11 +164,11 @@ fn collectTransferList(ctx: *CloneContext, transfer_val: Value) Error!void {
 
 fn cloneValue(ctx: *CloneContext, val: Value) Error!Value {
     const rt = ctx.rt;
-    return switch (val) {
+    return switch (val.unpack()) {
         .undefined, .null, .boolean, .number, .string, .bigint => val,
         .symbol => throwDataCloneError(rt, "Symbol could not be cloned"),
         .closure, .native => throwDataCloneError(rt, "Function could not be cloned"),
-        .object => |o| .{ .object = try cloneObject(ctx, o) },
+        .object => |o| Value.fromObject(try cloneObject(ctx, o)),
     };
 }
 
@@ -180,7 +180,7 @@ fn cloneObject(ctx: *CloneContext, src: *Object) Error!*Object {
     ctx.depth += 1;
     defer ctx.depth -= 1;
 
-    const saved = try ctx.pushRoot(.{ .object = src });
+    const saved = try ctx.pushRoot(Value.fromObject(src));
     defer ctx.popRoots(saved);
 
     return switch (src.kind) {
@@ -215,7 +215,7 @@ fn cloneOrdinary(ctx: *CloneContext, src: *Object) Error!*Object {
     defer _ = ctx.pending_keys.pop();
 
     for (keys) |k| {
-        const prop_val = try object.get(rt, .{ .object = src }, k);
+        const prop_val = try object.get(rt, Value.fromObject(src), k);
         const s1 = try ctx.pushRoot(prop_val);
         defer ctx.popRoots(s1);
         const cloned_val = try cloneValue(ctx, prop_val);
@@ -235,7 +235,7 @@ fn cloneArray(ctx: *CloneContext, src: *Object) Error!*Object {
     // Snapshot original length; iterate by index so getter mutations can't invalidate slices.
     const orig_len = src.kind.array.items.len;
     for (0..orig_len) |i| {
-        const elem = if (i < src.kind.array.items.len) src.kind.array.items[i] else .undefined;
+        const elem: Value = if (i < src.kind.array.items.len) src.kind.array.items[i] else .undefined;
         const s1 = try ctx.pushRoot(elem);
         defer ctx.popRoots(s1);
         const cloned_elem = try cloneValue(ctx, elem);
@@ -252,7 +252,7 @@ fn cloneArray(ctx: *CloneContext, src: *Object) Error!*Object {
 
     for (keys) |k| {
         if (k == .index and k.index < orig_len) continue;
-        const prop_val = try object.get(rt, .{ .object = src }, k);
+        const prop_val = try object.get(rt, Value.fromObject(src), k);
         const s1 = try ctx.pushRoot(prop_val);
         defer ctx.popRoots(s1);
         const cloned_val = try cloneValue(ctx, prop_val);
@@ -351,7 +351,7 @@ fn cloneTypedArray(ctx: *CloneContext, src: *Object) Error!*Object {
         return throwDataCloneError(rt, "Cannot clone a TypedArray backed by a detached ArrayBuffer");
     }
     const cloned_ab = try cloneArrayBuffer(ctx, ta.buffer);
-    const s1 = try ctx.pushRoot(.{ .object = cloned_ab });
+    const s1 = try ctx.pushRoot(Value.fromObject(cloned_ab));
     defer ctx.popRoots(s1);
 
     const vr = try builtins.viewsRealm(rt);
@@ -373,7 +373,7 @@ fn cloneDataView(ctx: *CloneContext, src: *Object) Error!*Object {
         return throwDataCloneError(rt, "Cannot clone a DataView backed by a detached ArrayBuffer");
     }
     const cloned_ab = try cloneArrayBuffer(ctx, dv.buffer);
-    const s1 = try ctx.pushRoot(.{ .object = cloned_ab });
+    const s1 = try ctx.pushRoot(Value.fromObject(cloned_ab));
     defer ctx.popRoots(s1);
 
     const vr = try builtins.viewsRealm(rt);
@@ -413,33 +413,33 @@ fn cloneError(ctx: *CloneContext, src: *Object) Error!*Object {
 
     const name_atom = try rt.heap.internAscii("name");
     if (src.props.get(PropKey.fromAtom(name_atom))) |_| {
-        const name_val = try object.get(rt, .{ .object = src }, .{ .atom = name_atom });
-        if (name_val != .undefined) {
+        const name_val = try object.get(rt, Value.fromObject(src), .{ .atom = name_atom });
+        if (!name_val.isUndefined()) {
             const s1 = try ctx.pushRoot(name_val);
             defer ctx.popRoots(s1);
             const name_str = try builtins.toStringObj(rt, name_val);
-            const s2 = try ctx.pushRoot(.{ .string = name_str });
+            const s2 = try ctx.pushRoot(Value.fromString(name_str));
             defer ctx.popRoots(s2);
-            try rt.heap.defineProperty(dst, name_atom, .{ .value = .{ .string = name_str }, .enumerable = false });
+            try rt.heap.defineProperty(dst, name_atom, .{ .value = Value.fromString(name_str), .enumerable = false });
         }
     }
 
     const msg_atom = try rt.heap.internAscii("message");
     if (src.props.get(PropKey.fromAtom(msg_atom))) |_| {
-        const msg_val = try object.get(rt, .{ .object = src }, .{ .atom = msg_atom });
-        if (msg_val != .undefined) {
+        const msg_val = try object.get(rt, Value.fromObject(src), .{ .atom = msg_atom });
+        if (!msg_val.isUndefined()) {
             const s1 = try ctx.pushRoot(msg_val);
             defer ctx.popRoots(s1);
             const msg_str = try builtins.toStringObj(rt, msg_val);
-            const s2 = try ctx.pushRoot(.{ .string = msg_str });
+            const s2 = try ctx.pushRoot(Value.fromString(msg_str));
             defer ctx.popRoots(s2);
-            try rt.heap.defineProperty(dst, msg_atom, .{ .value = .{ .string = msg_str }, .enumerable = false });
+            try rt.heap.defineProperty(dst, msg_atom, .{ .value = Value.fromString(msg_str), .enumerable = false });
         }
     }
 
     const cause_atom = try rt.heap.internAscii("cause");
     if (src.props.get(PropKey.fromAtom(cause_atom))) |_| {
-        const cause_val = try object.get(rt, .{ .object = src }, .{ .atom = cause_atom });
+        const cause_val = try object.get(rt, Value.fromObject(src), .{ .atom = cause_atom });
         const s1 = try ctx.pushRoot(cause_val);
         defer ctx.popRoots(s1);
         const cloned_cause = try cloneValue(ctx, cause_val);
@@ -451,7 +451,7 @@ fn cloneError(ctx: *CloneContext, src: *Object) Error!*Object {
     if (proto == r.aggregate_error_prototype) {
         const errors_atom = try rt.heap.internAscii("errors");
         if (src.props.get(PropKey.fromAtom(errors_atom))) |_| {
-            const errors_val = try object.get(rt, .{ .object = src }, .{ .atom = errors_atom });
+            const errors_val = try object.get(rt, Value.fromObject(src), .{ .atom = errors_atom });
             const s1 = try ctx.pushRoot(errors_val);
             defer ctx.popRoots(s1);
             const cloned_errors = try cloneValue(ctx, errors_val);

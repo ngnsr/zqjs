@@ -12,23 +12,23 @@ At the M10 checkpoint (`05c0c7a`, see `ROADMAP.md` and `bench/m10/baseline-qjs.m
 - **Objects, fib, loops, arrays, calls:** `1.66×–2.33×` QuickJS
 - **C-ABI throughput:** `~6.59M calls/s` (`js_to_c_native`), `~4.87M trips/s` (`host_js_c_js_roundtrip`), `18.0 µs` p50 per frame on `frame_loop_3600`
 
-### M52–M54 Checkpoints (D82–D84 — Property IC, `fastArraySet`, Superinstructions, Flattened `Slot`, Dead `clear_local`)
+### M52–M55 Checkpoints (D82–D85 — Property IC, `fastArraySet`, Superinstructions, 8-Byte NaN-Boxed `Value` & `Vm.Slot`)
 
-After M52–M54 (measured via `python3 tools/m10_compare.py`, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`), CLI-to-CLI ratios vs QuickJS improved dramatically across all 11 benchmarks:
+After M52–M55 (measured via `python3 tools/m10_compare.py`, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`), CLI-to-CLI ratios vs QuickJS improved dramatically across all 11 benchmarks — every benchmark is now under `2.0×` QuickJS:
 
-| Benchmark | Pre-M52 (`zqjs/qjs`) | M53 (`zqjs/qjs`) | **M54 (`zqjs/qjs`)** | ZQJS CLI med |
+| Benchmark | Pre-M52 (`zqjs/qjs`) | M54 (`zqjs/qjs`) | **M55 (`zqjs/qjs`)** | ZQJS CLI med |
 |---|---:|---:|---:|---:|
-| `closures.js` | `0.77×` (95.2 ms) | `0.69×` (86.4 ms) | **`0.68×`** | **84.8 ms** (32% faster than QJS) |
-| `branch_dense.js` | `1.91×` (200.8 ms) | `1.29×` (134.8 ms) | **`1.25×`** | **131.0 ms** (-35%) |
-| `arrays.js` | `2.42×` (400.0 ms) | `1.45×` (242.7 ms) | **`1.26×`** | **208.7 ms** (-48%) |
-| `float_math.js` | `2.14×` (286.7 ms) | `1.57×` (213.1 ms) | **`1.28×`** | **172.0 ms** (-40%) |
-| `int_loop.js` | `2.07×` (141.9 ms) | `1.41×` (98.2 ms) | **`1.32×`** | **91.1 ms** (-36%) |
-| `scopes.js` | `2.38×` (84.1 ms) | `1.67×` (58.9 ms) | **`1.36×`** | **48.3 ms** (-43%) |
-| `global_reads.js` | `2.61×` (64.4 ms) | `1.96×` (47.5 ms) | **`1.72×`** | **42.0 ms** (-35%) |
-| `fib.js` | `1.90×` (64.3 ms) | `1.79×` (59.8 ms) | **`1.83×`** | **61.9 ms** (-4%) |
-| `objects.js` | `2.37×` (75.4 ms) | `1.98×` (63.9 ms) | **`1.99×`** | **64.7 ms** (-14%) |
-| `call_chain.js` | `2.37×` (122.0 ms) | `2.16×` (111.9 ms) | **`2.03×`** | **103.7 ms** (-15%) |
-| `strings.js` | `2.31×` (26.3 ms) | `2.15×` (25.0 ms) | **`2.12×`** | **24.3 ms** (-8%) |
+| `closures.js` | `0.77×` (95.2 ms) | `0.68×` (84.8 ms) | **`0.63×`** | **77.5 ms** (37% faster than QJS) |
+| `arrays.js` | `2.42×` (400.0 ms) | `1.26×` (208.7 ms) | **`1.16×`** | **191.2 ms** (-52%) |
+| `branch_dense.js` | `1.91×` (200.8 ms) | `1.25×` (131.0 ms) | **`1.16×`** | **120.5 ms** (-40%) |
+| `float_math.js` | `2.14×` (286.7 ms) | `1.28×` (172.0 ms) | **`1.19×`** | **158.5 ms** (-45%) |
+| `int_loop.js` | `2.07×` (141.9 ms) | `1.32×` (91.1 ms) | **`1.24×`** | **83.8 ms** (-41%) |
+| `scopes.js` | `2.38×` (84.1 ms) | `1.36×` (48.3 ms) | **`1.38×`** | **48.0 ms** (-43%) |
+| `call_chain.js` | `2.37×` (122.0 ms) | `2.03×` (103.7 ms) | **`1.58×`** | **80.3 ms** (-34%) |
+| `global_reads.js` | `2.61×` (64.4 ms) | `1.72×` (42.0 ms) | **`1.59×`** | **38.6 ms** (-40%) |
+| `fib.js` | `1.90×` (64.3 ms) | `1.83×` (61.9 ms) | **`1.64×`** | **53.9 ms** (-16%) |
+| `objects.js` | `2.37×` (75.4 ms) | `1.99×` (64.7 ms) | **`1.65×`** | **52.4 ms** (-30%) |
+| `strings.js` | `2.31×` (26.3 ms) | `2.12×` (24.3 ms) | **`1.95×`** | **22.7 ms** (-14%) |
 
 *Note:* Labeled-switch threaded dispatch with `noinline` cold handlers and expanding `FrameCache` with `stack`/`locals` pointers both regressed due to register spilling and I-cache bloat, and were reverted per §5.
 
@@ -40,9 +40,9 @@ QuickJS uses reference counting (inc/dec on every stack move), 16-byte `JSValue`
 
 Low-risk, localized changes that preserve the current bytecode architecture, verifier, and dual-engine parity:
 
-1. **8-byte NaN-boxed `Value` (D5):**
-   - Shrink `Value` from 16 bytes to 8 bytes inside `src/runtime/value.zig` (all other modules already go through accessors).
-   - Halves memory bandwidth for operand stacks, locals, cells, and dense arrays.
+1. **8-byte NaN-boxed `Value` & `Vm.Slot` (D5, D85) — DONE (M55):**
+   - Shrank `Value` from 16 bytes to 8 bytes (`packed struct(u64)`) inside `src/runtime/value.zig` and `Vm.Slot` from 24 bytes to 8 bytes (`packed struct(u64)`) inside `src/vm/vm.zig`.
+   - Halved memory bandwidth for operand stacks, locals, cells, and dense arrays, and simplified GC marking/barrier checks to a single range check.
 2. **Zig labeled-switch threaded dispatch:**
    - Use Zig's labeled `sw: switch (op) { ... continue :sw next_op; }` in `Vm.runLoop()` so LLVM emits per-opcode indirect jumps (computed goto) instead of a single central jump-table dispatch, improving CPU branch prediction.
 3. **Back-edge & call-site budget/safepoint checks:**

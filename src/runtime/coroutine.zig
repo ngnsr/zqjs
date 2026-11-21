@@ -73,7 +73,7 @@ pub fn start(
         return e;
     };
     try finishStep(rt, co, outcome);
-    return .{ .object = p_obj };
+    return Value.fromObject(p_obj);
 }
 
 /// Resumes a suspended coroutine from an `.await_resume` microtask. A coroutine
@@ -133,7 +133,7 @@ fn suspendAwait(rt: *Runtime, co: *Coroutine, v: Value) Error!void {
         destroyEngine(rt, co);
     }
     const awaited_p_val = try builtins.resolveToPromise(rt, v);
-    const awaited_p = awaited_p_val.object;
+    const awaited_p = awaited_p_val.asObject();
     try chargeSuspended(rt, co);
 
     const pr = &awaited_p.kind.promise;
@@ -205,8 +205,8 @@ pub fn startGenerator(
     try suspendGenerator(rt, co);
     const r = try builtins.realm(rt);
     const proto_val = try object.get(rt, func, try object.named(rt, "prototype"));
-    const proto = if (proto_val == .object) proto_val.object else if (is_async) r.async_generator_prototype else r.generator_prototype;
-    return .{ .object = try rt.heap.newGenerator(proto, co, is_async) };
+    const proto = if (proto_val.isObject()) proto_val.asObject() else if (is_async) r.async_generator_prototype else r.generator_prototype;
+    return Value.fromObject(try rt.heap.newGenerator(proto, co, is_async));
 }
 
 /// `%GeneratorPrototype%.next/throw/return` on generator `gen` (D67): the iterator result,
@@ -253,12 +253,12 @@ pub fn resumeGenerator(rt: *Runtime, gen: *heap.Object, mode: ResumeMode, val: V
 pub fn asyncGeneratorRequest(rt: *Runtime, this: Value, mode: ResumeMode, val: Value) Error!Value {
     const r = try builtins.realm(rt);
     const p = try rt.heap.newPromise(r.promise_prototype);
-    var root_buf = [_]Value{ .{ .object = p }, this, val, .undefined };
+    var root_buf = [_]Value{ Value.fromObject(p), this, val, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    if (this != .object or this.object.kind != .generator or !this.object.kind.generator.is_async) {
+    if (!this.isObject() or this.asObject().kind != .generator or !this.asObject().kind.generator.is_async) {
         const name = switch (mode) {
             .next => "next",
             .throw => "throw",
@@ -269,7 +269,7 @@ pub fn asyncGeneratorRequest(rt: *Runtime, this: Value, mode: ResumeMode, val: V
         try builtins.settlePromiseFromJob(rt, p, true, try rt.catchValue());
         return root_buf[0];
     }
-    const gen = this.object;
+    const gen = this.asObject();
     const g = &gen.kind.generator;
     switch (mode) {
         .next => if (g.state == .completed) {
@@ -390,7 +390,7 @@ fn completeStep(rt: *Runtime, gen: *heap.Object, value: Value, done: bool, rejec
     const g = &gen.kind.generator;
     if (g.queue.items.len == 0) return rt.bug("an async generator step without a request");
     const p = g.queue.items[0].promise;
-    var root_buf = [_]Value{ .{ .object = p }, value, .undefined };
+    var root_buf = [_]Value{ Value.fromObject(p), value, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -423,14 +423,14 @@ fn drainQueue(rt: *Runtime, gen: *heap.Object) Error!void {
 fn awaitReturn(rt: *Runtime, gen: *heap.Object) Error!void {
     const g = &gen.kind.generator;
     g.state = .awaiting_return;
-    var root_buf = [_]Value{ .{ .object = gen }, .undefined, .undefined, .undefined };
+    var root_buf = [_]Value{ Value.fromObject(gen), .undefined, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
     root_buf[1] = try builtins.resolveToPromise(rt, g.queue.items[0].value);
-    root_buf[2] = .{ .closure = try rt.heap.newNativeClosure(@ptrCast(&awaitReturnFulfilled), gen) };
-    root_buf[3] = .{ .closure = try rt.heap.newNativeClosure(@ptrCast(&awaitReturnRejected), gen) };
-    try builtins.performPromiseThen(rt, root_buf[1].object, root_buf[2], root_buf[3]);
+    root_buf[2] = Value.fromClosure(try rt.heap.newNativeClosure(@ptrCast(&awaitReturnFulfilled), gen));
+    root_buf[3] = Value.fromClosure(try rt.heap.newNativeClosure(@ptrCast(&awaitReturnRejected), gen));
+    try builtins.performPromiseThen(rt, root_buf[1].asObject(), root_buf[2], root_buf[3]);
 }
 
 fn awaitReturnFulfilled(rt: *Runtime, gen: *heap.Object, args: []const Value) Error!Value {

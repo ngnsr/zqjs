@@ -101,8 +101,8 @@ pub fn instruction(p: Proto, pc: usize, w: *Writer) Writer.Error!void {
 /// "-0"); strings quoted, with everything outside printable ASCII (including lone
 /// surrogates) as \uXXXX, so output is plain ASCII.
 pub fn value(v: Value, w: *Writer) Writer.Error!void {
-    switch (v) {
-        .undefined, .null => try w.writeAll(@tagName(v)),
+    switch (v.unpack()) {
+        .undefined, .null => try w.writeAll(@tagName(v.tag())),
         .boolean => |b| try w.writeAll(if (b) "true" else "false"),
         .native => |n| try w.print("<native {s}>", .{n.name}),
         .closure => try w.writeAll("<function>"),

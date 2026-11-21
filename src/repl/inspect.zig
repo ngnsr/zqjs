@@ -80,8 +80,8 @@ const Context = struct {
     }
 
     fn scanCycles(ctx: *Context, v: Value, depth: u32) Allocator.Error!void {
-        if (v != .object) return;
-        const obj = v.object;
+        if (!v.isObject()) return;
+        const obj = v.asObject();
         if (ctx.isOnActive(obj)) {
             if (!ctx.circular_ids.contains(obj)) {
                 try ctx.circular_ids.put(ctx.gpa, obj, ctx.next_ref_id);
@@ -142,7 +142,7 @@ const Context = struct {
     }
 
     fn writeValue(ctx: *Context, v: Value, depth: u32, indent: usize) (Allocator.Error || Writer.Error)!void {
-        switch (v) {
+        switch (v.unpack()) {
             .undefined => try ctx.w.print("{s}undefined{s}", .{ ctx.style(Ansi.dim), ctx.reset() }),
             .null => try ctx.w.print("{s}null{s}", .{ ctx.style(Ansi.bold), ctx.reset() }),
             .boolean => |b| try ctx.w.print("{s}{s}{s}", .{ ctx.style(Ansi.yellow), if (b) "true" else "false", ctx.reset() }),
@@ -436,7 +436,7 @@ const Context = struct {
         var inline_mode = items.len <= 8;
         if (inline_mode) {
             for (items[0..n]) |item| {
-                if (item == .object) {
+                if (item.isObject()) {
                     inline_mode = false;
                     break;
                 }
@@ -582,8 +582,8 @@ const Context = struct {
 
     fn writePropertyValue(ctx: *Context, prop: Property, depth: u32, indent: usize) (Allocator.Error || Writer.Error)!void {
         if (prop.is_accessor) {
-            const has_get = prop.value != .undefined;
-            const has_set = prop.setter != .undefined;
+            const has_get = !prop.value.isUndefined();
+            const has_set = !prop.setter.isUndefined();
             try ctx.w.writeAll(ctx.style(Ansi.cyan));
             if (has_get and has_set) {
                 try ctx.w.writeAll("[Getter/Setter]");
@@ -630,7 +630,7 @@ const Context = struct {
             if (entry.key_ptr.isSymbol()) continue;
             if (utf16EqlAscii(entry.key_ptr.asAtom().units, "constructor")) {
                 if (entry.value_ptr.is_accessor) return null;
-                switch (entry.value_ptr.value) {
+                switch (entry.value_ptr.value.unpack()) {
                     .closure => |c| switch (c.impl) {
                         .vm => |vm_cl| {
                             const p: *const Proto = @ptrCast(@alignCast(vm_cl.proto));
@@ -660,8 +660,8 @@ const Context = struct {
         while (cur) |o| : (steps += 1) {
             if (steps > 64) break;
             if (o.props.get(sym_key)) |prop| {
-                if (!prop.is_accessor and prop.value == .string and prop.value.string.units.len > 0) {
-                    return prop.value.string;
+                if (!prop.is_accessor and prop.value.isString() and prop.value.asString().units.len > 0) {
+                    return prop.value.asString();
                 }
                 return null;
             }
@@ -686,8 +686,8 @@ const Context = struct {
         const name_val = getReadOnlyPropAscii(obj, "name");
         const msg_val = getReadOnlyPropAscii(obj, "message");
         if (name_val) |nv| {
-            if (nv == .string) {
-                try ops.writeUtf16(ctx.w, nv.string.units);
+            if (nv.isString()) {
+                try ops.writeUtf16(ctx.w, nv.asString().units);
             } else {
                 try ctx.w.writeAll("Error");
             }
@@ -695,9 +695,9 @@ const Context = struct {
             try ctx.w.writeAll("Error");
         }
         if (msg_val) |mv| {
-            if (mv == .string and mv.string.units.len > 0) {
+            if (mv.isString() and mv.asString().units.len > 0) {
                 try ctx.w.writeAll(": ");
-                try ops.writeUtf16(ctx.w, mv.string.units);
+                try ops.writeUtf16(ctx.w, mv.asString().units);
             }
         }
     }

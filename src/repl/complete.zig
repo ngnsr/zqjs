@@ -413,23 +413,23 @@ fn resolveRootValue(rt: *const Runtime, repl_lookup: ?ReplBindingLookup, name: [
         if (rl.get(rl.ctx, name)) |v| return v;
     }
     if (rt.realm) |r| {
-        if (std.mem.eql(u8, name, "Math")) return .{ .object = r.math };
-        if (std.mem.eql(u8, name, "JSON")) return .{ .object = r.json };
-        if (std.mem.eql(u8, name, "Object")) return .{ .object = r.object_namespace };
-        if (std.mem.eql(u8, name, "Array")) return .{ .object = r.array_namespace };
-        if (std.mem.eql(u8, name, "String")) return .{ .object = r.string_namespace };
-        if (std.mem.eql(u8, name, "Number")) return .{ .object = r.number_namespace };
-        if (std.mem.eql(u8, name, "Map")) return .{ .object = r.map_namespace };
-        if (std.mem.eql(u8, name, "Set")) return .{ .object = r.set_namespace };
-        if (std.mem.eql(u8, name, "Promise")) return .{ .object = r.promise_namespace };
-        if (std.mem.eql(u8, name, "Symbol")) return .{ .object = r.symbol_namespace };
-        if (std.mem.eql(u8, name, "RegExp")) return .{ .object = r.regexp_namespace };
+        if (std.mem.eql(u8, name, "Math")) return Value.fromObject(r.math);
+        if (std.mem.eql(u8, name, "JSON")) return Value.fromObject(r.json);
+        if (std.mem.eql(u8, name, "Object")) return Value.fromObject(r.object_namespace);
+        if (std.mem.eql(u8, name, "Array")) return Value.fromObject(r.array_namespace);
+        if (std.mem.eql(u8, name, "String")) return Value.fromObject(r.string_namespace);
+        if (std.mem.eql(u8, name, "Number")) return Value.fromObject(r.number_namespace);
+        if (std.mem.eql(u8, name, "Map")) return Value.fromObject(r.map_namespace);
+        if (std.mem.eql(u8, name, "Set")) return Value.fromObject(r.set_namespace);
+        if (std.mem.eql(u8, name, "Promise")) return Value.fromObject(r.promise_namespace);
+        if (std.mem.eql(u8, name, "Symbol")) return Value.fromObject(r.symbol_namespace);
+        if (std.mem.eql(u8, name, "RegExp")) return Value.fromObject(r.regexp_namespace);
     }
     return null;
 }
 
 fn readOnlyProperty(rt: *const Runtime, target: Value, name: []const u8) ?Value {
-    const obj: *const Object = switch (target) {
+    const obj: *const Object = switch (target.unpack()) {
         .object => |o| o,
         .string => if (rt.realm) |r| r.string_prototype else return null,
         .number => if (rt.realm) |r| r.number_prototype else return null,
@@ -461,7 +461,7 @@ fn collectProperties(
     prefix: []const u8,
     out: *std.ArrayList([]const u8),
 ) Allocator.Error!void {
-    const obj: ?*const Object = switch (target) {
+    const obj: ?*const Object = switch (target.unpack()) {
         .object => |o| o,
         .string => if (rt.realm) |r| r.string_prototype else null,
         .number => if (rt.realm) |r| r.number_prototype else null,
@@ -469,11 +469,11 @@ fn collectProperties(
         else => null,
     };
 
-    if (target == .object and target.object.kind == .array) {
+    if (target.isObject() and target.asObject().kind == .array) {
         if (std.mem.startsWith(u8, "length", prefix)) {
             try out.append(gpa, try gpa.dupe(u8, "length"));
         }
-    } else if (target == .string) {
+    } else if (target.isString()) {
         if (std.mem.startsWith(u8, "length", prefix)) {
             try out.append(gpa, try gpa.dupe(u8, "length"));
         }

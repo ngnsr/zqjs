@@ -465,16 +465,16 @@ test "M16.1: ClosureCaller, callCallable, ValueRoots, exception propagation, dep
             const this_v = if (args.len > 1) args[1] else zqjs.Value.undefined;
             const r = try zqjs.builtins.realm(rt);
             const acc_obj = try rt.heap.newObject(r.object_prototype);
-            var root_buf = [_]zqjs.Value{ cb, this_v, .{ .object = acc_obj }, .undefined };
+            var root_buf = [_]zqjs.Value{ cb, this_v, zqjs.Value.fromObject(acc_obj), .undefined };
             var roots: zqjs.runtime.ValueRoots = .{ .values = &root_buf };
             try roots.register(rt);
             defer roots.unregister(rt);
 
-            const v1 = try rt.callCallable(cb, this_v, &.{.{ .number = 10 }});
+            const v1 = try rt.callCallable(cb, this_v, &.{zqjs.Value.fromNumber(10)});
             root_buf[3] = v1;
             const v2 = try rt.callCallable(cb, this_v, &.{v1});
             try zqjs.object.define(rt, acc_obj, try zqjs.object.named(rt, "val"), v2);
-            return .{ .object = acc_obj };
+            return zqjs.Value.fromObject(acc_obj);
         }
 
         fn addGlobal(rt: *Runtime, alloc: Allocator) !void {
@@ -674,8 +674,8 @@ test "M18.1: Promise state, self-resolution, native adoption, queue fault preser
     };
     const burn_fn: zqjs.Native = .{ .name = "burn", .call = step_burner.call };
     const noop_fn: zqjs.Native = .{ .name = "noop", .call = noop.call };
-    try q_rt.microtasks.append(testing.allocator, .{ .kind = .reaction, .child = p_child1, .cb = .{ .native = &burn_fn }, .arg = .{ .number = 1 } });
-    try q_rt.microtasks.append(testing.allocator, .{ .kind = .reaction, .child = p_child2, .cb = .{ .native = &noop_fn }, .arg = .{ .number = 99 } });
+    try q_rt.microtasks.append(testing.allocator, .{ .kind = .reaction, .child = p_child1, .cb = zqjs.Value.fromNative(&burn_fn), .arg = zqjs.Value.fromNumber(1) });
+    try q_rt.microtasks.append(testing.allocator, .{ .kind = .reaction, .child = p_child2, .cb = zqjs.Value.fromNative(&noop_fn), .arg = zqjs.Value.fromNumber(99) });
 
     try testing.expectError(error.LimitExceeded, q_rt.drainMicrotasks());
     try testing.expectEqual(@as(usize, 1), q_rt.microtask_head);
@@ -689,7 +689,7 @@ test "M18.1: Promise state, self-resolution, native adoption, queue fault preser
     try q_rt.drainMicrotasks();
     try testing.expectEqual(@as(usize, 0), q_rt.microtasks.items.len);
     try testing.expectEqual(zqjs.heap.PromiseStateTag.fulfilled, p_child2.kind.promise.state);
-    try testing.expectEqual(@as(f64, 99), p_child2.kind.promise.result.number);
+    try testing.expectEqual(@as(f64, 99), p_child2.kind.promise.result.asNumber());
 
     // 3. OOM across Promise creation, self-resolution, and native adoption
     const OomCtx = struct {

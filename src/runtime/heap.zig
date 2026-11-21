@@ -227,7 +227,7 @@ pub const PropKey = struct {
     }
 
     pub inline fn toValue(k: PropKey) Value {
-        return if (k.isSymbol()) .{ .symbol = k.asSymbol() } else .{ .string = k.asAtom() };
+        return if (k.isSymbol()) Value.fromSymbol(k.asSymbol()) else Value.fromString(k.asAtom());
     }
 };
 
@@ -297,7 +297,7 @@ pub const OrderedTable = struct {
     }
 
     pub fn set(t: *OrderedTable, h: *Heap, owner: *Object, k_in: Value, v: Value) Error!void {
-        const k = if (k_in == .number and k_in.number == 0) Value{ .number = 0.0 } else k_in;
+        const k = if (k_in.isNumber() and k_in.asNumber() == 0) Value.fromNumber(0.0) else k_in;
         if (t.index.getKeyAdapted(k, LookupContext{ .entries = t.entries.items })) |idx| {
             h.barrier(&owner.obj, t.entries.items[idx].value, v);
             t.entries.items[idx].value = v;
@@ -331,25 +331,22 @@ pub const OrderedTable = struct {
 };
 
 pub fn sameValueZero(a: Value, b: Value) bool {
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-    return switch (a) {
-        .undefined, .null => true,
-        .boolean => |x| x == b.boolean,
-        .number => |x| (x == b.number) or (std.math.isNan(x) and std.math.isNan(b.number)),
-        .bigint => |x| x.negative == b.bigint.negative and std.mem.eql(u64, x.limbs, b.bigint.limbs),
-        .string => |x| std.mem.eql(u16, x.units, b.string.units),
-        .symbol => |x| x == b.symbol,
-        .native => |x| x == b.native,
-        .closure => |x| x == b.closure,
-        .object => |x| x == b.object,
-    };
+    if (a.bits == b.bits) return true; // canonical NaN, identical immediates, identical pointers
+    if (a.isNumber() and b.isNumber()) return a.asNumber() == b.asNumber(); // -0 === +0
+    if (a.isString() and b.isString()) return std.mem.eql(u16, a.asString().units, b.asString().units);
+    if (a.isBigInt() and b.isBigInt()) {
+        const x = a.asBigInt();
+        const y = b.asBigInt();
+        return x.negative == y.negative and std.mem.eql(u64, x.limbs, y.limbs);
+    }
+    return false;
 }
 
 pub fn hashValue(v: Value) u64 {
     var hasher = std.hash.Wyhash.init(0);
-    const tag: u8 = @backingInt(std.meta.activeTag(v));
+    const tag: u8 = @backingInt(v.tag());
     hasher.update(&.{tag});
-    switch (v) {
+    switch (v.unpack()) {
         .undefined, .null => {},
         .boolean => |b| hasher.update(&.{@intFromBool(b)}),
         .number => |n| {
@@ -474,7 +471,7 @@ pub const RegExpState = struct {
     source: *const String,
     flags: *const String,
     global: bool = false,
-    last_index: Value = .{ .number = 0 },
+    last_index: Value = Value.fromNumber(0),
 };
 
 pub const ModuleExport = struct {
@@ -555,7 +552,7 @@ pub const WeakKey = union(enum) {
     native: *const Native,
 
     pub fn fromValue(v: Value) ?WeakKey {
-        return switch (v) {
+        return switch (v.unpack()) {
             .object => |o| .{ .obj = &o.obj },
             .closure => |c| .{ .obj = @constCast(&c.obj) },
             .symbol => |s| if (!s.is_global) .{ .obj = @constCast(&s.obj) } else null,
@@ -1500,7 +1497,7 @@ pub const Heap = struct {
     /// Creates a `for...in` iterator holding `target` and the snapshotted `keys_arr` (D69).
     pub fn newForInIterator(h: *Heap, target: Value, keys_arr: *Object) Error!*Object {
         const o = try h.newObject(null);
-        const keys_val: Value = .{ .object = keys_arr };
+        const keys_val: Value = Value.fromObject(keys_arr);
         o.kind = .{ .iterator = .{ .target = target, .next_method = keys_val, .kind = .for_in } };
         h.barrier(&o.obj, null, target);
         h.barrier(&o.obj, null, keys_val);
@@ -1510,8 +1507,8 @@ pub const Heap = struct {
     /// Creates a `matchAll` iterator holding the cloned RegExp and target string (M44).
     pub fn newMatchAllIterator(h: *Heap, proto: ?*Object, rx: *Object, str: *const String) Error!*Object {
         const o = try h.newObject(proto);
-        const rx_val: Value = .{ .object = rx };
-        const str_val: Value = .{ .string = str };
+        const rx_val: Value = Value.fromObject(rx);
+        const str_val: Value = Value.fromString(str);
         o.kind = .{ .iterator = .{ .target = rx_val, .next_method = str_val, .kind = .regexp_match_all } };
         h.barrier(&o.obj, null, rx_val);
         h.barrier(&o.obj, null, str_val);
@@ -1624,11 +1621,11 @@ pub const Heap = struct {
             .source = source,
             .flags = flags,
             .global = global,
-            .last_index = .{ .number = 0 },
+            .last_index = Value.fromNumber(0),
         };
         o.kind = .{ .regexp = state };
-        h.barrier(&o.obj, null, .{ .string = source });
-        h.barrier(&o.obj, null, .{ .string = flags });
+        h.barrier(&o.obj, null, Value.fromString(source));
+        h.barrier(&o.obj, null, Value.fromString(flags));
         return o;
     }
 
@@ -1972,7 +1969,7 @@ pub const Heap = struct {
         const new_buf = h.allocator().realloc(m.instance_inits, old_len + 1) catch |e| return h.failed(e);
         new_buf[old_len] = entry;
         m.instance_inits = new_buf;
-        if (entry.name) |n| h.barrier(&c.obj, null, .{ .string = n });
+        if (entry.name) |n| h.barrier(&c.obj, null, Value.fromString(n));
         h.barrier(&c.obj, null, entry.func);
     }
 
@@ -1986,7 +1983,7 @@ pub const Heap = struct {
     }
 
     pub fn definePrivateProperty(h: *Heap, target: Value, key: PrivateKey, prop: Property) Error!void {
-        switch (target) {
+        switch (target.unpack()) {
             .object => |o| {
                 o.obj.checkLive();
                 const pp = o.private_props orelse blk: {
@@ -2000,8 +1997,8 @@ pub const Heap = struct {
                 const old_set: ?Value = if (gop.found_existing and gop.value_ptr.is_accessor) gop.value_ptr.setter else null;
                 gop.value_ptr.* = prop;
                 if (!gop.found_existing) {
-                    h.barrier(&o.obj, null, .{ .closure = key.brand });
-                    h.barrier(&o.obj, null, .{ .string = key.name });
+                    h.barrier(&o.obj, null, Value.fromClosure(key.brand));
+                    h.barrier(&o.obj, null, Value.fromString(key.name));
                 }
                 h.barrier(&o.obj, old_val, prop.value);
                 if (prop.is_accessor) h.barrier(&o.obj, old_set, prop.setter) else if (old_set) |s| h.barrier(&o.obj, s, null);
@@ -2015,8 +2012,8 @@ pub const Heap = struct {
                 const old_set: ?Value = if (gop.found_existing and gop.value_ptr.is_accessor) gop.value_ptr.setter else null;
                 gop.value_ptr.* = prop;
                 if (!gop.found_existing) {
-                    h.barrier(&mc.obj, null, .{ .closure = key.brand });
-                    h.barrier(&mc.obj, null, .{ .string = key.name });
+                    h.barrier(&mc.obj, null, Value.fromClosure(key.brand));
+                    h.barrier(&mc.obj, null, Value.fromString(key.name));
                 }
                 h.barrier(&mc.obj, old_val, prop.value);
                 if (prop.is_accessor) h.barrier(&mc.obj, old_set, prop.setter) else if (old_set) |s| h.barrier(&mc.obj, s, null);
@@ -2026,7 +2023,7 @@ pub const Heap = struct {
     }
 
     pub fn updatePrivateProperty(h: *Heap, target: Value, key: PrivateKey, value: Value) void {
-        switch (target) {
+        switch (target.unpack()) {
             .object => |o| {
                 o.obj.checkLive();
                 const p = o.private_props.?.getPtr(key).?;
@@ -2047,9 +2044,9 @@ pub const Heap = struct {
     }
 
     pub fn storeObjectProto(h: *Heap, o: *Object, proto: ?*Object) void {
-        const old: ?Value = if (o.proto) |p| .{ .object = p } else null;
+        const old: ?Value = if (o.proto) |p| Value.fromObject(p) else null;
         o.proto = proto;
-        h.barrier(&o.obj, old, if (proto) |p| .{ .object = p } else null);
+        h.barrier(&o.obj, old, if (proto) |p| Value.fromObject(p) else null);
     }
 
     /// The write barrier: `owner` now holds `new` where it held `old` (GC_DESIGN §7). M8.1:
@@ -2079,15 +2076,8 @@ pub const Heap = struct {
         h.remembered = owner;
     }
 
-    fn isYoung(v: Value) bool {
-        return switch (v) {
-            .undefined, .null, .boolean, .number, .native => false,
-            .string => |s| !s.obj.old,
-            .symbol => |s| !s.obj.old,
-            .bigint => |b| !b.obj.old,
-            .closure => |c| !c.obj.old,
-            .object => |o| !o.obj.old,
-        };
+    inline fn isYoung(v: Value) bool {
+        return v.isHeapObj() and !v.asHeapObj().old;
     }
 
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
@@ -2694,27 +2684,21 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
     }
 }
 
-pub fn visitValue(v: Value, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *Obj) void) void {
-    switch (v) {
-        .undefined, .null, .boolean, .number, .native => {}, // natives are static
-        .string => |s| visit(ctx, @constCast(&s.obj)),
-        .symbol => |s| visit(ctx, @constCast(&s.obj)),
-        .bigint => |b| visit(ctx, @constCast(&b.obj)),
-        .closure => |c| visit(ctx, @constCast(&c.obj)),
-        .object => |o| visit(ctx, &o.obj),
-    }
+comptime {
+    std.debug.assert(@offsetOf(Object, "obj") == 0);
+    std.debug.assert(@offsetOf(String, "obj") == 0);
+    std.debug.assert(@offsetOf(Closure, "obj") == 0);
+    std.debug.assert(@offsetOf(Symbol, "obj") == 0);
+    std.debug.assert(@offsetOf(BigInt, "obj") == 0);
+}
+
+pub inline fn visitValue(v: Value, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *Obj) void) void {
+    if (v.isHeapObj()) visit(ctx, v.asHeapObj());
 }
 
 /// Panics if `v` is a collected heap object (stress builds; one compare otherwise skipped).
 pub inline fn checkValue(v: Value) void {
-    switch (v) {
-        .string => |x| x.obj.checkLive(),
-        .symbol => |x| x.obj.checkLive(),
-        .bigint => |x| x.obj.checkLive(),
-        .closure => |x| x.obj.checkLive(),
-        .object => |x| x.obj.checkLive(),
-        .undefined, .null, .boolean, .number, .native => {},
-    }
+    if (v.isHeapObj()) v.asHeapObj().checkLive();
 }
 
 /// The canonical array index a key denotes: "0" or [1-9][0-9]* with value ≤ 2^32 − 2.
@@ -2790,7 +2774,7 @@ test "object storage is charged to the heap limit and refunded exactly" {
     const k = try h.internAscii("k");
     const before = h.bytes;
     try o.props.put(h.allocator(), PropKey.fromAtom(k), .{ .value = .null });
-    try arr.kind.array.append(h.allocator(), .{ .number = 1 });
+    try arr.kind.array.append(h.allocator(), Value.fromNumber(1));
     try testing.expect(h.bytes > before);
     _ = o.props.orderedRemove(PropKey.fromAtom(k));
     o.props.clearAndFree(h.allocator());
@@ -2812,11 +2796,11 @@ test "forEachChild enumerates every reference edge (what the M8 GC will mark)" {
     const key = try h.internAscii("x");
     const str = try h.ascii("value");
     const arr = try h.newArray(proto);
-    try arr.kind.array.append(h.allocator(), .{ .string = str });
-    try o.props.put(h.allocator(), PropKey.fromAtom(key), .{ .value = .{ .object = arr } });
-    const cell = try h.newCell(.{ .object = o });
+    try arr.kind.array.append(h.allocator(), Value.fromString(str));
+    try o.props.put(h.allocator(), PropKey.fromAtom(key), .{ .value = Value.fromObject(arr) });
+    const cell = try h.newCell(Value.fromObject(o));
     const env = try h.newEnv(null, 0, 1);
-    env.values[0] = .{ .string = str };
+    env.values[0] = Value.fromString(str);
     const env2 = try h.newEnv(env, 1, 0);
     const tree = try h.newTreeClosure(@ptrCast(&h), env2);
     const vm = try h.newVmClosure(@ptrCast(&h), 1);
@@ -2850,7 +2834,7 @@ test "forEachChild enumerates every reference edge (what the M8 GC will mark)" {
     const rx_flags = try h.ascii("g");
     const rx_last = try h.ascii("0");
     const rx = try h.newRegExp(proto, rx_prog, rx_src, rx_flags, true);
-    h.storeRegExpLastIndex(rx, .{ .string = rx_last });
+    h.storeRegExpLastIndex(rx, Value.fromString(rx_last));
     try Collect.expect(&rx.obj, &.{ &proto.obj, &rx_src.obj, &rx_flags.obj, &rx_last.obj });
 }
 
@@ -2911,7 +2895,7 @@ test "cells, closures and environments are accounted and freed" {
     const m = h.mark();
     const before = h.bytes;
     _ = try h.newEnv(e, 1, 5);
-    _ = try h.newCell(.{ .number = 1 });
+    _ = try h.newCell(Value.fromNumber(1));
     h.rollback(m);
     try testing.expectEqual(before, h.bytes); // charges given back exactly
 }

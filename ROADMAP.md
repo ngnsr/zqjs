@@ -22,7 +22,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | **done** |
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | **done** |
 | 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
-| 11.1–54 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1 VM perf (see milestone log below; D55–D84) | **done** |
+| 11.1–55 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1 VM perf (see milestone log below; D55–D85) | **done** |
 | Perf | Remaining Tier 1–2 interpreter optimizations toward QuickJS parity (see `PERF_PLAN.md`) | in progress |
 
 ## Direction after M8.1 (reviewed 2026-11-15)
@@ -510,3 +510,6 @@ runs on both engines unless noted.
 
 **M54 (done — Tier 1 VM Performance Part 3: Flattened `Slot`, Local-RHS Ops, `get_elem_local` & Dead `clear_local`)**
 - **M54:** Implemented D84 across `bytecode.zig`, `compiler.zig`, and `vm.zig`: flattened `Vm.Slot` from 32 B to 24 B (`uninit | value | cell`), added `add_local`/`sub_local`/`mul_local`/`mod_local` and `get_elem_local` (with `Compiler.init_slots` TDZ-safety tracking), and eliminated dead per-iteration `clear_local`s for leading pure declarations inside loops. Brought CLI-to-QuickJS ratios down to `0.68×` (`closures.js`), `1.25×` (`branch_dense.js`), `1.26×` (`arrays.js`, -48% vs pre-M52), `1.28×` (`float_math.js`, -40%), `1.32×` (`int_loop.js`, -36%), `1.36×` (`scopes.js`, -43%), and `1.72×` (`global_reads.js`, -35%).
+
+**M55 (done — 8-Byte NaN-Boxed `Value` and 8-Byte `Vm.Slot`)**
+- **M55:** Implemented D85 across `src/runtime/value.zig`, `src/vm/vm.zig`, `src/runtime/heap.zig`, `src/runtime/ops.zig`, and all runtime/VM/interpreter/REPL/API call sites: replaced the 16-byte `Value` tagged union with an 8-byte IEEE-754 negative quiet-NaN boxed `packed struct(u64)` (preserving `-0`, `±Infinity`, subnormals, and canonical NaN) and compressed `Vm.Slot` from 24 B to 8 B (`packed struct(u64)` sharing `Value`'s bit layout plus `UNINIT_BITS` and `TAG_CELL`). Reduced GC `visitValue`/`checkValue`/`isYoung` to a single range check + mask. Cut every M10 benchmark by another 8–22% (bringing all 11 below `2.0×` QuickJS: `closures.js` `0.63×` [37% faster than QJS], `arrays.js` `1.16×`, `branch_dense.js` `1.16×`, `float_math.js` `1.19×`, `int_loop.js` `1.24×`, `call_chain.js` `1.58×`, `objects.js` `1.65×`, `strings.js` `1.95×`, C-ABI `frame_loop_3600` p50 `16.0 µs`).

@@ -491,7 +491,7 @@ pub const Runtime = struct {
 
     /// Invokes a JS callable (`native` or `closure`) from inside a built-in (M16.1).
     pub fn callCallable(rt: *Runtime, callee: Value, this_val: Value, args: []const Value) Error!Value {
-        return switch (callee) {
+        return switch (callee.unpack()) {
             .native => |n| if (n.host) |h|
                 h.call(rt, h.ctx, if (this_val.isObjectLike()) this_val else null, args)
             else
@@ -558,11 +558,11 @@ pub const Runtime = struct {
             },
             .resolve_promise => {
                 if (job.child) |ch| {
-                    try builtins_mod.adoptPromiseNow(rt, ch, job.arg.object);
+                    try builtins_mod.adoptPromiseNow(rt, ch, job.arg.asObject());
                 }
             },
             .reaction => {
-                if (job.cb == .native or job.cb == .closure) {
+                if (job.cb.isNative() or job.cb.isClosure()) {
                     if (rt.callCallable(job.cb, .undefined, &.{job.arg})) |ret| {
                         if (job.child) |ch| try builtins_mod.resolvePromiseValue(rt, ch, ret);
                     } else |e| {

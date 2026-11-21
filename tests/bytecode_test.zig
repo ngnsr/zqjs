@@ -142,7 +142,7 @@ test "constant pool and name table are deduplicated" {
     defer c.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 3), c.proto.consts.len); // 1, 'a', 2
     try testing.expectEqual(@as(usize, 2), c.proto.names.len); // print, x
-    try testing.expectEqual(@as(f64, 2), c.proto.consts[2].number);
+    try testing.expectEqual(@as(f64, 2), c.proto.consts[2].asNumber());
 }
 
 fn expectLimit(source: []const u8, limits: Limits, which: zqjs.Limit) !void {
@@ -208,7 +208,7 @@ fn fuzzVerify(_: void, smith: *testing.Smith) anyerror!void {
     var failure: zqjs.verify.Failure = .{};
     const p: zqjs.bytecode.Proto = .{
         .code = code[0..len],
-        .consts = &.{ .{ .number = 1 }, .{ .number = 2 } },
+        .consts = &.{ zqjs.Value.fromNumber(1), zqjs.Value.fromNumber(2) },
         .names = &.{ "a", "b" },
         .slot_count = 3,
         .max_stack = 4,

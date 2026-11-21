@@ -19,10 +19,14 @@ const bigint = @import("bigint.zig");
 // ------------------------------------------------------------ ToBoolean
 
 pub inline fn toBoolean(v: Value) bool {
-    return switch (v) {
+    if (v.isNumber()) {
+        const n = v.asNumber();
+        return !(n == 0 or std.math.isNan(n));
+    }
+    return switch (v.unpack()) {
         .undefined, .null => false,
         .boolean => |b| b,
-        .number => |n| !(n == 0 or std.math.isNan(n)), // 0, -0 and NaN are falsy
+        .number => unreachable,
         .bigint => |b| b.limbs.len != 0,
         .string => |s| s.units.len != 0,
         .symbol, .native, .closure, .object => true,
@@ -32,8 +36,9 @@ pub inline fn toBoolean(v: Value) bool {
 // ------------------------------------------------------------ ToNumber
 
 pub fn toNumber(rt: *Runtime, v: Value) Error!f64 {
+    if (v.isNumber()) return v.asNumber();
     const gpa = rt.gpa;
-    return switch (v) {
+    return switch (v.unpack()) {
         .undefined => std.math.nan(f64),
         .null => 0,
         .boolean => |b| if (b) 1 else 0,
@@ -165,7 +170,7 @@ pub fn formatNumber(buf: *NumberBuf, x: f64) []const u8 {
 /// text and must outlive the returned piece.
 pub fn toPiece(rt: *Runtime, v: Value, buf: *NumberBuf) Error!Piece {
     heap.checkValue(v); // stress builds: printing or converting a collected value
-    return switch (v) {
+    return switch (v.unpack()) {
         .undefined => .{ .ascii = "undefined" },
         .null => .{ .ascii = "null" },
         .boolean => |b| .{ .ascii = if (b) "true" else "false" },
@@ -187,10 +192,10 @@ pub fn toPiece(rt: *Runtime, v: Value, buf: *NumberBuf) Error!Piece {
 }
 
 pub fn toStringValue(rt: *Runtime, v: Value) Error!Value {
-    if (v == .string) return v;
+    if (v.isString()) return v;
     var buf: NumberBuf = undefined;
     const piece = try toPiece(rt, v, &buf);
-    return .{ .string = try rt.heap.newString(&.{piece}) };
+    return Value.fromString(try rt.heap.newString(&.{piece}));
 }
 
 /// Writes UTF-16 as UTF-8. A lone surrogate becomes U+FFFD, as node does on output.
@@ -234,26 +239,26 @@ pub fn remainder(a: f64, b: f64) f64 {
 /// strings compare by UTF-16 code unit; otherwise both sides become numbers. null
 /// means "undefined" in the spec (a NaN was involved).
 pub fn lessThan(rt: *Runtime, a: Value, b: Value) Error!?bool {
-    if (a == .string and b == .string) return std.mem.order(u16, a.string.units, b.string.units) == .lt;
-    if (a == .bigint or b == .bigint) {
-        if (a == .bigint and b == .bigint) {
-            return bigint.cmp(a.bigint, b.bigint) == .lt;
+    if (a.isString() and b.isString()) return std.mem.order(u16, a.asString().units, b.asString().units) == .lt;
+    if (a.isBigInt() or b.isBigInt()) {
+        if (a.isBigInt() and b.isBigInt()) {
+            return bigint.cmp(a.asBigInt(), b.asBigInt()) == .lt;
         }
-        if (a == .bigint and b == .string) {
-            const rhs = (try stringToBigIntOpt(rt, b.string.units)) orelse return null;
-            return bigint.cmp(a.bigint, rhs) == .lt;
+        if (a.isBigInt() and b.isString()) {
+            const rhs = (try stringToBigIntOpt(rt, b.asString().units)) orelse return null;
+            return bigint.cmp(a.asBigInt(), rhs) == .lt;
         }
-        if (a == .string and b == .bigint) {
-            const lhs = (try stringToBigIntOpt(rt, a.string.units)) orelse return null;
-            return bigint.cmp(lhs, b.bigint) == .lt;
+        if (a.isString() and b.isBigInt()) {
+            const lhs = (try stringToBigIntOpt(rt, a.asString().units)) orelse return null;
+            return bigint.cmp(lhs, b.asBigInt()) == .lt;
         }
-        if (a == .bigint) {
+        if (a.isBigInt()) {
             const y = try toNumber(rt, b);
-            const ord = bigint.cmpNumber(a.bigint, y) orelse return null;
+            const ord = bigint.cmpNumber(a.asBigInt(), y) orelse return null;
             return ord == .lt;
         } else {
             const x = try toNumber(rt, a);
-            const ord = bigint.cmpNumber(b.bigint, x) orelse return null;
+            const ord = bigint.cmpNumber(b.asBigInt(), x) orelse return null;
             return ord == .gt;
         }
     }
@@ -262,7 +267,7 @@ pub fn lessThan(rt: *Runtime, a: Value, b: Value) Error!?bool {
     // source text to compare. Against anything else the text becomes NaN, as below.
     const textual = struct {
         fn f(v: Value) bool {
-            return v == .string or v.isFunction();
+            return v.isString() or v.isFunction();
         }
     }.f;
     if ((a.isFunction() and textual(b)) or (b.isFunction() and textual(a))) return rt.fail(.function_to_string);
@@ -288,15 +293,15 @@ pub fn stringToBigIntOpt(rt: *Runtime, units_in: []const u16) Error!?*const heap
 
 pub fn toNumeric(rt: *Runtime, v_in: Value) Error!Value {
     const v = if (v_in.isObjectLike()) try object.toPrimitive(rt, v_in, .number) else v_in;
-    if (v == .bigint or v == .number) return v;
-    return .{ .number = try toNumber(rt, v) };
+    if (v.isBigInt() or v.isNumber()) return v;
+    return Value.fromNumber(try toNumber(rt, v));
 }
 
 /// ES ToBigInt(argument): throws TypeError on Number/Undefined/Null/Symbol,
 /// SyntaxError on invalid String, converts Boolean to 0n/1n.
 pub fn toBigInt(rt: *Runtime, v_in: Value) Error!*const heap.BigInt {
     const v = if (v_in.isObjectLike()) try object.toPrimitive(rt, v_in, .number) else v_in;
-    return switch (v) {
+    return switch (v.unpack()) {
         .bigint => |b| b,
         .boolean => |b| bigint.fromU64(rt, if (b) 1 else 0),
         .string => |s| (try stringToBigIntOpt(rt, s.units)) orelse
@@ -307,18 +312,11 @@ pub fn toBigInt(rt: *Runtime, v_in: Value) Error!*const heap.BigInt {
 }
 
 pub fn strictEquals(a: Value, b: Value) bool {
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-    return switch (a) {
-        .undefined, .null => true,
-        .boolean => |x| x == b.boolean,
-        .number => |x| x == b.number, // NaN !== NaN, 0 === -0
-        .bigint => |x| bigint.cmp(x, b.bigint) == .eq,
-        .string => |x| std.mem.eql(u16, x.units, b.string.units),
-        .symbol => |x| x == b.symbol,
-        .native => |x| x == b.native,
-        .closure => |x| x == b.closure, // identity
-        .object => |x| x == b.object,
-    };
+    if (a.isNumber() and b.isNumber()) return a.asNumber() == b.asNumber(); // NaN !== NaN, 0 === -0
+    if (a.bits == b.bits) return !a.isNumber();
+    if (a.isString() and b.isString()) return std.mem.eql(u16, a.asString().units, b.asString().units);
+    if (a.isBigInt() and b.isBigInt()) return bigint.cmp(a.asBigInt(), b.asBigInt()) == .eq;
+    return false;
 }
 
 /// All binary operators except `&&`/`||` (which short-circuit, so they are control
@@ -345,50 +343,50 @@ pub fn binary(rt: *Runtime, op: ast.BinaryOp, a_in: Value, b_in: Value) Error!Va
     if (may_call) roots_buf[1] = b;
     return switch (op) {
         .add => {
-            if (a == .string or b == .string) {
+            if (a.isString() or b.isString()) {
                 var buf_a: NumberBuf = undefined;
                 var buf_b: NumberBuf = undefined;
                 const pa = try toPiece(rt, a, &buf_a);
                 const pb = try toPiece(rt, b, &buf_b);
-                return .{ .string = try rt.heap.newString(&.{ pa, pb }) };
+                return Value.fromString(try rt.heap.newString(&.{ pa, pb }));
             }
             const na = try toNumeric(rt, a);
             const nb = try toNumeric(rt, b);
-            if (na == .bigint and nb == .bigint) {
-                return .{ .bigint = try bigint.add(rt, na.bigint, nb.bigint) };
+            if (na.isBigInt() and nb.isBigInt()) {
+                return Value.fromBigInt(try bigint.add(rt, na.asBigInt(), nb.asBigInt()));
             }
-            if (na == .bigint or nb == .bigint) {
+            if (na.isBigInt() or nb.isBigInt()) {
                 return rt.throw(.TypeError, &.{.{ .ascii = "Cannot mix BigInt and other types, use explicit conversions" }});
             }
-            return .{ .number = na.number + nb.number };
+            return Value.fromNumber(na.asNumber() + nb.asNumber());
         },
         .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or => {
             const na = try toNumeric(rt, a);
             const nb = try toNumeric(rt, b);
-            if (na == .bigint and nb == .bigint) {
-                const x = na.bigint;
-                const y = nb.bigint;
+            if (na.isBigInt() and nb.isBigInt()) {
+                const x = na.asBigInt();
+                const y = nb.asBigInt();
                 return switch (op) {
-                    .sub => .{ .bigint = try bigint.sub(rt, x, y) },
-                    .mul => .{ .bigint = try bigint.mul(rt, x, y) },
-                    .div => .{ .bigint = (try bigint.divRem(rt, x, y)).quot },
-                    .mod => .{ .bigint = (try bigint.divRem(rt, x, y)).rem },
-                    .pow => .{ .bigint = try bigint.pow(rt, x, y) },
-                    .shl => .{ .bigint = try bigint.shl(rt, x, y) },
-                    .shr => .{ .bigint = try bigint.shr(rt, x, y) },
+                    .sub => Value.fromBigInt(try bigint.sub(rt, x, y)),
+                    .mul => Value.fromBigInt(try bigint.mul(rt, x, y)),
+                    .div => Value.fromBigInt((try bigint.divRem(rt, x, y)).quot),
+                    .mod => Value.fromBigInt((try bigint.divRem(rt, x, y)).rem),
+                    .pow => Value.fromBigInt(try bigint.pow(rt, x, y)),
+                    .shl => Value.fromBigInt(try bigint.shl(rt, x, y)),
+                    .shr => Value.fromBigInt(try bigint.shr(rt, x, y)),
                     .ushr => rt.throw(.TypeError, &.{.{ .ascii = "BigInts have no unsigned right shift, use >> instead" }}),
-                    .bit_and => .{ .bigint = try bigint.bitAnd(rt, x, y) },
-                    .bit_xor => .{ .bigint = try bigint.bitXor(rt, x, y) },
-                    .bit_or => .{ .bigint = try bigint.bitOr(rt, x, y) },
+                    .bit_and => Value.fromBigInt(try bigint.bitAnd(rt, x, y)),
+                    .bit_xor => Value.fromBigInt(try bigint.bitXor(rt, x, y)),
+                    .bit_or => Value.fromBigInt(try bigint.bitOr(rt, x, y)),
                     else => unreachable,
                 };
             }
-            if (na == .bigint or nb == .bigint) {
+            if (na.isBigInt() or nb.isBigInt()) {
                 return rt.throw(.TypeError, &.{.{ .ascii = "Cannot mix BigInt and other types, use explicit conversions" }});
             }
-            const x = na.number;
-            const y = nb.number;
-            return .{ .number = switch (op) {
+            const x = na.asNumber();
+            const y = nb.asNumber();
+            return Value.fromNumber(switch (op) {
                 .sub => x - y,
                 .mul => x * y,
                 .div => x / y,
@@ -401,23 +399,23 @@ pub fn binary(rt: *Runtime, op: ast.BinaryOp, a_in: Value, b_in: Value) Error!Va
                 .bit_xor => bitXor(x, y),
                 .bit_or => bitOr(x, y),
                 else => unreachable,
-            } };
+            });
         },
-        .in => .{ .boolean = try object.has(rt, try object.key(rt, a), b) },
-        .instanceof => .{ .boolean = try object.instanceOf(rt, a, b) },
-        .lt => .{ .boolean = (try lessThan(rt, a, b)) orelse false },
-        .gt => .{ .boolean = (try lessThan(rt, b, a)) orelse false },
-        .le => .{ .boolean = if (try lessThan(rt, b, a)) |r| !r else false },
-        .ge => .{ .boolean = if (try lessThan(rt, a, b)) |r| !r else false },
-        .strict_eq => .{ .boolean = strictEquals(a, b) },
-        .strict_ne => .{ .boolean = !strictEquals(a, b) },
+        .in => Value.fromBool(try object.has(rt, try object.key(rt, a), b)),
+        .instanceof => Value.fromBool(try object.instanceOf(rt, a, b)),
+        .lt => Value.fromBool((try lessThan(rt, a, b)) orelse false),
+        .gt => Value.fromBool((try lessThan(rt, b, a)) orelse false),
+        .le => Value.fromBool(if (try lessThan(rt, b, a)) |r| !r else false),
+        .ge => Value.fromBool(if (try lessThan(rt, a, b)) |r| !r else false),
+        .strict_eq => Value.fromBool(strictEquals(a, b)),
+        .strict_ne => Value.fromBool(!strictEquals(a, b)),
         .logical_and, .logical_or, .nullish, .comma => unreachable,
     };
 }
 
 /// JS `typeof`: returns the type tag string for any value.
 pub fn typeOf(rt: *Runtime, v: Value) Error!Value {
-    const s: []const u8 = switch (v) {
+    const s: []const u8 = switch (v.unpack()) {
         .undefined => "undefined",
         .null => "object",
         .boolean => "boolean",
@@ -428,7 +426,7 @@ pub fn typeOf(rt: *Runtime, v: Value) Error!Value {
         .native, .closure => "function",
         .object => |o| if (o.kind == .proxy and o.kind.proxy.is_callable) "function" else "object",
     };
-    return .{ .string = try rt.heap.ascii(s) };
+    return Value.fromString(try rt.heap.ascii(s));
 }
 
 // ------------------------------------------------------------ Bitwise / ToInt32 / ToUint32
@@ -493,7 +491,7 @@ test "-0 survives arithmetic and is distinguished where JS distinguishes it" {
     try testing.expect(std.math.signbit(remainder(-0.0, 5)));
     try testing.expect(std.math.signbit(@as(f64, 0) * -1));
     try testing.expect(!std.math.signbit(@as(f64, -0.0) + 0));
-    try testing.expect(strictEquals(.{ .number = -0.0 }, .{ .number = 0 }));
+    try testing.expect(strictEquals(Value.fromNumber(-0.0), Value.fromNumber(0)));
     try testing.expectEqual(-std.math.inf(f64), 1 / @as(f64, -0.0));
     try testing.expect(std.math.signbit(try stringToNumber(testing.allocator, &.{ '-', '0' })));
 }

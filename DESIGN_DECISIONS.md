@@ -2071,3 +2071,29 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
   - Tracked `Compiler.init_slots: u64` (slots 0..63 guaranteed initialized on all paths, saved/restored across blocks and loops to stay sound under sibling-block slot reuse). When both base and key of `o[k]` are non-captured initialized locals, emits `get_elem_local(s0, s1)` (collapsing 3 ops → 1 op and routing directly through `fastArrayGet`/`fastTypedArrayGet`).
 - **Loop-Body Dead `clear_local` Elimination (`compiler.zig`):**
   - Inside nested loops/blocks (`c.controls.items.len > 0`), skips emitting `clear_local` for leading simple non-captured `let`/`const` declarations whose pure initializers (`isPureNoPendingTdz`) cannot observe TDZ before `init_local`, preserving top-level step counts and all loop-body TDZ errors.
+
+---
+
+## D85. 8-Byte NaN-Boxed `Value` and 8-Byte `Vm.Slot` *(M55; refines D5)*
+
+**Decision:** Shrink `Value` from a 16-byte tagged union to an 8-byte NaN-boxed `packed struct(u64)` (`src/runtime/value.zig`) and shrink `Vm.Slot` from a 24-byte tagged union to an 8-byte `packed struct(u64)` (`src/vm/vm.zig`), halving memory bandwidth and footprint across operand stacks, call-frame locals, dense arrays, property tables, cells, and handle slots.
+
+- **NaN-Boxing Layout (`src/runtime/value.zig`, `@sizeOf(Value) == 8`):**
+  - IEEE-754 `f64` numbers are stored directly as their raw `u64` bits for all non-NaN values (`-0.0`, `±Infinity`, subnormals preserved bit-exact); all `NaN` values are canonicalized to positive quiet NaN `0x7FF8_0000_0000_0000`.
+  - Non-number values live in the negative quiet-NaN range (`bits >= 0xFFF8_0000_0000_0000`), using the upper 16 bits as a tag and the lower 48 bits (`PAYLOAD_MASK = 0x0000_FFFF_FFFF_FFFF`) as payload (valid on all 64-bit targets with 48-bit virtual user-space pointers, verified by `debug.assert` on pointer packing):
+    - `0xFFF8`: immediates (`0 = undefined`, `1 = null`, `2 = false`, `3 = true`, `4 = UNINIT_BITS` reserved for `Vm.Slot`)
+    - `0xFFF9`: `object: *heap.Object`
+    - `0xFFFA`: `string: *const heap.String`
+    - `0xFFFB`: `closure: *const heap.Closure`
+    - `0xFFFC`: `symbol: *const heap.Symbol`
+    - `0xFFFD`: `bigint: *const heap.BigInt`
+    - `0xFFFE`: `native: *const Native`
+    - `0xFFFF`: `TAG_CELL` (`*heap.Cell`, internal to `Vm.Slot`, never a `Value`)
+  - Comptime inline helpers (`fromPtr`/`asPtr`, `isNumber` = single `bits < 0xFFF8_0000_0000_0000` check, `isHeapObj` = single range check `TAG_OBJECT <= bits < TAG_NATIVE`, `unpack()` returning the `Unpacked` tagged union for exhaustive cold-path switches) keep all hot paths branch-minimal and zero-overhead.
+- **8-Byte `Vm.Slot` (`src/vm/vm.zig`, `@sizeOf(Slot) == 8`):**
+  - Reuses the exact `Value` bit pattern for `.value`, `Value.UNINIT_BITS` (`0xFFF8_0000_0000_0004`) for TDZ `.uninit`, and `Value.TAG_CELL | ptr` (`0xFFFF_...`) for captured `.cell`, cutting frame-local storage from 32 B (pre-M54) → 24 B (M54) → 8 B (M55) and making `Slot.fromValue`/`asValue` a zero-instruction bit copy.
+- **GC & Runtime Fast Paths (`src/runtime/heap.zig`, `src/runtime/ops.zig`):**
+  - `comptime` asserts `@offsetOf(T, "obj") == 0` for `Object`, `String`, `Closure`, `Symbol`, and `BigInt`, allowing `Heap.visitValue`, `Heap.checkValue`, and `Heap.isYoung` to extract `*Obj` with a single range check and mask instead of a 10-way union switch.
+  - `ops.strictEquals` fast-paths identical non-number bits with `a.bits == b.bits` and `ops.toBoolean` checks booleans/nullish in one comparison.
+- **Measured Impact (`python3 tools/m10_compare.py`, Apple M4, `ReleaseFast`):**
+  - Every benchmark improved 8–22% over M54 and all 11 are now below `2.0×` QuickJS: `closures.js` `0.63×` (37% faster than QuickJS), `arrays.js` `1.16×`, `branch_dense.js` `1.16×`, `float_math.js` `1.19×`, `int_loop.js` `1.24×`, `scopes.js` `1.38×`, `call_chain.js` `1.58×` (-22.5%), `global_reads.js` `1.59×`, `fib.js` `1.64×`, `objects.js` `1.65×` (-19%), `strings.js` `1.95×`. C-ABI `frame_loop_3600` median frame time dropped from `18.0 µs` to `16.0 µs`.

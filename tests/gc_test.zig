@@ -147,11 +147,11 @@ test "collect frees the unreachable, keeps the reachable, and accounts exactly" 
     defer h.deinit();
     const keep = try h.newObject(null);
     const kept_str = try h.ascii("kept");
-    try h.storeProperty(keep, try h.internAscii("k"), .{ .string = kept_str });
+    try h.storeProperty(keep, try h.internAscii("k"), zqjs.Value.fromString(kept_str));
     const survivors = h.bytes; // everything so far stays reachable from `keep`
     for (0..100) |i| {
         const g = try h.newArray(keep);
-        try h.appendElement(g, .{ .number = @floatFromInt(i) });
+        try h.appendElement(g, zqjs.Value.fromNumber(@floatFromInt(i)));
         _ = try h.ascii("garbage");
     }
     h.collect(TestRoots{ .objs = &.{&keep.obj} }, TestRoots.mark);
@@ -160,7 +160,7 @@ test "collect frees the unreachable, keeps the reachable, and accounts exactly" 
     try testing.expectEqual(@as(u64, 200), h.stats.swept);
     try testing.expectEqual(@as(u64, 3), h.stats.marked); // keep, its key atom, its string
     try testing.expectEqual(h.bytes, h.stats.live_after_last);
-    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("kept"), keep.props.get(heap.PropKey.fromAtom(try h.internAscii("k"))).?.value.string.units);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("kept"), keep.props.get(heap.PropKey.fromAtom(try h.internAscii("k"))).?.value.asString().units);
 }
 
 test "a value reachable only through a chain of every object kind survives" {
@@ -170,27 +170,27 @@ test "a value reachable only through a chain of every object kind survives" {
     //                      → tree closure → env → parent env → string
     const root = try h.newObject(null);
     const arr = try h.newArray(null);
-    try h.storeProperty(root, try h.internAscii("list"), .{ .object = arr });
+    try h.storeProperty(root, try h.internAscii("list"), zqjs.Value.fromObject(arr));
     const vm_closure = try h.newVmClosure(@ptrCast(&h), 1);
     const cell = try h.newCell(null);
     vm_closure.impl.vm.captures[0] = cell; // construction
-    try h.appendElement(arr, .{ .closure = vm_closure });
+    try h.appendElement(arr, zqjs.Value.fromClosure(vm_closure));
     const proto = try h.newObject(null);
     const via_cell = try h.newObject(proto);
-    h.storeCell(cell, .{ .object = via_cell });
+    h.storeCell(cell, zqjs.Value.fromObject(via_cell));
     const deep_key = try h.internAscii("deep");
-    try h.storeProperty(proto, deep_key, .{ .string = try h.ascii("via the prototype") });
+    try h.storeProperty(proto, deep_key, zqjs.Value.fromString(try h.ascii("via the prototype")));
     const outer_env = try h.newEnv(null, 0, 1);
-    h.storeEnv(outer_env, 0, .{ .string = try h.ascii("via the environment") });
+    h.storeEnv(outer_env, 0, zqjs.Value.fromString(try h.ascii("via the environment")));
     const inner_env = try h.newEnv(outer_env, 1, 0);
     const tree_closure = try h.newTreeClosure(@ptrCast(&h), inner_env);
-    try h.appendElement(arr, .{ .closure = tree_closure });
+    try h.appendElement(arr, zqjs.Value.fromClosure(tree_closure));
     const live = h.bytes;
     // Garbage of every kind, some of it pointing *into* the live chain.
     for (0..20) |_| {
         const g = try h.newObject(via_cell);
-        try h.storeProperty(g, deep_key, .{ .object = root });
-        _ = try h.newCell(.{ .object = g });
+        try h.storeProperty(g, deep_key, zqjs.Value.fromObject(root));
+        _ = try h.newCell(zqjs.Value.fromObject(g));
         _ = try h.newEnv(outer_env, 2, 3);
         _ = try h.newTreeClosure(@ptrCast(&h), inner_env);
         _ = try h.newVmClosure(@ptrCast(&h), 0);
@@ -200,12 +200,12 @@ test "a value reachable only through a chain of every object kind survives" {
     collectMajor(&h, &.{&root.obj}); // a minor one would keep the loose atom (promoted)
     try testing.expectEqual(live, h.bytes);
     // Walk the chain again: every link and leaf is intact.
-    const a2 = root.props.get(heap.PropKey.fromAtom(try h.internAscii("list"))).?.value.object;
-    const c2 = a2.kind.array.items[0].closure.impl.vm.captures[0];
-    const o2 = c2.value.?.object;
-    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("via the prototype"), o2.proto.?.props.get(heap.PropKey.fromAtom(deep_key)).?.value.string.units);
-    const e2 = a2.kind.array.items[1].closure.impl.tree.env.?.parent.?;
-    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("via the environment"), e2.values[0].?.string.units);
+    const a2 = root.props.get(heap.PropKey.fromAtom(try h.internAscii("list"))).?.value.asObject();
+    const c2 = a2.kind.array.items[0].asClosure().impl.vm.captures[0];
+    const o2 = c2.value.?.asObject();
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("via the prototype"), o2.proto.?.props.get(heap.PropKey.fromAtom(deep_key)).?.value.asString().units);
+    const e2 = a2.kind.array.items[1].asClosure().impl.tree.env.?.parent.?;
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("via the environment"), e2.values[0].?.asString().units);
 }
 
 test "collecting allocates nothing: marking, atom cleanup and sweep, with the allocator failing" {
@@ -215,7 +215,7 @@ test "collecting allocates nothing: marking, atom cleanup and sweep, with the al
     for (0..500) |i| {
         var buf: [16]u8 = undefined;
         const k = try h.internAscii(std.fmt.bufPrint(&buf, "k{d}", .{i}) catch unreachable);
-        if (i % 2 == 0) try h.storeProperty(keep, k, .{ .number = 1 }); // half the atoms stay live
+        if (i % 2 == 0) try h.storeProperty(keep, k, zqjs.Value.fromNumber(1)); // half the atoms stay live
     }
     const capacity = h.atoms.capacity();
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
@@ -236,17 +236,17 @@ test "weak atoms (D11): kept by their objects, dropped with them, reusable after
     const baseline = h.atoms.count();
     const o = try h.newObject(null);
     var buf: [16]u8 = undefined;
-    for (0..10_000) |i| try h.storeProperty(o, try h.internAscii(std.fmt.bufPrint(&buf, "k{d}", .{i}) catch unreachable), .{ .number = @floatFromInt(i) });
+    for (0..10_000) |i| try h.storeProperty(o, try h.internAscii(std.fmt.bufPrint(&buf, "k{d}", .{i}) catch unreachable), zqjs.Value.fromNumber(@floatFromInt(i)));
     for (0..5) |_| collectMajor(&h, &.{&o.obj});
     for (0..10_000) |i| {
         const k = try h.internAscii(std.fmt.bufPrint(&buf, "k{d}", .{i}) catch unreachable);
-        try testing.expectEqual(@as(f64, @floatFromInt(i)), o.props.get(heap.PropKey.fromAtom(k)).?.value.number); // same atom as the key
+        try testing.expectEqual(@as(f64, @floatFromInt(i)), o.props.get(heap.PropKey.fromAtom(k)).?.value.asNumber()); // same atom as the key
     }
     // delete o[k], collect, reuse k: a fresh atom works as the key.
     h.removeProperty(o, try h.internAscii("k7"));
     collectMajor(&h, &.{&o.obj});
-    try h.storeProperty(o, try h.internAscii("k7"), .{ .number = 77 });
-    try testing.expectEqual(@as(f64, 77), o.props.get(heap.PropKey.fromAtom(try h.internAscii("k7"))).?.value.number);
+    try h.storeProperty(o, try h.internAscii("k7"), zqjs.Value.fromNumber(77));
+    try testing.expectEqual(@as(f64, 77), o.props.get(heap.PropKey.fromAtom(try h.internAscii("k7"))).?.value.asNumber());
     // Drop the object: the table shrinks back to its baseline, and every entry left is a
     // live object (the cleanup ran before the sweep freed anything).
     collectMajor(&h, &.{});
@@ -629,10 +629,10 @@ test "the heap verifier passes after real collections and catches each kind of c
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
     const keep = try h.newObject(null);
-    try h.storeProperty(keep, try h.internAscii("s"), .{ .string = try h.ascii("live") });
+    try h.storeProperty(keep, try h.internAscii("s"), zqjs.Value.fromString(try h.ascii("live")));
     const arr = try h.newArray(keep);
-    try h.appendElement(arr, .{ .object = keep });
-    try h.storeProperty(keep, try h.internAscii("a"), .{ .object = arr });
+    try h.appendElement(arr, zqjs.Value.fromObject(keep));
+    try h.storeProperty(keep, try h.internAscii("a"), zqjs.Value.fromObject(arr));
     for (0..50) |_| _ = try h.newObject(keep); // garbage
     h.collect(TestRoots{ .objs = &.{&keep.obj} }, TestRoots.mark);
     try h.verify(); // exact accounting, no dangling edge, clean atom table, empty gray list
@@ -647,9 +647,9 @@ test "the heap verifier passes after real collections and catches each kind of c
     h.gray = null;
     // An edge from a live object to a collected one (a hand-made tombstone).
     var dead: heap.Object = .{ .obj = .{ .kind = .dead, .next = null }, .proto = null };
-    keep.props.getPtr(heap.PropKey.fromAtom(try h.internAscii("a"))).?.value = .{ .object = &dead };
+    keep.props.getPtr(heap.PropKey.fromAtom(try h.internAscii("a"))).?.value = zqjs.Value.fromObject(&dead);
     try testing.expectError(error.EdgeToCollectedObject, h.verify());
-    keep.props.getPtr(heap.PropKey.fromAtom(try h.internAscii("a"))).?.value = .{ .object = arr };
+    keep.props.getPtr(heap.PropKey.fromAtom(try h.internAscii("a"))).?.value = zqjs.Value.fromObject(arr);
     // A non-atom in the atom table.
     const plain = try h.ascii("not an atom");
     try h.atoms.putNoClobber(h.allocator(), plain, {});
@@ -806,7 +806,7 @@ fn utf16(comptime text: []const u8) []const u16 {
 fn oldArray(h: *heap.Heap, n: usize) !*heap.Object {
     const arr = try h.newArray(null);
     const filler = try h.ascii("old");
-    for (0..n) |_| try h.appendElement(arr, .{ .string = filler });
+    for (0..n) |_| try h.appendElement(arr, zqjs.Value.fromString(filler));
     try collectMinor(h, &.{&arr.obj});
     try testing.expect(arr.obj.old);
     return arr;
@@ -838,40 +838,40 @@ test "cards: a young store at a card boundary is found, and only its card is sca
         defer h.deinit();
         const arr = try oldArray(&h, 4 * card);
         const young = try h.ascii("young");
-        h.storeElement(arr, i, .{ .string = young });
+        h.storeElement(arr, i, zqjs.Value.fromString(young));
         try h.verify();
         const before = h.stats.remembered_children;
         try collectMinor(&h, &.{&arr.obj}); // minor: the root is old
         try testing.expectEqual(@as(u64, card), h.stats.remembered_children - before); // one card, no other
         try testing.expect(young.obj.old);
-        try testing.expectEqualSlices(u16, utf16("young"), arr.kind.array.items[i].string.units);
+        try testing.expectEqualSlices(u16, utf16("young"), arr.kind.array.items[i].asString().units);
         try h.verifyCollected();
     }
     // All six at once: four distinct cards.
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
     const arr = try oldArray(&h, 4 * card);
-    for (indices) |i| h.storeElement(arr, i, .{ .string = try h.ascii("young") });
+    for (indices) |i| h.storeElement(arr, i, zqjs.Value.fromString(try h.ascii("young")));
     const before = h.stats.remembered_children;
     try collectMinor(&h, &.{&arr.obj});
     try testing.expectEqual(@as(u64, 4 * card), h.stats.remembered_children - before);
-    for (indices) |i| try testing.expectEqualSlices(u16, utf16("young"), arr.kind.array.items[i].string.units);
+    for (indices) |i| try testing.expectEqualSlices(u16, utf16("young"), arr.kind.array.items[i].asString().units);
     try h.verifyCollected();
 }
 
 test "cards: an array remembered before its first bitmap gets an all-dirty one (the hole)" {
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
-    const arr = try oldArray(&h, 390); // capacity 398: no bitmap yet
+    const arr = try oldArray(&h, 300); // capacity < card_elements (512): no bitmap yet
     try testing.expect(h.cards.get(arr) == null);
     const young = try h.ascii("young");
-    h.storeElement(arr, 3, .{ .string = young }); // remembered as a whole
-    for (0..200) |i| try h.appendElement(arr, .{ .number = @floatFromInt(i) }); // first bitmap
+    h.storeElement(arr, 3, zqjs.Value.fromString(young)); // remembered as a whole
+    for (0..300) |i| try h.appendElement(arr, zqjs.Value.fromNumber(@floatFromInt(i))); // first bitmap
     try testing.expect(h.cards.get(arr) != null);
     try h.verify(); // I-gen2: index 3's card is dirty
     try collectMinor(&h, &.{&arr.obj});
     try testing.expect(young.obj.old);
-    try testing.expectEqualSlices(u16, utf16("young"), arr.kind.array.items[3].string.units);
+    try testing.expectEqualSlices(u16, utf16("young"), arr.kind.array.items[3].asString().units);
     try h.verifyCollected();
 }
 
@@ -881,8 +881,8 @@ test "cards: the bitmap grows with the array, keeping dirty bits and adding clea
     const arr = try oldArray(&h, 1000);
     try testing.expectEqual(@as(usize, 1), h.cards.get(arr).?.len);
     const young = try h.ascii("young");
-    h.storeElement(arr, 0, .{ .string = young });
-    for (0..40_000) |i| try h.appendElement(arr, .{ .number = @floatFromInt(i) }); // several resizes
+    h.storeElement(arr, 0, zqjs.Value.fromString(young));
+    for (0..40_000) |i| try h.appendElement(arr, zqjs.Value.fromNumber(@floatFromInt(i))); // several resizes
     const words = h.cards.get(arr).?;
     try testing.expectEqual(@as(usize, 2), words.len); // 64 cards of 512 per word
     try testing.expectEqual(@as(u64, 1), words[0]);
@@ -897,8 +897,8 @@ test "cards: pop and shrink after a young store leave nothing stale" {
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
     const arr = try oldArray(&h, 1024);
-    h.storeElement(arr, 600, .{ .string = try h.ascii("dropped") });
-    h.storeElement(arr, 1023, .{ .string = try h.ascii("popped") });
+    h.storeElement(arr, 600, zqjs.Value.fromString(try h.ascii("dropped")));
+    h.storeElement(arr, 1023, zqjs.Value.fromString(try h.ascii("popped")));
     _ = h.popElement(arr);
     h.shrinkElements(arr, 100); // the dirty cards are now past the length
     const swept = h.stats.swept;
@@ -913,12 +913,12 @@ test "cards: a carded array's bitmap goes with it, in a minor and in a major col
     // The side table keeps its bucket storage once it has any (as the atom table does), so
     // measure from after a first carded array has come and gone.
     const first = try h.newArray(null);
-    for (0..2000) |i| try h.appendElement(first, .{ .number = @floatFromInt(i) });
+    for (0..2000) |i| try h.appendElement(first, zqjs.Value.fromNumber(@floatFromInt(i)));
     try collectMinor(&h, &.{});
     const base = h.bytes;
     // Young and carded, then garbage: freed by a minor collection.
     const young = try h.newArray(null);
-    for (0..2000) |i| try h.appendElement(young, .{ .number = @floatFromInt(i) });
+    for (0..2000) |i| try h.appendElement(young, zqjs.Value.fromNumber(@floatFromInt(i)));
     try testing.expectEqual(@as(u32, 1), h.cards.count());
     try collectMinor(&h, &.{});
     try testing.expectEqual(@as(u32, 0), h.cards.count());
@@ -926,7 +926,7 @@ test "cards: a carded array's bitmap goes with it, in a minor and in a major col
     try h.verifyCollected();
     // Old, carded, dirty and remembered, then garbage: freed by a major collection.
     const old = try oldArray(&h, 2000);
-    h.storeElement(old, 1500, .{ .string = try h.ascii("young") });
+    h.storeElement(old, 1500, zqjs.Value.fromString(try h.ascii("young")));
     try testing.expectEqual(@as(u32, 1), h.cards.count());
     collectMajor(&h, &.{});
     try testing.expectEqual(@as(u32, 0), h.cards.count());
@@ -938,13 +938,13 @@ test "cards: a carded array's bitmap goes with it, in a minor and in a major col
 fn growRememberedArray(gpa: Allocator) !void {
     var h = heap.Heap.init(gpa, .{});
     defer h.deinit();
-    const arr = try oldArray(&h, 390);
-    h.storeElement(arr, 3, .{ .string = try h.ascii("young") });
+    const arr = try oldArray(&h, 300);
+    h.storeElement(arr, 3, zqjs.Value.fromString(try h.ascii("young")));
     // Whatever allocation fails, the heap is left consistent: bitmap and elements agree.
     errdefer h.verify() catch |e| std.debug.panic("heap unsound after a failed append: {s}", .{@errorName(e)});
-    for (0..300) |i| try h.appendElement(arr, .{ .number = @floatFromInt(i) });
+    for (0..300) |i| try h.appendElement(arr, zqjs.Value.fromNumber(@floatFromInt(i)));
     try collectMinor(&h, &.{&arr.obj});
-    try testing.expectEqualSlices(u16, utf16("young"), arr.kind.array.items[3].string.units);
+    try testing.expectEqualSlices(u16, utf16("young"), arr.kind.array.items[3].asString().units);
     try h.verifyCollected();
 }
 
@@ -958,7 +958,7 @@ test "minor collections never free an atom; promotion keeps nothing else alive; 
     const baseline = h.atoms.count();
     const garbage = try h.newObject(null);
     const key = try h.internAscii("dynamic key 1");
-    try h.storeProperty(garbage, key, .{ .object = try h.newObject(null) });
+    try h.storeProperty(garbage, key, zqjs.Value.fromObject(try h.newObject(null)));
     const swept = h.stats.swept;
     try collectMinor(&h, &.{}); // minor
     try testing.expectEqual(@as(u64, 1), h.stats.minor);
@@ -977,7 +977,7 @@ test "remembered set: an owner is listed once however often it stores, and clear
     const o = try h.newObject(null);
     try collectMinor(&h, &.{&o.obj});
     const key = try h.internAscii("k");
-    for (0..3) |_| try h.storeProperty(o, key, .{ .string = try h.ascii("young") });
+    for (0..3) |_| try h.storeProperty(o, key, zqjs.Value.fromString(try h.ascii("young")));
     try testing.expectEqual(@as(usize, 1), rememberedLength(&h));
     try h.verify();
     try collectMinor(&h, &.{&o.obj});
@@ -986,8 +986,8 @@ test "remembered set: an owner is listed once however often it stores, and clear
     try h.verifyCollected();
     // A young reference stored, then overwritten: the owner is still remembered, but the
     // scan reads its current contents, so the young string is freed.
-    try h.storeProperty(o, key, .{ .string = try h.ascii("overwritten") });
-    try h.storeProperty(o, key, .{ .number = 1 });
+    try h.storeProperty(o, key, zqjs.Value.fromString(try h.ascii("overwritten")));
+    try h.storeProperty(o, key, zqjs.Value.fromNumber(1));
     try testing.expect(o.obj.remembered);
     const swept = h.stats.swept;
     try collectMinor(&h, &.{&o.obj});
@@ -1001,14 +1001,14 @@ test "major collection: remembered owners and dirty cards are reset, survivors a
     const arr = try oldArray(&h, 1024);
     const o = try h.newObject(null);
     try collectMinor(&h, &.{ &arr.obj, &o.obj });
-    h.storeElement(arr, 700, .{ .string = try h.ascii("in a card") });
-    try h.storeProperty(o, try h.internAscii("young key"), .{ .string = try h.ascii("young value") });
+    h.storeElement(arr, 700, zqjs.Value.fromString(try h.ascii("in a card")));
+    try h.storeProperty(o, try h.internAscii("young key"), zqjs.Value.fromString(try h.ascii("young value")));
     _ = try h.internAscii("dead atom");
     try testing.expectEqual(@as(usize, 2), rememberedLength(&h));
     collectMajor(&h, &.{ &arr.obj, &o.obj });
     try h.verifyCollected(); // nothing young, remembered or dirty; the atom table is sound
-    try testing.expectEqualSlices(u16, utf16("in a card"), arr.kind.array.items[700].string.units);
-    try testing.expect(arr.kind.array.items[700].string.obj.old);
+    try testing.expectEqualSlices(u16, utf16("in a card"), arr.kind.array.items[700].asString().units);
+    try testing.expect(arr.kind.array.items[700].asString().obj.old);
 }
 
 // ---- the broken builds: `zig build gc-mutants` runs these against each heap.Mutation,
@@ -1033,7 +1033,7 @@ test "mutation: an element store without its barrier fails I-gen2" {
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
     const arr = try oldArray(&h, 10);
-    h.storeElement(arr, 0, .{ .string = try h.ascii("young") });
+    h.storeElement(arr, 0, zqjs.Value.fromString(try h.ascii("young")));
     try expectCaught(.no_element_barrier, error.UnrememberedOldToYoungEdge, h.verify());
 }
 
@@ -1042,7 +1042,7 @@ test "mutation: a young element store that doesn't dirty its card fails I-gen2" 
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
     const arr = try oldArray(&h, 1024);
-    h.storeElement(arr, 700, .{ .string = try h.ascii("young") });
+    h.storeElement(arr, 700, zqjs.Value.fromString(try h.ascii("young")));
     try expectCaught(.no_card_set, error.CleanCardOverYoungElement, h.verify());
 }
 
@@ -1053,7 +1053,7 @@ test "mutation: a remembered bit left set after the scan fails I-gen4" {
     h.verify_always = false; // the test verifies itself, instead of a panic in collect
     const o = try h.newObject(null);
     try collectMinor(&h, &.{&o.obj});
-    try h.storeProperty(o, try h.internAscii("k"), .{ .string = try h.ascii("young") });
+    try h.storeProperty(o, try h.internAscii("k"), zqjs.Value.fromString(try h.ascii("young")));
     try collectMinor(&h, &.{&o.obj});
     try expectCaught(.keep_remembered_bit, error.RememberedListCorrupt, h.verifyCollected());
 }
@@ -1062,9 +1062,9 @@ test "mutation: a clean first bitmap for a remembered array fails I-gen2 (the ho
     try onlyIn(.clean_first_bitmap);
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
-    const arr = try oldArray(&h, 390);
-    h.storeElement(arr, 3, .{ .string = try h.ascii("young") });
-    for (0..200) |i| try h.appendElement(arr, .{ .number = @floatFromInt(i) });
+    const arr = try oldArray(&h, 300);
+    h.storeElement(arr, 3, zqjs.Value.fromString(try h.ascii("young")));
+    for (0..300) |i| try h.appendElement(arr, zqjs.Value.fromNumber(@floatFromInt(i)));
     try expectCaught(.clean_first_bitmap, error.CleanCardOverYoungElement, h.verify());
 }
 
@@ -1106,7 +1106,7 @@ fn oldDict(h: *heap.Heap, n: usize) !*heap.Object {
     const o = try h.newObject(null);
     const filler = try h.ascii("old");
     var buf: [16]u8 = undefined;
-    for (0..n) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .{ .string = filler });
+    for (0..n) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), zqjs.Value.fromString(filler));
     try collectMinor(h, &.{&o.obj});
     try testing.expect(o.obj.old);
     return o;
@@ -1123,7 +1123,7 @@ fn oldKeys(h: *heap.Heap, root: *heap.Object, from: usize, to: usize) !void {
 }
 
 fn valueAt(o: *heap.Object, i: usize) []const u16 {
-    return o.props.values()[i].value.string.units;
+    return o.props.values()[i].value.asString().units;
 }
 
 test "property cards: a young value under an existing key at a card boundary dirties only its card" {
@@ -1136,7 +1136,7 @@ test "property cards: a young value under an existing key at a card boundary dir
         var h = heap.Heap.init(dbg.allocator(), .{});
         defer h.deinit();
         const o = try oldDict(&h, 4 * card);
-        try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .{ .string = try h.ascii("young") }); // an update
+        try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), zqjs.Value.fromString(try h.ascii("young"))); // an update
         try h.verify();
         const before = h.stats.remembered_children;
         try collectMinor(&h, &.{&o.obj});
@@ -1147,7 +1147,7 @@ test "property cards: a young value under an existing key at a card boundary dir
     var h = heap.Heap.init(dbg.allocator(), .{});
     defer h.deinit();
     const o = try oldDict(&h, 4 * card);
-    for (indices) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .{ .string = try h.ascii("young") });
+    for (indices) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), zqjs.Value.fromString(try h.ascii("young")));
     const before = h.stats.remembered_children;
     try collectMinor(&h, &.{&o.obj});
     try testing.expectEqual(@as(u64, 4 * 2 * card), h.stats.remembered_children - before); // four distinct cards
@@ -1180,13 +1180,13 @@ test "property cards: deletes at the start, middle and end shift young entries a
         // Young values at the first two entries of card 2 and in card 3: a delete before
         // them moves 2·card down into card 1, and the others down one place.
         const young = [_]usize{ 2 * card, 2 * card + 1, 3 * card };
-        for (young) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .{ .string = try h.ascii("young") });
+        for (young) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), zqjs.Value.fromString(try h.ascii("young")));
         h.removeProperty(o, try h.internAscii(keyName(&buf, removed)));
         try h.verify(); // PC8: every young entry, wherever it moved, is under a dirty card
         try collectMinor(&h, &.{&o.obj});
         for (young) |i| {
             const k = try h.internAscii(keyName(&buf, i));
-            try testing.expectEqualSlices(u16, utf16("young"), o.props.get(heap.PropKey.fromAtom(k)).?.value.string.units);
+            try testing.expectEqualSlices(u16, utf16("young"), o.props.get(heap.PropKey.fromAtom(k)).?.value.asString().units);
         }
         try h.verifyCollected();
     }
@@ -1199,7 +1199,7 @@ test "property cards: a table remembered before its first bitmap gets an all-dir
     try testing.expect(h.prop_cards.get(o) == null);
     var buf: [16]u8 = undefined;
     try oldKeys(&h, o, 400, 600);
-    try h.storeProperty(o, try h.internAscii(keyName(&buf, 3)), .{ .string = try h.ascii("young") }); // remembered whole
+    try h.storeProperty(o, try h.internAscii(keyName(&buf, 3)), zqjs.Value.fromString(try h.ascii("young"))); // remembered whole
     for (400..600) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .null); // first bitmap at 512
     try testing.expect(h.prop_cards.get(o) != null);
     try h.verify();
@@ -1219,7 +1219,7 @@ test "property cards: the bitmap grows over many reallocations; indices stay val
     // the young value below dirties anything.
     for (1000..40_000) |i| _ = try h.internAscii(keyName(&buf, i));
     try collectMinor(&h, &.{&o.obj});
-    try h.storeProperty(o, try h.internAscii(keyName(&buf, 0)), .{ .string = try h.ascii("young") });
+    try h.storeProperty(o, try h.internAscii(keyName(&buf, 0)), zqjs.Value.fromString(try h.ascii("young")));
     for (1000..40_000) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .null); // buffer moves many times
     const words = h.prop_cards.get(o).?;
     try testing.expectEqual(@as(usize, 2), words.len);
@@ -1245,7 +1245,7 @@ test "property cards: allocation failing at every point of a bitmap's creation" 
         var h = heap.Heap.init(failing.allocator(), .{});
         defer h.deinit();
         const o = try oldDict(&h, 500);
-        try h.storeProperty(o, try h.internAscii(keyName(&buf, 3)), .{ .string = try h.ascii("young") });
+        try h.storeProperty(o, try h.internAscii(keyName(&buf, 3)), zqjs.Value.fromString(try h.ascii("young")));
         failing.fail_index = failing.alloc_index + nth;
         const inserted: anyerror!void = for (500..530) |i| {
             const k = h.internAscii(keyName(&buf, i)) catch |e| break e;
@@ -1281,7 +1281,7 @@ test "property cards: a table's bitmap goes with it, in a minor and in a major c
     const old = try h.newObject(null);
     for (0..600) |i| try h.storeProperty(old, try h.internAscii(keyName(&buf, i)), .null);
     try collectMinor(&h, &.{&old.obj});
-    try h.storeProperty(old, try h.internAscii(keyName(&buf, 550)), .{ .string = try h.ascii("young") });
+    try h.storeProperty(old, try h.internAscii(keyName(&buf, 550)), zqjs.Value.fromString(try h.ascii("young")));
     collectMajor(&h, &.{});
     try testing.expectEqual(@as(u32, 0), h.prop_cards.count());
     try h.verifyCollected();
@@ -1293,7 +1293,7 @@ test "mutation: a young property store that doesn't dirty its card fails PC1" {
     defer h.deinit();
     const o = try oldDict(&h, 1024);
     var buf: [16]u8 = undefined;
-    try h.storeProperty(o, try h.internAscii(keyName(&buf, 700)), .{ .string = try h.ascii("young") });
+    try h.storeProperty(o, try h.internAscii(keyName(&buf, 700)), zqjs.Value.fromString(try h.ascii("young")));
     try expectCaught(.no_prop_card_set, error.CleanCardOverYoungProperty, h.verify());
 }
 
@@ -1304,7 +1304,7 @@ test "mutation: a delete that doesn't dirty the shifted cards fails PC1" {
     defer h.deinit();
     const o = try oldDict(&h, 4 * card);
     var buf: [16]u8 = undefined;
-    try h.storeProperty(o, try h.internAscii(keyName(&buf, 2 * card)), .{ .string = try h.ascii("young") });
+    try h.storeProperty(o, try h.internAscii(keyName(&buf, 2 * card)), zqjs.Value.fromString(try h.ascii("young")));
     h.removeProperty(o, try h.internAscii(keyName(&buf, 0))); // moves it to 2·card − 1: card 1
     try expectCaught(.no_dirty_on_remove, error.CleanCardOverYoungProperty, h.verify());
 }
@@ -1316,7 +1316,7 @@ test "mutation: a clean first property bitmap for a remembered table fails PC1 (
     const o = try oldDict(&h, 400);
     var buf: [16]u8 = undefined;
     try oldKeys(&h, o, 400, 600);
-    try h.storeProperty(o, try h.internAscii(keyName(&buf, 3)), .{ .string = try h.ascii("young") });
+    try h.storeProperty(o, try h.internAscii(keyName(&buf, 3)), zqjs.Value.fromString(try h.ascii("young")));
     for (400..600) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), .null);
     try expectCaught(.clean_first_prop_bitmap, error.CleanCardOverYoungProperty, h.verify());
 }
@@ -1346,7 +1346,7 @@ test "scheduling (AS5): f doubles to 4 while majors free little, holds in betwee
     var h = heap.Heap.init(dbg.allocator(), .{});
     defer h.deinit();
     const keep = try h.newArray(null);
-    for (0..2000) |_| try h.appendElement(keep, .{ .string = try h.ascii("live data, kept") });
+    for (0..2000) |_| try h.appendElement(keep, zqjs.Value.fromString(try h.ascii("live data, kept")));
     try testing.expectEqual(@as(u8, 1), h.growth);
     for ([_]u8{ 2, 4, 4 }) |want| { // nothing to free: < 10% each time, capped at 4
         collectMajor(&h, &.{&keep.obj});
@@ -1930,14 +1930,14 @@ test "M36: old object storing young symbol property key survives minor GC and is
     const desc = try h.ascii("sym-key");
     const sym = try h.newSymbol(desc, false);
     const val = try h.ascii("sym-val");
-    try h.storePropKey(obj, heap.PropKey.fromSymbol(sym), .{ .string = val });
+    try h.storePropKey(obj, heap.PropKey.fromSymbol(sym), zqjs.Value.fromString(val));
     try h.verify();
 
     try collectMinor(&h, &.{&obj.obj});
     try testing.expect(sym.obj.old);
     try testing.expect(desc.obj.old);
     try testing.expect(val.obj.old);
-    try testing.expectEqual(val, obj.props.get(heap.PropKey.fromSymbol(sym)).?.value.string);
+    try testing.expectEqual(val, obj.props.get(heap.PropKey.fromSymbol(sym)).?.value.asString());
     try h.verifyCollected();
 
     collectMajor(&h, &.{});
@@ -2475,7 +2475,7 @@ test "M45: Heap ephemeron unit tests (unreachable keys, chains, generational bar
     for (0..1000) |_| {
         const k = try h.newObject(null);
         const v = try h.newArrayBuffer(null, 512);
-        try h.weakMapSet(wm, .{ .obj = &k.obj }, .{ .object = v });
+        try h.weakMapSet(wm, .{ .obj = &k.obj }, zqjs.Value.fromObject(v));
         const sym = try h.newSymbol(null, false);
         try h.weakSetAdd(ws, .{ .obj = @constCast(&sym.obj) });
     }
@@ -2492,9 +2492,9 @@ test "M45: Heap ephemeron unit tests (unreachable keys, chains, generational bar
     const k2 = try h.newObject(null);
     const k3 = try h.newSymbol(null, false);
     const payload = try h.newObject(null);
-    try h.weakMapSet(wm_chain, .{ .obj = &k1.obj }, .{ .object = k2 });
-    try h.weakMapSet(wm_chain, .{ .obj = &k2.obj }, .{ .symbol = k3 });
-    try h.weakMapSet(wm_chain, .{ .obj = @constCast(&k3.obj) }, .{ .object = payload });
+    try h.weakMapSet(wm_chain, .{ .obj = &k1.obj }, zqjs.Value.fromObject(k2));
+    try h.weakMapSet(wm_chain, .{ .obj = &k2.obj }, zqjs.Value.fromSymbol(k3));
+    try h.weakMapSet(wm_chain, .{ .obj = @constCast(&k3.obj) }, zqjs.Value.fromObject(payload));
 
     // Minor GC with only wm_chain and k1 rooted -> chain keeps payload alive
     try collectMinor(&h, &.{ &wm_chain.obj, &k1.obj });
@@ -2520,19 +2520,19 @@ test "M45: Heap ephemeron unit tests (unreachable keys, chains, generational bar
     const young_val = try h.newObject(null);
     const young_drop = try h.newObject(null);
     const young_drop_val = try h.newObject(null);
-    try h.weakMapSet(old_wm, .{ .obj = &young_keep.obj }, .{ .object = young_val });
-    try h.weakMapSet(old_wm, .{ .obj = &young_drop.obj }, .{ .object = young_drop_val });
+    try h.weakMapSet(old_wm, .{ .obj = &young_keep.obj }, zqjs.Value.fromObject(young_val));
+    try h.weakMapSet(old_wm, .{ .obj = &young_drop.obj }, zqjs.Value.fromObject(young_drop_val));
     try h.verify();
 
     try collectMinor(&h, &.{&young_keep.obj});
     try h.verifyCollected();
     try testing.expect(heap.Heap.weakMapHas(old_wm, .{ .obj = &young_keep.obj }));
-    try testing.expectEqual(young_val, heap.Heap.weakMapGet(old_wm, .{ .obj = &young_keep.obj }).?.object);
+    try testing.expectEqual(young_val, heap.Heap.weakMapGet(old_wm, .{ .obj = &young_keep.obj }).?.asObject());
     try testing.expectEqual(@as(usize, 1), old_wm.kind.weak_map.entries.count());
 
     // 4. Cyclic ephemeron: wm.set(k, k) -> once k is unreachable, major GC collects both
     const cyc_k = try h.newObject(null);
-    try h.weakMapSet(old_wm, .{ .obj = &cyc_k.obj }, .{ .object = cyc_k });
+    try h.weakMapSet(old_wm, .{ .obj = &cyc_k.obj }, zqjs.Value.fromObject(cyc_k));
     try h.verify();
     collectMajor(&h, &.{&old_wm.obj});
     try h.verifyCollected();
@@ -2547,7 +2547,7 @@ test "M46: Proxy revocable drops target/handler and old-to-young proxy barrier s
     // 1. Old Proxy holding young target/handler survives minor GC
     const t1 = try h.newObject(null);
     const h1 = try h.newObject(null);
-    const px = try h.newProxy(null, .{ .object = t1 }, .{ .object = h1 }, false, false);
+    const px = try h.newProxy(null, zqjs.Value.fromObject(t1), zqjs.Value.fromObject(h1), false, false);
     collectMajor(&h, &.{&px.obj});
     try testing.expect(px.obj.old);
     try testing.expect(t1.obj.old);
@@ -2556,7 +2556,7 @@ test "M46: Proxy revocable drops target/handler and old-to-young proxy barrier s
     // 2. Revoking a proxy drops references to target/handler so major GC collects them
     const t_buf = try h.newArrayBuffer(null, 64 << 10);
     const h_buf = try h.newArrayBuffer(null, 64 << 10);
-    const rev_px = try h.newProxy(null, .{ .object = t_buf }, .{ .object = h_buf }, false, false);
+    const rev_px = try h.newProxy(null, zqjs.Value.fromObject(t_buf), zqjs.Value.fromObject(h_buf), false, false);
     collectMajor(&h, &.{&rev_px.obj});
     const bytes_with_refs = h.bytes;
     try testing.expect(bytes_with_refs > 128 << 10);

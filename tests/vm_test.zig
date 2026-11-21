@@ -65,7 +65,7 @@ test "step executes one instruction at a time; after halt nothing runs" {
     try testing.expectEqual(@as(u64, 4), s.rt.steps);
     try testing.expectEqual(zqjs.Vm.State.halted, try vm.step());
     try testing.expectEqual(@as(u64, 4), s.rt.steps); // nothing executed, nothing charged
-    try testing.expectEqual(zqjs.Value{ .number = 1 }, vm.locals[0].value);
+    try testing.expectEqual(zqjs.Value.fromNumber(1), vm.locals[0].asValue());
 }
 
 test "an empty script has max_stack 0 and halts" {
@@ -91,7 +91,7 @@ test "a throwing instruction is precise: pc and stack as before it, then the VM 
     try testing.expectEqual(error.Thrown, runToFault(&vm));
     try testing.expectEqual(Op.get_global, s.opAt(vm.pc)); // `nope`, not the next instruction
     try testing.expectEqual(@as(usize, 2), vm.operands().len); // [print, 1]: nothing pushed
-    try testing.expectEqual(zqjs.Value{ .number = 1 }, vm.operands()[1]);
+    try testing.expectEqual(zqjs.Value.fromNumber(1), vm.operands()[1]);
     try testing.expectEqual(zqjs.ErrorName.ReferenceError, s.rt.exception.?.name);
     const steps = s.rt.steps;
     try testing.expectError(error.Thrown, vm.step());
@@ -195,8 +195,8 @@ test "a fault inside a callee is precise and leaves the frames intact" {
     try testing.expectEqual(Op.get_global, @as(Op, @fromBackingInt(vm.proto().code[vm.pc])));
     // The caller's operands sit below the callee's: [print, 1, f], untouched.
     try testing.expectEqual(@as(usize, 3), vm.operands().len);
-    try testing.expectEqual(zqjs.Value{ .number = 1 }, vm.operands()[1]);
-    try testing.expect(vm.operands()[2] == .closure);
+    try testing.expectEqual(zqjs.Value.fromNumber(1), vm.operands()[1]);
+    try testing.expect(vm.operands()[2].isClosure());
 }
 
 test "a call that fails during setup leaves the caller unchanged: limit" {
@@ -228,7 +228,7 @@ test "a call that fails during setup leaves the caller unchanged: out of memory"
     try testing.expectError(error.OutOfMemory, vm.step());
     s.rt.gpa = gpa;
     try testing.expectEqual(before, .{ vm.pc, vm.sp, vm.locals_len, vm.frames.items.len, vm.reserved });
-    try testing.expect(vm.operands()[1] == .closure); // [print, f, 1]
+    try testing.expect(vm.operands()[1].isClosure()); // [print, f, 1]
 }
 
 test "return restores the caller's pc, frame and operand depth" {
@@ -244,7 +244,7 @@ test "return restores the caller's pc, frame and operand depth" {
     while (vm.frames.items.len == 2) _ = try vm.step(); // until f returns
     try testing.expectEqual(pc + zqjs.bytecode.Op.call.size(), vm.pc);
     try testing.expectEqual(@as(usize, 3), vm.operands().len); // [print, 10, 3]
-    try testing.expectEqual(zqjs.Value{ .number = 3 }, vm.operands()[2]);
+    try testing.expectEqual(zqjs.Value.fromNumber(3), vm.operands()[2]);
     try testing.expectEqual(s.proto.slot_count, vm.locals_len);
 }
 
@@ -420,11 +420,15 @@ test "chain: engine records stack with proof and teardown discipline (D52)" {
 
 /// The script's first closure value, after a run created it (the declaration's slot).
 fn firstClosure(vm: *zqjs.Vm) !*const zqjs.heap.Closure {
-    for (vm.locals[0..vm.locals_len]) |s| switch (s) {
-        .uninit => {},
-        .value => |x| if (x == .closure) return x.closure,
-        .cell => |c| if (c.value) |x| if (x == .closure) return x.closure,
-    };
+    for (vm.locals[0..vm.locals_len]) |s| {
+        if (s.isUninit()) continue;
+        if (s.isCell()) {
+            if (s.asCell().value) |x| if (x.isClosure()) return x.asClosure();
+        } else {
+            const x = s.asValue();
+            if (x.isClosure()) return x.asClosure();
+        }
+    }
     return error.TestUnexpectedResult;
 }
 
@@ -454,32 +458,32 @@ fn runCall(source: []const u8, this: ?zqjs.Value, args: []const zqjs.Value) !zqj
 }
 
 test "nested call: runs a closure with arguments and returns its value" {
-    const v = try runCall("function f(x) { return x * 2; } f(1);", null, &.{.{ .number = 21 }});
-    try testing.expectEqual(@as(f64, 42), v.number);
+    const v = try runCall("function f(x) { return x * 2; } f(1);", null, &.{zqjs.Value.fromNumber(21)});
+    try testing.expectEqual(@as(f64, 42), v.asNumber());
 }
 
 test "nested call: arity variants bind like a call does (D41)" {
     // Missing parameters are undefined.
     const missing = try runCall("function f(x) { return x; } f(1);", null, &.{});
-    try testing.expect(missing == .undefined);
+    try testing.expect(missing.isUndefined());
     // Extra arguments are ignored.
-    const extra = try runCall("function f() { return 7; } f(1);", null, &.{ .{ .number = 1 }, .{ .number = 2 } });
-    try testing.expectEqual(@as(f64, 7), extra.number);
+    const extra = try runCall("function f() { return 7; } f(1);", null, &.{ zqjs.Value.fromNumber(1), zqjs.Value.fromNumber(2) });
+    try testing.expectEqual(@as(f64, 7), extra.asNumber());
 }
 
 test "nested call: `this` binds by the VM's sloppy rule (D41)" {
     // No receiver: `this` is unset (Unsupported.sloppy_this).
     try testing.expectError(error.Unsupported, runCall("function f() { return this; } 0;", null, &.{}));
     // An explicit value passed to initCall is bound as `this`.
-    const prim = try runCall("function f() { return this; } 0;", .{ .number = 42 }, &.{});
-    try testing.expectEqual(@as(f64, 42), prim.number);
+    const prim = try runCall("function f() { return this; } 0;", zqjs.Value.fromNumber(42), &.{});
+    try testing.expectEqual(@as(f64, 42), prim.asNumber());
     // An object receiver binds `this` to that object.
     const script = try Setup.create("let o = { a: 7 }; function f() { return this.a; } 0;", .{});
     defer script.destroy();
     var vm = try zqjs.Vm.init(&script.rt, &script.proto);
     defer vm.deinit();
     try testing.expect(runUntilStop(&vm) == null);
-    const obj = vm.locals[0].value;
+    const obj = vm.locals[0].asValue();
     const c = try firstClosure(&vm);
 
     const cx = &script.rt.exec_ctx;
@@ -493,7 +497,7 @@ test "nested call: `this` binds by the VM's sloppy rule (D41)" {
     defer cx.removeVm(&cvm);
 
     try testing.expect(runUntilStop(&cvm) == null);
-    try testing.expectEqual(@as(f64, 7), cvm.nested_result.?.number);
+    try testing.expectEqual(@as(f64, 7), cvm.nested_result.?.asNumber());
 }
 
 test "nested call: a script exception is a Thrown fault with the exception set" {
@@ -554,7 +558,7 @@ test "nested call: the chain's depth counts its recursion as one number (D51)" {
     const cx = &script.rt.exec_ctx;
     script.rt.beginChain(0, std.math.maxInt(u64));
     defer _ = script.rt.endChain();
-    var cvm = try zqjs.Vm.initCall(&script.rt, c, null, &.{.{ .number = 1e9 }});
+    var cvm = try zqjs.Vm.initCall(&script.rt, c, null, &.{zqjs.Value.fromNumber(1e9)});
     errdefer cvm.deinit();
     cvm.chain = cx;
     cx.call_depth += 1;
@@ -585,7 +589,7 @@ test "nested call: a collection between steps keeps the suspended VM's state (R2
     const cx = &script.rt.exec_ctx;
     script.rt.beginChain(0, std.math.maxInt(u64));
     defer _ = script.rt.endChain();
-    var cvm = try zqjs.Vm.initCall(&script.rt, c, null, &.{.{ .number = 8 }});
+    var cvm = try zqjs.Vm.initCall(&script.rt, c, null, &.{zqjs.Value.fromNumber(8)});
     defer cvm.deinit();
     cvm.chain = cx;
     cx.call_depth += 1;
@@ -599,8 +603,8 @@ test "nested call: a collection between steps keeps the suspended VM's state (R2
     // Resume to completion: recursion continues over the moved/collected state.
     try testing.expect(runUntilStop(&cvm) == null);
     const r = cvm.nested_result.?;
-    try testing.expect(r == .string);
-    try testing.expectEqual(@as(usize, 12), r.string.units.len); // "done!!!!!!!!"
+    try testing.expect(r.isString());
+    try testing.expectEqual(@as(usize, 12), r.asString().units.len); // "done!!!!!!!!"
 }
 
 const api = @import("zqjs");
@@ -639,7 +643,7 @@ test "nested call: suspended outer VM stays rooted and intact while nested VM re
     outer_vm.chain = null;
 
     // Grab `inner` closure from outer_vm's top-level locals.
-    const inner_c = outer_vm.locals[1].cell.value.?.closure;
+    const inner_c = outer_vm.locals[1].asCell().value.?.asClosure();
     const outer_stack_ptr = outer_vm.stack.ptr;
     const outer_locals_ptr = outer_vm.locals.ptr;
 
@@ -647,7 +651,7 @@ test "nested call: suspended outer VM stays rooted and intact while nested VM re
     script.rt.beginChain(0, std.math.maxInt(u64));
     {
         defer _ = script.rt.endChain();
-        var cvm = try zqjs.Vm.initCall(&script.rt, inner_c, null, &.{.{ .number = 12 }});
+        var cvm = try zqjs.Vm.initCall(&script.rt, inner_c, null, &.{zqjs.Value.fromNumber(12)});
         defer cvm.deinit();
         cvm.chain = cx;
         cx.call_depth += 1;
@@ -670,7 +674,7 @@ test "nested call: suspended outer VM stays rooted and intact while nested VM re
         // Confirm the nested VM actually reallocated its stacks while outer_vm was suspended.
         try testing.expect(reallocated_stack);
         try testing.expect(reallocated_locals);
-        try testing.expect(cvm.nested_result.? == .string);
+        try testing.expect(cvm.nested_result.?.isString());
     }
     try testing.expect(!cx.active);
     try testing.expectEqual(@as(usize, 0), cx.vms.items.len);
@@ -705,14 +709,14 @@ test "chain edge cases: nested call does not reset budget, latched budget fault 
     var setup_vm = try zqjs.Vm.init(&script.rt, &script.proto);
     defer setup_vm.deinit();
     try testing.expect(runUntilStop(&setup_vm) == null);
-    const work_c = setup_vm.locals[0].value.closure;
-    const loop_c = setup_vm.locals[1].value.closure;
+    const work_c = setup_vm.locals[0].asValue().asClosure();
+    const loop_c = setup_vm.locals[1].asValue().asClosure();
 
     // 1. Nested calls share one cumulative budget and never reset it.
     const cx = &script.rt.exec_ctx;
     script.rt.beginChain(5, 500);
     {
-        var cvm1 = try zqjs.Vm.initCall(&script.rt, work_c, null, &.{.{ .number = 3 }});
+        var cvm1 = try zqjs.Vm.initCall(&script.rt, work_c, null, &.{zqjs.Value.fromNumber(3)});
         defer cvm1.deinit();
         cvm1.chain = cx;
         cx.call_depth += 1;
@@ -723,7 +727,7 @@ test "chain edge cases: nested call does not reset budget, latched budget fault 
         try testing.expect(after_first > 5);
 
         // Second nested call in the same chain continues from `after_first`, not 0.
-        var cvm2 = try zqjs.Vm.initCall(&script.rt, work_c, null, &.{.{ .number = 3 }});
+        var cvm2 = try zqjs.Vm.initCall(&script.rt, work_c, null, &.{zqjs.Value.fromNumber(3)});
         defer cvm2.deinit();
         cvm2.chain = cx;
         cx.call_depth += 1;
@@ -759,7 +763,7 @@ test "chain edge cases: nested call does not reset budget, latched budget fault 
 
             // The native ignores the budget exhaustion and either returns normally or throws.
             return switch (mode) {
-                .return_normal => .{ .number = 999 },
+                .return_normal => zqjs.Value.fromNumber(999),
                 .throw_error => rt.throw(.TypeError, &.{.{ .ascii = "native throw after budget fault" }}),
             };
         }
@@ -786,9 +790,9 @@ test "chain edge cases: nested call does not reset budget, latched budget fault 
         call_script.rt.exec_ctx.call_depth = @intCast(outer.frames.items.len);
 
         // Step until both function declarations (`loop` and `nf`) are initialized in locals.
-        while (outer.locals[0] == .uninit or outer.locals[1] == .uninit) _ = try outer.step();
-        Ctx.loop_closure = outer.locals[0].value.closure;
-        outer.locals[1] = .{ .value = .{ .native = &.{ .name = "hostNative", .call = Ctx.hostNative } } };
+        while (outer.locals[0].isUninit() or outer.locals[1].isUninit()) _ = try outer.step();
+        Ctx.loop_closure = outer.locals[0].asValue().asClosure();
+        outer.locals[1] = .fromValue(zqjs.Value.fromNative(&.{ .name = "hostNative", .call = Ctx.hostNative }));
 
         // Regardless of whether the native returned 999 or threw TypeError, the outer VM
         // faults with the latched LimitExceeded(steps) and leaves its stack pre-call (D35).
@@ -869,13 +873,13 @@ test "public Runtime.call: poisoned runtime returns Internal, closure round-trip
         const irt: *zqjs.Runtime = @ptrCast(@alignCast(arg.owner));
         const ex_vm: *zqjs.Vm = @ptrCast(@alignCast(irt.extra_roots.items[1].ctx));
 
-        const sum_tok = try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[0].cell.value.?.closure });
+        const sum_tok = try zqjs.handles.Table.mint(irt, zqjs.Value.fromClosure(ex_vm.locals[0].asCell().value.?.asClosure()));
         const sum_h: api.Handle = .{ .owner = sum_tok.owner, .slot = sum_tok.slot, .generation = sum_tok.generation };
         defer sum_h.release();
-        const throw_tok = try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[1].value.closure });
+        const throw_tok = try zqjs.handles.Table.mint(irt, zqjs.Value.fromClosure(ex_vm.locals[1].asValue().asClosure()));
         const throw_h: api.Handle = .{ .owner = throw_tok.owner, .slot = throw_tok.slot, .generation = throw_tok.generation };
         defer throw_h.release();
-        const unsup_tok = try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[2].value.closure });
+        const unsup_tok = try zqjs.handles.Table.mint(irt, zqjs.Value.fromClosure(ex_vm.locals[2].asValue().asClosure()));
         const unsup_h: api.Handle = .{ .owner = unsup_tok.owner, .slot = unsup_tok.slot, .generation = unsup_tok.generation };
         defer unsup_h.release();
 
@@ -945,7 +949,7 @@ fn checkClosureCallAllocFailOnce(allocator: std.mem.Allocator) !void {
 
     const irt: *zqjs.Runtime = @ptrCast(@alignCast(arg.owner));
     const ex_vm: *zqjs.Vm = @ptrCast(@alignCast(irt.extra_roots.items[1].ctx));
-    const fn_tok = zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[0].value.closure }) catch |e| switch (e) {
+    const fn_tok = zqjs.handles.Table.mint(irt, zqjs.Value.fromClosure(ex_vm.locals[0].asValue().asClosure())) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.TestUnexpectedResult,
     };
@@ -1433,9 +1437,9 @@ test "M28b VM: uncatchable fault during resume leaves promise pending" {
     try testing.expectEqual(zqjs.Limit.steps, rt.limitHit().?);
 
     // `inf` is in script slot 0, `p` is in script slot 1; `p` must still be pending.
-    const p_val = vm.locals[1].value;
-    try testing.expect(p_val == .object and p_val.object.kind == .promise);
-    try testing.expectEqual(zqjs.heap.PromiseStateTag.pending, p_val.object.kind.promise.state);
+    const p_val = vm.locals[1].asValue();
+    try testing.expect(p_val.isObject() and p_val.asObject().kind == .promise);
+    try testing.expectEqual(zqjs.heap.PromiseStateTag.pending, p_val.asObject().kind.promise.state);
 }
 
 test "M52: property IC invalidation (delete/re-add, defineProperty accessor/writable, freeze, setPrototypeOf, polymorphic, array override)" {

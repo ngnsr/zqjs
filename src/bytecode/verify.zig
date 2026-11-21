@@ -34,6 +34,7 @@ const Limits = @import("../limits.zig").Limits;
 const bc = @import("bytecode.zig");
 const Op = bc.Op;
 const Proto = bc.Proto;
+const Value = @import("../runtime/value.zig").Value;
 
 pub const Error = error{ InvalidBytecode, OutOfMemory };
 
@@ -79,7 +80,7 @@ const Verifier = struct {
         if (p.names.len > v.limits.max_constants) return v.fail(p, 0, "more names than max_constants");
         if (p.code.len == 0) return v.fail(p, 0, "empty code");
         if (@as(u64, p.param_slot) + p.param_count > p.slot_count) return v.fail(p, 0, "more parameters than slots");
-        for (p.consts) |k| switch (k) {
+        for (p.consts) |k| switch (k.tag()) {
             .number, .bigint, .string => {},
             else => return v.fail(p, 0, "constant is not a number, bigint, or string"),
         };
@@ -111,7 +112,7 @@ const Verifier = struct {
                     const k0 = bc.readU32(p.code, pc + 1);
                     const k1 = bc.readU32(p.code, pc + 5);
                     if (k0 < p.consts.len and k1 < p.consts.len) {
-                        if (p.consts[k0] != .string or p.consts[k1] != .string)
+                        if (!p.consts[k0].isString() or !p.consts[k1].isString())
                             return v.fail(p, at, "new_regexp operand is not a string constant");
                     }
                 },
@@ -123,11 +124,11 @@ const Verifier = struct {
                     if (site.cooked.len != site.raw.len)
                         return v.fail(p, at, "template cooked/raw length mismatch");
                     for (site.cooked) |k| {
-                        if (k != std.math.maxInt(u32) and (k >= p.consts.len or p.consts[k] != .string))
+                        if (k != std.math.maxInt(u32) and (k >= p.consts.len or !p.consts[k].isString()))
                             return v.fail(p, at, "template cooked operand is not a string constant");
                     }
                     for (site.raw) |k| {
-                        if (k >= p.consts.len or p.consts[k] != .string)
+                        if (k >= p.consts.len or !p.consts[k].isString())
                             return v.fail(p, at, "template raw operand is not a string constant");
                     }
                 },
@@ -272,7 +273,7 @@ fn enc(comptime parts: anytype) []const u8 {
 
 fn expectInvalid(code: []const u8, max_stack: u32, reason: []const u8) !void {
     var f: Failure = .{};
-    const p: Proto = .{ .code = code, .consts = &.{.{ .number = 1 }}, .names = &.{"x"}, .slot_count = 1, .max_stack = max_stack };
+    const p: Proto = .{ .code = code, .consts = &.{Value.fromNumber(1)}, .names = &.{"x"}, .slot_count = 1, .max_stack = max_stack };
     try testing.expectError(error.InvalidBytecode, verify(testing.allocator, &p, .{}, &f));
     try testing.expectEqualStrings(reason, f.reason);
 }
@@ -281,7 +282,7 @@ test "valid code reports its real stack use and unreachable code" {
     var f: Failure = .{};
     const p: Proto = .{
         .code = enc(.{ .push_const, 0, .dup, .add, .pop, .jump, 14, .pop, .halt }),
-        .consts = &.{.{ .number = 1 }},
+        .consts = &.{Value.fromNumber(1)},
         .names = &.{},
         .slot_count = 0,
         .max_stack = 5, // a generous claim is safe; Info reports the truth
@@ -471,7 +472,7 @@ test "M30: new_regexp requires two string constant operands" {
     var s1: heap.String = .{ .obj = .{ .kind = .string, .next = null }, .units = &.{'g'} };
     const ok: Proto = .{
         .code = enc(.{ .new_regexp, 0, 1, .pop, .halt }),
-        .consts = &.{ .{ .string = &s0 }, .{ .string = &s1 } },
+        .consts = &.{ Value.fromString(&s0), Value.fromString(&s1) },
         .names = &.{},
         .slot_count = 0,
         .max_stack = 1,
@@ -483,7 +484,7 @@ test "M30: new_regexp requires two string constant operands" {
 
     const bad_type: Proto = .{
         .code = enc(.{ .new_regexp, 0, 1, .pop, .halt }),
-        .consts = &.{ .{ .string = &s0 }, .{ .number = 1 } },
+        .consts = &.{ Value.fromString(&s0), Value.fromNumber(1) },
         .names = &.{},
         .slot_count = 0,
         .max_stack = 1,

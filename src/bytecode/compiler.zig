@@ -398,7 +398,7 @@ const Compiler = struct {
         const gop = try c.number_index.getOrPut(c.s.gpa, @bitCast(n));
         if (gop.found_existing) return gop.value_ptr.*;
         errdefer _ = c.number_index.remove(@bitCast(n));
-        gop.value_ptr.* = try c.constant(.{ .number = n });
+        gop.value_ptr.* = try c.constant(Value.fromNumber(n));
         return gop.value_ptr.*;
     }
 
@@ -414,7 +414,7 @@ const Compiler = struct {
         };
         // On a later failure the string is freed by the heap rollback in `compile`.
         gop.key_ptr.* = std.mem.sliceAsBytes(str.units);
-        gop.value_ptr.* = try c.constant(.{ .string = str });
+        gop.value_ptr.* = try c.constant(Value.fromString(str));
         return gop.value_ptr.*;
     }
 
@@ -427,7 +427,7 @@ const Compiler = struct {
         const gop = try c.bigint_index.getOrPut(c.s.gpa, b);
         if (gop.found_existing) return gop.value_ptr.*;
         errdefer _ = c.bigint_index.remove(b);
-        gop.value_ptr.* = try c.constant(.{ .bigint = b });
+        gop.value_ptr.* = try c.constant(Value.fromBigInt(b));
         return gop.value_ptr.*;
     }
 

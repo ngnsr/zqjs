@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const internal = @import("zqjs_internal");
+const Value = internal.Value;
 const IRuntime = internal.Runtime;
 const handles = internal.handles;
 const Proto = internal.bytecode.Proto;
@@ -341,7 +342,7 @@ pub const Runtime = opaque {
             },
             error.Thrown, error.HostError, error.OutOfMemory, error.WriteFailed, error.Internal => |re| return failRun(&r.rt, re, failure),
         };
-        return mintHandle(r, .{ .object = ns_obj }, failure);
+        return mintHandle(r, Value.fromObject(ns_obj), failure);
     }
 
     /// Returns an owned `Handle` to the namespace object of an already-loaded module.
@@ -355,7 +356,7 @@ pub const Runtime = opaque {
         }
         const mod = r.rt.modules.map.get(specifier) orelse return error.ModuleNotFound;
         const ns_obj = internal.module.getNamespace(&r.rt, mod) catch |e| return failRun(&r.rt, e, failure);
-        return mintHandle(r, .{ .object = ns_obj }, failure);
+        return mintHandle(r, Value.fromObject(ns_obj), failure);
     }
 
     /// A major collection, now (between calls or inside a native callback: no script is
@@ -394,7 +395,7 @@ pub const Runtime = opaque {
         const guard = Guard.enterReentrant(r);
         defer guard.exit();
         if (r.rt.poisoned) return error.Internal; // E7: only destroy works now
-        return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .number = n }));
+        return Handle.fromToken(try handles.Table.mint(&r.rt, Value.fromNumber(n)));
     }
 
     pub fn newBoolean(rt: *Runtime, b: bool) HandleError!Handle {
@@ -402,7 +403,7 @@ pub const Runtime = opaque {
         const guard = Guard.enterReentrant(r);
         defer guard.exit();
         if (r.rt.poisoned) return error.Internal; // E7
-        return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .boolean = b }));
+        return Handle.fromToken(try handles.Table.mint(&r.rt, Value.fromBool(b)));
     }
 
     /// Creates a heap string (E10: UTF-16 units in, lone surrogates kept) and mints a
@@ -417,7 +418,7 @@ pub const Runtime = opaque {
             error.LimitExceeded => return error.LimitExceeded,
             else => unreachable, // newString only allocates and checks a limit
         };
-        return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .string = s }));
+        return Handle.fromToken(try handles.Table.mint(&r.rt, Value.fromString(s)));
     }
 
     /// Creates an empty ordinary JS object (`Object.prototype`) and mints an owned handle.
@@ -428,7 +429,7 @@ pub const Runtime = opaque {
         if (r.rt.poisoned) return error.Internal;
         const realm = internal.builtins.realm(&r.rt) catch |e| return mapHandleInternalError(e);
         const obj = r.rt.heap.newObject(realm.object_prototype) catch |e| return mapHandleInternalError(e);
-        return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .object = obj }));
+        return Handle.fromToken(try handles.Table.mint(&r.rt, Value.fromObject(obj)));
     }
 
     /// Creates an empty dense JS array (`Array.prototype`) and mints an owned handle.
@@ -439,7 +440,7 @@ pub const Runtime = opaque {
         if (r.rt.poisoned) return error.Internal;
         const realm = internal.builtins.realm(&r.rt) catch |e| return mapHandleInternalError(e);
         const arr = r.rt.heap.newArray(realm.array_prototype) catch |e| return mapHandleInternalError(e);
-        return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .object = arr }));
+        return Handle.fromToken(try handles.Table.mint(&r.rt, Value.fromObject(arr)));
     }
 
     /// Creates a zero-initialized `ArrayBuffer` of `byte_len` bytes and mints an owned handle.
@@ -450,7 +451,7 @@ pub const Runtime = opaque {
         if (r.rt.poisoned) return error.Internal;
         const vr = internal.builtins.viewsRealm(&r.rt) catch |e| return mapHandleInternalError(e);
         const ab = r.rt.heap.newArrayBuffer(vr.array_buffer_prototype, byte_len) catch |e| return mapHandleInternalError(e);
-        return Handle.fromToken(try handles.Table.mint(&r.rt, .{ .object = ab }));
+        return Handle.fromToken(try handles.Table.mint(&r.rt, Value.fromObject(ab)));
     }
 
     /// Returns a zero-copy mutable byte slice for an `ArrayBuffer`, `TypedArray` (its view
@@ -460,8 +461,8 @@ pub const Runtime = opaque {
         const guard = Guard.enterReentrant(r);
         defer guard.exit();
         const val = handles.Token.checkedValue(&r.rt, h.tok());
-        if (val != .object) return null;
-        return switch (val.object.kind) {
+        if (!val.isObject()) return null;
+        return switch (val.asObject().kind) {
             .array_buffer => |ab| if (ab.detached) @constCast(@as([]const u8, &.{})) else ab.data,
             .typed_array => |ta| blk: {
                 const ab = ta.buffer.kind.array_buffer;
@@ -493,11 +494,11 @@ pub const Runtime = opaque {
         const p = r.rt.heap.newPromise(realm.promise_prototype) catch |e| return mapHandleInternalError(e);
         const res_cap = r.rt.heap.newPromiseCapability(p, false) catch |e| return mapHandleInternalError(e);
         const rej_cap = r.rt.heap.newPromiseCapability(p, true) catch |e| return mapHandleInternalError(e);
-        const p_tok = try handles.Table.mint(&r.rt, .{ .object = p });
+        const p_tok = try handles.Table.mint(&r.rt, Value.fromObject(p));
         errdefer p_tok.release();
-        const res_tok = try handles.Table.mint(&r.rt, .{ .closure = res_cap });
+        const res_tok = try handles.Table.mint(&r.rt, Value.fromClosure(res_cap));
         errdefer res_tok.release();
-        const rej_tok = try handles.Table.mint(&r.rt, .{ .closure = rej_cap });
+        const rej_tok = try handles.Table.mint(&r.rt, Value.fromClosure(rej_cap));
         return .{
             .promise = Handle.fromToken(p_tok),
             .resolve = Handle.fromToken(res_tok),
@@ -516,8 +517,8 @@ pub const Runtime = opaque {
         defer guard.exit();
         const v = handles.Token.checkedValue(&r.rt, h.tok());
         if (r.rt.poisoned) return error.Internal;
-        if (v != .object or v.object.kind != .promise) return null;
-        const pr = &v.object.kind.promise;
+        if (!v.isObject() or v.asObject().kind != .promise) return null;
+        const pr = &v.asObject().kind.promise;
         return switch (pr.state) {
             .pending => .pending,
             .fulfilled => .{ .fulfilled = Handle.fromToken(try handles.Table.mint(&r.rt, pr.result)) },
@@ -1195,9 +1196,9 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
     defer r.gpa.free(argv);
     for (args, 0..) |h, i| argv[i] = handles.Token.checkedValue(rt, h.tok());
 
-    switch (callee) {
+    switch (callee.unpack()) {
         .native => |n| {
-            const this_obj: ?internal.Value = if (this_v == .object) this_v else null;
+            const this_obj: ?internal.Value = if (this_v.isObject()) this_v else null;
             const result = (if (n.host) |h|
                 h.call(rt, h.ctx, this_obj, argv)
             else
@@ -1243,8 +1244,8 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
                     bound_combined = buf;
                     call_argv = buf;
                 }
-                if (b.target == .native) {
-                    const n = b.target.native;
+                if (b.target.isNative()) {
+                    const n = b.target.asNative();
                     const this_obj: ?internal.Value = if (call_this.isObjectLike()) call_this else null;
                     const result = (if (n.host) |h|
                         h.call(rt, h.ctx, this_obj, call_argv)
@@ -1270,7 +1271,7 @@ fn callImpl(r: *RuntimeImpl, f: Handle, this_h: ?Handle, args: []const Handle, f
                     }
                     return mintHandle(r, result, failure);
                 }
-                target_closure = b.target.closure;
+                target_closure = b.target.asClosure();
             }
             if (target_closure.impl == .promise_cap) {
                 const pc = target_closure.impl.promise_cap;

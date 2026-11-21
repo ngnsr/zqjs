@@ -45,7 +45,7 @@ const max_index = std.math.maxInt(u32) - 1;
 
 /// ToPropertyKey.
 pub fn key(rt: *Runtime, v: Value) Error!Key {
-    switch (v) {
+    switch (v.unpack()) {
         .number => |n| {
             if (n >= 0 and n <= max_index and @floor(n) == n) return .{ .index = @intFromFloat(n) }; // -0 → 0
             var buf: ops.NumberBuf = undefined;
@@ -159,7 +159,7 @@ pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
 /// ES GetMethod(V, P): returns null for undefined/null, throws TypeError if non-callable.
 pub fn getMethod(rt: *Runtime, v: Value, k: Key) Error!?Value {
     const func = try get(rt, v, k);
-    if (func == .undefined or func == .null) return null;
+    if (func.isUndefined() or func.isNull()) return null;
     if (!func.isFunction()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Property is not a function" }});
     }
@@ -168,15 +168,15 @@ pub fn getMethod(rt: *Runtime, v: Value, k: Key) Error!?Value {
 
 pub fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error!Value {
     heap_mod.checkValue(base);
-    switch (base) {
+    switch (base.unpack()) {
         .undefined, .null => {
             var buf: [10]u8 = undefined;
-            return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot read properties of " }, .{ .ascii = @tagName(base) }, .{ .ascii = " (reading '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
+            return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot read properties of " }, .{ .ascii = @tagName(base.tag()) }, .{ .ascii = " (reading '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
         },
         .string => |s| {
             switch (k) {
-                .index => |i| if (i < s.units.len) return .{ .string = try rt.heap.newString(&.{.{ .utf16 = s.units[i..][0..1] }}) },
-                .atom => if (isNamed(k, "length")) return .{ .number = @floatFromInt(s.units.len) },
+                .index => |i| if (i < s.units.len) return Value.fromString(try rt.heap.newString(&.{.{ .utf16 = s.units[i..][0..1] }})),
+                .atom => if (isNamed(k, "length")) return Value.fromNumber(@floatFromInt(s.units.len)),
                 .symbol => {},
             }
             const r = try builtins.realm(rt);
@@ -188,8 +188,8 @@ pub fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error
         .boolean => return getFrom(rt, (try builtins.realm(rt)).boolean_prototype, receiver, k),
         .object => |o| return getFrom(rt, o, receiver, k),
         .native => |n| {
-            if (isNamed(k, "name")) return .{ .string = try rt.heap.ascii(n.name) };
-            if (isNamed(k, "length")) return .{ .number = @floatFromInt(n.length) };
+            if (isNamed(k, "name")) return Value.fromString(try rt.heap.ascii(n.name));
+            if (isNamed(k, "length")) return Value.fromNumber(@floatFromInt(n.length));
             if (try builtins.namespaceObject(rt, n)) |ns| {
                 if (try ownProp(rt, ns, k)) |p| return resolvePropValue(rt, receiver, p);
                 if (nodeHas(ns.builtin.?, k)) return unsupportedBuiltin(rt, k);
@@ -197,12 +197,12 @@ pub fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error
             return getWithReceiver(rt, try builtins.nativeProto(rt, n), receiver, k);
         },
         .closure => |c| {
-            if (isNamed(k, "name")) return .{ .string = try builtins.closureName(rt, c) };
-            if (isNamed(k, "length")) return .{ .number = @floatFromInt(builtins.closureLength(c)) };
+            if (isNamed(k, "name")) return Value.fromString(try builtins.closureName(rt, c));
+            if (isNamed(k, "length")) return Value.fromNumber(@floatFromInt(builtins.closureLength(c)));
             if (isNamed(k, "prototype")) {
                 if (c.meta) |m| if (m.prototype) |p| return p;
                 if (builtins.hasAutoPrototype(c)) {
-                    return .{ .object = try builtins.materializeClosurePrototype(rt, @constCast(c)) };
+                    return Value.fromObject(try builtins.materializeClosurePrototype(rt, @constCast(c)));
                 }
             }
             if (c.meta) |m| if (m.props.count() > 0) {
@@ -215,25 +215,25 @@ pub fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error
 }
 
 pub fn getPrototypeOfValue(rt: *Runtime, v: Value) Error!Value {
-    return switch (v) {
-        .object => |o| if (o.kind == .proxy) builtins.proxyGetPrototypeOf(rt, o) else if (o.proto) |p| .{ .object = p } else .null,
-        .closure => |c| if (c.meta) |m| (m.proto orelse .{ .object = try builtins.closureDefaultProto(rt, c) }) else .{ .object = try builtins.closureDefaultProto(rt, c) },
+    return switch (v.unpack()) {
+        .object => |o| if (o.kind == .proxy) builtins.proxyGetPrototypeOf(rt, o) else if (o.proto) |p| Value.fromObject(p) else .null,
+        .closure => |c| if (c.meta) |m| (m.proto orelse Value.fromObject(try builtins.closureDefaultProto(rt, c))) else Value.fromObject(try builtins.closureDefaultProto(rt, c)),
         .native => |n| try builtins.nativeProto(rt, n),
-        .symbol => .{ .object = (try builtins.realm(rt)).symbol_prototype },
-        .bigint => .{ .object = (try builtins.realm(rt)).bigint_prototype },
+        .symbol => Value.fromObject((try builtins.realm(rt)).symbol_prototype),
+        .bigint => Value.fromObject((try builtins.realm(rt)).bigint_prototype),
         else => .null,
     };
 }
 
 pub fn getSuper(rt: *Runtime, home: Value, receiver: Value, k: Key) Error!Value {
     const proto = try getPrototypeOfValue(rt, home);
-    if (proto == .null or proto == .undefined) return .undefined;
+    if (proto.isNull() or proto.isUndefined()) return .undefined;
     return getWithReceiver(rt, proto, receiver, k);
 }
 
 fn resolvePropValue(rt: *Runtime, receiver: Value, p: Property) Error!Value {
     if (!p.is_accessor) return p.value;
-    if (p.value == .undefined) return .undefined;
+    if (p.value.isUndefined()) return .undefined;
     return rt.callCallable(p.value, receiver, &.{});
 }
 
@@ -268,14 +268,14 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
                 .configurable = o.array_elements_configurable,
             } else null,
             .atom => if (isNamed(k, "length")) return .{
-                .value = .{ .number = @floatFromInt(elements.items.len) },
+                .value = Value.fromNumber(@floatFromInt(elements.items.len)),
                 .enumerable = false,
                 .writable = o.array_length_writable,
                 .configurable = false,
             },
             .symbol => {},
         },
-        .map, .set => |table| if (isNamed(k, "size")) return .{ .value = .{ .number = @floatFromInt(table.live_count) }, .enumerable = false, .writable = false },
+        .map, .set => |table| if (isNamed(k, "size")) return .{ .value = Value.fromNumber(@floatFromInt(table.live_count)), .enumerable = false, .writable = false },
         .regexp => |re| {
             if (isNamed(k, "lastIndex")) return .{
                 .value = re.last_index,
@@ -283,16 +283,16 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
                 .writable = o.regexp_last_index_writable,
                 .configurable = false,
             };
-            if (isNamed(k, "source")) return .{ .value = .{ .string = re.source }, .enumerable = false, .writable = false };
-            if (isNamed(k, "flags")) return .{ .value = .{ .string = re.flags }, .enumerable = false, .writable = false };
-            if (isNamed(k, "hasIndices")) return .{ .value = .{ .boolean = re.program.flags.has_indices }, .enumerable = false, .writable = false };
-            if (isNamed(k, "global")) return .{ .value = .{ .boolean = re.global }, .enumerable = false, .writable = false };
-            if (isNamed(k, "ignoreCase")) return .{ .value = .{ .boolean = re.program.flags.ignore_case }, .enumerable = false, .writable = false };
-            if (isNamed(k, "multiline")) return .{ .value = .{ .boolean = re.program.flags.multiline }, .enumerable = false, .writable = false };
-            if (isNamed(k, "dotAll")) return .{ .value = .{ .boolean = re.program.flags.dot_all }, .enumerable = false, .writable = false };
-            if (isNamed(k, "unicode")) return .{ .value = .{ .boolean = re.program.flags.unicode }, .enumerable = false, .writable = false };
-            if (isNamed(k, "unicodeSets")) return .{ .value = .{ .boolean = re.program.flags.unicode_sets }, .enumerable = false, .writable = false };
-            if (isNamed(k, "sticky")) return .{ .value = .{ .boolean = re.program.flags.sticky }, .enumerable = false, .writable = false };
+            if (isNamed(k, "source")) return .{ .value = Value.fromString(re.source), .enumerable = false, .writable = false };
+            if (isNamed(k, "flags")) return .{ .value = Value.fromString(re.flags), .enumerable = false, .writable = false };
+            if (isNamed(k, "hasIndices")) return .{ .value = Value.fromBool(re.program.flags.has_indices), .enumerable = false, .writable = false };
+            if (isNamed(k, "global")) return .{ .value = Value.fromBool(re.global), .enumerable = false, .writable = false };
+            if (isNamed(k, "ignoreCase")) return .{ .value = Value.fromBool(re.program.flags.ignore_case), .enumerable = false, .writable = false };
+            if (isNamed(k, "multiline")) return .{ .value = Value.fromBool(re.program.flags.multiline), .enumerable = false, .writable = false };
+            if (isNamed(k, "dotAll")) return .{ .value = Value.fromBool(re.program.flags.dot_all), .enumerable = false, .writable = false };
+            if (isNamed(k, "unicode")) return .{ .value = Value.fromBool(re.program.flags.unicode), .enumerable = false, .writable = false };
+            if (isNamed(k, "unicodeSets")) return .{ .value = Value.fromBool(re.program.flags.unicode_sets), .enumerable = false, .writable = false };
+            if (isNamed(k, "sticky")) return .{ .value = Value.fromBool(re.program.flags.sticky), .enumerable = false, .writable = false };
         },
         .module_namespace => |ns| {
             if (k == .atom) {
@@ -360,9 +360,9 @@ const ChainHit = union(enum) {
 
 fn sameTarget(a: Value, b: ?Value) bool {
     const bv = b orelse return false;
-    return switch (a) {
-        .object => |ao| bv == .object and bv.object == ao,
-        .closure => |ac| bv == .closure and bv.closure == ac,
+    return switch (a.unpack()) {
+        .object => |ao| bv.isObject() and bv.asObject() == ao,
+        .closure => |ac| bv.isClosure() and bv.asClosure() == ac,
         else => false,
     };
 }
@@ -370,7 +370,7 @@ fn sameTarget(a: Value, b: ?Value) bool {
 fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainHit {
     var cur: Value = start;
     while (true) {
-        switch (cur) {
+        switch (cur.unpack()) {
             .object => |o| {
                 o.obj.checkLive();
                 if (o.kind == .proxy) return .{ .proxy = o };
@@ -378,7 +378,7 @@ fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainH
                     if (p.is_accessor) return .{ .accessor = p };
                     return .{ .data = .{ .is_own = sameTarget(cur, base), .writable = p.writable } };
                 }
-                cur = if (o.proto) |p| .{ .object = p } else return .none;
+                cur = if (o.proto) |p| Value.fromObject(p) else return .none;
             },
             .closure => |c| {
                 c.obj.checkLive();
@@ -401,7 +401,7 @@ fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainH
                         continue;
                     }
                 }
-                cur = .{ .object = try builtins.closureDefaultProto(rt, c) };
+                cur = Value.fromObject(try builtins.closureDefaultProto(rt, c));
             },
             else => return .none,
         }
@@ -409,7 +409,7 @@ fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainH
 }
 
 fn invokeSetter(rt: *Runtime, p: Property, receiver: Value, v: Value, strict: bool) Error!bool {
-    if (p.setter == .undefined) {
+    if (p.setter.isUndefined()) {
         if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot set property which has only a getter" }});
         return false;
     }
@@ -428,10 +428,10 @@ pub fn setStrict(rt: *Runtime, base: Value, k: Key, v: Value) Error!void {
 }
 
 pub fn setWithReceiver(rt: *Runtime, base: Value, k: Key, v: Value, receiver: Value, strict: bool) Error!bool {
-    switch (base) {
+    switch (base.unpack()) {
         .undefined, .null => {
             var buf: [10]u8 = undefined;
-            return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot set properties of " }, .{ .ascii = @tagName(base) }, .{ .ascii = " (setting '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
+            return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot set properties of " }, .{ .ascii = @tagName(base.tag()) }, .{ .ascii = " (setting '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
         },
         .string, .number, .boolean, .symbol, .bigint => return if (strict) rt.throw(.TypeError, &.{.{ .ascii = "Cannot create property on primitive" }}) else rt.fail(.primitive_write),
         .native => {
@@ -509,7 +509,7 @@ pub fn setWithReceiver(rt: *Runtime, base: Value, k: Key, v: Value, receiver: Va
 
 pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value) Error!void {
     const proto = try getPrototypeOfValue(rt, home);
-    if (proto != .null and proto != .undefined) {
+    if (!proto.isNull() and !proto.isUndefined()) {
         switch (try lookupSetChain(rt, proto, null, k)) {
             .proxy => |px_obj| {
                 _ = try builtins.proxySet(rt, px_obj, k, v, receiver);
@@ -524,7 +524,7 @@ pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value) Er
         }
     }
     // Check own property on receiver before writing own data property.
-    switch (receiver) {
+    switch (receiver.unpack()) {
         .object => |o| {
             if (o.kind == .proxy) {
                 _ = try builtins.ordinarySetWithReceiver(rt, receiver, k, v, false);
@@ -550,7 +550,7 @@ pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value) Er
         },
         .undefined, .null => {
             var buf: [10]u8 = undefined;
-            return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot set properties of " }, .{ .ascii = @tagName(receiver) }, .{ .ascii = " (setting '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
+            return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot set properties of " }, .{ .ascii = @tagName(receiver.tag()) }, .{ .ascii = " (setting '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
         },
         else => return rt.fail(.primitive_write),
     }
@@ -558,7 +558,7 @@ pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value) Er
 }
 
 fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!bool {
-    switch (base) {
+    switch (base.unpack()) {
         .closure => |c| {
             const pk = try propKey(rt, k);
             if (c.meta) |m| if (!m.extensible and !m.props.contains(pk)) {
@@ -647,7 +647,7 @@ pub fn define(rt: *Runtime, o: *Object, k: Key, v: Value) Error!void {
 
 pub fn defineNonEnumerable(rt: *Runtime, target: Value, k: Key, v: Value) Error!void {
     const pk = try propKey(rt, k);
-    switch (target) {
+    switch (target.unpack()) {
         .object => |o| try rt.heap.definePropKey(o, pk, .{ .value = v, .enumerable = false }),
         .closure => |c| try rt.heap.defineClosurePropKey(@constCast(c), pk, .{ .value = v, .enumerable = false }),
         else => unreachable,
@@ -656,7 +656,7 @@ pub fn defineNonEnumerable(rt: *Runtime, target: Value, k: Key, v: Value) Error!
 
 pub fn defineAccessor(rt: *Runtime, target: Value, k: Key, fn_val: Value, is_setter: bool, enumerable: bool) Error!void {
     const pk = try propKey(rt, k);
-    const existing: ?Property = switch (target) {
+    const existing: ?Property = switch (target.unpack()) {
         .object => |o| o.props.get(pk),
         .closure => |c| if (c.meta) |m| m.props.get(pk) else null,
         else => unreachable,
@@ -670,7 +670,7 @@ pub fn defineAccessor(rt: *Runtime, target: Value, k: Key, fn_val: Value, is_set
         .configurable = true,
         .writable = false,
     };
-    switch (target) {
+    switch (target.unpack()) {
         .object => |o| try rt.heap.definePropKey(o, pk, prop),
         .closure => |c| try rt.heap.defineClosurePropKey(@constCast(c), pk, prop),
         else => unreachable,
@@ -680,7 +680,7 @@ pub fn defineAccessor(rt: *Runtime, target: Value, k: Key, fn_val: Value, is_set
 pub fn definePublicField(rt: *Runtime, target: Value, k: Key, v: Value) Error!void {
     const pk = try propKey(rt, k);
     const prop: Property = .{ .value = v, .enumerable = true, .writable = true, .configurable = true };
-    switch (target) {
+    switch (target.unpack()) {
         .object => |o| try rt.heap.definePropKey(o, pk, prop),
         .closure => |c| try rt.heap.defineClosurePropKey(@constCast(c), pk, prop),
         else => unreachable,
@@ -688,7 +688,7 @@ pub fn definePublicField(rt: *Runtime, target: Value, k: Key, v: Value) Error!vo
 }
 
 fn privateLookup(target: Value, pk: heap_mod.PrivateKey) ?Property {
-    return switch (target) {
+    return switch (target.unpack()) {
         .object => |o| if (o.private_props) |pp| pp.get(pk) else null,
         .closure => |c| if (c.meta) |m| m.private_props.get(pk) else null,
         else => null,
@@ -728,7 +728,7 @@ pub fn definePrivateAccessor(rt: *Runtime, target: Value, brand: *const heap_mod
 
 pub fn getPrivate(rt: *Runtime, base: Value, brand: *const heap_mod.Closure, name_str: *String) Error!Value {
     heap_mod.checkValue(base);
-    if (base == .undefined or base == .null) {
+    if (base.isNullish()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Cannot read private member from undefined or null" }});
     }
     const pk: heap_mod.PrivateKey = .{ .brand = @constCast(brand), .name = name_str };
@@ -740,7 +740,7 @@ pub fn getPrivate(rt: *Runtime, base: Value, brand: *const heap_mod.Closure, nam
 
 pub fn setPrivate(rt: *Runtime, base: Value, brand: *const heap_mod.Closure, name_str: *String, v: Value) Error!void {
     heap_mod.checkValue(base);
-    if (base == .undefined or base == .null) {
+    if (base.isNullish()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Cannot write private member to undefined or null" }});
     }
     const pk: heap_mod.PrivateKey = .{ .brand = @constCast(brand), .name = name_str };
@@ -748,7 +748,7 @@ pub fn setPrivate(rt: *Runtime, base: Value, brand: *const heap_mod.Closure, nam
         return rt.throw(.TypeError, &.{.{ .ascii = "Cannot write private member to an object whose class did not declare it" }});
     };
     if (p.is_accessor) {
-        if (p.setter == .undefined) {
+        if (p.setter.isUndefined()) {
             return rt.throw(.TypeError, &.{.{ .ascii = "Private property has only a getter" }});
         }
         _ = try rt.callCallable(p.setter, base, &.{v});
@@ -762,7 +762,7 @@ pub fn setPrivate(rt: *Runtime, base: Value, brand: *const heap_mod.Closure, nam
 
 pub fn hasPrivate(rt: *Runtime, base: Value, brand: *const heap_mod.Closure, name_str: *String) Error!bool {
     heap_mod.checkValue(base);
-    if (base != .object and base != .closure and base != .native) {
+    if (!base.isObjectLike()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Cannot use 'in' operator to search for private member in a non-object" }});
     }
     return privateLookup(base, .{ .brand = @constCast(brand), .name = name_str }) != null;
@@ -794,7 +794,7 @@ fn setLength(rt: *Runtime, arr: *Object, v: Value, strict: bool) Error!bool {
 /// `delete base[k]`.
 pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
     heap_mod.checkValue(base);
-    const o = switch (base) {
+    const o = switch (base.unpack()) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
         .string, .number, .boolean, .symbol, .bigint => return rt.fail(.primitive_write),
         .native => return rt.fail(.function_properties),
@@ -843,7 +843,7 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
 /// Own property check (`Object.hasOwn` / `hasOwnProperty`).
 pub fn hasOwn(rt: *Runtime, base: Value, k: Key) Error!bool {
     heap_mod.checkValue(base);
-    return switch (base) {
+    return switch (base.unpack()) {
         .object => |o| if (o.kind == .proxy) (try builtins.proxyGetOwnPropertyDescriptor(rt, o, k)) != null else (try ownProp(rt, o, k)) != null,
         .closure => |c| {
             if (isNamed(k, "name") or isNamed(k, "length")) return true;
@@ -869,7 +869,7 @@ pub fn hasOwn(rt: *Runtime, base: Value, k: Key) Error!bool {
 /// `k in base`.
 pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
     heap_mod.checkValue(base);
-    const start: *Object = switch (base) {
+    const start: *Object = switch (base.unpack()) {
         .object => |o| o,
         .native => |n| {
             if (isNamed(k, "name") or isNamed(k, "length")) return true;
@@ -926,7 +926,7 @@ pub fn instanceOf(rt: *Runtime, lhs: Value, rhs: Value) Error!bool {
     defer roots.unregister(rt);
 
     if (try getMethod(rt, rhs, .{ .symbol = r.sym_has_instance })) |handler| {
-        if (handler == .native and handler.native == &builtins.function_has_instance) {
+        if (handler.isNative() and handler.asNative() == &builtins.function_has_instance) {
             return ordinaryHasInstance(rt, rhs, lhs);
         }
         const res = try rt.callCallable(handler, rhs, &.{lhs});
@@ -941,11 +941,11 @@ pub fn instanceOf(rt: *Runtime, lhs: Value, rhs: Value) Error!bool {
 /// ES OrdinaryHasInstance(C, O).
 pub fn ordinaryHasInstance(rt: *Runtime, c_val: Value, o_val: Value) Error!bool {
     if (!c_val.isFunction()) return false;
-    if (c_val == .closure and c_val.closure.impl == .bound) {
-        return instanceOf(rt, o_val, c_val.closure.impl.bound.target);
+    if (c_val.isClosure() and c_val.asClosure().impl == .bound) {
+        return instanceOf(rt, o_val, c_val.asClosure().impl.bound.target);
     }
     if (!o_val.isObjectLike()) return false;
-    const target_proto: *Object = switch (c_val) {
+    const target_proto: *Object = switch (c_val.unpack()) {
         .native => |n| (try builtins.constructorPrototype(rt, n)) orelse
             return rt.throw(.TypeError, &.{.{ .ascii = "Function has non-object prototype 'undefined' in instanceof check" }}),
         .closure => blk: {
@@ -954,18 +954,18 @@ pub fn ordinaryHasInstance(rt: *Runtime, c_val: Value, o_val: Value) Error!bool 
             try roots.register(rt);
             defer roots.unregister(rt);
             const proto_val = try get(rt, c_val, try named(rt, "prototype"));
-            if (proto_val != .object) {
+            if (!proto_val.isObject()) {
                 return rt.throw(.TypeError, &.{.{ .ascii = "Function has non-object prototype in instanceof check" }});
             }
-            break :blk proto_val.object;
+            break :blk proto_val.asObject();
         },
         else => unreachable,
     };
     var cur: Value = try getPrototypeOfValue(rt, o_val);
-    while (cur != .null) : (cur = try getPrototypeOfValue(rt, cur)) {
-        if (cur == .object) {
-            cur.object.obj.checkLive();
-            if (cur.object == target_proto) return true;
+    while (!cur.isNull()) : (cur = try getPrototypeOfValue(rt, cur)) {
+        if (cur.isObject()) {
+            cur.asObject().obj.checkLive();
+            if (cur.asObject() == target_proto) return true;
         }
     }
     return false;
@@ -1135,11 +1135,11 @@ pub fn toPrimitive(rt: *Runtime, v: Value, hint: Hint) Error!Value {
     defer roots.unregister(rt);
 
     if (try getMethod(rt, v, .{ .symbol = r.sym_to_primitive })) |exotic_to_prim| {
-        const hint_str: Value = .{ .string = try rt.heap.ascii(switch (hint) {
+        const hint_str: Value = Value.fromString(try rt.heap.ascii(switch (hint) {
             .default => "default",
             .number => "number",
             .string => "string",
-        }) };
+        }));
         const res = try rt.callCallable(exotic_to_prim, v, &.{hint_str});
         if (!res.isObjectLike()) return res;
         return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert object to primitive value" }});
@@ -1277,7 +1277,7 @@ pub fn readTypedArrayU64(ta: heap_mod.TypedArrayState, idx: usize) u64 {
 pub fn readTypedArrayNumber(ta: heap_mod.TypedArrayState, idx: usize) Value {
     const data = ta.buffer.kind.array_buffer.data;
     const off = ta.byte_offset + idx * ta.kind.bytesPerElement();
-    return .{ .number = switch (ta.kind) {
+    return Value.fromNumber(switch (ta.kind) {
         .int8 => @floatFromInt(@as(i8, @bitCast(data[off]))),
         .uint8, .uint8_clamped => @floatFromInt(data[off]),
         .int16 => @floatFromInt(std.mem.readInt(i16, data[off..][0..2], native_endian)),
@@ -1287,13 +1287,13 @@ pub fn readTypedArrayNumber(ta: heap_mod.TypedArrayState, idx: usize) Value {
         .float32 => @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, data[off..][0..4], native_endian)))),
         .float64 => @bitCast(std.mem.readInt(u64, data[off..][0..8], native_endian)),
         .bigint64, .biguint64 => unreachable,
-    } };
+    });
 }
 
 pub fn readTypedArrayElement(rt: *Runtime, ta: heap_mod.TypedArrayState, idx: usize) Error!Value {
     return switch (ta.kind) {
-        .bigint64 => .{ .bigint = try bigint.fromI64(rt, readTypedArrayI64(ta, idx)) },
-        .biguint64 => .{ .bigint = try bigint.fromU64(rt, readTypedArrayU64(ta, idx)) },
+        .bigint64 => Value.fromBigInt(try bigint.fromI64(rt, readTypedArrayI64(ta, idx))),
+        .biguint64 => Value.fromBigInt(try bigint.fromU64(rt, readTypedArrayU64(ta, idx))),
         else => readTypedArrayNumber(ta, idx),
     };
 }

@@ -57,12 +57,45 @@ const bc = @import("../bytecode/bytecode.zig");
 const Op = bc.Op;
 const Proto = bc.Proto;
 
-/// A local slot: uninitialized (TDZ), a plain binding's value, or a captured binding's cell (M54).
-pub const Slot = union(enum) {
-    uninit,
-    value: Value,
-    cell: *Cell,
+/// An 8-byte NaN-boxed local slot: uninitialized (TDZ), a plain JS `Value`, or a
+/// captured `*Cell` tagged with `Value.TAG_CELL` (M55, D85).
+pub const Slot = packed struct(u64) {
+    bits: u64,
+
+    pub const uninit: Slot = .{ .bits = Value.UNINIT_BITS };
+
+    pub inline fn fromValue(v: Value) Slot {
+        return .{ .bits = v.bits };
+    }
+
+    pub inline fn fromCell(c: *Cell) Slot {
+        const addr: u64 = @intFromPtr(c);
+        std.debug.assert((addr & ~Value.PAYLOAD_MASK) == 0);
+        return .{ .bits = Value.TAG_CELL | addr };
+    }
+
+    pub inline fn isUninit(s: Slot) bool {
+        return s.bits == Value.UNINIT_BITS;
+    }
+
+    pub inline fn isCell(s: Slot) bool {
+        return (s.bits & Value.TAG_MASK) == Value.TAG_CELL;
+    }
+
+    pub inline fn asValue(s: Slot) Value {
+        std.debug.assert(!s.isUninit() and !s.isCell());
+        return .{ .bits = s.bits };
+    }
+
+    pub inline fn asCell(s: Slot) *Cell {
+        std.debug.assert(s.isCell());
+        return @ptrFromInt(@as(usize, @truncate(s.bits & Value.PAYLOAD_MASK)));
+    }
 };
+
+comptime {
+    std.debug.assert(@sizeOf(Slot) == 8);
+}
 
 pub const Frame = struct {
     proto: *const Proto,
@@ -239,16 +272,16 @@ pub const Vm = struct {
         if (callee.is_generator or !builtins.hasAutoPrototype(c)) {
             return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
         }
-        var root_buf = [_]Value{ .{ .closure = c }, new_target, .undefined };
+        var root_buf = [_]Value{ Value.fromClosure(c), new_target, .undefined };
         var val_roots: rt_mod.ValueRoots = .{ .values = &root_buf };
         try val_roots.register(rt);
         defer val_roots.unregister(rt);
 
         const proto_val = try object.get(rt, new_target, try object.named(rt, "prototype"));
         const r = try builtins.realm(rt);
-        const instance = try rt.heap.newObject(if (proto_val == .object) proto_val.object else r.object_prototype);
-        root_buf[2] = .{ .object = instance };
-        const init_this: ?Value = if (callee.has_super_ctor) null else .{ .object = instance };
+        const instance = try rt.heap.newObject(if (proto_val.isObject()) proto_val.asObject() else r.object_prototype);
+        root_buf[2] = Value.fromObject(instance);
+        const init_this: ?Value = if (callee.has_super_ctor) null else Value.fromObject(instance);
         return callNested(rt, caller_vm, c, init_this, args, true, instance);
     }
 
@@ -294,7 +327,7 @@ pub const Vm = struct {
         defer rt.exec_ctx.removeVm(&nested);
 
         if (is_construct and !callee.has_super_ctor and construct_instance != null) {
-            try builtins.runInstanceInits(rt, @constCast(c), .{ .object = construct_instance.? });
+            try builtins.runInstanceInits(rt, @constCast(c), Value.fromObject(construct_instance.?));
         }
 
         try nested.run();
@@ -323,7 +356,7 @@ pub const Vm = struct {
     /// Starts a top-level REPL script compiled as an async body (D71).
     pub fn startTopLevelAsync(rt: *Runtime, p: *const Proto) Error!Value {
         const c = try rt.heap.newVmClosure(p, 0);
-        var held = [_]Value{.{ .closure = c }};
+        var held = [_]Value{Value.fromClosure(c)};
         var val_roots: rt_mod.ValueRoots = .{ .values = &held };
         try val_roots.register(rt);
         defer val_roots.unregister(rt);
@@ -336,7 +369,7 @@ pub const Vm = struct {
         const ctx: StartAsyncCtx = .{ .rt = rt, .caller_vm = caller_vm, .c = c, .this = this, .args = args };
         const p: *const Proto = @ptrCast(@alignCast(c.impl.vm.proto));
         if (p.is_generator)
-            return coroutine.startGenerator(rt, &coro_vtable, .{ .closure = c }, p.is_async_generator, ctx, createAndRunCoro);
+            return coroutine.startGenerator(rt, &coro_vtable, Value.fromClosure(c), p.is_async_generator, ctx, createAndRunCoro);
         return coroutine.start(rt, &coro_vtable, ctx, createAndRunCoro);
     }
 
@@ -400,7 +433,7 @@ pub const Vm = struct {
                     // [value, mode]: the code after `yield` dispatches on the mode (D67).
                     if (vm.sp + 2 > vm.stack.len) return vm.bug("stack overflow on generator resume");
                     vm.stack[vm.sp] = res.val;
-                    vm.stack[vm.sp + 1] = .{ .number = @floatFromInt(@backingInt(res.mode)) };
+                    vm.stack[vm.sp + 1] = Value.fromNumber(@floatFromInt(@backingInt(res.mode)));
                     vm.sp += 2;
                     vm.pc += Op.yield.size();
                 } else if (res.mode == .throw) {
@@ -565,12 +598,11 @@ pub const Vm = struct {
             return &vm.locals[self.locals_base + i];
         }
 
-        inline fn value(self: FrameCache, vm: *Vm, i: u32) Error!?*Value {
-            return switch ((try self.slot(vm, i)).*) {
-                .value => |*v| v,
-                .uninit => null,
-                .cell => return vm.bug("value access to a cell slot"),
-            };
+        inline fn valueSlot(self: FrameCache, vm: *Vm, i: u32) Error!?*Slot {
+            const s = try self.slot(vm, i);
+            if (s.isUninit()) return null;
+            if (s.isCell()) return vm.bug("value access to a cell slot");
+            return s;
         }
 
         inline fn cellAt(self: FrameCache, vm: *Vm, i: u32) Error!*Cell {
@@ -609,6 +641,7 @@ pub const Vm = struct {
     };
 
     inline fn runLoop(vm: *Vm, comptime bounded: bool, steps: u64) Error!State {
+        @setEvalBranchQuota(10_000);
         if (vm.fault) |e| return e;
         if (vm.halted) return .halted;
         const rt = vm.rt;
@@ -693,11 +726,10 @@ pub const Vm = struct {
     /// VM), and a coroutine trace must not read a Proto whose program may already be gone.
     fn visitRoots(vm: *const Vm, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *heap.Obj) void) void {
         for (vm.stack[0..vm.sp]) |v| heap.visitValue(v, ctx, visit);
-        for (vm.locals[0..vm.locals_len]) |s| switch (s) {
-            .uninit => {},
-            .value => |v| heap.visitValue(v, ctx, visit),
-            .cell => |c| visit(ctx, &c.obj),
-        };
+        for (vm.locals[0..vm.locals_len]) |s| {
+            if (s.isUninit()) continue;
+            if (s.isCell()) visit(ctx, &s.asCell().obj) else heap.visitValue(s.asValue(), ctx, visit);
+        }
         for (vm.frames.items) |f| {
             if (f.closure) |c| visit(ctx, @constCast(&c.obj));
             if (f.this) |t| heap.visitValue(t, ctx, visit);
@@ -787,8 +819,8 @@ pub const Vm = struct {
         switch (op) {
             .push_undefined => try cache.push(vm, .undefined),
             .push_null => try cache.push(vm, .null),
-            .push_true => try cache.push(vm, .{ .boolean = true }),
-            .push_false => try cache.push(vm, .{ .boolean = false }),
+            .push_true => try cache.push(vm, Value.fromBool(true)),
+            .push_false => try cache.push(vm, Value.fromBool(false)),
             .push_const => {
                 const k = cache.operand(0);
                 if (k >= p.consts.len) return vm.bug("constant index out of range");
@@ -796,39 +828,39 @@ pub const Vm = struct {
             },
 
             .get_local => {
-                const v = (try cache.value(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
-                try cache.push(vm, v.*);
+                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                try cache.push(vm, s.asValue());
             },
             .set_local => {
-                const s = (try cache.value(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
-                s.* = try cache.peek(vm, 0); // the assignment's value stays on the stack
+                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                s.* = Slot.fromValue(try cache.peek(vm, 0)); // the assignment's value stays on the stack
             },
             .set_local_pop => {
-                const s = (try cache.value(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
-                s.* = try cache.peek(vm, 0);
+                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                s.* = Slot.fromValue(try cache.peek(vm, 0));
                 try cache.drop(vm, 1);
             },
             .inc_local, .dec_local => {
-                const s = (try cache.value(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
-                const v = s.*;
-                if (v == .number) {
-                    s.* = .{ .number = v.number + @as(f64, if (op == .inc_local) 1 else -1) };
+                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                const v = s.asValue();
+                if (v.isNumber()) {
+                    s.* = Slot.fromValue(Value.fromNumber(v.asNumber() + @as(f64, if (op == .inc_local) 1 else -1)));
                 } else {
                     cache.syncSp(vm);
                     const nv = try ops.toNumeric(rt, v);
-                    s.* = if (nv == .bigint)
-                        .{ .bigint = try bigint.addI64(rt, nv.bigint, if (op == .inc_local) 1 else -1) }
+                    s.* = Slot.fromValue(if (nv.isBigInt())
+                        Value.fromBigInt(try bigint.addI64(rt, nv.asBigInt(), if (op == .inc_local) 1 else -1))
                     else
-                        .{ .number = nv.number + @as(f64, if (op == .inc_local) 1 else -1) };
+                        Value.fromNumber(nv.asNumber() + @as(f64, if (op == .inc_local) 1 else -1)));
                 }
             },
             .init_local => {
-                (try cache.slot(vm, cache.operand(0))).* = .{ .value = try cache.peek(vm, 0) };
+                (try cache.slot(vm, cache.operand(0))).* = Slot.fromValue(try cache.peek(vm, 0));
                 try cache.drop(vm, 1);
             },
             .clear_local => (try cache.slot(vm, cache.operand(0))).* = .uninit,
             .assign_const => {
-                if ((try cache.value(vm, cache.operand(0))) == null) return vm.tdz(cache.operand(1));
+                if ((try cache.valueSlot(vm, cache.operand(0))) == null) return vm.tdz(cache.operand(1));
                 return vm.constAssignment();
             },
             .get_global => {
@@ -841,21 +873,18 @@ pub const Vm = struct {
             },
 
             .new_cell => {
-                (try cache.slot(vm, cache.operand(0))).* = .{ .cell = try rt.heap.newCell(null) };
+                (try cache.slot(vm, cache.operand(0))).* = Slot.fromCell(try rt.heap.newCell(null));
             },
             .box_local => {
                 const s = try cache.slot(vm, cache.operand(0));
-                const v: Value = switch (s.*) {
-                    .value => |v| v,
-                    .uninit => return vm.bug("boxing a slot in the TDZ"),
-                    .cell => return vm.bug("boxing a cell"),
-                };
-                s.* = .{ .cell = try rt.heap.newCell(v) };
+                if (s.isUninit()) return vm.bug("boxing a slot in the TDZ");
+                if (s.isCell()) return vm.bug("boxing a cell");
+                s.* = Slot.fromCell(try rt.heap.newCell(s.asValue()));
             },
             .fresh_cell => {
                 const s = try cache.slot(vm, cache.operand(0));
                 const old = try vm.cellIn(s);
-                s.* = .{ .cell = try rt.heap.newCell(old.value) };
+                s.* = Slot.fromCell(try rt.heap.newCell(old.value));
             },
             .get_cell => {
                 const v = (try cache.cellAt(vm, cache.operand(0))).value orelse return vm.tdz(cache.operand(1));
@@ -942,11 +971,11 @@ pub const Vm = struct {
                         if (pm.brand) |br| try rt.heap.storeClosureBrand(c, br);
                     }
                 }
-                try cache.push(vm, .{ .closure = c });
+                try cache.push(vm, Value.fromClosure(c));
             },
             .push_callee => {
                 const c = vm.frame().closure orelse return vm.bug("push_callee in the script");
-                try cache.push(vm, .{ .closure = c });
+                try cache.push(vm, Value.fromClosure(c));
             },
 
             .pop => try cache.drop(vm, 1),
@@ -971,7 +1000,7 @@ pub const Vm = struct {
             .new_object => {
                 try cache.ensurePush(vm);
                 const o = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
-                try cache.push(vm, .{ .object = o });
+                try cache.push(vm, Value.fromObject(o));
             },
             .new_array => {
                 const n = cache.operand(0);
@@ -979,7 +1008,7 @@ pub const Vm = struct {
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
                 try rt.heap.appendElements(arr, vm.stack[cache.sp - n .. cache.sp]);
                 cache.sp -= n;
-                try cache.push(vm, .{ .object = arr });
+                try cache.push(vm, Value.fromObject(arr));
             },
             .new_regexp,
             .get_template_obj,
@@ -1046,15 +1075,15 @@ pub const Vm = struct {
             },
             .define_prop => {
                 const o = try cache.peek(vm, 1);
-                if (o != .object) return vm.bug("define on a non-object");
-                try object.define(rt, o.object, try vm.nameKey(cache.operand(0)), try cache.peek(vm, 0));
+                if (!o.isObject()) return vm.bug("define on a non-object");
+                try object.define(rt, o.asObject(), try vm.nameKey(cache.operand(0)), try cache.peek(vm, 0));
                 try cache.drop(vm, 1);
             },
             .define_elem => {
                 cache.syncSp(vm);
                 const o = try cache.peek(vm, 2);
-                if (o != .object) return vm.bug("define on a non-object");
-                try object.define(rt, o.object, try object.key(rt, try cache.peek(vm, 1)), try cache.peek(vm, 0));
+                if (!o.isObject()) return vm.bug("define on a non-object");
+                try object.define(rt, o.asObject(), try object.key(rt, try cache.peek(vm, 1)), try cache.peek(vm, 0));
                 try cache.drop(vm, 2);
             },
             .get_prop => {
@@ -1086,10 +1115,10 @@ pub const Vm = struct {
                 (try cache.top(vm)).* = r;
             },
             .get_elem_local => {
-                const base_ptr = (try cache.value(vm, cache.operand(0))) orelse return vm.bug("uninit base in get_elem_local");
-                const idx_ptr = (try cache.value(vm, cache.operand(1))) orelse return vm.bug("uninit key in get_elem_local");
-                const base = base_ptr.*;
-                const idx = idx_ptr.*;
+                const base_slot = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.bug("uninit base in get_elem_local");
+                const idx_slot = (try cache.valueSlot(vm, cache.operand(1))) orelse return vm.bug("uninit key in get_elem_local");
+                const base = base_slot.asValue();
+                const idx = idx_slot.asValue();
                 try cache.ensurePush(vm);
                 const r: Value = fastArrayGet(base, idx) orelse fastTypedArrayGet(base, idx) orelse blk: {
                     cache.syncSp(vm);
@@ -1149,8 +1178,8 @@ pub const Vm = struct {
             .array_push => {
                 const arr_v = try cache.peek(vm, 1);
                 const val = try cache.peek(vm, 0);
-                if (arr_v != .object or arr_v.object.kind != .array) return vm.bug("array_push on non-array");
-                try rt.heap.appendElement(arr_v.object, val);
+                if (!arr_v.isObject() or arr_v.asObject().kind != .array) return vm.bug("array_push on non-array");
+                try rt.heap.appendElement(arr_v.asObject(), val);
                 try cache.drop(vm, 1);
             },
 
@@ -1159,11 +1188,11 @@ pub const Vm = struct {
                 if (k >= p.consts.len) return vm.bug("constant index out of range");
                 const lhs = try cache.peek(vm, 0);
                 const rhs = p.consts[k];
-                const r: Value = if (lhs == .number and rhs == .number) switch (op) {
-                    .add_const => .{ .number = lhs.number + rhs.number },
-                    .sub_const => .{ .number = lhs.number - rhs.number },
-                    .mul_const => .{ .number = lhs.number * rhs.number },
-                    .mod_const => .{ .number = fastRemainder(lhs.number, rhs.number) },
+                const r: Value = if (lhs.isNumber() and rhs.isNumber()) switch (op) {
+                    .add_const => Value.fromNumber(lhs.asNumber() + rhs.asNumber()),
+                    .sub_const => Value.fromNumber(lhs.asNumber() - rhs.asNumber()),
+                    .mul_const => Value.fromNumber(lhs.asNumber() * rhs.asNumber()),
+                    .mod_const => Value.fromNumber(fastRemainder(lhs.asNumber(), rhs.asNumber())),
                     else => unreachable,
                 } else blk: {
                     cache.syncSp(vm);
@@ -1180,13 +1209,13 @@ pub const Vm = struct {
             },
             .add_local, .sub_local, .mul_local, .mod_local => {
                 const lhs = try cache.peek(vm, 0);
-                const rhs_ptr = (try cache.value(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
-                const rhs = rhs_ptr.*;
-                const r: Value = if (lhs == .number and rhs == .number) switch (op) {
-                    .add_local => .{ .number = lhs.number + rhs.number },
-                    .sub_local => .{ .number = lhs.number - rhs.number },
-                    .mul_local => .{ .number = lhs.number * rhs.number },
-                    .mod_local => .{ .number = fastRemainder(lhs.number, rhs.number) },
+                const rhs_slot = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                const rhs = rhs_slot.asValue();
+                const r: Value = if (lhs.isNumber() and rhs.isNumber()) switch (op) {
+                    .add_local => Value.fromNumber(lhs.asNumber() + rhs.asNumber()),
+                    .sub_local => Value.fromNumber(lhs.asNumber() - rhs.asNumber()),
+                    .mul_local => Value.fromNumber(lhs.asNumber() * rhs.asNumber()),
+                    .mod_local => Value.fromNumber(fastRemainder(lhs.asNumber(), rhs.asNumber())),
                     else => unreachable,
                 } else blk: {
                     cache.syncSp(vm);
@@ -1207,24 +1236,24 @@ pub const Vm = struct {
                 // out-of-domain cases fall back to `ops.binary`.
                 const lhs = try cache.peek(vm, 1);
                 const rhs = try cache.peek(vm, 0);
-                const r: Value = if (lhs == .number and rhs == .number) switch (op) {
-                    .add => .{ .number = lhs.number + rhs.number },
-                    .sub => .{ .number = lhs.number - rhs.number },
-                    .mul => .{ .number = lhs.number * rhs.number },
-                    .div => .{ .number = lhs.number / rhs.number },
-                    .mod => .{ .number = fastRemainder(lhs.number, rhs.number) },
-                    .shl => .{ .number = ops.bitShl(lhs.number, rhs.number) },
-                    .shr => .{ .number = ops.bitShr(lhs.number, rhs.number) },
-                    .ushr => .{ .number = ops.bitUshr(lhs.number, rhs.number) },
-                    .bit_and => .{ .number = ops.bitAnd(lhs.number, rhs.number) },
-                    .bit_xor => .{ .number = ops.bitXor(lhs.number, rhs.number) },
-                    .bit_or => .{ .number = ops.bitOr(lhs.number, rhs.number) },
-                    .lt => .{ .boolean = lhs.number < rhs.number },
-                    .le => .{ .boolean = lhs.number <= rhs.number },
-                    .gt => .{ .boolean = lhs.number > rhs.number },
-                    .ge => .{ .boolean = lhs.number >= rhs.number },
-                    .strict_eq => .{ .boolean = lhs.number == rhs.number },
-                    .strict_ne => .{ .boolean = lhs.number != rhs.number },
+                const r: Value = if (lhs.isNumber() and rhs.isNumber()) switch (op) {
+                    .add => Value.fromNumber(lhs.asNumber() + rhs.asNumber()),
+                    .sub => Value.fromNumber(lhs.asNumber() - rhs.asNumber()),
+                    .mul => Value.fromNumber(lhs.asNumber() * rhs.asNumber()),
+                    .div => Value.fromNumber(lhs.asNumber() / rhs.asNumber()),
+                    .mod => Value.fromNumber(fastRemainder(lhs.asNumber(), rhs.asNumber())),
+                    .shl => Value.fromNumber(ops.bitShl(lhs.asNumber(), rhs.asNumber())),
+                    .shr => Value.fromNumber(ops.bitShr(lhs.asNumber(), rhs.asNumber())),
+                    .ushr => Value.fromNumber(ops.bitUshr(lhs.asNumber(), rhs.asNumber())),
+                    .bit_and => Value.fromNumber(ops.bitAnd(lhs.asNumber(), rhs.asNumber())),
+                    .bit_xor => Value.fromNumber(ops.bitXor(lhs.asNumber(), rhs.asNumber())),
+                    .bit_or => Value.fromNumber(ops.bitOr(lhs.asNumber(), rhs.asNumber())),
+                    .lt => Value.fromBool(lhs.asNumber() < rhs.asNumber()),
+                    .le => Value.fromBool(lhs.asNumber() <= rhs.asNumber()),
+                    .gt => Value.fromBool(lhs.asNumber() > rhs.asNumber()),
+                    .ge => Value.fromBool(lhs.asNumber() >= rhs.asNumber()),
+                    .strict_eq => Value.fromBool(lhs.asNumber() == rhs.asNumber()),
+                    .strict_ne => Value.fromBool(lhs.asNumber() != rhs.asNumber()),
                     .pow, .in, .instanceof => blk: {
                         cache.syncSp(vm);
                         break :blk try ops.binary(rt, binaryOp(op), lhs, rhs);
@@ -1237,9 +1266,6 @@ pub const Vm = struct {
                 cache.sp -= 1;
                 vm.stack[cache.sp - 1] = r;
             },
-            // Compute into a local, then store. `top().* = .{ .number = f(peek(0)) }` would
-            // be wrong: Zig builds the union in place, so the slot's tag changes *before*
-            // f reads the old value through peek (result-location aliasing).
             .neg, .to_number, .to_numeric, .to_string, .not, .bit_not, .typeof => {
                 const v = try cache.peek(vm, 0);
                 if (v.isObjectLike() and (op == .neg or op == .to_number or op == .to_numeric or op == .to_string or op == .bit_not)) {
@@ -1247,18 +1273,18 @@ pub const Vm = struct {
                 }
                 const r: Value = switch (op) {
                     .neg => blk: {
-                        if (v == .number) break :blk .{ .number = -v.number };
+                        if (v.isNumber()) break :blk Value.fromNumber(-v.asNumber());
                         const nv = try ops.toNumeric(rt, v);
-                        break :blk if (nv == .bigint) .{ .bigint = try bigint.neg(rt, nv.bigint) } else .{ .number = -nv.number };
+                        break :blk if (nv.isBigInt()) Value.fromBigInt(try bigint.neg(rt, nv.asBigInt())) else Value.fromNumber(-nv.asNumber());
                     },
-                    .to_number => if (v == .number) v else .{ .number = try ops.toNumber(rt, v) },
-                    .to_numeric => if (v == .number or v == .bigint) v else try ops.toNumeric(rt, v),
-                    .to_string => if (v == .string) v else try ops.toStringValue(rt, v),
-                    .not => .{ .boolean = !ops.toBoolean(v) },
+                    .to_number => if (v.isNumber()) v else Value.fromNumber(try ops.toNumber(rt, v)),
+                    .to_numeric => if (v.isNumber() or v.isBigInt()) v else try ops.toNumeric(rt, v),
+                    .to_string => if (v.isString()) v else try ops.toStringValue(rt, v),
+                    .not => Value.fromBool(!ops.toBoolean(v)),
                     .bit_not => blk: {
-                        if (v == .number) break :blk .{ .number = ops.bitNot(v.number) };
+                        if (v.isNumber()) break :blk Value.fromNumber(ops.bitNot(v.asNumber()));
                         const nv = try ops.toNumeric(rt, v);
-                        break :blk if (nv == .bigint) .{ .bigint = try bigint.bitNot(rt, nv.bigint) } else .{ .number = ops.bitNot(nv.number) };
+                        break :blk if (nv.isBigInt()) Value.fromBigInt(try bigint.bitNot(rt, nv.asBigInt())) else Value.fromNumber(ops.bitNot(nv.asNumber()));
                     },
                     .typeof => try ops.typeOf(rt, v),
                     else => unreachable,
@@ -1267,10 +1293,10 @@ pub const Vm = struct {
             },
             .inc, .dec => {
                 const t = try cache.top(vm);
-                if (t.* == .number) {
-                    t.number += if (op == .inc) 1 else -1;
-                } else if (t.* == .bigint) {
-                    t.* = .{ .bigint = try bigint.addI64(rt, t.bigint, if (op == .inc) 1 else -1) };
+                if (t.isNumber()) {
+                    t.* = Value.fromNumber(t.asNumber() + @as(f64, if (op == .inc) 1 else -1));
+                } else if (t.isBigInt()) {
+                    t.* = Value.fromBigInt(try bigint.addI64(rt, t.asBigInt(), if (op == .inc) 1 else -1));
                 } else {
                     return vm.bug("inc/dec on a non-numeric");
                 }
@@ -1285,13 +1311,13 @@ pub const Vm = struct {
             .lt_jump_if_false, .le_jump_if_false, .gt_jump_if_false, .ge_jump_if_false, .strict_eq_jump_if_false, .strict_ne_jump_if_false => {
                 const lhs = try cache.peek(vm, 1);
                 const rhs = try cache.peek(vm, 0);
-                const cond: bool = if (lhs == .number and rhs == .number) switch (op) {
-                    .lt_jump_if_false => lhs.number < rhs.number,
-                    .le_jump_if_false => lhs.number <= rhs.number,
-                    .gt_jump_if_false => lhs.number > rhs.number,
-                    .ge_jump_if_false => lhs.number >= rhs.number,
-                    .strict_eq_jump_if_false => lhs.number == rhs.number,
-                    .strict_ne_jump_if_false => lhs.number != rhs.number,
+                const cond: bool = if (lhs.isNumber() and rhs.isNumber()) switch (op) {
+                    .lt_jump_if_false => lhs.asNumber() < rhs.asNumber(),
+                    .le_jump_if_false => lhs.asNumber() <= rhs.asNumber(),
+                    .gt_jump_if_false => lhs.asNumber() > rhs.asNumber(),
+                    .ge_jump_if_false => lhs.asNumber() >= rhs.asNumber(),
+                    .strict_eq_jump_if_false => lhs.asNumber() == rhs.asNumber(),
+                    .strict_ne_jump_if_false => lhs.asNumber() != rhs.asNumber(),
                     else => unreachable,
                 } else blk: {
                     cache.syncSp(vm);
@@ -1314,29 +1340,29 @@ pub const Vm = struct {
                 const iterable = try cache.peek(vm, 0);
                 cache.syncSp(vm);
                 const iter = try builtins.getIterator(rt, iterable);
-                vm.stack[cache.sp - 1] = .{ .object = iter };
+                vm.stack[cache.sp - 1] = Value.fromObject(iter);
             },
             .iter_next => {
                 const iter_val = try cache.peek(vm, 0);
-                if (iter_val != .object or iter_val.object.kind != .iterator) return vm.bug("iter_next on non-iterator");
+                if (!iter_val.isObject() or iter_val.asObject().kind != .iterator) return vm.bug("iter_next on non-iterator");
                 cache.syncSp(vm);
-                const next_v = try builtins.iteratorNextVal(rt, iter_val.object);
+                const next_v = try builtins.iteratorNextVal(rt, iter_val.asObject());
                 vm.stack[cache.sp - 1] = next_v orelse .undefined;
-                try cache.push(vm, .{ .boolean = next_v == null });
+                try cache.push(vm, Value.fromBool(next_v == null));
             },
             .for_in_init => {
                 const obj = try cache.peek(vm, 0);
                 cache.syncSp(vm);
                 const iter = try builtins.forInInit(rt, obj);
-                vm.stack[cache.sp - 1] = .{ .object = iter };
+                vm.stack[cache.sp - 1] = Value.fromObject(iter);
             },
             .for_in_next => {
                 const iter_val = try cache.peek(vm, 0);
-                if (iter_val != .object or iter_val.object.kind != .iterator) return vm.bug("for_in_next on non-iterator");
+                if (!iter_val.isObject() or iter_val.asObject().kind != .iterator) return vm.bug("for_in_next on non-iterator");
                 cache.syncSp(vm);
-                const next_v = try builtins.forInNext(rt, iter_val.object);
+                const next_v = try builtins.forInNext(rt, iter_val.asObject());
                 vm.stack[cache.sp - 1] = next_v orelse .undefined;
-                try cache.push(vm, .{ .boolean = next_v == null });
+                try cache.push(vm, Value.fromBool(next_v == null));
             },
             .new_call => {
                 const argc = cache.operand(0);
@@ -1361,7 +1387,7 @@ pub const Vm = struct {
                 const base = cache.sp - group;
                 const args = cache.sp - argc;
                 const receiver: ?Value = if (op == .call_method) vm.stack[base] else null;
-                switch (vm.stack[args - 1]) {
+                switch (vm.stack[args - 1].unpack()) {
                     // A built-in native *borrows* the argument slice: valid only during the call; it
                     // cannot call back into JS, so the stack cannot move under it. A host native
                     // (D53) receives temporary handles owned by its native-call record. If either
@@ -1447,12 +1473,12 @@ pub const Vm = struct {
                     ret_v
                 else if (cur_f.proto.has_super_ctor) blk: {
                     if (ret_v.isObjectLike()) break :blk ret_v;
-                    if (ret_v == .undefined) {
+                    if (ret_v.isUndefined()) {
                         break :blk cur_f.this orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
                     }
                     return rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
                 } else if (!ret_v.isObjectLike())
-                    .{ .object = cur_f.construct_instance.? }
+                    Value.fromObject(cur_f.construct_instance.?)
                 else
                     ret_v;
                 const f = vm.frames.pop().?;
@@ -1514,9 +1540,9 @@ pub const Vm = struct {
                 if (k_pat >= p.consts.len or k_flags >= p.consts.len) return vm.bug("constant index out of range");
                 const pat_val = p.consts[k_pat];
                 const flags_val = p.consts[k_flags];
-                if (pat_val != .string or flags_val != .string) return vm.bug("new_regexp operand is not a string");
+                if (!pat_val.isString() or !flags_val.isString()) return vm.bug("new_regexp operand is not a string");
                 try cache.ensurePush(vm);
-                const re = try builtins.newRegExpFromStrings(rt, pat_val.string, flags_val.string);
+                const re = try builtins.newRegExpFromStrings(rt, pat_val.asString(), flags_val.asString());
                 try cache.push(vm, re);
             },
             .get_template_obj => {
@@ -1532,7 +1558,7 @@ pub const Vm = struct {
                 const mod_ptr = p.module_record orelse return vm.bug("get_import_meta outside a module");
                 try cache.ensurePush(vm);
                 const meta_obj = try module.getImportMeta(rt, @ptrCast(@alignCast(mod_ptr)));
-                try cache.push(vm, .{ .object = meta_obj });
+                try cache.push(vm, Value.fromObject(meta_obj));
             },
             .dynamic_import => {
                 cache.syncSp(vm);
@@ -1540,7 +1566,7 @@ pub const Vm = struct {
                 const mod_ptr: ?*module.ModuleRecord = if (p.module_record) |mp| @ptrCast(@alignCast(mp)) else null;
                 const promise_obj = try module.dynamicImport(rt, mod_ptr, spec_val, .vm);
                 try cache.drop(vm, 1);
-                try cache.push(vm, .{ .object = promise_obj });
+                try cache.push(vm, Value.fromObject(promise_obj));
             },
             .setup_class => {
                 const has_super = cache.operand(0) != 0;
@@ -1548,7 +1574,7 @@ pub const Vm = struct {
                 const ctor_val = try cache.peek(vm, 1);
                 const proto_obj = try builtins.setupClass(rt, ctor_val, has_super, super_val);
                 try cache.drop(vm, 1);
-                try cache.push(vm, .{ .object = proto_obj });
+                try cache.push(vm, Value.fromObject(proto_obj));
             },
             .define_method => {
                 const method_val = try cache.peek(vm, 0);
@@ -1570,8 +1596,8 @@ pub const Vm = struct {
                 const flags = cache.operand(1);
                 const is_setter = (flags & 1) != 0;
                 const enumerable = (flags & 2) != 0;
-                if (fn_val != .closure) return vm.bug("define_accessor expects closure");
-                try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), target);
+                if (!fn_val.isClosure()) return vm.bug("define_accessor expects closure");
+                try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), target);
                 try object.defineAccessor(rt, target, try vm.nameKey(cache.operand(0)), fn_val, is_setter, enumerable);
                 try cache.drop(vm, 1);
             },
@@ -1583,30 +1609,30 @@ pub const Vm = struct {
                 const flags = cache.operand(0);
                 const is_setter = (flags & 1) != 0;
                 const enumerable = (flags & 2) != 0;
-                if (fn_val != .closure) return vm.bug("define_elem_accessor expects closure");
-                try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), target);
+                if (!fn_val.isClosure()) return vm.bug("define_elem_accessor expects closure");
+                try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), target);
                 try object.defineAccessor(rt, target, try object.key(rt, key_val), fn_val, is_setter, enumerable);
                 try cache.drop(vm, 2);
             },
             .define_private_method => {
                 const fn_val = try cache.peek(vm, 0);
                 const target = try cache.peek(vm, 1);
-                if (fn_val != .closure or target != .closure) return vm.bug("define_private_method expects closures");
-                try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), target);
-                try rt.heap.storeClosureBrand(@constCast(fn_val.closure), target);
+                if (!fn_val.isClosure() or !target.isClosure()) return vm.bug("define_private_method expects closures");
+                try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), target);
+                try rt.heap.storeClosureBrand(@constCast(fn_val.asClosure()), target);
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                try object.definePrivateMethod(rt, target, target.closure, name_str, fn_val);
+                try object.definePrivateMethod(rt, target, target.asClosure(), name_str, fn_val);
                 try cache.drop(vm, 1);
             },
             .define_private_accessor => {
                 const fn_val = try cache.peek(vm, 0);
                 const target = try cache.peek(vm, 1);
-                if (fn_val != .closure or target != .closure) return vm.bug("define_private_accessor expects closures");
-                try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), target);
-                try rt.heap.storeClosureBrand(@constCast(fn_val.closure), target);
+                if (!fn_val.isClosure() or !target.isClosure()) return vm.bug("define_private_accessor expects closures");
+                try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), target);
+                try rt.heap.storeClosureBrand(@constCast(fn_val.asClosure()), target);
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
                 const is_setter = (cache.operand(1) & 1) != 0;
-                try object.definePrivateAccessor(rt, target, target.closure, name_str, fn_val, is_setter);
+                try object.definePrivateAccessor(rt, target, target.asClosure(), name_str, fn_val, is_setter);
                 try cache.drop(vm, 1);
             },
             .define_public_field => {
@@ -1620,52 +1646,52 @@ pub const Vm = struct {
             .define_private_field => {
                 const val = try cache.peek(vm, 0);
                 const target = try cache.peek(vm, 1);
-                const brand_val = if (target == .closure) target else (vm.frame().closure.?.meta.?.brand orelse return vm.bug("define_private_field without brand"));
+                const brand_val = if (target.isClosure()) target else (vm.frame().closure.?.meta.?.brand orelse return vm.bug("define_private_field without brand"));
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                try object.definePrivateField(rt, target, brand_val.closure, name_str, val);
+                try object.definePrivateField(rt, target, brand_val.asClosure(), name_str, val);
                 try cache.drop(vm, 1);
             },
             .get_private => {
                 const brand_val = vm.frame().closure.?.meta.?.brand orelse return vm.bug("get_private without brand");
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                const r = try object.getPrivate(rt, try cache.peek(vm, 0), brand_val.closure, name_str);
+                const r = try object.getPrivate(rt, try cache.peek(vm, 0), brand_val.asClosure(), name_str);
                 (try cache.top(vm)).* = r;
             },
             .set_private => {
                 const v = try cache.peek(vm, 0);
                 const brand_val = vm.frame().closure.?.meta.?.brand orelse return vm.bug("set_private without brand");
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                try object.setPrivate(rt, try cache.peek(vm, 1), brand_val.closure, name_str, v);
+                try object.setPrivate(rt, try cache.peek(vm, 1), brand_val.asClosure(), name_str, v);
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = v;
             },
             .in_private => {
                 const brand_val = vm.frame().closure.?.meta.?.brand orelse return vm.bug("in_private without brand");
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                const b = try object.hasPrivate(rt, try cache.peek(vm, 0), brand_val.closure, name_str);
-                (try cache.top(vm)).* = .{ .boolean = b };
+                const b = try object.hasPrivate(rt, try cache.peek(vm, 0), brand_val.asClosure(), name_str);
+                (try cache.top(vm)).* = Value.fromBool(b);
             },
             .store_field_key => {
                 const key_val = try cache.peek(vm, 0);
                 const ctor_val = try cache.peek(vm, 1);
-                if (ctor_val != .closure) return vm.bug("store_field_key expects closure");
-                try rt.heap.appendClosureFieldKey(@constCast(ctor_val.closure), key_val);
+                if (!ctor_val.isClosure()) return vm.bug("store_field_key expects closure");
+                try rt.heap.appendClosureFieldKey(@constCast(ctor_val.asClosure()), key_val);
                 try cache.drop(vm, 1);
             },
             .add_instance_init => {
                 const fn_val = try cache.peek(vm, 0);
                 const ctor_val = try cache.peek(vm, 1);
-                if (ctor_val != .closure) return vm.bug("add_instance_init expects closure");
+                if (!ctor_val.isClosure()) return vm.bug("add_instance_init expects closure");
                 const packed_op = cache.operand(1);
                 const kind: @FieldType(heap.InstanceInit, "kind") = @fromBackingInt(@intCast(@as(u8, @intCast(packed_op >> 16))));
                 const key_idx: u32 = packed_op & 0xffff;
                 const name_str: ?*heap.String = if (kind == .public_field) null else (try vm.nameKey(cache.operand(0))).atom;
-                if (fn_val == .closure) {
-                    const proto_val = (ctor_val.closure.meta orelse return vm.bug("add_instance_init without meta")).prototype orelse return vm.bug("add_instance_init without prototype");
-                    try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), proto_val);
-                    try rt.heap.storeClosureBrand(@constCast(fn_val.closure), ctor_val);
+                if (fn_val.isClosure()) {
+                    const proto_val = (ctor_val.asClosure().meta orelse return vm.bug("add_instance_init without meta")).prototype orelse return vm.bug("add_instance_init without prototype");
+                    try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), proto_val);
+                    try rt.heap.storeClosureBrand(@constCast(fn_val.asClosure()), ctor_val);
                 }
-                try rt.heap.appendClosureInstanceInit(@constCast(ctor_val.closure), .{
+                try rt.heap.appendClosureInstanceInit(@constCast(ctor_val.asClosure()), .{
                     .kind = kind,
                     .name = name_str,
                     .key_idx = key_idx,
@@ -1676,9 +1702,9 @@ pub const Vm = struct {
             .run_static_init => {
                 const fn_val = try cache.peek(vm, 0);
                 const ctor_val = try cache.peek(vm, 1);
-                if (fn_val != .closure or ctor_val != .closure) return vm.bug("run_static_init expects closures");
-                try rt.heap.storeClosureHomeObject(@constCast(fn_val.closure), ctor_val);
-                try rt.heap.storeClosureBrand(@constCast(fn_val.closure), ctor_val);
+                if (!fn_val.isClosure() or !ctor_val.isClosure()) return vm.bug("run_static_init expects closures");
+                try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), ctor_val);
+                try rt.heap.storeClosureBrand(@constCast(fn_val.asClosure()), ctor_val);
                 const r = try rt.callCallable(fn_val, ctor_val, &.{});
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = r;
@@ -1686,8 +1712,8 @@ pub const Vm = struct {
             .set_brand => {
                 const fn_val = try cache.peek(vm, 0);
                 const ctor_val = try cache.peek(vm, 1);
-                if (fn_val != .closure or ctor_val != .closure) return vm.bug("set_brand expects closures");
-                try rt.heap.storeClosureBrand(@constCast(fn_val.closure), ctor_val);
+                if (!fn_val.isClosure() or !ctor_val.isClosure()) return vm.bug("set_brand expects closures");
+                try rt.heap.storeClosureBrand(@constCast(fn_val.asClosure()), ctor_val);
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = fn_val;
             },
@@ -1702,9 +1728,9 @@ pub const Vm = struct {
             .super_call_spread => {
                 const arr_val = try cache.peek(vm, 0);
                 const base = cache.sp - 1;
-                if (arr_val != .object or arr_val.object.kind != .array) return vm.bug("super_call_spread expects array");
+                if (!arr_val.isObject() or arr_val.asObject().kind != .array) return vm.bug("super_call_spread expects array");
                 cache.syncSp(vm);
-                if (try vm.callSuper(base, arr_val.object.kind.array.items, true, next)) return true;
+                if (try vm.callSuper(base, arr_val.asObject().kind.array.items, true, next)) return true;
                 cache.sp = base + 1;
             },
             .super_get_prop => {
@@ -1743,14 +1769,14 @@ pub const Vm = struct {
             .delete_prop => {
                 cache.syncSp(vm);
                 const r = try object.delete(rt, try cache.peek(vm, 0), try vm.nameKey(cache.operand(0)));
-                (try cache.top(vm)).* = .{ .boolean = r };
+                (try cache.top(vm)).* = Value.fromBool(r);
             },
             .delete_elem => {
                 cache.syncSp(vm);
                 const k = try object.key(rt, try cache.peek(vm, 0));
                 const r = try object.delete(rt, try cache.peek(vm, 1), k);
                 try cache.drop(vm, 1);
-                (try cache.top(vm)).* = .{ .boolean = r };
+                (try cache.top(vm)).* = Value.fromBool(r);
             },
             .rest_array => {
                 const start_idx = cache.operand(0);
@@ -1761,19 +1787,19 @@ pub const Vm = struct {
                     const rest_len = f.argc - start_idx;
                     try rt.heap.appendElements(arr, vm.stack[args_start..][0..rest_len]);
                 }
-                try cache.push(vm, .{ .object = arr });
+                try cache.push(vm, Value.fromObject(arr));
             },
             .array_spread => {
                 const arr_v = try cache.peek(vm, 1);
                 const iterable = try cache.peek(vm, 0);
-                if (arr_v != .object or arr_v.object.kind != .array) return vm.bug("array_spread on non-array");
+                if (!arr_v.isObject() or arr_v.asObject().kind != .array) return vm.bug("array_spread on non-array");
                 const iter = try builtins.getIterator(rt, iterable);
-                var root_buf = [_]Value{ arr_v, .{ .object = iter } };
+                var root_buf = [_]Value{ arr_v, Value.fromObject(iter) };
                 var val_roots: rt_mod.ValueRoots = .{ .values = &root_buf };
                 try val_roots.register(rt);
                 defer val_roots.unregister(rt);
                 while (try builtins.iteratorNextVal(rt, iter)) |elem| {
-                    try rt.heap.appendElement(arr_v.object, elem);
+                    try rt.heap.appendElement(arr_v.asObject(), elem);
                 }
                 try cache.drop(vm, 1);
             },
@@ -1781,27 +1807,27 @@ pub const Vm = struct {
                 cache.syncSp(vm);
                 const obj_v = try cache.peek(vm, 1);
                 const src = try cache.peek(vm, 0);
-                if (obj_v != .object) return vm.bug("object_spread on non-object");
-                try copyDataProperties(rt, obj_v.object, src, &.{});
+                if (!obj_v.isObject()) return vm.bug("object_spread on non-object");
+                try copyDataProperties(rt, obj_v.asObject(), src, &.{});
                 try cache.drop(vm, 1);
             },
             .iter_rest => {
                 const iter_val = try cache.peek(vm, 0);
-                if (iter_val != .object or iter_val.object.kind != .iterator) return vm.bug("iter_rest on non-iterator");
+                if (!iter_val.isObject() or iter_val.asObject().kind != .iterator) return vm.bug("iter_rest on non-iterator");
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
-                var root_buf = [_]Value{ iter_val, .{ .object = arr } };
+                var root_buf = [_]Value{ iter_val, Value.fromObject(arr) };
                 var val_roots: rt_mod.ValueRoots = .{ .values = &root_buf };
                 try val_roots.register(rt);
                 defer val_roots.unregister(rt);
-                while (try builtins.iteratorNextVal(rt, iter_val.object)) |elem| {
+                while (try builtins.iteratorNextVal(rt, iter_val.asObject())) |elem| {
                     try rt.heap.appendElement(arr, elem);
                 }
-                vm.stack[cache.sp - 1] = .{ .object = arr };
+                vm.stack[cache.sp - 1] = Value.fromObject(arr);
             },
             .require_obj => {
                 const v = try cache.peek(vm, 0);
-                if (v == .undefined or v == .null) {
-                    return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot destructure '" }, .{ .ascii = @tagName(v) }, .{ .ascii = "'" } });
+                if (v.isNullish()) {
+                    return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot destructure '" }, .{ .ascii = @tagName(v.tag()) }, .{ .ascii = "'" } });
                 }
             },
             .object_rest => {
@@ -1818,23 +1844,23 @@ pub const Vm = struct {
                     dst.* = k;
                     // Keep converted atom/symbol keys rooted on the VM stack across subsequent conversions.
                     vm.stack[base + 1 + idx] = switch (k) {
-                        .atom => |a| .{ .string = a },
-                        .symbol => |s| .{ .symbol = s },
+                        .atom => |a| Value.fromString(a),
+                        .symbol => |s| Value.fromSymbol(s),
                         .index => .undefined,
                     };
                 }
                 const rest_obj = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
                 try copyDataProperties(rt, rest_obj, src, excluded);
-                vm.stack[base] = .{ .object = rest_obj };
+                vm.stack[base] = Value.fromObject(rest_obj);
                 cache.sp = base + 1;
             },
             .new_call_spread => {
                 cache.syncSp(vm);
                 const callee = try cache.peek(vm, 1);
                 const args_v = try cache.peek(vm, 0);
-                if (args_v != .object or args_v.object.kind != .array) return vm.bug("new_call_spread args not array");
+                if (!args_v.isObject() or args_v.asObject().kind != .array) return vm.bug("new_call_spread args not array");
                 const base = cache.sp - 2;
-                if (try vm.callConstruct(base, callee, 0, args_v.object.kind.array.items, true, next)) return true;
+                if (try vm.callConstruct(base, callee, 0, args_v.asObject().kind.array.items, true, next)) return true;
                 cache.sp = base + 1;
             },
             .call_spread, .call_method_spread => {
@@ -1846,9 +1872,9 @@ pub const Vm = struct {
                 const receiver: ?Value = if (is_method) vm.stack[base] else null;
                 const callee = vm.stack[cache.sp - 2];
                 const args_v = vm.stack[cache.sp - 1];
-                if (args_v != .object or args_v.object.kind != .array) return vm.bug("call_spread args not array");
-                const args_slice = args_v.object.kind.array.items;
-                switch (callee) {
+                if (!args_v.isObject() or args_v.asObject().kind != .array) return vm.bug("call_spread args not array");
+                const args_slice = args_v.asObject().kind.array.items;
+                switch (callee.unpack()) {
                     .native => |n| {
                         const this_obj: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
                         const result = (if (n.host) |h|
@@ -1916,40 +1942,40 @@ pub const Vm = struct {
             .yield_star_step => {
                 const iter_val = try cache.peek(vm, 2);
                 const mode_val = try cache.peek(vm, 0);
-                if (iter_val != .object or iter_val.object.kind != .iterator or mode_val != .number) return vm.bug("yield_star_step operands");
-                const mode: coroutine.ResumeMode = switch (@as(u32, @intFromFloat(mode_val.number))) {
+                if (!iter_val.isObject() or iter_val.asObject().kind != .iterator or !mode_val.isNumber()) return vm.bug("yield_star_step operands");
+                const mode: coroutine.ResumeMode = switch (@as(u32, @intFromFloat(mode_val.asNumber()))) {
                     0 => .next,
                     1 => .throw,
                     else => .@"return",
                 };
-                const r = try builtins.yieldStarStep(rt, iter_val.object, try cache.peek(vm, 1), mode);
+                const r = try builtins.yieldStarStep(rt, iter_val.asObject(), try cache.peek(vm, 1), mode);
                 try cache.drop(vm, 3);
                 try cache.push(vm, r.value);
-                try cache.push(vm, .{ .number = @floatFromInt(@backingInt(r.kind)) });
+                try cache.push(vm, Value.fromNumber(@floatFromInt(@backingInt(r.kind))));
             },
             .get_async_iter => {
                 const rec = try builtins.getAsyncIterator(rt, try cache.peek(vm, 0));
-                vm.stack[cache.sp - 1] = .{ .object = rec };
+                vm.stack[cache.sp - 1] = Value.fromObject(rec);
             },
             .async_iter_next => {
                 const rec = try cache.peek(vm, 0);
-                if (rec != .object or rec.object.kind != .iterator) return vm.bug("async_iter_next on a non-iterator");
-                vm.stack[cache.sp - 1] = try builtins.asyncIterNext(rt, rec.object);
+                if (!rec.isObject() or rec.asObject().kind != .iterator) return vm.bug("async_iter_next on a non-iterator");
+                vm.stack[cache.sp - 1] = try builtins.asyncIterNext(rt, rec.asObject());
             },
             .async_iter_result => {
                 const v = try builtins.asyncIterValue(rt, try cache.peek(vm, 0));
                 vm.stack[cache.sp - 1] = v orelse .undefined;
-                try cache.push(vm, .{ .boolean = v == null });
+                try cache.push(vm, Value.fromBool(v == null));
             },
             .async_iter_close, .async_iter_close_throw => {
                 const rec = try cache.peek(vm, 0);
                 var res: ?Value = null;
-                if (rec != .undefined) {
-                    if (rec != .object or rec.object.kind != .iterator) return vm.bug("async_iter_close on a non-iterator");
-                    res = try builtins.asyncIterCloseStart(rt, rec.object, op == .async_iter_close_throw);
+                if (!rec.isUndefined()) {
+                    if (!rec.isObject() or rec.asObject().kind != .iterator) return vm.bug("async_iter_close on a non-iterator");
+                    res = try builtins.asyncIterCloseStart(rt, rec.asObject(), op == .async_iter_close_throw);
                 }
                 vm.stack[cache.sp - 1] = res orelse .undefined;
-                try cache.push(vm, .{ .boolean = res != null });
+                try cache.push(vm, Value.fromBool(res != null));
             },
             .async_iter_close_check => {
                 try builtins.asyncIterCloseCheck(rt, try cache.peek(vm, 0));
@@ -1958,30 +1984,30 @@ pub const Vm = struct {
             .async_yield_star_call => {
                 const rec = try cache.peek(vm, 2);
                 const mode_val = try cache.peek(vm, 0);
-                if (rec != .object or rec.object.kind != .iterator or mode_val != .number) return vm.bug("async_yield_star_call operands");
-                const mode: coroutine.ResumeMode = switch (@as(u32, @intFromFloat(mode_val.number))) {
+                if (!rec.isObject() or rec.asObject().kind != .iterator or !mode_val.isNumber()) return vm.bug("async_yield_star_call operands");
+                const mode: coroutine.ResumeMode = switch (@as(u32, @intFromFloat(mode_val.asNumber()))) {
                     0 => .next,
                     1 => .throw,
                     else => .@"return",
                 };
-                const r = try builtins.asyncYieldStarCall(rt, rec.object, try cache.peek(vm, 1), mode);
+                const r = try builtins.asyncYieldStarCall(rt, rec.asObject(), try cache.peek(vm, 1), mode);
                 try cache.drop(vm, 3);
-                try cache.push(vm, .{ .number = @floatFromInt(@backingInt(r.kind)) });
+                try cache.push(vm, Value.fromNumber(@floatFromInt(@backingInt(r.kind))));
                 try cache.push(vm, r.value);
             },
             .async_yield_star_result => {
                 const kind_val = try cache.peek(vm, 1);
-                if (kind_val != .number or !(kind_val.number >= 0 and kind_val.number <= 3)) return vm.bug("async_yield_star_result operands");
-                const kind: @FieldType(builtins.AsyncYieldStar, "kind") = @fromBackingInt(@intCast(@as(u8, @intFromFloat(kind_val.number))));
+                if (!kind_val.isNumber() or !(kind_val.asNumber() >= 0 and kind_val.asNumber() <= 3)) return vm.bug("async_yield_star_result operands");
+                const kind: @FieldType(builtins.AsyncYieldStar, "kind") = @fromBackingInt(@intCast(@as(u8, @intFromFloat(kind_val.asNumber()))));
                 const r = try builtins.asyncYieldStarResult(rt, kind, try cache.peek(vm, 0));
                 vm.stack[cache.sp - 2] = r.value;
-                vm.stack[cache.sp - 1] = .{ .number = @floatFromInt(@backingInt(r.kind)) };
+                vm.stack[cache.sp - 1] = Value.fromNumber(@floatFromInt(@backingInt(r.kind)));
             },
             .iter_close, .iter_close_throw => {
                 const iter_val = try cache.peek(vm, 0);
-                if (iter_val != .undefined) {
-                    if (iter_val != .object or iter_val.object.kind != .iterator) return vm.bug("iter_close on non-iterator");
-                    try builtins.iteratorClose(rt, iter_val.object, op == .iter_close_throw);
+                if (!iter_val.isUndefined()) {
+                    if (!iter_val.isObject() or iter_val.asObject().kind != .iterator) return vm.bug("iter_close on non-iterator");
+                    try builtins.iteratorClose(rt, iter_val.asObject(), op == .iter_close_throw);
                 }
                 try cache.drop(vm, 1);
             },
@@ -1999,7 +2025,7 @@ pub const Vm = struct {
         @memcpy(combined[0..b.bound_args.len], b.bound_args);
         @memcpy(combined[b.bound_args.len..], call_args);
 
-        switch (b.target) {
+        switch (b.target.unpack()) {
             .native => |n| {
                 const this_obj: ?Value = if (b.bound_this.isObjectLike()) b.bound_this else null;
                 const result = (if (n.host) |h|
@@ -2053,8 +2079,8 @@ pub const Vm = struct {
         var combined: []Value = &.{};
         defer if (combined.len > 0) rt.gpa.free(combined);
 
-        if (callee == .closure and callee.closure.impl == .bound) {
-            const b = callee.closure.impl.bound;
+        if (callee.isClosure() and callee.asClosure().impl == .bound) {
+            const b = callee.asClosure().impl.bound;
             target = b.target;
             new_target = b.target;
             if (b.bound_args.len > 0) {
@@ -2067,24 +2093,24 @@ pub const Vm = struct {
         if (!builtins.isConstructor(target)) {
             return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
         }
-        if (target == .object) {
-            vm.stack[base] = try builtins.callProxyConstruct(rt, target.object, effective_args, new_target);
+        if (target.isObject()) {
+            vm.stack[base] = try builtins.callProxyConstruct(rt, target.asObject(), effective_args, new_target);
             return false;
         }
-        if (target == .native) {
+        if (target.isNative()) {
             const result = try builtins.construct(rt, target, effective_args);
             vm.stack[base] = result;
             return false;
         }
-        const tc = target.closure;
+        const tc = target.asClosure();
         const tc_proto: *const Proto = switch (tc.impl) {
             .vm => |v| @ptrCast(@alignCast(v.proto)),
             else => return vm.bug("a non-VM closure in the VM"),
         };
         const proto_val = try object.get(rt, target, try object.named(rt, "prototype"));
         const r = try builtins.realm(rt);
-        const instance = try rt.heap.newObject(if (proto_val == .object) proto_val.object else r.object_prototype);
-        const init_this: ?Value = if (tc_proto.has_super_ctor) null else .{ .object = instance };
+        const instance = try rt.heap.newObject(if (proto_val.isObject()) proto_val.asObject() else r.object_prototype);
+        const init_this: ?Value = if (tc_proto.has_super_ctor) null else Value.fromObject(instance);
         if (!is_spread and combined.len == 0) {
             try vm.enter(tc, base, args_start, @intCast(args_slice.len), next, init_this, true, false, instance);
         } else {
@@ -2109,12 +2135,12 @@ pub const Vm = struct {
             return rt.throw(.ReferenceError, &.{.{ .ascii = "Super constructor may only be called once" }});
         }
         const cur_closure = f.closure orelse return vm.bug("super() without closure");
-        var target = try object.getPrototypeOfValue(rt, .{ .closure = cur_closure });
+        var target = try object.getPrototypeOfValue(rt, Value.fromClosure(cur_closure));
         var combined: []Value = &.{};
         defer if (combined.len > 0) rt.gpa.free(combined);
 
-        if (target == .closure and target.closure.impl == .bound) {
-            const b = target.closure.impl.bound;
+        if (target.isClosure() and target.asClosure().impl == .bound) {
+            const b = target.asClosure().impl.bound;
             target = b.target;
             if (b.bound_args.len > 0) {
                 combined = try rt.gpa.alloc(Value, b.bound_args.len + args_slice.len);
@@ -2127,29 +2153,29 @@ pub const Vm = struct {
             return rt.throw(.TypeError, &.{.{ .ascii = "Super constructor is not a constructor" }});
         }
         const inst = f.construct_instance orelse return vm.bug("super() without construct_instance");
-        if (target == .object) {
-            const res = try builtins.callProxyConstruct(rt, target.object, effective_args, .{ .closure = cur_closure });
+        if (target.isObject()) {
+            const res = try builtins.callProxyConstruct(rt, target.asObject(), effective_args, Value.fromClosure(cur_closure));
             vm.frames.items[vm.frames.items.len - 1].this = res;
             vm.stack[base] = res;
             vm.sp = base + 1;
             try builtins.runInstanceInits(rt, @constCast(cur_closure), res);
             return false;
         }
-        if (target == .native) {
+        if (target.isNative()) {
             const res = try builtins.construct(rt, target, effective_args);
-            if (res == .object) rt.heap.storeObjectProto(res.object, inst.proto);
+            if (res.isObject()) rt.heap.storeObjectProto(res.asObject(), inst.proto);
             vm.frames.items[vm.frames.items.len - 1].this = res;
             vm.stack[base] = res;
             vm.sp = base + 1;
             try builtins.runInstanceInits(rt, @constCast(cur_closure), res);
             return false;
         }
-        const tc = target.closure;
+        const tc = target.asClosure();
         const tc_proto: *const Proto = switch (tc.impl) {
             .vm => |v| @ptrCast(@alignCast(v.proto)),
             else => return vm.bug("a non-VM closure in the VM"),
         };
-        const child_this: ?Value = if (tc_proto.has_super_ctor) null else .{ .object = inst };
+        const child_this: ?Value = if (tc_proto.has_super_ctor) null else Value.fromObject(inst);
         if (!is_spread and combined.len == 0) {
             try vm.enter(tc, base, base, @intCast(args_slice.len), next, child_this, true, true, inst);
         } else {
@@ -2210,7 +2236,7 @@ pub const Vm = struct {
         vm.pc = 0;
         if (vm.chain) |cx| cx.call_depth += 1; // the frame is live now (D51 #2)
         if (is_construct and !callee.has_super_ctor) {
-            try builtins.runInstanceInits(vm.rt, @constCast(c), .{ .object = construct_instance.? });
+            try builtins.runInstanceInits(vm.rt, @constCast(c), Value.fromObject(construct_instance.?));
         }
     }
 
@@ -2261,7 +2287,7 @@ pub const Vm = struct {
         vm.pc = 0;
         if (vm.chain) |cx| cx.call_depth += 1;
         if (is_construct and !callee.has_super_ctor) {
-            try builtins.runInstanceInits(vm.rt, @constCast(c), .{ .object = construct_instance.? });
+            try builtins.runInstanceInits(vm.rt, @constCast(c), Value.fromObject(construct_instance.?));
         }
     }
 
@@ -2321,8 +2347,8 @@ pub const Vm = struct {
         const pe = ps + p.param_count;
         const copy_n = @min(p.param_count, args.len);
         @memset(dst[0..ps], .uninit);
-        for (dst[ps..][0..copy_n], args[0..copy_n]) |*s, arg| s.* = .{ .value = arg };
-        @memset(dst[ps + copy_n .. pe], .{ .value = .undefined });
+        for (dst[ps..][0..copy_n], args[0..copy_n]) |*s, arg| s.* = Slot.fromValue(arg);
+        @memset(dst[ps + copy_n .. pe], Slot.fromValue(.undefined));
         @memset(dst[pe..], .uninit);
     }
 
@@ -2331,13 +2357,10 @@ pub const Vm = struct {
     // before anything it guards was touched (D35, D49).
 
     fn cellIn(vm: *const Vm, s: *const Slot) Error!*Cell {
-        return switch (s.*) {
-            .cell => |c| blk: {
-                c.obj.checkLive(); // stress builds: a collected cell
-                break :blk c;
-            },
-            .uninit, .value => return vm.bug("cell access to a value slot"),
-        };
+        if (!s.isCell()) return vm.bug("cell access to a value slot");
+        const c = s.asCell();
+        c.obj.checkLive(); // stress builds: a collected cell
+        return c;
     }
 
     fn capture(vm: *const Vm, i: u32) Error!*Cell {
@@ -2428,28 +2451,28 @@ fn keyIn(k: object.Key, list: []const object.Key) bool {
 }
 
 fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []const object.Key) Error!void {
-    switch (src) {
+    switch (src.unpack()) {
         .string => |s| {
             for (0..s.units.len) |i| {
                 const k: object.Key = .{ .index = @intCast(i) };
                 if (keyIn(k, excluded)) continue;
                 const ch = try rt.heap.newString(&.{.{ .utf16 = s.units[i..][0..1] }});
-                try object.define(rt, dst, k, .{ .string = ch });
+                try object.define(rt, dst, k, Value.fromString(ch));
             }
         },
         .object, .closure => {
-            const keys = if (src == .object)
-                try object.ownAllKeys(rt, src.object)
+            const keys = if (src.isObject())
+                try object.ownAllKeys(rt, src.asObject())
             else
-                try object.ownAllKeysClosure(rt, src.closure);
+                try object.ownAllKeysClosure(rt, src.asClosure());
             defer rt.gpa.free(keys);
             const root_vals = try rt.gpa.alloc(Value, 2 + keys.len);
             defer rt.gpa.free(root_vals);
-            root_vals[0] = .{ .object = dst };
+            root_vals[0] = Value.fromObject(dst);
             root_vals[1] = src;
             for (keys, root_vals[2..]) |k, *rv| rv.* = switch (k) {
-                .atom => |a| .{ .string = a },
-                .symbol => |s| .{ .symbol = s },
+                .atom => |a| Value.fromString(a),
+                .symbol => |s| Value.fromSymbol(s),
                 .index => .undefined,
             };
             var roots: rt_mod.ValueRoots = .{ .values = root_vals };
@@ -2467,10 +2490,10 @@ fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []c
 }
 
 fn fastArrayGet(base: Value, idx: Value) ?Value {
-    if (base != .object or idx != .number) return null;
-    const o = base.object;
+    if (!base.isObject() or !idx.isNumber()) return null;
+    const o = base.asObject();
     if (o.kind != .array) return null;
-    const n = idx.number;
+    const n = idx.asNumber();
     const elems = o.kind.array.items;
     if (!(n >= 0 and n < @as(f64, @floatFromInt(elems.len)) and @floor(n) == n)) return null;
     o.obj.checkLive();
@@ -2480,10 +2503,10 @@ fn fastArrayGet(base: Value, idx: Value) ?Value {
 }
 
 fn fastArraySet(rt: *Runtime, base: Value, idx: Value, val: Value) bool {
-    if (base != .object or idx != .number) return false;
-    const o = base.object;
+    if (!base.isObject() or !idx.isNumber()) return false;
+    const o = base.asObject();
     if (o.kind != .array or !o.array_elements_writable) return false;
-    const n = idx.number;
+    const n = idx.asNumber();
     const elems = o.kind.array.items;
     if (!(n >= 0 and n < @as(f64, @floatFromInt(elems.len)) and @floor(n) == n)) return false;
     o.obj.checkLive();
@@ -2501,8 +2524,8 @@ inline fn isLengthAtom(atom: *const heap.String) bool {
 }
 
 fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) ?Value {
-    if (base != .object) return null;
-    const o = base.object;
+    if (!base.isObject()) return null;
+    const o = base.asObject();
     const is_array = o.kind == .array;
     if (!is_array and (o.kind != .ordinary or o.builtin != null)) return null;
     o.obj.checkLive();
@@ -2542,8 +2565,8 @@ fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
 }
 
 noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) void {
-    if (base != .object) return;
-    const o = base.object;
+    if (!base.isObject()) return;
+    const o = base.asObject();
     const is_array = o.kind == .array;
     if (!is_array and (o.kind != .ordinary or o.builtin != null)) return;
     const key = heap.PropKey.fromAtom(atom);
@@ -2569,8 +2592,8 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
 }
 
 fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String, val: Value) bool {
-    if (base != .object) return false;
-    const o = base.object;
+    if (!base.isObject()) return false;
+    const o = base.asObject();
     if (o.kind != .ordinary or o.builtin != null) return false;
     o.obj.checkLive();
     const entry = propIcSlot(rt, p, pc).*;
@@ -2588,8 +2611,8 @@ fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
 }
 
 noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) void {
-    if (base != .object) return;
-    const o = base.object;
+    if (!base.isObject()) return;
+    const o = base.asObject();
     if (o.kind != .ordinary or o.builtin != null) return;
     const key = heap.PropKey.fromAtom(atom);
     if (o.props.getIndex(key)) |own_idx| {
@@ -2601,27 +2624,27 @@ noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
 }
 
 fn fastTypedArrayGet(base: Value, idx: Value) ?Value {
-    if (base != .object or idx != .number) return null;
-    const o = base.object;
+    if (!base.isObject() or !idx.isNumber()) return null;
+    const o = base.asObject();
     if (o.kind != .typed_array) return null;
     const ta = o.kind.typed_array;
     if (ta.kind.isBigInt() or ta.buffer.kind.array_buffer.detached) return null;
-    const n = idx.number;
+    const n = idx.asNumber();
     if (!(n >= 0 and n < @as(f64, @floatFromInt(ta.length)) and @floor(n) == n)) return null;
     o.obj.checkLive();
     return object.readTypedArrayNumber(ta, @intFromFloat(n));
 }
 
 fn fastTypedArraySet(base: Value, idx: Value, val: Value) bool {
-    if (base != .object or idx != .number or val != .number) return false;
-    const o = base.object;
+    if (!base.isObject() or !idx.isNumber() or !val.isNumber()) return false;
+    const o = base.asObject();
     if (o.kind != .typed_array) return false;
     const ta = o.kind.typed_array;
     if (ta.kind.isBigInt() or ta.buffer.kind.array_buffer.detached) return false;
-    const n = idx.number;
+    const n = idx.asNumber();
     if (!(n >= 0 and n < @as(f64, @floatFromInt(ta.length)) and @floor(n) == n)) return false;
     o.obj.checkLive();
-    object.writeTypedArrayNumber(ta, @intFromFloat(n), val.number);
+    object.writeTypedArrayNumber(ta, @intFromFloat(n), val.asNumber());
     return true;
 }
 
@@ -2655,8 +2678,10 @@ fn binaryOp(op: Op) BinaryOp {
 /// `[-Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]` with non-zero divisor. Preserves
 /// JS dividend-sign remainder and `-0` (`-4 % 2`, `-0 % 5`), falling back to `ops.remainder`
 /// for everything else.
+const pos_inf: f64 = std.math.inf(f64);
+
 inline fn fastRemainder(a: f64, b: f64) f64 {
-    if (a > 0 and a < b and b != std.math.inf(f64)) return a;
+    if (a > 0 and a < b and b != pos_inf) return a;
     const max_safe: f64 = 9007199254740991.0; // 2^53 - 1
     if (-max_safe <= a and a <= max_safe and -max_safe <= b and b <= max_safe and b != 0) {
         const ai: i64 = @intFromFloat(a);

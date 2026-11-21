@@ -190,7 +190,7 @@ pub fn runEntry(
     const entry = try loadAndLink(rt, specifier, entry_source, engine, mod_diag);
     try evaluateModule(rt, entry, engine);
     if (entry.eval_promise) |ep| {
-        var held = [_]Value{.{ .object = ep }};
+        var held = [_]Value{Value.fromObject(ep)};
         var roots: ValueRoots = .{ .values = &held };
         try roots.register(rt);
         defer roots.unregister(rt);
@@ -494,7 +494,7 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
         var ns_it = m.ns_reexports.valueIterator();
         while (ns_it.next()) |entry| {
             const ns_obj = getNamespace(rt, entry.dep) catch |e| return mapRuntimeToModErr(e);
-            rt.heap.storeCell(entry.cell, .{ .object = ns_obj });
+            rt.heap.storeCell(entry.cell, Value.fromObject(ns_obj));
         }
         for (m.import_links.items) |link| {
             if (link.imported_name) |imp_name| {
@@ -512,7 +512,7 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                 }
             } else {
                 const ns_obj = getNamespace(rt, link.dep) catch |e| return mapRuntimeToModErr(e);
-                m.cells[link.repl_idx] = rt.heap.newCell(.{ .object = ns_obj }) catch |e| return mapHeapErr(e, rt);
+                m.cells[link.repl_idx] = rt.heap.newCell(Value.fromObject(ns_obj)) catch |e| return mapHeapErr(e, rt);
             }
         }
 
@@ -544,23 +544,23 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                     const cl = rt.heap.newVmClosure(&m.proto.?.functions[fn_idx], 0) catch |e| return mapHeapErr(e, rt);
                     fn_idx += 1;
                     const ri = m.res.bindings[f.name.?.binding].repl_index.?;
-                    rt.heap.storeCell(m.cells[ri], .{ .closure = cl });
+                    rt.heap.storeCell(m.cells[ri], Value.fromClosure(cl));
                 },
                 .export_decl => |exp| switch (exp) {
                     .function => |f| {
                         const cl = rt.heap.newVmClosure(&m.proto.?.functions[fn_idx], 0) catch |e| return mapHeapErr(e, rt);
                         fn_idx += 1;
                         const ri = m.res.bindings[f.name.?.binding].repl_index.?;
-                        rt.heap.storeCell(m.cells[ri], .{ .closure = cl });
+                        rt.heap.storeCell(m.cells[ri], Value.fromClosure(cl));
                     },
                     .default_function => |df| {
                         const cl = rt.heap.newVmClosure(&m.proto.?.functions[fn_idx], 0) catch |e| return mapHeapErr(e, rt);
                         fn_idx += 1;
                         const def_ri = m.res.bindings[df.binding].repl_index.?;
-                        rt.heap.storeCell(m.cells[def_ri], .{ .closure = cl });
+                        rt.heap.storeCell(m.cells[def_ri], Value.fromClosure(cl));
                         if (df.func.name) |n| {
                             const name_ri = m.res.bindings[n.binding].repl_index.?;
-                            rt.heap.storeCell(m.cells[name_ri], .{ .closure = cl });
+                            rt.heap.storeCell(m.cells[name_ri], Value.fromClosure(cl));
                         }
                     },
                     else => {},
@@ -575,7 +575,7 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                     cl.impl.tree.repl_cells = m.cells;
                     cl.impl.tree.module_record = m;
                     const ri = m.res.bindings[f.name.?.binding].repl_index.?;
-                    rt.heap.storeCell(m.cells[ri], .{ .closure = cl });
+                    rt.heap.storeCell(m.cells[ri], Value.fromClosure(cl));
                 },
                 .export_decl => |exp| switch (exp) {
                     .function => |f| {
@@ -584,7 +584,7 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                         cl.impl.tree.repl_cells = m.cells;
                         cl.impl.tree.module_record = m;
                         const ri = m.res.bindings[f.name.?.binding].repl_index.?;
-                        rt.heap.storeCell(m.cells[ri], .{ .closure = cl });
+                        rt.heap.storeCell(m.cells[ri], Value.fromClosure(cl));
                     },
                     .default_function => |df| {
                         const cl = rt.heap.newTreeClosure(df.func, null) catch |e| return mapHeapErr(e, rt);
@@ -592,10 +592,10 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                         cl.impl.tree.repl_cells = m.cells;
                         cl.impl.tree.module_record = m;
                         const def_ri = m.res.bindings[df.binding].repl_index.?;
-                        rt.heap.storeCell(m.cells[def_ri], .{ .closure = cl });
+                        rt.heap.storeCell(m.cells[def_ri], Value.fromClosure(cl));
                         if (df.func.name) |n| {
                             const name_ri = m.res.bindings[n.binding].repl_index.?;
-                            rt.heap.storeCell(m.cells[name_ri], .{ .closure = cl });
+                            rt.heap.storeCell(m.cells[name_ri], Value.fromClosure(cl));
                         }
                     },
                     else => {},
@@ -722,7 +722,7 @@ pub fn getNamespace(rt: *Runtime, mod: *ModuleRecord) RuntimeError!*heap.Object 
     const realm = try builtins.realm(rt);
     const tag_str = try rt.heap.internAscii("Module");
     try rt.heap.definePropKey(ns_obj, heap.PropKey.fromSymbol(realm.sym_to_string_tag), .{
-        .value = .{ .string = tag_str },
+        .value = Value.fromString(tag_str),
         .enumerable = false,
         .writable = false,
         .configurable = false,
@@ -769,7 +769,7 @@ pub fn getImportMeta(rt: *Runtime, mod: *ModuleRecord) RuntimeError!*heap.Object
     if (mod.import_meta) |im| return im;
 
     const obj = try rt.heap.newObject(null);
-    var held = [_]Value{ .{ .object = obj }, .undefined };
+    var held = [_]Value{ Value.fromObject(obj), .undefined };
     var roots: ValueRoots = .{ .values = &held };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -784,7 +784,7 @@ pub fn getImportMeta(rt: *Runtime, mod: *ModuleRecord) RuntimeError!*heap.Object
     } else mod.canonical_id;
 
     const url_str = try utf8ToHeapString(rt, url_utf8);
-    held[1] = .{ .string = url_str };
+    held[1] = Value.fromString(url_str);
 
     try rt.heap.defineProperty(obj, try rt.heap.internAscii("url"), .{
         .value = held[1],
@@ -817,7 +817,7 @@ pub fn dynamicImport(
     const r = try builtins.realm(rt);
     const p = try rt.heap.newPromise(r.promise_prototype);
 
-    var held = [_]Value{ .{ .object = p }, specifier_val, .undefined, .undefined, .undefined };
+    var held = [_]Value{ Value.fromObject(p), specifier_val, .undefined, .undefined, .undefined };
     var roots: ValueRoots = .{ .values = &held };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -832,7 +832,7 @@ pub fn dynamicImport(
     };
     held[1] = spec_str_val;
 
-    const spec_utf8 = std.unicode.utf16LeToUtf8Alloc(rt.gpa, spec_str_val.string.units) catch |e| switch (e) {
+    const spec_utf8 = std.unicode.utf16LeToUtf8Alloc(rt.gpa, spec_str_val.asString().units) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try rejectPromiseWithError(rt, p, .TypeError, "Invalid module specifier");
@@ -871,7 +871,7 @@ pub fn dynamicImport(
     switch (target_mod.status) {
         .evaluated => {
             const ns = try getNamespace(rt, target_mod);
-            held[2] = .{ .object = ns };
+            held[2] = Value.fromObject(ns);
             try builtins.resolvePromiseValue(rt, p, held[2]);
             return p;
         },
@@ -884,7 +884,7 @@ pub fn dynamicImport(
         },
         .evaluating => {
             const ns = try getNamespace(rt, target_mod);
-            held[2] = .{ .object = ns };
+            held[2] = Value.fromObject(ns);
             try builtins.resolvePromiseValue(rt, p, held[2]);
             return p;
         },
@@ -904,7 +904,7 @@ pub fn dynamicImport(
             switch (target_mod.status) {
                 .evaluated => {
                     const ns = try getNamespace(rt, target_mod);
-                    held[2] = .{ .object = ns };
+                    held[2] = Value.fromObject(ns);
                     try builtins.resolvePromiseValue(rt, p, held[2]);
                 },
                 .evaluating_async => try attachDynImportReaction(rt, target_mod, p, &held),
@@ -940,32 +940,32 @@ fn loadAndLinkFromReferrer(
 fn attachDynImportReaction(rt: *Runtime, target: *ModuleRecord, result_p: *heap.Object, held: *[5]Value) RuntimeError!void {
     const ep = target.eval_promise orelse return rt.bug("evaluating_async module missing eval_promise");
     const env = try rt.heap.newArray(null);
-    held[2] = .{ .object = env };
-    try rt.heap.appendElements(env, &.{ .{ .number = @floatFromInt(target.mod_index) }, .{ .object = result_p } });
+    held[2] = Value.fromObject(env);
+    try rt.heap.appendElements(env, &.{ Value.fromNumber(@floatFromInt(target.mod_index)), Value.fromObject(result_p) });
     const on_ful = try rt.heap.newNativeClosure(&dynImportFulfillCb, env);
-    held[3] = .{ .closure = on_ful };
+    held[3] = Value.fromClosure(on_ful);
     const on_rej = try rt.heap.newNativeClosure(&dynImportRejectCb, env);
-    held[4] = .{ .closure = on_rej };
+    held[4] = Value.fromClosure(on_rej);
     try builtins.performPromiseThen(rt, ep, held[3], held[4]);
 }
 
 fn dynImportFulfillCb(rt: *Runtime, env: *heap.Object, _: []const Value) RuntimeError!Value {
-    const mod_idx: usize = @intFromFloat(env.kind.array.items[0].number);
-    const result_p = env.kind.array.items[1].object;
+    const mod_idx: usize = @intFromFloat(env.kind.array.items[0].asNumber());
+    const result_p = env.kind.array.items[1].asObject();
     const mod = rt.modules.list.items[mod_idx];
-    var held = [_]Value{ .{ .object = result_p }, .undefined };
+    var held = [_]Value{ Value.fromObject(result_p), .undefined };
     var roots: ValueRoots = .{ .values = &held };
     try roots.register(rt);
     defer roots.unregister(rt);
     const ns = try getNamespace(rt, mod);
-    held[1] = .{ .object = ns };
+    held[1] = Value.fromObject(ns);
     try builtins.resolvePromiseValue(rt, result_p, held[1]);
     return .undefined;
 }
 
 fn dynImportRejectCb(rt: *Runtime, env: *heap.Object, args: []const Value) RuntimeError!Value {
-    const result_p = env.kind.array.items[1].object;
-    const reason = if (args.len > 0) args[0] else .undefined;
+    const result_p = env.kind.array.items[1].asObject();
+    const reason: Value = if (args.len > 0) args[0] else .undefined;
     try builtins.settlePromiseFromJob(rt, result_p, true, reason);
     return .undefined;
 }
@@ -1165,16 +1165,16 @@ fn executeAsyncModule(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeE
     defer roots.unregister(rt);
 
     const env = try rt.heap.newArray(null);
-    held[1] = .{ .object = env };
+    held[1] = Value.fromObject(env);
     try rt.heap.appendElements(env, &.{
-        .{ .number = @floatFromInt(mod.mod_index) },
-        .{ .number = @floatFromInt(@backingInt(engine)) },
+        Value.fromNumber(@floatFromInt(mod.mod_index)),
+        Value.fromNumber(@floatFromInt(@backingInt(engine))),
     });
     const on_ful = try rt.heap.newNativeClosure(&asyncModFulfillCb, env);
-    held[2] = .{ .closure = on_ful };
+    held[2] = Value.fromClosure(on_ful);
     const on_rej = try rt.heap.newNativeClosure(&asyncModRejectCb, env);
-    held[3] = .{ .closure = on_rej };
-    try builtins.performPromiseThen(rt, body_p_val.object, held[2], held[3]);
+    held[3] = Value.fromClosure(on_rej);
+    try builtins.performPromiseThen(rt, body_p_val.asObject(), held[2], held[3]);
 }
 
 fn handleAsyncModuleFailure(rt: *Runtime, mod: *ModuleRecord, e: RuntimeError) RuntimeError!void {
@@ -1189,17 +1189,17 @@ fn handleAsyncModuleFailure(rt: *Runtime, mod: *ModuleRecord, e: RuntimeError) R
 }
 
 fn asyncModFulfillCb(rt: *Runtime, env: *heap.Object, _: []const Value) RuntimeError!Value {
-    const mod_idx: usize = @intFromFloat(env.kind.array.items[0].number);
-    const engine: Engine = @fromBackingInt(@intCast(@as(u8, @intFromFloat(env.kind.array.items[1].number))));
+    const mod_idx: usize = @intFromFloat(env.kind.array.items[0].asNumber());
+    const engine: Engine = @fromBackingInt(@intCast(@as(u8, @intFromFloat(env.kind.array.items[1].asNumber()))));
     const mod = rt.modules.list.items[mod_idx];
     try fulfillAsyncModule(rt, mod, engine);
     return .undefined;
 }
 
 fn asyncModRejectCb(rt: *Runtime, env: *heap.Object, args: []const Value) RuntimeError!Value {
-    const mod_idx: usize = @intFromFloat(env.kind.array.items[0].number);
+    const mod_idx: usize = @intFromFloat(env.kind.array.items[0].asNumber());
     const mod = rt.modules.list.items[mod_idx];
-    const reason = if (args.len > 0) args[0] else .undefined;
+    const reason: Value = if (args.len > 0) args[0] else .undefined;
     try rejectAsyncModule(rt, mod, reason);
     return .undefined;
 }

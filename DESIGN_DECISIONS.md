@@ -378,7 +378,7 @@ an identical hash also shows the compiler does not contract `a*b + c` into fused
 (Zig's default float mode is strict). We use musl's non-FMA code path so no result depends on
 FMA hardware.
 On real hardware, the same hash on GitHub's Linux x86_64, Linux arm64 and macOS arm64 runners
-(Debug builds; first green run 2026-11-14 at commit df83aaa). CI repeats this check on every push.
+(Debug builds; first green run 2026-11-14 at commit df83aaa).
 **Not verified, so not claimed:** Windows, WebAssembly, 32-bit x86 (where x87 extended precision could cause
 double rounding), or other compiler versions. Run `zig build pow-bits -Dtarget=…` there and
 compare with the hash above before relying on bit-identity.

@@ -166,17 +166,6 @@ bench/ and the game-like workloads in bench/gc/. Its baselines are in `bench/gc/
 change in steps or heap means different work, a change in time alone means the same work got
 faster or slower.
 
-## Continuous integration
-`.github/workflows/ci.yml` runs on every push that touches code, tests, tools or the build
-(documentation-only changes skip it), on macOS arm64, Linux x86_64 and Linux arm64.
-- **Test configurations,** one parallel job each: `zig build test`, with
-  `-Dgc-stress -Dstack-stress`, in ReleaseSafe, and with `-Dgc-stress` in ReleaseSafe.
-- **The plain-tests job also runs** `zig fmt --check .`, `zig build gc-mutants`,
-  `zig build check-goldens`, `zig build --release=fast`, and a check that `pow` produces the
-  same bits as the reference hash (DESIGN_DECISIONS D25).
-- **Watchdog:** each test binary aborts, naming itself, if it ever runs far longer than it
-  should.
-
 ## Documents
 - [EMBEDDING.md](EMBEDDING.md): embedding ZQJS in Zig (lifecycle, slices, step caps, errors)
 - [LANGUAGE.md](LANGUAGE.md): what ZQJS accepts and the compatibility contract with node

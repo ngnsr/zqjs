@@ -2629,7 +2629,7 @@ test "M12.2: newObject, newArray, getGlobal, getProperty/setProperty, getIndex/s
     try testing.expectEqual(@as(?f64, 0), sin_res.number());
 
     var reflect_fail: zqjs.Failure = .{};
-    try testing.expectError(error.Unsupported, rt.getGlobal("Reflect", &reflect_fail));
+    try testing.expectError(error.Unsupported, rt.getGlobal("Intl", &reflect_fail));
     try testing.expectEqual(zqjs.Failure.Kind.unsupported, reflect_fail.kind);
 
     var ref_fail: zqjs.Failure = .{};

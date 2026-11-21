@@ -321,7 +321,7 @@ test "holes are Unsupported: arrays stay dense" {
 }
 
 test "built-ins: known to node but not implemented is Unsupported, naming the member" {
-    try expectUnsupported("print(Reflect === undefined);", "", "Unsupported(builtin): a built-in node has that ZQJS doesn't implement yet ('Reflect')");
+    try expectUnsupported("print(Intl === undefined);", "", "Unsupported(builtin): a built-in node has that ZQJS doesn't implement yet ('Intl')");
     try expectUnsupported("print([1].length); [1].toLocaleString;", "1\n", "Unsupported(builtin)");
     try expectUnsupported("[1].toLocaleString;", "", "('toLocaleString')");
     try expectUnsupported("'abc'.normalize;", "", "('normalize')");

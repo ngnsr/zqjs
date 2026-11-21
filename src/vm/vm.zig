@@ -165,6 +165,10 @@ pub const Vm = struct {
     /// first step, and tears the VM down with `deinit` — which unwinds exactly the
     /// frames a fault left live. Transactional: on failure nothing is left allocated.
     pub fn initCall(rt: *Runtime, c: *const Closure, this: ?Value, args: []const Value) Error!Vm {
+        return initCallEx(rt, c, this, args, false, null);
+    }
+
+    fn initCallEx(rt: *Runtime, c: *const Closure, this: ?Value, args: []const Value, is_construct: bool, construct_instance: ?*heap.Object) Error!Vm {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
@@ -192,6 +196,8 @@ pub const Vm = struct {
             .stack_end = argc + callee.max_stack,
             .args_start = 0,
             .argc = argc,
+            .is_construct = is_construct,
+            .construct_instance = construct_instance,
         });
         vm.locals_len = callee.slot_count;
         vm.reserved = callee.slot_count + callee.max_stack;
@@ -201,23 +207,56 @@ pub const Vm = struct {
     /// Invokes a VM closure from inside a built-in native via Model B nested VM execution (M16.1).
     fn callFromBuiltin(ctx: *anyopaque, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
         const vm: *Vm = @ptrCast(@alignCast(ctx));
-        return callNested(vm.rt, vm, c, this, args);
+        return callNested(vm.rt, vm, c, this, args, false, null);
+    }
+
+    fn constructFromBuiltin(ctx: *anyopaque, c: *const Closure, args: []const Value, new_target: Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        return constructNested(vm.rt, vm, c, args, new_target);
     }
 
     /// Invokes a VM closure from a top-level microtask checkpoint outside any outer VM (M18).
     pub fn callStandalone(ctx: *anyopaque, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
         const rt: *Runtime = @ptrCast(@alignCast(ctx));
-        return callNested(rt, null, c, this, args);
+        return callNested(rt, null, c, this, args, false, null);
     }
 
-    fn callNested(rt: *Runtime, caller_vm: ?*Vm, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
+    pub fn constructStandalone(ctx: *anyopaque, c: *const Closure, args: []const Value, new_target: Value) Error!Value {
+        const rt: *Runtime = @ptrCast(@alignCast(ctx));
+        return constructNested(rt, null, c, args, new_target);
+    }
+
+    fn constructNested(rt: *Runtime, caller_vm: ?*Vm, c: *const Closure, args: []const Value, new_target: Value) Error!Value {
+        c.obj.checkLive();
+        const v = switch (c.impl) {
+            .vm => |v| v,
+            .tree, .promise_cap, .native_closure, .bound => return rt.bug("a non-VM closure in a nested construct"),
+        };
+        const callee: *const Proto = @ptrCast(@alignCast(v.proto));
+        if (callee.is_generator or !builtins.hasAutoPrototype(c)) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+        }
+        var root_buf = [_]Value{ .{ .closure = c }, new_target, .undefined };
+        var val_roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+        try val_roots.register(rt);
+        defer val_roots.unregister(rt);
+
+        const proto_val = try object.get(rt, new_target, try object.named(rt, "prototype"));
+        const r = try builtins.realm(rt);
+        const instance = try rt.heap.newObject(if (proto_val == .object) proto_val.object else r.object_prototype);
+        root_buf[2] = .{ .object = instance };
+        const init_this: ?Value = if (callee.has_super_ctor) null else .{ .object = instance };
+        return callNested(rt, caller_vm, c, init_this, args, true, instance);
+    }
+
+    fn callNested(rt: *Runtime, caller_vm: ?*Vm, c: *const Closure, this: ?Value, args: []const Value, is_construct: bool, construct_instance: ?*heap.Object) Error!Value {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
             .tree, .promise_cap, .native_closure, .bound => return rt.bug("a non-VM closure in a nested call"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
-        if (callee.is_class_constructor) return rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
+        if (!is_construct and callee.is_class_constructor) return rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
         if (callee.is_async) return startAsync(rt, caller_vm, c, this, args);
 
         const own_chain = !rt.exec_ctx.active;
@@ -244,12 +283,16 @@ pub const Vm = struct {
         if (rt.exec_ctx.budget_fault != null) return rt.limit(.steps);
         if (rt.exec_ctx.call_depth >= rt.limits.max_call_depth) return rt.limit(.call_depth);
 
-        var nested = try Vm.initCall(rt, c, this, args);
+        var nested = try Vm.initCallEx(rt, c, this, args, is_construct, construct_instance);
         defer nested.deinit();
         nested.chain = &rt.exec_ctx;
         rt.exec_ctx.call_depth += 1;
         try rt.exec_ctx.vms.append(rt.gpa, nested.roots());
         defer rt.exec_ctx.removeVm(&nested);
+
+        if (is_construct and !callee.has_super_ctor and construct_instance != null) {
+            try builtins.runInstanceInits(rt, @constCast(c), .{ .object = construct_instance.? });
+        }
 
         try nested.run();
         if (rt.exec_ctx.budget_fault != null) return rt.limit(.steps);
@@ -568,7 +611,7 @@ pub const Vm = struct {
         const h = &rt.heap;
         if (!vm.nested) rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
         const prev_caller = rt.closure_caller;
-        rt.closure_caller = .{ .ctx = vm, .call = callFromBuiltin };
+        rt.closure_caller = .{ .ctx = vm, .call = callFromBuiltin, .construct = constructFromBuiltin };
         defer rt.closure_caller = prev_caller;
         var cache = FrameCache.fromVm(vm, vm.pc);
         var n: u64 = 0;
@@ -1216,6 +1259,12 @@ pub const Vm = struct {
                         },
                         .tree => return vm.bug("a non-VM closure in the VM"),
                     },
+                    .object => |o| {
+                        if (o.kind != .proxy or !o.kind.proxy.is_callable) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
+                        cache.syncSp(vm);
+                        vm.stack[base] = try builtins.callProxy(rt, o, receiver orelse .undefined, vm.stack[args..cache.sp]);
+                        cache.sp = base + 1;
+                    },
                     else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
                 }
             },
@@ -1472,6 +1521,7 @@ pub const Vm = struct {
                 const argc = cache.operand(0);
                 const args_start = cache.sp - argc;
                 const base = args_start;
+                cache.syncSp(vm);
                 if (try vm.callSuper(base, vm.stack[args_start..cache.sp], false, next)) return true;
                 cache.sp = base + 1;
             },
@@ -1479,10 +1529,12 @@ pub const Vm = struct {
                 const arr_val = try cache.peek(vm, 0);
                 const base = cache.sp - 1;
                 if (arr_val != .object or arr_val.object.kind != .array) return vm.bug("super_call_spread expects array");
+                cache.syncSp(vm);
                 if (try vm.callSuper(base, arr_val.object.kind.array.items, true, next)) return true;
                 cache.sp = base + 1;
             },
             .super_get_prop => {
+                cache.syncSp(vm);
                 const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_get_prop without home_object");
                 try cache.ensurePush(vm);
@@ -1515,6 +1567,7 @@ pub const Vm = struct {
             },
             .throw_delete_super => return rt.throw(.ReferenceError, &.{.{ .ascii = "Unsupported reference to 'super'" }}),
             .delete_prop => {
+                cache.syncSp(vm);
                 const r = try object.delete(rt, try cache.peek(vm, 0), try vm.nameKey(cache.operand(0)));
                 (try cache.top(vm)).* = .{ .boolean = r };
             },
@@ -1551,6 +1604,7 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
             },
             .object_spread => {
+                cache.syncSp(vm);
                 const obj_v = try cache.peek(vm, 1);
                 const src = try cache.peek(vm, 0);
                 if (obj_v != .object) return vm.bug("object_spread on non-object");
@@ -1601,6 +1655,7 @@ pub const Vm = struct {
                 cache.sp = base + 1;
             },
             .new_call_spread => {
+                cache.syncSp(vm);
                 const callee = try cache.peek(vm, 1);
                 const args_v = try cache.peek(vm, 0);
                 if (args_v != .object or args_v.object.kind != .array) return vm.bug("new_call_spread args not array");
@@ -1609,6 +1664,7 @@ pub const Vm = struct {
                 cache.sp = base + 1;
             },
             .call_spread, .call_method_spread => {
+                cache.syncSp(vm);
                 const is_method = op == .call_method_spread;
                 const group: u32 = if (is_method) 3 else 2;
                 if (group > cache.sp - cache.stack_base) return vm.bug("stack underflow");
@@ -1660,6 +1716,11 @@ pub const Vm = struct {
                             }
                         },
                         .tree => return vm.bug("a non-VM closure in the VM"),
+                    },
+                    .object => |o| {
+                        if (o.kind != .proxy or !o.kind.proxy.is_callable) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
+                        vm.stack[base] = try builtins.callProxy(rt, o, receiver orelse .undefined, args_slice);
+                        cache.sp = base + 1;
                     },
                     else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
                 }
@@ -1802,6 +1863,11 @@ pub const Vm = struct {
                 },
                 .tree, .bound => return vm.bug("invalid bound target in the VM"),
             },
+            .object => |o| {
+                if (o.kind != .proxy or !o.kind.proxy.is_callable) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
+                vm.stack[base] = try builtins.callProxy(rt, o, b.bound_this, combined);
+                return false;
+            },
             else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
         }
     }
@@ -1809,12 +1875,14 @@ pub const Vm = struct {
     noinline fn callConstruct(vm: *Vm, base: u32, callee: Value, args_start: u32, args_slice: []const Value, is_spread: bool, next: u32) Error!bool {
         const rt = vm.rt;
         var target = callee;
+        var new_target = callee;
         var combined: []Value = &.{};
         defer if (combined.len > 0) rt.gpa.free(combined);
 
         if (callee == .closure and callee.closure.impl == .bound) {
             const b = callee.closure.impl.bound;
             target = b.target;
+            new_target = b.target;
             if (b.bound_args.len > 0) {
                 combined = try rt.gpa.alloc(Value, b.bound_args.len + args_slice.len);
                 @memcpy(combined[0..b.bound_args.len], b.bound_args);
@@ -1824,6 +1892,10 @@ pub const Vm = struct {
         const effective_args = if (combined.len > 0) combined else args_slice;
         if (!builtins.isConstructor(target)) {
             return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+        }
+        if (target == .object) {
+            vm.stack[base] = try builtins.callProxyConstruct(rt, target.object, effective_args, new_target);
+            return false;
         }
         if (target == .native) {
             const result = try builtins.construct(rt, target, effective_args);
@@ -1881,6 +1953,14 @@ pub const Vm = struct {
             return rt.throw(.TypeError, &.{.{ .ascii = "Super constructor is not a constructor" }});
         }
         const inst = f.construct_instance orelse return vm.bug("super() without construct_instance");
+        if (target == .object) {
+            const res = try builtins.callProxyConstruct(rt, target.object, effective_args, .{ .closure = cur_closure });
+            vm.frames.items[vm.frames.items.len - 1].this = res;
+            vm.stack[base] = res;
+            vm.sp = base + 1;
+            try builtins.runInstanceInits(rt, @constCast(cur_closure), res);
+            return false;
+        }
         if (target == .native) {
             const res = try builtins.construct(rt, target, effective_args);
             if (res == .object) rt.heap.storeObjectProto(res.object, inst.proto);

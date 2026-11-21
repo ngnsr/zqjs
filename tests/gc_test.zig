@@ -380,7 +380,7 @@ test "the exception message and the unsupported name are roots" {
     const gpa = testing.allocator;
     for ([_]struct { []const u8, []const u8 }{
         .{ "let o = {}; o.a.b;", "Cannot read properties of undefined (reading 'b')" },
-        .{ "Reflect.get;", "Reflect" },
+        .{ "Intl.Collator;", "Intl" },
     }) |case| {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
@@ -2536,4 +2536,73 @@ test "M45: Heap ephemeron unit tests (unreachable keys, chains, generational bar
     collectMajor(&h, &.{&old_wm.obj});
     try h.verifyCollected();
     try testing.expect(!heap.Heap.weakMapHas(old_wm, .{ .obj = &cyc_k.obj }));
+}
+
+test "M46: Proxy revocable drops target/handler and old-to-young proxy barrier survives minor GC" {
+    const gpa = testing.allocator;
+    var h = heap.Heap.init(gpa, .{});
+    defer h.deinit();
+
+    // 1. Old Proxy holding young target/handler survives minor GC
+    const t1 = try h.newObject(null);
+    const h1 = try h.newObject(null);
+    const px = try h.newProxy(null, .{ .object = t1 }, .{ .object = h1 }, false, false);
+    collectMajor(&h, &.{&px.obj});
+    try testing.expect(px.obj.old);
+    try testing.expect(t1.obj.old);
+    try testing.expect(h1.obj.old);
+
+    // 2. Revoking a proxy drops references to target/handler so major GC collects them
+    const t_buf = try h.newArrayBuffer(null, 64 << 10);
+    const h_buf = try h.newArrayBuffer(null, 64 << 10);
+    const rev_px = try h.newProxy(null, .{ .object = t_buf }, .{ .object = h_buf }, false, false);
+    collectMajor(&h, &.{&rev_px.obj});
+    const bytes_with_refs = h.bytes;
+    try testing.expect(bytes_with_refs > 128 << 10);
+
+    heap.Heap.revokeProxy(rev_px);
+    collectMajor(&h, &.{&rev_px.obj});
+    try h.verifyCollected();
+    try testing.expect(h.bytes < bytes_with_refs - (100 << 10));
+}
+
+test "M46: forced GC inside Proxy get, set, ownKeys, apply, and construct traps (both engines)" {
+    const src =
+        \\function allocGarbage() {
+        \\  let acc = 0;
+        \\  for (let i = 0; i < 400; i++) {
+        \\    const s = "trap-garbage-" + i;
+        \\    acc += s.length;
+        \\  }
+        \\  return acc;
+        \\}
+        \\class Target {
+        \\  constructor(v) { this.v = v; }
+        \\}
+        \\const base = { a: 10, b: 20 };
+        \\const p = new Proxy(base, {
+        \\  get(t, k, r) { allocGarbage(); return Reflect.get(t, k, r); },
+        \\  set(t, k, v, r) { allocGarbage(); return Reflect.set(t, k, v, r); },
+        \\  ownKeys(t) { allocGarbage(); return Reflect.ownKeys(t); },
+        \\  getOwnPropertyDescriptor(t, k) { allocGarbage(); return Reflect.getOwnPropertyDescriptor(t, k); },
+        \\});
+        \\p.c = 30;
+        \\const keys = Object.keys(p).join(",");
+        \\const fnP = new Proxy(Target, {
+        \\  apply(t, thisArg, args) { allocGarbage(); return args[0] + args[1]; },
+        \\  construct(t, args, newT) { allocGarbage(); return Reflect.construct(t, args, newT); },
+        \\});
+        \\const inst = new fnP(77);
+        \\print(p.a, p.c, keys, fnP(3, 4), inst.v);
+    ;
+    const opts: zqjs.Limits = .{ .max_heap_bytes = 256 << 10 };
+    const vm_res = try runVm(src, opts, false);
+    defer testing.allocator.free(vm_res.out);
+    try testing.expectEqual(@as(?anyerror, null), vm_res.err);
+    try testing.expect(vm_res.collections > 0);
+    try testing.expectEqualStrings("10 30 a,b,c 7 77\n", vm_res.out);
+
+    const tw_out = try runCollecting(src, .treewalk, opts);
+    defer testing.allocator.free(tw_out);
+    try testing.expectEqualStrings("10 30 a,b,c 7 77\n", tw_out);
 }

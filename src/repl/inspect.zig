@@ -121,6 +121,10 @@ const Context = struct {
                 if (p.state != .pending) try ctx.scanCycles(p.result, depth + 1);
             },
             .weak_map, .weak_set => {},
+            .proxy => |px| {
+                if (px.target) |t| try ctx.scanCycles(t, depth + 1);
+                if (px.handler) |hv| try ctx.scanCycles(hv, depth + 1);
+            },
             else => {},
         }
 
@@ -337,6 +341,24 @@ const Context = struct {
             },
             .weak_set => {
                 try ctx.w.print("WeakSet {{ {s}<items unknown>{s} }}", .{ ctx.style(Ansi.cyan), ctx.reset() });
+                return;
+            },
+            .proxy => |px| {
+                if (px.target == null or px.handler == null) {
+                    try ctx.w.print("Proxy [ {s}<revoked>{s} ]", .{ ctx.style(Ansi.dim), ctx.reset() });
+                    return;
+                }
+                if (depth >= ctx.options.depth) {
+                    try ctx.w.print("{s}[Proxy]{s}", .{ ctx.style(Ansi.cyan), ctx.reset() });
+                    return;
+                }
+                try ctx.active.append(ctx.gpa, obj);
+                defer _ = ctx.active.pop();
+                try ctx.w.writeAll("Proxy [ ");
+                try ctx.writeValue(px.target.?, depth + 1, indent);
+                try ctx.w.writeAll(", ");
+                try ctx.writeValue(px.handler.?, depth + 1, indent);
+                try ctx.w.writeAll(" ]");
                 return;
             },
             else => {},

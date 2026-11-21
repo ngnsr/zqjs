@@ -57,7 +57,7 @@ pub fn runModule(rt: *Runtime, script: ast.Script, res: *const Resolution, modul
     rt.engine_roots = m.roots();
     defer rt.engine_roots = prev_roots;
     const prev_caller = rt.closure_caller;
-    rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin };
+    rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
     defer rt.closure_caller = prev_caller;
 
     try m.pushBlock(script.statements);
@@ -82,7 +82,7 @@ pub fn runRepl(rt: *Runtime, script: ast.Script, res: *const Resolution, repl_ce
     rt.engine_roots = m.roots();
     defer rt.engine_roots = prev_roots;
     const prev_caller = rt.closure_caller;
-    rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin };
+    rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
     defer rt.closure_caller = prev_caller;
 
     try m.pushBlock(script.statements);
@@ -150,7 +150,7 @@ fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUs
     rt.engine_roots = m.roots();
     defer rt.engine_roots = prev_roots;
     const prev_caller = rt.closure_caller;
-    rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin };
+    rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
     defer rt.closure_caller = prev_caller;
 
     try m.pushBlock(script.statements);
@@ -2090,15 +2090,23 @@ const Machine = struct {
             .invoke_new_call => |args_base| {
                 const callee = m.values.items[args_base - 1];
                 var target = callee;
+                var new_target = callee;
                 if (callee == .closure and callee.closure.impl == .bound) {
                     const b = callee.closure.impl.bound;
                     target = b.target;
+                    new_target = b.target;
                     if (b.bound_args.len > 0) {
                         try m.values.insertSlice(rt.gpa, args_base, b.bound_args);
                     }
                 }
                 if (!builtins.isConstructor(target)) {
                     return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+                }
+                if (target == .object) {
+                    const res_v = try builtins.callProxyConstruct(rt, target.object, m.values.items[args_base..], new_target);
+                    m.values.shrinkRetainingCapacity(args_base - 1);
+                    try m.pushVal(res_v);
+                    return;
                 }
                 if (target == .native) {
                     const res_v = try builtins.construct(rt, target, m.values.items[args_base..]);
@@ -2132,6 +2140,14 @@ const Machine = struct {
                     return rt.throw(.TypeError, &.{.{ .ascii = "Super constructor is not a constructor" }});
                 }
                 const inst = m.construct_instance orelse return rt.bug("super() without construct_instance");
+                if (target == .object) {
+                    const res_v = try builtins.callProxyConstruct(rt, target.object, m.values.items[args_base..], .{ .closure = cur_closure });
+                    m.values.shrinkRetainingCapacity(args_base);
+                    m.this = res_v;
+                    try builtins.runInstanceInits(rt, @constCast(cur_closure), res_v);
+                    try m.pushVal(res_v);
+                    return;
+                }
                 if (target == .native) {
                     const res_v = try builtins.construct(rt, target, m.values.items[args_base..]);
                     if (res_v == .object) rt.heap.storeObjectProto(res_v.object, inst.proto);
@@ -3357,6 +3373,12 @@ const Machine = struct {
                 const this_val: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
                 try m.pushClosureCall(cl, this_val, args_base, result_base);
             },
+            .object => |o| {
+                if (o.kind != .proxy or !o.kind.proxy.is_callable) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
+                const res_v = try builtins.callProxy(rt, o, receiver orelse .undefined, args);
+                m.values.shrinkRetainingCapacity(result_base);
+                try m.pushVal(res_v);
+            },
             else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
         }
     }
@@ -3439,6 +3461,47 @@ const Machine = struct {
         if (construct_instance != null and !f.has_super_ctor) {
             try builtins.runInstanceInits(m.rt, @constCast(closure), .{ .object = construct_instance.? });
         }
+    }
+
+    fn constructFromBuiltin(ctx: *anyopaque, closure: *const heap.Closure, args: []const Value, new_target: Value) Error!Value {
+        const m: *Machine = @ptrCast(@alignCast(ctx));
+        closure.obj.checkLive();
+        const t = switch (closure.impl) {
+            .tree => |t| t,
+            else => return m.rt.bug("a non-tree-walker closure in constructFromBuiltin"),
+        };
+        const f: *const ast.Function = @ptrCast(@alignCast(t.func));
+        if (f.is_generator or !builtins.hasAutoPrototype(closure)) {
+            return m.rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+        }
+
+        var ret_root = [_]Value{ m.ret, .{ .closure = closure }, new_target, .undefined };
+        var ret_roots: rt_mod.ValueRoots = .{ .values = &ret_root };
+        try ret_roots.register(m.rt);
+        m.ret = .undefined;
+        defer {
+            m.ret = ret_root[0];
+            ret_roots.unregister(m.rt);
+        }
+
+        const proto_val = try object.get(m.rt, new_target, try object.named(m.rt, "prototype"));
+        const r = try builtins.realm(m.rt);
+        const instance = try m.rt.heap.newObject(if (proto_val == .object) proto_val.object else r.object_prototype);
+        ret_root[3] = .{ .object = instance };
+        const init_this: ?Value = if (f.has_super_ctor) null else .{ .object = instance };
+
+        const values_base = m.values.items.len;
+        const stop_len = m.tasks.items.len;
+        errdefer {
+            m.tasks.shrinkRetainingCapacity(stop_len);
+            m.values.shrinkRetainingCapacity(values_base);
+        }
+        try m.pushTask(.{ .barrier = @intCast(values_base) });
+        const args_base = m.values.items.len;
+        try m.values.appendSlice(m.rt.gpa, args);
+        try m.pushClosureCallSync(closure, f, t.env, init_this, args_base, values_base, instance, false);
+        _ = try m.runLoop(stop_len);
+        return m.popVal();
     }
 
     fn callFromBuiltin(ctx: *anyopaque, closure: *const heap.Closure, this: ?Value, args: []const Value) Error!Value {
@@ -3540,7 +3603,7 @@ const Machine = struct {
     fn runCoroMachine(m: *Machine, caller_calls: u32, caller_depth: u32, action: CoroAction) Error!coroutine.Outcome {
         const rt = m.rt;
         const prev_caller = rt.closure_caller;
-        rt.closure_caller = .{ .ctx = m, .call = Machine.callFromBuiltin };
+        rt.closure_caller = .{ .ctx = m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
         defer rt.closure_caller = prev_caller;
 
         try rt.addRoots(m.roots());

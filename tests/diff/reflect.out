@@ -1,0 +1,42 @@
+tag: [object Reflect] Reflect
+typeof: object
+get non-obj: TypeError
+set non-obj: TypeError
+has non-obj: TypeError
+deleteProperty non-obj: TypeError
+ownKeys non-obj: TypeError
+getOwnPropertyDescriptor non-obj: TypeError
+defineProperty non-obj: TypeError
+getPrototypeOf non-obj: TypeError
+setPrototypeOf non-obj: TypeError
+isExtensible non-obj: TypeError
+preventExtensions non-obj: TypeError
+apply non-fn: TypeError
+construct arrow: TypeError
+construct bad newTarget: TypeError
+get: 21 100 undefined
+set: true 2
+set with receiver: true undefined 3
+set accessor: true true 77 undefined
+set readonly: false 5
+set non-ext: false false
+has: true true false
+del: true false false 2
+ownKeys: 0,2,b,a,hidden,Symbol(s1),Symbol(s2)
+ownKeys arr: 0,1,length,extra
+desc: 9 false false false
+desc missing: undefined
+def1: true
+def2 reject: false 42
+def3 non-ext: false false
+getProto: true null
+setProto: true B true
+setProto cycle: false
+setProto non-ext same: true
+setProto non-ext diff: false
+ext: true true false
+apply: 123
+apply array-like: 10
+construct: 55 true Base
+construct newTarget: 66 true true Sub
+construct derived: 7 8 true

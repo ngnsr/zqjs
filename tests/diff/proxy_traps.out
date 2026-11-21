@@ -1,0 +1,43 @@
+Proxy.prototype: undefined
+no-new: TypeError
+bad target: TypeError
+bad handler: TypeError
+passthrough get/has: 1 true false
+passthrough set/del: 3 true false
+passthrough keys: a,c
+p.a: 1
+child.a: 1
+virtual in child: true
+child.x: 99 target.x: undefined
+del p.a: true false
+log: get:a:proxy|get:a:child|has:virtual|set:a:proxy|set:x:child|del:a
+Object.keys: b,virtual
+Object.getOwnPropertyNames: b,virtual,hidden
+Object.getOwnPropertySymbols: 1
+Reflect.ownKeys: b,virtual,hidden,SYM
+for..in: b,virtual
+spread: 2 42 undefined 3
+json: {"b":2,"virtual":42}
+added: 7
+proto: true
+proto2: true 2
+ext: true
+ext after: false false
+typeof fnProxy: function
+call fnProxy: 50
+call/apply/bind: 30 70 110
+sub: 105 true true true Base
+isArray: true true false
+json arr: [10,20,30]
+nested: 12
+rev before: function 42 1
+rev typeof after: function
+revoked: TypeError
+revoked: TypeError
+revoked: TypeError
+revoked: TypeError
+revoked: TypeError
+revoked: TypeError
+revoked: TypeError
+revoked: TypeError
+revoked: TypeError

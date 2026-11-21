@@ -1907,3 +1907,23 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
 - **Generational Barrier & Verifier:**
   - `heap.weakMapSet` and `heap.weakSetAdd` call `h.remember(&o.obj)` whenever `o.obj.old` and the key or value is young.
   - `Heap.verify` independently inspects `WeakMap`/`WeakSet` entries for dead pointers and unremembered old-to-young edges.
+
+---
+
+## D76. `Proxy` and `Reflect` (M46)
+
+**Decision:** Implement ECMAScript `Proxy` (constructor, `Proxy.revocable`, all 13 traps, and ECMAScript invariant checks) and `Reflect` (all 13 namespace methods) across both engines (`Vm` and tree-walking `Machine`), `JSON.stringify`, and the REPL inspector (`src/repl/inspect.zig`).
+
+- **Heap & GC (`heap.zig`, `value.zig`, `ops.zig`):**
+  - `Object.kind.proxy: *ProxyState` (`{ target: ?Value, handler: ?Value, is_callable: bool, is_constructable: bool }`) is heap-boxed via `Heap.allocator()` (like `regexp` in D61) so `Object` stays small.
+  - `forEachChild` and `RememberedScan` trace `target` and `handler`; `releaseObject` frees `ProxyState` on sweep.
+  - `Heap.revokeProxy` nulls `target` and `handler` so revoked targets/handlers can be collected on the next major GC.
+  - `Value.isFunction()` and `ops.typeOf` report `"function"` for callable proxies (`is_callable == true`), even after revocation. `builtins.isArray` unwraps proxy chains and throws `TypeError` on revoked proxies.
+- **Unified Internal Methods (`object.zig`, `builtins.zig`):**
+  - `getWithReceiver`, `setWithReceiver`, `ordinarySetWithReceiver`, `getPrototypeOfValue`, `setPrototypeOfValue`, `isExtensibleValue`, `preventExtensionsValue`, `getOwnPropertyRaw`, `defineOwnPropertyParsed`, `ownKeysAllValue`, `has`, `delete`, and `constructWithNewTarget` route both ordinary objects and proxies through one shared path.
+  - All 13 `Proxy` traps (`get`, `set`, `has`, `deleteProperty`, `ownKeys`, `getOwnPropertyDescriptor`, `defineProperty`, `getPrototypeOf`, `setPrototypeOf`, `isExtensible`, `preventExtensions`, `apply`, `construct`) enforce ECMAScript non-configurable / non-writable / non-extensible / duplicate-key / non-object-return invariants and guard deep proxy chains with `rt.checkNativeStack()` (D60).
+- **VM & Machine Call/Construct & Rooting (`vm.zig`, `machine.zig`, `api.zig`, `runtime.zig`):**
+  - `ClosureCaller` gains `construct` (`constructFromBuiltin` / `constructStandalone`) so `Reflect.construct` and pass-through `new proxy()` work on JS functions and classes in both engines.
+  - `Vm` calls `cache.syncSp(vm)` before every opcode that can enter a proxy trap (including `.call`, `.call_spread`, `.super_call`, `.super_call_spread`, `.super_get_prop`, `.delete_prop`, `.object_spread`, `.new_call_spread`), and every trap invocation roots live values via `ValueRoots` / `rt.addRoots`.
+- **Inspector (`src/repl/inspect.zig`):**
+  - Formats proxies as `Proxy [ target, handler ]` or `Proxy [ <revoked> ]` without invoking any traps.

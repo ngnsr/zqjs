@@ -39,6 +39,8 @@ const objects = vm.runInNewContext(`({
   weak_map_prototype: WeakMap.prototype,
   weak_set_constructor: WeakSet,
   weak_set_prototype: WeakSet.prototype,
+  proxy_constructor: Proxy,
+  reflect: Reflect,
   promise_constructor: Promise,
   promise_prototype: Promise.prototype,
   iterator_prototype: Object.getPrototypeOf(Object.getPrototypeOf([].values())),

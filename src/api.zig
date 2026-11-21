@@ -1401,7 +1401,7 @@ fn drainTopLevelMicrotasks(rt: *IRuntime, result: internal.Value) internal.runti
     try roots.register(rt);
     defer roots.unregister(rt);
     const prev_caller = rt.closure_caller;
-    rt.closure_caller = .{ .ctx = rt, .call = internal.Vm.callStandalone };
+    rt.closure_caller = .{ .ctx = rt, .call = internal.Vm.callStandalone, .construct = internal.Vm.constructStandalone };
     defer rt.closure_caller = prev_caller;
     try rt.drainMicrotasks();
 }

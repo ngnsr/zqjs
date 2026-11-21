@@ -573,8 +573,12 @@ const Stringifier = struct {
                 return true;
             },
             .object => |o| {
-                if (o.kind == .array) {
-                    try s.writeArray(o);
+                if (try builtins.isArray(s.rt, .{ .object = o })) {
+                    if (o.kind == .array) {
+                        try s.writeArray(o);
+                    } else {
+                        try s.writeArrayLike(o);
+                    }
                 } else {
                     try s.writeObject(o);
                 }
@@ -622,6 +626,41 @@ const Stringifier = struct {
         try s.writeUnit(']');
     }
 
+    fn writeArrayLike(s: *Stringifier, arr: *Object) Error!void {
+        try s.pushAncestor(arr);
+        defer _ = s.stack.pop();
+
+        var roots_buf = [_]Value{ .{ .object = arr }, .undefined, .undefined };
+        var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+        try roots.register(s.rt);
+        defer roots.unregister(s.rt);
+
+        const len_val = try object.get(s.rt, .{ .object = arr }, try object.named(s.rt, "length"));
+        const len_n = try ops.toNumber(s.rt, len_val);
+        const len: usize = if (std.math.isNan(len_n) or len_n <= 0) 0 else @intFromFloat(@min(@trunc(len_n), @as(f64, @floatFromInt(s.rt.limits.max_stack_slots))));
+        if (len == 0) {
+            try s.writeAscii("[]");
+            return;
+        }
+
+        const step_indent = s.stack.items.len;
+        try s.writeUnit('[');
+        for (0..len) |i| {
+            if (i > 0) try s.writeUnit(',');
+            if (s.gap.len > 0) try s.writeIndent(step_indent);
+            const elem = try object.get(s.rt, .{ .object = arr }, .{ .index = @intCast(i) });
+            roots_buf[2] = elem;
+            var buf: [20]u8 = undefined;
+            const idx_str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+            const key_val: Value = .{ .string = try s.rt.heap.ascii(idx_str) };
+            roots_buf[1] = key_val;
+            if (!try s.writeValue(.{ .object = arr }, elem, key_val)) try s.writeAscii("null");
+            roots_buf[2] = .undefined;
+        }
+        if (s.gap.len > 0) try s.writeIndent(step_indent - 1);
+        try s.writeUnit(']');
+    }
+
     fn writeObject(s: *Stringifier, obj: *Object) Error!void {
         try s.pushAncestor(obj);
         defer _ = s.stack.pop();
@@ -662,9 +701,11 @@ const Stringifier = struct {
 
             for (keys) |k| {
                 if (k == .symbol) continue;
-                if (try object.ownProp(s.rt, obj, k)) |p| {
-                    if (!p.enumerable) continue;
-                } else continue;
+                if (obj.kind != .proxy) {
+                    if (try object.ownProp(s.rt, obj, k)) |p| {
+                        if (!p.enumerable) continue;
+                    } else continue;
+                }
                 const key_val: Value = switch (k) {
                     .atom => |a| .{ .string = a },
                     .index => |i| blk: {

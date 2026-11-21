@@ -80,6 +80,8 @@ pub const Realm = struct {
     set_namespace: *Object,
     weak_map_namespace: *Object,
     weak_set_namespace: *Object,
+    proxy_namespace: *Object,
+    reflect: *Object,
     promise_namespace: *Object,
     error_namespace: *Object,
     type_error_namespace: *Object,
@@ -103,7 +105,7 @@ pub const Realm = struct {
     views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [51]*Object {
+    pub fn objects(r: *const Realm) [53]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -143,6 +145,8 @@ pub const Realm = struct {
             r.set_namespace,
             r.weak_map_namespace,
             r.weak_set_namespace,
+            r.proxy_namespace,
+            r.reflect,
             r.promise_namespace,
             r.error_namespace,
             r.type_error_namespace,
@@ -246,6 +250,8 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .set_namespace = try builtin(h, null, .set_constructor),
         .weak_map_namespace = try builtin(h, null, .weak_map_constructor),
         .weak_set_namespace = try builtin(h, null, .weak_set_constructor),
+        .proxy_namespace = try builtin(h, null, .proxy_constructor),
+        .reflect = try builtin(h, object_prototype, .reflect),
         .promise_namespace = try builtin(h, null, .promise_constructor),
         .error_namespace = try builtin(h, null, .error_constructor),
         .type_error_namespace = try builtin(h, null, .type_error_constructor),
@@ -374,6 +380,21 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try constant(rt, r.number_namespace, "POSITIVE_INFINITY", .{ .number = std.math.inf(f64) });
     try constant(rt, r.number_namespace, "NEGATIVE_INFINITY", .{ .number = -std.math.inf(f64) });
     try constant(rt, r.number_namespace, "NaN", .{ .number = std.math.nan(f64) });
+    try method(rt, r.proxy_namespace, "revocable", &proxy_revocable);
+    try defineToStringTag(rt, r.reflect, r.sym_to_string_tag, "Reflect");
+    try method(rt, r.reflect, "get", &reflect_get);
+    try method(rt, r.reflect, "set", &reflect_set);
+    try method(rt, r.reflect, "has", &reflect_has);
+    try method(rt, r.reflect, "deleteProperty", &reflect_delete_property);
+    try method(rt, r.reflect, "ownKeys", &reflect_own_keys);
+    try method(rt, r.reflect, "getOwnPropertyDescriptor", &reflect_get_own_property_descriptor);
+    try method(rt, r.reflect, "defineProperty", &reflect_define_property);
+    try method(rt, r.reflect, "getPrototypeOf", &reflect_get_prototype_of);
+    try method(rt, r.reflect, "setPrototypeOf", &reflect_set_prototype_of);
+    try method(rt, r.reflect, "isExtensible", &reflect_is_extensible);
+    try method(rt, r.reflect, "preventExtensions", &reflect_prevent_extensions);
+    try method(rt, r.reflect, "apply", &reflect_apply);
+    try method(rt, r.reflect, "construct", &reflect_construct);
     try method(rt, r.map_prototype, "get", &map_get);
     try method(rt, r.map_prototype, "set", &map_set);
     try method(rt, r.map_prototype, "has", &map_has);
@@ -590,6 +611,7 @@ pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
         .set => r.set_namespace,
         .weak_map => r.weak_map_namespace,
         .weak_set => r.weak_set_namespace,
+        .proxy => r.proxy_namespace,
         .promise => r.promise_namespace,
         .@"error" => r.error_namespace,
         .type_error => r.type_error_namespace,
@@ -646,6 +668,7 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
         .set => r.set_prototype,
         .weak_map => r.weak_map_prototype,
         .weak_set => r.weak_set_prototype,
+        .proxy => null,
         .promise => r.promise_prototype,
         .@"error" => r.error_prototype,
         .type_error => r.type_error_prototype,
@@ -738,6 +761,8 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "Set")) return .{ .native = &set_global };
     if (std.mem.eql(u8, name, "WeakMap")) return .{ .native = &weak_map_global };
     if (std.mem.eql(u8, name, "WeakSet")) return .{ .native = &weak_set_global };
+    if (std.mem.eql(u8, name, "Proxy")) return .{ .native = &proxy_global };
+    if (std.mem.eql(u8, name, "Reflect")) return .{ .object = (try realm(rt)).reflect };
     if (std.mem.eql(u8, name, "Promise")) return .{ .native = &promise_global };
     if (std.mem.eql(u8, name, "Error")) return .{ .native = &error_global };
     if (std.mem.eql(u8, name, "TypeError")) return .{ .native = &type_error_global };
@@ -856,6 +881,7 @@ pub fn isConstructor(v: Value) bool {
             .bound => |b| isConstructor(b.target),
             .promise_cap, .native_closure => false,
         },
+        .object => |o| o.kind == .proxy and o.kind.proxy.is_constructable,
         else => false,
     };
 }
@@ -1056,6 +1082,19 @@ fn functionBind(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         .closure => |c| {
             target_len = closureLength(c);
             target_name_str = try closureName(rt, c);
+        },
+        .object => {
+            if (try object.hasOwn(rt, this, try object.named(rt, "length"))) {
+                const lv = try object.get(rt, this, try object.named(rt, "length"));
+                if (lv == .number) {
+                    const n = @trunc(lv.number);
+                    if (n > 0 and !std.math.isNan(n)) {
+                        target_len = @intFromFloat(@min(n, 65535.0));
+                    }
+                }
+            }
+            const nv = try object.get(rt, this, try object.named(rt, "name"));
+            if (nv == .string) target_name_str = nv.string;
         },
         else => unreachable,
     }
@@ -2538,6 +2577,11 @@ const number_is_safe_integer: Native = .{ .name = "isSafeInteger", .call = numbe
 fn objectKeys(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const r = try realm(rt);
     const out = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{.{ .object = out }};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     switch (arg(args, 0)) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
         .boolean, .number, .symbol, .native => {},
@@ -2550,6 +2594,12 @@ fn objectKeys(rt: *Runtime, _: Value, args: []const Value) Error!Value {
         .object => |o| {
             const keys = try object.ownKeys(rt, o);
             defer rt.gpa.free(keys);
+            const key_vals = try rt.gpa.alloc(Value, keys.len);
+            defer rt.gpa.free(key_vals);
+            for (keys, key_vals) |k, *dst| dst.* = keyToRootValue(k);
+            var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+            try key_roots.register(rt);
+            defer key_roots.unregister(rt);
             for (keys) |k| try pushKey(rt, out, k);
         },
     }
@@ -2708,6 +2758,7 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                         return null;
                     }
                 },
+                .proxy => return proxyGetOwnPropertyDescriptor(rt, o, k),
                 .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set => {},
             }
             if (o.props.count() == 0) return null;
@@ -2781,24 +2832,25 @@ fn objectGetOwnPropertyDescriptors(rt: *Runtime, _: Value, args: []const Value) 
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    switch (target) {
-        .object => |o| {
-            for (o.props.keys(), o.props.values()) |pk, p| {
+    if (target.isObjectLike()) {
+        const keys = try ownKeysAllValue(rt, target);
+        defer rt.gpa.free(keys);
+        const key_vals = try rt.gpa.alloc(Value, keys.len);
+        defer rt.gpa.free(key_vals);
+        for (keys, key_vals) |k, *dst| dst.* = keyToRootValue(k);
+        var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+        try key_roots.register(rt);
+        defer key_roots.unregister(rt);
+
+        for (keys) |k| {
+            if (try getOwnPropertyRaw(rt, target, k)) |p| {
                 const desc = try descriptorToObject(rt, p);
                 root_buf[2] = desc;
-                try rt.heap.storePropKey(out, pk, desc);
+                const pk = try object.propKey(rt, k);
+                try rt.heap.definePropKey(out, pk, .{ .value = desc });
                 root_buf[2] = .undefined;
             }
-        },
-        .closure => |c| if (c.meta) |m| {
-            for (m.props.keys(), m.props.values()) |pk, p| {
-                const desc = try descriptorToObject(rt, p);
-                root_buf[2] = desc;
-                try rt.heap.storePropKey(out, pk, desc);
-                root_buf[2] = .undefined;
-            }
-        },
-        else => {},
+        }
     }
     return .{ .object = out };
 }
@@ -2811,44 +2863,148 @@ fn keyToRootValue(k: object.Key) Value {
     };
 }
 
-fn defineOwnPropertyFromDesc(rt: *Runtime, target: Value, k: object.Key, desc: Value) Error!void {
-    if (desc != .object and desc != .closure and desc != .native) {
+const ParsedDesc = struct {
+    has_enum: bool = false,
+    enum_val: bool = false,
+    has_conf: bool = false,
+    conf_val: bool = false,
+    has_val: bool = false,
+    val: Value = .undefined,
+    has_writ: bool = false,
+    writ_val: bool = false,
+    has_get: bool = false,
+    get_val: Value = .undefined,
+    has_set: bool = false,
+    set_val: Value = .undefined,
+
+    fn isData(d: ParsedDesc) bool {
+        return d.has_val or d.has_writ;
+    }
+
+    fn isAccessor(d: ParsedDesc) bool {
+        return d.has_get or d.has_set;
+    }
+
+    fn toCompleteProperty(d: ParsedDesc) heap_mod.Property {
+        if (d.isAccessor()) {
+            return .{
+                .is_accessor = true,
+                .value = if (d.has_get) d.get_val else .undefined,
+                .setter = if (d.has_set) d.set_val else .undefined,
+                .enumerable = if (d.has_enum) d.enum_val else false,
+                .configurable = if (d.has_conf) d.conf_val else false,
+                .writable = false,
+            };
+        }
+        return .{
+            .is_accessor = false,
+            .value = if (d.has_val) d.val else .undefined,
+            .writable = if (d.has_writ) d.writ_val else false,
+            .enumerable = if (d.has_enum) d.enum_val else false,
+            .configurable = if (d.has_conf) d.conf_val else false,
+        };
+    }
+};
+
+fn parsePropertyDescriptor(rt: *Runtime, desc: Value) Error!ParsedDesc {
+    if (!desc.isObjectLike()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Property description must be an object" }});
     }
-    var root_buf = [_]Value{ target, desc, .undefined, .undefined, .undefined, keyToRootValue(k) };
+    var out: ParsedDesc = .{};
+    var root_buf = [_]Value{ desc, .undefined, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const has_enum = try object.has(rt, .{ .atom = try rt.heap.internAscii("enumerable") }, desc);
-    const enum_val = if (has_enum) ops.toBoolean(try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("enumerable") })) else false;
-    const has_conf = try object.has(rt, .{ .atom = try rt.heap.internAscii("configurable") }, desc);
-    const conf_val = if (has_conf) ops.toBoolean(try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("configurable") })) else false;
+    out.has_enum = try object.has(rt, .{ .atom = try rt.heap.internAscii("enumerable") }, desc);
+    if (out.has_enum) out.enum_val = ops.toBoolean(try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("enumerable") }));
+    out.has_conf = try object.has(rt, .{ .atom = try rt.heap.internAscii("configurable") }, desc);
+    if (out.has_conf) out.conf_val = ops.toBoolean(try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("configurable") }));
 
-    const has_val = try object.has(rt, .{ .atom = try rt.heap.internAscii("value") }, desc);
-    const val = if (has_val) try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("value") }) else .undefined;
-    root_buf[2] = val;
-    const has_writ = try object.has(rt, .{ .atom = try rt.heap.internAscii("writable") }, desc);
-    const writ_val = if (has_writ) ops.toBoolean(try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("writable") })) else false;
+    out.has_val = try object.has(rt, .{ .atom = try rt.heap.internAscii("value") }, desc);
+    if (out.has_val) {
+        out.val = try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("value") });
+        root_buf[1] = out.val;
+    }
+    out.has_writ = try object.has(rt, .{ .atom = try rt.heap.internAscii("writable") }, desc);
+    if (out.has_writ) out.writ_val = ops.toBoolean(try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("writable") }));
 
-    const has_get = try object.has(rt, .{ .atom = try rt.heap.internAscii("get") }, desc);
-    const get_val = if (has_get) try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("get") }) else .undefined;
-    root_buf[3] = get_val;
-    if (has_get and get_val != .undefined and !get_val.isFunction()) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "Getter must be a function" }});
+    out.has_get = try object.has(rt, .{ .atom = try rt.heap.internAscii("get") }, desc);
+    if (out.has_get) {
+        out.get_val = try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("get") });
+        root_buf[2] = out.get_val;
+        if (out.get_val != .undefined and !out.get_val.isFunction()) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Getter must be a function" }});
+        }
     }
 
-    const has_set = try object.has(rt, .{ .atom = try rt.heap.internAscii("set") }, desc);
-    const set_val = if (has_set) try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("set") }) else .undefined;
-    root_buf[4] = set_val;
-    if (has_set and set_val != .undefined and !set_val.isFunction()) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "Setter must be a function" }});
+    out.has_set = try object.has(rt, .{ .atom = try rt.heap.internAscii("set") }, desc);
+    if (out.has_set) {
+        out.set_val = try object.get(rt, desc, .{ .atom = try rt.heap.internAscii("set") });
+        root_buf[3] = out.set_val;
+        if (out.set_val != .undefined and !out.set_val.isFunction()) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Setter must be a function" }});
+        }
     }
 
-    const is_data_desc = has_val or has_writ;
-    const is_acc_desc = has_get or has_set;
-    if (is_data_desc and is_acc_desc) {
+    if (out.isData() and out.isAccessor()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute" }});
+    }
+    return out;
+}
+
+fn parsedDescToObject(rt: *Runtime, d: ParsedDesc) Error!Value {
+    const r = try realm(rt);
+    const out = try rt.heap.newObject(r.object_prototype);
+    var root_buf = [_]Value{ .{ .object = out }, d.val, d.get_val, d.set_val };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    if (d.has_val) try rt.heap.storeProperty(out, try rt.heap.internAscii("value"), d.val);
+    if (d.has_writ) try rt.heap.storeProperty(out, try rt.heap.internAscii("writable"), .{ .boolean = d.writ_val });
+    if (d.has_get) try rt.heap.storeProperty(out, try rt.heap.internAscii("get"), d.get_val);
+    if (d.has_set) try rt.heap.storeProperty(out, try rt.heap.internAscii("set"), d.set_val);
+    if (d.has_enum) try rt.heap.storeProperty(out, try rt.heap.internAscii("enumerable"), .{ .boolean = d.enum_val });
+    if (d.has_conf) try rt.heap.storeProperty(out, try rt.heap.internAscii("configurable"), .{ .boolean = d.conf_val });
+    return .{ .object = out };
+}
+
+fn isCompatiblePropertyDescriptor(d: ParsedDesc, cur: heap_mod.Property) bool {
+    if (!cur.configurable) {
+        if (d.has_conf and d.conf_val) return false;
+        if (d.has_enum and d.enum_val != cur.enumerable) return false;
+    }
+    if (!d.isData() and !d.isAccessor()) return true;
+    if (cur.is_accessor != d.isAccessor()) {
+        if (!cur.configurable) return false;
+    } else if (!cur.is_accessor) {
+        if (!cur.configurable and !cur.writable) {
+            if (d.has_writ and d.writ_val) return false;
+            if (d.has_val and !sameValue(d.val, cur.value)) return false;
+        }
+    } else {
+        if (!cur.configurable) {
+            if (d.has_get and !sameValue(d.get_val, cur.value)) return false;
+            if (d.has_set and !sameValue(d.set_val, cur.setter)) return false;
+        }
+    }
+    return true;
+}
+
+fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: ParsedDesc, throw_on_reject: bool) Error!bool {
+    var root_buf = [_]Value{ target, d.val, d.get_val, d.set_val, keyToRootValue(k) };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    if (target == .object and target.object.kind == .proxy) {
+        const desc_obj = try parsedDescToObject(rt, d);
+        const ok = try proxyDefineProperty(rt, target.object, k, d, desc_obj);
+        if (!ok and throw_on_reject) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'defineProperty' on proxy: trap returned falsish" }});
+        }
+        return ok;
     }
 
     if (target == .object and target.object.kind == .array and k == .index) {
@@ -2865,41 +3021,24 @@ fn defineOwnPropertyFromDesc(rt: *Runtime, target: Value, k: object.Key, desc: V
             else => false,
         };
         if (!extensible) {
-            return rt.throw(.TypeError, &.{.{ .ascii = "Cannot define property, object is not extensible" }});
+            if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot define property, object is not extensible" }});
+            return false;
         }
-        if (is_acc_desc) {
-            next = .{
-                .is_accessor = true,
-                .value = if (has_get) get_val else .undefined,
-                .setter = if (has_set) set_val else .undefined,
-                .enumerable = if (has_enum) enum_val else false,
-                .configurable = if (has_conf) conf_val else false,
-                .writable = false,
-            };
-        } else {
-            next = .{
-                .is_accessor = false,
-                .value = if (has_val) val else .undefined,
-                .writable = if (has_writ) writ_val else false,
-                .enumerable = if (has_enum) enum_val else false,
-                .configurable = if (has_conf) conf_val else false,
-            };
-        }
+        next = d.toCompleteProperty();
     } else {
         const cur = current.?;
-        if (!cur.configurable) {
-            if (has_conf and conf_val) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
-            if (has_enum and enum_val != cur.enumerable) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
+        if (!isCompatiblePropertyDescriptor(d, cur)) {
+            if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
+            return false;
         }
-        if (!is_data_desc and !is_acc_desc) {
+        if (!d.isData() and !d.isAccessor()) {
             next = cur;
-        } else if (cur.is_accessor != is_acc_desc) {
-            if (!cur.configurable) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
-            if (is_acc_desc) {
+        } else if (cur.is_accessor != d.isAccessor()) {
+            if (d.isAccessor()) {
                 next = .{
                     .is_accessor = true,
-                    .value = if (has_get) get_val else .undefined,
-                    .setter = if (has_set) set_val else .undefined,
+                    .value = if (d.has_get) d.get_val else .undefined,
+                    .setter = if (d.has_set) d.set_val else .undefined,
                     .enumerable = cur.enumerable,
                     .configurable = cur.configurable,
                     .writable = false,
@@ -2907,63 +3046,63 @@ fn defineOwnPropertyFromDesc(rt: *Runtime, target: Value, k: object.Key, desc: V
             } else {
                 next = .{
                     .is_accessor = false,
-                    .value = if (has_val) val else .undefined,
-                    .writable = if (has_writ) writ_val else false,
+                    .value = if (d.has_val) d.val else .undefined,
+                    .writable = if (d.has_writ) d.writ_val else false,
                     .enumerable = cur.enumerable,
                     .configurable = cur.configurable,
                 };
             }
         } else if (!cur.is_accessor) {
-            if (!cur.configurable and !cur.writable) {
-                if (has_writ and writ_val) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
-                if (has_val and !sameValue(val, cur.value)) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
-            }
             next = .{
                 .is_accessor = false,
-                .value = if (has_val) val else cur.value,
-                .writable = if (has_writ) writ_val else cur.writable,
-                .enumerable = if (has_enum) enum_val else cur.enumerable,
-                .configurable = if (has_conf) conf_val else cur.configurable,
+                .value = if (d.has_val) d.val else cur.value,
+                .writable = if (d.has_writ) d.writ_val else cur.writable,
+                .enumerable = if (d.has_enum) d.enum_val else cur.enumerable,
+                .configurable = if (d.has_conf) d.conf_val else cur.configurable,
             };
         } else {
-            if (!cur.configurable) {
-                if (has_get and !sameValue(get_val, cur.value)) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
-                if (has_set and !sameValue(set_val, cur.setter)) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
-            }
             next = .{
                 .is_accessor = true,
-                .value = if (has_get) get_val else cur.value,
-                .setter = if (has_set) set_val else cur.setter,
-                .enumerable = if (has_enum) enum_val else cur.enumerable,
-                .configurable = if (has_conf) conf_val else cur.configurable,
+                .value = if (d.has_get) d.get_val else cur.value,
+                .setter = if (d.has_set) d.set_val else cur.setter,
+                .enumerable = if (d.has_enum) d.enum_val else cur.enumerable,
+                .configurable = if (d.has_conf) d.conf_val else cur.configurable,
                 .writable = false,
             };
         }
-        if (has_enum) next.enumerable = enum_val;
-        if (has_conf) next.configurable = conf_val;
+        if (d.has_enum) next.enumerable = d.enum_val;
+        if (d.has_conf) next.configurable = d.conf_val;
     }
 
     if (target == .object and target.object.kind == .array and k == .atom and object.isNamed(k, "length")) {
-        if (has_val) try object.setStrict(rt, target, k, next.value);
-        if (has_writ and !next.writable) target.object.array_length_writable = false;
-        return;
+        if (d.has_val) {
+            if (!try object.setWithReceiver(rt, target, k, next.value, target, throw_on_reject)) return false;
+        }
+        if (d.has_writ and !next.writable) target.object.array_length_writable = false;
+        return true;
     }
     if (target == .object and target.object.kind == .regexp and object.isNamed(k, "lastIndex")) {
-        if (has_val) rt.heap.storeRegExpLastIndex(target.object, next.value);
-        if (has_writ and !next.writable) target.object.regexp_last_index_writable = false;
-        return;
+        if (d.has_val) {
+            if (!target.object.regexp_last_index_writable and !sameValue(next.value, target.object.kind.regexp.last_index)) {
+                if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
+                return false;
+            }
+            rt.heap.storeRegExpLastIndex(target.object, next.value);
+        }
+        if (d.has_writ and !next.writable) target.object.regexp_last_index_writable = false;
+        return true;
     }
     if (target == .closure and object.isNamed(k, "prototype") and hasAutoPrototype(target.closure)) {
-        if (has_val) try rt.heap.storeClosurePrototype(@constCast(target.closure), next.value);
-        if (has_writ and !next.writable) (try rt.heap.ensureClosureMeta(@constCast(target.closure))).prototype_writable = false;
-        return;
+        if (d.has_val) try rt.heap.storeClosurePrototype(@constCast(target.closure), next.value);
+        if (d.has_writ and !next.writable) (try rt.heap.ensureClosureMeta(@constCast(target.closure))).prototype_writable = false;
+        return true;
     }
     if (target == .closure and (object.isNamed(k, "name") or object.isNamed(k, "length"))) {
-        if (has_conf and !next.configurable) {
+        if (d.has_conf and !next.configurable) {
             const m = try rt.heap.ensureClosureMeta(@constCast(target.closure));
             if (object.isNamed(k, "name")) m.name_configurable = false else m.length_configurable = false;
         }
-        return;
+        return true;
     }
 
     const pk = try object.propKey(rt, k);
@@ -2972,6 +3111,38 @@ fn defineOwnPropertyFromDesc(rt: *Runtime, target: Value, k: object.Key, desc: V
         .closure => |c| try rt.heap.defineClosurePropKey(@constCast(c), pk, next),
         else => unreachable,
     }
+    return true;
+}
+
+fn defineOwnPropertyFromDesc(rt: *Runtime, target: Value, k: object.Key, desc: Value) Error!void {
+    const parsed = try parsePropertyDescriptor(rt, desc);
+    _ = try defineOwnPropertyParsed(rt, target, k, parsed, true);
+}
+
+pub fn ordinarySetWithReceiver(rt: *Runtime, receiver: Value, k: object.Key, v: Value, strict: bool) Error!bool {
+    var root_buf = [_]Value{ receiver, v, keyToRootValue(k) };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const existing = try getOwnPropertyRaw(rt, receiver, k);
+    if (existing) |ex| {
+        if (ex.is_accessor or !ex.writable) {
+            if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
+            return false;
+        }
+        return defineOwnPropertyParsed(rt, receiver, k, .{ .has_val = true, .val = v }, strict);
+    }
+    return defineOwnPropertyParsed(rt, receiver, k, .{
+        .has_val = true,
+        .val = v,
+        .has_writ = true,
+        .writ_val = true,
+        .has_enum = true,
+        .enum_val = true,
+        .has_conf = true,
+        .conf_val = true,
+    }, strict);
 }
 
 fn objectDefineProperty(rt: *Runtime, _: Value, args: []const Value) Error!Value {
@@ -3022,9 +3193,19 @@ fn objectDefineProperties(rt: *Runtime, _: Value, args: []const Value) Error!Val
     return target;
 }
 
-fn arrayIsArray(_: *Runtime, _: Value, args: []const Value) Error!Value {
-    const v = arg(args, 0);
-    return .{ .boolean = v == .object and v.object.kind == .array };
+pub fn isArray(rt: *Runtime, v: Value) Error!bool {
+    var cur = v;
+    while (cur == .object) {
+        if (cur.object.kind == .array) return true;
+        if (cur.object.kind != .proxy) return false;
+        try rt.checkNativeStack();
+        cur = cur.object.kind.proxy.target orelse return rt.throw(.TypeError, &.{.{ .ascii = "Cannot perform 'IsArray' on a proxy that has been revoked" }});
+    }
+    return false;
+}
+
+fn arrayIsArray(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .boolean = try isArray(rt, arg(args, 0)) };
 }
 
 fn keyToString(rt: *Runtime, k: object.Key) Error!*heap_mod.String {
@@ -3182,39 +3363,31 @@ fn objectAssign(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     return target;
 }
 
-fn objectSetPrototypeOf(rt: *Runtime, _: Value, args: []const Value) Error!Value {
-    const target = arg(args, 0);
-    const proto = arg(args, 1);
-    if (target == .undefined or target == .null) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
-    }
+fn setPrototypeOfValue(rt: *Runtime, target: Value, proto: Value) Error!bool {
     switch (proto) {
         .object, .null => {},
         .native, .closure => return rt.fail(.function_properties),
         else => return rt.throw(.TypeError, &.{.{ .ascii = "Object prototype may only be an Object or null" }}),
     }
     switch (target) {
-        .object, .closure => {},
+        .object => |o| if (o.kind == .proxy) return proxySetPrototypeOf(rt, o, proto),
+        .closure => {},
         .native => return rt.fail(.function_properties),
-        else => return target,
+        else => return true,
     }
     const cur_proto = try object.getPrototypeOfValue(rt, target);
-    if (sameValue(proto, cur_proto)) return target;
+    if (sameValue(proto, cur_proto)) return true;
 
     const extensible = switch (target) {
         .object => |o| o.extensible,
         .closure => |c| if (c.meta) |m| m.extensible else true,
         else => unreachable,
     };
-    if (!extensible) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "#<Object> is not extensible" }});
-    }
+    if (!extensible) return false;
 
     var p = proto;
     while (p != .null) {
-        if (sameValue(p, target)) {
-            return rt.throw(.TypeError, &.{.{ .ascii = "Cyclic __proto__ value" }});
-        }
+        if (sameValue(p, target)) return false;
         p = try object.getPrototypeOfValue(rt, p);
     }
 
@@ -3223,28 +3396,53 @@ fn objectSetPrototypeOf(rt: *Runtime, _: Value, args: []const Value) Error!Value
         .closure => |c| try rt.heap.storeClosureProto(@constCast(c), proto),
         else => unreachable,
     }
-    return target;
+    return true;
 }
 
-fn objectPreventExtensions(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+fn objectSetPrototypeOf(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const target = arg(args, 0);
-    switch (target) {
-        .object => |o| o.extensible = false,
-        .closure => |c| (try rt.heap.ensureClosureMeta(@constCast(c))).extensible = false,
-        .native => return rt.fail(.function_properties),
-        else => {},
+    const proto = arg(args, 1);
+    if (target == .undefined or target == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    if (!try setPrototypeOfValue(rt, target, proto)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Object.setPrototypeOf failed" }});
     }
     return target;
 }
 
-fn objectIsExtensible(rt: *Runtime, _: Value, args: []const Value) Error!Value {
-    const target = arg(args, 0);
-    return .{ .boolean = switch (target) {
-        .object => |o| o.extensible,
-        .closure => |c| if (c.meta) |m| m.extensible else true,
+fn preventExtensionsValue(rt: *Runtime, target: Value) Error!bool {
+    switch (target) {
+        .object => |o| {
+            if (o.kind == .proxy) return proxyPreventExtensions(rt, o);
+            o.extensible = false;
+        },
+        .closure => |c| (try rt.heap.ensureClosureMeta(@constCast(c))).extensible = false,
         .native => return rt.fail(.function_properties),
+        else => {},
+    }
+    return true;
+}
+
+fn objectPreventExtensions(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = arg(args, 0);
+    if (!try preventExtensionsValue(rt, target)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot prevent extensions" }});
+    }
+    return target;
+}
+
+fn isExtensibleValue(rt: *Runtime, target: Value) Error!bool {
+    return switch (target) {
+        .object => |o| if (o.kind == .proxy) proxyIsExtensible(rt, o) else o.extensible,
+        .closure => |c| if (c.meta) |m| m.extensible else true,
+        .native => rt.fail(.function_properties),
         else => false,
-    } };
+    };
+}
+
+fn objectIsExtensible(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .boolean = try isExtensibleValue(rt, arg(args, 0)) };
 }
 
 fn setIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!Value {
@@ -3543,11 +3741,23 @@ pub fn forInInit(rt: *Runtime, target: Value) Error!*Object {
     defer seen.deinit(rt.gpa);
 
     var cur: Value = target;
+    var cur_root = [_]Value{cur};
+    var cur_roots: rt_mod.ValueRoots = .{ .values = &cur_root };
+    try cur_roots.register(rt);
+    defer cur_roots.unregister(rt);
+
     while (cur != .null) {
+        cur_root[0] = cur;
         switch (cur) {
             .object => |o| {
                 const keys = try object.ownPropertyNames(rt, o);
                 defer rt.gpa.free(keys);
+                const key_vals = try rt.gpa.alloc(Value, keys.len);
+                defer rt.gpa.free(key_vals);
+                for (keys, key_vals) |k, *dst| dst.* = keyToRootValue(k);
+                var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+                try key_roots.register(rt);
+                defer key_roots.unregister(rt);
                 for (keys) |k| {
                     const atom = try object.atomOf(rt, k);
                     const gop = try seen.getOrPut(rt.gpa, atom);
@@ -3561,6 +3771,12 @@ pub fn forInInit(rt: *Runtime, target: Value) Error!*Object {
             .closure => |c| {
                 const keys = try object.ownPropertyNamesClosure(rt, c);
                 defer rt.gpa.free(keys);
+                const key_vals = try rt.gpa.alloc(Value, keys.len);
+                defer rt.gpa.free(key_vals);
+                for (keys, key_vals) |k, *dst| dst.* = keyToRootValue(k);
+                var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+                try key_roots.register(rt);
+                defer key_roots.unregister(rt);
                 for (keys) |k| {
                     const atom = try object.atomOf(rt, k);
                     const gop = try seen.getOrPut(rt.gpa, atom);
@@ -3581,15 +3797,20 @@ pub fn forInInit(rt: *Runtime, target: Value) Error!*Object {
 
 /// Returns the next still-present enumerable key for a `for...in` iterator, or `null` when done (D69).
 pub fn forInNext(rt: *Runtime, iter: *Object) Error!?Value {
+    var root_buf = [_]Value{ .{ .object = iter }, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     const it = &iter.kind.iterator;
-    const keys = it.next_method.object.kind.array.items;
-    while (it.cursor < keys.len) {
-        const key_str = keys[it.cursor].string;
+    while (it.cursor < it.next_method.object.kind.array.items.len) {
+        const key_str = it.next_method.object.kind.array.items[it.cursor].string;
         it.cursor += 1;
         if (it.target == .string) return .{ .string = key_str };
         const k: object.Key = if (key_str.atom.?.index) |idx| .{ .index = idx } else .{ .atom = @constCast(key_str) };
         var cur: Value = it.target;
         while (cur != .null) {
+            root_buf[1] = cur;
             if (try getOwnPropertyRaw(rt, cur, k)) |desc| {
                 if (desc.enumerable) return .{ .string = key_str };
                 break; // shadowed by non-enumerable property
@@ -8396,4 +8617,876 @@ fn taReduce(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 fn taReduceRight(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return taReduceImpl(rt, this, args, true);
+}
+
+// ---------------------------------------------------------------- Proxy & Reflect (M46, D76)
+
+const proxy_global: Native = .{
+    .name = "Proxy",
+    .length = 2,
+    .call = proxyCallThrow,
+    .construct = proxyConstruct,
+    .namespace = .proxy,
+};
+const proxy_revocable: Native = .{ .name = "revocable", .length = 2, .call = proxyRevocable };
+
+const reflect_get: Native = .{ .name = "get", .length = 2, .call = reflectGet };
+const reflect_set: Native = .{ .name = "set", .length = 3, .call = reflectSet };
+const reflect_has: Native = .{ .name = "has", .length = 2, .call = reflectHas };
+const reflect_delete_property: Native = .{ .name = "deleteProperty", .length = 2, .call = reflectDeleteProperty };
+const reflect_own_keys: Native = .{ .name = "ownKeys", .length = 1, .call = reflectOwnKeys };
+const reflect_get_own_property_descriptor: Native = .{ .name = "getOwnPropertyDescriptor", .length = 2, .call = reflectGetOwnPropertyDescriptor };
+const reflect_define_property: Native = .{ .name = "defineProperty", .length = 3, .call = reflectDefineProperty };
+const reflect_get_prototype_of: Native = .{ .name = "getPrototypeOf", .length = 1, .call = reflectGetPrototypeOf };
+const reflect_set_prototype_of: Native = .{ .name = "setPrototypeOf", .length = 2, .call = reflectSetPrototypeOf };
+const reflect_is_extensible: Native = .{ .name = "isExtensible", .length = 1, .call = reflectIsExtensible };
+const reflect_prevent_extensions: Native = .{ .name = "preventExtensions", .length = 1, .call = reflectPreventExtensions };
+const reflect_apply: Native = .{ .name = "apply", .length = 3, .call = reflectApply };
+const reflect_construct: Native = .{ .name = "construct", .length = 2, .call = reflectConstruct };
+
+fn proxyCallThrow(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "Constructor Proxy requires 'new'" }});
+}
+
+fn proxyConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const target = arg(args, 0);
+    const handler = arg(args, 1);
+    if (!target.isObjectLike() or !handler.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot create proxy with a non-object as target or handler" }});
+    }
+    if (target == .object and target.object.kind == .proxy and target.object.kind.proxy.target == null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot create proxy with a revoked proxy as target" }});
+    }
+    if (handler == .object and handler.object.kind == .proxy and handler.object.kind.proxy.target == null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot create proxy with a revoked proxy as handler" }});
+    }
+    const is_callable = target.isFunction();
+    const is_constructable = isConstructor(target);
+    const px = try rt.heap.newProxy(null, target, handler, is_callable, is_constructable);
+    return .{ .object = px };
+}
+
+fn proxyRevokeFn(rt: *Runtime, env: *Object, _: []const Value) Error!Value {
+    const k = try rt.heap.internAscii("p");
+    const pk = heap_mod.PropKey.fromAtom(k);
+    if (env.props.get(pk)) |prop| {
+        if (prop.value == .object and prop.value.object.kind == .proxy) {
+            heap_mod.Heap.revokeProxy(prop.value.object);
+        }
+        rt.heap.removePropKey(env, pk);
+    }
+    return .undefined;
+}
+
+fn proxyRevocable(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const px_val = try proxyConstruct(rt, args);
+    const r = try realm(rt);
+    var root_buf = [_]Value{ px_val, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const env = try rt.heap.newObject(null);
+    root_buf[1] = .{ .object = env };
+    try rt.heap.storeProperty(env, try rt.heap.internAscii("p"), px_val);
+    const revoke_fn = try rt.heap.newNativeClosure(@ptrCast(&proxyRevokeFn), env);
+    root_buf[2] = .{ .closure = revoke_fn };
+
+    const out = try rt.heap.newObject(r.object_prototype);
+    try rt.heap.storeProperty(out, try rt.heap.internAscii("proxy"), px_val);
+    try rt.heap.storeProperty(out, try rt.heap.internAscii("revoke"), .{ .closure = revoke_fn });
+    return .{ .object = out };
+}
+
+const ProxyTrap = struct {
+    target: Value,
+    handler: Value,
+    trap: ?Value,
+};
+
+fn getProxyTrap(rt: *Runtime, px_obj: *Object, trap_name: []const u8) Error!ProxyTrap {
+    try rt.checkNativeStack();
+    const px = px_obj.kind.proxy;
+    const target = px.target orelse return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot perform '" }, .{ .ascii = trap_name }, .{ .ascii = "' on a proxy that has been revoked" } });
+    const handler = px.handler orelse return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot perform '" }, .{ .ascii = trap_name }, .{ .ascii = "' on a proxy that has been revoked" } });
+    var root_buf = [_]Value{ target, handler };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const trap = try object.getMethod(rt, handler, try object.named(rt, trap_name));
+    return .{ .target = target, .handler = handler, .trap = trap };
+}
+
+fn keyToValue(rt: *Runtime, k: object.Key) Error!Value {
+    return switch (k) {
+        .atom => |a| .{ .string = a },
+        .symbol => |s| .{ .symbol = s },
+        .index => |i| .{ .string = try keyToString(rt, .{ .index = i }) },
+    };
+}
+
+pub fn proxyGet(rt: *Runtime, px_obj: *Object, k: object.Key, receiver: Value) Error!Value {
+    var root_buf = [_]Value{ .{ .object = px_obj }, receiver, keyToRootValue(k), .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "get");
+    if (t.trap == null) return object.getWithReceiver(rt, t.target, receiver, k);
+    const prop_val = try keyToValue(rt, k);
+    root_buf[3] = t.target;
+    root_buf[4] = t.handler;
+    root_buf[5] = prop_val;
+
+    const trap_res = try rt.callCallable(t.trap.?, t.handler, &.{ t.target, prop_val, receiver });
+    root_buf[4] = trap_res;
+
+    if (try getOwnPropertyRaw(rt, t.target, k)) |td| {
+        if (!td.configurable) {
+            if (!td.is_accessor and !td.writable and !sameValue(trap_res, td.value)) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "'get' on proxy: property is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value" }});
+            }
+            if (td.is_accessor and td.value == .undefined and trap_res != .undefined) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "'get' on proxy: property is a non-configurable accessor without a getter on the proxy target but the proxy did not return undefined" }});
+            }
+        }
+    }
+    return trap_res;
+}
+
+pub fn proxySet(rt: *Runtime, px_obj: *Object, k: object.Key, v: Value, receiver: Value) Error!bool {
+    var root_buf = [_]Value{ .{ .object = px_obj }, v, receiver, keyToRootValue(k), .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "set");
+    if (t.trap == null) return object.setWithReceiver(rt, t.target, k, v, receiver, false);
+    const prop_val = try keyToValue(rt, k);
+    root_buf[4] = t.target;
+    root_buf[5] = t.handler;
+    root_buf[6] = prop_val;
+
+    const trap_res = ops.toBoolean(try rt.callCallable(t.trap.?, t.handler, &.{ t.target, prop_val, v, receiver }));
+    if (!trap_res) return false;
+
+    if (try getOwnPropertyRaw(rt, t.target, k)) |td| {
+        if (!td.configurable) {
+            if (!td.is_accessor and !td.writable and !sameValue(v, td.value)) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "'set' on proxy: trap returned truish for property which exists in the proxy target as a non-configurable and non-writable data property with a different value" }});
+            }
+            if (td.is_accessor and td.setter == .undefined) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "'set' on proxy: trap returned truish for property which exists in the proxy target as a non-configurable accessor without a setter" }});
+            }
+        }
+    }
+    return true;
+}
+
+pub fn proxyHas(rt: *Runtime, px_obj: *Object, k: object.Key) Error!bool {
+    var root_buf = [_]Value{ .{ .object = px_obj }, keyToRootValue(k), .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "has");
+    if (t.trap == null) return object.has(rt, k, t.target);
+    const prop_val = try keyToValue(rt, k);
+    root_buf[2] = t.target;
+    root_buf[3] = t.handler;
+    root_buf[4] = prop_val;
+
+    const trap_res = ops.toBoolean(try rt.callCallable(t.trap.?, t.handler, &.{ t.target, prop_val }));
+    if (!trap_res) {
+        if (try getOwnPropertyRaw(rt, t.target, k)) |td| {
+            if (!td.configurable) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "'has' on proxy: trap returned falsish for property which exists in the proxy target as non-configurable" }});
+            }
+            if (!try isExtensibleValue(rt, t.target)) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "'has' on proxy: trap returned falsish for property but the proxy target is not extensible" }});
+            }
+        }
+    }
+    return trap_res;
+}
+
+pub fn proxyDeleteProperty(rt: *Runtime, px_obj: *Object, k: object.Key) Error!bool {
+    var root_buf = [_]Value{ .{ .object = px_obj }, keyToRootValue(k), .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "deleteProperty");
+    if (t.trap == null) return object.delete(rt, t.target, k);
+    const prop_val = try keyToValue(rt, k);
+    root_buf[2] = t.target;
+    root_buf[3] = t.handler;
+    root_buf[4] = prop_val;
+
+    const trap_res = ops.toBoolean(try rt.callCallable(t.trap.?, t.handler, &.{ t.target, prop_val }));
+    if (!trap_res) return false;
+
+    if (try getOwnPropertyRaw(rt, t.target, k)) |td| {
+        if (!td.configurable) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'deleteProperty' on proxy: trap returned truish for property which is non-configurable in the proxy target" }});
+        }
+        if (!try isExtensibleValue(rt, t.target)) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'deleteProperty' on proxy: trap returned truish for property but the proxy target is non-extensible" }});
+        }
+    }
+    return true;
+}
+
+pub fn proxyGetPrototypeOf(rt: *Runtime, px_obj: *Object) Error!Value {
+    var root_buf = [_]Value{ .{ .object = px_obj }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "getPrototypeOf");
+    if (t.trap == null) return object.getPrototypeOfValue(rt, t.target);
+    root_buf[1] = t.target;
+    root_buf[2] = t.handler;
+
+    const handler_proto = try rt.callCallable(t.trap.?, t.handler, &.{t.target});
+    root_buf[2] = handler_proto;
+    if (handler_proto != .null and !handler_proto.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "'getPrototypeOf' on proxy: trap returned neither object nor null" }});
+    }
+    if (try isExtensibleValue(rt, t.target)) return handler_proto;
+    const target_proto = try object.getPrototypeOfValue(rt, t.target);
+    if (!sameValue(handler_proto, target_proto)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "'getPrototypeOf' on proxy: proxy target is non-extensible but the trap did not return its actual prototype" }});
+    }
+    return handler_proto;
+}
+
+fn proxySetPrototypeOf(rt: *Runtime, px_obj: *Object, proto: Value) Error!bool {
+    var root_buf = [_]Value{ .{ .object = px_obj }, proto, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "setPrototypeOf");
+    if (t.trap == null) return setPrototypeOfValue(rt, t.target, proto);
+    root_buf[2] = t.target;
+    root_buf[3] = t.handler;
+
+    const trap_res = ops.toBoolean(try rt.callCallable(t.trap.?, t.handler, &.{ t.target, proto }));
+    if (!trap_res) return false;
+    if (try isExtensibleValue(rt, t.target)) return true;
+    const target_proto = try object.getPrototypeOfValue(rt, t.target);
+    if (!sameValue(proto, target_proto)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "'setPrototypeOf' on proxy: trap returned truish for setting a new prototype on the non-extensible proxy target" }});
+    }
+    return true;
+}
+
+fn proxyIsExtensible(rt: *Runtime, px_obj: *Object) Error!bool {
+    var root_buf = [_]Value{ .{ .object = px_obj }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "isExtensible");
+    if (t.trap == null) return isExtensibleValue(rt, t.target);
+    root_buf[1] = t.target;
+    root_buf[2] = t.handler;
+
+    const trap_res = ops.toBoolean(try rt.callCallable(t.trap.?, t.handler, &.{t.target}));
+    const target_ext = try isExtensibleValue(rt, t.target);
+    if (trap_res != target_ext) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "'isExtensible' on proxy: trap result does not reflect extensibility of proxy target" }});
+    }
+    return trap_res;
+}
+
+fn proxyPreventExtensions(rt: *Runtime, px_obj: *Object) Error!bool {
+    var root_buf = [_]Value{ .{ .object = px_obj }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "preventExtensions");
+    if (t.trap == null) return preventExtensionsValue(rt, t.target);
+    root_buf[1] = t.target;
+    root_buf[2] = t.handler;
+
+    const trap_res = ops.toBoolean(try rt.callCallable(t.trap.?, t.handler, &.{t.target}));
+    if (trap_res and try isExtensibleValue(rt, t.target)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "'preventExtensions' on proxy: trap returned truish but the proxy target is extensible" }});
+    }
+    return trap_res;
+}
+
+pub fn proxyGetOwnPropertyDescriptor(rt: *Runtime, px_obj: *Object, k: object.Key) Error!?heap_mod.Property {
+    var root_buf = [_]Value{ .{ .object = px_obj }, keyToRootValue(k), .undefined, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "getOwnPropertyDescriptor");
+    if (t.trap == null) return getOwnPropertyRaw(rt, t.target, k);
+    const prop_val = try keyToValue(rt, k);
+    root_buf[2] = t.target;
+    root_buf[3] = t.handler;
+    root_buf[4] = prop_val;
+
+    const trap_res = try rt.callCallable(t.trap.?, t.handler, &.{ t.target, prop_val });
+    root_buf[3] = trap_res;
+    if (trap_res != .undefined and !trap_res.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "'getOwnPropertyDescriptor' on proxy: trap returned neither object nor undefined" }});
+    }
+
+    const target_desc = try getOwnPropertyRaw(rt, t.target, k);
+    if (trap_res == .undefined) {
+        if (target_desc) |td| {
+            if (!td.configurable) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "'getOwnPropertyDescriptor' on proxy: trap returned undefined for property which is non-configurable in the proxy target" }});
+            }
+            if (!try isExtensibleValue(rt, t.target)) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "'getOwnPropertyDescriptor' on proxy: trap returned undefined for property which exists in the non-extensible proxy target" }});
+            }
+        }
+        return null;
+    }
+
+    const extensible_target = try isExtensibleValue(rt, t.target);
+    const parsed = try parsePropertyDescriptor(rt, trap_res);
+    const result_desc = parsed.toCompleteProperty();
+    root_buf[4] = result_desc.value;
+    root_buf[5] = result_desc.setter;
+
+    if (target_desc == null) {
+        if (!extensible_target) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'getOwnPropertyDescriptor' on proxy: trap returned descriptor for property that does not exist on the non-extensible proxy target" }});
+        }
+        if (!result_desc.configurable) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'getOwnPropertyDescriptor' on proxy: trap returned non-configurable descriptor for property that does not exist in the proxy target" }});
+        }
+    } else {
+        const td = target_desc.?;
+        const completed_parsed: ParsedDesc = if (result_desc.is_accessor) .{
+            .has_enum = true,
+            .enum_val = result_desc.enumerable,
+            .has_conf = true,
+            .conf_val = result_desc.configurable,
+            .has_get = true,
+            .get_val = result_desc.value,
+            .has_set = true,
+            .set_val = result_desc.setter,
+        } else .{
+            .has_enum = true,
+            .enum_val = result_desc.enumerable,
+            .has_conf = true,
+            .conf_val = result_desc.configurable,
+            .has_val = true,
+            .val = result_desc.value,
+            .has_writ = true,
+            .writ_val = result_desc.writable,
+        };
+        if (!isCompatiblePropertyDescriptor(completed_parsed, td)) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'getOwnPropertyDescriptor' on proxy: trap returned descriptor that is incompatible with property on the proxy target" }});
+        }
+        if (!result_desc.configurable and td.configurable) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'getOwnPropertyDescriptor' on proxy: trap reported non-configurability for property which is configurable in the proxy target" }});
+        }
+        if (!result_desc.configurable and !result_desc.is_accessor and !result_desc.writable and !td.is_accessor and td.writable) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'getOwnPropertyDescriptor' on proxy: trap reported non-configurable and non-writable for property which is writable in the proxy target" }});
+        }
+    }
+    return result_desc;
+}
+
+fn proxyDefineProperty(rt: *Runtime, px_obj: *Object, k: object.Key, parsed: ParsedDesc, desc_obj: Value) Error!bool {
+    var root_buf = [_]Value{ .{ .object = px_obj }, desc_obj, parsed.val, parsed.get_val, parsed.set_val, keyToRootValue(k), .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "defineProperty");
+    if (t.trap == null) return defineOwnPropertyParsed(rt, t.target, k, parsed, false);
+    const prop_val = try keyToValue(rt, k);
+    root_buf[6] = t.target;
+    root_buf[7] = t.handler;
+    root_buf[8] = prop_val;
+
+    const trap_res = ops.toBoolean(try rt.callCallable(t.trap.?, t.handler, &.{ t.target, prop_val, desc_obj }));
+    if (!trap_res) return false;
+
+    const target_desc = try getOwnPropertyRaw(rt, t.target, k);
+    const extensible_target = try isExtensibleValue(rt, t.target);
+    const setting_non_conf = parsed.has_conf and !parsed.conf_val;
+
+    if (target_desc == null) {
+        if (!extensible_target) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'defineProperty' on proxy: trap returned truish for adding property to the non-extensible proxy target" }});
+        }
+        if (setting_non_conf) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'defineProperty' on proxy: trap returned truish for defining non-configurable property which is non-existent in the proxy target" }});
+        }
+    } else {
+        const td = target_desc.?;
+        if (!isCompatiblePropertyDescriptor(parsed, td)) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'defineProperty' on proxy: trap returned truish for defining incompatible property" }});
+        }
+        if (setting_non_conf and td.configurable) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'defineProperty' on proxy: trap returned truish for defining non-configurable property which is configurable in the proxy target" }});
+        }
+        if (!td.is_accessor and !td.configurable and td.writable and parsed.has_writ and !parsed.writ_val) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'defineProperty' on proxy: trap returned truish for defining non-writable property which is writable in the proxy target" }});
+        }
+    }
+    return true;
+}
+
+fn ownKeysAllValue(rt: *Runtime, target: Value) Error![]object.Key {
+    var out: std.ArrayList(object.Key) = .empty;
+    errdefer out.deinit(rt.gpa);
+    switch (target) {
+        .object => |o| {
+            if (o.kind == .proxy) return proxyOwnKeys(rt, o);
+            const prop_names = try object.ownPropertyNames(rt, o);
+            defer rt.gpa.free(prop_names);
+            var idx_end: usize = 0;
+            while (idx_end < prop_names.len and prop_names[idx_end] == .index) : (idx_end += 1) {}
+            try out.appendSlice(rt.gpa, prop_names[0..idx_end]);
+            if (o.kind == .array) {
+                try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("length") });
+            } else if (o.kind == .regexp) {
+                try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("lastIndex") });
+            }
+            try out.appendSlice(rt.gpa, prop_names[idx_end..]);
+            const syms = try object.ownSymbolKeys(rt, o, true);
+            defer rt.gpa.free(syms);
+            for (syms) |s| try out.append(rt.gpa, .{ .symbol = s });
+        },
+        .closure => |c| {
+            try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("length") });
+            try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("name") });
+            if (hasAutoPrototype(c)) {
+                try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("prototype") });
+            }
+            const prop_names = try object.ownPropertyNamesClosure(rt, c);
+            defer rt.gpa.free(prop_names);
+            try out.appendSlice(rt.gpa, prop_names);
+            const syms = try object.ownSymbolKeysClosure(rt, c, true);
+            defer rt.gpa.free(syms);
+            for (syms) |s| try out.append(rt.gpa, .{ .symbol = s });
+        },
+        .native => {
+            try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("length") });
+            try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("name") });
+        },
+        else => {},
+    }
+    return out.toOwnedSlice(rt.gpa);
+}
+
+fn keyInList(k: object.Key, list: []const object.Key) bool {
+    for (list) |item| {
+        switch (k) {
+            .atom => |a| if (item == .atom and item.atom == a) return true,
+            .index => |i| if (item == .index and item.index == i) return true,
+            .symbol => |s| if (item == .symbol and item.symbol == s) return true,
+        }
+    }
+    return false;
+}
+
+fn proxyOwnKeys(rt: *Runtime, px_obj: *Object) Error![]object.Key {
+    var root_buf = [_]Value{ .{ .object = px_obj }, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "ownKeys");
+    if (t.trap == null) return ownKeysAllValue(rt, t.target);
+    root_buf[1] = t.target;
+    root_buf[2] = t.handler;
+
+    const trap_res = try rt.callCallable(t.trap.?, t.handler, &.{t.target});
+    root_buf[2] = trap_res;
+    if (!trap_res.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "'ownKeys' on proxy: trap returned non-object" }});
+    }
+
+    const len_val = try object.get(rt, trap_res, try object.named(rt, "length"));
+    const len_n = try toIntegerOrInfinity(rt, len_val);
+    const len: usize = if (len_n <= 0) 0 else @intFromFloat(@min(len_n, @as(f64, @floatFromInt(rt.limits.max_stack_slots))));
+
+    var out: std.ArrayList(object.Key) = .empty;
+    errdefer out.deinit(rt.gpa);
+    var seen: std.AutoHashMapUnmanaged(heap_mod.PropKey, void) = .empty;
+    defer seen.deinit(rt.gpa);
+    var out_roots: std.ArrayList(Value) = .empty;
+    defer out_roots.deinit(rt.gpa);
+
+    const ListRoot = struct {
+        list: *const std.ArrayList(Value),
+        fn mark(ctx: *anyopaque, h: *heap_mod.Heap) void {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            for (self.list.items) |v| h.markValue(v);
+        }
+    };
+    var list_root: ListRoot = .{ .list = &out_roots };
+    try rt.addRoots(.{ .ctx = &list_root, .mark = ListRoot.mark });
+    defer rt.removeRoots(&list_root);
+
+    for (0..len) |i| {
+        const elem = try object.get(rt, trap_res, .{ .index = @intCast(i) });
+        if (elem != .string and elem != .symbol) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'ownKeys' on proxy: trap returned non-string/symbol key" }});
+        }
+        const k = try object.key(rt, elem);
+        const pk = try object.propKey(rt, k);
+        const gop = try seen.getOrPut(rt.gpa, pk);
+        if (gop.found_existing) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'ownKeys' on proxy: trap returned duplicate entries" }});
+        }
+        try out.append(rt.gpa, k);
+        try out_roots.append(rt.gpa, keyToRootValue(k));
+    }
+
+    const extensible_target = try isExtensibleValue(rt, t.target);
+    const target_keys = try ownKeysAllValue(rt, t.target);
+    defer rt.gpa.free(target_keys);
+
+    for (target_keys) |tk| {
+        const td = try getOwnPropertyRaw(rt, t.target, tk);
+        const is_non_conf = if (td) |d| !d.configurable else false;
+        if (is_non_conf and !keyInList(tk, out.items)) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'ownKeys' on proxy: trap result did not include non-configurable property" }});
+        }
+        if (!extensible_target and !keyInList(tk, out.items)) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "'ownKeys' on proxy: trap result did not include property of non-extensible target" }});
+        }
+    }
+    if (!extensible_target and out.items.len != target_keys.len) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "'ownKeys' on proxy: trap returned extra keys but proxy target is non-extensible" }});
+    }
+    return out.toOwnedSlice(rt.gpa);
+}
+
+pub const ProxyKeyFilter = enum { enum_strings, all_strings, enum_all };
+
+pub fn proxyOwnKeysFiltered(rt: *Runtime, px_obj: *Object, filter: ProxyKeyFilter) Error![]object.Key {
+    const keys = try proxyOwnKeys(rt, px_obj);
+    defer rt.gpa.free(keys);
+
+    const key_vals = try rt.gpa.alloc(Value, 1 + keys.len);
+    defer rt.gpa.free(key_vals);
+    key_vals[0] = .{ .object = px_obj };
+    for (keys, key_vals[1..]) |k, *dst| dst.* = keyToRootValue(k);
+    var roots: rt_mod.ValueRoots = .{ .values = key_vals };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var out: std.ArrayList(object.Key) = .empty;
+    errdefer out.deinit(rt.gpa);
+    for (keys) |k| {
+        switch (filter) {
+            .enum_strings => {
+                if (k == .symbol) continue;
+                const desc = (try proxyGetOwnPropertyDescriptor(rt, px_obj, k)) orelse continue;
+                if (desc.enumerable) try out.append(rt.gpa, k);
+            },
+            .all_strings => {
+                if (k == .symbol) continue;
+                try out.append(rt.gpa, k);
+            },
+            .enum_all => {
+                const desc = (try proxyGetOwnPropertyDescriptor(rt, px_obj, k)) orelse continue;
+                if (desc.enumerable) try out.append(rt.gpa, k);
+            },
+        }
+    }
+    return out.toOwnedSlice(rt.gpa);
+}
+
+pub fn proxyOwnSymbolKeys(rt: *Runtime, px_obj: *Object, include_non_enum: bool) Error![]*heap_mod.Symbol {
+    const keys = try proxyOwnKeys(rt, px_obj);
+    defer rt.gpa.free(keys);
+
+    const key_vals = try rt.gpa.alloc(Value, 1 + keys.len);
+    defer rt.gpa.free(key_vals);
+    key_vals[0] = .{ .object = px_obj };
+    for (keys, key_vals[1..]) |k, *dst| dst.* = keyToRootValue(k);
+    var roots: rt_mod.ValueRoots = .{ .values = key_vals };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var out: std.ArrayList(*heap_mod.Symbol) = .empty;
+    errdefer out.deinit(rt.gpa);
+    for (keys) |k| {
+        if (k != .symbol) continue;
+        if (!include_non_enum) {
+            const desc = (try proxyGetOwnPropertyDescriptor(rt, px_obj, k)) orelse continue;
+            if (!desc.enumerable) continue;
+        }
+        try out.append(rt.gpa, k.symbol);
+    }
+    return out.toOwnedSlice(rt.gpa);
+}
+
+pub fn callProxy(rt: *Runtime, px_obj: *Object, this_arg: Value, args: []const Value) Error!Value {
+    try rt.checkNativeStack();
+    if (!px_obj.kind.proxy.is_callable) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
+    }
+    var root_buf = [_]Value{ .{ .object = px_obj }, this_arg, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "apply");
+    if (t.trap == null) return rt.callCallable(t.target, this_arg, args);
+    root_buf[2] = t.target;
+    root_buf[3] = t.handler;
+
+    const r = try realm(rt);
+    const args_arr = try rt.heap.newArray(r.array_prototype);
+    root_buf[4] = .{ .object = args_arr };
+    try rt.heap.appendElements(args_arr, args);
+    return rt.callCallable(t.trap.?, t.handler, &.{ t.target, this_arg, .{ .object = args_arr } });
+}
+
+pub fn callProxyConstruct(rt: *Runtime, px_obj: *Object, args: []const Value, new_target: Value) Error!Value {
+    try rt.checkNativeStack();
+    if (!px_obj.kind.proxy.is_constructable) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+    }
+    var root_buf = [_]Value{ .{ .object = px_obj }, new_target, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const t = try getProxyTrap(rt, px_obj, "construct");
+    if (t.trap == null) return constructWithNewTarget(rt, t.target, args, new_target);
+    root_buf[2] = t.target;
+    root_buf[3] = t.handler;
+
+    const r = try realm(rt);
+    const args_arr = try rt.heap.newArray(r.array_prototype);
+    root_buf[4] = .{ .object = args_arr };
+    try rt.heap.appendElements(args_arr, args);
+    const res = try rt.callCallable(t.trap.?, t.handler, &.{ t.target, .{ .object = args_arr }, new_target });
+    if (!res.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "'construct' on proxy: trap returned non-object" }});
+    }
+    return res;
+}
+
+fn constructWithNewTarget(rt: *Runtime, target_in: Value, args: []const Value, new_target_in: Value) Error!Value {
+    var target = target_in;
+    var new_target = new_target_in;
+    var extra_args: std.ArrayList(Value) = .empty;
+    defer extra_args.deinit(rt.gpa);
+
+    if (target == .closure and target.closure.impl == .bound) {
+        const b = target.closure.impl.bound;
+        if (sameValue(new_target, target)) new_target = b.target;
+        if (b.bound_args.len > 0) {
+            try extra_args.appendSlice(rt.gpa, b.bound_args);
+            try extra_args.appendSlice(rt.gpa, args);
+        }
+        target = b.target;
+    }
+    const effective_args = if (extra_args.items.len > 0) extra_args.items else args;
+    if (!isConstructor(target)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }});
+    }
+    if (target == .object and target.object.kind == .proxy) {
+        return callProxyConstruct(rt, target.object, effective_args, new_target);
+    }
+    if (target == .native) {
+        return construct(rt, target, effective_args);
+    }
+    return rt.constructClosure(target.closure, effective_args, new_target);
+}
+
+fn requireReflectTarget(rt: *Runtime, v: Value, name: []const u8) Error!Value {
+    if (!v.isObjectLike()) {
+        return rt.throw(.TypeError, &.{ .{ .ascii = "Reflect." }, .{ .ascii = name }, .{ .ascii = " called on non-object" } });
+    }
+    return v;
+}
+
+fn reflectGet(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = try requireReflectTarget(rt, arg(args, 0), "get");
+    const receiver = if (args.len >= 3) args[2] else target;
+    var root_buf = [_]Value{ target, receiver };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const k = try object.key(rt, arg(args, 1));
+    return object.getWithReceiver(rt, target, receiver, k);
+}
+
+fn reflectSet(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = try requireReflectTarget(rt, arg(args, 0), "set");
+    const val = arg(args, 2);
+    const receiver = if (args.len >= 4) args[3] else target;
+    var root_buf = [_]Value{ target, val, receiver };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const k = try object.key(rt, arg(args, 1));
+    return .{ .boolean = try object.setWithReceiver(rt, target, k, val, receiver, false) };
+}
+
+fn reflectHas(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = try requireReflectTarget(rt, arg(args, 0), "has");
+    var root_buf = [_]Value{target};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const k = try object.key(rt, arg(args, 1));
+    return .{ .boolean = try object.has(rt, k, target) };
+}
+
+fn reflectDeleteProperty(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = try requireReflectTarget(rt, arg(args, 0), "deleteProperty");
+    var root_buf = [_]Value{target};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const k = try object.key(rt, arg(args, 1));
+    return .{ .boolean = try object.delete(rt, target, k) };
+}
+
+fn reflectOwnKeys(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = try requireReflectTarget(rt, arg(args, 0), "ownKeys");
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ target, .{ .object = out } };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const keys = try ownKeysAllValue(rt, target);
+    defer rt.gpa.free(keys);
+    const key_vals = try rt.gpa.alloc(Value, keys.len);
+    defer rt.gpa.free(key_vals);
+    for (keys, key_vals) |k, *dst| dst.* = keyToRootValue(k);
+    var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+    try key_roots.register(rt);
+    defer key_roots.unregister(rt);
+
+    for (keys) |k| {
+        try rt.heap.appendElement(out, try keyToValue(rt, k));
+    }
+    return .{ .object = out };
+}
+
+fn reflectGetOwnPropertyDescriptor(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = try requireReflectTarget(rt, arg(args, 0), "getOwnPropertyDescriptor");
+    var root_buf = [_]Value{target};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const k = try object.key(rt, arg(args, 1));
+    const p = (try getOwnPropertyRaw(rt, target, k)) orelse return .undefined;
+    return descriptorToObject(rt, p);
+}
+
+fn reflectDefineProperty(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = try requireReflectTarget(rt, arg(args, 0), "defineProperty");
+    var root_buf = [_]Value{ target, arg(args, 2) };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const k = try object.key(rt, arg(args, 1));
+    const parsed = try parsePropertyDescriptor(rt, arg(args, 2));
+    return .{ .boolean = try defineOwnPropertyParsed(rt, target, k, parsed, false) };
+}
+
+fn reflectGetPrototypeOf(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = try requireReflectTarget(rt, arg(args, 0), "getPrototypeOf");
+    return object.getPrototypeOfValue(rt, target);
+}
+
+fn reflectSetPrototypeOf(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = try requireReflectTarget(rt, arg(args, 0), "setPrototypeOf");
+    return .{ .boolean = try setPrototypeOfValue(rt, target, arg(args, 1)) };
+}
+
+fn reflectIsExtensible(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = try requireReflectTarget(rt, arg(args, 0), "isExtensible");
+    return .{ .boolean = try isExtensibleValue(rt, target) };
+}
+
+fn reflectPreventExtensions(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = try requireReflectTarget(rt, arg(args, 0), "preventExtensions");
+    return .{ .boolean = try preventExtensionsValue(rt, target) };
+}
+
+fn createListFromArrayLike(rt: *Runtime, list_val: Value) Error![]Value {
+    if (!list_val.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "CreateListFromArrayLike called on non-object" }});
+    }
+    if (list_val == .object and list_val.object.kind == .array) {
+        return rt.gpa.dupe(Value, list_val.object.kind.array.items);
+    }
+    var list_root = [_]Value{list_val};
+    var lr: rt_mod.ValueRoots = .{ .values = &list_root };
+    try lr.register(rt);
+    defer lr.unregister(rt);
+
+    const len_val = try object.get(rt, list_val, try object.named(rt, "length"));
+    const len_n = try toIntegerOrInfinity(rt, len_val);
+    const len: usize = if (len_n <= 0) 0 else @intFromFloat(@min(len_n, @as(f64, @floatFromInt(rt.limits.max_stack_slots))));
+    const out = try rt.gpa.alloc(Value, len);
+    errdefer rt.gpa.free(out);
+    @memset(out, .undefined);
+    var out_roots: rt_mod.ValueRoots = .{ .values = out };
+    try out_roots.register(rt);
+    defer out_roots.unregister(rt);
+
+    for (0..len) |i| {
+        out[i] = try object.get(rt, list_val, .{ .index = @intCast(i) });
+    }
+    return out;
+}
+
+fn reflectApply(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = arg(args, 0);
+    if (!target.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Reflect.apply requires a callable target" }});
+    }
+    const this_arg = arg(args, 1);
+    var root_buf = [_]Value{ target, this_arg };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const arg_list = try createListFromArrayLike(rt, arg(args, 2));
+    defer rt.gpa.free(arg_list);
+    var arg_roots: rt_mod.ValueRoots = .{ .values = arg_list };
+    try arg_roots.register(rt);
+    defer arg_roots.unregister(rt);
+    return rt.callCallable(target, this_arg, arg_list);
+}
+
+fn reflectConstruct(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = arg(args, 0);
+    if (!isConstructor(target)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Reflect.construct requires a constructor target" }});
+    }
+    const new_target = if (args.len >= 3) args[2] else target;
+    if (!isConstructor(new_target)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Reflect.construct requires a constructor newTarget" }});
+    }
+    var root_buf = [_]Value{ target, new_target };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const arg_list = try createListFromArrayLike(rt, arg(args, 1));
+    defer rt.gpa.free(arg_list);
+    var arg_roots: rt_mod.ValueRoots = .{ .values = arg_list };
+    try arg_roots.register(rt);
+    defer arg_roots.unregister(rt);
+    return constructWithNewTarget(rt, target, arg_list, new_target);
 }

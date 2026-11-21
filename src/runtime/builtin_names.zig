@@ -24,6 +24,8 @@ pub const Builtin = enum {
     weak_map_prototype,
     weak_set_constructor,
     weak_set_prototype,
+    proxy_constructor,
+    reflect,
     promise_constructor,
     promise_prototype,
     iterator_prototype,
@@ -104,6 +106,8 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .weak_map_prototype => weak_map_prototype.has(name),
         .weak_set_constructor => weak_set_constructor.has(name),
         .weak_set_prototype => weak_set_prototype.has(name),
+        .proxy_constructor => proxy_constructor.has(name),
+        .reflect => reflect.has(name),
         .promise_constructor => promise_constructor.has(name),
         .promise_prototype => promise_prototype.has(name),
         .iterator_prototype => iterator_prototype.has(name),
@@ -524,6 +528,28 @@ const weak_set_prototype = std.StaticStringMap(void).initComptime(.{
     .{"constructor"},
     .{"delete"},
     .{"has"},
+});
+
+const proxy_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"length"},
+    .{"name"},
+    .{"revocable"},
+});
+
+const reflect = std.StaticStringMap(void).initComptime(.{
+    .{"apply"},
+    .{"construct"},
+    .{"defineProperty"},
+    .{"deleteProperty"},
+    .{"get"},
+    .{"getOwnPropertyDescriptor"},
+    .{"getPrototypeOf"},
+    .{"has"},
+    .{"isExtensible"},
+    .{"ownKeys"},
+    .{"preventExtensions"},
+    .{"set"},
+    .{"setPrototypeOf"},
 });
 
 const promise_constructor = std.StaticStringMap(void).initComptime(.{

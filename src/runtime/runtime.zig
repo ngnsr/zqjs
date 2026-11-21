@@ -54,6 +54,7 @@ pub const EngineRoots = struct {
 pub const ClosureCaller = struct {
     ctx: *anyopaque,
     call: *const fn (ctx: *anyopaque, c: *const heap_mod.Closure, this: ?Value, args: []const Value) Error!Value,
+    construct: ?*const fn (ctx: *anyopaque, c: *const heap_mod.Closure, args: []const Value, new_target: Value) Error!Value = null,
 };
 
 /// Stack-local GC root frame for built-ins that hold live JS values across callbacks (M16.1).
@@ -504,8 +505,16 @@ pub const Runtime = struct {
                     },
                 }
             },
+            .object => |o| if (o.kind == .proxy) builtins_mod.callProxy(rt, o, this_val, args) else rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
             else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
         };
+    }
+
+    pub fn constructClosure(rt: *Runtime, c: *const heap_mod.Closure, args: []const Value, new_target: Value) Error!Value {
+        try rt.checkNativeStack();
+        const cc = rt.closure_caller orelse return rt.bug("closure constructed without an active engine");
+        const construct_fn = cc.construct orelse return rt.bug("closure constructor not supported by active engine");
+        return construct_fn(cc.ctx, c, args, new_target);
     }
 
     /// Drains queued microtasks FIFO at an outermost turn checkpoint (M18).

@@ -19,7 +19,7 @@ pub const Value = union(enum) {
     object: *heap.Object,
 
     pub fn isFunction(v: Value) bool {
-        return v == .native or v == .closure;
+        return v == .native or v == .closure or (v == .object and v.object.kind == .proxy and v.object.kind.proxy.is_callable);
     }
 
     pub fn isObjectLike(v: Value) bool {
@@ -58,6 +58,7 @@ pub const Native = struct {
         set,
         weak_map,
         weak_set,
+        proxy,
         promise,
         @"error",
         type_error,

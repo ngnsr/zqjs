@@ -1,0 +1,26 @@
+non-callable trap TypeError
+get non-conf non-writ TypeError
+get non-conf no-getter TypeError
+set non-conf non-writ TypeError
+set non-conf no-setter TypeError
+has non-conf TypeError
+has non-ext TypeError
+del non-conf TypeError
+del non-ext TypeError
+getProto bad return TypeError
+getProto non-ext mismatch TypeError
+setProto non-ext mismatch TypeError
+isExtensible mismatch TypeError
+preventExtensions while extensible TypeError
+gopd bad return TypeError
+gopd undefined for non-conf TypeError
+gopd non-conf for missing TypeError
+defProp non-ext TypeError
+defProp non-conf for missing TypeError
+ownKeys duplicate TypeError
+ownKeys bad key type TypeError
+ownKeys missing non-conf TypeError
+ownKeys extra on non-ext TypeError
+construct non-object return TypeError
+construct on non-constructable TypeError
+apply on non-callable TypeError

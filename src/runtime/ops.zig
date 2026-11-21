@@ -38,12 +38,11 @@ pub fn toNumber(rt: *Runtime, v: Value) Error!f64 {
         .number => |n| n,
         .string => |s| stringToNumber(gpa, s.units),
         .symbol => rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert a Symbol value to a number" }}),
-        .native, .closure => {
+        .native, .closure, .object => {
             const prim = try object.toPrimitive(rt, v, .number);
             if (prim.isFunction()) return std.math.nan(f64);
             return toNumber(rt, prim);
         },
-        .object => toNumber(rt, try object.toPrimitive(rt, v, .number)),
     };
 }
 
@@ -170,12 +169,11 @@ pub fn toPiece(rt: *Runtime, v: Value, buf: *NumberBuf) Error!Piece {
         .number => |n| .{ .ascii = formatNumber(buf, n) },
         .string => |s| .{ .utf16 = s.units },
         .symbol => rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert a Symbol value to a string" }}),
-        .native, .closure => {
+        .native, .closure, .object => {
             const prim = try object.toPrimitive(rt, v, .string);
             if (prim.isFunction()) return rt.fail(.function_to_string);
             return toPiece(rt, prim, buf);
         },
-        .object => toPiece(rt, try object.toPrimitive(rt, v, .string), buf),
     };
 }
 
@@ -323,7 +321,7 @@ pub fn typeOf(rt: *Runtime, v: Value) Error!Value {
         .string => "string",
         .symbol => "symbol",
         .native, .closure => "function",
-        .object => "object",
+        .object => |o| if (o.kind == .proxy and o.kind.proxy.is_callable) "function" else "object",
     };
     return .{ .string = try rt.heap.ascii(s) };
 }

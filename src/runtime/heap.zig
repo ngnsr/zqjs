@@ -573,6 +573,13 @@ pub const WeakKeyContext = struct {
     }
 };
 
+pub const ProxyState = struct {
+    target: ?Value,
+    handler: ?Value,
+    is_callable: bool,
+    is_constructable: bool,
+};
+
 pub const WeakMapState = struct {
     entries: std.HashMapUnmanaged(WeakKey, Value, WeakKeyContext, 80) = .empty,
     /// Intrusive list link for `Heap.marked_weak_maps` during GC (zero-alloc, D9/D75).
@@ -622,6 +629,8 @@ pub const Object = struct {
         /// Ephemeron WeakMap and WeakSet (M45, D75).
         weak_map: WeakMapState,
         weak_set: WeakSetState,
+        /// ES Proxy exotic object (M46, D76); boxed so `Object` stays small.
+        proxy: *ProxyState,
     } = .ordinary,
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
@@ -1063,6 +1072,10 @@ pub const Heap = struct {
                     std.debug.assert(ws.weak_next == null);
                     ws.weak_next = h.marked_weak_sets;
                     h.marked_weak_sets = o;
+                },
+                .proxy => |px| {
+                    if (px.target) |t| visitValue(t, &scan, RememberedScan.child);
+                    if (px.handler) |hv| visitValue(hv, &scan, RememberedScan.child);
                 },
             }
         }
@@ -1564,6 +1577,34 @@ pub const Heap = struct {
         h.barrier(&o.obj, old, val);
     }
 
+    pub fn newProxy(
+        h: *Heap,
+        proto: ?*Object,
+        target: Value,
+        handler: Value,
+        is_callable: bool,
+        is_constructable: bool,
+    ) Error!*Object {
+        const state = h.allocator().create(ProxyState) catch |e| return h.failed(e);
+        errdefer h.allocator().destroy(state);
+        const o = try h.newObject(proto);
+        state.* = .{
+            .target = target,
+            .handler = handler,
+            .is_callable = is_callable,
+            .is_constructable = is_constructable,
+        };
+        o.kind = .{ .proxy = state };
+        h.barrier(&o.obj, null, target);
+        h.barrier(&o.obj, null, handler);
+        return o;
+    }
+
+    pub fn revokeProxy(o: *Object) void {
+        o.kind.proxy.target = null;
+        o.kind.proxy.handler = null;
+    }
+
     // ---- the store API (GC_DESIGN §7, I3)
     //
     // After construction, every reference written into a heap object goes through one of
@@ -1978,7 +2019,7 @@ pub const Heap = struct {
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
         return switch (arr.kind) {
             .array => |*elements| elements,
-            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .module_namespace, .array_buffer, .typed_array, .data_view, .weak_map, .weak_set => unreachable, // only arrays have elements
+            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .module_namespace, .array_buffer, .typed_array, .data_view, .weak_map, .weak_set, .proxy => unreachable, // only arrays have elements
         };
     }
 
@@ -2313,6 +2354,7 @@ pub const Heap = struct {
                     .typed_array, .data_view => {},
                     .weak_map => |*wm| wm.entries.deinit(h.allocator()),
                     .weak_set => |*ws| ws.entries.deinit(h.allocator()),
+                    .proxy => |px| h.allocator().destroy(px),
                 }
                 o.kind = .ordinary;
                 o.proto = null;
@@ -2527,6 +2569,10 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                         visitValue(rq.value, ctx, visit);
                         visit(ctx, &rq.promise.obj);
                     }
+                },
+                .proxy => |px| {
+                    if (px.target) |t| visitValue(t, ctx, visit);
+                    if (px.handler) |hv| visitValue(hv, ctx, visit);
                 },
             }
         },

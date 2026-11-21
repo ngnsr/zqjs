@@ -18,10 +18,12 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | 8.2 | Incremental major marking | deferred (see Direction) |
 | 9.0 | Zig embedding API: lifecycle, compile once / run many, execution under limits and step budgets, results instead of panics | **done** |
 | 9.1 | GC-safe handles, native functions (`NativeFn`), JS callbacks from natives, error handling across the boundary | **done** |
-| 9.2 | C ABI: header, opaque handles, error codes, a C example and integration tests in CI | – |
-| D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | – |
-| 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | – |
+| 9.2 | C ABI: header, opaque handles, error codes, a C example and integration tests in CI | **done** |
+| D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | **done** |
+| 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | **done** |
 | 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
+| 11.1–51 | Language, runtime, REPL, ES modules, Test262 harness & built-ins (see milestone log below; D55–D81) | **done** |
+| Perf | Tier 1–2 interpreter optimizations toward QuickJS parity (see `PERF_PLAN.md`) | planned |
 
 ## Direction after M8.1 (reviewed 2026-11-15)
 
@@ -436,3 +438,66 @@ runs on both engines unless noted.
 
 **M30 (done — RegExp in the Runtime)**
 - **M30:** Wired `src/regex.zig` into the frontend, bytecode, object model, and built-ins per D61: moved pattern complexity ceilings into `src/limits.zig` (`LimitExceeded(nesting_depth)` and `LimitExceeded(code_bytes)`), charged matcher steps to `rt.steps` (`LimitExceeded(steps)`) and matcher allocations to `rt.heap` (`LimitExceeded(heap_bytes)`), added boxed `Object.kind.regexp` (`RegExpState`) with GC tracing, remembered-set write barrier on `lastIndex`, and zero-allocation property interception (`lastIndex`, `source`, `flags`, `global`, `ignoreCase`, `multiline`, `dotAll`, `sticky`), implemented `/pattern/flags` literal scanning and early validation (`new_regexp` opcode with verifier rule and unit test), and implemented `RegExp(pattern, flags)` / `new RegExp(pattern, flags)`, `RegExp.prototype.{exec, test, toString}`, `re instanceof RegExp`, and `String.prototype.{match, search, replace, replaceAll, split}`. Added Node-checked syntax cases (`tests/syntax/cases.jsonl`), Node-differential tests (`tests/diff/regexp.js`, `tests/diff/string_regexp.js`), step/nesting/OOM/Unsupported tests (`tests/interpreter_test.zig`), and generational GC barrier tests (`tests/gc_test.zig`). Updated `DESIGN_DECISIONS.md`, `LANGUAGE.md`, `ARCHITECTURE.md`, and `ROADMAP.md`.
+
+**M31 (done — Functions as Objects, Constructors & Lexical Arrow `this`)**
+- **M31:** Implemented D62 across both engines: turned `.closure` and `.native` functions into first-class objects inheriting from `Function.prototype -> Object.prototype` with own properties (`name`, `length`, `prototype`), implemented user-defined constructors (`new F(...)`), `x instanceof F`, `Function.prototype.{call, apply, bind}`, and lexical `this` capture in arrow functions.
+
+**M32 (done — Modern RegExp & Everyday Syntax)**
+- **M32:** Extended `src/regex.zig` with `u`/`v`/`d` flags (`hasIndices`, `unicode`, `unicodeSets`), named capturing groups (`(?<name>...)`, `\k<name>`), lookbehind (`(?<=...)`, `(?<!...)`), inline flag modifiers (`(?ims-ims:...)`), Unicode property escapes (`\p{...}`/`\P{...}`), and `v`-mode nested character classes (`&&`, `--`, `\q{...}`). Also added labeled statements (`label: ...`, `break label`, `continue label`), the comma operator `(a, b)`, and tagged template literals across both engines.
+
+**M33 (done — Classes, `extends`, and `super`)**
+- **M33:** Implemented D63 across both engines: `class` declarations and expressions, `constructor`, prototype and `static` methods, `extends` (prototype and constructor inheritance, `extends null`), `super(...)` derived construction with `this` TDZ, `super.prop` / `super[k]` / `super.m()` lookups, and non-callable class constructors (`TypeError` without `new`).
+
+**M34 (done — Getters, Setters, and Property Descriptors)**
+- **M34:** Implemented D64 across both engines: extended `Property` in `src/runtime/heap.zig` with `enumerable`, `writable`, `configurable`, `is_accessor`, and `setter`, added `get`/`set` accessors in object literals and classes, and implemented `Object.{defineProperty, defineProperties, getOwnPropertyDescriptor, getOwnPropertyDescriptors, getOwnPropertyNames}` with GC write barriers and verifier coverage.
+
+**M35 (done — Class Fields, Private Members (`#`), and Static Blocks)**
+- **M35:** Implemented D65 across both engines: public and private instance/static class fields (`x = 1`, `static x = 1`, `#x = 1`, `static #x = 1`), private methods and accessors (`#m()`, `get #x()`, `set #x(v)`), ergonomic brand checks (`#x in obj`), and `static { ... }` initialization blocks.
+
+**M36 (done — `Symbol`, `Symbol.iterator`, and `IteratorClose`)**
+- **M36:** Implemented D66 across both engines and the Zig/C embedding APIs: `Symbol` heap values (`Value.symbol`, `HandleKind.symbol` / `ZQJS_HANDLE_SYMBOL`), symbol-keyed properties and `Object.getOwnPropertySymbols`, global registry (`Symbol.for`/`Symbol.keyFor`), custom `[Symbol.iterator]` protocol, and `IteratorClose` on abrupt exit from `for...of` and destructuring.
+
+**M37 (done — Synchronous Generators: `function*`, `yield`, `yield*`)**
+- **M37:** Implemented D67 across both engines: `function*` declarations/expressions/methods, `yield` and `yield*` delegation, generator objects (`next`, `throw`, `return`) reusing D56 coroutines and D55 `finally` unwinding, with full GC-stress and OOM coverage.
+
+**M38 (done — Async Generators, `for await`, and Generator Prototypes)**
+- **M38:** Implemented D68 across both engines: `async function*` declarations/expressions/methods, `for await (... of ...)` (supporting both `Symbol.asyncIterator` and sync-to-async fallback via `Symbol.iterator`), FIFO async-generator request queues, `yield` / `yield*` inside async generators, and standard `GeneratorFunction` / `AsyncGeneratorFunction` / `AsyncFunction` prototype chains.
+
+**M39 (done — `for...in` and `Object` Prototype, Extensibility & Integrity APIs)**
+- **M39:** Implemented D69 across both engines: `for...in` enumeration over own and inherited enumerable string keys (respecting live deletions and shadowed keys), `Object.{setPrototypeOf, is, hasOwn, preventExtensions, isExtensible, seal, isSealed, freeze, isFrozen, fromEntries}`, `Object.prototype.{hasOwnProperty, isPrototypeOf, propertyIsEnumerable}`, and `__proto__` accessor support with cycle rejection.
+
+**M40 (done — User Conversions & Well-Known Symbols)**
+- **M40:** Implemented D70 across both engines (retiring D40's rejection of user conversions): full `ToPrimitive` honoring `[Symbol.toPrimitive]`, `valueOf`, and `toString`, `Array.prototype.join` honoring custom element conversions, `JSON.stringify` invoking `toJSON`, plus well-known symbols `Symbol.toStringTag` and `Symbol.hasInstance`.
+
+**M41 (done — Interactive REPL)**
+- **M41:** Implemented D71 in `src/repl/`: raw-mode line editor (`editor.zig`) with history, multi-line completeness detection, `.editor` paste mode, dot-commands (`.help`, `.clear`, `.load`, `.save`, `.gc`, `.stats`, `.exit`), persistent top-level session state (`session.zig`), and colored object/value inspector (`inspect.zig`) launched by `zqjs` with no file arguments.
+
+**M42 (done — ES Modules & Host Module Loader)**
+- **M42:** Implemented D72 across both engines, CLI, Zig API, and C ABI: static `import`/`export` syntax (default, named, namespace `* as ns`, re-exports, side-effect imports), live module bindings with TDZ, cyclic module graph linking and evaluation (`src/runtime/module.zig`), and host-provided module resolver/loader hooks.
+
+**M43 (done — `ArrayBuffer`, `TypedArray`, and `DataView`)**
+- **M43:** Implemented D73 across both engines and the REPL inspector: `ArrayBuffer` (with byte-length limits accounted in `max_heap_bytes`), all 9 numeric `TypedArray` views (`Int8`, `Uint8`, `Uint8Clamped`, `Int16`, `Uint16`, `Int32`, `Uint32`, `Float32`, `Float64`) sharing `%TypedArray%.prototype` methods, and `DataView` with little/big-endian getters and setters.
+
+**M44 (done — Everyday Built-ins Pack)**
+- **M44:** Implemented D74 across both engines: `JSON.parse` `reviver` and `JSON.stringify` `replacer`/`space`, ES2024 `Object.groupBy` / `Map.groupBy`, `Promise.{withResolvers, try}`, ES2025 `Set` set-theory methods (`union`, `intersection`, `difference`, `symmetricDifference`, `isSubsetOf`, `isSupersetOf`, `isDisjointFrom`), `Array.prototype.{flat, flatMap, toReversed, toSorted, toSpliced, with}`, `String.prototype.{matchAll, codePointAt}` + `String.{fromCharCode, fromCodePoint}`, and URI globals (`encodeURI`, `decodeURI`, `encodeURIComponent`, `decodeURIComponent`).
+
+**M45 (done — `WeakMap` and `WeakSet` with Zero-Allocation Ephemeron GC)**
+- **M45:** Implemented D75 across both engines and the REPL inspector: `WeakMap` and `WeakSet` supporting ES2023 `CanBeHeldWeakly` keys (objects, closures, non-registered symbols, native functions) backed by zero-allocation ephemeron tracing and weak-entry sweeping in `src/runtime/heap.zig`.
+
+**M46 (done — `Proxy` and `Reflect`)**
+- **M46:** Implemented D76 across both engines, `JSON.stringify`, and the REPL inspector: `new Proxy(target, handler)`, `Proxy.revocable`, all 13 ECMAScript traps with invariant checks, and all 13 `Reflect` namespace methods.
+
+**M47 (done — Pure-Zig `BigInt`, `BigInt64Array`, and `BigUint64Array`)**
+- **M47:** Implemented D77 across both engines, REPL inspector, and Zig/C APIs: arbitrary-precision `BigInt` literals (`10n`, `0xffn`, `0o77n`, `0b101n`), arithmetic/bitwise/comparison/conversion operators (`BigInt(...)`, `BigInt.asIntN`, `BigInt.asUintN`, `BigInt.prototype.toString(radix)`), bounded by `Limits.max_bigint_bits` and `rt.steps`, plus `BigInt64Array`, `BigUint64Array`, and `DataView.{get,set}Big{Int,Uint}64`.
+
+**M48 (done — Modern ESM: Top-Level `await`, Dynamic `import()`, and `import.meta`)**
+- **M48:** Implemented D78 across both engines, CLI, Zig API, and C ABI: ES2020 `import.meta` (per-module metadata object with `url`), ES2020 dynamic `import(specifier)` returning a `Promise` for the module namespace, and ES2022 module top-level `await` / `for await` with async module evaluation graphs.
+
+**M49 (done — Test262 Conformance Runner & Polish)**
+- **M49:** Added `tools/test262.py` and `TEST262.md` and implemented D79 conformance fixes across VM, treewalk, built-ins, and regex. Verified across 39,332 executed Test262 cases with **0 internal errors / 0 crashes** (`built-ins`: 97.56%, `language`: 87.61% on supported subset).
+
+**M50 (done — `Date` Built-in & Calendar Engine)**
+- **M50:** Implemented D80 across both engines and the REPL inspector: pure-Zig calendar engine (`src/runtime/date.zig`), `Date` constructor/function, `Date.{now, parse, UTC}`, full `Date.prototype` UTC/local getters/setters and formatting (`toISOString`, `toJSON`, `toUTCString`, `toString`, `toDateString`, `toTimeString`), POSIX `localtime_r` timezone handling, and optional `Runtime.wall_clock` host hook.
+
+**M51 (done — `structuredClone` and `ArrayBuffer` Transfer/Detachment)**
+- **M51:** Implemented D81 across both engines, `Heap`, Zig API, and C ABI: global `structuredClone(value, options?)` (`src/runtime/clone.zig`) with cycle-safe cloning for primitives, `BigInt`, `Date`, `RegExp`, `Map`, `Set`, `Array`, ordinary objects, `Error`, `ArrayBuffer`, `TypedArray`, and `DataView`, plus zero-copy `options.transfer` detachment (`ArrayBuffer.prototype.{detached, transfer, transferToFixedLength}`).

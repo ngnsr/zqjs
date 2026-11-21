@@ -65,25 +65,25 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `legacy_octal` | restriction | `017`, `09`, `'\1'`, `'\08'` | sloppy-mode legacy syntax |
 | `non_ascii_source` | restriction | `é = 1`, NBSP outside strings | identifiers and whitespace are ASCII only. Non-ASCII is fine inside strings and comments |
 | `invalid_utf8` | restriction | malformed bytes in the source file | source must be valid UTF-8 |
-| `bigint` | not yet | `10n` | |
-| `global_assignment` | restriction (revisit at M9) | `y = 1`, `undefined = 1`, `y++` with no declaration of `y` | sloppy JS silently creates (or ignores writes to) globals; ZQJS has no writable globals yet |
+| `bigint` | retired (M47) | *(implemented in M47)* | retained in `diag.Feature` enum for stability; `10n` / `BigInt` are now supported |
+| `global_assignment` | restriction | `y = 1`, `undefined = 1`, `y++` with no declaration of `y` | sloppy JS silently creates (or ignores writes to) globals; ZQJS forbids implicit global writes |
 | `function_to_string` | not yet | `print(print)`, `'' + f`, `f < 'a'`, `f < g` | JS converts a function to its source text; ZQJS has none to show or compare |
 | `block_function` | restriction | `{ function f() {} }`, `if (c) function f() {}` | sloppy-mode Annex B gives block-level function declarations two bindings; declare functions at the top of a script or function body, or use `let f = function () {}` |
 | `duplicate_parameter` | restriction | `function f(a, a) {}` | legal in sloppy JS (the last one wins) |
 | `duplicate_function` | restriction | `function f() {} function f() {}`, `function f(a) { function a() {} }`, `function NaN() {}` | legal in sloppy JS (the later declaration wins, or a global is redefined) |
 | `function_name_assignment` | restriction | `let g = function n() { n = 1; };` | sloppy JS silently ignores the write |
 | `arguments` | not yet | `arguments`, `function f(arguments) {}` | the arguments object |
-| `builtin` | not yet | `Math.PI`, `[].map`, `'x'.toUpperCase`, `Object.assign`, `({}).constructor`, `o.__proto__`, `{ __proto__: p }`, `Object()` | a global or built-in member node has but ZQJS doesn't implement (the diagnostic names it; DESIGN_DECISIONS D39) |
+| `builtin` | not yet | `Intl`, `WeakRef`, `FinalizationRegistry`, `eval`, `Function(...)`, … | a global or built-in member node has that ZQJS doesn't implement yet (the diagnostic names it; DESIGN_DECISIONS D39) |
 | `sparse_array` | restriction (revisit) | `[1,,2]`, `delete a[0]`, `a[a.length + 1] = x`, `a.length = 10` | arrays have no holes |
-| `user_conversion` | not yet | `print({ toString() { return 'x'; } })`, `o.valueOf = …; o + 1` | converting an object through a user-defined toString/valueOf/join (D40) |
+| `user_conversion` | retired (M40) | *(implemented in M40)* | retained in `diag.Feature` enum for stability; `Symbol.toPrimitive`, `toString`/`valueOf`, and `toJSON` are now supported (D70) |
 | `sloppy_this` | restriction | `this` at script level, `const f = o.m; f()` where `m` reads `this` | sloppy JS uses the global object (or boxes a primitive receiver) |
-| `arrow_this` | not yet | `() => this`, `function f() { return () => this; }` | lexical `this` inside arrow functions |
-| `function_properties` | not yet | `f.x`, `f.length`, `print.name`, `o instanceof F` | functions aren't objects yet (no `.prototype` property on user functions) |
+| `arrow_this` | retired (M31) | *(implemented in M31)* | retained in `diag.Feature` enum for stability; lexical `this` in arrows is now supported (D62) |
+| `function_properties` | retired (M31) | *(implemented in M31)* | retained in `diag.Feature` enum for stability; functions are first-class objects (D62) |
 | `primitive_write` | restriction | `'s'.x = 1`, `delete 'ab'.length` | sloppy JS silently ignores these |
 | `regex_annex_b` | restriction | `/{/`, `/(?=a)*/`, `/\8/` | Annex B web-reality RegExp syntax |
 | `regex_unicode_escape_braced` | restriction | `/\u{41}/` | `\u{...}` RegExp escapes without `u`/`v` mode (Annex B identity escape in JS) |
 | `regex_unicode_property` | restriction | `/\p{ASCII}/` | `\p{...}` and `\P{...}` RegExp unicode property escapes without `u`/`v` mode (Annex B identity escape in JS) |
-| `syntax` | not yet | `var`, `for…in`, `let` used as a variable name, generators (including `async function*`), `for await`, top-level `await` … | any JS token or construct not yet in the grammar below |
+| `syntax` | not yet | `var`, `with`, `let` used as a variable name, `eval`, … | any JS token or construct not yet in the grammar below |
 
 ## 3. Lexical grammar (M1)
 
@@ -327,9 +327,33 @@ evaluated); reading an undeclared global throws a **ReferenceError**.
   - Literals (`/pattern/flags`) and `RegExp(pattern[, flags])` / `new RegExp(pattern[, flags])`: every literal evaluation creates a fresh `RegExp` object with `lastIndex = 0`; `RegExp(re)` returns `re` unchanged when `flags === undefined`, while `new RegExp(re)` clones it and `RegExp(re, flags)` recompiles with new flags. Empty pattern has `.source === "(?:)"`.
   - Flags: `d` (`hasIndices`), `g` (`global`), `i` (`ignoreCase`, full Unicode and legacy non-`u` case folding), `m` (`multiline`), `s` (`dotAll`), `u` (`unicode`), `v` (`unicodeSets`), `y` (`sticky`). Duplicate flags, unknown flags, or combining `u` and `v` raise `SyntaxError` (early for literals, thrown `SyntaxError` for `RegExp(...)`).
   - Pattern features: character classes, `\d`/`\D`/`\w`/`\W`/`\s`/`\S`, `.`, `^`, `$`, `\b`/`\B`, greedy and lazy `*`/`+`/`?`/`{n,m}`, capturing `(…)` and non-capturing `(?:…)`, named capturing groups (`(?<name>…)`, `\k<name>`), multi-digit backreferences (`\10+`), control escapes (`\cA`..`\cZ`), lookahead (`(?=…)` / `(?!…)`), lookbehind (`(?<=…)` / `(?<!…)`), inline flag modifiers (`(?ims-ims:…)`), and in `u`/`v` mode code-point matching, `\u{…}`, `\p{…}` / `\P{…}`, plus `v`-mode nested classes, `&&`, `--`, `\q{…}`, and properties of strings (`\p{Basic_Emoji}`, etc.). Annex B regex syntax reports `Unsupported(regex_annex_b)` (or `regex_unicode_escape_braced` / `regex_unicode_property` outside `u`/`v` mode).
-  - Instance properties & methods: writable `lastIndex` (non-configurable, `delete re.lastIndex === false`), read-only `source`, `flags` (sorted `"dgimsuvy"`), `hasIndices`, `global`, `ignoreCase`, `multiline`, `dotAll`, `unicode`, `unicodeSets`, `sticky` (`Object.keys(re)` is `[]`), `re instanceof RegExp`, `RegExp.prototype.exec(str)` (returns `[full, cap1, …]` with `.index`, `.input`, `.groups`, and `.indices` when `d` is set, or `null`, updating `lastIndex` on `g`/`y`), `RegExp.prototype.test(str)`, and `RegExp.prototype.toString()` (allowed under D40 for `String(re)`, `"" + re`, `` `${re}` ``, `print(re)`).
-  - `String.prototype`: `match(regexp)`, `search(regexp)`, `replace(regexp, repl)` and `replaceAll(regexp, repl)` (`TypeError` on non-`g` `RegExp`; supports `$$`, `$&`, `` $` ``, `$'`, `$1`..`$9`/`$nn`, `$<name>`, and callback `(match, p1, …, offset, str[, groups])`), and `split(regexp[, limit])` (splices captured groups without mutating `regexp.lastIndex`). `matchAll` remains `Unsupported(builtin)`.
+  - Instance properties & methods: writable `lastIndex` (non-configurable, `delete re.lastIndex === false`), read-only `source`, `flags` (sorted `"dgimsuvy"`), `hasIndices`, `global`, `ignoreCase`, `multiline`, `dotAll`, `unicode`, `unicodeSets`, `sticky` (`Object.keys(re)` is `[]`), `re instanceof RegExp`, `RegExp.prototype.exec(str)` (returns `[full, cap1, …]` with `.index`, `.input`, `.groups`, and `.indices` when `d` is set, or `null`, updating `lastIndex` on `g`/`y`), `RegExp.prototype.test(str)`, and `RegExp.prototype.toString()`.
+  - `String.prototype`: `match(regexp)`, `matchAll(regexp)` (M44), `search(regexp)`, `replace(regexp, repl)` and `replaceAll(regexp, repl)` (`TypeError` on non-`g` `RegExp`; supports `$$`, `$&`, `` $` ``, `$'`, `$1`..`$9`/`$nn`, `$<name>`, and callback `(match, p1, …, offset, str[, groups])`), and `split(regexp[, limit])` (splices captured groups without mutating `regexp.lastIndex`).
   - Limits: pattern group nesting is bounded by `Limits.max_nesting_depth` (`LimitExceeded(nesting_depth)`), structural pattern ceilings in `src/limits.zig` report `LimitExceeded(code_bytes)`, matcher backtracking steps charge `rt.steps` (`LimitExceeded(steps)`), and matcher allocations charge `rt.heap` (`LimitExceeded(heap_bytes)`).
+- **Functions as Objects, Constructors & Lexical Arrow `this` (M31, D62):**
+  - User and native functions inherit from `Function.prototype -> Object.prototype`, carry own properties (`name`, `length`, `prototype`, plus user-assigned properties), support `new F(...)` and `x instanceof F`, and provide `Function.prototype.{call, apply, bind}`.
+  - Arrow functions capture lexical `this` from their enclosing function scope.
+- **Labels, Comma Operator & Tagged Templates (M32):**
+  - Labeled statements (`label: stmt`, `break label;`, `continue label;`), the comma operator `(a, b)`, and tagged template literals (`` tag`a${x}b` `` with cached frozen template object and `.raw` array).
+- **Classes, Accessors, Descriptors & Private Members (M33–M35, D63–D65):**
+  - `class` declarations/expressions, `extends` (including `extends null`), `super(...)`, `super.prop`/`super[k]`/`super.m()`, public/private instance & static fields (`x = 1`, `static x = 1`, `#x = 1`, `static #x = 1`), private methods & accessors, ergonomic brand checks (`#x in obj`), and `static { ... }` blocks.
+  - Full ECMAScript property descriptors (`enumerable`, `writable`, `configurable`, `get`/`set` accessors) in object literals, classes, and `Object.{defineProperty, defineProperties, getOwnPropertyDescriptor, getOwnPropertyDescriptors, getOwnPropertyNames}`.
+- **`Symbol`, Custom Iterables, Generators & Async Generators (M36–M38, D66–D68):**
+  - `Symbol(desc)`, `Symbol.for`/`Symbol.keyFor`, symbol-keyed properties, `Object.getOwnPropertySymbols`, custom `[Symbol.iterator]` with `IteratorClose`, `Symbol.asyncIterator`, `Symbol.toPrimitive`, `Symbol.toStringTag`, and `Symbol.hasInstance`.
+  - Synchronous generators (`function*`, `yield`, `yield*`, `next`/`throw`/`return`) and async generators (`async function*`, `for await (... of ...)`).
+- **`for...in`, `Object` Integrity & User Conversions (M39–M40, D69–D70):**
+  - `for...in` over own and inherited enumerable string keys; `Object.{setPrototypeOf, is, hasOwn, preventExtensions, isExtensible, seal, isSealed, freeze, isFrozen, fromEntries}`, `Object.prototype.{hasOwnProperty, isPrototypeOf, propertyIsEnumerable}`, and `__proto__`.
+  - User-defined conversions via `[Symbol.toPrimitive]`, `valueOf`, `toString`, and `JSON.stringify` `toJSON` (retiring D40's restriction).
+- **ES Modules (M42, M48, D72, D78):**
+  - Static `import`/`export` (default, named, `* as ns`, re-exports, side-effect imports), live bindings, cyclic graphs, `import.meta`, dynamic `import(specifier)`, and module top-level `await` / `for await`.
+- **Binary Data, `BigInt`, Weak Collections, `Proxy`/`Reflect`, `Date`, `structuredClone` & ES2024/2025 Built-ins (M43–M51, D73–D81):**
+  - `ArrayBuffer` (with `detached`, `transfer`, `transferToFixedLength`), all 11 `TypedArray` views (`Int8`..`Float64`, `BigInt64Array`, `BigUint64Array`), and `DataView`.
+  - Arbitrary-precision `BigInt` (`10n`, `0xffn`, `BigInt(...)`, `asIntN`/`asUintN`, bounded by `Limits.max_bigint_bits` and `rt.steps`).
+  - `WeakMap` and `WeakSet` (ephemeron GC, ES2023 `CanBeHeldWeakly` keys including non-registered symbols).
+  - `Proxy`, `Proxy.revocable`, and `Reflect` (all 13 traps/methods with invariant checks).
+  - `Date` (`Date.now`/`parse`/`UTC`, full `Date.prototype` UTC/local getters/setters/formatters, optional `Runtime.wall_clock` hook).
+  - `structuredClone(value, options?)` with cycle-safe cloning and `options.transfer` zero-copy `ArrayBuffer` detachment.
+  - Everyday built-ins pack (M44): `JSON.parse` reviver & `JSON.stringify` replacer/space, `Object.groupBy`/`Map.groupBy`, `Promise.{withResolvers, try}`, ES2025 `Set` set-theory methods, `Array.prototype.{flat, flatMap, toReversed, toSorted, toSpliced, with}`, `String.{fromCharCode, fromCodePoint}` / `String.prototype.codePointAt`, and `encodeURI`/`decodeURI`/`encodeURIComponent`/`decodeURIComponent`.
 
 ### Bindings
 

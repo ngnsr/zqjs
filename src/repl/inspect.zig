@@ -13,6 +13,7 @@ const PropKey = heap.PropKey;
 const Property = heap.Property;
 const Runtime = @import("../runtime/runtime.zig").Runtime;
 const ops = @import("../runtime/ops.zig");
+const date = @import("../runtime/date.zig");
 const ast = @import("../frontend/ast.zig");
 const Proto = @import("../bytecode/bytecode.zig").Proto;
 
@@ -261,6 +262,15 @@ const Context = struct {
 
         // Special built-in kinds first.
         switch (obj.kind) {
+            .date => |tv| {
+                if (std.math.isFinite(tv)) {
+                    var buf: [64]u8 = undefined;
+                    try ctx.w.print("{s}{s}{s}", .{ ctx.style(Ansi.magenta), date.formatISO(&buf, tv), ctx.reset() });
+                } else {
+                    try ctx.w.print("{s}Invalid Date{s}", .{ ctx.style(Ansi.magenta), ctx.reset() });
+                }
+                return;
+            },
             .regexp => |re| {
                 try ctx.w.writeAll(ctx.style(Ansi.red));
                 try ctx.w.writeByte('/');

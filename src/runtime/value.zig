@@ -71,6 +71,7 @@ pub const Native = struct {
         uri_error,
         aggregate_error,
         regexp,
+        date,
         symbol,
         array_buffer,
         data_view,

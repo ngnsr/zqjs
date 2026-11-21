@@ -1986,3 +1986,20 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
   - Evaluates `this` TDZ (`push_this`/`pop` in `compiler.zig`, `requireThis()` in `machine.zig`) before evaluating `expr` in `super[expr]` get/set/update expressions per ES 13.3.7.1.
 - **Test262 Runner (`tools/test262.py`):**
   - Injects harness shims (and `globalThis` bindings) for non-raw `--module` tests in the test's directory so relative imports resolve, and skips Stage 2/3 proposals (`import-defer`, `iterator-chunking`, `iterator-includes`, `Math.sumPrecise`, `await-dictionary`, `Iterator.prototype.join`, `json-parse-with-source`).
+
+---
+
+## D80. `Date` Built-in & Calendar Engine (M50)
+
+**Decision:** Implement ECMAScript `Date` with zero external dependencies using a shared pure-Zig calendar engine (`src/runtime/date.zig`), POSIX `localtime_r` for host-matching local timezone offsets, and an optional `Runtime.wall_clock` hook for deterministic testing/embedding.
+
+- **Heap & Wall-Clock Hook (`heap.zig`, `runtime.zig`):**
+  - `Object.kind.date: f64` stores the `[[DateValue]]` timestamp in UTC milliseconds (`NaN` for Invalid Date, clipped via `TimeClip` to `|t| <= 8.64e15`) with no child pointers to trace.
+  - `Runtime.wall_clock: ?*const fn (ctx: ?*anyopaque) i64 = null` + `wall_clock_ctx: ?*anyopaque = null` defaults to `date.systemNowMs()` (`std.c.gettimeofday`) when `null`.
+- **Calendar Math, Parsing & Formatting (`src/runtime/date.zig`):**
+  - Implements `timeClip`, `makeTime`, `makeDay`, `makeDate`, `weekDay`, and `decompose` using Howard Hinnant's civil-date algorithm (`civilFromDays` / `daysFromCivil`) over the full `±8.64e15` ms range, including leap years and negative/BCE years.
+  - Queries POSIX `localtime_r` (`std.c` + `extern "c"`) for local timezone offsets and zone abbreviations (with an equivalent-year fallback for out-of-range `time_t`), using a two-step fixed point in `utcFromLocal` to match Node on the same host.
+  - `parse` supports ISO-8601 (`YYYY`, `YYYY-MM`, `YYYY-MM-DD` as UTC, `THH:mm(:ss(.sss)?)?(Z|[+-]HH:mm)?`, expanded 6-digit signed years `±YYYYYY`) and RFC-2822 / `toUTCString()` / `toString()` round-tripping.
+- **Built-ins, Inspector & Registry (`builtins.zig`, `object.zig`, `inspect.zig`, `gen_builtins.js`):**
+  - Exposes `Date` constructor (`new Date()`, `new Date(v)`, `new Date(y, m, ...)`, and `Date(...)` without `new`), `Date.{now, UTC, parse}`, and `Date.prototype` getters/setters, `toISOString`, `toUTCString`, `toString`, `toDateString`, `toTimeString`, `toJSON`, and `[Symbol.toPrimitive]` (via `object.ordinaryToPrimitive`), throwing `TypeError` on non-`Date` receivers (except generic `toJSON` and `[Symbol.toPrimitive]`).
+  - `src/repl/inspect.zig` formats valid `Date` instances as ISO-8601 strings and invalid ones as `Invalid Date`; `tools/gen_builtins.js` registers `date_constructor` and `date_prototype`.

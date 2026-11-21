@@ -321,7 +321,7 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
                 return null;
             }
         },
-        .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy => {},
+        .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
     if (o.props.count() == 0) return null; // don't intern index keys just to miss
     return o.props.get(try propKey(rt, k));
@@ -624,7 +624,7 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!b
                         return true;
                     }
                 },
-                .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy => {},
+                .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
             }
             const pk = try propKey(rt, k);
             if (!o.extensible and !o.props.contains(pk)) {
@@ -831,7 +831,7 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
             }
         },
         .proxy => return builtins.proxyDeleteProperty(rt, o, k),
-        .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set => {},
+        .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .date => {},
     }
     if (o.props.count() == 0) return true;
     const pk = try propKey(rt, k);
@@ -1045,7 +1045,7 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
             for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
         .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
-        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
     const first_named = out.items.len;
     try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false, false);
@@ -1063,7 +1063,7 @@ pub fn ownPropertyNames(rt: *Runtime, o: *Object) Error![]Key {
             for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
         .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
-        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
     const first_named = out.items.len;
     try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false, true);
@@ -1081,7 +1081,7 @@ pub fn ownAllKeys(rt: *Runtime, o: *Object) Error![]Key {
             for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
         .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
-        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
     const first_named = out.items.len;
     try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, true, false);
@@ -1147,7 +1147,7 @@ pub fn toPrimitive(rt: *Runtime, v: Value, hint: Hint) Error!Value {
     return ordinaryToPrimitive(rt, v, if (hint == .string) .string else .number);
 }
 
-fn ordinaryToPrimitive(rt: *Runtime, v: Value, hint: Hint) Error!Value {
+pub fn ordinaryToPrimitive(rt: *Runtime, v: Value, hint: Hint) Error!Value {
     const order: [2][]const u8 = if (hint == .string) .{ "toString", "valueOf" } else .{ "valueOf", "toString" };
     for (order) |method| {
         const f = get(rt, v, try named(rt, method)) catch |err| {

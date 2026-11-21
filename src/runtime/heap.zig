@@ -654,6 +654,8 @@ pub const Object = struct {
         weak_set: WeakSetState,
         /// ES Proxy exotic object (M46, D76); boxed so `Object` stays small.
         proxy: *ProxyState,
+        /// Date object timestamp in UTC ms since epoch, or NaN for Invalid Date (M50, D80).
+        date: f64,
     } = .ordinary,
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
@@ -1083,7 +1085,7 @@ pub const Heap = struct {
                     RememberedScan.child(&scan, &e.name.obj);
                     RememberedScan.child(&scan, &e.cell.obj);
                 },
-                .array_buffer => {},
+                .array_buffer, .date => {},
                 .typed_array => |ta| RememberedScan.child(&scan, &ta.buffer.obj),
                 .data_view => |dv| RememberedScan.child(&scan, &dv.buffer.obj),
                 .weak_map => |*wm| {
@@ -1452,6 +1454,12 @@ pub const Heap = struct {
 
     pub fn weakSetDelete(o: *Object, key: WeakKey) bool {
         return o.kind.weak_set.entries.remove(key);
+    }
+
+    pub fn newDate(h: *Heap, proto: ?*Object, time_val: f64) Error!*Object {
+        const o = try h.newObject(proto);
+        o.kind = .{ .date = time_val };
+        return o;
     }
 
     pub fn newIterator(h: *Heap, proto: ?*Object, target: Value, kind: IteratorKind) Error!*Object {
@@ -2065,7 +2073,7 @@ pub const Heap = struct {
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
         return switch (arr.kind) {
             .array => |*elements| elements,
-            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .module_namespace, .array_buffer, .typed_array, .data_view, .weak_map, .weak_set, .proxy => unreachable, // only arrays have elements
+            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .module_namespace, .array_buffer, .typed_array, .data_view, .weak_map, .weak_set, .proxy, .date => unreachable, // only arrays have elements
         };
     }
 
@@ -2419,7 +2427,7 @@ pub const Heap = struct {
                     },
                     .module_namespace => |ns| h.allocator().free(ns.entries),
                     .array_buffer => |ab| h.allocator().free(ab.data),
-                    .typed_array, .data_view => {},
+                    .typed_array, .data_view, .date => {},
                     .weak_map => |*wm| wm.entries.deinit(h.allocator()),
                     .weak_set => |*ws| ws.entries.deinit(h.allocator()),
                     .proxy => |px| h.allocator().destroy(px),
@@ -2602,7 +2610,7 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                     visit(ctx, @constCast(&e.name.obj));
                     visit(ctx, &e.cell.obj);
                 },
-                .array_buffer => {},
+                .array_buffer, .date => {},
                 .typed_array => |ta| visit(ctx, &ta.buffer.obj),
                 .data_view => |dv| visit(ctx, &dv.buffer.obj),
                 // WeakMap/WeakSet keys and WeakMap values are traced by the ephemeron

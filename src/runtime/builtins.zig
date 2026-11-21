@@ -33,6 +33,7 @@ const bigint = @import("bigint.zig");
 const object = @import("object.zig");
 const names = @import("builtin_names.zig");
 const json = @import("json.zig");
+const date = @import("date.zig");
 const regex = @import("../regex.zig");
 const Feature = @import("../frontend/diag.zig").Feature;
 const ast = @import("../frontend/ast.zig");
@@ -72,7 +73,8 @@ pub const Realm = struct {
     uri_error_prototype: *Object,
     aggregate_error_prototype: *Object,
     regexp_prototype: *Object,
-    /// Static members of the `Object`, `Array`, `String`, `Number`, `Map`, `Set`, `Promise`, `Error`, and `RegExp` globals.
+    date_prototype: *Object,
+    /// Static members of the `Object`, `Array`, `String`, `Number`, `Map`, `Set`, `Promise`, `Error`, `RegExp`, and `Date` globals.
     object_namespace: *Object,
     array_namespace: *Object,
     string_namespace: *Object,
@@ -93,6 +95,7 @@ pub const Realm = struct {
     uri_error_namespace: *Object,
     aggregate_error_namespace: *Object,
     regexp_namespace: *Object,
+    date_namespace: *Object,
     symbol_prototype: *Object,
     symbol_namespace: *Object,
     bigint_prototype: *Object,
@@ -108,7 +111,7 @@ pub const Realm = struct {
     views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [55]*Object {
+    pub fn objects(r: *const Realm) [57]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -139,6 +142,7 @@ pub const Realm = struct {
             r.uri_error_prototype,
             r.aggregate_error_prototype,
             r.regexp_prototype,
+            r.date_prototype,
             r.symbol_prototype,
             r.bigint_prototype,
             r.object_namespace,
@@ -161,6 +165,7 @@ pub const Realm = struct {
             r.uri_error_namespace,
             r.aggregate_error_namespace,
             r.regexp_namespace,
+            r.date_namespace,
             r.symbol_namespace,
             r.bigint_namespace,
             r.math,
@@ -251,6 +256,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .uri_error_prototype = try builtin(h, error_prototype, .uri_error_prototype),
         .aggregate_error_prototype = try builtin(h, error_prototype, .aggregate_error_prototype),
         .regexp_prototype = try builtin(h, object_prototype, .regexp_prototype),
+        .date_prototype = try builtin(h, object_prototype, .date_prototype),
         .object_namespace = try builtin(h, null, .object_constructor),
         .array_namespace = try builtin(h, null, .array_constructor),
         .string_namespace = try builtin(h, null, .string_constructor),
@@ -271,6 +277,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .uri_error_namespace = try builtin(h, null, .uri_error_constructor),
         .aggregate_error_namespace = try builtin(h, null, .aggregate_error_constructor),
         .regexp_namespace = try builtin(h, null, .regexp_constructor),
+        .date_namespace = try builtin(h, null, .date_constructor),
         .symbol_prototype = try builtin(h, object_prototype, .symbol_prototype),
         .symbol_namespace = try builtin(h, null, .symbol_constructor),
         .bigint_prototype = try builtin(h, object_prototype, .bigint_prototype),
@@ -489,6 +496,57 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.regexp_prototype, "exec", &regexp_exec);
     try method(rt, r.regexp_prototype, "test", &regexp_test);
     try method(rt, r.regexp_prototype, "toString", &regexp_to_string);
+    try constant(rt, r.date_namespace, "prototype", .{ .object = r.date_prototype });
+    try method(rt, r.date_namespace, "now", &date_now);
+    try method(rt, r.date_namespace, "UTC", &date_utc);
+    try method(rt, r.date_namespace, "parse", &date_parse);
+    try constant(rt, r.date_prototype, "constructor", .{ .native = &date_global });
+    try method(rt, r.date_prototype, "getTime", &date_get_time);
+    try method(rt, r.date_prototype, "valueOf", &date_value_of);
+    try method(rt, r.date_prototype, "getTimezoneOffset", &date_get_timezone_offset);
+    try method(rt, r.date_prototype, "setTime", &date_set_time);
+    try method(rt, r.date_prototype, "getUTCFullYear", &date_get_utc_full_year);
+    try method(rt, r.date_prototype, "getUTCMonth", &date_get_utc_month);
+    try method(rt, r.date_prototype, "getUTCDate", &date_get_utc_date);
+    try method(rt, r.date_prototype, "getUTCDay", &date_get_utc_day);
+    try method(rt, r.date_prototype, "getUTCHours", &date_get_utc_hours);
+    try method(rt, r.date_prototype, "getUTCMinutes", &date_get_utc_minutes);
+    try method(rt, r.date_prototype, "getUTCSeconds", &date_get_utc_seconds);
+    try method(rt, r.date_prototype, "getUTCMilliseconds", &date_get_utc_milliseconds);
+    try method(rt, r.date_prototype, "setUTCFullYear", &date_set_utc_full_year);
+    try method(rt, r.date_prototype, "setUTCMonth", &date_set_utc_month);
+    try method(rt, r.date_prototype, "setUTCDate", &date_set_utc_date);
+    try method(rt, r.date_prototype, "setUTCHours", &date_set_utc_hours);
+    try method(rt, r.date_prototype, "setUTCMinutes", &date_set_utc_minutes);
+    try method(rt, r.date_prototype, "setUTCSeconds", &date_set_utc_seconds);
+    try method(rt, r.date_prototype, "setUTCMilliseconds", &date_set_utc_milliseconds);
+    try method(rt, r.date_prototype, "getFullYear", &date_get_full_year);
+    try method(rt, r.date_prototype, "getMonth", &date_get_month);
+    try method(rt, r.date_prototype, "getDate", &date_get_date);
+    try method(rt, r.date_prototype, "getDay", &date_get_day);
+    try method(rt, r.date_prototype, "getHours", &date_get_hours);
+    try method(rt, r.date_prototype, "getMinutes", &date_get_minutes);
+    try method(rt, r.date_prototype, "getSeconds", &date_get_seconds);
+    try method(rt, r.date_prototype, "getMilliseconds", &date_get_milliseconds);
+    try method(rt, r.date_prototype, "setFullYear", &date_set_full_year);
+    try method(rt, r.date_prototype, "setMonth", &date_set_month);
+    try method(rt, r.date_prototype, "setDate", &date_set_date);
+    try method(rt, r.date_prototype, "setHours", &date_set_hours);
+    try method(rt, r.date_prototype, "setMinutes", &date_set_minutes);
+    try method(rt, r.date_prototype, "setSeconds", &date_set_seconds);
+    try method(rt, r.date_prototype, "setMilliseconds", &date_set_milliseconds);
+    try method(rt, r.date_prototype, "toISOString", &date_to_iso_string);
+    try method(rt, r.date_prototype, "toUTCString", &date_to_utc_string);
+    try method(rt, r.date_prototype, "toString", &date_to_string);
+    try method(rt, r.date_prototype, "toDateString", &date_to_date_string);
+    try method(rt, r.date_prototype, "toTimeString", &date_to_time_string);
+    try method(rt, r.date_prototype, "toJSON", &date_to_json);
+    try rt.heap.definePropKey(r.date_prototype, heap_mod.PropKey.fromSymbol(r.sym_to_primitive), .{
+        .value = .{ .native = &date_to_primitive },
+        .enumerable = false,
+        .writable = false,
+        .configurable = true,
+    });
     try constant(rt, r.function_namespace, "prototype", .{ .object = r.function_prototype });
     try constant(rt, r.function_prototype, "constructor", .{ .native = &function_global });
     try constant(rt, r.object_namespace, "prototype", .{ .object = r.object_prototype });
@@ -649,6 +707,7 @@ pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
         .uri_error => r.uri_error_namespace,
         .aggregate_error => r.aggregate_error_namespace,
         .regexp => r.regexp_namespace,
+        .date => r.date_namespace,
         .symbol => r.symbol_namespace,
         .bigint => r.bigint_namespace,
         .array_buffer => (try viewsRealm(rt)).array_buffer_namespace,
@@ -711,6 +770,7 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
         .uri_error => r.uri_error_prototype,
         .aggregate_error => r.aggregate_error_prototype,
         .regexp => r.regexp_prototype,
+        .date => r.date_prototype,
         .symbol => r.symbol_prototype,
         .bigint => r.bigint_prototype,
         .array_buffer => (try viewsRealm(rt)).array_buffer_prototype,
@@ -760,6 +820,7 @@ pub const eval_error_global: Native = .{ .name = "EvalError", .call = evalErrorC
 pub const uri_error_global: Native = .{ .name = "URIError", .call = uriErrorCall, .construct = uriErrorConstruct, .namespace = .uri_error };
 pub const aggregate_error_global: Native = .{ .name = "AggregateError", .call = aggregateErrorCall, .construct = aggregateErrorConstruct, .namespace = .aggregate_error };
 pub const regexp_global: Native = .{ .name = "RegExp", .call = regexpCall, .construct = regexpConstruct, .namespace = .regexp };
+pub const date_global: Native = .{ .name = "Date", .length = 7, .call = dateCall, .construct = dateConstruct, .namespace = .date };
 pub const symbol_global: Native = .{ .name = "Symbol", .call = symbolCall, .namespace = .symbol };
 pub const bigint_global: Native = .{ .name = "BigInt", .length = 1, .call = bigintCall, .namespace = .bigint };
 
@@ -809,6 +870,7 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "URIError")) return .{ .native = &uri_error_global };
     if (std.mem.eql(u8, name, "AggregateError")) return .{ .native = &aggregate_error_global };
     if (std.mem.eql(u8, name, "RegExp")) return .{ .native = &regexp_global };
+    if (std.mem.eql(u8, name, "Date")) return .{ .native = &date_global };
     if (std.mem.eql(u8, name, "Symbol")) return .{ .native = &symbol_global };
     if (std.mem.eql(u8, name, "BigInt")) return .{ .native = &bigint_global };
     if (std.mem.eql(u8, name, "ArrayBuffer")) return .{ .native = &array_buffer_global };
@@ -1213,6 +1275,7 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
                 .custom, .async_from_sync, .for_in => "Object",
             },
             .regexp => "RegExp",
+            .date => "Date",
             .module_namespace => "Module",
             .ordinary => if (o.is_error) "Error" else if (o.builtin == .number_prototype) "Number" else "Object",
             else => "Object",
@@ -2800,7 +2863,7 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                     }
                 },
                 .proxy => return proxyGetOwnPropertyDescriptor(rt, o, k),
-                .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set => {},
+                .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .date => {},
             }
             if (o.props.count() == 0) return null;
             return o.props.get(try object.propKey(rt, k));
@@ -10049,4 +10112,401 @@ fn reflectConstruct(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     try arg_roots.register(rt);
     defer arg_roots.unregister(rt);
     return constructWithNewTarget(rt, target, arg_list, new_target);
+}
+
+// ---------------------------------------------------------------- Date (M50, D80)
+
+const date_now: Native = .{ .name = "now", .length = 0, .call = dateNow };
+const date_utc: Native = .{ .name = "UTC", .length = 7, .call = dateUtc };
+const date_parse: Native = .{ .name = "parse", .length = 1, .call = dateParse };
+
+const date_get_time: Native = .{ .name = "getTime", .length = 0, .call = dateGetTime };
+const date_value_of: Native = .{ .name = "valueOf", .length = 0, .call = dateGetTime };
+const date_get_timezone_offset: Native = .{ .name = "getTimezoneOffset", .length = 0, .call = dateGetTimezoneOffset };
+const date_set_time: Native = .{ .name = "setTime", .length = 1, .call = dateSetTime };
+
+const date_get_utc_full_year: Native = .{ .name = "getUTCFullYear", .length = 0, .call = dateGetUtcFullYear };
+const date_get_utc_month: Native = .{ .name = "getUTCMonth", .length = 0, .call = dateGetUtcMonth };
+const date_get_utc_date: Native = .{ .name = "getUTCDate", .length = 0, .call = dateGetUtcDate };
+const date_get_utc_day: Native = .{ .name = "getUTCDay", .length = 0, .call = dateGetUtcDay };
+const date_get_utc_hours: Native = .{ .name = "getUTCHours", .length = 0, .call = dateGetUtcHours };
+const date_get_utc_minutes: Native = .{ .name = "getUTCMinutes", .length = 0, .call = dateGetUtcMinutes };
+const date_get_utc_seconds: Native = .{ .name = "getUTCSeconds", .length = 0, .call = dateGetUtcSeconds };
+const date_get_utc_milliseconds: Native = .{ .name = "getUTCMilliseconds", .length = 0, .call = dateGetUtcMilliseconds };
+
+const date_set_utc_full_year: Native = .{ .name = "setUTCFullYear", .length = 3, .call = dateSetUtcFullYear };
+const date_set_utc_month: Native = .{ .name = "setUTCMonth", .length = 2, .call = dateSetUtcMonth };
+const date_set_utc_date: Native = .{ .name = "setUTCDate", .length = 1, .call = dateSetUtcDate };
+const date_set_utc_hours: Native = .{ .name = "setUTCHours", .length = 4, .call = dateSetUtcHours };
+const date_set_utc_minutes: Native = .{ .name = "setUTCMinutes", .length = 3, .call = dateSetUtcMinutes };
+const date_set_utc_seconds: Native = .{ .name = "setUTCSeconds", .length = 2, .call = dateSetUtcSeconds };
+const date_set_utc_milliseconds: Native = .{ .name = "setUTCMilliseconds", .length = 1, .call = dateSetUtcMilliseconds };
+
+const date_get_full_year: Native = .{ .name = "getFullYear", .length = 0, .call = dateGetFullYear };
+const date_get_month: Native = .{ .name = "getMonth", .length = 0, .call = dateGetMonth };
+const date_get_date: Native = .{ .name = "getDate", .length = 0, .call = dateGetDate };
+const date_get_day: Native = .{ .name = "getDay", .length = 0, .call = dateGetDay };
+const date_get_hours: Native = .{ .name = "getHours", .length = 0, .call = dateGetHours };
+const date_get_minutes: Native = .{ .name = "getMinutes", .length = 0, .call = dateGetMinutes };
+const date_get_seconds: Native = .{ .name = "getSeconds", .length = 0, .call = dateGetSeconds };
+const date_get_milliseconds: Native = .{ .name = "getMilliseconds", .length = 0, .call = dateGetMilliseconds };
+
+const date_set_full_year: Native = .{ .name = "setFullYear", .length = 3, .call = dateSetFullYear };
+const date_set_month: Native = .{ .name = "setMonth", .length = 2, .call = dateSetMonth };
+const date_set_date: Native = .{ .name = "setDate", .length = 1, .call = dateSetDate };
+const date_set_hours: Native = .{ .name = "setHours", .length = 4, .call = dateSetHours };
+const date_set_minutes: Native = .{ .name = "setMinutes", .length = 3, .call = dateSetMinutes };
+const date_set_seconds: Native = .{ .name = "setSeconds", .length = 2, .call = dateSetSeconds };
+const date_set_milliseconds: Native = .{ .name = "setMilliseconds", .length = 1, .call = dateSetMilliseconds };
+
+const date_to_iso_string: Native = .{ .name = "toISOString", .length = 0, .call = dateToIsoString };
+const date_to_utc_string: Native = .{ .name = "toUTCString", .length = 0, .call = dateToUtcString };
+const date_to_string: Native = .{ .name = "toString", .length = 0, .call = dateToString };
+const date_to_date_string: Native = .{ .name = "toDateString", .length = 0, .call = dateToDateString };
+const date_to_time_string: Native = .{ .name = "toTimeString", .length = 0, .call = dateToTimeString };
+const date_to_json: Native = .{ .name = "toJSON", .length = 1, .call = dateToJson };
+const date_to_primitive: Native = .{ .name = "[Symbol.toPrimitive]", .length = 1, .call = dateToPrimitive };
+
+fn adjustTwoDigitYear(y: f64) f64 {
+    if (!std.math.isFinite(y)) return y;
+    const yi = @trunc(y);
+    if (yi >= 0.0 and yi <= 99.0) return 1900.0 + yi;
+    return y;
+}
+
+fn parseDateStringValue(s: *const heap_mod.String) f64 {
+    if (s.units.len > 256) return std.math.nan(f64);
+    var buf: [256]u8 = undefined;
+    for (s.units, 0..) |u, i| {
+        if (u > 0x7f) return std.math.nan(f64);
+        buf[i] = @intCast(u);
+    }
+    return date.parse(buf[0..s.units.len]);
+}
+
+fn evalDateArgs(rt: *Runtime, args: []const Value, is_utc: bool) Error!f64 {
+    const y_raw = try ops.toNumber(rt, arg(args, 0));
+    const m = if (args.len > 1) try ops.toNumber(rt, args[1]) else 0.0;
+    const dt = if (args.len > 2) try ops.toNumber(rt, args[2]) else 1.0;
+    const h = if (args.len > 3) try ops.toNumber(rt, args[3]) else 0.0;
+    const min = if (args.len > 4) try ops.toNumber(rt, args[4]) else 0.0;
+    const s = if (args.len > 5) try ops.toNumber(rt, args[5]) else 0.0;
+    const ms = if (args.len > 6) try ops.toNumber(rt, args[6]) else 0.0;
+    const yr = adjustTwoDigitYear(y_raw);
+    const final_date = date.makeDate(date.makeDay(yr, m, dt), date.makeTime(h, min, s, ms));
+    return date.timeClip(if (is_utc) final_date else date.utcFromLocal(final_date));
+}
+
+fn dateCall(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    var buf: [128]u8 = undefined;
+    return .{ .string = try rt.heap.ascii(date.formatToString(&buf, rt.nowMs())) };
+}
+
+fn dateConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const tv: f64 = if (args.len == 0)
+        rt.nowMs()
+    else if (args.len == 1) blk: {
+        const v = args[0];
+        if (v == .object and v.object.kind == .date) {
+            break :blk date.timeClip(v.object.kind.date);
+        }
+        const pv = try object.toPrimitive(rt, v, .default);
+        if (pv == .string) {
+            break :blk parseDateStringValue(pv.string);
+        }
+        break :blk date.timeClip(try ops.toNumber(rt, pv));
+    } else try evalDateArgs(rt, args, false);
+
+    const r = try realm(rt);
+    return .{ .object = try rt.heap.newDate(r.date_prototype, tv) };
+}
+
+fn dateNow(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return .{ .number = rt.nowMs() };
+}
+
+fn dateUtc(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return .{ .number = try evalDateArgs(rt, args, true) };
+}
+
+fn dateParse(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const s = try ops.toStringValue(rt, arg(args, 0));
+    return .{ .number = parseDateStringValue(s.string) };
+}
+
+fn requireDate(rt: *Runtime, this: Value) Error!*Object {
+    if (this != .object or this.object.kind != .date) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "this is not a Date object" }});
+    }
+    return this.object;
+}
+
+fn dateGetTime(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireDate(rt, this);
+    return .{ .number = o.kind.date };
+}
+
+fn dateGetTimezoneOffset(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireDate(rt, this);
+    return .{ .number = date.timezoneOffsetMinutes(o.kind.date) };
+}
+
+fn dateSetTime(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireDate(rt, this);
+    const v = date.timeClip(try ops.toNumber(rt, arg(args, 0)));
+    o.kind.date = v;
+    return .{ .number = v };
+}
+
+const DateField = enum { year, month, day, weekday, hour, minute, second, ms };
+
+fn dateGetField(rt: *Runtime, this: Value, is_utc: bool, field: DateField) Error!Value {
+    const o = try requireDate(rt, this);
+    const t = o.kind.date;
+    if (!std.math.isFinite(t)) return .{ .number = std.math.nan(f64) };
+    const t_eff = if (is_utc) t else date.localTime(t);
+    const d = date.decompose(t_eff) orelse return .{ .number = std.math.nan(f64) };
+    return .{ .number = switch (field) {
+        .year => @floatFromInt(d.year),
+        .month => @floatFromInt(d.month),
+        .day => @floatFromInt(d.day),
+        .weekday => @floatFromInt(d.weekday),
+        .hour => @floatFromInt(d.hour),
+        .minute => @floatFromInt(d.minute),
+        .second => @floatFromInt(d.second),
+        .ms => @floatFromInt(d.ms),
+    } };
+}
+
+fn dateGetUtcFullYear(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, true, .year);
+}
+fn dateGetUtcMonth(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, true, .month);
+}
+fn dateGetUtcDate(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, true, .day);
+}
+fn dateGetUtcDay(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, true, .weekday);
+}
+fn dateGetUtcHours(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, true, .hour);
+}
+fn dateGetUtcMinutes(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, true, .minute);
+}
+fn dateGetUtcSeconds(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, true, .second);
+}
+fn dateGetUtcMilliseconds(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, true, .ms);
+}
+
+fn dateGetFullYear(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, false, .year);
+}
+fn dateGetMonth(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, false, .month);
+}
+fn dateGetDate(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, false, .day);
+}
+fn dateGetDay(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, false, .weekday);
+}
+fn dateGetHours(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, false, .hour);
+}
+fn dateGetMinutes(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, false, .minute);
+}
+fn dateGetSeconds(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, false, .second);
+}
+fn dateGetMilliseconds(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return dateGetField(rt, this, false, .ms);
+}
+
+fn dateSetTimeFields(rt: *Runtime, this: Value, args: []const Value, is_utc: bool, start_idx: usize) Error!Value {
+    const o = try requireDate(rt, this);
+    const max_count = 4 - start_idx;
+    var vals: [4]f64 = .{ 0, 0, 0, 0 };
+    const n_args = @min(args.len, max_count);
+    for (0..@max(n_args, 1)) |i| {
+        vals[start_idx + i] = try ops.toNumber(rt, arg(args, i));
+    }
+    const t_raw = o.kind.date;
+    if (!std.math.isFinite(t_raw)) return .{ .number = std.math.nan(f64) };
+    const t = if (is_utc) t_raw else date.localTime(t_raw);
+    const d = date.decompose(t) orelse return .{ .number = std.math.nan(f64) };
+    const cur: [4]f64 = .{
+        @floatFromInt(d.hour),
+        @floatFromInt(d.minute),
+        @floatFromInt(d.second),
+        @floatFromInt(d.ms),
+    };
+    const h = if (start_idx <= 0 and 0 - start_idx < @max(n_args, 1)) vals[0] else cur[0];
+    const m = if (start_idx <= 1 and 1 - start_idx < @max(n_args, 1)) vals[1] else cur[1];
+    const s = if (start_idx <= 2 and 2 - start_idx < @max(n_args, 1)) vals[2] else cur[2];
+    const ms = if (start_idx <= 3 and 3 - start_idx < @max(n_args, 1)) vals[3] else cur[3];
+    const day_f = @floor(t / date.ms_per_day);
+    const new_local = date.makeDate(day_f, date.makeTime(h, m, s, ms));
+    const u = date.timeClip(if (is_utc) new_local else date.utcFromLocal(new_local));
+    o.kind.date = u;
+    return .{ .number = u };
+}
+
+fn dateSetDateFields(rt: *Runtime, this: Value, args: []const Value, is_utc: bool, start_idx: usize) Error!Value {
+    const o = try requireDate(rt, this);
+    const max_count = 3 - start_idx;
+    var vals: [3]f64 = .{ 0, 0, 0 };
+    const n_args = @min(args.len, max_count);
+    for (0..@max(n_args, 1)) |i| {
+        vals[start_idx + i] = try ops.toNumber(rt, arg(args, i));
+    }
+    const t_raw = o.kind.date;
+    const t = if (!std.math.isFinite(t_raw)) blk: {
+        // Only setFullYear / setUTCFullYear (start_idx == 0) treats NaN as +0.0 per ES spec.
+        if (start_idx != 0) return .{ .number = std.math.nan(f64) };
+        break :blk 0.0;
+    } else if (is_utc) t_raw else date.localTime(t_raw);
+    const d = date.decompose(t) orelse return .{ .number = std.math.nan(f64) };
+    const cur: [3]f64 = .{
+        @floatFromInt(d.year),
+        @floatFromInt(d.month),
+        @floatFromInt(d.day),
+    };
+    const yr = if (start_idx <= 0 and 0 - start_idx < @max(n_args, 1)) vals[0] else cur[0];
+    const mo = if (start_idx <= 1 and 1 - start_idx < @max(n_args, 1)) vals[1] else cur[1];
+    const dt = if (start_idx <= 2 and 2 - start_idx < @max(n_args, 1)) vals[2] else cur[2];
+    const tod = @as(f64, @floatFromInt(d.hour)) * date.ms_per_hour +
+        @as(f64, @floatFromInt(d.minute)) * date.ms_per_minute +
+        @as(f64, @floatFromInt(d.second)) * date.ms_per_second +
+        @as(f64, @floatFromInt(d.ms));
+    const new_local = date.makeDate(date.makeDay(yr, mo, dt), tod);
+    const u = date.timeClip(if (is_utc) new_local else date.utcFromLocal(new_local));
+    o.kind.date = u;
+    return .{ .number = u };
+}
+
+fn dateSetUtcFullYear(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetDateFields(rt, this, args, true, 0);
+}
+fn dateSetUtcMonth(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetDateFields(rt, this, args, true, 1);
+}
+fn dateSetUtcDate(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetDateFields(rt, this, args, true, 2);
+}
+fn dateSetUtcHours(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetTimeFields(rt, this, args, true, 0);
+}
+fn dateSetUtcMinutes(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetTimeFields(rt, this, args, true, 1);
+}
+fn dateSetUtcSeconds(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetTimeFields(rt, this, args, true, 2);
+}
+fn dateSetUtcMilliseconds(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetTimeFields(rt, this, args, true, 3);
+}
+
+fn dateSetFullYear(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetDateFields(rt, this, args, false, 0);
+}
+fn dateSetMonth(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetDateFields(rt, this, args, false, 1);
+}
+fn dateSetDate(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetDateFields(rt, this, args, false, 2);
+}
+fn dateSetHours(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetTimeFields(rt, this, args, false, 0);
+}
+fn dateSetMinutes(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetTimeFields(rt, this, args, false, 1);
+}
+fn dateSetSeconds(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetTimeFields(rt, this, args, false, 2);
+}
+fn dateSetMilliseconds(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return dateSetTimeFields(rt, this, args, false, 3);
+}
+
+fn dateToIsoString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireDate(rt, this);
+    if (!std.math.isFinite(o.kind.date)) {
+        return rt.throw(.RangeError, &.{.{ .ascii = "Invalid time value" }});
+    }
+    var buf: [64]u8 = undefined;
+    return .{ .string = try rt.heap.ascii(date.formatISO(&buf, o.kind.date)) };
+}
+
+fn dateToUtcString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireDate(rt, this);
+    var buf: [64]u8 = undefined;
+    return .{ .string = try rt.heap.ascii(date.formatUTC(&buf, o.kind.date)) };
+}
+
+fn dateToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireDate(rt, this);
+    var buf: [128]u8 = undefined;
+    return .{ .string = try rt.heap.ascii(date.formatToString(&buf, o.kind.date)) };
+}
+
+fn dateToDateString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireDate(rt, this);
+    var buf: [64]u8 = undefined;
+    return .{ .string = try rt.heap.ascii(date.formatDateString(&buf, o.kind.date)) };
+}
+
+fn dateToTimeString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireDate(rt, this);
+    var buf: [96]u8 = undefined;
+    return .{ .string = try rt.heap.ascii(date.formatTimeString(&buf, o.kind.date)) };
+}
+
+fn dateToJson(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    if (this == .undefined or this == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    var root_buf = [_]Value{this};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const tv = try ops.toNumber(rt, this);
+    if (!std.math.isFinite(tv)) return .null;
+    const iso = try object.get(rt, this, try object.named(rt, "toISOString"));
+    if (!iso.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "toISOString is not a function" }});
+    }
+    return rt.callCallable(iso, this, &.{});
+}
+
+fn dateToPrimitive(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Date.prototype[Symbol.toPrimitive] called on non-object" }});
+    }
+    const hint_val = arg(args, 0);
+    if (hint_val != .string) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Invalid hint" }});
+    }
+    const hint_units = hint_val.string.units;
+    if (eqlAscii(hint_units, "string") or eqlAscii(hint_units, "default")) {
+        return object.ordinaryToPrimitive(rt, this, .string);
+    }
+    if (eqlAscii(hint_units, "number")) {
+        return object.ordinaryToPrimitive(rt, this, .number);
+    }
+    return rt.throw(.TypeError, &.{.{ .ascii = "Invalid hint" }});
+}
+
+fn eqlAscii(units: []const u16, ascii: []const u8) bool {
+    if (units.len != ascii.len) return false;
+    for (units, ascii) |u, a| {
+        if (u != a) return false;
+    }
+    return true;
 }

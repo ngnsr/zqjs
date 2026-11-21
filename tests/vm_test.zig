@@ -1429,3 +1429,127 @@ test "M28b VM: uncatchable fault during resume leaves promise pending" {
     try testing.expect(p_val == .object and p_val.object.kind == .promise);
     try testing.expectEqual(zqjs.heap.PromiseStateTag.pending, p_val.object.kind.promise.state);
 }
+
+test "M52: property IC invalidation (delete/re-add, defineProperty accessor/writable, freeze, setPrototypeOf, polymorphic, array override)" {
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\function readX(o) { return o.x; }
+        \\function writeX(o, v) { o.x = v; return o.x; }
+        \\
+        \\// 1. Delete and re-add changes property index.
+        \\let a = { x: 1, y: 2 };
+        \\print(readX(a), writeX(a, 10));
+        \\delete a.x;
+        \\a.x = 20;
+        \\print(readX(a), writeX(a, 30));
+        \\
+        \\// 2. Polymorphic sites switching shapes.
+        \\let b = { z: 0, x: 40 };
+        \\print(readX(a), readX(b), writeX(b, 41), readX(a));
+        \\
+        \\// 3. Object.defineProperty converting data -> accessor & writable: false.
+        \\let gets = 0;
+        \\let sets = 0;
+        \\Object.defineProperty(a, 'x', {
+        \\  get() { gets++; return 99; },
+        \\  set(v) { sets += v; },
+        \\  configurable: true,
+        \\});
+        \\print(readX(a), writeX(a, 5), gets, sets);
+        \\
+        \\let ro = { x: 7 };
+        \\print(writeX(ro, 8));
+        \\Object.defineProperty(ro, 'x', { writable: false });
+        \\let roErr = false;
+        \\try { writeX(ro, 9); } catch (e) { roErr = e instanceof TypeError; }
+        \\print(ro.x, roErr);
+        \\
+        \\// 4. Object.freeze & Object.setPrototypeOf.
+        \\let fr = { x: 50 };
+        \\print(writeX(fr, 51));
+        \\Object.freeze(fr);
+        \\let frErr = false;
+        \\try { writeX(fr, 52); } catch (e) { frErr = e instanceof TypeError; }
+        \\print(fr.x, frErr);
+        \\
+        \\let p1 = { k: 'one' };
+        \\let p2 = { other: 0, k: 'two' };
+        \\let child = Object.create(p1);
+        \\function readK(o) { return o.k; }
+        \\print(readK(child));
+        \\Object.setPrototypeOf(child, p2);
+        \\print(readK(child));
+        \\child.k = 'own';
+        \\print(readK(child));
+        \\
+        \\// 5. Array.prototype method IC hit + own property override + fastArraySet on frozen array.
+        \\function pushOne(arr, v) { return arr.push(v); }
+        \\let arr1 = [1];
+        \\let arr2 = [2];
+        \\arr2.push = function (v) { return v * 100; };
+        \\print(pushOne(arr1, 9), arr1.length, pushOne(arr2, 3));
+        \\let fa = [10, 20];
+        \\fa[-0] = 11;
+        \\Object.freeze(fa);
+        \\let faErr = false;
+        \\try { fa[0] = 99; } catch (e) { faErr = e instanceof TypeError; }
+        \\print(fa[0], faErr);
+    ;
+    const prog = try rt.compile("m52_ic.js", src, null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+    try testing.expectEqualStrings(
+        "1 10\n20 30\n30 40 41 30\n99 99 2 5\n8\n8 false\n51\n51 false\none\ntwo\nown\n2 2 300\n11 false\n",
+        out.buffered(),
+    );
+}
+
+test "M52: superinstructions (inc_local, dec_local, set_local_pop, lt/le_jump_if_false) edge cases" {
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\// inc_local / dec_local on number, BigInt, string, object valueOf, NaN
+        \\let n = 5; n++; ++n; n--; --n;
+        \\let bi = 10n; bi++; ++bi; bi--;
+        \\let s = '41'; s++;
+        \\let o = { valueOf() { return 99; } }; o++;
+        \\let nan = NaN; nan++;
+        \\print(n, bi, s, o, nan);
+        \\
+        \\// lt_jump_if_false / le_jump_if_false with NaN, strings, BigInt, throwing valueOf
+        \\let hits = 0;
+        \\if (NaN < 5) hits += 1;
+        \\if (NaN <= 5) hits += 2;
+        \\if ('a' < 'b') hits += 4;
+        \\if (2n <= 2n) hits += 8;
+        \\let threw = false;
+        \\try {
+        \\  let bad = { valueOf() { throw new Error('boom'); } };
+        \\  if (bad < 1) hits += 16;
+        \\} catch (e) {
+        \\  threw = e.message === 'boom';
+        \\}
+        \\print(hits, threw);
+        \\
+        \\// TDZ on inc_local and set_local_pop
+        \\let tdz1 = false;
+        \\try { x++; let x = 1; } catch (e) { tdz1 = e instanceof ReferenceError; }
+        \\let tdz2 = false;
+        \\try { y = 2; let y = 1; } catch (e) { tdz2 = e instanceof ReferenceError; }
+        \\print(tdz1, tdz2);
+    ;
+    const prog = try rt.compile("m52_super.js", src, null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+    try testing.expectEqualStrings(
+        "5 11 42 100 NaN\n12 true\ntrue true\n",
+        out.buffered(),
+    );
+}

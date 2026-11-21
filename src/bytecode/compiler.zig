@@ -578,10 +578,7 @@ const Compiler = struct {
         c.span = s.span;
         switch (s.data) {
             .empty, .function => {}, // functions were created on entry to the body
-            .expression => |e| {
-                try c.expr(e);
-                try c.emit(.pop, &.{});
-            },
+            .expression => |e| try c.exprDiscard(e),
             .declaration => |decl| try c.declare(decl),
             .class => |cls| {
                 try c.compileClass(cls, false);
@@ -603,8 +600,7 @@ const Compiler = struct {
             },
             .@"try" => |t| return c.compileTry(t, s.span),
             .@"if" => |i| {
-                try c.expr(i.cond);
-                const to_else = try c.jumpForward(.jump_if_false);
+                const to_else = try c.jumpIfFalseExpr(i.cond);
                 const then_completes = try c.stmt(i.then.*);
                 const e = i.@"else" orelse {
                     c.patch(to_else, c.here());
@@ -623,8 +619,7 @@ const Compiler = struct {
                 c.attachLabelsToLoop(&loop);
                 c.attachLabelsToLoop(&loop);
                 const top = c.here();
-                try c.expr(w.cond);
-                const to_end = try c.jumpForward(.jump_if_false);
+                const to_end = try c.jumpIfFalseExpr(w.cond);
                 if (try c.loopBody(&loop, w.body.*)) try c.emit(.jump, &.{top});
                 c.patch(to_end, c.here());
                 for (loop.continues.items) |j| c.patch(j, top);
@@ -660,10 +655,7 @@ const Compiler = struct {
                         try c.declare(decl);
                         if (decl.kind == .let) copies = decl.declarators;
                     },
-                    .expression => |e| {
-                        try c.expr(e);
-                        try c.emit(.pop, &.{});
-                    },
+                    .expression => |e| try c.exprDiscard(e),
                 };
                 try c.perIteration(copies);
                 var loop: Loop = .{};
@@ -671,19 +663,13 @@ const Compiler = struct {
                 c.attachLabelsToLoop(&loop);
                 c.attachLabelsToLoop(&loop);
                 const top = c.here();
-                const to_end = if (f.cond) |cond| blk: {
-                    try c.expr(cond);
-                    break :blk try c.jumpForward(.jump_if_false);
-                } else null;
+                const to_end = if (f.cond) |cond| try c.jumpIfFalseExpr(cond) else null;
                 const body_completes = try c.loopBody(&loop, f.body.*);
                 // `continue` lands on the copy and the update, which still run (as in treewalk).
                 if (body_completes or loop.continues.items.len > 0) {
                     for (loop.continues.items) |j| c.patch(j, c.here());
                     try c.perIteration(copies);
-                    if (f.update) |u| {
-                        try c.expr(u);
-                        try c.emit(.pop, &.{});
-                    }
+                    if (f.update) |u| try c.exprDiscard(u);
                     try c.emit(.jump, &.{top});
                 }
                 if (to_end) |j| c.patch(j, c.here());
@@ -2165,6 +2151,52 @@ const Compiler = struct {
             },
             .string, .number => unreachable, // only in literals
         }
+    }
+
+    /// Compiles `e` in a value-discarded context (expression statements, `for` init/update),
+    /// emitting superinstructions for common local updates and assignments (M52).
+    fn exprDiscard(c: *Compiler, e: *const ast.Expr) Error!void {
+        switch (e.data) {
+            .update => |u| if (u.target == .ref) {
+                const ref = u.target.ref;
+                if (c.s.res.refs[ref.id] == .local) {
+                    const b = c.s.res.refs[ref.id].local;
+                    if (!c.binding(b).captured and c.binding(b).kind != .@"const") {
+                        try c.emit(if (u.op == .inc) .inc_local else .dec_local, &.{ c.slotOf(b), try c.name(ref.name) });
+                        return;
+                    }
+                }
+            },
+            .assign => |a| if (a.op == .plain and a.target == .ref) {
+                const ref = a.target.ref;
+                if (c.s.res.refs[ref.id] == .local) {
+                    const b = c.s.res.refs[ref.id].local;
+                    if (!c.binding(b).captured and c.binding(b).kind != .@"const") {
+                        try c.expr(a.value);
+                        try c.emit(.set_local_pop, &.{ c.slotOf(b), try c.name(ref.name) });
+                        return;
+                    }
+                }
+            },
+            else => {},
+        }
+        try c.expr(e);
+        try c.emit(.pop, &.{});
+    }
+
+    /// Evaluates condition `e` and emits a forward conditional jump taken when falsy,
+    /// fusing `<` and `<=` into `lt_jump_if_false` / `le_jump_if_false` (M52).
+    fn jumpIfFalseExpr(c: *Compiler, e: *const ast.Expr) Error!u32 {
+        if (e.data == .binary) {
+            const b = e.data.binary;
+            if (b.op == .lt or b.op == .le) {
+                try c.expr(b.lhs);
+                try c.expr(b.rhs);
+                return c.jumpForward(if (b.op == .lt) .lt_jump_if_false else .le_jump_if_false);
+            }
+        }
+        try c.expr(e);
+        return c.jumpForward(.jump_if_false);
     }
 
     fn read(c: *Compiler, ref: ast.Ref) Error!void {

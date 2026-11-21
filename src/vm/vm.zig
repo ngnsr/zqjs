@@ -801,6 +801,26 @@ pub const Vm = struct {
                 if (s.* == null) return vm.tdz(cache.operand(1));
                 s.* = try cache.peek(vm, 0); // the assignment's value stays on the stack
             },
+            .set_local_pop => {
+                const s = try cache.value(vm, cache.operand(0));
+                if (s.* == null) return vm.tdz(cache.operand(1));
+                s.* = try cache.peek(vm, 0);
+                try cache.drop(vm, 1);
+            },
+            .inc_local, .dec_local => {
+                const s = try cache.value(vm, cache.operand(0));
+                const v = s.* orelse return vm.tdz(cache.operand(1));
+                if (v == .number) {
+                    s.* = .{ .number = v.number + @as(f64, if (op == .inc_local) 1 else -1) };
+                } else {
+                    cache.syncSp(vm);
+                    const nv = try ops.toNumeric(rt, v);
+                    s.* = if (nv == .bigint)
+                        .{ .bigint = try bigint.addI64(rt, nv.bigint, if (op == .inc_local) 1 else -1) }
+                    else
+                        .{ .number = nv.number + @as(f64, if (op == .inc_local) 1 else -1) };
+                }
+            },
             .init_local => {
                 (try cache.slot(vm, cache.operand(0))).* = .{ .value = try cache.peek(vm, 0) };
                 try cache.drop(vm, 1);
@@ -1036,8 +1056,20 @@ pub const Vm = struct {
                 try cache.drop(vm, 2);
             },
             .get_prop => {
-                cache.syncSp(vm);
-                const r = try object.get(rt, try cache.peek(vm, 0), try vm.nameKey(cache.operand(0)));
+                const base = try cache.peek(vm, 0);
+                const name_idx = cache.operand(0);
+                const r: Value = if (name_idx < p.name_atoms.len)
+                    fastGetProp(rt, p, pc, base, p.name_atoms[name_idx]) orelse blk: {
+                        cache.syncSp(vm);
+                        const atom = p.name_atoms[name_idx];
+                        const val = try object.get(rt, base, object.namedAtom(atom));
+                        populateGetPropIc(rt, p, pc, base, atom);
+                        break :blk val;
+                    }
+                else blk: {
+                    cache.syncSp(vm);
+                    break :blk try object.get(rt, base, try vm.nameKey(name_idx));
+                };
                 (try cache.top(vm)).* = r;
             },
             .get_elem => {
@@ -1053,8 +1085,19 @@ pub const Vm = struct {
             },
             .set_prop => {
                 const v = try cache.peek(vm, 0);
-                cache.syncSp(vm);
-                try object.set(rt, try cache.peek(vm, 1), try vm.nameKey(cache.operand(0)), v);
+                const base = try cache.peek(vm, 1);
+                const name_idx = cache.operand(0);
+                if (name_idx < p.name_atoms.len) {
+                    const atom = p.name_atoms[name_idx];
+                    if (!fastSetProp(rt, p, pc, base, atom, v)) {
+                        cache.syncSp(vm);
+                        try object.set(rt, base, object.namedAtom(atom), v);
+                        populateSetPropIc(rt, p, pc, base, atom);
+                    }
+                } else {
+                    cache.syncSp(vm);
+                    try object.set(rt, base, try vm.nameKey(name_idx), v);
+                }
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = v;
             },
@@ -1062,7 +1105,7 @@ pub const Vm = struct {
                 const v = try cache.peek(vm, 0);
                 const idx = try cache.peek(vm, 1);
                 const base = try cache.peek(vm, 2);
-                if (!fastTypedArraySet(base, idx, v)) {
+                if (!fastArraySet(rt, base, idx, v) and !fastTypedArraySet(base, idx, v)) {
                     cache.syncSp(vm);
                     const k = try object.key(rt, idx); // after the value: JS's order for `=`
                     try object.set(rt, base, k, v);
@@ -1168,6 +1211,19 @@ pub const Vm = struct {
                 const truthy = ops.toBoolean(try cache.peek(vm, 0));
                 try cache.drop(vm, 1);
                 if (truthy == (op == .jump_if_true)) next = try cache.target(vm);
+            },
+            .lt_jump_if_false, .le_jump_if_false => {
+                const lhs = try cache.peek(vm, 1);
+                const rhs = try cache.peek(vm, 0);
+                const cond: bool = if (lhs == .number and rhs == .number)
+                    (if (op == .lt_jump_if_false) lhs.number < rhs.number else lhs.number <= rhs.number)
+                else blk: {
+                    cache.syncSp(vm);
+                    const bv = try ops.binary(rt, if (op == .lt_jump_if_false) .lt else .le, lhs, rhs);
+                    break :blk ops.toBoolean(bv);
+                };
+                cache.sp -= 2;
+                if (!cond) next = try cache.target(vm);
             },
             .get_iter => {
                 const iterable = try cache.peek(vm, 0);
@@ -2336,6 +2392,127 @@ fn fastArrayGet(base: Value, idx: Value) ?Value {
     const r = elems[@intFromFloat(n)];
     heap.checkValue(r);
     return r;
+}
+
+fn fastArraySet(rt: *Runtime, base: Value, idx: Value, val: Value) bool {
+    if (base != .object or idx != .number) return false;
+    const o = base.object;
+    if (o.kind != .array or !o.array_elements_writable) return false;
+    const n = idx.number;
+    const elems = o.kind.array.items;
+    if (!(n >= 0 and n < @as(f64, @floatFromInt(elems.len)) and @floor(n) == n)) return false;
+    o.obj.checkLive();
+    rt.heap.storeElement(o, @intFromFloat(n), val);
+    return true;
+}
+
+inline fn propIcSlot(rt: *Runtime, p: *const Proto, pc: u32) *u32 {
+    return &rt.prop_ic[((@intFromPtr(p) >> 4) ^ pc) & (rt.prop_ic.len - 1)];
+}
+
+inline fn isLengthAtom(atom: *const heap.String) bool {
+    const u = atom.units;
+    return u.len == 6 and u[0] == 'l' and u[1] == 'e' and u[2] == 'n' and u[3] == 'g' and u[4] == 't' and u[5] == 'h';
+}
+
+fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) ?Value {
+    if (base != .object) return null;
+    const o = base.object;
+    const is_array = o.kind == .array;
+    if (!is_array and (o.kind != .ordinary or o.builtin != null)) return null;
+    o.obj.checkLive();
+    const entry = propIcSlot(rt, p, pc).*;
+    const idx: usize = entry & 0x7FFF_FFFF;
+    const keys = o.props.keys();
+    if ((entry & 0x8000_0000) == 0) {
+        if (!is_array and idx < keys.len and keys[idx].obj == &atom.obj) {
+            const prop = &o.props.values()[idx];
+            if (!prop.is_accessor) {
+                heap.checkValue(prop.value);
+                return prop.value;
+            }
+        }
+        return null;
+    }
+    if (is_array and (atom.atom.?.index != null or isLengthAtom(atom))) return null;
+    if (keys.len <= 4) {
+        for (keys) |k| {
+            if (k.obj == &atom.obj) return null;
+        }
+        if (o.proto) |proto| {
+            if (proto.kind == .ordinary) {
+                proto.obj.checkLive();
+                const pkeys = proto.props.keys();
+                if (idx < pkeys.len and pkeys[idx].obj == &atom.obj) {
+                    const prop = &proto.props.values()[idx];
+                    if (!prop.is_accessor) {
+                        heap.checkValue(prop.value);
+                        return prop.value;
+                    }
+                }
+            }
+        }
+    }
+    return null;
+}
+
+noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) void {
+    if (base != .object) return;
+    const o = base.object;
+    const is_array = o.kind == .array;
+    if (!is_array and (o.kind != .ordinary or o.builtin != null)) return;
+    const key = heap.PropKey.fromAtom(atom);
+    if (!is_array) {
+        if (o.props.getIndex(key)) |own_idx| {
+            if (!o.props.values()[own_idx].is_accessor and own_idx <= 0x7FFF_FFFF) {
+                propIcSlot(rt, p, pc).* = @intCast(own_idx);
+            }
+            return;
+        }
+    } else if (atom.atom.?.index != null or isLengthAtom(atom)) {
+        return;
+    }
+    if (o.proto) |proto| {
+        if (proto.kind == .ordinary) {
+            if (proto.props.getIndex(key)) |proto_idx| {
+                if (!proto.props.values()[proto_idx].is_accessor and proto_idx <= 0x7FFF_FFFF) {
+                    propIcSlot(rt, p, pc).* = @as(u32, @intCast(proto_idx)) | 0x8000_0000;
+                }
+            }
+        }
+    }
+}
+
+fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String, val: Value) bool {
+    if (base != .object) return false;
+    const o = base.object;
+    if (o.kind != .ordinary or o.builtin != null) return false;
+    o.obj.checkLive();
+    const entry = propIcSlot(rt, p, pc).*;
+    if ((entry & 0x8000_0000) != 0) return false;
+    const idx: usize = entry;
+    const keys = o.props.keys();
+    if (idx < keys.len and keys[idx].obj == &atom.obj) {
+        const prop = &o.props.values()[idx];
+        if (prop.writable and !prop.is_accessor) {
+            rt.heap.storePropertyAt(o, idx, atom, val);
+            return true;
+        }
+    }
+    return false;
+}
+
+noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) void {
+    if (base != .object) return;
+    const o = base.object;
+    if (o.kind != .ordinary or o.builtin != null) return;
+    const key = heap.PropKey.fromAtom(atom);
+    if (o.props.getIndex(key)) |own_idx| {
+        const prop = &o.props.values()[own_idx];
+        if (prop.writable and !prop.is_accessor and own_idx <= 0x7FFF_FFFF) {
+            propIcSlot(rt, p, pc).* = @intCast(own_idx);
+        }
+    }
 }
 
 fn fastTypedArrayGet(base: Value, idx: Value) ?Value {

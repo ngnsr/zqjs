@@ -1,4 +1,4 @@
-slots 2, max_stack 3, code 174 bytes
+slots 2, max_stack 3, code 173 bytes
 constants
   k0  "rhs first"
   k1  "never"
@@ -15,36 +15,35 @@ code
      10  get_global     n0            ; print
      15  push_const     k0            ; "rhs first"
      20  call           1
-     25  set_local      s0 n1         ; x
-     34  pop
-     35  get_local      s0 n1         ; x
-     44  get_global     n0            ; print
-     49  push_const     k1            ; "never"
-     54  call           1
-     59  add
-     60  set_local      s0 n1         ; x
-     69  pop
-     70  push_const     k2            ; 1
-     75  init_local     s0
-     80  push_const     k3            ; 2
-     85  init_local     s1
-     90  get_global     n0            ; print
-     95  push_const     k0            ; "rhs first"
-    100  call           1
-    105  assign_const   s1 n2         ; c
-    114  pop
-    115  get_local      s1 n2         ; c
-    124  get_global     n0            ; print
-    129  push_const     k4            ; "rhs, then op"
-    134  call           1
-    139  add
-    140  assign_const   s1 n2         ; c
-    149  pop
-    150  get_local      s1 n2         ; c
-    159  to_numeric
-    160  dup
-    161  inc
-    162  assign_const   s1 n2         ; c
+     25  set_local_pop  s0 n1         ; x
+     34  get_local      s0 n1         ; x
+     43  get_global     n0            ; print
+     48  push_const     k1            ; "never"
+     53  call           1
+     58  add
+     59  set_local      s0 n1         ; x
+     68  pop
+     69  push_const     k2            ; 1
+     74  init_local     s0
+     79  push_const     k3            ; 2
+     84  init_local     s1
+     89  get_global     n0            ; print
+     94  push_const     k0            ; "rhs first"
+     99  call           1
+    104  assign_const   s1 n2         ; c
+    113  pop
+    114  get_local      s1 n2         ; c
+    123  get_global     n0            ; print
+    128  push_const     k4            ; "rhs, then op"
+    133  call           1
+    138  add
+    139  assign_const   s1 n2         ; c
+    148  pop
+    149  get_local      s1 n2         ; c
+    158  to_numeric
+    159  dup
+    160  inc
+    161  assign_const   s1 n2         ; c
+    170  pop
     171  pop
-    172  pop
-    173  halt
+    172  halt

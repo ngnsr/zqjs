@@ -249,7 +249,7 @@ fn opAt(p: *const Proto, pc: usize) Op {
 
 fn target(p: *const Proto, pc: usize) ?u32 {
     return switch (opAt(p, pc)) {
-        .jump, .jump_if_false, .jump_if_true, .lt_jump_if_false, .le_jump_if_false, .gt_jump_if_false, .ge_jump_if_false, .strict_eq_jump_if_false, .strict_ne_jump_if_false => bc.readU32(p.code, pc + 1),
+        .jump, .jump_if_false, .jump_if_true, .lt_jump_if_false, .le_jump_if_false, .gt_jump_if_false, .ge_jump_if_false, .strict_eq_jump_if_false, .strict_ne_jump_if_false, .lt_local_const_jif, .le_local_const_jif, .strict_eq_local_const_jif, .strict_ne_local_const_jif => bc.readU32(p.code, pc + 1),
         else => null,
     };
 }

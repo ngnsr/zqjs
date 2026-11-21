@@ -286,6 +286,11 @@ pub const Op = enum(u8) {
     ge_jump_if_false,
     strict_eq_jump_if_false,
     strict_ne_jump_if_false,
+    /// Jump to target if (locals[slot] op consts[k]) is false (M57 superinstructions; slot guaranteed initialized).
+    lt_local_const_jif,
+    le_local_const_jif,
+    strict_eq_local_const_jif,
+    strict_ne_local_const_jif,
     /// [iterable] → [iterator]: obtain built-in iterator for `for...of` (M14.4).
     get_iter,
     /// [iterator] → [iterator, value, done_bool]: advance iterator (M14.4).
@@ -451,6 +456,7 @@ pub const Op = enum(u8) {
             .jump => .{ .operands = &.{.target}, .pops = 0, .pushes = 0 },
             .jump_if_false, .jump_if_true => .{ .operands = &.{.target}, .pops = 1, .pushes = 0 },
             .lt_jump_if_false, .le_jump_if_false, .gt_jump_if_false, .ge_jump_if_false, .strict_eq_jump_if_false, .strict_ne_jump_if_false => .{ .operands = &.{.target}, .pops = 2, .pushes = 0 },
+            .lt_local_const_jif, .le_local_const_jif, .strict_eq_local_const_jif, .strict_ne_local_const_jif => .{ .operands = &.{ .target, .slot, .@"const" }, .pops = 0, .pushes = 0 },
             .get_iter, .for_in_init => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .iter_next, .for_in_next => .{ .operands = &.{}, .pops = 1, .pushes = 2 },
             .iter_close, .iter_close_throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
@@ -609,6 +615,6 @@ pub const Proto = struct {
 test "every opcode has a consistent size" {
     inline for (@typeInfo(Op).@"enum".field_values) |value| {
         const op: Op = @fromBackingInt(value);
-        try std.testing.expect(op.size() == 1 or op.size() == 5 or op.size() == 9);
+        try std.testing.expect(op.size() == 1 or op.size() == 5 or op.size() == 9 or op.size() == 13);
     }
 }

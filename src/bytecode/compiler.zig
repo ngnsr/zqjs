@@ -2356,10 +2356,35 @@ const Compiler = struct {
     }
 
     /// Evaluates condition `e` and emits a forward conditional jump taken when falsy,
-    /// fusing relational/strict-equality ops into `*_jump_if_false` (M52/M53).
+    /// fusing relational/strict-equality ops into `*_jump_if_false` (M52/M53) and
+    /// `local op num_const` into `*_local_const_jif` (M57).
     fn jumpIfFalseExpr(c: *Compiler, e: *const ast.Expr) Error!u32 {
         if (e.data == .binary) {
             const b = e.data.binary;
+            if (b.lhs.data == .identifier and b.rhs.data == .number) {
+                const lref = b.lhs.data.identifier;
+                if (c.s.res.refs[lref.id] == .local) {
+                    const lb = c.s.res.refs[lref.id].local;
+                    if (!c.binding(lb).captured) {
+                        const ls = c.slotOf(lb);
+                        if (c.isSlotInit(ls)) {
+                            const lc_op: ?Op = switch (b.op) {
+                                .lt => .lt_local_const_jif,
+                                .le => .le_local_const_jif,
+                                .strict_eq => .strict_eq_local_const_jif,
+                                .strict_ne => .strict_ne_local_const_jif,
+                                else => null,
+                            };
+                            if (lc_op) |fop| {
+                                const k = try c.constant(Value.fromNumber(b.rhs.data.number));
+                                const target_pos = c.here() + 1;
+                                try c.emit(fop, &.{ 0, ls, k });
+                                return target_pos;
+                            }
+                        }
+                    }
+                }
+            }
             const fused: ?Op = switch (b.op) {
                 .lt => .lt_jump_if_false,
                 .le => .le_jump_if_false,

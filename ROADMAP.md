@@ -22,7 +22,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | **done** |
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | **done** |
 | 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
-| 11.1–56 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1 VM perf (see milestone log below; D55–D86) | **done** |
+| 11.1–57 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1 VM perf (see milestone log below; D55–D87) | **done** |
 | Perf | Remaining Tier 1–2 interpreter optimizations toward QuickJS parity (see `PERF_PLAN.md`) | in progress |
 
 ## Direction after M8.1 (reviewed 2026-11-15)
@@ -516,3 +516,6 @@ runs on both engines unless noted.
 
 **M56 (done — Tier 1 VM Performance Part 4: Back-Edge Safepoints, Fast Calls, Registerized `pc`, O(1) Global Lookup)**
 - **M56:** Implemented D86 across `src/vm/vm.zig`, `src/runtime/runtime.zig`, and `src/runtime/builtins.zig`: comptime stress split in `runLoop` moving `collect_requested` checks to back-edges/calls/allocations, registerized `vm.pc` (synced in `FrameCache.syncSp`), removed dead `exec_ctx.used` write in `Runtime.step()`, added `enterCall` / `returnConstruct` fast JS→JS call/return paths with guarded `initLocals` memsets, and replaced the 55-way linear global lookup chain with `std.StaticStringMap`. Cut `closures.js` to `0.53×` QuickJS (nearly 2× faster), `branch_dense.js` `1.07×`, `float_math.js` `1.10×`, `arrays.js` `1.13×`, `scopes.js` `1.15×`, `int_loop.js` `1.17×`, `fib.js` `1.26×` (-23%), `call_chain.js` `1.34×` (-15%), `global_reads.js` `1.35×` (-15%), `objects.js` `1.56×`; C-ABI `js_to_c_native` hit `8.32M calls/s` (+38%) and `frame_loop_3600` p50 dropped to `12.0 µs` (-25%).
+
+**M57 (done — Tier 1 VM Performance Part 5: Local-Constant Branch Fusion & Power-of-2 Remainder)**
+- **M57:** Implemented D87 across `bytecode.zig`, `compiler.zig`, `verify.zig`, `disasm.zig`, and `vm.zig`: added 4 zero-stack-traffic comparison-jump superinstructions (`lt_local_const_jif`, `le_local_const_jif`, `strict_eq_local_const_jif`, `strict_ne_local_const_jif`) emitted when `Compiler.init_slots` guarantees initialization, plus a power-of-2 bitmask fast path in `fastRemainder`. Surpassed QuickJS end-to-end (CLI-to-CLI) on 4 benchmarks: `closures.js` **`0.49×`** (over 2× faster than QJS), `branch_dense.js` **`0.69×`** (-37%), `int_loop.js` **`0.87×`** (-25%), and `arrays.js` **`0.94×`** (-18%), with `scopes.js` (`1.05×`), `float_math.js` (`1.07×`), `fib.js` (`1.15×`), and `global_reads.js` (`1.15×`) right at parity.

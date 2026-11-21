@@ -12,23 +12,23 @@ At the M10 checkpoint (`05c0c7a`, see `ROADMAP.md` and `bench/m10/baseline-qjs.m
 - **Objects, fib, loops, arrays, calls:** `1.66×–2.33×` QuickJS
 - **C-ABI throughput:** `~6.59M calls/s` (`js_to_c_native`), `~4.87M trips/s` (`host_js_c_js_roundtrip`), `18.0 µs` p50 per frame on `frame_loop_3600`
 
-### M52–M56 Checkpoints (D82–D86 — Property IC, Superinstructions, 8-Byte NaN-Boxed `Value`/`Slot`, Back-Edge Safepoints & Fast Calls)
+### M52–M57 Checkpoints (D82–D87 — Property IC, Superinstructions, 8-Byte NaN-Boxed `Value`/`Slot`, Back-Edge Safepoints, Fast Calls & Local-Const Branch Fusion)
 
-After M52–M56 (measured via `python3 tools/m10_compare.py`, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`), CLI-to-CLI ratios vs QuickJS reached near-parity across almost all workloads (and nearly 2× faster than QuickJS on closures):
+After M52–M57 (measured via `python3 tools/m10_compare.py`, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`), ZQJS **surpassed QuickJS end-to-end on 4 benchmarks** (including over 2× faster on closures and 31% faster on dense branching) and is within 5–15% on 4 more:
 
-| Benchmark | Pre-M52 (`zqjs/qjs`) | M55 (`zqjs/qjs`) | **M56 (`zqjs/qjs`)** | ZQJS CLI med |
+| Benchmark | Pre-M52 (`zqjs/qjs`) | M56 (`zqjs/qjs`) | **M57 (`zqjs/qjs`)** | ZQJS CLI med |
 |---|---:|---:|---:|---:|
-| `closures.js` | `0.77×` (95.2 ms) | `0.63×` (77.5 ms) | **`0.53×`** | **66.4 ms** (47% faster than QJS) |
-| `branch_dense.js` | `1.91×` (200.8 ms) | `1.16×` (120.5 ms) | **`1.07×`** | **112.6 ms** (-44%) |
-| `float_math.js` | `2.14×` (286.7 ms) | `1.19×` (158.5 ms) | **`1.10×`** | **150.4 ms** (-48%) |
-| `arrays.js` | `2.42×` (400.0 ms) | `1.16×` (191.2 ms) | **`1.13×`** | **188.7 ms** (-53%) |
-| `scopes.js` | `2.38×` (84.1 ms) | `1.38×` (48.0 ms) | **`1.15×`** | **41.1 ms** (-51%) |
-| `int_loop.js` | `2.07×` (141.9 ms) | `1.24×` (83.8 ms) | **`1.17×`** | **80.6 ms** (-43%) |
-| `fib.js` | `1.90×` (64.3 ms) | `1.64×` (53.9 ms) | **`1.26×`** | **42.2 ms** (-34%) |
-| `call_chain.js` | `2.37×` (122.0 ms) | `1.58×` (80.3 ms) | **`1.34×`** | **68.2 ms** (-44%) |
-| `global_reads.js` | `2.61×` (64.4 ms) | `1.59×` (38.6 ms) | **`1.35×`** | **33.5 ms** (-48%) |
-| `objects.js` | `2.37×` (75.4 ms) | `1.65×` (52.4 ms) | **`1.56×`** | **51.0 ms** (-32%) |
-| `strings.js` | `2.31×` (26.3 ms) | `1.95×` (22.7 ms) | **`1.94×`** | **22.3 ms** (-15%) |
+| `closures.js` | `0.77×` (95.2 ms) | `0.53×` (66.4 ms) | **`0.49×`** | **61.6 ms** (51% faster than QJS) |
+| `branch_dense.js` | `1.91×` (200.8 ms) | `1.07×` (112.6 ms) | **`0.69×`** | **71.1 ms** (31% faster than QJS, -65%) |
+| `int_loop.js` | `2.07×` (141.9 ms) | `1.17×` (80.6 ms) | **`0.87×`** | **60.8 ms** (13% faster than QJS, -57%) |
+| `arrays.js` | `2.42×` (400.0 ms) | `1.13×` (188.7 ms) | **`0.94×`** | **154.6 ms** (6% faster than QJS, -61%) |
+| `scopes.js` | `2.38×` (84.1 ms) | `1.15×` (41.1 ms) | **`1.05×`** | **37.6 ms** (-55%) |
+| `float_math.js` | `2.14×` (286.7 ms) | `1.10×` (150.4 ms) | **`1.07×`** | **144.4 ms** (-50%) |
+| `fib.js` | `1.90×` (64.3 ms) | `1.26×` (42.2 ms) | **`1.15×`** | **38.6 ms** (-40%) |
+| `global_reads.js` | `2.61×` (64.4 ms) | `1.35×` (33.5 ms) | **`1.15×`** | **29.6 ms** (-54%) |
+| `call_chain.js` | `2.37×` (122.0 ms) | `1.34×` (68.2 ms) | **`1.29×`** | **65.6 ms** (-46%) |
+| `objects.js` | `2.37×` (75.4 ms) | `1.56×` (51.0 ms) | **`1.54×`** | **50.4 ms** (-33%) |
+| `strings.js` | `2.31×` (26.3 ms) | `1.94×` (22.3 ms) | **`1.86×`** | **22.2 ms** (-16%) |
 
 *Note:* Labeled-switch threaded dispatch with `noinline` cold handlers and expanding `FrameCache` with `stack`/`locals` pointers both regressed due to register spilling and I-cache bloat, and were reverted per §5.
 

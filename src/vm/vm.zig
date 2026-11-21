@@ -1367,6 +1367,32 @@ pub const Vm = struct {
                 cache.sp -= 2;
                 if (!cond) next = try cache.target(vm);
             },
+            .lt_local_const_jif, .le_local_const_jif, .strict_eq_local_const_jif, .strict_ne_local_const_jif => {
+                const s = (try cache.valueSlot(vm, cache.operand(1))) orelse return vm.bug("uninit local in local_const_jif");
+                const k = cache.operand(2);
+                if (k >= p.consts.len) return vm.bug("constant index out of range");
+                const lhs = s.asValue();
+                const rhs = p.consts[k];
+                const cond: bool = if (lhs.isNumber() and rhs.isNumber()) switch (op) {
+                    .lt_local_const_jif => lhs.asNumber() < rhs.asNumber(),
+                    .le_local_const_jif => lhs.asNumber() <= rhs.asNumber(),
+                    .strict_eq_local_const_jif => lhs.asNumber() == rhs.asNumber(),
+                    .strict_ne_local_const_jif => lhs.asNumber() != rhs.asNumber(),
+                    else => unreachable,
+                } else blk: {
+                    cache.syncSp(vm);
+                    const bop: BinaryOp = switch (op) {
+                        .lt_local_const_jif => .lt,
+                        .le_local_const_jif => .le,
+                        .strict_eq_local_const_jif => .strict_eq,
+                        .strict_ne_local_const_jif => .strict_ne,
+                        else => unreachable,
+                    };
+                    const bv = try ops.binary(rt, bop, lhs, rhs);
+                    break :blk ops.toBoolean(bv);
+                };
+                if (!cond) next = try cache.target(vm);
+            },
             .get_iter => {
                 const iterable = try cache.peek(vm, 0);
                 cache.syncSp(vm);
@@ -2787,7 +2813,7 @@ inline fn fastRemainder(a: f64, b: f64) f64 {
         const ai: i64 = @intFromFloat(a);
         const bi: i64 = @intFromFloat(b);
         if (@as(f64, @floatFromInt(ai)) == a and @as(f64, @floatFromInt(bi)) == b) {
-            const r = @rem(ai, bi);
+            const r = if (ai >= 0 and bi > 0 and (bi & (bi - 1)) == 0) ai & (bi - 1) else @rem(ai, bi);
             if (r == 0) return if (std.math.signbit(a)) -0.0 else 0.0;
             return @floatFromInt(r);
         }

@@ -1655,3 +1655,47 @@ test "M54: flattened Slot, *_local arithmetic, get_elem_local, and loop clear_lo
         out.buffered(),
     );
 }
+
+test "M57: *_local_const_jif superinstructions (numbers, NaN, -0, BigInt, strings, TDZ) and pow2 remainder" {
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\// Numeric, NaN, -0, BigInt, and string comparisons on fused *_local_const_jif
+        \\let n = 0;
+        \\let hits = 0;
+        \\for (let i = 0; i < 5; i++) {
+        \\  if (i <= 2) hits++;
+        \\  if (i === 3) hits += 10;
+        \\  if (i !== 4) hits += 100;
+        \\}
+        \\let nan = NaN, neg0 = -0, bi = 2n, str = '2';
+        \\print(hits,
+        \\  (nan < 1 ? 1 : 0),
+        \\  (nan <= 1 ? 1 : 0),
+        \\  (nan === 1 ? 1 : 0),
+        \\  (nan !== 1 ? 1 : 0),
+        \\  (neg0 === 0 ? 1 : 0),
+        \\  (bi < 3 ? 1 : 0),
+        \\  (str === 2 ? 1 : 0),
+        \\  (str !== 2 ? 1 : 0));
+        \\
+        \\// TDZ must still throw when local is uninitialized
+        \\let tdz = false;
+        \\{ try { if (u < 1) hits++; } catch (e) { tdz = e instanceof ReferenceError; } let u = 0; }
+        \\print(tdz);
+        \\
+        \\// fastRemainder power-of-2 edge cases (-0, negatives, fractions, exact multiples)
+        \\let r0 = (-0) % 4;
+        \\print(Object.is(r0, -0), (-5) % 4, 5.5 % 4, 8 % 4, 9 % 4, 7 % 8);
+    ;
+    const prog = try rt.compile("m57_super.js", src, null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+    try testing.expectEqualStrings(
+        "413 0 0 0 1 1 1 0 1\ntrue\ntrue -1 1.5 0 1 7\n",
+        out.buffered(),
+    );
+}

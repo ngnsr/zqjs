@@ -2116,3 +2116,17 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
 - **Measured Impact (`python3 tools/m10_compare.py`, Apple M4, `ReleaseFast`):**
   - All 11 JS benchmarks improved over M55: `closures.js` `0.53×` (nearly 2× faster than QuickJS), `branch_dense.js` `1.07×`, `float_math.js` `1.10×`, `arrays.js` `1.13×`, `scopes.js` `1.15×`, `int_loop.js` `1.17×`, `fib.js` `1.26×` (-23%), `call_chain.js` `1.34×` (-15%), `global_reads.js` `1.35×` (-15%), `objects.js` `1.56×`, `strings.js` `1.94×`.
   - C-ABI embedding benchmarks surged: `js_to_c_native` `8.32M calls/s` (+38%), `host_js_c_js_roundtrip` `4.12M trips/s` (+19%), and `frame_loop_3600` p50 frame time `16.0 µs → 12.0 µs` (-25%).
+
+---
+
+## D87. Tier 1 VM Performance Part 5: Local-Constant Comparison-Jump Fusion and Power-of-2 Remainder Fast Path *(M57)*
+
+**Decision:** Fuse `local op num_const` conditional branches into single zero-stack-traffic 3-operand superinstructions (`lt_local_const_jif`, `le_local_const_jif`, `strict_eq_local_const_jif`, `strict_ne_local_const_jif`) and add a bitmask fast path for non-negative power-of-2 remainders in `fastRemainder`, crossing QuickJS parity on four CLI benchmarks.
+
+- **Local-Constant Comparison-Jump Superinstructions (`bytecode.zig`, `compiler.zig`, `verify.zig`, `disasm.zig`, `vm.zig`):**
+  - Added `lt_local_const_jif`, `le_local_const_jif`, `strict_eq_local_const_jif`, and `strict_ne_local_const_jif` with operands `.{ .target, .slot, .@"const" }` (`pops = 0, pushes = 0`). Placing `.target` at operand 0 keeps `compiler.zig`'s jump-patching and `verify.zig:target()` uniform.
+  - Emitted by `jumpIfFalseExpr` when the LHS is a non-captured local proven initialized by `Compiler.init_slots` (including function parameters) and the RHS is a numeric literal, collapsing 3 instructions (`get_local`, `push_const`, `*_jump_if_false`) into 1 with zero operand-stack traffic while preserving exact `ops.binary` semantics for non-number locals (`BigInt`, strings, objects) and exact TDZ errors for uninitialized locals.
+- **Power-of-2 Remainder Fast Path (`src/vm/vm.zig`):**
+  - Inside `fastRemainder`'s exact safe-integer path, replaces `@rem(ai, bi)` (`sdiv`/`msub`) with `ai & (bi - 1)` when `ai >= 0`, `bi > 0`, and `(bi & (bi - 1)) == 0`, preserving `-0` via `std.math.signbit(a)`.
+- **Measured Impact (`python3 tools/m10_compare.py`, Apple M4, `ReleaseFast`):**
+  - Surpassed QuickJS end-to-end (CLI-to-CLI) on **4 benchmarks**: `closures.js` **`0.49×`** (over 2× faster than QuickJS), `branch_dense.js` **`0.69×`** (-37% vs M56), `int_loop.js` **`0.87×`** (-25% vs M56), and `arrays.js` **`0.94×`** (-18% vs M56); with `scopes.js` (`1.05×`), `float_math.js` (`1.07×`), `fib.js` (`1.15×`), and `global_reads.js` (`1.15×`) within 5–15% of QuickJS.

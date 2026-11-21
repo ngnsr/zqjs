@@ -67,7 +67,7 @@ fn listing(p: Proto, path: []u32, depth: usize, w: *Writer) Writer.Error!void {
 /// `--trace`, so traces and listings look the same.
 pub fn instruction(p: Proto, pc: usize, w: *Writer) Writer.Error!void {
     const op: Op = @fromBackingInt(@intCast(p.code[pc]));
-    var buf: [96]u8 = undefined; // offset, opcode and at most two u32 operands
+    var buf: [128]u8 = undefined; // offset, opcode and up to three u32 operands
     var line: Writer = .fixed(&buf);
     line.print("  {d:>5}  {s:<14} ", .{ pc, @tagName(op) }) catch unreachable;
     var comment: ?Value = null;

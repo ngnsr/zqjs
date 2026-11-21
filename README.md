@@ -184,4 +184,5 @@ faster or slower.
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md): why things are the way they are
 - [ROADMAP.md](ROADMAP.md): milestones, required regression tests, technical debt
 - [GC_DESIGN.md](GC_DESIGN.md): the garbage collector's design (M8; generations in §15, M8.1)
+- [TEST262.md](TEST262.md): ECMAScript Test262 conformance runner, baseline results (M47), and spec edge cases
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): licenses of ported code (musl/Arm `pow`)

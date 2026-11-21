@@ -36,7 +36,7 @@ code
      93  push_const     k1            ; "b"
      98  dup2
      99  get_elem
-    100  to_number
+    100  to_numeric
     101  dup
     102  rot4
     103  inc

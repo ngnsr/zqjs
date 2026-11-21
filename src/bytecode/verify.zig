@@ -80,8 +80,8 @@ const Verifier = struct {
         if (p.code.len == 0) return v.fail(p, 0, "empty code");
         if (@as(u64, p.param_slot) + p.param_count > p.slot_count) return v.fail(p, 0, "more parameters than slots");
         for (p.consts) |k| switch (k) {
-            .number, .string => {},
-            else => return v.fail(p, 0, "constant is not a number or string"),
+            .number, .bigint, .string => {},
+            else => return v.fail(p, 0, "constant is not a number, bigint, or string"),
         };
         // 7. structure: where this function's captures come from
         if (parent) |pp| for (p.captures) |c| switch (c.from) {
@@ -335,7 +335,7 @@ test "limits are checked again, and constants must be numbers or strings" {
     try testing.expectError(error.InvalidBytecode, verify(testing.allocator, &.{ .code = code, .consts = &.{}, .names = &.{}, .slot_count = 0, .max_stack = 0 }, .{ .max_code_bytes = 0 }, &f));
     try testing.expectEqualStrings("code larger than max_code_bytes", f.reason);
     try testing.expectError(error.InvalidBytecode, verify(testing.allocator, &.{ .code = code, .consts = &.{.null}, .names = &.{}, .slot_count = 0, .max_stack = 0 }, .{}, &f));
-    try testing.expectEqualStrings("constant is not a number or string", f.reason);
+    try testing.expectEqualStrings("constant is not a number, bigint, or string", f.reason);
 }
 
 /// A script `make_closure 0; pop; halt` (1 slot) around one function, to test the rules

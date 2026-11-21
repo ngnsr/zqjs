@@ -9,6 +9,7 @@ pub const Value = union(enum) {
     null,
     boolean: bool,
     number: f64,
+    bigint: *const heap.BigInt,
     string: *const heap.String,
     symbol: *const heap.Symbol,
     /// A function implemented in Zig. Becomes a function object in M7.
@@ -53,6 +54,7 @@ pub const Native = struct {
         array,
         string,
         number,
+        bigint,
         function,
         map,
         set,
@@ -82,5 +84,7 @@ pub const Native = struct {
         uint32_array,
         float32_array,
         float64_array,
+        bigint64_array,
+        biguint64_array,
     } = null,
 };

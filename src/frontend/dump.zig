@@ -465,6 +465,7 @@ const Dumper = struct {
         const w = d.w;
         switch (e.data) {
             .number => |n| try w.print("{d}", .{n}),
+            .bigint => |raw| try w.print("{s}n", .{raw}),
             .string => |units| try d.string(units),
             .regexp => |rx| {
                 try w.writeAll("(regexp ");

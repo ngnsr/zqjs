@@ -29,6 +29,7 @@ const Runtime = rt_mod.Runtime;
 const Error = rt_mod.Error;
 const ops = @import("ops.zig");
 const builtins = @import("builtins.zig");
+const bigint = @import("bigint.zig");
 const names = @import("builtin_names.zig");
 
 pub const Key = union(enum) {
@@ -49,6 +50,12 @@ pub fn key(rt: *Runtime, v: Value) Error!Key {
             if (n >= 0 and n <= max_index and @floor(n) == n) return .{ .index = @intFromFloat(n) }; // -0 → 0
             var buf: ops.NumberBuf = undefined;
             return .{ .atom = try rt.heap.internAscii(ops.formatNumber(&buf, n)) };
+        },
+        .bigint => |b| {
+            const s = try bigint.toString(rt, b, 10);
+            defer rt.gpa.free(s);
+            const a = try rt.heap.internAscii(s);
+            return if (a.atom.?.index) |idx| .{ .index = idx } else .{ .atom = a };
         },
         .string => |s| return keyUnits(rt, s.units),
         .symbol => |s| return .{ .symbol = @constCast(s) },
@@ -176,6 +183,7 @@ pub fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error
             return getFrom(rt, r.string_prototype, receiver, k);
         },
         .symbol => return getFrom(rt, (try builtins.realm(rt)).symbol_prototype, receiver, k),
+        .bigint => return getFrom(rt, (try builtins.realm(rt)).bigint_prototype, receiver, k),
         .number => return getFrom(rt, (try builtins.realm(rt)).number_prototype, receiver, k),
         .boolean => return getFrom(rt, (try builtins.realm(rt)).boolean_prototype, receiver, k),
         .object => |o| return getFrom(rt, o, receiver, k),
@@ -212,6 +220,7 @@ pub fn getPrototypeOfValue(rt: *Runtime, v: Value) Error!Value {
         .closure => |c| if (c.meta) |m| (m.proto orelse .{ .object = try builtins.closureDefaultProto(rt, c) }) else .{ .object = try builtins.closureDefaultProto(rt, c) },
         .native => |n| try builtins.nativeProto(rt, n),
         .symbol => .{ .object = (try builtins.realm(rt)).symbol_prototype },
+        .bigint => .{ .object = (try builtins.realm(rt)).bigint_prototype },
         else => .null,
     };
 }
@@ -239,7 +248,7 @@ fn getFrom(rt: *Runtime, start: *Object, receiver: Value, k: Key) Error!Value {
         if (cur.kind == .typed_array) {
             if (canonicalNumericIndex(k)) |n| {
                 if (validIntegerIndex(cur.kind.typed_array, n)) |idx| {
-                    return readTypedArrayElement(cur.kind.typed_array, idx);
+                    return readTypedArrayElement(rt, cur.kind.typed_array, idx);
                 }
                 return .undefined;
             }
@@ -303,7 +312,7 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
             if (canonicalNumericIndex(k)) |n| {
                 if (validIntegerIndex(ta, n)) |idx| {
                     return .{
-                        .value = readTypedArrayElement(ta, idx),
+                        .value = try readTypedArrayElement(rt, ta, idx),
                         .enumerable = true,
                         .writable = true,
                         .configurable = true,
@@ -424,7 +433,7 @@ pub fn setWithReceiver(rt: *Runtime, base: Value, k: Key, v: Value, receiver: Va
             var buf: [10]u8 = undefined;
             return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot set properties of " }, .{ .ascii = @tagName(base) }, .{ .ascii = " (setting '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
         },
-        .string, .number, .boolean, .symbol => return if (strict) rt.throw(.TypeError, &.{.{ .ascii = "Cannot create property on primitive" }}) else rt.fail(.primitive_write),
+        .string, .number, .boolean, .symbol, .bigint => return if (strict) rt.throw(.TypeError, &.{.{ .ascii = "Cannot create property on primitive" }}) else rt.fail(.primitive_write),
         .native => {
             if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
             if (isNamed(k, "name") or isNamed(k, "length")) {
@@ -459,9 +468,16 @@ pub fn setWithReceiver(rt: *Runtime, base: Value, k: Key, v: Value, receiver: Va
             if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
             if (o.kind == .typed_array) {
                 if (canonicalNumericIndex(k)) |n| {
-                    const num = try ops.toNumber(rt, v);
-                    if (validIntegerIndex(o.kind.typed_array, n)) |idx| {
-                        writeTypedArrayNumber(o.kind.typed_array, idx, num);
+                    if (o.kind.typed_array.kind.isBigInt()) {
+                        const b = try ops.toBigInt(rt, v);
+                        if (validIntegerIndex(o.kind.typed_array, n)) |idx| {
+                            writeTypedArrayBigInt(o.kind.typed_array, idx, b);
+                        }
+                    } else {
+                        const num = try ops.toNumber(rt, v);
+                        if (validIntegerIndex(o.kind.typed_array, n)) |idx| {
+                            writeTypedArrayNumber(o.kind.typed_array, idx, num);
+                        }
                     }
                     return true;
                 }
@@ -598,8 +614,13 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!b
                 },
                 .typed_array => |ta| {
                     if (canonicalNumericIndex(k)) |n| {
-                        const num = try ops.toNumber(rt, v);
-                        if (validIntegerIndex(ta, n)) |idx| writeTypedArrayNumber(ta, idx, num);
+                        if (ta.kind.isBigInt()) {
+                            const b = try ops.toBigInt(rt, v);
+                            if (validIntegerIndex(ta, n)) |idx| writeTypedArrayBigInt(ta, idx, b);
+                        } else {
+                            const num = try ops.toNumber(rt, v);
+                            if (validIntegerIndex(ta, n)) |idx| writeTypedArrayNumber(ta, idx, num);
+                        }
                         return true;
                     }
                 },
@@ -775,7 +796,7 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
     heap_mod.checkValue(base);
     const o = switch (base) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .string, .number, .boolean, .symbol => return rt.fail(.primitive_write),
+        .string, .number, .boolean, .symbol, .bigint => return rt.fail(.primitive_write),
         .native => return rt.fail(.function_properties),
         .closure => |c| {
             if (isNamed(k, "name")) return if (c.meta) |m| m.name_configurable else true;
@@ -840,7 +861,7 @@ pub fn hasOwn(rt: *Runtime, base: Value, k: Key) Error!bool {
             .atom => isNamed(k, "length"),
             .symbol => false,
         },
-        .number, .boolean, .symbol => false,
+        .number, .boolean, .symbol, .bigint => false,
         .undefined, .null => rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
     };
 }
@@ -1241,7 +1262,19 @@ pub fn toUint8Clamp(n: f64) u8 {
     return @intFromFloat(f + 1.0);
 }
 
-pub fn readTypedArrayElement(ta: heap_mod.TypedArrayState, idx: usize) Value {
+pub fn readTypedArrayI64(ta: heap_mod.TypedArrayState, idx: usize) i64 {
+    const data = ta.buffer.kind.array_buffer.data;
+    const off = ta.byte_offset + idx * 8;
+    return std.mem.readInt(i64, data[off..][0..8], native_endian);
+}
+
+pub fn readTypedArrayU64(ta: heap_mod.TypedArrayState, idx: usize) u64 {
+    const data = ta.buffer.kind.array_buffer.data;
+    const off = ta.byte_offset + idx * 8;
+    return std.mem.readInt(u64, data[off..][0..8], native_endian);
+}
+
+pub fn readTypedArrayNumber(ta: heap_mod.TypedArrayState, idx: usize) Value {
     const data = ta.buffer.kind.array_buffer.data;
     const off = ta.byte_offset + idx * ta.kind.bytesPerElement();
     return .{ .number = switch (ta.kind) {
@@ -1253,7 +1286,26 @@ pub fn readTypedArrayElement(ta: heap_mod.TypedArrayState, idx: usize) Value {
         .uint32 => @floatFromInt(std.mem.readInt(u32, data[off..][0..4], native_endian)),
         .float32 => @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, data[off..][0..4], native_endian)))),
         .float64 => @bitCast(std.mem.readInt(u64, data[off..][0..8], native_endian)),
+        .bigint64, .biguint64 => unreachable,
     } };
+}
+
+pub fn readTypedArrayElement(rt: *Runtime, ta: heap_mod.TypedArrayState, idx: usize) Error!Value {
+    return switch (ta.kind) {
+        .bigint64 => .{ .bigint = try bigint.fromI64(rt, readTypedArrayI64(ta, idx)) },
+        .biguint64 => .{ .bigint = try bigint.fromU64(rt, readTypedArrayU64(ta, idx)) },
+        else => readTypedArrayNumber(ta, idx),
+    };
+}
+
+pub fn writeTypedArrayBigInt(ta: heap_mod.TypedArrayState, idx: usize, b: *const heap_mod.BigInt) void {
+    const data = ta.buffer.kind.array_buffer.data;
+    const off = ta.byte_offset + idx * 8;
+    switch (ta.kind) {
+        .bigint64 => std.mem.writeInt(i64, data[off..][0..8], bigint.toI64Wrapping(b), native_endian),
+        .biguint64 => std.mem.writeInt(u64, data[off..][0..8], bigint.toU64Wrapping(b), native_endian),
+        else => unreachable,
+    }
 }
 
 pub fn writeTypedArrayNumber(ta: heap_mod.TypedArrayState, idx: usize, n: f64) void {
@@ -1272,10 +1324,16 @@ pub fn writeTypedArrayNumber(ta: heap_mod.TypedArrayState, idx: usize, n: f64) v
             std.mem.writeInt(u32, data[off..][0..4], @bitCast(f), native_endian);
         },
         .float64 => std.mem.writeInt(u64, data[off..][0..8], @bitCast(n), native_endian),
+        .bigint64, .biguint64 => unreachable,
     }
 }
 
 pub fn writeTypedArrayElement(rt: *Runtime, ta: heap_mod.TypedArrayState, idx: usize, v: Value) Error!void {
-    const n = try ops.toNumber(rt, v);
-    writeTypedArrayNumber(ta, idx, n);
+    if (ta.kind.isBigInt()) {
+        const b = try ops.toBigInt(rt, v);
+        writeTypedArrayBigInt(ta, idx, b);
+    } else {
+        const n = try ops.toNumber(rt, v);
+        writeTypedArrayNumber(ta, idx, n);
+    }
 }

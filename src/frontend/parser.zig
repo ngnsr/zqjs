@@ -2401,6 +2401,11 @@ const Parser = struct {
                 try p.advance();
                 return p.node(s, .{ .number = value }, 0);
             },
+            .bigint => {
+                const raw = t.text(p.source());
+                try p.advance();
+                return p.node(s, .{ .bigint = raw[0 .. raw.len - 1] }, 0);
+            },
             .string => {
                 const units = try p.decodeString(t);
                 try p.advance();

@@ -588,7 +588,7 @@ fn writeTriviaHighlighted(trivia: []const u8, w: *Writer) Writer.Error!void {
 fn tokenColor(tag: Tag, text: []const u8) ?[]const u8 {
     return switch (tag) {
         .kw_const, .kw_if, .kw_else, .kw_while, .kw_for, .kw_break, .kw_continue => "\x1b[35m",
-        .kw_true, .kw_false, .kw_null, .number => "\x1b[33m",
+        .kw_true, .kw_false, .kw_null, .number, .bigint => "\x1b[33m",
         .string, .template_no_sub, .template_head, .template_middle, .template_tail => "\x1b[32m",
         .identifier => if (isContextualKeyword(text)) "\x1b[35m" else null,
         .l_paren, .r_paren, .l_brace, .r_brace, .l_bracket, .r_bracket, .semicolon, .comma, .dot, .arrow => "\x1b[36m",

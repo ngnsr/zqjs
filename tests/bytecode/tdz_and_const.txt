@@ -41,7 +41,7 @@ code
     140  assign_const   s1 n2         ; c
     149  pop
     150  get_local      s1 n2         ; c
-    159  to_number
+    159  to_numeric
     160  dup
     161  inc
     162  assign_const   s1 n2         ; c

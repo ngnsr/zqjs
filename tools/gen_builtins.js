@@ -72,6 +72,8 @@ const objects = vm.runInNewContext(`({
   regexp_prototype: RegExp.prototype,
   symbol_constructor: Symbol,
   symbol_prototype: Symbol.prototype,
+  bigint_constructor: BigInt,
+  bigint_prototype: BigInt.prototype,
   array_buffer_constructor: ArrayBuffer,
   array_buffer_prototype: ArrayBuffer.prototype,
   data_view_constructor: DataView,
@@ -96,6 +98,10 @@ const objects = vm.runInNewContext(`({
   float32_array_prototype: Float32Array.prototype,
   float64_array_constructor: Float64Array,
   float64_array_prototype: Float64Array.prototype,
+  bigint64_array_constructor: BigInt64Array,
+  bigint64_array_prototype: BigInt64Array.prototype,
+  biguint64_array_constructor: BigUint64Array,
+  biguint64_array_prototype: BigUint64Array.prototype,
 })`);
 
 const lines = [

@@ -29,6 +29,8 @@ const Diagnostic = @import("../frontend/diag.zig").Diagnostic;
 const Limits = @import("../limits.zig").Limits;
 const Limit = @import("../limits.zig").Limit;
 const Heap = @import("../runtime/heap.zig").Heap;
+const heap_mod = @import("../runtime/heap.zig");
+const bigint_mod = @import("../runtime/bigint.zig");
 const Value = @import("../runtime/value.zig").Value;
 const bc = @import("bytecode.zig");
 const Op = bc.Op;
@@ -195,6 +197,18 @@ const ControlContext = union(enum) {
     finally_body: *FinallyContext,
 };
 
+const BigIntIndexCtx = struct {
+    pub fn hash(_: @This(), b: *const heap_mod.BigInt) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(&.{@intFromBool(b.negative)});
+        hasher.update(std.mem.sliceAsBytes(b.limbs));
+        return hasher.final();
+    }
+    pub fn eql(_: @This(), a: *const heap_mod.BigInt, b: *const heap_mod.BigInt) bool {
+        return a.negative == b.negative and std.mem.eql(u64, a.limbs, b.limbs);
+    }
+};
+
 /// The compiler of one function (or the script).
 const Compiler = struct {
     s: *Shared,
@@ -215,6 +229,7 @@ const Compiler = struct {
     // Strings by content; keys are the literals' UTF-16 units as bytes, which live in
     // the AST arena for the whole compilation.
     string_index: std.StringHashMapUnmanaged(u32) = .empty,
+    bigint_index: std.HashMapUnmanaged(*const heap_mod.BigInt, u32, BigIntIndexCtx, std.hash_map.default_max_load_percentage) = .empty,
     name_index: std.StringHashMapUnmanaged(u32) = .empty,
 
     depth: u32 = 0,
@@ -231,6 +246,7 @@ const Compiler = struct {
         const gpa = c.s.gpa;
         c.number_index.deinit(gpa);
         c.string_index.deinit(gpa);
+        c.bigint_index.deinit(gpa);
         c.name_index.deinit(gpa);
         c.code.deinit(gpa);
         c.consts.deinit(gpa);
@@ -393,6 +409,19 @@ const Compiler = struct {
         // On a later failure the string is freed by the heap rollback in `compile`.
         gop.key_ptr.* = std.mem.sliceAsBytes(str.units);
         gop.value_ptr.* = try c.constant(.{ .string = str });
+        return gop.value_ptr.*;
+    }
+
+    fn bigintConst(c: *Compiler, raw: []const u8) Error!u32 {
+        if (c.consts.items.len >= c.s.limits.max_constants) return c.limit(.constants);
+        const b = bigint_mod.parseLiteralToHeap(c.s.heap, c.s.gpa, c.s.limits.max_bigint_bits, raw) catch |e| switch (e) {
+            error.LimitExceeded => return c.limit(c.s.heap.limit_hit orelse .heap_bytes),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        const gop = try c.bigint_index.getOrPut(c.s.gpa, b);
+        if (gop.found_existing) return gop.value_ptr.*;
+        errdefer _ = c.bigint_index.remove(b);
+        gop.value_ptr.* = try c.constant(.{ .bigint = b });
         return gop.value_ptr.*;
     }
 
@@ -1293,6 +1322,7 @@ const Compiler = struct {
     fn expr(c: *Compiler, e: *const ast.Expr) Error!void {
         switch (e.data) {
             .number => |n| try c.emit(.push_const, &.{try c.number(n)}),
+            .bigint => |raw| try c.emit(.push_const, &.{try c.bigintConst(raw)}),
             .string => |units| try c.emit(.push_const, &.{try c.string(units)}),
             .template => |t| {
                 try c.emit(.push_const, &.{try c.string(t.quasis[0])});
@@ -1571,7 +1601,7 @@ const Compiler = struct {
                     // Read, ToNumber, then write; the result is the new value (prefix) or the
                     // old one (postfix: keep a copy of it under the new value).
                     try c.read(ref);
-                    try c.emit(.to_number, &.{});
+                    try c.emit(.to_numeric, &.{});
                     if (!u.prefix) try c.emit(.dup, &.{});
                     try c.emit(if (u.op == .inc) .inc else .dec, &.{});
                     try c.write(ref);
@@ -1599,7 +1629,7 @@ const Compiler = struct {
                         try c.emit(.dup2, &.{});
                         try c.emit(.get_elem, &.{});
                     }
-                    try c.emit(.to_number, &.{});
+                    try c.emit(.to_numeric, &.{});
                     if (!u.prefix) {
                         try c.emit(.dup, &.{});
                         try c.emit(if (named == null) .rot4 else .rot3, &.{});
@@ -1619,7 +1649,7 @@ const Compiler = struct {
                     };
                     if (named) |n| {
                         try c.emit(.super_get_prop, &.{try c.name(n)});
-                        try c.emit(.to_number, &.{});
+                        try c.emit(.to_numeric, &.{});
                         if (!u.prefix) try c.emit(.dup, &.{});
                         try c.emit(if (u.op == .inc) .inc else .dec, &.{});
                         try c.emit(.super_set_prop, &.{try c.name(n)});
@@ -1632,7 +1662,7 @@ const Compiler = struct {
                         try c.emit(.init_local, &.{k_slot});
                         try c.emit(.get_local, &.{ k_slot, try c.name("<key>") });
                         try c.emit(.super_get_elem, &.{});
-                        try c.emit(.to_number, &.{});
+                        try c.emit(.to_numeric, &.{});
                         if (!u.prefix) {
                             try c.emit(.dup, &.{});
                             try c.emit(.init_local, &.{val_slot});

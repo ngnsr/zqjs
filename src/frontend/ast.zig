@@ -234,6 +234,8 @@ pub const Expr = struct {
 
     pub const Data = union(enum) {
         number: f64,
+        /// Validated BigInt literal text without the trailing `n` (slice of source).
+        bigint: []const u8,
         /// UTF-16 code units, possibly containing lone surrogates (DESIGN_DECISIONS D6).
         string: []const u16,
         /// `/pattern/flags` literal (M30, D61).

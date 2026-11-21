@@ -537,7 +537,7 @@ const Stringifier = struct {
         if (may_call) try roots.register(s.rt);
         defer if (may_call) roots.unregister(s.rt);
 
-        if (v.isObjectLike()) {
+        if (v.isObjectLike() or v == .bigint) {
             const to_json = try object.get(s.rt, v, object.namedAtom(s.to_json_atom));
             if (to_json.isFunction()) {
                 v = try s.rt.callCallable(to_json, v, &.{key_val});
@@ -551,6 +551,7 @@ const Stringifier = struct {
 
         switch (v) {
             .undefined, .native, .closure, .symbol => return false,
+            .bigint => return s.rt.throw(.TypeError, &.{.{ .ascii = "Do not know how to serialize a BigInt" }}),
             .null => {
                 try s.writeAscii("null");
                 return true;

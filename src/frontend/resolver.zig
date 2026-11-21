@@ -588,7 +588,7 @@ const Resolver = struct {
 
     fn expr(r: *Resolver, e: *const ast.Expr) Error!void {
         switch (e.data) {
-            .number, .string, .regexp, .boolean, .null => {},
+            .number, .bigint, .string, .regexp, .boolean, .null => {},
             .template => |t| for (t.exprs) |ex| try r.expr(ex),
             .tagged_template => |tt| {
                 try r.expr(tt.callee);

@@ -32,7 +32,18 @@ const Error = rt_mod.Error;
 const ops = @import("../runtime/ops.zig");
 const object = @import("../runtime/object.zig");
 const builtins = @import("../runtime/builtins.zig");
+const bigint = @import("../runtime/bigint.zig");
 const coroutine = @import("../runtime/coroutine.zig");
+
+/// Helper for `++` / `--` supporting both Number and BigInt.
+fn stepNumeric(rt: *Runtime, old_in: Value, is_inc: bool) Error!struct { old: Value, new: Value } {
+    const old = try ops.toNumeric(rt, old_in);
+    const new: Value = if (old == .bigint)
+        .{ .bigint = try bigint.addI64(rt, old.bigint, if (is_inc) 1 else -1) }
+    else
+        .{ .number = if (is_inc) old.number + 1 else old.number - 1 };
+    return .{ .old = old, .new = new };
+}
 
 /// Runs a resolved script. On error.Thrown, `rt.exception` or `rt.thrown_value`
 /// describes the exception.
@@ -968,6 +979,13 @@ const Machine = struct {
                 m.depth -= 1;
                 try m.pushVal(.{ .number = n });
             },
+            .bigint => |raw| {
+                try m.enter();
+                m.safepoint();
+                try m.rt.step();
+                m.depth -= 1;
+                try m.pushVal(.{ .bigint = try bigint.parse(m.rt, raw, true) });
+            },
             .boolean => |b| {
                 try m.enter();
                 m.safepoint();
@@ -1001,11 +1019,10 @@ const Machine = struct {
                     try m.enter();
                     m.safepoint();
                     try m.rt.step();
-                    const old = try ops.toNumber(m.rt, try m.read(ref));
-                    const new = if (u.op == .inc) old + 1 else old - 1;
-                    try m.write(ref, .{ .number = new });
+                    const s = try stepNumeric(m.rt, try m.read(ref), u.op == .inc);
+                    try m.write(ref, s.new);
                     m.depth -= 1;
-                    try m.pushVal(.{ .number = if (u.prefix) new else old });
+                    try m.pushVal(if (u.prefix) s.new else s.old);
                 },
                 .member, .super_member => try m.pushTask(.{ .eval = e }),
             },
@@ -1248,10 +1265,16 @@ const Machine = struct {
             .unary_finish => |op| {
                 const v = m.popVal();
                 const res_v: Value = switch (op) {
-                    .neg => .{ .number = -(try ops.toNumber(rt, v)) },
+                    .neg => blk: {
+                        const nv = try ops.toNumeric(rt, v);
+                        break :blk if (nv == .bigint) .{ .bigint = try bigint.neg(rt, nv.bigint) } else .{ .number = -nv.number };
+                    },
                     .plus => .{ .number = try ops.toNumber(rt, v) },
                     .not => .{ .boolean = !ops.toBoolean(v) },
-                    .bit_not => .{ .number = ops.bitNot(try ops.toNumber(rt, v)) },
+                    .bit_not => blk: {
+                        const nv = try ops.toNumeric(rt, v);
+                        break :blk if (nv == .bigint) .{ .bigint = try bigint.bitNot(rt, nv.bigint) } else .{ .number = ops.bitNot(nv.number) };
+                    },
                     .typeof => try ops.typeOf(rt, v),
                 };
                 m.depth -= 1;
@@ -1684,16 +1707,14 @@ const Machine = struct {
                 if (um.is_private) {
                     const brand = m.current_closure.?.meta.?.brand.?.closure;
                     const name_str = try rt.heap.internAscii(um.named.?);
-                    const old = try ops.toNumber(rt, try object.getPrivate(rt, base, brand, name_str));
-                    const new = if (um.op == .inc) old + 1 else old - 1;
-                    try object.setPrivate(rt, base, brand, name_str, .{ .number = new });
-                    try m.pushVal(.{ .number = if (um.prefix) new else old });
+                    const s = try stepNumeric(rt, try object.getPrivate(rt, base, brand, name_str), um.op == .inc);
+                    try object.setPrivate(rt, base, brand, name_str, s.new);
+                    try m.pushVal(if (um.prefix) s.new else s.old);
                 } else {
                     const k = try m.toKey(kv);
-                    const old = try ops.toNumber(rt, try object.get(rt, base, k));
-                    const new = if (um.op == .inc) old + 1 else old - 1;
-                    try object.set(rt, base, k, .{ .number = new });
-                    try m.pushVal(.{ .number = if (um.prefix) new else old });
+                    const s = try stepNumeric(rt, try object.get(rt, base, k), um.op == .inc);
+                    try object.set(rt, base, k, s.new);
+                    try m.pushVal(if (um.prefix) s.new else s.old);
                 }
             },
             .member_base => |mb| {
@@ -1888,10 +1909,9 @@ const Machine = struct {
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_update without home_object");
                 const kv: KeyValue = if (su.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const k = try m.toKey(kv);
-                const old = try ops.toNumber(rt, try object.getSuper(rt, home, this_val, k));
-                const new = if (su.op == .inc) old + 1 else old - 1;
-                try object.setSuper(rt, home, this_val, k, .{ .number = new });
-                try m.pushVal(.{ .number = if (su.prefix) new else old });
+                const s = try stepNumeric(rt, try object.getSuper(rt, home, this_val, k), su.op == .inc);
+                try object.setSuper(rt, home, this_val, k, s.new);
+                try m.pushVal(if (su.prefix) s.new else s.old);
             },
             .super_call_member_key => |sm| {
                 const this_val = try m.requireThis();
@@ -3017,6 +3037,10 @@ const Machine = struct {
                 m.depth -= 1;
                 try m.pushVal(.{ .number = n });
             },
+            .bigint => |raw| {
+                m.depth -= 1;
+                try m.pushVal(.{ .bigint = try bigint.parse(rt, raw, true) });
+            },
             .string => |units| {
                 m.depth -= 1;
                 try m.pushVal(.{ .string = try rt.heap.newString(&.{.{ .utf16 = units }}) });
@@ -3189,11 +3213,10 @@ const Machine = struct {
             .spread, .hole => unreachable,
             .update => |u| switch (u.target) {
                 .ref => |ref| {
-                    const old = try ops.toNumber(rt, try m.read(ref));
-                    const new = if (u.op == .inc) old + 1 else old - 1;
-                    try m.write(ref, .{ .number = new });
+                    const s = try stepNumeric(rt, try m.read(ref), u.op == .inc);
+                    try m.write(ref, s.new);
                     m.depth -= 1;
-                    try m.pushVal(.{ .number = if (u.prefix) new else old });
+                    try m.pushVal(if (u.prefix) s.new else s.old);
                 },
                 .member => |mem| {
                     try m.pushTask(.depth_pop);
@@ -3925,7 +3948,7 @@ fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []c
                 try object.define(rt, dst, k, v);
             }
         },
-        .undefined, .null, .boolean, .number, .symbol, .native => {},
+        .undefined, .null, .boolean, .number, .bigint, .symbol, .native => {},
     }
 }
 

@@ -1927,3 +1927,21 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
   - `Vm` calls `cache.syncSp(vm)` before every opcode that can enter a proxy trap (including `.call`, `.call_spread`, `.super_call`, `.super_call_spread`, `.super_get_prop`, `.delete_prop`, `.object_spread`, `.new_call_spread`), and every trap invocation roots live values via `ValueRoots` / `rt.addRoots`.
 - **Inspector (`src/repl/inspect.zig`):**
   - Formats proxies as `Proxy [ target, handler ]` or `Proxy [ <revoked> ]` without invoking any traps.
+
+---
+
+## D77. `BigInt`, `BigInt64Array`, and `BigUint64Array` (M47)
+
+**Decision:** Implement arbitrary-precision `BigInt`, `BigInt64Array`, `BigUint64Array`, and `DataView.{get,set}Big{Int,Uint}64` in pure Zig (zero external dependencies) across both engines (`Vm` and tree-walking `Machine`), the REPL inspector, and the embedding/C API.
+
+- **Limits (`limits.zig`):**
+  - `Limits.max_bigint_bits: u32 = 1 << 20` (1 Mi bits; exceeding throws `RangeError: Maximum BigInt size exceeded`). O(n²) loops (`mul`, `divRem`, `pow`, `parse`, `toString`) charge `rt.step()` so huge operations remain interruptible by `max_steps`.
+- **Heap & GC (`heap.zig`, `value.zig`, `handles.zig`, `c_api.zig`, `include/zqjs.h`):**
+  - `Obj.Kind.bigint` and `heap.BigInt { obj: Obj, negative: bool, limbs: []const u64 }` (immutable, little-endian `u64` limbs allocated via `Heap.allocator()` and freed on sweep). `Heap.newBigInt` enforces canonical normalization: `0n` always has `limbs.len == 0` and `negative == false`, and non-zero values have no trailing zero limbs.
+  - `Value.bigint: *const heap.BigInt` participates in `SameValueZero` and `hashValue` by canonical `(negative, limbs)` value equality so `Map`/`Set` keys work by value.
+  - Exposed as `HandleKind.bigint` / `ZQJS_HANDLE_BIGINT = 9`, preserving `CLimits` and all existing C ABI values.
+- **Pure-Zig Math (`runtime/bigint.zig`):**
+  - `fromI64`, `fromU64`, `fromF64Exact`, `toF64` (IEEE-754 round-half-to-even), `toI64Wrapping`/`toU64Wrapping`, `parse`/`tryParse`/`parseLiteralToHeap`, `toString` (radices `2..36` with power-of-2 fast path and chunked base conversion), `neg`, `add`, `sub`, `mul` (schoolbook `u128`), `divRem` (truncated toward zero; Knuth Algorithm D for multi-limb), `pow` (exponentiation by squaring), infinite two's-complement bitwise ops (`bitNot`, `bitAnd`, `bitOr`, `bitXor`, `shl`, `shr`), `cmp`, exact `cmpNumber(big, f64)`, and `asIntN`/`asUintN`.
+- **Frontend, Bytecode & Semantics (`lexer.zig`, `parser.zig`, `compiler.zig`, `verify.zig`, `ops.zig`, `object.zig`, `json.zig`, `vm.zig`, `machine.zig`):**
+  - Lexer validates decimal/hex/octal/binary BigInt literals and rejects `01n`, `1.5n`, `1e5n`, `1__0n`, `0x_1n`, `10_n` as `SyntaxError`. Compiler deduplicates BigInt constants in `Proto.consts`.
+  - Added `Op.to_numeric` for `++`/`--` (preserving `BigInt` while `.to_number` continues to throw `TypeError` for `+1n`), `ops.toBigInt` for `ToBigInt`, `JSON.stringify` `TypeError` unless `BigInt.prototype.toJSON` is defined, and `BigInt64Array`/`BigUint64Array` + `DataView` 64-bit BigInt accessors.

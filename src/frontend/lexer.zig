@@ -31,8 +31,8 @@ pub const Lexer = struct {
         const c = l.source[start];
 
         if (isDigit(c) or (c == '.' and isDigit(l.peekAt(start + 1)))) {
-            try l.number();
-            return l.make(.number, start, newline_before);
+            const tag = try l.number();
+            return l.make(tag, start, newline_before);
         }
         if (isIdentStart(c)) {
             while (isIdentPart(l.peekAt(l.pos))) l.pos += 1;
@@ -114,15 +114,22 @@ pub const Lexer = struct {
     }
 
     /// `digits [. digits] [e [+-] digits]`, `. digits [exponent]`, or `0x`/`0o`/`0b` digits;
-    /// `_` separators only between two digits. The value comes from `number.zig`.
-    fn number(l: *Lexer) Error!void {
+    /// `_` separators only between two digits. Returns `.bigint` if suffixed with `n`.
+    fn number(l: *Lexer) Error!Tag {
         const start = l.pos;
         if (l.source[start] == '0') {
             const radix: u8 = switch (l.peekAt(start + 1)) {
                 'x', 'X' => 16,
                 'o', 'O' => 8,
                 'b', 'B' => 2,
-                '0'...'9' => return l.fail(.{ .unsupported = .legacy_octal }, start, start + 2),
+                '0'...'9' => {
+                    var scan = start + 1;
+                    while (isDigit(l.peekAt(scan)) or l.peekAt(scan) == '_') scan += 1;
+                    if (l.peekAt(scan) == 'n') {
+                        return l.fail(.{ .syntax_error = "Decimal BigInt literal cannot have leading zero" }, start, scan + 1);
+                    }
+                    return l.fail(.{ .unsupported = .legacy_octal }, start, start + 2);
+                },
                 '_' => return l.fail(.{ .syntax_error = "numeric separator after a leading 0" }, start + 1, start + 2),
                 else => 10,
             };
@@ -130,27 +137,36 @@ pub const Lexer = struct {
                 l.pos = start + 2;
                 if (!isRadixDigit(l.peekAt(l.pos), radix)) return l.fail(.{ .syntax_error = "missing digits after the radix prefix" }, start, l.pos);
                 try l.digits(radix);
-                return l.numberEnd(start);
+                return l.numberEnd(start, false);
             }
         }
+        var is_float = l.source[start] == '.';
         try l.digits(10);
         if (l.peekAt(l.pos) == '.') {
+            is_float = true;
             l.pos += 1;
             try l.digits(10);
         }
         if (l.peekAt(l.pos) == 'e' or l.peekAt(l.pos) == 'E') {
+            is_float = true;
             l.pos += 1;
             if (l.peekAt(l.pos) == '+' or l.peekAt(l.pos) == '-') l.pos += 1;
             if (!isDigit(l.peekAt(l.pos))) return l.fail(.{ .syntax_error = "missing digits in exponent" }, start, l.pos);
             try l.digits(10);
         }
-        return l.numberEnd(start);
+        return l.numberEnd(start, is_float);
     }
 
-    fn numberEnd(l: *Lexer, start: usize) Error!void {
+    fn numberEnd(l: *Lexer, start: usize, is_float: bool) Error!Tag {
         const after = l.peekAt(l.pos);
-        if (after == 'n') return l.fail(.{ .unsupported = .bigint }, start, l.pos + 1);
+        if (after == 'n') {
+            if (is_float) return l.fail(.{ .syntax_error = "Invalid or unexpected token" }, start, l.pos + 1);
+            l.pos += 1;
+            if (isIdentPart(l.peekAt(l.pos))) return l.fail(.{ .syntax_error = "identifier or digit directly after a number" }, l.pos, l.pos + 1);
+            return .bigint;
+        }
         if (isIdentPart(after)) return l.fail(.{ .syntax_error = "identifier or digit directly after a number" }, l.pos, l.pos + 1);
+        return .number;
     }
 
     /// A run of digits, possibly empty; each `_` must sit between two digits.
@@ -360,8 +376,13 @@ test "numbers" {
     try expectFailure("0b12", error.SyntaxError, .{ .syntax_error = "identifier or digit directly after a number" });
     try expectFailure("0o8", error.SyntaxError, .{ .syntax_error = "missing digits after the radix prefix" });
     try expectFailure("0x1g", error.SyntaxError, .{ .syntax_error = "identifier or digit directly after a number" });
-    try expectFailure("10n", error.Unsupported, .{ .unsupported = .bigint });
-    try expectFailure("0x10n", error.Unsupported, .{ .unsupported = .bigint });
+    try expectTags("10n 0x10n 0o77n 0b101n 123_456n", &.{ .bigint, .bigint, .bigint, .bigint, .bigint });
+    try expectFailure("01n", error.SyntaxError, .{ .syntax_error = "Decimal BigInt literal cannot have leading zero" });
+    try expectFailure("1.5n", error.SyntaxError, .{ .syntax_error = "Invalid or unexpected token" });
+    try expectFailure("1e5n", error.SyntaxError, .{ .syntax_error = "Invalid or unexpected token" });
+    try expectFailure("1__0n", error.SyntaxError, .{ .syntax_error = sep });
+    try expectFailure("0x_1n", error.SyntaxError, .{ .syntax_error = "missing digits after the radix prefix" });
+    try expectFailure("10_n", error.SyntaxError, .{ .syntax_error = sep });
     try expectFailure("1e", error.SyntaxError, .{ .syntax_error = "missing digits in exponent" });
     try expectFailure("1e+", error.SyntaxError, .{ .syntax_error = "missing digits in exponent" });
     try expectFailure("3in", error.SyntaxError, .{ .syntax_error = "identifier or digit directly after a number" });

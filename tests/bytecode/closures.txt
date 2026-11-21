@@ -31,7 +31,7 @@ code
     105  pop
     106  fresh_cell     s2
     111  get_cell       s2 n1         ; i
-    120  to_number
+    120  to_numeric
     121  dup
     122  inc
     123  set_cell       s2 n1         ; i
@@ -72,7 +72,7 @@ code
       0  push_callee
       1  init_local     s0
       6  get_capture    ^0 n0         ; depth
-     15  to_number
+     15  to_numeric
      16  dup
      17  inc
      18  set_capture    ^0 n0         ; depth

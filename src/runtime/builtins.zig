@@ -29,6 +29,7 @@ const coroutine = @import("coroutine.zig");
 const Runtime = rt_mod.Runtime;
 const Error = rt_mod.Error;
 const ops = @import("ops.zig");
+const bigint = @import("bigint.zig");
 const object = @import("object.zig");
 const names = @import("builtin_names.zig");
 const json = @import("json.zig");
@@ -94,6 +95,8 @@ pub const Realm = struct {
     regexp_namespace: *Object,
     symbol_prototype: *Object,
     symbol_namespace: *Object,
+    bigint_prototype: *Object,
+    bigint_namespace: *Object,
     sym_iterator: *heap_mod.Symbol,
     /// `Symbol.asyncIterator` (D68).
     sym_async_iterator: *heap_mod.Symbol,
@@ -105,7 +108,7 @@ pub const Realm = struct {
     views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [53]*Object {
+    pub fn objects(r: *const Realm) [55]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -137,6 +140,7 @@ pub const Realm = struct {
             r.aggregate_error_prototype,
             r.regexp_prototype,
             r.symbol_prototype,
+            r.bigint_prototype,
             r.object_namespace,
             r.array_namespace,
             r.string_namespace,
@@ -158,6 +162,7 @@ pub const Realm = struct {
             r.aggregate_error_namespace,
             r.regexp_namespace,
             r.symbol_namespace,
+            r.bigint_namespace,
             r.math,
             r.json,
         };
@@ -171,10 +176,10 @@ pub const ViewsRealm = struct {
     data_view_namespace: *Object,
     typed_array_prototype: *Object,
     typed_array_namespace: *Object,
-    typed_array_prototypes: [9]*Object,
-    typed_array_namespaces: [9]*Object,
+    typed_array_prototypes: [11]*Object,
+    typed_array_namespaces: [11]*Object,
 
-    pub fn objects(v: *const ViewsRealm) [24]*Object {
+    pub fn objects(v: *const ViewsRealm) [28]*Object {
         return .{
             v.array_buffer_prototype,
             v.array_buffer_namespace,
@@ -191,6 +196,8 @@ pub const ViewsRealm = struct {
             v.typed_array_prototypes[6],
             v.typed_array_prototypes[7],
             v.typed_array_prototypes[8],
+            v.typed_array_prototypes[9],
+            v.typed_array_prototypes[10],
             v.typed_array_namespaces[0],
             v.typed_array_namespaces[1],
             v.typed_array_namespaces[2],
@@ -200,6 +207,8 @@ pub const ViewsRealm = struct {
             v.typed_array_namespaces[6],
             v.typed_array_namespaces[7],
             v.typed_array_namespaces[8],
+            v.typed_array_namespaces[9],
+            v.typed_array_namespaces[10],
         };
     }
 };
@@ -264,6 +273,8 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .regexp_namespace = try builtin(h, null, .regexp_constructor),
         .symbol_prototype = try builtin(h, object_prototype, .symbol_prototype),
         .symbol_namespace = try builtin(h, null, .symbol_constructor),
+        .bigint_prototype = try builtin(h, object_prototype, .bigint_prototype),
+        .bigint_namespace = try builtin(h, null, .bigint_constructor),
         .sym_iterator = try h.newSymbol(try h.ascii("Symbol.iterator"), false),
         .sym_async_iterator = try h.newSymbol(try h.ascii("Symbol.asyncIterator"), false),
         .sym_to_primitive = try h.newSymbol(try h.ascii("Symbol.toPrimitive"), false),
@@ -553,6 +564,18 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.symbol_prototype, "toString", &symbol_to_string);
     try method(rt, r.symbol_prototype, "valueOf", &symbol_value_of);
     try object.defineAccessor(rt, .{ .object = r.symbol_prototype }, try object.named(rt, "description"), .{ .native = &symbol_description_getter }, false, false);
+    try rt.heap.defineProperty(r.bigint_namespace, try rt.heap.internAscii("prototype"), .{
+        .value = .{ .object = r.bigint_prototype },
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
+    try method(rt, r.bigint_namespace, "asIntN", &bigint_as_int_n);
+    try method(rt, r.bigint_namespace, "asUintN", &bigint_as_uint_n);
+    try constant(rt, r.bigint_prototype, "constructor", .{ .native = &bigint_global });
+    try method(rt, r.bigint_prototype, "toString", &bigint_to_string);
+    try method(rt, r.bigint_prototype, "valueOf", &bigint_value_of);
+    try defineToStringTag(rt, r.bigint_prototype, r.sym_to_string_tag, "BigInt");
     _ = &r;
     rt.realm = r;
     return &rt.realm.?;
@@ -623,6 +646,7 @@ pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
         .aggregate_error => r.aggregate_error_namespace,
         .regexp => r.regexp_namespace,
         .symbol => r.symbol_namespace,
+        .bigint => r.bigint_namespace,
         .array_buffer => (try viewsRealm(rt)).array_buffer_namespace,
         .data_view => (try viewsRealm(rt)).data_view_namespace,
         .typed_array => (try viewsRealm(rt)).typed_array_namespace,
@@ -635,6 +659,8 @@ pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
         .uint32_array => (try viewsRealm(rt)).typed_array_namespaces[6],
         .float32_array => (try viewsRealm(rt)).typed_array_namespaces[7],
         .float64_array => (try viewsRealm(rt)).typed_array_namespaces[8],
+        .bigint64_array => (try viewsRealm(rt)).typed_array_namespaces[9],
+        .biguint64_array => (try viewsRealm(rt)).typed_array_namespaces[10],
     };
 }
 
@@ -650,6 +676,8 @@ pub fn nativeProto(rt: *Runtime, n: *const Native) Error!Value {
         .uint32_array,
         .float32_array,
         .float64_array,
+        .bigint64_array,
+        .biguint64_array,
         => .{ .native = &typed_array_global },
         else => .{ .object = (try realm(rt)).function_prototype },
     };
@@ -680,6 +708,7 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
         .aggregate_error => r.aggregate_error_prototype,
         .regexp => r.regexp_prototype,
         .symbol => r.symbol_prototype,
+        .bigint => r.bigint_prototype,
         .array_buffer => (try viewsRealm(rt)).array_buffer_prototype,
         .data_view => (try viewsRealm(rt)).data_view_prototype,
         .typed_array => (try viewsRealm(rt)).typed_array_prototype,
@@ -692,6 +721,8 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
         .uint32_array => (try viewsRealm(rt)).typed_array_prototypes[6],
         .float32_array => (try viewsRealm(rt)).typed_array_prototypes[7],
         .float64_array => (try viewsRealm(rt)).typed_array_prototypes[8],
+        .bigint64_array => (try viewsRealm(rt)).typed_array_prototypes[9],
+        .biguint64_array => (try viewsRealm(rt)).typed_array_prototypes[10],
     };
 }
 
@@ -726,6 +757,7 @@ pub const uri_error_global: Native = .{ .name = "URIError", .call = uriErrorCall
 pub const aggregate_error_global: Native = .{ .name = "AggregateError", .call = aggregateErrorCall, .construct = aggregateErrorConstruct, .namespace = .aggregate_error };
 pub const regexp_global: Native = .{ .name = "RegExp", .call = regexpCall, .construct = regexpConstruct, .namespace = .regexp };
 pub const symbol_global: Native = .{ .name = "Symbol", .call = symbolCall, .namespace = .symbol };
+pub const bigint_global: Native = .{ .name = "BigInt", .length = 1, .call = bigintCall, .namespace = .bigint };
 
 /// A global read: implemented, host-registered (M9.1, D53), known to node (Unsupported),
 /// or a ReferenceError.
@@ -774,6 +806,7 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "AggregateError")) return .{ .native = &aggregate_error_global };
     if (std.mem.eql(u8, name, "RegExp")) return .{ .native = &regexp_global };
     if (std.mem.eql(u8, name, "Symbol")) return .{ .native = &symbol_global };
+    if (std.mem.eql(u8, name, "BigInt")) return .{ .native = &bigint_global };
     if (std.mem.eql(u8, name, "ArrayBuffer")) return .{ .native = &array_buffer_global };
     if (std.mem.eql(u8, name, "DataView")) return .{ .native = &data_view_global };
     if (std.mem.eql(u8, name, "Int8Array")) return .{ .native = &typed_array_ctors[0] };
@@ -785,6 +818,8 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "Uint32Array")) return .{ .native = &typed_array_ctors[6] };
     if (std.mem.eql(u8, name, "Float32Array")) return .{ .native = &typed_array_ctors[7] };
     if (std.mem.eql(u8, name, "Float64Array")) return .{ .native = &typed_array_ctors[8] };
+    if (std.mem.eql(u8, name, "BigInt64Array")) return .{ .native = &typed_array_ctors[9] };
+    if (std.mem.eql(u8, name, "BigUint64Array")) return .{ .native = &typed_array_ctors[10] };
     if (std.mem.eql(u8, name, "Math")) return .{ .object = (try realm(rt)).math };
     if (std.mem.eql(u8, name, "JSON")) return .{ .object = (try realm(rt)).json };
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return .{ .native = n };
@@ -810,7 +845,7 @@ fn notCallable(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 /// Evaluates `new callee(args...)` for built-in constructors (M14).
 pub fn construct(rt: *Runtime, callee: Value, args: []const Value) Error!Value {
     return switch (callee) {
-        .native => |n| if (n.construct) |c| c(rt, args) else if (n == &symbol_global) rt.throw(.TypeError, &.{.{ .ascii = "Symbol is not a constructor" }}) else if (n.namespace != null) rt.fail(.builtin) else rt.throw(.TypeError, &.{ .{ .ascii = n.name }, .{ .ascii = " is not a constructor" } }),
+        .native => |n| if (n.construct) |c| c(rt, args) else if (n == &symbol_global or n == &bigint_global) rt.throw(.TypeError, &.{ .{ .ascii = n.name }, .{ .ascii = " is not a constructor" } }) else if (n.namespace != null) rt.fail(.builtin) else rt.throw(.TypeError, &.{ .{ .ascii = n.name }, .{ .ascii = " is not a constructor" } }),
         .closure => rt.fail(.builtin),
         else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }}),
     };
@@ -1161,6 +1196,7 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
         .number => "Number",
         .string => "String",
         .symbol => "Object",
+        .bigint => "Object",
         .native, .closure => "Function",
         .object => |o| switch (o.kind) {
             .array => "Array",
@@ -2584,7 +2620,7 @@ fn objectKeys(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 
     switch (arg(args, 0)) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .boolean, .number, .symbol, .native => {},
+        .boolean, .number, .bigint, .symbol, .native => {},
         .closure => |c| {
             const keys = try object.ownKeysClosure(rt, c);
             defer rt.gpa.free(keys);
@@ -2671,6 +2707,7 @@ fn objectGetPrototypeOf(rt: *Runtime, _: Value, args: []const Value) Error!Value
         .number => .{ .object = r.number_prototype },
         .string => .{ .object = r.string_prototype },
         .symbol => .{ .object = r.symbol_prototype },
+        .bigint => .{ .object = r.bigint_prototype },
         .native, .closure, .object => object.getPrototypeOfValue(rt, v),
     };
 }
@@ -2749,7 +2786,7 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                     if (object.canonicalNumericIndex(k)) |n| {
                         if (object.validIntegerIndex(ta, n)) |idx| {
                             return .{
-                                .value = object.readTypedArrayElement(ta, idx),
+                                .value = try object.readTypedArrayElement(rt, ta, idx),
                                 .enumerable = true,
                                 .writable = true,
                                 .configurable = true,
@@ -3234,7 +3271,7 @@ fn objectValuesEntriesImpl(rt: *Runtime, args: []const Value, comptime is_entrie
 
     switch (arg(args, 0)) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .boolean, .number, .symbol, .native => {},
+        .boolean, .number, .bigint, .symbol, .native => {},
         .closure => |c| {
             const keys = try object.ownKeysClosure(rt, c);
             defer rt.gpa.free(keys);
@@ -3304,7 +3341,7 @@ fn objectAssign(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const target = arg(args, 0);
     switch (target) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .boolean, .number, .string, .symbol => return unsupportedReceiver(rt, "assign"),
+        .boolean, .number, .bigint, .string, .symbol => return unsupportedReceiver(rt, "assign"),
         .native => return rt.fail(.function_properties),
         .object, .closure => {},
     }
@@ -3318,7 +3355,7 @@ fn objectAssign(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     for (args[1..]) |src| {
         root_buf[1] = src;
         switch (src) {
-            .undefined, .null, .boolean, .number, .symbol, .native => {},
+            .undefined, .null, .boolean, .number, .bigint, .symbol, .native => {},
             .closure => |c| {
                 const keys = try object.ownAllKeysClosure(rt, c);
                 defer rt.gpa.free(keys);
@@ -3727,7 +3764,7 @@ pub fn forInInit(rt: *Runtime, target: Value) Error!*Object {
     defer roots.unregister(rt);
 
     switch (target) {
-        .undefined, .null, .boolean, .number, .symbol => return rt.heap.newForInIterator(target, keys_arr),
+        .undefined, .null, .boolean, .number, .bigint, .symbol => return rt.heap.newForInIterator(target, keys_arr),
         .string => |s| {
             for (0..s.units.len) |i| {
                 try rt.heap.appendElement(keys_arr, .{ .string = try keyToString(rt, .{ .index = @intCast(i) }) });
@@ -3935,8 +3972,75 @@ fn symbolDescriptionGetter(rt: *Runtime, this: Value, _: []const Value) Error!Va
 
 fn numberCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     if (args.len == 0) return .{ .number = 0 };
-    return .{ .number = try ops.toNumber(rt, args[0]) };
+    const prim = if (args[0].isObjectLike()) try object.toPrimitive(rt, args[0], .number) else args[0];
+    if (prim == .bigint) return .{ .number = bigint.toF64(prim.bigint) };
+    return .{ .number = try ops.toNumber(rt, prim) };
 }
+
+fn bigintCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const v_in = arg(args, 0);
+    const prim = if (v_in.isObjectLike()) try object.toPrimitive(rt, v_in, .number) else v_in;
+    return switch (prim) {
+        .bigint => prim,
+        .number => |n| .{ .bigint = try bigint.fromF64Exact(rt, n) },
+        .boolean => |b| .{ .bigint = try bigint.fromU64(rt, if (b) 1 else 0) },
+        .string => |s| .{ .bigint = (try ops.stringToBigIntOpt(rt, s.units)) orelse
+            return rt.throw(.SyntaxError, &.{.{ .ascii = "Cannot convert string to a BigInt" }}) },
+        .undefined, .null, .symbol => rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert value to a BigInt" }}),
+        .native, .closure, .object => unreachable,
+    };
+}
+
+fn toBigIntWidth(rt: *Runtime, v: Value) Error!u64 {
+    const n = try ops.toNumber(rt, v);
+    if (std.math.isNan(n) or n == 0.0) return 0;
+    const t = @trunc(n);
+    if (!std.math.isFinite(t) or t < 0.0 or t > 9007199254740991.0) {
+        return rt.throw(.RangeError, &.{.{ .ascii = "Invalid BigInt bit width" }});
+    }
+    return @intFromFloat(t);
+}
+
+fn bigintAsIntN(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const bits = try toBigIntWidth(rt, arg(args, 0));
+    const b = try ops.toBigInt(rt, arg(args, 1));
+    return .{ .bigint = try bigint.asIntN(rt, bits, b) };
+}
+
+fn bigintAsUintN(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const bits = try toBigIntWidth(rt, arg(args, 0));
+    const b = try ops.toBigInt(rt, arg(args, 1));
+    return .{ .bigint = try bigint.asUintN(rt, bits, b) };
+}
+
+fn thisBigInt(rt: *Runtime, this: Value) Error!*const heap_mod.BigInt {
+    if (this == .bigint) return this.bigint;
+    return rt.throw(.TypeError, &.{.{ .ascii = "BigInt.prototype method called on non-BigInt" }});
+}
+
+fn bigintToString(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const b = try thisBigInt(rt, this);
+    var radix: u8 = 10;
+    if (args.len > 0 and args[0] != .undefined) {
+        const r_num = try toIntegerOrInfinity(rt, args[0]);
+        if (r_num < 2.0 or r_num > 36.0) {
+            return rt.throw(.RangeError, &.{.{ .ascii = "toString() radix argument must be between 2 and 36" }});
+        }
+        radix = @intFromFloat(r_num);
+    }
+    const s = try bigint.toString(rt, b, radix);
+    defer rt.gpa.free(s);
+    return .{ .string = try rt.heap.ascii(s) };
+}
+
+fn bigintValueOf(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return .{ .bigint = try thisBigInt(rt, this) };
+}
+
+const bigint_as_int_n: Native = .{ .name = "asIntN", .length = 2, .call = bigintAsIntN };
+const bigint_as_uint_n: Native = .{ .name = "asUintN", .length = 2, .call = bigintAsUintN };
+const bigint_to_string: Native = .{ .name = "toString", .length = 0, .call = bigintToString };
+const bigint_value_of: Native = .{ .name = "valueOf", .length = 0, .call = bigintValueOf };
 
 fn numberIsNaN(_: *Runtime, _: Value, args: []const Value) Error!Value {
     const v = arg(args, 0);
@@ -5809,9 +5913,9 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
                     it.cursor += 1;
                     const idx_val: Value = .{ .number = @floatFromInt(i) };
                     return switch (it.kind) {
-                        .array_values => object.readTypedArrayElement(ta, i),
+                        .array_values => try object.readTypedArrayElement(rt, ta, i),
                         .array_keys => idx_val,
-                        .array_entries => try makePairArray(rt, idx_val, object.readTypedArrayElement(ta, i)),
+                        .array_entries => try makePairArray(rt, idx_val, try object.readTypedArrayElement(rt, ta, i)),
                         else => unreachable,
                     };
                 }
@@ -7294,7 +7398,7 @@ pub const typed_array_global: Native = .{
     .namespace = .typed_array,
 };
 
-pub const typed_array_ctors: [9]Native = .{
+pub const typed_array_ctors: [11]Native = .{
     .{ .name = "Int8Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructInt8, .namespace = .int8_array },
     .{ .name = "Uint8Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructUint8, .namespace = .uint8_array },
     .{ .name = "Uint8ClampedArray", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructUint8Clamped, .namespace = .uint8_clamped_array },
@@ -7304,6 +7408,8 @@ pub const typed_array_ctors: [9]Native = .{
     .{ .name = "Uint32Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructUint32, .namespace = .uint32_array },
     .{ .name = "Float32Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructFloat32, .namespace = .float32_array },
     .{ .name = "Float64Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructFloat64, .namespace = .float64_array },
+    .{ .name = "BigInt64Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructBigInt64, .namespace = .bigint64_array },
+    .{ .name = "BigUint64Array", .length = 3, .call = typedArrayWithoutNew, .construct = typedArrayConstructBigUint64, .namespace = .biguint64_array },
 };
 
 pub fn viewsRealm(rt: *Runtime) Error!*const ViewsRealm {
@@ -7331,6 +7437,8 @@ pub fn viewsRealm(rt: *Runtime) Error!*const ViewsRealm {
         .uint32_array_prototype,
         .float32_array_prototype,
         .float64_array_prototype,
+        .bigint64_array_prototype,
+        .biguint64_array_prototype,
     };
     const ta_ctor_builtins = [_]names.Builtin{
         .int8_array_constructor,
@@ -7342,8 +7450,10 @@ pub fn viewsRealm(rt: *Runtime) Error!*const ViewsRealm {
         .uint32_array_constructor,
         .float32_array_constructor,
         .float64_array_constructor,
+        .bigint64_array_constructor,
+        .biguint64_array_constructor,
     };
-    for (0..9) |i| {
+    for (0..11) |i| {
         v.typed_array_prototypes[i] = try builtin(h, v.typed_array_prototype, ta_proto_builtins[i]);
         v.typed_array_namespaces[i] = try builtin(h, null, ta_ctor_builtins[i]);
     }
@@ -7393,6 +7503,10 @@ fn initArrayBufferAndViews(rt: *Runtime, r: *const Realm, v: *ViewsRealm) Error!
     try method(rt, v.data_view_prototype, "setFloat32", &dv_set_float32);
     try method(rt, v.data_view_prototype, "getFloat64", &dv_get_float64);
     try method(rt, v.data_view_prototype, "setFloat64", &dv_set_float64);
+    try method(rt, v.data_view_prototype, "getBigInt64", &dv_get_bigint64);
+    try method(rt, v.data_view_prototype, "setBigInt64", &dv_set_bigint64);
+    try method(rt, v.data_view_prototype, "getBigUint64", &dv_get_biguint64);
+    try method(rt, v.data_view_prototype, "setBigUint64", &dv_set_biguint64);
     try defineToStringTag(rt, v.data_view_prototype, r.sym_to_string_tag, "DataView");
 
     // %TypedArray%
@@ -7439,11 +7553,11 @@ fn initArrayBufferAndViews(rt: *Runtime, r: *const Realm, v: *ViewsRealm) Error!
     try method(rt, v.typed_array_prototype, "entries", &ta_entries);
     try symbolMethod(rt, v.typed_array_prototype, r.sym_iterator, &ta_values);
 
-    // 9 concrete TypedArray constructors & prototypes
+    // 11 concrete TypedArray constructors & prototypes
     const bpe_atom = try rt.heap.internAscii("BYTES_PER_ELEMENT");
     const proto_atom = try rt.heap.internAscii("prototype");
     const ctor_atom = try rt.heap.internAscii("constructor");
-    for (0..9) |i| {
+    for (0..11) |i| {
         const kind: heap_mod.TypedArrayKind = @fromBackingInt(@intCast(i));
         const bpe_val: Value = .{ .number = @floatFromInt(kind.bytesPerElement()) };
         const ns = v.typed_array_namespaces[i];
@@ -7617,14 +7731,14 @@ fn dvByteOffsetGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     return .{ .number = @floatFromInt(dv.byte_offset) };
 }
 
-const DataViewElem = enum { int8, uint8, int16, uint16, int32, uint32, float32, float64 };
+const DataViewElem = enum { int8, uint8, int16, uint16, int32, uint32, float32, float64, bigint64, biguint64 };
 
 fn dvElemSize(comptime elem: DataViewElem) usize {
     return switch (elem) {
         .int8, .uint8 => 1,
         .int16, .uint16 => 2,
         .int32, .uint32, .float32 => 4,
-        .float64 => 8,
+        .float64, .bigint64, .biguint64 => 8,
     };
 }
 
@@ -7644,16 +7758,21 @@ fn dvGet(comptime elem: DataViewElem, rt: *Runtime, this: Value, args: []const V
     if (end > dv.byte_length) return rt.throw(.RangeError, &.{.{ .ascii = "Offset is outside the bounds of the DataView" }});
     const bytes = dv.buffer.kind.array_buffer.data[dv.byte_offset + get_idx ..];
     const endian: std.builtin.Endian = if (little) .little else .big;
-    return .{ .number = switch (elem) {
-        .int8 => @floatFromInt(@as(i8, @bitCast(bytes[0]))),
-        .uint8 => @floatFromInt(bytes[0]),
-        .int16 => @floatFromInt(std.mem.readInt(i16, bytes[0..2], endian)),
-        .uint16 => @floatFromInt(std.mem.readInt(u16, bytes[0..2], endian)),
-        .int32 => @floatFromInt(std.mem.readInt(i32, bytes[0..4], endian)),
-        .uint32 => @floatFromInt(std.mem.readInt(u32, bytes[0..4], endian)),
-        .float32 => @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, bytes[0..4], endian)))),
-        .float64 => @bitCast(std.mem.readInt(u64, bytes[0..8], endian)),
-    } };
+    return switch (elem) {
+        .bigint64 => .{ .bigint = try bigint.fromI64(rt, std.mem.readInt(i64, bytes[0..8], endian)) },
+        .biguint64 => .{ .bigint = try bigint.fromU64(rt, std.mem.readInt(u64, bytes[0..8], endian)) },
+        else => .{ .number = switch (elem) {
+            .int8 => @floatFromInt(@as(i8, @bitCast(bytes[0]))),
+            .uint8 => @floatFromInt(bytes[0]),
+            .int16 => @floatFromInt(std.mem.readInt(i16, bytes[0..2], endian)),
+            .uint16 => @floatFromInt(std.mem.readInt(u16, bytes[0..2], endian)),
+            .int32 => @floatFromInt(std.mem.readInt(i32, bytes[0..4], endian)),
+            .uint32 => @floatFromInt(std.mem.readInt(u32, bytes[0..4], endian)),
+            .float32 => @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, bytes[0..4], endian)))),
+            .float64 => @bitCast(std.mem.readInt(u64, bytes[0..8], endian)),
+            .bigint64, .biguint64 => unreachable,
+        } },
+    };
 }
 
 fn dvSet(comptime elem: DataViewElem, rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -7664,7 +7783,9 @@ fn dvSet(comptime elem: DataViewElem, rt: *Runtime, this: Value, args: []const V
     defer roots.unregister(rt);
 
     const get_idx = try toIndex(rt, arg(args, 0));
-    const n = try ops.toNumber(rt, arg(args, 1));
+    const is_bigint = (elem == .bigint64 or elem == .biguint64);
+    const big_val = if (is_bigint) try ops.toBigInt(rt, arg(args, 1)) else undefined;
+    const n = if (!is_bigint) try ops.toNumber(rt, arg(args, 1)) else 0.0;
     const little = ops.toBoolean(arg(args, 2));
     const dv = o.kind.data_view;
     if (dv.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
@@ -7685,6 +7806,8 @@ fn dvSet(comptime elem: DataViewElem, rt: *Runtime, this: Value, args: []const V
             std.mem.writeInt(u32, bytes[0..4], @bitCast(f), endian);
         },
         .float64 => std.mem.writeInt(u64, bytes[0..8], @bitCast(n), endian),
+        .bigint64 => std.mem.writeInt(i64, bytes[0..8], bigint.toI64Wrapping(big_val), endian),
+        .biguint64 => std.mem.writeInt(u64, bytes[0..8], bigint.toU64Wrapping(big_val), endian),
     }
     return .undefined;
 }
@@ -7769,6 +7892,26 @@ const dv_set_float64: Native = .{ .name = "setFloat64", .length = 2, .call = str
         return dvSet(.float64, rt, t, a);
     }
 }.f };
+const dv_get_bigint64: Native = .{ .name = "getBigInt64", .length = 1, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvGet(.bigint64, rt, t, a);
+    }
+}.f };
+const dv_set_bigint64: Native = .{ .name = "setBigInt64", .length = 2, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvSet(.bigint64, rt, t, a);
+    }
+}.f };
+const dv_get_biguint64: Native = .{ .name = "getBigUint64", .length = 1, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvGet(.biguint64, rt, t, a);
+    }
+}.f };
+const dv_set_biguint64: Native = .{ .name = "setBigUint64", .length = 2, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvSet(.biguint64, rt, t, a);
+    }
+}.f };
 
 // ---- %TypedArray% & Concrete Constructors
 
@@ -7810,6 +7953,12 @@ fn typedArrayConstructFloat32(rt: *Runtime, args: []const Value) Error!Value {
 }
 fn typedArrayConstructFloat64(rt: *Runtime, args: []const Value) Error!Value {
     return typedArrayConstructKind(rt, .float64, args);
+}
+fn typedArrayConstructBigInt64(rt: *Runtime, args: []const Value) Error!Value {
+    return typedArrayConstructKind(rt, .bigint64, args);
+}
+fn typedArrayConstructBigUint64(rt: *Runtime, args: []const Value) Error!Value {
+    return typedArrayConstructKind(rt, .biguint64, args);
 }
 
 fn allocateTypedArray(rt: *Runtime, kind: heap_mod.TypedArrayKind, len: usize) Error!*Object {
@@ -7871,6 +8020,9 @@ fn typedArrayConstructKind(rt: *Runtime, kind: heap_mod.TypedArrayKind, args: []
     switch (arg0.object.kind) {
         .typed_array => |src| {
             if (src.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Source TypedArray buffer is detached" }});
+            if (src.kind.isBigInt() != kind.isBigInt()) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "Cannot mix BigInt and other types, use explicit conversions" }});
+            }
             var root_buf = [_]Value{arg0};
             var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
             try roots.register(rt);
@@ -7878,8 +8030,8 @@ fn typedArrayConstructKind(rt: *Runtime, kind: heap_mod.TypedArrayKind, args: []
             const dst = try allocateTypedArray(rt, kind, src.length);
             const dst_ta = dst.kind.typed_array;
             for (0..src.length) |i| {
-                const v = object.readTypedArrayElement(src, i);
-                object.writeTypedArrayNumber(dst_ta, i, v.number);
+                const v = try object.readTypedArrayElement(rt, src, i);
+                try object.writeTypedArrayElement(rt, dst_ta, i, v);
             }
             return .{ .object = dst };
         },
@@ -8122,6 +8274,9 @@ fn taSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const src_bpe = src.kind.bytesPerElement();
         const dst_data = dst.buffer.kind.array_buffer.data[dst.byte_offset + target_off * dst_bpe ..][0 .. src.length * dst_bpe];
         const src_data = src.buffer.kind.array_buffer.data[src.byte_offset..][0 .. src.length * src_bpe];
+        if (src.kind.isBigInt() != dst.kind.isBigInt()) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Cannot mix BigInt and other types, use explicit conversions" }});
+        }
         if (src.buffer == dst.buffer) {
             if (src.kind == dst.kind) {
                 if (@intFromPtr(dst_data.ptr) < @intFromPtr(src_data.ptr)) {
@@ -8129,17 +8284,27 @@ fn taSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
                 } else {
                     std.mem.copyBackwards(u8, dst_data, src_data);
                 }
+            } else if (src.kind.isBigInt()) {
+                const tmp = try rt.gpa.alloc(Value, src.length);
+                defer rt.gpa.free(tmp);
+                for (0..src.length) |i| tmp[i] = try object.readTypedArrayElement(rt, src, i);
+                for (tmp, 0..) |v, i| try object.writeTypedArrayElement(rt, dst, target_off + i, v);
             } else {
                 const tmp = try rt.gpa.alloc(f64, src.length);
                 defer rt.gpa.free(tmp);
-                for (0..src.length) |i| tmp[i] = object.readTypedArrayElement(src, i).number;
+                for (0..src.length) |i| tmp[i] = object.readTypedArrayNumber(src, i).number;
                 for (tmp, 0..) |n, i| object.writeTypedArrayNumber(dst, target_off + i, n);
             }
         } else if (src.kind == dst.kind) {
             @memcpy(dst_data, src_data);
+        } else if (src.kind.isBigInt()) {
+            for (0..src.length) |i| {
+                const v = try object.readTypedArrayElement(rt, src, i);
+                try object.writeTypedArrayElement(rt, dst, target_off + i, v);
+            }
         } else {
             for (0..src.length) |i| {
-                object.writeTypedArrayNumber(dst, target_off + i, object.readTypedArrayElement(src, i).number);
+                object.writeTypedArrayNumber(dst, target_off + i, object.readTypedArrayNumber(src, i).number);
             }
         }
         return .undefined;
@@ -8205,11 +8370,20 @@ fn taFill(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const val = try ops.toNumber(rt, arg(args, 0));
-    const start_idx = try relativeIndex(rt, arg(args, 1), ta.length, 0);
-    const end_idx = try relativeIndex(rt, arg(args, 2), ta.length, ta.length);
-    if (end_idx > start_idx) {
-        for (start_idx..end_idx) |i| object.writeTypedArrayNumber(ta, i, val);
+    if (ta.kind.isBigInt()) {
+        const b = try ops.toBigInt(rt, arg(args, 0));
+        const start_idx = try relativeIndex(rt, arg(args, 1), ta.length, 0);
+        const end_idx = try relativeIndex(rt, arg(args, 2), ta.length, ta.length);
+        if (end_idx > start_idx) {
+            for (start_idx..end_idx) |i| object.writeTypedArrayBigInt(ta, i, b);
+        }
+    } else {
+        const val = try ops.toNumber(rt, arg(args, 0));
+        const start_idx = try relativeIndex(rt, arg(args, 1), ta.length, 0);
+        const end_idx = try relativeIndex(rt, arg(args, 2), ta.length, ta.length);
+        if (end_idx > start_idx) {
+            for (start_idx..end_idx) |i| object.writeTypedArrayNumber(ta, i, val);
+        }
     }
     return this;
 }
@@ -8306,6 +8480,42 @@ fn mergeSortTypedArray(
     @memcpy(arr, tmp[0..arr.len]);
 }
 
+fn mergeSortTypedArrayValues(
+    rt: *Runtime,
+    arr: []Value,
+    tmp: []Value,
+    cmp: Value,
+) Error!void {
+    if (arr.len <= 1) return;
+    const mid = arr.len / 2;
+    try mergeSortTypedArrayValues(rt, arr[0..mid], tmp[0..mid], cmp);
+    try mergeSortTypedArrayValues(rt, arr[mid..], tmp[mid..], cmp);
+    var i: usize = 0;
+    var j: usize = mid;
+    var k: usize = 0;
+    while (i < mid and j < arr.len) : (k += 1) {
+        try rt.step();
+        const res = try rt.callCallable(cmp, .undefined, &.{ arr[i], arr[j] });
+        const order = try ops.toNumber(rt, res);
+        if (order <= 0 or std.math.isNan(order)) {
+            tmp[k] = arr[i];
+            i += 1;
+        } else {
+            tmp[k] = arr[j];
+            j += 1;
+        }
+    }
+    while (i < mid) : ({
+        i += 1;
+        k += 1;
+    }) tmp[k] = arr[i];
+    while (j < arr.len) : ({
+        j += 1;
+        k += 1;
+    }) tmp[k] = arr[j];
+    @memcpy(arr, tmp[0..arr.len]);
+}
+
 fn taSort(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const o = try requireLiveTypedArray(rt, this);
     const cmp = arg(args, 0);
@@ -8315,9 +8525,51 @@ fn taSort(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const ta = o.kind.typed_array;
     if (ta.length <= 1) return this;
 
+    if (ta.kind.isBigInt()) {
+        if (cmp == .undefined) {
+            if (ta.kind == .bigint64) {
+                const vals = try rt.gpa.alloc(i64, ta.length);
+                defer rt.gpa.free(vals);
+                for (0..ta.length) |i| vals[i] = object.readTypedArrayI64(ta, i);
+                std.mem.sort(i64, vals, {}, std.sort.asc(i64));
+                const data = ta.buffer.kind.array_buffer.data;
+                const native_endian = @import("builtin").cpu.arch.endian();
+                for (vals, 0..) |v, i| {
+                    std.mem.writeInt(i64, data[ta.byte_offset + i * 8 ..][0..8], v, native_endian);
+                }
+            } else {
+                const vals = try rt.gpa.alloc(u64, ta.length);
+                defer rt.gpa.free(vals);
+                for (0..ta.length) |i| vals[i] = object.readTypedArrayU64(ta, i);
+                std.mem.sort(u64, vals, {}, std.sort.asc(u64));
+                const data = ta.buffer.kind.array_buffer.data;
+                const native_endian = @import("builtin").cpu.arch.endian();
+                for (vals, 0..) |v, i| {
+                    std.mem.writeInt(u64, data[ta.byte_offset + i * 8 ..][0..8], v, native_endian);
+                }
+            }
+        } else {
+            const vals = try rt.gpa.alloc(Value, ta.length);
+            defer rt.gpa.free(vals);
+            for (0..ta.length) |i| vals[i] = try object.readTypedArrayElement(rt, ta, i);
+            var root_buf = [_]Value{ this, cmp };
+            var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+            var val_roots: rt_mod.ValueRoots = .{ .values = vals };
+            try val_roots.register(rt);
+            defer val_roots.unregister(rt);
+            const scratch = try rt.gpa.alloc(Value, ta.length);
+            defer rt.gpa.free(scratch);
+            try mergeSortTypedArrayValues(rt, vals, scratch, cmp);
+            for (vals, 0..) |v, i| try object.writeTypedArrayElement(rt, ta, i, v);
+        }
+        return this;
+    }
+
     const vals = try rt.gpa.alloc(f64, ta.length);
     defer rt.gpa.free(vals);
-    for (0..ta.length) |i| vals[i] = object.readTypedArrayElement(ta, i).number;
+    for (0..ta.length) |i| vals[i] = object.readTypedArrayNumber(ta, i).number;
 
     if (cmp == .undefined) {
         std.mem.sort(f64, vals, {}, numericSortLess);
@@ -8339,7 +8591,9 @@ fn taIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const ta = o.kind.typed_array;
     if (ta.length == 0) return .{ .number = -1 };
     const search = arg(args, 0);
-    if (search != .number) return .{ .number = -1 };
+    if (ta.kind.isBigInt()) {
+        if (search != .bigint) return .{ .number = -1 };
+    } else if (search != .number) return .{ .number = -1 };
     const from_n = if (args.len > 1) try toIntegerOrInfinity(rt, arg(args, 1)) else 0.0;
     const len_f: f64 = @floatFromInt(ta.length);
     if (from_n >= len_f) return .{ .number = -1 };
@@ -8348,8 +8602,8 @@ fn taIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         break :blk if (k <= 0) 0 else @intFromFloat(k);
     } else @intFromFloat(from_n);
     for (start..ta.length) |i| {
-        const elem = object.readTypedArrayElement(ta, i).number;
-        if (elem == search.number) return .{ .number = @floatFromInt(i) };
+        const elem = try object.readTypedArrayElement(rt, ta, i);
+        if (ops.strictEquals(elem, search)) return .{ .number = @floatFromInt(i) };
     }
     return .{ .number = -1 };
 }
@@ -8359,15 +8613,17 @@ fn taLastIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const ta = o.kind.typed_array;
     if (ta.length == 0) return .{ .number = -1 };
     const search = arg(args, 0);
-    if (search != .number) return .{ .number = -1 };
+    if (ta.kind.isBigInt()) {
+        if (search != .bigint) return .{ .number = -1 };
+    } else if (search != .number) return .{ .number = -1 };
     const len_f: f64 = @floatFromInt(ta.length);
     const from_n = if (args.len > 1) try toIntegerOrInfinity(rt, arg(args, 1)) else len_f - 1.0;
     const k_f = if (from_n >= 0) @min(from_n, len_f - 1.0) else len_f + from_n;
     if (k_f < 0) return .{ .number = -1 };
     var i: usize = @intFromFloat(k_f);
     while (true) {
-        const elem = object.readTypedArrayElement(ta, i).number;
-        if (elem == search.number) return .{ .number = @floatFromInt(i) };
+        const elem = try object.readTypedArrayElement(rt, ta, i);
+        if (ops.strictEquals(elem, search)) return .{ .number = @floatFromInt(i) };
         if (i == 0) break;
         i -= 1;
     }
@@ -8379,7 +8635,9 @@ fn taIncludes(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const ta = o.kind.typed_array;
     if (ta.length == 0) return .{ .boolean = false };
     const search = arg(args, 0);
-    if (search != .number) return .{ .boolean = false };
+    if (ta.kind.isBigInt()) {
+        if (search != .bigint) return .{ .boolean = false };
+    } else if (search != .number) return .{ .boolean = false };
     const from_n = if (args.len > 1) try toIntegerOrInfinity(rt, arg(args, 1)) else 0.0;
     const len_f: f64 = @floatFromInt(ta.length);
     if (from_n >= len_f) return .{ .boolean = false };
@@ -8387,11 +8645,9 @@ fn taIncludes(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const k = len_f + from_n;
         break :blk if (k <= 0) 0 else @intFromFloat(k);
     } else @intFromFloat(from_n);
-    const target_nan = std.math.isNan(search.number);
     for (start..ta.length) |i| {
-        const elem = object.readTypedArrayElement(ta, i).number;
-        if (target_nan and std.math.isNan(elem)) return .{ .boolean = true };
-        if (elem == search.number) return .{ .boolean = true };
+        const elem = try object.readTypedArrayElement(rt, ta, i);
+        if (heap_mod.sameValueZero(elem, search)) return .{ .boolean = true };
     }
     return .{ .boolean = false };
 }
@@ -8403,7 +8659,7 @@ fn taAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const len_f: f64 = @floatFromInt(ta.length);
     const k = if (idx_f >= 0) idx_f else len_f + idx_f;
     if (k < 0 or k >= len_f) return .undefined;
-    return object.readTypedArrayElement(ta, @intFromFloat(k));
+    return object.readTypedArrayElement(rt, ta, @intFromFloat(k));
 }
 
 fn taJoin(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -8425,9 +8681,11 @@ fn taJoin(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     for (0..ta.length) |i| {
         if (i > 0) try out.appendSlice(rt.gpa, sep);
         var buf: ops.NumberBuf = undefined;
-        const elem = object.readTypedArrayElement(ta, i);
-        const s = ops.formatNumber(&buf, elem.number);
-        for (s) |c| try out.append(rt.gpa, c);
+        const elem = try object.readTypedArrayElement(rt, ta, i);
+        switch (try ops.toPiece(rt, elem, &buf)) {
+            .ascii => |s| for (s) |c| try out.append(rt.gpa, c),
+            .utf16 => |u| try out.appendSlice(rt.gpa, u),
+        }
         if (out.items.len > rt.heap.max_string_length) return rt.limit(.string_length);
     }
     return .{ .string = try rt.heap.newString(&.{.{ .utf16 = out.items }}) };
@@ -8458,7 +8716,7 @@ fn taForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
     for (0..ta.length) |i| {
-        const elem = object.readTypedArrayElement(ta, i);
+        const elem = try object.readTypedArrayElement(rt, ta, i);
         _ = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
     }
     return .undefined;
@@ -8474,7 +8732,7 @@ fn taEvery(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
     for (0..ta.length) |i| {
-        const elem = object.readTypedArrayElement(ta, i);
+        const elem = try object.readTypedArrayElement(rt, ta, i);
         const res = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
         if (!ops.toBoolean(res)) return .{ .boolean = false };
     }
@@ -8491,7 +8749,7 @@ fn taSome(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
     for (0..ta.length) |i| {
-        const elem = object.readTypedArrayElement(ta, i);
+        const elem = try object.readTypedArrayElement(rt, ta, i);
         const res = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
         if (ops.toBoolean(res)) return .{ .boolean = true };
     }
@@ -8510,7 +8768,7 @@ fn taFindImpl(rt: *Runtime, this: Value, args: []const Value, reverse: bool, ret
     if (ta.length == 0) return if (return_index) .{ .number = -1 } else .undefined;
     var i: usize = if (reverse) ta.length - 1 else 0;
     while (true) {
-        const elem = object.readTypedArrayElement(ta, i);
+        const elem = try object.readTypedArrayElement(rt, ta, i);
         const res = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
         if (ops.toBoolean(res)) return if (return_index) .{ .number = @floatFromInt(i) } else elem;
         if (reverse) {
@@ -8548,7 +8806,7 @@ fn taMap(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
     for (0..ta.length) |i| {
-        const elem = object.readTypedArrayElement(ta, i);
+        const elem = try object.readTypedArrayElement(rt, ta, i);
         const mapped = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
         try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, mapped);
     }
@@ -8560,14 +8818,31 @@ fn taFilter(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const cb = try requireCallable(rt, arg(args, 0));
     const this_arg = arg(args, 1);
     const ta = o.kind.typed_array;
-    var kept: std.ArrayList(f64) = .empty;
-    defer kept.deinit(rt.gpa);
     var root_buf = [_]Value{ this, cb, this_arg };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
+    if (ta.kind.isBigInt()) {
+        var kept: std.ArrayList(u64) = .empty;
+        defer kept.deinit(rt.gpa);
+        for (0..ta.length) |i| {
+            const raw = object.readTypedArrayU64(ta, i);
+            const elem = try object.readTypedArrayElement(rt, ta, i);
+            const res = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
+            if (ops.toBoolean(res)) try kept.append(rt.gpa, raw);
+        }
+        const dst = try allocateTypedArray(rt, ta.kind, kept.items.len);
+        const data = dst.kind.typed_array.buffer.kind.array_buffer.data;
+        const native_endian = @import("builtin").cpu.arch.endian();
+        for (kept.items, 0..) |raw, i| {
+            std.mem.writeInt(u64, data[i * 8 ..][0..8], raw, native_endian);
+        }
+        return .{ .object = dst };
+    }
+    var kept: std.ArrayList(f64) = .empty;
+    defer kept.deinit(rt.gpa);
     for (0..ta.length) |i| {
-        const elem = object.readTypedArrayElement(ta, i);
+        const elem = object.readTypedArrayNumber(ta, i);
         const res = try rt.callCallable(cb, this_arg, &.{ elem, .{ .number = @floatFromInt(i) }, this });
         if (ops.toBoolean(res)) try kept.append(rt.gpa, elem.number);
     }
@@ -8589,7 +8864,7 @@ fn taReduceImpl(rt: *Runtime, this: Value, args: []const Value, right: bool) Err
         acc = arg(args, 1);
         start_i = if (right) ta.length else 0;
     } else {
-        acc = object.readTypedArrayElement(ta, if (right) ta.length - 1 else 0);
+        acc = try object.readTypedArrayElement(rt, ta, if (right) ta.length - 1 else 0);
         start_i = if (right) ta.length - 1 else 1;
     }
     var root_buf = [_]Value{ this, cb, acc };
@@ -8600,12 +8875,12 @@ fn taReduceImpl(rt: *Runtime, this: Value, args: []const Value, right: bool) Err
         var i = start_i;
         while (i > 0) {
             i -= 1;
-            const elem = object.readTypedArrayElement(ta, i);
+            const elem = try object.readTypedArrayElement(rt, ta, i);
             root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, .{ .number = @floatFromInt(i) }, this });
         }
     } else {
         for (start_i..ta.length) |i| {
-            const elem = object.readTypedArrayElement(ta, i);
+            const elem = try object.readTypedArrayElement(rt, ta, i);
             root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, .{ .number = @floatFromInt(i) }, this });
         }
     }

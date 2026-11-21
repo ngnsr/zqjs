@@ -2606,3 +2606,33 @@ test "M46: forced GC inside Proxy get, set, ownKeys, apply, and construct traps 
     defer testing.allocator.free(tw_out);
     try testing.expectEqualStrings("10 30 a,b,c 7 77\n", tw_out);
 }
+
+test "M47: multi-limb BigInt churn and Map/Set/object/closure/constant survival under GC (both engines)" {
+    const src =
+        \\const k0 = 0x123456789abcdef0123456789abcdef0n;
+        \\function makeAdder(base) {
+        \\  return function (d) { return base + d; };
+        \\}
+        \\const addBase = makeAdder(k0);
+        \\const set = new Set([k0, 1n << 128n]);
+        \\const map = new Map([[k0, 999n]]);
+        \\const holder = { v: 1n << 200n };
+        \\let acc = 0n;
+        \\for (let i = 0; i < 600; i++) {
+        \\  const x = (1n << 130n) + BigInt(i) * 0xdeadbeefcafebaben;
+        \\  acc = (acc + x) ^ (x >> 3n);
+        \\}
+        \\const out = addBase(1n) === k0 + 1n && set.has(k0) && map.get(k0) === 999n && holder.v === (1n << 200n);
+        \\print(out, acc > 0n || acc < 0n);
+    ;
+    const opts: zqjs.Limits = .{ .max_heap_bytes = 256 << 10 };
+    const vm_res = try runVm(src, opts, false);
+    defer testing.allocator.free(vm_res.out);
+    try testing.expectEqual(@as(?anyerror, null), vm_res.err);
+    try testing.expect(vm_res.collections > 0);
+    try testing.expectEqualStrings("true true\n", vm_res.out);
+
+    const tw_out = try runCollecting(src, .treewalk, opts);
+    defer testing.allocator.free(tw_out);
+    try testing.expectEqualStrings("true true\n", tw_out);
+}

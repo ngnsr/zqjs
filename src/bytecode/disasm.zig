@@ -125,6 +125,13 @@ pub fn value(v: Value, w: *Writer) Writer.Error!void {
             var buf: ops.NumberBuf = undefined;
             if (n == 0 and std.math.signbit(n)) try w.writeAll("-0") else try w.writeAll(ops.formatNumber(&buf, n));
         },
+        .bigint => |b| {
+            if (b.limbs.len == 0) {
+                try w.writeAll("0n");
+            } else {
+                try w.print("<bigint:{d}-limbs>", .{b.limbs.len});
+            }
+        },
         .string => |s| {
             try w.writeByte('"');
             for (s.units) |u| switch (u) {

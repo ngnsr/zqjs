@@ -66,6 +66,8 @@ pub const Limits = struct {
     max_handles: u32 = 1 << 18,
     /// Maximum number of ES modules loaded in one Runtime (M42, D72).
     max_modules: u32 = 1024,
+    /// Maximum size of a BigInt in bits (M47, D77). Exceeding throws RangeError.
+    max_bigint_bits: u32 = 1 << 20,
 };
 
 /// Elements per card (M8.1): an array with at least this capacity records young stores

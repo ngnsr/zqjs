@@ -57,6 +57,8 @@ pub const Builtin = enum {
     regexp_prototype,
     symbol_constructor,
     symbol_prototype,
+    bigint_constructor,
+    bigint_prototype,
     array_buffer_constructor,
     array_buffer_prototype,
     data_view_constructor,
@@ -81,6 +83,10 @@ pub const Builtin = enum {
     float32_array_prototype,
     float64_array_constructor,
     float64_array_prototype,
+    bigint64_array_constructor,
+    bigint64_array_prototype,
+    biguint64_array_constructor,
+    biguint64_array_prototype,
 };
 
 /// Whether node gives `b` an own property called `name`.
@@ -139,6 +145,8 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .regexp_prototype => regexp_prototype.has(name),
         .symbol_constructor => symbol_constructor.has(name),
         .symbol_prototype => symbol_prototype.has(name),
+        .bigint_constructor => bigint_constructor.has(name),
+        .bigint_prototype => bigint_prototype.has(name),
         .array_buffer_constructor => array_buffer_constructor.has(name),
         .array_buffer_prototype => array_buffer_prototype.has(name),
         .data_view_constructor => data_view_constructor.has(name),
@@ -163,6 +171,10 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .float32_array_prototype => float32_array_prototype.has(name),
         .float64_array_constructor => float64_array_constructor.has(name),
         .float64_array_prototype => float64_array_prototype.has(name),
+        .bigint64_array_constructor => bigint64_array_constructor.has(name),
+        .bigint64_array_prototype => bigint64_array_prototype.has(name),
+        .biguint64_array_constructor => biguint64_array_constructor.has(name),
+        .biguint64_array_prototype => biguint64_array_prototype.has(name),
     };
 }
 
@@ -846,6 +858,21 @@ const symbol_prototype = std.StaticStringMap(void).initComptime(.{
     .{"valueOf"},
 });
 
+const bigint_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"asIntN"},
+    .{"asUintN"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const bigint_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"constructor"},
+    .{"toLocaleString"},
+    .{"toString"},
+    .{"valueOf"},
+});
+
 const array_buffer_constructor = std.StaticStringMap(void).initComptime(.{
     .{"isView"},
     .{"length"},
@@ -1057,6 +1084,30 @@ const float64_array_constructor = std.StaticStringMap(void).initComptime(.{
 });
 
 const float64_array_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"constructor"},
+});
+
+const bigint64_array_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const bigint64_array_prototype = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"constructor"},
+});
+
+const biguint64_array_constructor = std.StaticStringMap(void).initComptime(.{
+    .{"BYTES_PER_ELEMENT"},
+    .{"length"},
+    .{"name"},
+    .{"prototype"},
+});
+
+const biguint64_array_prototype = std.StaticStringMap(void).initComptime(.{
     .{"BYTES_PER_ELEMENT"},
     .{"constructor"},
 });

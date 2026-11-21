@@ -13,6 +13,7 @@ pub const resolve = @import("frontend/resolver.zig").resolve;
 pub const Resolution = @import("frontend/resolver.zig").Resolution;
 pub const dump = @import("frontend/dump.zig");
 pub const ops = @import("runtime/ops.zig");
+pub const bigint = @import("runtime/bigint.zig");
 pub const Runtime = @import("runtime/runtime.zig").Runtime;
 pub const ErrorName = @import("runtime/runtime.zig").ErrorName;
 pub const interpret = @import("interp/machine.zig").run;
@@ -54,6 +55,7 @@ test {
     _ = @import("frontend/resolver.zig");
     _ = @import("runtime/heap.zig");
     _ = @import("runtime/ops.zig");
+    _ = @import("runtime/bigint.zig");
     _ = @import("runtime/pow.zig");
     _ = @import("bytecode/bytecode.zig");
     _ = @import("bytecode/verify.zig");

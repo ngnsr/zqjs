@@ -43,7 +43,7 @@ code
     158  set_local      s0 n2         ; s
     167  pop
     168  get_local      s2 n1         ; j
-    177  to_number
+    177  to_numeric
     178  dup
     179  dec
     180  set_local      s2 n1         ; j
@@ -51,7 +51,7 @@ code
     190  pop
     191  jump           @119
     196  get_local      s1 n0         ; i
-    205  to_number
+    205  to_numeric
     206  dup
     207  inc
     208  set_local      s1 n0         ; i

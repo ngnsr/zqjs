@@ -240,6 +240,7 @@ pub const Op = enum(u8) {
     neg,
     /// ToNumber: unary `+`, and the first step of `++`/`--`.
     to_number,
+    to_numeric,
     to_string,
     not,
     bit_not,
@@ -407,7 +408,7 @@ pub const Op = enum(u8) {
             .object_rest => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
             .call_method => .{ .operands = &.{.argc}, .pops = 2, .pushes = 1 },
             .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
-            .neg, .to_number, .to_string, .not, .bit_not, .typeof, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .neg, .to_number, .to_numeric, .to_string, .not, .bit_not, .typeof, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .jump => .{ .operands = &.{.target}, .pops = 0, .pushes = 0 },
             .jump_if_false, .jump_if_true => .{ .operands = &.{.target}, .pops = 1, .pushes = 0 },
             .get_iter, .for_in_init => .{ .operands = &.{}, .pops = 1, .pushes = 1 },

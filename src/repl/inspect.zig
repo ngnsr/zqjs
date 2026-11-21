@@ -155,6 +155,16 @@ const Context = struct {
                 }
                 try ctx.w.writeAll(ctx.reset());
             },
+            .bigint => |b| {
+                try ctx.w.writeAll(ctx.style(Ansi.yellow));
+                if (b.limbs.len == 0) {
+                    try ctx.w.writeAll("0n");
+                } else {
+                    try writeBigIntRaw(ctx.w, b);
+                    try ctx.w.writeByte('n');
+                }
+                try ctx.w.writeAll(ctx.reset());
+            },
             .string => |s| {
                 try ctx.w.writeAll(ctx.style(Ansi.green));
                 try writeQuotedString(ctx.w, s.units);
@@ -328,8 +338,20 @@ const Context = struct {
                 const n = @min(ta.length, ctx.options.max_items);
                 for (0..n) |i| {
                     if (i > 0) try ctx.w.writeAll(", ");
-                    const elem = @import("../runtime/object.zig").readTypedArrayElement(ta, i);
-                    try ctx.writeValue(elem, depth + 1, indent);
+                    if (ta.kind == .bigint64) {
+                        const v = @import("../runtime/object.zig").readTypedArrayI64(ta, i);
+                        try ctx.w.writeAll(ctx.style(Ansi.yellow));
+                        try ctx.w.print("{d}n", .{v});
+                        try ctx.w.writeAll(ctx.reset());
+                    } else if (ta.kind == .biguint64) {
+                        const v = @import("../runtime/object.zig").readTypedArrayU64(ta, i);
+                        try ctx.w.writeAll(ctx.style(Ansi.yellow));
+                        try ctx.w.print("{d}n", .{v});
+                        try ctx.w.writeAll(ctx.reset());
+                    } else {
+                        const elem = @import("../runtime/object.zig").readTypedArrayNumber(ta, i);
+                        try ctx.writeValue(elem, depth + 1, indent);
+                    }
                 }
                 if (ta.length > n) try ctx.w.print(", ... {d} more items", .{ta.length - n});
                 try ctx.w.writeAll(" ]");
@@ -706,6 +728,49 @@ fn isPlainIdentifier(units: []const u16) bool {
         if (!ok) return false;
     }
     return true;
+}
+
+fn writeBigIntRaw(w: *Writer, b: *const heap.BigInt) Writer.Error!void {
+    if (b.negative) try w.writeByte('-');
+    if (b.limbs.len == 1) {
+        try w.print("{d}", .{b.limbs[0]});
+        return;
+    }
+    const alloc = std.heap.page_allocator;
+    var work = alloc.dupe(u64, b.limbs) catch {
+        try w.writeAll("<BigInt>");
+        return;
+    };
+    defer alloc.free(work);
+    var chunks = std.ArrayList(u64).empty;
+    defer chunks.deinit(alloc);
+
+    const base: u64 = 10_000_000_000_000_000_000; // 10^19
+    var len = work.len;
+    while (len > 0) {
+        var rem: u128 = 0;
+        var i = len;
+        while (i > 0) {
+            i -= 1;
+            const cur = (rem << 64) | work[i];
+            work[i] = @truncate(cur / base);
+            rem = cur % base;
+        }
+        while (len > 0 and work[len - 1] == 0) : (len -= 1) {}
+        chunks.append(alloc, @truncate(rem)) catch {
+            try w.writeAll("<BigInt>");
+            return;
+        };
+    }
+    var i = chunks.items.len;
+    if (i > 0) {
+        i -= 1;
+        try w.print("{d}", .{chunks.items[i]});
+        while (i > 0) {
+            i -= 1;
+            try w.print("{d:0>19}", .{chunks.items[i]});
+        }
+    }
 }
 
 fn writeQuotedString(w: *Writer, units: []const u16) Writer.Error!void {

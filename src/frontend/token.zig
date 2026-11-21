@@ -8,6 +8,7 @@ const std = @import("std");
 pub const Tag = enum {
     eof,
     number,
+    bigint,
     string,
     template_no_sub,
     template_head,

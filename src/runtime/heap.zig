@@ -70,6 +70,7 @@ pub const Obj = struct {
     pub const Kind = enum {
         string,
         symbol,
+        bigint,
         cell,
         closure,
         env,
@@ -188,6 +189,15 @@ pub const Symbol = struct {
     description: ?*const String,
     /// True iff registered in `Runtime.global_symbols` via `Symbol.for(key)`.
     is_global: bool = false,
+};
+
+/// Immutable arbitrary-precision integer (M47, D77).
+/// Canonical normalization invariant: `0n` always has `limbs.len == 0` and
+/// `negative == false`; non-zero values have no trailing zero limbs (little-endian).
+pub const BigInt = struct {
+    obj: Obj,
+    negative: bool,
+    limbs: []const u64,
 };
 
 /// Property map key: either an interned atom (`*String`) or a `*Symbol` (M36, D66).
@@ -326,6 +336,7 @@ pub fn sameValueZero(a: Value, b: Value) bool {
         .undefined, .null => true,
         .boolean => |x| x == b.boolean,
         .number => |x| (x == b.number) or (std.math.isNan(x) and std.math.isNan(b.number)),
+        .bigint => |x| x.negative == b.bigint.negative and std.mem.eql(u64, x.limbs, b.bigint.limbs),
         .string => |x| std.mem.eql(u16, x.units, b.string.units),
         .symbol => |x| x == b.symbol,
         .native => |x| x == b.native,
@@ -351,6 +362,10 @@ pub fn hashValue(v: Value) u64 {
             hasher.update(std.mem.asBytes(&bits));
         },
         .string => |s| hasher.update(std.mem.sliceAsBytes(s.units)),
+        .bigint => |b| {
+            hasher.update(&.{@intFromBool(b.negative)});
+            hasher.update(std.mem.sliceAsBytes(b.limbs));
+        },
         .symbol => |s| {
             const p: usize = @intFromPtr(s);
             hasher.update(std.mem.asBytes(&p));
@@ -481,13 +496,19 @@ pub const TypedArrayKind = enum(u8) {
     uint32,
     float32,
     float64,
+    bigint64,
+    biguint64,
+
+    pub fn isBigInt(k: TypedArrayKind) bool {
+        return k == .bigint64 or k == .biguint64;
+    }
 
     pub fn bytesPerElement(k: TypedArrayKind) usize {
         return switch (k) {
             .int8, .uint8, .uint8_clamped => 1,
             .int16, .uint16 => 2,
             .int32, .uint32, .float32 => 4,
-            .float64 => 8,
+            .float64, .bigint64, .biguint64 => 8,
         };
     }
 
@@ -502,6 +523,8 @@ pub const TypedArrayKind = enum(u8) {
             .uint32 => "Uint32Array",
             .float32 => "Float32Array",
             .float64 => "Float64Array",
+            .bigint64 => "BigInt64Array",
+            .biguint64 => "BigUint64Array",
         };
     }
 };
@@ -537,7 +560,7 @@ pub const WeakKey = union(enum) {
             .closure => |c| .{ .obj = @constCast(&c.obj) },
             .symbol => |s| if (!s.is_global) .{ .obj = @constCast(&s.obj) } else null,
             .native => |n| .{ .native = n },
-            .undefined, .null, .boolean, .number, .string => null,
+            .undefined, .null, .boolean, .number, .bigint, .string => null,
         };
     }
 
@@ -1496,6 +1519,28 @@ pub const Heap = struct {
         return s;
     }
 
+    /// Allocates an immutable BigInt on the heap, normalizing away trailing zero limbs
+    /// and ensuring `0n` has `limbs.len == 0` and `negative == false`.
+    pub fn newBigInt(h: *Heap, negative: bool, raw_limbs: []const u64) Error!*BigInt {
+        var len = raw_limbs.len;
+        while (len > 0 and raw_limbs[len - 1] == 0) : (len -= 1) {}
+        const limbs = if (len == 0)
+            @as([]const u64, &.{})
+        else
+            h.allocator().dupe(u64, raw_limbs[0..len]) catch |e| return h.failed(e);
+        errdefer if (limbs.len > 0) h.allocator().free(limbs);
+        const charge = try h.reserve(@sizeOf(BigInt), 0, 1);
+        errdefer h.bytes -= charge;
+        const b = try h.gpa.create(BigInt);
+        b.* = .{
+            .obj = h.newHeader(.bigint),
+            .negative = if (len == 0) false else negative,
+            .limbs = limbs,
+        };
+        h.young = &b.obj;
+        return b;
+    }
+
     pub fn newPromise(h: *Heap, proto: ?*Object) Error!*Object {
         const o = try h.newObject(proto);
         o.kind = .{ .promise = .{} };
@@ -2011,6 +2056,7 @@ pub const Heap = struct {
             .undefined, .null, .boolean, .number, .native => false,
             .string => |s| !s.obj.old,
             .symbol => |s| !s.obj.old,
+            .bigint => |b| !b.obj.old,
             .closure => |c| !c.obj.old,
             .object => |o| !o.obj.old,
         };
@@ -2271,6 +2317,7 @@ pub const Heap = struct {
         return switch (obj.kind) {
             .string => @sizeOf(String) + @as(*const String, @alignCast(@fieldParentPtr("obj", obj))).units.len * @sizeOf(u16) + 2 * per_allocation_overhead,
             .symbol => @sizeOf(Symbol) + per_allocation_overhead,
+            .bigint => @sizeOf(BigInt) + per_allocation_overhead,
             .cell => @sizeOf(Cell) + per_allocation_overhead,
             .closure => switch (@as(*const Closure, @alignCast(@fieldParentPtr("obj", obj))).impl) {
                 .vm => |v| @sizeOf(Closure) + v.captures.len * @sizeOf(*Cell) + 2 * per_allocation_overhead,
@@ -2295,6 +2342,12 @@ pub const Heap = struct {
                 s.atom = null;
             },
             .symbol => @as(*Symbol, @fieldParentPtr("obj", obj)).description = null,
+            .bigint => {
+                const b: *BigInt = @fieldParentPtr("obj", obj);
+                if (b.limbs.len > 0) h.allocator().free(b.limbs);
+                b.limbs = &.{};
+                b.negative = false;
+            },
             .cell => @as(*Cell, @fieldParentPtr("obj", obj)).value = null,
             .closure => {
                 const c: *Closure = @fieldParentPtr("obj", obj);
@@ -2376,6 +2429,7 @@ pub const Heap = struct {
         switch (kind) {
             .string => h.gpa.destroy(@as(*String, @fieldParentPtr("obj", obj))),
             .symbol => h.gpa.destroy(@as(*Symbol, @fieldParentPtr("obj", obj))),
+            .bigint => h.gpa.destroy(@as(*BigInt, @fieldParentPtr("obj", obj))),
             .cell => h.gpa.destroy(@as(*Cell, @fieldParentPtr("obj", obj))),
             .closure => h.gpa.destroy(@as(*Closure, @fieldParentPtr("obj", obj))),
             .env => h.gpa.destroy(@as(*Env, @fieldParentPtr("obj", obj))),
@@ -2454,7 +2508,7 @@ pub const Heap = struct {
 /// M8's marking follows (D38). Atoms used as property keys are edges too (D11).
 pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *Obj) void) void {
     switch (obj.kind) {
-        .string => {},
+        .string, .bigint => {},
         .symbol => {
             const s: *Symbol = @fieldParentPtr("obj", obj);
             if (s.description) |d| visit(ctx, @constCast(&d.obj));
@@ -2602,6 +2656,7 @@ pub fn visitValue(v: Value, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *Obj
         .undefined, .null, .boolean, .number, .native => {}, // natives are static
         .string => |s| visit(ctx, @constCast(&s.obj)),
         .symbol => |s| visit(ctx, @constCast(&s.obj)),
+        .bigint => |b| visit(ctx, @constCast(&b.obj)),
         .closure => |c| visit(ctx, @constCast(&c.obj)),
         .object => |o| visit(ctx, &o.obj),
     }
@@ -2612,6 +2667,7 @@ pub inline fn checkValue(v: Value) void {
     switch (v) {
         .string => |x| x.obj.checkLive(),
         .symbol => |x| x.obj.checkLive(),
+        .bigint => |x| x.obj.checkLive(),
         .closure => |x| x.obj.checkLive(),
         .object => |x| x.obj.checkLive(),
         .undefined, .null, .boolean, .number, .native => {},

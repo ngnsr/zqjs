@@ -48,6 +48,7 @@ const Runtime = rt_mod.Runtime;
 const Error = rt_mod.Error;
 const ops = @import("../runtime/ops.zig");
 const object = @import("../runtime/object.zig");
+const bigint = @import("../runtime/bigint.zig");
 const builtins = @import("../runtime/builtins.zig");
 const coroutine = @import("../runtime/coroutine.zig");
 const BinaryOp = @import("../frontend/ast.zig").BinaryOp;
@@ -1123,17 +1124,26 @@ pub const Vm = struct {
             // Compute into a local, then store. `top().* = .{ .number = f(peek(0)) }` would
             // be wrong: Zig builds the union in place, so the slot's tag changes *before*
             // f reads the old value through peek (result-location aliasing).
-            .neg, .to_number, .to_string, .not, .bit_not, .typeof => {
+            .neg, .to_number, .to_numeric, .to_string, .not, .bit_not, .typeof => {
                 const v = try cache.peek(vm, 0);
-                if (v.isObjectLike() and (op == .neg or op == .to_number or op == .to_string or op == .bit_not)) {
+                if (v.isObjectLike() and (op == .neg or op == .to_number or op == .to_numeric or op == .to_string or op == .bit_not)) {
                     cache.syncSp(vm);
                 }
                 const r: Value = switch (op) {
-                    .neg => .{ .number = if (v == .number) -v.number else -(try ops.toNumber(rt, v)) },
+                    .neg => blk: {
+                        if (v == .number) break :blk .{ .number = -v.number };
+                        const nv = try ops.toNumeric(rt, v);
+                        break :blk if (nv == .bigint) .{ .bigint = try bigint.neg(rt, nv.bigint) } else .{ .number = -nv.number };
+                    },
                     .to_number => if (v == .number) v else .{ .number = try ops.toNumber(rt, v) },
+                    .to_numeric => if (v == .number or v == .bigint) v else try ops.toNumeric(rt, v),
                     .to_string => if (v == .string) v else try ops.toStringValue(rt, v),
                     .not => .{ .boolean = !ops.toBoolean(v) },
-                    .bit_not => .{ .number = ops.bitNot(if (v == .number) v.number else try ops.toNumber(rt, v)) },
+                    .bit_not => blk: {
+                        if (v == .number) break :blk .{ .number = ops.bitNot(v.number) };
+                        const nv = try ops.toNumeric(rt, v);
+                        break :blk if (nv == .bigint) .{ .bigint = try bigint.bitNot(rt, nv.bigint) } else .{ .number = ops.bitNot(nv.number) };
+                    },
                     .typeof => try ops.typeOf(rt, v),
                     else => unreachable,
                 };
@@ -1141,8 +1151,13 @@ pub const Vm = struct {
             },
             .inc, .dec => {
                 const t = try cache.top(vm);
-                if (t.* != .number) return vm.bug("inc/dec on a non-number"); // always after to_number
-                t.number += if (op == .inc) 1 else -1;
+                if (t.* == .number) {
+                    t.number += if (op == .inc) 1 else -1;
+                } else if (t.* == .bigint) {
+                    t.* = .{ .bigint = try bigint.addI64(rt, t.bigint, if (op == .inc) 1 else -1) };
+                } else {
+                    return vm.bug("inc/dec on a non-numeric");
+                }
             },
 
             .jump => next = try cache.target(vm),
@@ -2288,7 +2303,7 @@ fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []c
                 try object.define(rt, dst, k, v);
             }
         },
-        .undefined, .null, .boolean, .number, .symbol, .native => {},
+        .undefined, .null, .boolean, .number, .bigint, .symbol, .native => {},
     }
 }
 
@@ -2310,11 +2325,11 @@ fn fastTypedArrayGet(base: Value, idx: Value) ?Value {
     const o = base.object;
     if (o.kind != .typed_array) return null;
     const ta = o.kind.typed_array;
-    if (ta.buffer.kind.array_buffer.detached) return null;
+    if (ta.kind.isBigInt() or ta.buffer.kind.array_buffer.detached) return null;
     const n = idx.number;
     if (!(n >= 0 and n < @as(f64, @floatFromInt(ta.length)) and @floor(n) == n)) return null;
     o.obj.checkLive();
-    return object.readTypedArrayElement(ta, @intFromFloat(n));
+    return object.readTypedArrayNumber(ta, @intFromFloat(n));
 }
 
 fn fastTypedArraySet(base: Value, idx: Value, val: Value) bool {
@@ -2322,7 +2337,7 @@ fn fastTypedArraySet(base: Value, idx: Value, val: Value) bool {
     const o = base.object;
     if (o.kind != .typed_array) return false;
     const ta = o.kind.typed_array;
-    if (ta.buffer.kind.array_buffer.detached) return false;
+    if (ta.kind.isBigInt() or ta.buffer.kind.array_buffer.detached) return false;
     const n = idx.number;
     if (!(n >= 0 and n < @as(f64, @floatFromInt(ta.length)) and @floor(n) == n)) return false;
     o.obj.checkLive();

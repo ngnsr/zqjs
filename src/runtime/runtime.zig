@@ -21,6 +21,7 @@ const value_mod = @import("value.zig");
 const Value = value_mod.Value;
 const Native = value_mod.Native;
 const builtins_mod = @import("builtins.zig");
+const date_mod = @import("date.zig");
 const object_mod = @import("object.zig");
 const module_mod = @import("module.zig");
 const Limits = @import("../limits.zig").Limits;
@@ -256,8 +257,18 @@ pub const Runtime = struct {
     repl_result: Value = .undefined,
     /// Loaded ES Modules and host loader (M42, D72).
     modules: module_mod.ModuleRegistry = .{},
+    /// Optional wall-clock hook returning UTC epoch milliseconds (M50, D80).
+    wall_clock: ?*const fn (ctx: ?*anyopaque) i64 = null,
+    wall_clock_ctx: ?*anyopaque = null,
 
     pub const default_random_seed: u64 = 0x9e3779b97f4a7c15;
+
+    pub fn nowMs(rt: *const Runtime) f64 {
+        if (rt.wall_clock) |cb| {
+            return date_mod.timeClip(@floatFromInt(cb(rt.wall_clock_ctx)));
+        }
+        return date_mod.systemNowMs();
+    }
 
     pub fn setRandomSeed(rt: *Runtime, seed: u64) void {
         rt.rng = std.Random.DefaultPrng.init(seed);

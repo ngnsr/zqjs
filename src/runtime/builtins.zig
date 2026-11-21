@@ -842,59 +842,83 @@ pub fn tryGlobal(rt: *Runtime, name: []const u8) Error!Value {
     return (try lookupGlobal(rt, name)) orelse .undefined;
 }
 
+const GlobalTarget = union(enum) {
+    undefined,
+    nan,
+    inf,
+    math,
+    json,
+    reflect,
+    native: *const Native,
+};
+
+const builtin_globals = std.StaticStringMap(GlobalTarget).initComptime([_]struct { []const u8, GlobalTarget }{
+    .{ "undefined", .undefined },
+    .{ "NaN", .nan },
+    .{ "Infinity", .inf },
+    .{ "print", .{ .native = &print } },
+    .{ "Object", .{ .native = &object_global } },
+    .{ "Array", .{ .native = &array_global } },
+    .{ "String", .{ .native = &string_global } },
+    .{ "Number", .{ .native = &number_global } },
+    .{ "Function", .{ .native = &function_global } },
+    .{ "parseInt", .{ .native = &parse_int_global } },
+    .{ "parseFloat", .{ .native = &parse_float_global } },
+    .{ "isNaN", .{ .native = &is_nan_global } },
+    .{ "isFinite", .{ .native = &is_finite_global } },
+    .{ "encodeURI", .{ .native = &encode_uri_global } },
+    .{ "decodeURI", .{ .native = &decode_uri_global } },
+    .{ "encodeURIComponent", .{ .native = &encode_uri_component_global } },
+    .{ "decodeURIComponent", .{ .native = &decode_uri_component_global } },
+    .{ "Map", .{ .native = &map_global } },
+    .{ "Set", .{ .native = &set_global } },
+    .{ "WeakMap", .{ .native = &weak_map_global } },
+    .{ "WeakSet", .{ .native = &weak_set_global } },
+    .{ "Proxy", .{ .native = &proxy_global } },
+    .{ "Reflect", .reflect },
+    .{ "Promise", .{ .native = &promise_global } },
+    .{ "Error", .{ .native = &error_global } },
+    .{ "TypeError", .{ .native = &type_error_global } },
+    .{ "RangeError", .{ .native = &range_error_global } },
+    .{ "SyntaxError", .{ .native = &syntax_error_global } },
+    .{ "ReferenceError", .{ .native = &reference_error_global } },
+    .{ "EvalError", .{ .native = &eval_error_global } },
+    .{ "URIError", .{ .native = &uri_error_global } },
+    .{ "AggregateError", .{ .native = &aggregate_error_global } },
+    .{ "RegExp", .{ .native = &regexp_global } },
+    .{ "Date", .{ .native = &date_global } },
+    .{ "Symbol", .{ .native = &symbol_global } },
+    .{ "BigInt", .{ .native = &bigint_global } },
+    .{ "ArrayBuffer", .{ .native = &array_buffer_global } },
+    .{ "DataView", .{ .native = &data_view_global } },
+    .{ "Int8Array", .{ .native = &typed_array_ctors[0] } },
+    .{ "Uint8Array", .{ .native = &typed_array_ctors[1] } },
+    .{ "Uint8ClampedArray", .{ .native = &typed_array_ctors[2] } },
+    .{ "Int16Array", .{ .native = &typed_array_ctors[3] } },
+    .{ "Uint16Array", .{ .native = &typed_array_ctors[4] } },
+    .{ "Int32Array", .{ .native = &typed_array_ctors[5] } },
+    .{ "Uint32Array", .{ .native = &typed_array_ctors[6] } },
+    .{ "Float32Array", .{ .native = &typed_array_ctors[7] } },
+    .{ "Float64Array", .{ .native = &typed_array_ctors[8] } },
+    .{ "BigInt64Array", .{ .native = &typed_array_ctors[9] } },
+    .{ "BigUint64Array", .{ .native = &typed_array_ctors[10] } },
+    .{ "Math", .math },
+    .{ "JSON", .json },
+    .{ "structuredClone", .{ .native = &structured_clone_global } },
+});
+
 fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
-    if (std.mem.eql(u8, name, "undefined")) return .undefined;
-    if (std.mem.eql(u8, name, "NaN")) return Value.fromNumber(std.math.nan(f64));
-    if (std.mem.eql(u8, name, "Infinity")) return Value.fromNumber(std.math.inf(f64));
-    if (std.mem.eql(u8, name, "print")) return Value.fromNative(&print);
-    if (std.mem.eql(u8, name, "Object")) return Value.fromNative(&object_global);
-    if (std.mem.eql(u8, name, "Array")) return Value.fromNative(&array_global);
-    if (std.mem.eql(u8, name, "String")) return Value.fromNative(&string_global);
-    if (std.mem.eql(u8, name, "Number")) return Value.fromNative(&number_global);
-    if (std.mem.eql(u8, name, "Function")) return Value.fromNative(&function_global);
-    if (std.mem.eql(u8, name, "parseInt")) return Value.fromNative(&parse_int_global);
-    if (std.mem.eql(u8, name, "parseFloat")) return Value.fromNative(&parse_float_global);
-    if (std.mem.eql(u8, name, "isNaN")) return Value.fromNative(&is_nan_global);
-    if (std.mem.eql(u8, name, "isFinite")) return Value.fromNative(&is_finite_global);
-    if (std.mem.eql(u8, name, "encodeURI")) return Value.fromNative(&encode_uri_global);
-    if (std.mem.eql(u8, name, "decodeURI")) return Value.fromNative(&decode_uri_global);
-    if (std.mem.eql(u8, name, "encodeURIComponent")) return Value.fromNative(&encode_uri_component_global);
-    if (std.mem.eql(u8, name, "decodeURIComponent")) return Value.fromNative(&decode_uri_component_global);
-    if (std.mem.eql(u8, name, "Map")) return Value.fromNative(&map_global);
-    if (std.mem.eql(u8, name, "Set")) return Value.fromNative(&set_global);
-    if (std.mem.eql(u8, name, "WeakMap")) return Value.fromNative(&weak_map_global);
-    if (std.mem.eql(u8, name, "WeakSet")) return Value.fromNative(&weak_set_global);
-    if (std.mem.eql(u8, name, "Proxy")) return Value.fromNative(&proxy_global);
-    if (std.mem.eql(u8, name, "Reflect")) return Value.fromObject((try realm(rt)).reflect);
-    if (std.mem.eql(u8, name, "Promise")) return Value.fromNative(&promise_global);
-    if (std.mem.eql(u8, name, "Error")) return Value.fromNative(&error_global);
-    if (std.mem.eql(u8, name, "TypeError")) return Value.fromNative(&type_error_global);
-    if (std.mem.eql(u8, name, "RangeError")) return Value.fromNative(&range_error_global);
-    if (std.mem.eql(u8, name, "SyntaxError")) return Value.fromNative(&syntax_error_global);
-    if (std.mem.eql(u8, name, "ReferenceError")) return Value.fromNative(&reference_error_global);
-    if (std.mem.eql(u8, name, "EvalError")) return Value.fromNative(&eval_error_global);
-    if (std.mem.eql(u8, name, "URIError")) return Value.fromNative(&uri_error_global);
-    if (std.mem.eql(u8, name, "AggregateError")) return Value.fromNative(&aggregate_error_global);
-    if (std.mem.eql(u8, name, "RegExp")) return Value.fromNative(&regexp_global);
-    if (std.mem.eql(u8, name, "Date")) return Value.fromNative(&date_global);
-    if (std.mem.eql(u8, name, "Symbol")) return Value.fromNative(&symbol_global);
-    if (std.mem.eql(u8, name, "BigInt")) return Value.fromNative(&bigint_global);
-    if (std.mem.eql(u8, name, "ArrayBuffer")) return Value.fromNative(&array_buffer_global);
-    if (std.mem.eql(u8, name, "DataView")) return Value.fromNative(&data_view_global);
-    if (std.mem.eql(u8, name, "Int8Array")) return Value.fromNative(&typed_array_ctors[0]);
-    if (std.mem.eql(u8, name, "Uint8Array")) return Value.fromNative(&typed_array_ctors[1]);
-    if (std.mem.eql(u8, name, "Uint8ClampedArray")) return Value.fromNative(&typed_array_ctors[2]);
-    if (std.mem.eql(u8, name, "Int16Array")) return Value.fromNative(&typed_array_ctors[3]);
-    if (std.mem.eql(u8, name, "Uint16Array")) return Value.fromNative(&typed_array_ctors[4]);
-    if (std.mem.eql(u8, name, "Int32Array")) return Value.fromNative(&typed_array_ctors[5]);
-    if (std.mem.eql(u8, name, "Uint32Array")) return Value.fromNative(&typed_array_ctors[6]);
-    if (std.mem.eql(u8, name, "Float32Array")) return Value.fromNative(&typed_array_ctors[7]);
-    if (std.mem.eql(u8, name, "Float64Array")) return Value.fromNative(&typed_array_ctors[8]);
-    if (std.mem.eql(u8, name, "BigInt64Array")) return Value.fromNative(&typed_array_ctors[9]);
-    if (std.mem.eql(u8, name, "BigUint64Array")) return Value.fromNative(&typed_array_ctors[10]);
-    if (std.mem.eql(u8, name, "Math")) return Value.fromObject((try realm(rt)).math);
-    if (std.mem.eql(u8, name, "JSON")) return Value.fromObject((try realm(rt)).json);
-    if (std.mem.eql(u8, name, "structuredClone")) return Value.fromNative(&structured_clone_global);
+    if (builtin_globals.get(name)) |target| {
+        return switch (target) {
+            .undefined => .undefined,
+            .nan => Value.fromNumber(std.math.nan(f64)),
+            .inf => Value.fromNumber(std.math.inf(f64)),
+            .math => Value.fromObject((try realm(rt)).math),
+            .json => Value.fromObject((try realm(rt)).json),
+            .reflect => Value.fromObject((try realm(rt)).reflect),
+            .native => |n| Value.fromNative(n),
+        };
+    }
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return Value.fromNative(n);
     if (names.has(.global, name)) {
         rt.unsupported_name = try rt.heap.internAscii(name);

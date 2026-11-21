@@ -22,7 +22,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | **done** |
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | **done** |
 | 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
-| 11.1–55 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1 VM perf (see milestone log below; D55–D85) | **done** |
+| 11.1–56 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1 VM perf (see milestone log below; D55–D86) | **done** |
 | Perf | Remaining Tier 1–2 interpreter optimizations toward QuickJS parity (see `PERF_PLAN.md`) | in progress |
 
 ## Direction after M8.1 (reviewed 2026-11-15)
@@ -513,3 +513,6 @@ runs on both engines unless noted.
 
 **M55 (done — 8-Byte NaN-Boxed `Value` and 8-Byte `Vm.Slot`)**
 - **M55:** Implemented D85 across `src/runtime/value.zig`, `src/vm/vm.zig`, `src/runtime/heap.zig`, `src/runtime/ops.zig`, and all runtime/VM/interpreter/REPL/API call sites: replaced the 16-byte `Value` tagged union with an 8-byte IEEE-754 negative quiet-NaN boxed `packed struct(u64)` (preserving `-0`, `±Infinity`, subnormals, and canonical NaN) and compressed `Vm.Slot` from 24 B to 8 B (`packed struct(u64)` sharing `Value`'s bit layout plus `UNINIT_BITS` and `TAG_CELL`). Reduced GC `visitValue`/`checkValue`/`isYoung` to a single range check + mask. Cut every M10 benchmark by another 8–22% (bringing all 11 below `2.0×` QuickJS: `closures.js` `0.63×` [37% faster than QJS], `arrays.js` `1.16×`, `branch_dense.js` `1.16×`, `float_math.js` `1.19×`, `int_loop.js` `1.24×`, `call_chain.js` `1.58×`, `objects.js` `1.65×`, `strings.js` `1.95×`, C-ABI `frame_loop_3600` p50 `16.0 µs`).
+
+**M56 (done — Tier 1 VM Performance Part 4: Back-Edge Safepoints, Fast Calls, Registerized `pc`, O(1) Global Lookup)**
+- **M56:** Implemented D86 across `src/vm/vm.zig`, `src/runtime/runtime.zig`, and `src/runtime/builtins.zig`: comptime stress split in `runLoop` moving `collect_requested` checks to back-edges/calls/allocations, registerized `vm.pc` (synced in `FrameCache.syncSp`), removed dead `exec_ctx.used` write in `Runtime.step()`, added `enterCall` / `returnConstruct` fast JS→JS call/return paths with guarded `initLocals` memsets, and replaced the 55-way linear global lookup chain with `std.StaticStringMap`. Cut `closures.js` to `0.53×` QuickJS (nearly 2× faster), `branch_dense.js` `1.07×`, `float_math.js` `1.10×`, `arrays.js` `1.13×`, `scopes.js` `1.15×`, `int_loop.js` `1.17×`, `fib.js` `1.26×` (-23%), `call_chain.js` `1.34×` (-15%), `global_reads.js` `1.35×` (-15%), `objects.js` `1.56×`; C-ABI `js_to_c_native` hit `8.32M calls/s` (+38%) and `frame_loop_3600` p50 dropped to `12.0 µs` (-25%).

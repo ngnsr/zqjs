@@ -327,7 +327,6 @@ pub const Runtime = struct {
             return error.LimitExceeded;
         }
         rt.steps += 1;
-        if (rt.exec_ctx.active) rt.exec_ctx.used = rt.steps;
     }
 
     /// Begins a chain (M9.1, D51): one per top-level entry. Installs the cumulative

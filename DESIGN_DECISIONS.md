@@ -2097,3 +2097,22 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
   - `ops.strictEquals` fast-paths identical non-number bits with `a.bits == b.bits` and `ops.toBoolean` checks booleans/nullish in one comparison.
 - **Measured Impact (`python3 tools/m10_compare.py`, Apple M4, `ReleaseFast`):**
   - Every benchmark improved 8–22% over M54 and all 11 are now below `2.0×` QuickJS: `closures.js` `0.63×` (37% faster than QuickJS), `arrays.js` `1.16×`, `branch_dense.js` `1.16×`, `float_math.js` `1.19×`, `int_loop.js` `1.24×`, `scopes.js` `1.38×`, `call_chain.js` `1.58×` (-22.5%), `global_reads.js` `1.59×`, `fib.js` `1.64×`, `objects.js` `1.65×` (-19%), `strings.js` `1.95×`. C-ABI `frame_loop_3600` median frame time dropped from `18.0 µs` to `16.0 µs`.
+
+---
+
+## D86. Tier 1 VM Performance Part 4: Back-Edge Safepoints, Fast JS→JS Calls, Registerized `pc`, and O(1) Global Lookup *(M56)*
+
+**Decision:** Eliminate per-instruction safepoint, `vm.pc`, and `exec_ctx.used` traffic in the bytecode VM, specialize the hot JS→JS call/return path, and replace the linear built-in global lookup chain with a comptime `StaticStringMap`, preserving exact step counting and `-Dgc-stress` per-instruction collection semantics.
+
+- **Comptime Stress Split & Back-Edge/Allocation Safepoints (`src/vm/vm.zig`):**
+  - `runLoop` dispatches once on `rt.heap.collect_always` to `runLoopInner(bounded, stress, steps)`. When `stress == true` (`-Dgc-stress` or `collect_always = true`), `rt.collect()` still runs before every instruction. When `stress == false`, `h.collect_always` is never loaded and `h.collect_requested` is checked only at backward jumps (`next <= pc`), calls (`.call`, `.call_method`, `.new_call`), and heap-allocating opcodes (`.new_object`, `.new_array`, `.make_closure`). `Vm.step()` retains the exact per-step safepoint check.
+- **Registerized `pc` & Dead `exec_ctx.used` Removal (`src/vm/vm.zig`, `src/runtime/runtime.zig`):**
+  - Stopped writing `vm.pc = next` to memory on every straight-line instruction; `FrameCache.syncSp` now syncs both `vm.sp` and `vm.pc` before any helper, throw, GC, call, or loop exit that can observe them.
+  - Removed the write-only `if (rt.exec_ctx.active) rt.exec_ctx.used = rt.steps;` branch from `Runtime.step()` (`endChain()` already returns `rt.steps` directly).
+- **Fast JS→JS Call & Return Path (`src/vm/vm.zig`):**
+  - Added `noinline fn enterCall` (8 register args on arm64, no `FrameCache` pointer, no constructor/super branches) for normal non-async, non-class-constructor JS→JS calls, guarded zero-length `@memset`s in `initLocals`, and outlined constructor/super returns into `noinline fn returnConstruct`.
+- **O(1) Built-in Global Lookup (`src/runtime/builtins.zig`):**
+  - Replaced the 55-way linear `std.mem.eql` chain in `lookupGlobal` with a comptime `std.StaticStringMap(GlobalTarget)`.
+- **Measured Impact (`python3 tools/m10_compare.py`, Apple M4, `ReleaseFast`):**
+  - All 11 JS benchmarks improved over M55: `closures.js` `0.53×` (nearly 2× faster than QuickJS), `branch_dense.js` `1.07×`, `float_math.js` `1.10×`, `arrays.js` `1.13×`, `scopes.js` `1.15×`, `int_loop.js` `1.17×`, `fib.js` `1.26×` (-23%), `call_chain.js` `1.34×` (-15%), `global_reads.js` `1.35×` (-15%), `objects.js` `1.56×`, `strings.js` `1.94×`.
+  - C-ABI embedding benchmarks surged: `js_to_c_native` `8.32M calls/s` (+38%), `host_js_c_js_roundtrip` `4.12M trips/s` (+19%), and `frame_loop_3600` p50 frame time `16.0 µs → 12.0 µs` (-25%).

@@ -551,10 +551,9 @@ pub const Vm = struct {
     /// Loop-local cache of the active frame's `proto`, `code`, `pc`, and frame-constant
     /// stack/local bounds (`locals_base` is stored as an index into `vm.locals`, never
     /// as a slice/pointer, so stack/local growth in `enter()` cannot dangle).
-    /// Invariants: `vm.pc` is still written on every committed instruction so helpers,
-    /// errors, host calls, GC, and suspended slices always observe an exact PC; any
-    /// opcode that pushes or pops a frame (currently `.call`/`.call_method` on a
-    /// closure and `.@"return"`) must refresh the cache via `FrameCache.fromVm`.
+    /// Invariants: `vm.sp` and `vm.pc` are synced via `syncSp` before any helper,
+    /// error, host call, GC, or loop exit that can observe them; any opcode that pushes
+    /// or pops a frame updates `cache` directly or via `FrameCache.fromVm`.
     const FrameCache = struct {
         p: *const Proto,
         code: []const u8,
@@ -581,6 +580,7 @@ pub const Vm = struct {
 
         inline fn syncSp(self: FrameCache, vm: *Vm) void {
             vm.sp = self.sp;
+            vm.pc = self.pc;
         }
 
         inline fn operand(self: FrameCache, i: usize) u32 {
@@ -641,11 +641,18 @@ pub const Vm = struct {
     };
 
     inline fn runLoop(vm: *Vm, comptime bounded: bool, steps: u64) Error!State {
+        if (vm.rt.heap.collect_always) {
+            @branchHint(.cold);
+            return vm.runLoopInner(bounded, true, steps);
+        }
+        return vm.runLoopInner(bounded, false, steps);
+    }
+
+    fn runLoopInner(vm: *Vm, comptime bounded: bool, comptime stress: bool, steps: u64) Error!State {
         @setEvalBranchQuota(10_000);
         if (vm.fault) |e| return e;
         if (vm.halted) return .halted;
         const rt = vm.rt;
-        const h = &rt.heap;
         if (!vm.nested) rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
         const prev_caller = rt.closure_caller;
         rt.closure_caller = .{ .ctx = vm, .call = callFromBuiltin, .construct = constructFromBuiltin };
@@ -653,11 +660,11 @@ pub const Vm = struct {
         var cache = FrameCache.fromVm(vm, vm.pc);
         var n: u64 = 0;
         while (!bounded or n < steps) {
-            if (h.collect_requested or h.collect_always) {
+            if (stress) {
                 cache.syncSp(vm);
                 rt.collect();
             }
-            const state = @call(.always_inline, execute, .{ vm, &cache }) catch |e| {
+            const state = @call(.always_inline, execute, .{ vm, &cache, !stress }) catch |e| {
                 cache.syncSp(vm);
                 if (e == error.Thrown) {
                     if (vm.unwind(cache.pc)) |_| {
@@ -784,7 +791,7 @@ pub const Vm = struct {
             vm.rt.collect();
         }
         var cache = FrameCache.fromVm(vm, vm.pc);
-        const state = vm.execute(&cache) catch |e| {
+        const state = vm.execute(&cache, false) catch |e| {
             cache.syncSp(vm);
             if (e == error.Thrown) {
                 if (vm.unwind(cache.pc)) |_| {
@@ -803,7 +810,9 @@ pub const Vm = struct {
 
     /// One instruction. Every path either fails before changing VM state, or commits
     /// its changes and then sets `pc` (see the contract above).
-    fn execute(vm: *Vm, cache: *FrameCache) Error!State {
+    /// When `inline_safepoints` is true (non-stress `runLoop`), `collect_requested` is
+    /// checked at loop back-edges, calls, and allocations instead of every instruction.
+    fn execute(vm: *Vm, cache: *FrameCache, comptime inline_safepoints: bool) Error!State {
         const p = cache.p;
         const code = cache.code;
         const pc = cache.pc;
@@ -947,6 +956,11 @@ pub const Vm = struct {
             },
 
             .make_closure => {
+                if (inline_safepoints and rt.heap.collect_requested) {
+                    @branchHint(.unlikely);
+                    cache.syncSp(vm);
+                    rt.collect();
+                }
                 const f = cache.operand(0);
                 if (f >= p.functions.len) return vm.bug("function index out of range");
                 const child = &p.functions[f];
@@ -998,11 +1012,21 @@ pub const Vm = struct {
 
             // ---- objects: compute first (any of these can fail), then commit
             .new_object => {
+                if (inline_safepoints and rt.heap.collect_requested) {
+                    @branchHint(.unlikely);
+                    cache.syncSp(vm);
+                    rt.collect();
+                }
                 try cache.ensurePush(vm);
                 const o = try rt.heap.newObject((try builtins.realm(rt)).object_prototype);
                 try cache.push(vm, Value.fromObject(o));
             },
             .new_array => {
+                if (inline_safepoints and rt.heap.collect_requested) {
+                    @branchHint(.unlikely);
+                    cache.syncSp(vm);
+                    rt.collect();
+                }
                 const n = cache.operand(0);
                 if (n > cache.sp - cache.stack_base) return vm.bug("stack underflow");
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
@@ -1302,7 +1326,14 @@ pub const Vm = struct {
                 }
             },
 
-            .jump => next = try cache.target(vm),
+            .jump => {
+                next = try cache.target(vm);
+                if (inline_safepoints and next <= pc and rt.heap.collect_requested) {
+                    @branchHint(.unlikely);
+                    cache.syncSp(vm);
+                    rt.collect();
+                }
+            },
             .jump_if_false, .jump_if_true => {
                 const truthy = ops.toBoolean(try cache.peek(vm, 0));
                 try cache.drop(vm, 1);
@@ -1365,6 +1396,11 @@ pub const Vm = struct {
                 try cache.push(vm, Value.fromBool(next_v == null));
             },
             .new_call => {
+                if (inline_safepoints and rt.heap.collect_requested) {
+                    @branchHint(.unlikely);
+                    cache.syncSp(vm);
+                    rt.collect();
+                }
                 const argc = cache.operand(0);
                 const group = argc + 1;
                 if (group > cache.sp - cache.stack_base) return vm.bug("stack underflow");
@@ -1379,6 +1415,11 @@ pub const Vm = struct {
                 cache.sp = base + 1;
             },
             .call, .call_method => {
+                if (inline_safepoints and rt.heap.collect_requested) {
+                    @branchHint(.unlikely);
+                    cache.syncSp(vm);
+                    rt.collect();
+                }
                 // Stack: [callee, args…] or [receiver, callee, args…], arguments in source
                 // order. The result replaces the whole group, from `base`.
                 const argc = cache.operand(0);
@@ -1434,10 +1475,14 @@ pub const Vm = struct {
                             cache.syncSp(vm);
                             const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
                             if (callee_proto.is_async) {
+                                @branchHint(.unlikely);
                                 vm.stack[base] = try vm.startAsyncFromVm(c, this, vm.stack[args..cache.sp]);
                                 cache.sp = base + 1;
+                            } else if (callee_proto.is_class_constructor) {
+                                @branchHint(.unlikely);
+                                return rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
                             } else {
-                                try vm.enter(c, base, args, argc, next, this, false, false, null);
+                                try vm.enterCall(c, callee_proto, base, args, argc, next, this);
                                 cache.* = FrameCache.fromVm(vm, 0);
                                 return .running; // pc is the callee's 0
                             }
@@ -1469,35 +1514,19 @@ pub const Vm = struct {
                 }
                 const ret_v = try cache.peek(vm, 0);
                 const cur_f = vm.frame();
-                const v: Value = if (!cur_f.is_construct)
-                    ret_v
-                else if (cur_f.proto.has_super_ctor) blk: {
-                    if (ret_v.isObjectLike()) break :blk ret_v;
-                    if (ret_v.isUndefined()) {
-                        break :blk cur_f.this orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
-                    }
-                    return rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
-                } else if (!ret_v.isObjectLike())
-                    Value.fromObject(cur_f.construct_instance.?)
-                else
-                    ret_v;
-                const f = vm.frames.pop().?;
-                if (f.is_super_call) {
-                    vm.frames.items[vm.frames.items.len - 1].this = v;
+                if (!cur_f.is_construct) {
+                    const f = vm.frames.pop().?;
+                    if (vm.chain) |cx| cx.call_depth -= 1; // the frame died (D51 #2)
+                    vm.locals_len = f.locals_base;
+                    vm.reserved -= f.proto.slot_count + f.proto.max_stack;
+                    vm.stack[f.result_index] = ret_v; // replaces the callee (and receiver); arguments and callee operands are gone
+                    vm.sp = f.result_index + 1;
+                    cache.* = FrameCache.fromVm(vm, f.return_pc);
+                    return .running;
                 }
-                if (vm.chain) |cx| cx.call_depth -= 1; // the frame died (D51 #2)
-                vm.locals_len = f.locals_base;
-                vm.reserved -= f.proto.slot_count + f.proto.max_stack;
-                vm.sp = f.result_index;
-                vm.stack[vm.sp] = v; // replaces the callee (and receiver); arguments and callee operands are gone
-                vm.sp += 1;
-                vm.pc = f.return_pc;
-                if (f.is_super_call) {
-                    if (vm.frames.items[vm.frames.items.len - 1].closure) |dc| {
-                        try builtins.runInstanceInits(rt, @constCast(dc), v);
-                    }
-                }
-                cache.* = FrameCache.fromVm(vm, f.return_pc);
+                cache.syncSp(vm);
+                try vm.returnConstruct(ret_v);
+                cache.* = FrameCache.fromVm(vm, vm.pc);
                 return .running;
             },
             .halt => {
@@ -1520,7 +1549,6 @@ pub const Vm = struct {
             },
         }
         if (next >= code.len) return vm.bug("pc outside the code");
-        vm.pc = next;
         cache.pc = next;
         return .running;
     }
@@ -2184,6 +2212,78 @@ pub const Vm = struct {
         return true;
     }
 
+    /// Outlined return path for constructor / `super()` frames (keeps `.@"return"` tiny in `runLoop`).
+    noinline fn returnConstruct(vm: *Vm, ret_v: Value) Error!void {
+        @branchHint(.cold);
+        const rt = vm.rt;
+        const cur_f = vm.frame();
+        const v: Value = if (cur_f.proto.has_super_ctor) blk: {
+            if (ret_v.isObjectLike()) break :blk ret_v;
+            if (ret_v.isUndefined()) {
+                break :blk cur_f.this orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
+            }
+            return rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
+        } else if (!ret_v.isObjectLike())
+            Value.fromObject(cur_f.construct_instance.?)
+        else
+            ret_v;
+        const f = vm.frames.pop().?;
+        if (f.is_super_call) {
+            vm.frames.items[vm.frames.items.len - 1].this = v;
+        }
+        if (vm.chain) |cx| cx.call_depth -= 1;
+        vm.locals_len = f.locals_base;
+        vm.reserved -= f.proto.slot_count + f.proto.max_stack;
+        vm.stack[f.result_index] = v;
+        vm.sp = f.result_index + 1;
+        vm.pc = f.return_pc;
+        if (f.is_super_call) {
+            if (vm.frames.items[vm.frames.items.len - 1].closure) |dc| {
+                try builtins.runInstanceInits(rt, @constCast(dc), v);
+            }
+        }
+    }
+
+    /// Fast-path frame entry for normal (non-construct, non-async) JS→JS calls (D86).
+    /// Out-of-line with <= 8 register args (no FrameCache pointer) so `runLoop` keeps `cache` in registers.
+    noinline fn enterCall(vm: *Vm, c: *const Closure, callee: *const Proto, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value) Error!void {
+        c.obj.checkLive();
+        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else this;
+        const limits = vm.rt.limits;
+        if (vm.chain) |cx| {
+            if (cx.call_depth >= limits.max_call_depth) return vm.rt.limit(.call_depth);
+        } else if (vm.frames.items.len >= limits.max_call_depth) return vm.rt.limit(.call_depth);
+        const slot_count = callee.slot_count;
+        const max_stack = callee.max_stack;
+        if (vm.reserved + slot_count + max_stack > limits.max_stack_slots) return vm.rt.limit(.stack_slots);
+        if (vm.frames.items.len == vm.frames.capacity) try vm.growFrames();
+        const locals_base = vm.locals_len;
+        const need_locals = @as(usize, locals_base) + slot_count;
+        const stack_end = @max(vm.frame().stack_end, vm.sp + max_stack);
+        if (build_options.stack_stress or need_locals > vm.locals.len or @as(usize, stack_end) > vm.stack.len) {
+            try vm.reserve(callee);
+        }
+        vm.initLocals(callee, vm.stack[args..][0..argc]);
+        vm.frames.appendAssumeCapacity(.{
+            .proto = callee,
+            .closure = c,
+            .return_pc = return_pc,
+            .locals_base = locals_base,
+            .stack_base = vm.sp,
+            .result_index = base,
+            .this = effective_this,
+            .stack_end = stack_end,
+            .args_start = args,
+            .argc = argc,
+            .is_construct = false,
+            .is_super_call = false,
+            .construct_instance = null,
+        });
+        vm.locals_len = locals_base + slot_count;
+        vm.reserved += slot_count + max_stack;
+        if (vm.chain) |cx| cx.call_depth += 1;
+    }
+
     /// Enters closure `c`: its `argc` arguments start at `stack[args]`, and the result will
     /// replace everything from `stack[base]`. Transactional: everything that can fail
     /// happens before anything is committed.
@@ -2346,10 +2446,10 @@ pub const Vm = struct {
         const ps = p.param_slot;
         const pe = ps + p.param_count;
         const copy_n = @min(p.param_count, args.len);
-        @memset(dst[0..ps], .uninit);
+        if (ps > 0) @memset(dst[0..ps], .uninit);
         for (dst[ps..][0..copy_n], args[0..copy_n]) |*s, arg| s.* = Slot.fromValue(arg);
-        @memset(dst[ps + copy_n .. pe], Slot.fromValue(.undefined));
-        @memset(dst[pe..], .uninit);
+        if (copy_n < p.param_count) @memset(dst[ps + copy_n .. pe], Slot.fromValue(.undefined));
+        if (pe < p.slot_count) @memset(dst[pe..], .uninit);
     }
 
     // ---- checked accessors (see "Defensive checks"). Every one either returns its

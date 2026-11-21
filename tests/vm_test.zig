@@ -168,12 +168,11 @@ test "--trace prints each instruction and the operand stack before it runs" {
         \\     10  init_local     s0                               | 1
         \\     15  get_global     n0            ; print            |
         \\     20  get_local      s0 n1         ; x                | <native print>
-        \\     29  push_const     k1            ; 2                | <native print>, 1
-        \\     34  add                                             | <native print>, 1, 2
-        \\     35  push_const     k2            ; "a"              | <native print>, 3
-        \\     40  call           2                                | <native print>, 3, "a"
-        \\     45  pop                                             | undefined
-        \\     46  halt                                            |
+        \\     29  add_const      k1            ; 2                | <native print>, 1
+        \\     34  push_const     k2            ; "a"              | <native print>, 3
+        \\     39  call           2                                | <native print>, 3, "a"
+        \\     44  pop                                             | undefined
+        \\     45  halt                                            |
         \\
     , trace.written());
 }
@@ -1550,6 +1549,48 @@ test "M52: superinstructions (inc_local, dec_local, set_local_pop, lt/le_jump_if
     try rt.run(prog, null);
     try testing.expectEqualStrings(
         "5 11 42 100 NaN\n12 true\ntrue true\n",
+        out.buffered(),
+    );
+}
+
+test "M53: arithmetic-const, comparison-jump, set_prop/elem_pop, and fastRemainder short-circuit edge cases" {
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\function isNegZero(x) { return x === 0 && (1 / x) === -Infinity; }
+        \\// add_const / sub_const / mul_const / mod_const on numbers, strings, objects
+        \\let s = 'x';
+        \\let o = { valueOf() { return 10; } };
+        \\print(s + 1, o + 2, o - 3, o * 4, o % 6);
+        \\// fastRemainder 0 < a < b short-circuit vs -0, 0, Infinity, fractions
+        \\print(3 % 10, 5.5 % 10, 5 % Infinity, isNegZero(-0 % 10), isNegZero(0 % 10));
+        \\// gt / ge / strict_eq / strict_ne_jump_if_false with NaN, strings, numbers
+        \\let mask = 0;
+        \\if (5 > 3) mask += 1;
+        \\if (NaN > 3) mask += 2;
+        \\if (3 >= 3) mask += 4;
+        \\if (NaN >= 3) mask += 8;
+        \\if ('a' === 'a') mask += 16;
+        \\if (NaN === NaN) mask += 32;
+        \\if (1 !== 2) mask += 64;
+        \\if (NaN !== NaN) mask += 128;
+        \\print(mask);
+        \\// set_prop_pop / set_elem_pop
+        \\let obj = { a: 1 };
+        \\obj.a = 42;
+        \\let arr = [1, 2];
+        \\arr[1] = 99;
+        \\arr.push(7);
+        \\print(obj.a, arr[1], arr[2], arr.length);
+    ;
+    const prog = try rt.compile("m53_super.js", src, null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+    try testing.expectEqualStrings(
+        "x1 12 7 40 4\n3 5.5 5 true false\n213\n42 99 7 3\n",
         out.buffered(),
     );
 }

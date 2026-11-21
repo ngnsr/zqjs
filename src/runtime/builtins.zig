@@ -1407,7 +1407,11 @@ fn checkArrayMutate(rt: *Runtime, a: *Object, opts: struct {
 fn arrayPush(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const a = try thisArray(rt, this, "push");
     try checkArrayMutate(rt, a, .{ .grow = args.len > 0, .write_length = true });
-    try rt.heap.appendElements(a, args);
+    if (args.len == 1) {
+        try rt.heap.appendElement(a, args[0]);
+    } else if (args.len > 1) {
+        try rt.heap.appendElements(a, args);
+    }
     return .{ .number = @floatFromInt(a.kind.array.items.len) };
 }
 

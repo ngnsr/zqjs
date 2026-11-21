@@ -184,8 +184,12 @@ pub const Op = enum(u8) {
     get_elem,
     /// [base, value] → [value]: base.name = value.
     set_prop,
+    /// [base, value] → []: base.name = value (discarded, M53).
+    set_prop_pop,
     /// [base, key, value] → [value].
     set_elem,
+    /// [base, key, value] → []: base[key] = value (discarded, M53).
+    set_elem_pop,
     /// [base] → [delete base.name].
     delete_prop,
     /// [value] → [] (throws value as JS exception).
@@ -233,6 +237,11 @@ pub const Op = enum(u8) {
     mul,
     div,
     mod,
+    /// [lhs] → [lhs op consts[k]] (M53 superinstructions).
+    add_const,
+    sub_const,
+    mul_const,
+    mod_const,
     pow,
     shl,
     shr,
@@ -263,9 +272,13 @@ pub const Op = enum(u8) {
     /// Pop; jump if falsy / truthy (ToBoolean).
     jump_if_false,
     jump_if_true,
-    /// Pop rhs, lhs; jump if `!(lhs < rhs)` / `!(lhs <= rhs)` (M52 superinstruction).
+    /// Pop rhs, lhs; jump if comparison is false (M52/M53 superinstructions).
     lt_jump_if_false,
     le_jump_if_false,
+    gt_jump_if_false,
+    ge_jump_if_false,
+    strict_eq_jump_if_false,
+    strict_ne_jump_if_false,
     /// [iterable] → [iterator]: obtain built-in iterator for `for...of` (M14.4).
     get_iter,
     /// [iterator] → [iterator, value, done_bool]: advance iterator (M14.4).
@@ -411,7 +424,9 @@ pub const Op = enum(u8) {
             .get_prop, .delete_prop => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
             .get_elem, .delete_elem => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .set_prop => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
+            .set_prop_pop => .{ .operands = &.{.name}, .pops = 2, .pushes = 0 },
             .set_elem => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
+            .set_elem_pop => .{ .operands = &.{}, .pops = 3, .pushes = 0 },
             .in, .instanceof => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .push_this => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
             .get_arg, .rest_array => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
@@ -422,10 +437,11 @@ pub const Op = enum(u8) {
             .object_rest => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
             .call_method => .{ .operands = &.{.argc}, .pops = 2, .pushes = 1 },
             .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
+            .add_const, .sub_const, .mul_const, .mod_const => .{ .operands = &.{.@"const"}, .pops = 1, .pushes = 1 },
             .neg, .to_number, .to_numeric, .to_string, .not, .bit_not, .typeof, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .jump => .{ .operands = &.{.target}, .pops = 0, .pushes = 0 },
             .jump_if_false, .jump_if_true => .{ .operands = &.{.target}, .pops = 1, .pushes = 0 },
-            .lt_jump_if_false, .le_jump_if_false => .{ .operands = &.{.target}, .pops = 2, .pushes = 0 },
+            .lt_jump_if_false, .le_jump_if_false, .gt_jump_if_false, .ge_jump_if_false, .strict_eq_jump_if_false, .strict_ne_jump_if_false => .{ .operands = &.{.target}, .pops = 2, .pushes = 0 },
             .get_iter, .for_in_init => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .iter_next, .for_in_next => .{ .operands = &.{}, .pops = 1, .pushes = 2 },
             .iter_close, .iter_close_throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },

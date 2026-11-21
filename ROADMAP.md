@@ -22,7 +22,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | **done** |
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | **done** |
 | 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
-| 11.1–52 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1 VM perf (see milestone log below; D55–D82) | **done** |
+| 11.1–53 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1 VM perf (see milestone log below; D55–D83) | **done** |
 | Perf | Remaining Tier 1–2 interpreter optimizations toward QuickJS parity (see `PERF_PLAN.md`) | in progress |
 
 ## Direction after M8.1 (reviewed 2026-11-15)
@@ -504,3 +504,6 @@ runs on both engines unless noted.
 
 **M52 (done — Tier 1 VM Performance: Property IC, `fastArraySet`, Loop Superinstructions)**
 - **M52:** Implemented D82 across `bytecode.zig`, `compiler.zig`, `heap.zig`, `runtime.zig`, and `vm.zig`: zero-pointer direct-mapped monomorphic property IC (`Runtime.prop_ic` + `Heap.storePropertyAt`, supporting own properties and 1-hop prototype hits on ordinary objects and arrays), dense-array `fastArraySet` in `.set_elem`, and loop superinstructions (`inc_local`, `dec_local`, `set_local_pop`, `lt_jump_if_false`, `le_jump_if_false`). Cut `arrays.js` CLI time by 37% (`2.42× → 1.53×` QuickJS), `int_loop.js` by 24% (`2.07× → 1.58×`), `branch_dense.js` by 21% (`1.91× → 1.52×`), `global_reads.js` by 24% (`2.61× → 2.02×`), and `closures.js` to `0.73×` QuickJS. Added IC invalidation, superinstruction edge-case, and generational write-barrier GC tests (`tests/vm_test.zig`, `tests/gc_test.zig`).
+
+**M53 (done — Tier 1 VM Performance Part 2: Arithmetic-Const, Comparison-Jump & Store-Pop Superinstructions)**
+- **M53:** Implemented D83 across `bytecode.zig`, `compiler.zig`, `verify.zig`, `vm.zig`, and `builtins.zig`: added `add_const`/`sub_const`/`mul_const`/`mod_const`, `gt`/`ge`/`strict_eq`/`strict_ne_jump_if_false`, `set_prop_pop`/`set_elem_pop`, `fastRemainder` `0 < a < b` short-circuit, and 1-arg `arrayPush` fast path. Improved CLI-to-QuickJS ratios further to `0.69×` (`closures.js`), `1.29×` (`branch_dense.js`), `1.41×` (`int_loop.js`), `1.45×` (`arrays.js`), `1.57×` (`float_math.js`), `1.67×` (`scopes.js`), and `1.79×` (`fib.js`).

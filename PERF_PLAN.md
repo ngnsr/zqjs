@@ -12,23 +12,23 @@ At the M10 checkpoint (`05c0c7a`, see `ROADMAP.md` and `bench/m10/baseline-qjs.m
 - **Objects, fib, loops, arrays, calls:** `1.66×–2.33×` QuickJS
 - **C-ABI throughput:** `~6.59M calls/s` (`js_to_c_native`), `~4.87M trips/s` (`host_js_c_js_roundtrip`), `18.0 µs` p50 per frame on `frame_loop_3600`
 
-### M52 Checkpoint (D82 — Direct-Key Property IC, `fastArraySet`, Loop Superinstructions)
+### M52–M53 Checkpoints (D82–D83 — Property IC, `fastArraySet`, Superinstructions, `fastRemainder`)
 
-After M52 (measured via `python3 tools/m10_compare.py`, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`), CLI-to-CLI ratios vs QuickJS improved across all 11 benchmarks:
+After M52 and M53 (measured via `python3 tools/m10_compare.py`, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`), CLI-to-CLI ratios vs QuickJS improved across all 11 benchmarks:
 
-| Benchmark | Pre-M52 (`zqjs/qjs`) | Post-M52 (`zqjs/qjs`) | ZQJS CLI med |
-|---|---:|---:|---:|
-| `arrays.js` | `2.42×` (400.0 ms) | **`1.53×`** | **252.0 ms** (-37%) |
-| `branch_dense.js` | `1.91×` (200.8 ms) | **`1.52×`** | **158.4 ms** (-21%) |
-| `int_loop.js` | `2.07×` (141.9 ms) | **`1.58×`** | **108.1 ms** (-24%) |
-| `closures.js` | `0.77×` (95.2 ms) | **`0.73×`** | **88.2 ms** (-7%) |
-| `float_math.js` | `2.14×` (286.7 ms) | **`1.81×`** | **241.7 ms** (-16%) |
-| `scopes.js` | `2.38×` (84.1 ms) | **`1.93×`** | **66.8 ms** (-21%) |
-| `global_reads.js` | `2.61×` (64.4 ms) | **`2.02×`** | **49.1 ms** (-24%) |
-| `objects.js` | `2.37×` (75.4 ms) | **`2.04×`** | **65.3 ms** (-13%) |
-| `call_chain.js` | `2.37×` (122.0 ms) | **`2.19×`** | **111.9 ms** (-8%) |
-| `strings.js` | `2.31×` (26.3 ms) | **`2.11×`** | **24.5 ms** (-7%) |
-| `fib.js` | `1.90×` (64.3 ms) | **`1.96×`** | **64.8 ms** (flat) |
+| Benchmark | Pre-M52 (`zqjs/qjs`) | M52 (`zqjs/qjs`) | **M53 (`zqjs/qjs`)** | ZQJS CLI med |
+|---|---:|---:|---:|---:|
+| `closures.js` | `0.77×` (95.2 ms) | `0.73×` (88.2 ms) | **`0.69×`** | **86.4 ms** (31% faster than QJS) |
+| `branch_dense.js` | `1.91×` (200.8 ms) | `1.52×` (158.4 ms) | **`1.29×`** | **134.8 ms** (-33%) |
+| `int_loop.js` | `2.07×` (141.9 ms) | `1.58×` (108.1 ms) | **`1.41×`** | **98.2 ms** (-31%) |
+| `arrays.js` | `2.42×` (400.0 ms) | `1.53×` (252.0 ms) | **`1.45×`** | **242.7 ms** (-39%) |
+| `float_math.js` | `2.14×` (286.7 ms) | `1.81×` (241.7 ms) | **`1.57×`** | **213.1 ms** (-26%) |
+| `scopes.js` | `2.38×` (84.1 ms) | `1.93×` (66.8 ms) | **`1.67×`** | **58.9 ms** (-30%) |
+| `fib.js` | `1.90×` (64.3 ms) | `1.96×` (64.8 ms) | **`1.79×`** | **59.8 ms** (-7%) |
+| `global_reads.js` | `2.61×` (64.4 ms) | `2.02×` (49.1 ms) | **`1.96×`** | **47.5 ms** (-26%) |
+| `objects.js` | `2.37×` (75.4 ms) | `2.04×` (65.3 ms) | **`1.98×`** | **63.9 ms** (-15%) |
+| `call_chain.js` | `2.37×` (122.0 ms) | `2.19×` (111.9 ms) | **`2.16×`** | **111.9 ms** (-8%) |
+| `strings.js` | `2.31×` (26.3 ms) | `2.11×` (24.5 ms) | **`2.15×`** | **25.0 ms** (-5%) |
 
 *Note:* Labeled-switch threaded dispatch with `noinline` cold handlers and expanding `FrameCache` with `stack`/`locals` pointers both regressed due to register spilling and I-cache bloat, and were reverted per §5.
 

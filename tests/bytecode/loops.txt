@@ -1,4 +1,4 @@
-slots 3, max_stack 2, code 216 bytes
+slots 3, max_stack 2, code 213 bytes
 constants
   k0  0
   k1  10
@@ -18,35 +18,32 @@ code
      25  init_local     s1
      30  get_local      s1 n0         ; i
      39  push_const     k1            ; 10
-     44  lt_jump_if_false @195
+     44  lt_jump_if_false @192
      49  clear_local    s2
      54  get_local      s1 n0         ; i
      63  push_const     k2            ; 2
-     68  strict_eq
-     69  jump_if_false  @79
-     74  jump           @181
-     79  get_local      s1 n0         ; i
-     88  push_const     k3            ; 8
-     93  strict_eq
-     94  jump_if_false  @104
-     99  jump           @195
-    104  get_local      s1 n0         ; i
-    113  init_local     s2
-    118  get_local      s2 n1         ; j
-    127  push_const     k0            ; 0
-    132  gt
-    133  jump_if_false  @181
-    138  get_local      s0 n2         ; s
-    147  get_local      s2 n1         ; j
-    156  add
-    157  set_local      s0 n2         ; s
-    166  pop
-    167  dec_local      s2 n1         ; j
-    176  jump           @118
-    181  inc_local      s1 n0         ; i
-    190  jump           @30
-    195  get_global     n3            ; print
-    200  get_local      s0 n2         ; s
-    209  call           1
-    214  pop
-    215  halt
+     68  strict_eq_jump_if_false @78
+     73  jump           @178
+     78  get_local      s1 n0         ; i
+     87  push_const     k3            ; 8
+     92  strict_eq_jump_if_false @102
+     97  jump           @192
+    102  get_local      s1 n0         ; i
+    111  init_local     s2
+    116  get_local      s2 n1         ; j
+    125  push_const     k0            ; 0
+    130  gt_jump_if_false @178
+    135  get_local      s0 n2         ; s
+    144  get_local      s2 n1         ; j
+    153  add
+    154  set_local      s0 n2         ; s
+    163  pop
+    164  dec_local      s2 n1         ; j
+    173  jump           @116
+    178  inc_local      s1 n0         ; i
+    187  jump           @30
+    192  get_global     n3            ; print
+    197  get_local      s0 n2         ; s
+    206  call           1
+    211  pop
+    212  halt

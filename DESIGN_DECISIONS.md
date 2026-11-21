@@ -2041,3 +2041,18 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
 - **Measured Rejections (PERF_PLAN §5):**
   - Labeled-switch threaded dispatch with outlined `noinline` handlers and a local `StepBudget` regressed all 11 benchmarks (+4% to +43%) due to `FrameCache`/`StepBudget` register spilling and I-cache bloat; reverted.
   - Adding `stack`/`locals` pointers to `FrameCache` (7 → 9 fields) also regressed (+2% to +9%) due to register pressure across calls; reverted.
+
+---
+
+## D83. Tier 1 VM Performance Part 2: Arithmetic-Const, Comparison-Jump & Store-Pop Superinstructions *(M53)*
+
+**Decision:** Extend M52's bytecode specialization with ten high-frequency superinstructions (`add_const`, `sub_const`, `mul_const`, `mod_const`, `gt_jump_if_false`, `ge_jump_if_false`, `strict_eq_jump_if_false`, `strict_ne_jump_if_false`, `set_prop_pop`, `set_elem_pop`), a `fastRemainder` `0 < a < b` short-circuit, a 1-arg `Array.prototype.push` fast path, and deduplicated `Vm.enter` `stackEnd` calculation.
+
+- **Arithmetic-Const Superinstructions (`add_const`, `sub_const`, `mul_const`, `mod_const`):**
+  - Emitted by `compiler.zig` when the RHS of `+`, `-`, `*`, or `%` is a numeric literal, eliminating `push_const` and keeping the two-`.number` fast path inline while falling back to `ops.binary` for strings, objects, and `BigInt`.
+- **Comparison-Jump & Discarded-Store Superinstructions:**
+  - `gt_jump_if_false`, `ge_jump_if_false`, `strict_eq_jump_if_false`, `strict_ne_jump_if_false` fuse relational and strict-equality checks inside `if`/`while`/`for` conditions (registered in `verify.zig:target()`).
+  - `set_prop_pop` and `set_elem_pop` eliminate trailing `pop` instructions for discarded `o.p = v;` and `a[i] = v;` statements.
+- **Hot Runtime Fast Paths:**
+  - `fastRemainder` short-circuits `a > 0 and a < b and b != inf` directly to `a` (preserving `-0`, `NaN`, infinities, and fractional values while skipping 64-bit hardware divisions on modulo-guarded accumulators).
+  - `arrayPush` dispatches `args.len == 1` directly to `Heap.appendElement`.

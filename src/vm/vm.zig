@@ -1083,7 +1083,7 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = r;
             },
-            .set_prop => {
+            .set_prop, .set_prop_pop => {
                 const v = try cache.peek(vm, 0);
                 const base = try cache.peek(vm, 1);
                 const name_idx = cache.operand(0);
@@ -1098,10 +1098,14 @@ pub const Vm = struct {
                     cache.syncSp(vm);
                     try object.set(rt, base, try vm.nameKey(name_idx), v);
                 }
-                try cache.drop(vm, 1);
-                (try cache.top(vm)).* = v;
+                if (op == .set_prop_pop) {
+                    try cache.drop(vm, 2);
+                } else {
+                    try cache.drop(vm, 1);
+                    (try cache.top(vm)).* = v;
+                }
             },
-            .set_elem => {
+            .set_elem, .set_elem_pop => {
                 const v = try cache.peek(vm, 0);
                 const idx = try cache.peek(vm, 1);
                 const base = try cache.peek(vm, 2);
@@ -1110,8 +1114,12 @@ pub const Vm = struct {
                     const k = try object.key(rt, idx); // after the value: JS's order for `=`
                     try object.set(rt, base, k, v);
                 }
-                try cache.drop(vm, 2);
-                (try cache.top(vm)).* = v;
+                if (op == .set_elem_pop) {
+                    try cache.drop(vm, 3);
+                } else {
+                    try cache.drop(vm, 2);
+                    (try cache.top(vm)).* = v;
+                }
             },
             .push_this => {
                 try cache.ensurePush(vm);
@@ -1131,6 +1139,30 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
             },
 
+            .add_const, .sub_const, .mul_const, .mod_const => {
+                const k = cache.operand(0);
+                if (k >= p.consts.len) return vm.bug("constant index out of range");
+                const lhs = try cache.peek(vm, 0);
+                const rhs = p.consts[k];
+                const r: Value = if (lhs == .number and rhs == .number) switch (op) {
+                    .add_const => .{ .number = lhs.number + rhs.number },
+                    .sub_const => .{ .number = lhs.number - rhs.number },
+                    .mul_const => .{ .number = lhs.number * rhs.number },
+                    .mod_const => .{ .number = fastRemainder(lhs.number, rhs.number) },
+                    else => unreachable,
+                } else blk: {
+                    cache.syncSp(vm);
+                    const bop: BinaryOp = switch (op) {
+                        .add_const => .add,
+                        .sub_const => .sub,
+                        .mul_const => .mul,
+                        .mod_const => .mod,
+                        else => unreachable,
+                    };
+                    break :blk try ops.binary(rt, bop, lhs, rhs);
+                };
+                vm.stack[cache.sp - 1] = r;
+            },
             .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in, .instanceof => {
                 // M10.2b/M10.2c: fast path when both operands are already `.number` (`f64`),
                 // matching IEEE-754 / JS semantics for NaN, infinities, and -0. All mixed or
@@ -1212,14 +1244,29 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
                 if (truthy == (op == .jump_if_true)) next = try cache.target(vm);
             },
-            .lt_jump_if_false, .le_jump_if_false => {
+            .lt_jump_if_false, .le_jump_if_false, .gt_jump_if_false, .ge_jump_if_false, .strict_eq_jump_if_false, .strict_ne_jump_if_false => {
                 const lhs = try cache.peek(vm, 1);
                 const rhs = try cache.peek(vm, 0);
-                const cond: bool = if (lhs == .number and rhs == .number)
-                    (if (op == .lt_jump_if_false) lhs.number < rhs.number else lhs.number <= rhs.number)
-                else blk: {
+                const cond: bool = if (lhs == .number and rhs == .number) switch (op) {
+                    .lt_jump_if_false => lhs.number < rhs.number,
+                    .le_jump_if_false => lhs.number <= rhs.number,
+                    .gt_jump_if_false => lhs.number > rhs.number,
+                    .ge_jump_if_false => lhs.number >= rhs.number,
+                    .strict_eq_jump_if_false => lhs.number == rhs.number,
+                    .strict_ne_jump_if_false => lhs.number != rhs.number,
+                    else => unreachable,
+                } else blk: {
                     cache.syncSp(vm);
-                    const bv = try ops.binary(rt, if (op == .lt_jump_if_false) .lt else .le, lhs, rhs);
+                    const bop: BinaryOp = switch (op) {
+                        .lt_jump_if_false => .lt,
+                        .le_jump_if_false => .le,
+                        .gt_jump_if_false => .gt,
+                        .ge_jump_if_false => .ge,
+                        .strict_eq_jump_if_false => .strict_eq,
+                        .strict_ne_jump_if_false => .strict_ne,
+                        else => unreachable,
+                    };
+                    const bv = try ops.binary(rt, bop, lhs, rhs);
                     break :blk ops.toBoolean(bv);
                 };
                 cache.sp -= 2;
@@ -2098,8 +2145,8 @@ pub const Vm = struct {
         // 2. capacity (may move the stacks: fine, everything is an index)
         if (vm.frames.items.len == vm.frames.capacity) try vm.growFrames();
         const need_locals = @as(usize, vm.locals_len) + callee.slot_count;
-        const need_stack: usize = vm.stackEnd(callee);
-        if (build_options.stack_stress or need_locals > vm.locals.len or need_stack > vm.stack.len) {
+        const stack_end = vm.stackEnd(callee);
+        if (build_options.stack_stress or need_locals > vm.locals.len or @as(usize, stack_end) > vm.stack.len) {
             try vm.reserve(callee);
         }
         // 3. the callee's locals, above locals_len (not live yet, so nothing visible changes)
@@ -2113,7 +2160,7 @@ pub const Vm = struct {
             .stack_base = vm.sp,
             .result_index = base,
             .this = effective_this,
-            .stack_end = vm.stackEnd(callee),
+            .stack_end = stack_end,
             .args_start = args,
             .argc = argc,
             .is_construct = is_construct,
@@ -2571,6 +2618,7 @@ fn binaryOp(op: Op) BinaryOp {
 /// JS dividend-sign remainder and `-0` (`-4 % 2`, `-0 % 5`), falling back to `ops.remainder`
 /// for everything else.
 inline fn fastRemainder(a: f64, b: f64) f64 {
+    if (a > 0 and a < b and b != std.math.inf(f64)) return a;
     const max_safe: f64 = 9007199254740991.0; // 2^53 - 1
     if (-max_safe <= a and a <= max_safe and -max_safe <= b and b <= max_safe and b != 0) {
         const ai: i64 = @intFromFloat(a);

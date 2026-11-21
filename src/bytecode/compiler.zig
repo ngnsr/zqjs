@@ -1433,6 +1433,19 @@ const Compiler = struct {
                 },
                 else => {
                     try c.expr(b.lhs);
+                    if (b.rhs.data == .number) {
+                        const fused: ?Op = switch (b.op) {
+                            .add => .add_const,
+                            .sub => .sub_const,
+                            .mul => .mul_const,
+                            .mod => .mod_const,
+                            else => null,
+                        };
+                        if (fused) |fop| {
+                            try c.emit(fop, &.{try c.number(b.rhs.data.number)});
+                            return;
+                        }
+                    }
                     try c.expr(b.rhs);
                     try c.emit(binaryOp(b.op), &.{});
                 },
@@ -2167,16 +2180,33 @@ const Compiler = struct {
                     }
                 }
             },
-            .assign => |a| if (a.op == .plain and a.target == .ref) {
-                const ref = a.target.ref;
-                if (c.s.res.refs[ref.id] == .local) {
+            .assign => |a| if (a.op == .plain) switch (a.target) {
+                .ref => |ref| if (c.s.res.refs[ref.id] == .local) {
                     const b = c.s.res.refs[ref.id].local;
                     if (!c.binding(b).captured and c.binding(b).kind != .@"const") {
                         try c.expr(a.value);
                         try c.emit(.set_local_pop, &.{ c.slotOf(b), try c.name(ref.name) });
                         return;
                     }
-                }
+                },
+                .member => |m| if (!m.is_private) {
+                    try c.expr(m.object);
+                    switch (m.key) {
+                        .name => |n| {
+                            try c.expr(a.value);
+                            try c.emit(.set_prop_pop, &.{try c.name(n)});
+                            return;
+                        },
+                        .computed => |k| {
+                            try c.expr(k);
+                            try c.expr(a.value);
+                            try c.emit(.set_elem_pop, &.{});
+                            return;
+                        },
+                        .string, .number => unreachable,
+                    }
+                },
+                else => {},
             },
             else => {},
         }
@@ -2185,14 +2215,23 @@ const Compiler = struct {
     }
 
     /// Evaluates condition `e` and emits a forward conditional jump taken when falsy,
-    /// fusing `<` and `<=` into `lt_jump_if_false` / `le_jump_if_false` (M52).
+    /// fusing relational/strict-equality ops into `*_jump_if_false` (M52/M53).
     fn jumpIfFalseExpr(c: *Compiler, e: *const ast.Expr) Error!u32 {
         if (e.data == .binary) {
             const b = e.data.binary;
-            if (b.op == .lt or b.op == .le) {
+            const fused: ?Op = switch (b.op) {
+                .lt => .lt_jump_if_false,
+                .le => .le_jump_if_false,
+                .gt => .gt_jump_if_false,
+                .ge => .ge_jump_if_false,
+                .strict_eq => .strict_eq_jump_if_false,
+                .strict_ne => .strict_ne_jump_if_false,
+                else => null,
+            };
+            if (fused) |fop| {
                 try c.expr(b.lhs);
                 try c.expr(b.rhs);
-                return c.jumpForward(if (b.op == .lt) .lt_jump_if_false else .le_jump_if_false);
+                return c.jumpForward(fop);
             }
         }
         try c.expr(e);

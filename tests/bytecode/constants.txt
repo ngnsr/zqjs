@@ -1,4 +1,4 @@
-slots 0, max_stack 12, code 73 bytes
+slots 0, max_stack 12, code 72 bytes
 constants
   k0  1
   k1  "a"
@@ -21,9 +21,8 @@ code
      40  push_const     k2            ; "\uD800"
      45  push_const     k3            ; "\"\\"
      50  push_const     k4            ; 0.1
-     55  push_const     k5            ; 0.2
-     60  add
-     61  push_const     k6            ; 1e+21
-     66  call           11
-     71  pop
-     72  halt
+     55  add_const      k5            ; 0.2
+     60  push_const     k6            ; 1e+21
+     65  call           11
+     70  pop
+     71  halt

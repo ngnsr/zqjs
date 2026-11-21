@@ -43,7 +43,7 @@ pub fn parseWithOptions(arena: Allocator, source: []const u8, limits: Limits, op
         .arena = arena,
         .limits = limits,
         .tok = undefined,
-        .async_ctx = if (options.allow_top_level_await) .body else .none,
+        .async_ctx = if (options.allow_top_level_await or options.source_kind == .module) .body else .none,
         .source_kind = options.source_kind,
     };
     p.tok = try p.lexer.next();
@@ -1875,7 +1875,7 @@ const Parser = struct {
                     .none => {
                         if (p.in_async_paren) {
                             if (p.async_paren_await_span == null) p.async_paren_await_span = span(t, t);
-                            return p.postfix(try p.calls(try p.primary()));
+                            return p.postfix(try p.calls(try p.callPrimary()));
                         }
                         return p.fail(.{ .unsupported = .syntax }, t);
                     },
@@ -1891,8 +1891,8 @@ const Parser = struct {
                         return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .await = operand }, operand.depth);
                     },
                 }
-            } else return p.postfix(try p.calls(try p.primary())),
-            else => return p.postfix(try p.calls(try p.primary())),
+            } else return p.postfix(try p.calls(try p.callPrimary())),
+            else => return p.postfix(try p.calls(try p.callPrimary())),
         }
     }
 
@@ -1966,6 +1966,27 @@ const Parser = struct {
         var callee = callee_in;
         while (try p.memberStep(callee)) |next| callee = next;
         return callee;
+    }
+
+    fn callPrimary(p: *Parser) Error!*const ast.Expr {
+        if (p.isText(p.tok, "import")) {
+            const next = try p.peek();
+            if (next.tag == .l_paren) {
+                const start = p.tok.start;
+                try p.advance(); // `import`
+                try p.advance(); // `(`
+                if (p.tok.tag == .r_paren) return p.fail(.{ .syntax_error = "import() requires a specifier" }, p.tok);
+                const spec = try p.nestedAssignment();
+                if (p.tok.tag == .comma) {
+                    try p.advance();
+                    if (p.tok.tag != .r_paren) return p.fail(.{ .unsupported = .syntax }, p.tok);
+                }
+                const close = p.tok;
+                try p.expectAfterExpression(.r_paren);
+                return p.node(.{ .start = start, .end = close.end }, .{ .dynamic_import = spec }, spec.depth);
+            }
+        }
+        return p.primary();
     }
 
     /// `callee(args)`, `object.name`, `object[key]`, `callee\`...\``, or an optional chain starting at `?.`.
@@ -2494,7 +2515,17 @@ const Parser = struct {
                     return p.fail(.{ .syntax_error = "unexpected token 'finally'" }, t);
                 if (std.mem.eql(u8, name, "import")) {
                     const next = try p.peek();
-                    if (next.tag == .l_paren or next.tag == .dot) return p.fail(.{ .unsupported = .syntax }, t);
+                    if (next.tag == .dot) {
+                        if (p.source_kind != .module) return p.fail(.{ .syntax_error = "Cannot use 'import.meta' outside a module" }, t);
+                        try p.advance(); // `import`
+                        try p.advance(); // `.`
+                        if (p.tok.tag != .identifier or !std.mem.eql(u8, p.tok.text(p.source()), "meta")) {
+                            return p.fail(.{ .syntax_error = "The only valid meta property for import is 'import.meta'" }, p.tok);
+                        }
+                        const meta_tok = p.tok;
+                        try p.advance();
+                        return p.node(.{ .start = t.start, .end = meta_tok.end }, .import_meta, 0);
+                    }
                     return p.fail(.{ .syntax_error = "Unexpected token 'import'" }, t);
                 }
                 if (std.mem.eql(u8, name, "export")) {
@@ -3087,7 +3118,7 @@ const Parser = struct {
             const base = if (p.tok.tag == .identifier and p.isText(p.tok, "new"))
                 try p.newExpr()
             else
-                try p.members(try p.primary());
+                try p.members(try p.callPrimary());
             super_class = try p.calls(base);
         }
         const has_super = super_class != null;

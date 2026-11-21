@@ -3317,3 +3317,45 @@ test "M43: newArrayBuffer and zero-copy bufferBytes across ArrayBuffer, TypedArr
     // LimitExceeded(heap_bytes) on oversized ArrayBuffer
     try testing.expectError(error.LimitExceeded, rt.newArrayBuffer(1024 * 1024));
 }
+
+test "M48: host virtual loader with dynamic import() and top-level await" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    const rt = try zqjs.Runtime.create(testing.allocator, .{ .output = &out.writer });
+    defer rt.destroy();
+
+    const Loader = struct {
+        fn load(_: ?*anyopaque, _: ?[]const u8, specifier: []const u8) zqjs.ModuleLoadError!zqjs.LoadedModule {
+            if (std.mem.eql(u8, specifier, "./async_dep.js")) {
+                return .{
+                    .canonical_id = "virtual://async_dep.js",
+                    .source =
+                    \\export const val = await Promise.resolve(99);
+                    \\export const url = import.meta.url;
+                    ,
+                };
+            }
+            return error.ModuleNotFound;
+        }
+    };
+    try rt.setModuleLoader(.{ .ctx = null, .load = Loader.load });
+
+    var diag: zqjs.Diagnostic = .{};
+    var failure: zqjs.Failure = .{};
+    const ns = try rt.runModule(
+        "virtual://main.js",
+        \\const dep = await import('./async_dep.js');
+        \\export const result = dep.val + 1;
+        \\print(import.meta.url, dep.url, result);
+    ,
+        &diag,
+        &failure,
+    );
+    defer ns.release();
+
+    try testing.expectEqualStrings("virtual://main.js virtual://async_dep.js 100\n", out.written());
+    const res_h = try rt.getProperty(ns, "result", null);
+    defer res_h.release();
+    try testing.expectEqual(@as(?f64, 100), res_h.number());
+}

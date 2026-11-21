@@ -1047,6 +1047,62 @@ static void test_m43_array_buffer_and_views(void) {
     assert(zqjs_runtime_destroy(rt) == ZQJS_OK);
 }
 
+static zqjs_status m48_virtual_loader(
+    void *ctx,
+    const char *referrer_id,
+    size_t referrer_len,
+    const char *specifier,
+    size_t specifier_len,
+    zqjs_loaded_module *out_module
+) {
+    (void)ctx;
+    (void)referrer_id;
+    (void)referrer_len;
+    if (specifier_len == 12 && memcmp(specifier, "./tla_dep.js", 12) == 0) {
+        static const char src[] =
+            "export const v = await Promise.resolve(77);\n"
+            "export const u = import.meta.url;\n";
+        out_module->canonical_id = "c://tla_dep.js";
+        out_module->canonical_id_len = strlen(out_module->canonical_id);
+        out_module->source = src;
+        out_module->source_len = sizeof(src) - 1;
+        out_module->free_fn = NULL;
+        return ZQJS_OK;
+    }
+    return ZQJS_ERR_MODULE_NOT_FOUND;
+}
+
+static void test_m48_modern_esm(void) {
+    capture_buf cap = {0};
+    zqjs_options opts = zqjs_options_default();
+    opts.output_fn = test_output;
+    opts.output_ctx = &cap;
+
+    zqjs_runtime *rt = NULL;
+    assert(zqjs_runtime_create(&opts, &rt) == ZQJS_OK);
+    assert(zqjs_set_module_loader(rt, m48_virtual_loader, NULL) == ZQJS_OK);
+
+    const char *entry =
+        "const dep = await import('./tla_dep.js');\n"
+        "export const sum = dep.v + 3;\n"
+        "print(import.meta.url, dep.u, sum);\n";
+    zqjs_diagnostic diag;
+    zqjs_failure fail;
+    zqjs_handle ns = ZQJS_HANDLE_NULL;
+    assert(zqjs_eval_module(rt, "c://entry.js", 12, entry, strlen(entry), &diag, &fail, &ns) == ZQJS_OK);
+    assert(strcmp(cap.data, "c://entry.js c://tla_dep.js 80\n") == 0);
+
+    zqjs_handle sum_h = ZQJS_HANDLE_NULL;
+    assert(zqjs_handle_get_property(rt, ns, "sum", 3, &fail, &sum_h) == ZQJS_OK);
+    double sum_num = 0;
+    assert(zqjs_handle_number(rt, sum_h, &sum_num) == ZQJS_OK);
+    assert(sum_num == 80.0);
+
+    assert(zqjs_handle_release(rt, sum_h) == ZQJS_OK);
+    assert(zqjs_handle_release(rt, ns) == ZQJS_OK);
+    assert(zqjs_runtime_destroy(rt) == ZQJS_OK);
+}
+
 int main(void) {
     capture_buf cap = { .len = 0, .reenter_rt = NULL, .reenter_status = ZQJS_OK };
     cap.data[0] = '\0';
@@ -1107,6 +1163,7 @@ int main(void) {
     test_m29_host_promises_60_frames_and_d60_native_stack();
     test_m42_es_modules();
     test_m43_array_buffer_and_views();
+    test_m48_modern_esm();
 
     return 0;
 }

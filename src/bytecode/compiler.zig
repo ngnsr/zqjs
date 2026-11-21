@@ -1373,6 +1373,11 @@ const Compiler = struct {
                 try c.expr(pi.rhs);
                 try c.emit(.in_private, &.{try c.name(pi.name)});
             },
+            .import_meta => try c.emit(.get_import_meta, &.{}),
+            .dynamic_import => |spec| {
+                try c.expr(spec);
+                try c.emit(.dynamic_import, &.{});
+            },
             .await => |inner| {
                 try c.expr(inner);
                 try c.emit(.await, &.{});

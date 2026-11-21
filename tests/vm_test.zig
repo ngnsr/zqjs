@@ -1744,3 +1744,30 @@ test "M58: Shapes (inline/overflow/dict transitions, delete, freeze, and ADD-IC 
         out.buffered(),
     );
 }
+
+test "M59: fast i32 formatNumber, string+number concat, and str/arr .length fast path" {
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\const vals = [0, -0, 1, -1, 42, -999, 2147483647, -2147483648, 2147483648, -2147483649, 1.5, NaN, Infinity, -Infinity];
+        \\let out = '';
+        \\for (let i = 0; i < vals.length; i++) {
+        \\  if (i > 0) out = out + ',';
+        \\  out = out + vals[i];
+        \\}
+        \\print(out);
+        \\const s = 'x' + 123 + ':' + (-45);
+        \\const p = 7 + 'y';
+        \\print(s, s.length, p, p.length, vals.length);
+    ;
+    const prog = try rt.compile("m59_strings.js", src, null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+    try testing.expectEqualStrings(
+        "0,0,1,-1,42,-999,2147483647,-2147483648,2147483648,-2147483649,1.5,NaN,Infinity,-Infinity\nx123:-45 8 7y 2 14\n",
+        out.buffered(),
+    );
+}

@@ -2652,9 +2652,20 @@ inline fn isLengthAtom(atom: *const heap.String) bool {
 }
 
 fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) ?Value {
-    if (!base.isObject()) return null;
+    if (!base.isObject()) {
+        if (base.isString() and isLengthAtom(atom)) {
+            const s = base.asString();
+            s.obj.checkLive();
+            return Value.fromNumber(@floatFromInt(s.units.len));
+        }
+        return null;
+    }
     const o = base.asObject();
     const is_array = o.kind == .array;
+    if (is_array and isLengthAtom(atom)) {
+        o.obj.checkLive();
+        return Value.fromNumber(@floatFromInt(o.kind.array.items.len));
+    }
     if (!is_array and (o.kind != .ordinary or o.builtin != null)) return null;
     o.obj.checkLive();
     const ic = propIcSlot(rt, p, pc).*;

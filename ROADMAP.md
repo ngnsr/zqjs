@@ -22,7 +22,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | **done** |
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | **done** |
 | 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
-| 11.1–58 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1–2 VM perf (see milestone log below; D55–D88) | **done** |
+| 11.1–59 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1–2 VM perf (see milestone log below; D55–D89) | **done** |
 | Perf | Remaining Tier 1–2 interpreter optimizations toward QuickJS parity (see `PERF_PLAN.md`) | in progress |
 
 ## Direction after M8.1 (reviewed 2026-11-15)
@@ -522,3 +522,6 @@ runs on both engines unless noted.
 
 **M58 (done — Tier 2 VM Architecture: Shapes / Hidden Classes, Inline Slots & ADD-Transition ICs)**
 - **M58:** Implemented D88 across `heap.zig`, `runtime.zig`, `object.zig`, `builtins.zig`, and `vm.zig`: replaced per-object `AutoArrayHashMapUnmanaged` with hybrid `PropStore` (slab-pooled immutable `Shape` transition trees, 4 inline `Value` slots, overflow `[]Value` up to 64 properties, transactional `.dict` fallback for accessors/attribute changes/non-tail deletes/>64 props, and major-GC `sweepShapes` preserving weak atoms) plus shape-id-keyed read/write/ADD-transition property ICs. Cut `objects.js` CLI time by 25.5% (`1.54× → 1.18×` QuickJS, -52% allocs) and slashed peak heap RAM on `game_1m.js` (`496.8 → 296.6 MB`, -40%), `game_big_container.js` (`395.1 → 194.9 MB`, -51% RAM / -34% exec time), `game_100k.js` (`50.4 → 29.9 MB`, -41%), and C-ABI `frame_loop_3600` (`397 → 141 KiB`, -65% RAM).
+
+**M59 (done — Fast `i32` Formatting, Direct String Concat & `.length` Fast Paths; QuickJS Geomean Parity)**
+- **M59:** Implemented D89 across `ops.zig` and `vm.zig`: added an exact `i32` decimal fast path in `ops.formatNumber`, direct `str + str` / `str + num` / `num + str` concat fast paths in `ops.binary(.add)`, and inline `str.length` / `arr.length` fast paths in `Vm.fastGetProp`. Cut `strings.js` CLI time by 43% (`1.90× → 1.02×` QuickJS; exec `19.0 → 9.3 ms`), sped up all 5 game-loop GC benchmarks by 13–31% (`game_100k` `207 → 143 ms`, `game_1m` `278 → 220 ms`, `game_big_dictionary` `363 → 272 ms`), lowered C-ABI `frame_loop_3600` p50 to `11.0 µs`, and brought ZQJS to **`0.96×` QuickJS geometric mean across all 11 M10 benchmarks**.

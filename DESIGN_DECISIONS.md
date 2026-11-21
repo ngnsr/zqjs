@@ -2154,3 +2154,20 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
 - **Measured Impact (`python3 tools/m10_compare.py`, Apple M4, `ReleaseFast`):**
   - `objects.js` CLI time dropped **-25.5%** (`50.4 → 37.6 ms`, `1.54× → 1.18×` QuickJS), with **-52% allocated bytes** (`76.9 → 36.9 MB`) and **-52% minor GCs** (`293 → 140`).
   - Game-loop GC benchmarks dropped **35–51% in peak heap RAM** and **12–34% in execution time**: `game_1m.js` `496.8 → 296.6 MB` (-200 MB, -19% total time), `game_big_container.js` `395.1 → 194.9 MB` (-51% RAM, -34% exec time), `game_100k.js` `50.4 → 29.9 MB` (-41% RAM); C-ABI `frame_loop_3600` heap dropped `397 → 141 KiB` (-65% RAM, minor GCs `39 → 19`).
+
+---
+
+## D89. Fast `i32` Number Formatting, Direct String Concatenation, and `.length` Fast Paths *(M59)*
+
+**Decision:** Add an exact `i32` decimal fast path to `ops.formatNumber`, a direct `str + str` / `str + num` / `num + str` fast path to `ops.binary(.add)`, and inline `str.length` / `arr.length` fast paths to `Vm.fastGetProp`, bringing ZQJS to QuickJS parity across all 11 M10 benchmarks (geomean `0.96×` QuickJS).
+
+- **Fast `i32` Decimal Formatting (`src/runtime/ops.zig`):**
+  - In `formatNumber`, exact integer `f64` values in `[-2^31, 2^31 - 1]` are formatted directly into the caller's stack `NumberBuf` with a reverse base-10 integer loop, bypassing scientific-notation `{e}` formatting, `parseInt`, and `std.Io.Writer` while producing bit-for-bit identical ECMAScript `Number::toString` output (preserving `-0 → "0"`, `NaN`, `±Infinity`, and out-of-range / fractional floats).
+- **Direct String Concatenation (`src/runtime/ops.zig`):**
+  - `ops.binary(.add)` fast-paths `str + str`, `str + num`, and `num + str` directly into `Heap.newString` pieces before setting up `ValueRoots` or object-coercion switches.
+- **Inline `.length` Fast Paths (`src/vm/vm.zig`):**
+  - `fastGetProp` handles `base.isString() and isLengthAtom(atom)` and `o.kind == .array and isLengthAtom(atom)` inline without falling through to `object.get`.
+- **Measured Impact (`python3 tools/m10_compare.py`, Apple M4, `ReleaseFast`):**
+  - `strings.js` CLI time dropped **-43%** (`21.6 → 12.4 ms`, `1.90× → 1.02×` QuickJS; exec `19.0 → 9.3 ms`).
+  - All 5 game-loop GC benchmarks sped up by **13–31%** (`game_100k.js` `207 → 143 ms`, `game_big_dictionary.js` `363 → 272 ms`, `game_growing.js` `284 → 208 ms`, `game_1m.js` `278 → 220 ms`, `game_big_container.js` `156 → 136 ms`), and C-ABI `frame_loop_3600` p50 frame time dropped to **`11.0 µs`**.
+  - All 11 M10 CLI benchmarks now span `0.50×–1.27×` QuickJS (**geometric mean `0.96×` QuickJS**).

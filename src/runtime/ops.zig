@@ -132,6 +132,27 @@ pub fn formatNumber(buf: *NumberBuf, x: f64) []const u8 {
     if (x == 0) return "0"; // both +0 and -0
     if (std.math.isInf(x)) return if (x > 0) "Infinity" else "-Infinity";
 
+    // Fast path for exact i32 integers (avoids scientific-notation formatting + parsing).
+    if (x >= -2147483648.0 and x <= 2147483647.0) {
+        const iv: i32 = @intFromFloat(x);
+        if (@as(f64, @floatFromInt(iv)) == x) {
+            var pos: usize = buf.len;
+            var u: u32 = if (iv < 0) @intCast(-@as(i64, iv)) else @intCast(iv);
+            while (u >= 10) {
+                pos -= 1;
+                buf[pos] = @intCast('0' + (u % 10));
+                u /= 10;
+            }
+            pos -= 1;
+            buf[pos] = @intCast('0' + u);
+            if (iv < 0) {
+                pos -= 1;
+                buf[pos] = '-';
+            }
+            return buf[pos..];
+        }
+    }
+
     var sci_buf: [32]u8 = undefined;
     const sci = std.fmt.bufPrint(&sci_buf, "{e}", .{@abs(x)}) catch unreachable;
     const e_at = std.mem.indexOfScalar(u8, sci, 'e').?;
@@ -322,6 +343,21 @@ pub fn strictEquals(a: Value, b: Value) bool {
 /// All binary operators except `&&`/`||` (which short-circuit, so they are control
 /// flow in the evaluator). Both operands have already been evaluated, left first.
 pub fn binary(rt: *Runtime, op: ast.BinaryOp, a_in: Value, b_in: Value) Error!Value {
+    // Fast path for string concatenation without object coercion (`str + str`, `str + num`, `num + str`).
+    if (op == .add) {
+        if (a_in.isString()) {
+            if (b_in.isString()) {
+                return Value.fromString(try rt.heap.newString(&.{ .{ .utf16 = a_in.asString().units }, .{ .utf16 = b_in.asString().units } }));
+            }
+            if (b_in.isNumber()) {
+                var num_buf: NumberBuf = undefined;
+                return Value.fromString(try rt.heap.newString(&.{ .{ .utf16 = a_in.asString().units }, .{ .ascii = formatNumber(&num_buf, b_in.asNumber()) } }));
+            }
+        } else if (b_in.isString() and a_in.isNumber()) {
+            var num_buf: NumberBuf = undefined;
+            return Value.fromString(try rt.heap.newString(&.{ .{ .ascii = formatNumber(&num_buf, a_in.asNumber()) }, .{ .utf16 = b_in.asString().units } }));
+        }
+    }
     var roots_buf = [_]Value{ a_in, b_in };
     var roots = rt_mod.ValueRoots{ .values = &roots_buf };
     const may_call = a_in.isObjectLike() or b_in.isObjectLike();

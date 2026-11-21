@@ -132,9 +132,9 @@ pub const LineEditor = struct {
         raw.cc[@backingInt(posix.V.MIN)] = 1;
         raw.cc[@backingInt(posix.V.TIME)] = 0;
 
-        try posix.tcsetattr(fd, .FLUSH, raw);
+        try posix.tcsetattr(fd, .NOW, raw);
         defer {
-            posix.tcsetattr(fd, .FLUSH, orig) catch {};
+            posix.tcsetattr(fd, .NOW, orig) catch {};
             saved_termios_fd = null;
         }
 

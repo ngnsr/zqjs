@@ -10,6 +10,7 @@ comptime {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Strip debug info and symbol table (default: true for ReleaseSmall)") orelse (optimize == .small);
 
     // Two modules (M9.0, D46). `zqjs_internal` is everything (src/root.zig): tests, tools and
     // the CLI's debug modes import it, and it is never exported. `zqjs` (src/api.zig) is the
@@ -47,6 +48,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             .imports = imports,
         }),
     });
@@ -59,6 +61,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/c_api.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .imports = imports,
     });
     const libzqjs = b.addLibrary(.{

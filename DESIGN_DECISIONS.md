@@ -2003,3 +2003,20 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
 - **Built-ins, Inspector & Registry (`builtins.zig`, `object.zig`, `inspect.zig`, `gen_builtins.js`):**
   - Exposes `Date` constructor (`new Date()`, `new Date(v)`, `new Date(y, m, ...)`, and `Date(...)` without `new`), `Date.{now, UTC, parse}`, and `Date.prototype` getters/setters, `toISOString`, `toUTCString`, `toString`, `toDateString`, `toTimeString`, `toJSON`, and `[Symbol.toPrimitive]` (via `object.ordinaryToPrimitive`), throwing `TypeError` on non-`Date` receivers (except generic `toJSON` and `[Symbol.toPrimitive]`).
   - `src/repl/inspect.zig` formats valid `Date` instances as ISO-8601 strings and invalid ones as `Invalid Date`; `tools/gen_builtins.js` registers `date_constructor` and `date_prototype`.
+
+---
+
+## D81. `structuredClone(value, options?)` and `ArrayBuffer` Transfer/Detachment (M51)
+
+**Decision:** Implement `structuredClone(value, options?)` with zero-copy `ArrayBuffer` transfer and detachment semantics across both engines (`Vm` and tree-walking `Machine`), `Heap`, `api.zig`, and `c_api.zig`.
+
+- **Cycle-Safe Cloning & GC Rooting (`src/runtime/clone.zig`, `src/runtime/builtins.zig`):**
+  - Installs `structuredClone` (length 1) as a global function.
+  - `CloneContext` maintains `visited: AutoHashMapUnmanaged(*Object, *Object)` (allocated with `rt.gpa`, freed on `defer`), `transfer_set`, `in_flight`, and `pending_keys`, registering a custom `EngineRoots` callback so every in-flight value, visited mapping, pending property key atom, and transfer buffer stays rooted across GC — even when user getters allocate heavily under `-Dgc-stress`.
+  - Enforces `Limits.max_nesting_depth` and `Limits.max_heap_bytes`.
+  - Supports primitives (preserving `-0`, `NaN`, `BigInt`), plain objects (own enumerable string keys with getters evaluated to data properties, symbol keys skipped, prototype reset to `Object.prototype`), dense `Array`s (plus own enumerable non-index string properties), `Date`, `RegExp` (with `lastIndex` reset to `0`), `Map`/`Set` (self-referential), `ArrayBuffer`, all 11 `TypedArray`s and `DataView` (preserving shared `ArrayBuffer` identity across views), and `Error` instances (`o.is_error`, preserving built-in error prototype, `name`, `message`, deep-cloned `cause`, and `errors` for `AggregateError`).
+  - Non-cloneable values (`Symbol`, functions, `Proxy`, `WeakMap`, `WeakSet`, `Generator`, `Promise`, `module_namespace`, detached `ArrayBuffer`) throw `DataCloneError` (an `Error` instance with `name = "DataCloneError"`).
+- **Zero-Copy `ArrayBuffer` Transfer & Detached Semantics (`src/runtime/heap.zig`, `src/runtime/builtins.zig`, `src/api.zig`, `src/c_api.zig`):**
+  - `options.transfer` is consumed via `getIterator` (`[Symbol.iterator]`), validating every entry is a non-detached `ArrayBuffer` with no duplicates (closing the iterator and throwing `DataCloneError` on error).
+  - Cloning completes before any buffer in `transfer` is detached, so errors during cloning never prematurely detach buffers. On success, backing `[]u8` slices move zero-copy into cloned `ArrayBuffer`s and originals are detached via `Heap.detachArrayBuffer` (`detached = true, data = &.{}`), preserving exact `Heap` byte accounting.
+  - `TypedArray.prototype.subarray` checks `requireLiveTypedArray` (throwing `TypeError` on detached buffers matching Node). `api.zig` `bufferBytes` / `c_api.zig` `zqjs_handle_buffer_data` return an empty slice / `0` bytes (never a dangling pointer) on detached buffers.

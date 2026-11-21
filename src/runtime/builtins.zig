@@ -26,6 +26,7 @@ const heap_mod = @import("heap.zig");
 const Object = heap_mod.Object;
 const rt_mod = @import("runtime.zig");
 const coroutine = @import("coroutine.zig");
+const clone = @import("clone.zig");
 const Runtime = rt_mod.Runtime;
 const Error = rt_mod.Error;
 const ops = @import("ops.zig");
@@ -823,6 +824,11 @@ pub const regexp_global: Native = .{ .name = "RegExp", .call = regexpCall, .cons
 pub const date_global: Native = .{ .name = "Date", .length = 7, .call = dateCall, .construct = dateConstruct, .namespace = .date };
 pub const symbol_global: Native = .{ .name = "Symbol", .call = symbolCall, .namespace = .symbol };
 pub const bigint_global: Native = .{ .name = "BigInt", .length = 1, .call = bigintCall, .namespace = .bigint };
+pub const structured_clone_global: Native = .{ .name = "structuredClone", .length = 1, .call = structuredCloneCall };
+
+fn structuredCloneCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return clone.structuredCloneImpl(rt, args);
+}
 
 /// A global read: implemented, host-registered (M9.1, D53), known to node (Unsupported),
 /// or a ReferenceError.
@@ -888,6 +894,7 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (std.mem.eql(u8, name, "BigUint64Array")) return .{ .native = &typed_array_ctors[10] };
     if (std.mem.eql(u8, name, "Math")) return .{ .object = (try realm(rt)).math };
     if (std.mem.eql(u8, name, "JSON")) return .{ .object = (try realm(rt)).json };
+    if (std.mem.eql(u8, name, "structuredClone")) return .{ .native = &structured_clone_global };
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return .{ .native = n };
     if (names.has(.global, name)) {
         rt.unsupported_name = try rt.heap.internAscii(name);
@@ -899,7 +906,7 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
 /// Whether `name` is already a built-in or node-known global name (D53: duplicate
 /// registration is rejected, including built-in names).
 pub fn isBuiltinGlobal(name: []const u8) bool {
-    return std.mem.eql(u8, name, "print") or names.has(.global, name);
+    return std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "structuredClone") or names.has(.global, name);
 }
 
 fn notCallable(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -2163,7 +2170,7 @@ fn thisString(rt: *Runtime, this: Value, name: []const u8) Error!*const heap_mod
     };
 }
 
-fn toStringObj(rt: *Runtime, v: Value) Error!*const heap_mod.String {
+pub fn toStringObj(rt: *Runtime, v: Value) Error!*const heap_mod.String {
     if (v == .string) return v.string;
     var buf: ops.NumberBuf = undefined;
     const piece = try ops.toPiece(rt, v, &buf);
@@ -8675,7 +8682,7 @@ fn taSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn taSubarray(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const o = try requireTypedArray(rt, this);
+    const o = try requireLiveTypedArray(rt, this);
     const ta = o.kind.typed_array;
     var root_buf = [_]Value{this};
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };

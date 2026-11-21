@@ -17,6 +17,7 @@ const testing = std.testing;
 const scanned = [_][]const u8{
     "src/runtime/object.zig",
     "src/runtime/builtins.zig",
+    "src/runtime/clone.zig",
     "src/runtime/ops.zig",
     "src/vm/vm.zig",
     "src/interp/machine.zig",
@@ -2680,4 +2681,70 @@ test "M48: forced GC across TLA suspension, dynamic import(), and import.meta (b
         _ = try zqjs.module.runEntry(&rt, "main.js", main_src, engine, &mod_diag);
         try testing.expectEqualStrings("42 ok true true\n", out_buf.written());
     }
+}
+
+test "M51: forced GC during structuredClone with cyclic graph and allocating getters (both engines)" {
+    const src =
+        \\const root = { tag: "top" };
+        \\root.self = root;
+        \\Object.defineProperty(root, "heavy", {
+        \\  enumerable: true,
+        \\  get() {
+        \\    let acc = 0;
+        \\    for (let i = 0; i < 100; i++) {
+        \\      const tmp = { i, arr: [i, i + 1, { s: "x" + i }] };
+        \\      acc += tmp.arr[0];
+        \\    }
+        \\    return { acc, back: root };
+        \\  },
+        \\});
+        \\const m = new Map();
+        \\m.set("self", m);
+        \\m.set("root", root);
+        \\const c = structuredClone({ root, m, d: new Date(1), rx: /a/g, err: new TypeError("x"), ta: new Uint8Array([1]) });
+        \\print(
+        \\  structuredClone.length === 1,
+        \\  Object.getPrototypeOf(c.root) === Object.prototype,
+        \\  c.d instanceof Date,
+        \\  c.rx instanceof RegExp,
+        \\  c.err instanceof TypeError && c.err instanceof Error,
+        \\  c.ta instanceof Uint8Array,
+        \\  c.root.self === c.root && c.root.heavy.back === c.root && c.root.heavy.acc > 0 && c.m.get("self") === c.m && c.m.get("root") === c.root
+        \\);
+    ;
+    const opts: zqjs.Limits = .{ .max_heap_bytes = 512 << 10 };
+    const vm_res = try runVm(src, opts, true);
+    defer testing.allocator.free(vm_res.out);
+    try testing.expectEqual(@as(?anyerror, null), vm_res.err);
+    try testing.expect(vm_res.collections > 0);
+    try testing.expectEqualStrings("true true true true true true true\n", vm_res.out);
+
+    const tw_out = try runCollecting(src, .treewalk, opts);
+    defer testing.allocator.free(tw_out);
+    try testing.expectEqualStrings("true true true true true true true\n", tw_out);
+}
+
+test "M51: ArrayBuffer transfer under forced GC preserves exact heap accounting (both engines)" {
+    const src =
+        \\let total = 0;
+        \\for (let i = 0; i < 20; i++) {
+        \\  const ab = new ArrayBuffer(1024);
+        \\  const v = new Uint8Array(ab);
+        \\  v[0] = i + 1;
+        \\  const cloned = structuredClone({ ab, v }, { transfer: [ab] });
+        \\  if (ab.byteLength !== 0 || v.length !== 0) throw new Error("not detached");
+        \\  total += cloned.v[0];
+        \\}
+        \\print(total);
+    ;
+    const opts: zqjs.Limits = .{ .max_heap_bytes = 512 << 10 };
+    const vm_res = try runVm(src, opts, true);
+    defer testing.allocator.free(vm_res.out);
+    try testing.expectEqual(@as(?anyerror, null), vm_res.err);
+    try testing.expect(vm_res.collections > 0);
+    try testing.expectEqualStrings("210\n", vm_res.out);
+
+    const tw_out = try runCollecting(src, .treewalk, opts);
+    defer testing.allocator.free(tw_out);
+    try testing.expectEqualStrings("210\n", tw_out);
 }

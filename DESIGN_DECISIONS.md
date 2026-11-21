@@ -2130,3 +2130,27 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
   - Inside `fastRemainder`'s exact safe-integer path, replaces `@rem(ai, bi)` (`sdiv`/`msub`) with `ai & (bi - 1)` when `ai >= 0`, `bi > 0`, and `(bi & (bi - 1)) == 0`, preserving `-0` via `std.math.signbit(a)`.
 - **Measured Impact (`python3 tools/m10_compare.py`, Apple M4, `ReleaseFast`):**
   - Surpassed QuickJS end-to-end (CLI-to-CLI) on **4 benchmarks**: `closures.js` **`0.49×`** (over 2× faster than QuickJS), `branch_dense.js` **`0.69×`** (-37% vs M56), `int_loop.js` **`0.87×`** (-25% vs M56), and `arrays.js` **`0.94×`** (-18% vs M56); with `scopes.js` (`1.05×`), `float_math.js` (`1.07×`), `fib.js` (`1.15×`), and `global_reads.js` (`1.15×`) within 5–15% of QuickJS.
+
+---
+
+## D88. Tier 2 VM Architecture: Shapes (Hidden Classes), Inline Slots, and Shape-Transition Property ICs *(M58)*
+
+**Decision:** Replace per-object `AutoArrayHashMapUnmanaged` property tables with a hybrid `PropStore` (`shaped | dict`) backed by immutable `Shape` transition trees, 4 inline `Value` slots inside `Object`, dense overflow `[]Value` slots up to `MAX_SHAPE_PROPS = 64`, and shape-id-keyed monomorphic property ICs (including inline ADD-transition ICs).
+
+- **`Shape` & Slab Pool (`src/runtime/heap.zig`):**
+  - Each `Shape` records `(id: u32, slot: u16, count: u16, attrs: PropAttrs, parent: ?*Shape, key: PropKey)` plus an inline `first_transition: ?*Shape` (zero heap allocation for linear shape chains) and overflow `extra_transitions: ArrayList(*Shape)` for branching shapes.
+  - Allocated from a 64-shape slab pool (`Heap.shape_slabs` + O(1) `free_shapes` freelist) on `Heap.gpa` (outside per-object `Heap.bytes` accounting, like `Closure.captures`).
+  - **GC & weak-atom safety:** `drainGray` marks the live `Shape` ancestor chain during major GC; `sweepShapes` runs before weak-atom rebuilding in `collect(major)`, unlinking dead shapes from live parents and returning them to `free_shapes` so dead shapes never pin dead atoms or symbols.
+- **Hybrid `PropStore` (`src/runtime/heap.zig`, `object.zig`, `builtins.zig`):**
+  - Every `Object` starts in `.shaped` mode (`shape = null`, 4 inline `Value` slots = zero property-table allocation for objects with 0–4 data properties; overflow `extra: []Value` allocated via `h.allocator()` for 5..64 properties).
+  - `MAX_SHAPE_PROPS = 64` keeps all built-in prototypes (`Array.prototype`, `String.prototype`, `Object.prototype`) in fast Shape mode.
+  - Accessors (`is_accessor`), attribute mutations, non-tail `delete` (tail delete pops back to `parent` in O(1)), `Object.seal`/`Object.freeze`, and objects exceeding 64 properties transition transactionally via `Heap.toDictionary(o)` into `.dict` (`AutoArrayHashMapUnmanaged`), preserving all `prop_cards` (`card_elements = 512`) and `gc-mutants` invariants unchanged.
+- **Shape-Keyed Property & ADD-Transition ICs (`src/runtime/runtime.zig`, `src/vm/vm.zig`):**
+  - `Runtime.prop_ic: [128]PropIc` caches `(shape_id, proto_shape_id, grandproto_shape_id, atom_addr, slot, kind)` with zero GC pointers:
+    - `kind 1`: own shaped read (`shape_id` match → direct `getShapedSlot(slot)`).
+    - `kind 2`: 1-hop prototype shaped read (receiver `shape_id` + proto `proto_shape_id` → direct `proto.getShapedSlot(slot)` with zero own-key scan).
+    - `kind 3`: own shaped writable write (`shape_id` match → `Heap.storeShapedSlot`).
+    - `kind 4`: own shaped inline ADD transition (`shape_id` + up to 2 ordinary shaped prototype hops verified → `parent.findTransition(atom, .default)` → direct inline slot write + shape update + write barriers).
+- **Measured Impact (`python3 tools/m10_compare.py`, Apple M4, `ReleaseFast`):**
+  - `objects.js` CLI time dropped **-25.5%** (`50.4 → 37.6 ms`, `1.54× → 1.18×` QuickJS), with **-52% allocated bytes** (`76.9 → 36.9 MB`) and **-52% minor GCs** (`293 → 140`).
+  - Game-loop GC benchmarks dropped **35–51% in peak heap RAM** and **12–34% in execution time**: `game_1m.js` `496.8 → 296.6 MB` (-200 MB, -19% total time), `game_big_container.js` `395.1 → 194.9 MB` (-51% RAM, -34% exec time), `game_100k.js` `50.4 → 29.9 MB` (-41% RAM); C-ABI `frame_loop_3600` heap dropped `397 → 141 KiB` (-65% RAM, minor GCs `39 → 19`).

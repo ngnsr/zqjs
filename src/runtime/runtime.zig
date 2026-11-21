@@ -179,6 +179,18 @@ pub const ExecContext = struct {
     }
 };
 
+pub const PropIc = struct {
+    shape_id: u32 = heap_mod.DICT_SHAPE_ID,
+    proto_shape_id: u32 = 0,
+    /// For `kind == 4` (shaped ADD transition): expected shape id of `o.proto.proto` (e.g. `Object.prototype`).
+    grandproto_shape_id: u32 = 0,
+    atom_addr: usize = 0,
+    slot: u16 = 0,
+    /// 0 = empty, 1 = own shaped read, 2 = 1-hop proto shaped read,
+    /// 3 = own shaped writable write, 4 = own shaped inline ADD transition.
+    kind: u8 = 0,
+};
+
 pub const Runtime = struct {
     gpa: Allocator,
     heap: Heap,
@@ -222,9 +234,9 @@ pub const Runtime = struct {
     host_message_truncated: bool = false,
     /// The built-in objects, created on first use (builtins.zig).
     realm: ?@import("builtins.zig").Realm = null,
-    /// Direct-mapped monomorphic property inline cache (M52, D82): stores only
-    /// `(is_proto << 31) | prop_index` (no GC pointers; verified by atom pointer equality).
-    prop_ic: [128]u32 = @splat(0),
+    /// Direct-mapped monomorphic property inline cache (M52/M58, D82/D88): stores shape ids,
+    /// atom address (never dereferenced), slot index, and hit kind (zero GC pointers).
+    prop_ic: [128]PropIc = @splat(.{}),
     /// Arrays being converted to strings right now (cycle detection, object.join).
     joining: std.ArrayList(*heap_mod.Object) = .empty,
     /// The running engine's roots (its stacks and frames), marked by `collect` (D8).

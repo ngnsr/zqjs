@@ -1699,3 +1699,48 @@ test "M57: *_local_const_jif superinstructions (numbers, NaN, -0, BigInt, string
         out.buffered(),
     );
 }
+
+test "M58: Shapes (inline/overflow/dict transitions, delete, freeze, and ADD-IC prototype invalidation)" {
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\// 1. Shape inline slots (0..3), overflow slots (4..63), and dictionary fallback (>64)
+        \\const big = {};
+        \\for (let i = 0; i < 70; i++) big['k' + i] = i;
+        \\print(big.k0, big.k3, big.k4, big.k63, big.k69, Object.keys(big).length);
+        \\
+        \\// 2. Tail delete (stays shaped) and non-tail delete (transitions to dict), preserving order
+        \\const d = { a: 1, b: 2, c: 3 };
+        \\delete d.c;
+        \\d.d = 4;
+        \\delete d.a;
+        \\print(Object.keys(d).join(','), d.b, d.d);
+        \\
+        \\// 3. ADD-transition IC must respect setter / non-writable added to prototype later
+        \\const proto = {};
+        \\let setterHits = 0;
+        \\function make(v) { const o = Object.create(proto); o.x = v; return o; }
+        \\const a1 = make(10);
+        \\const a2 = make(20);
+        \\Object.defineProperty(proto, 'x', { set(v) { setterHits += v; }, configurable: true });
+        \\const a3 = make(5);
+        \\print(a1.x, a2.x, setterHits, Object.hasOwn(a3, 'x'));
+        \\
+        \\// 4. Object.freeze / seal on shaped objects
+        \\const f = { p: 1, q: 2 };
+        \\Object.freeze(f);
+        \\f.p = 99;
+        \\f.r = 3;
+        \\print(Object.isFrozen(f), Object.isSealed(f), f.p, f.r);
+    ;
+    const prog = try rt.compile("m58_shapes.js", src, null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+    try testing.expectEqualStrings(
+        "0 3 4 63 69 70\nb,d 2 4\n10 20 5 false\ntrue true 1 undefined\n",
+        out.buffered(),
+    );
+}

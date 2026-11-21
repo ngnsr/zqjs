@@ -22,7 +22,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | **done** |
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | **done** |
 | 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
-| 11.1–57 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1 VM perf (see milestone log below; D55–D87) | **done** |
+| 11.1–58 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1–2 VM perf (see milestone log below; D55–D88) | **done** |
 | Perf | Remaining Tier 1–2 interpreter optimizations toward QuickJS parity (see `PERF_PLAN.md`) | in progress |
 
 ## Direction after M8.1 (reviewed 2026-11-15)
@@ -519,3 +519,6 @@ runs on both engines unless noted.
 
 **M57 (done — Tier 1 VM Performance Part 5: Local-Constant Branch Fusion & Power-of-2 Remainder)**
 - **M57:** Implemented D87 across `bytecode.zig`, `compiler.zig`, `verify.zig`, `disasm.zig`, and `vm.zig`: added 4 zero-stack-traffic comparison-jump superinstructions (`lt_local_const_jif`, `le_local_const_jif`, `strict_eq_local_const_jif`, `strict_ne_local_const_jif`) emitted when `Compiler.init_slots` guarantees initialization, plus a power-of-2 bitmask fast path in `fastRemainder`. Surpassed QuickJS end-to-end (CLI-to-CLI) on 4 benchmarks: `closures.js` **`0.49×`** (over 2× faster than QJS), `branch_dense.js` **`0.69×`** (-37%), `int_loop.js` **`0.87×`** (-25%), and `arrays.js` **`0.94×`** (-18%), with `scopes.js` (`1.05×`), `float_math.js` (`1.07×`), `fib.js` (`1.15×`), and `global_reads.js` (`1.15×`) right at parity.
+
+**M58 (done — Tier 2 VM Architecture: Shapes / Hidden Classes, Inline Slots & ADD-Transition ICs)**
+- **M58:** Implemented D88 across `heap.zig`, `runtime.zig`, `object.zig`, `builtins.zig`, and `vm.zig`: replaced per-object `AutoArrayHashMapUnmanaged` with hybrid `PropStore` (slab-pooled immutable `Shape` transition trees, 4 inline `Value` slots, overflow `[]Value` up to 64 properties, transactional `.dict` fallback for accessors/attribute changes/non-tail deletes/>64 props, and major-GC `sweepShapes` preserving weak atoms) plus shape-id-keyed read/write/ADD-transition property ICs. Cut `objects.js` CLI time by 25.5% (`1.54× → 1.18×` QuickJS, -52% allocs) and slashed peak heap RAM on `game_1m.js` (`496.8 → 296.6 MB`, -40%), `game_big_container.js` (`395.1 → 194.9 MB`, -51% RAM / -34% exec time), `game_100k.js` (`50.4 → 29.9 MB`, -41%), and C-ABI `frame_loop_3600` (`397 → 141 KiB`, -65% RAM).

@@ -12,23 +12,23 @@ At the M10 checkpoint (`05c0c7a`, see `ROADMAP.md` and `bench/m10/baseline-qjs.m
 - **Objects, fib, loops, arrays, calls:** `1.66×–2.33×` QuickJS
 - **C-ABI throughput:** `~6.59M calls/s` (`js_to_c_native`), `~4.87M trips/s` (`host_js_c_js_roundtrip`), `18.0 µs` p50 per frame on `frame_loop_3600`
 
-### M52–M57 Checkpoints (D82–D87 — Property IC, Superinstructions, 8-Byte NaN-Boxed `Value`/`Slot`, Back-Edge Safepoints, Fast Calls & Local-Const Branch Fusion)
+### M52–M58 Checkpoints (D82–D88 — Tier 1 Superinstructions + 8-Byte NaN-Boxed `Value`/`Slot` + Tier 2 Shapes & Inline Slots)
 
-After M52–M57 (measured via `python3 tools/m10_compare.py`, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`), ZQJS **surpassed QuickJS end-to-end on 4 benchmarks** (including over 2× faster on closures and 31% faster on dense branching) and is within 5–15% on 4 more:
+After M52–M58 (measured via `python3 tools/m10_compare.py`, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`), ZQJS beats QuickJS on 4 benchmarks, sits within 4–28% on 6 more (10/11 between `0.50×` and `1.28×` QuickJS), and cut game-loop GC peak heap RAM by **40–65%**:
 
-| Benchmark | Pre-M52 (`zqjs/qjs`) | M56 (`zqjs/qjs`) | **M57 (`zqjs/qjs`)** | ZQJS CLI med |
+| Benchmark | Pre-M52 (`zqjs/qjs`) | M57 (`zqjs/qjs`) | **M58 (`zqjs/qjs`)** | ZQJS CLI med |
 |---|---:|---:|---:|---:|
-| `closures.js` | `0.77×` (95.2 ms) | `0.53×` (66.4 ms) | **`0.49×`** | **61.6 ms** (51% faster than QJS) |
-| `branch_dense.js` | `1.91×` (200.8 ms) | `1.07×` (112.6 ms) | **`0.69×`** | **71.1 ms** (31% faster than QJS, -65%) |
-| `int_loop.js` | `2.07×` (141.9 ms) | `1.17×` (80.6 ms) | **`0.87×`** | **60.8 ms** (13% faster than QJS, -57%) |
-| `arrays.js` | `2.42×` (400.0 ms) | `1.13×` (188.7 ms) | **`0.94×`** | **154.6 ms** (6% faster than QJS, -61%) |
-| `scopes.js` | `2.38×` (84.1 ms) | `1.15×` (41.1 ms) | **`1.05×`** | **37.6 ms** (-55%) |
-| `float_math.js` | `2.14×` (286.7 ms) | `1.10×` (150.4 ms) | **`1.07×`** | **144.4 ms** (-50%) |
-| `fib.js` | `1.90×` (64.3 ms) | `1.26×` (42.2 ms) | **`1.15×`** | **38.6 ms** (-40%) |
-| `global_reads.js` | `2.61×` (64.4 ms) | `1.35×` (33.5 ms) | **`1.15×`** | **29.6 ms** (-54%) |
-| `call_chain.js` | `2.37×` (122.0 ms) | `1.34×` (68.2 ms) | **`1.29×`** | **65.6 ms** (-46%) |
-| `objects.js` | `2.37×` (75.4 ms) | `1.56×` (51.0 ms) | **`1.54×`** | **50.4 ms** (-33%) |
-| `strings.js` | `2.31×` (26.3 ms) | `1.94×` (22.3 ms) | **`1.86×`** | **22.2 ms** (-16%) |
+| `closures.js` | `0.77×` (95.2 ms) | `0.49×` (61.6 ms) | **`0.50×`** | **61.8 ms** (2× faster than QJS) |
+| `branch_dense.js` | `1.91×` (200.8 ms) | `0.69×` (71.1 ms) | **`0.69×`** | **72.6 ms** (31% faster than QJS, -64%) |
+| `int_loop.js` | `2.07×` (141.9 ms) | `0.87×` (60.8 ms) | **`0.87×`** | **60.0 ms** (13% faster than QJS, -58%) |
+| `arrays.js` | `2.42×` (400.0 ms) | `0.94×` (154.6 ms) | **`0.93×`** | **155.0 ms** (7% faster than QJS, -61%) |
+| `scopes.js` | `2.38×` (84.1 ms) | `1.05×` (37.6 ms) | **`1.04×`** | **36.2 ms** (-57%) |
+| `float_math.js` | `2.14×` (286.7 ms) | `1.07×` (144.4 ms) | **`1.05×`** | **141.7 ms** (-51%) |
+| `fib.js` | `1.90×` (64.3 ms) | `1.15×` (38.6 ms) | **`1.10×`** | **36.3 ms** (-44%) |
+| `objects.js` | `2.37×` (75.4 ms) | `1.54×` (50.4 ms) | **`1.18×`** | **37.6 ms** (-50%, -52% allocs) |
+| `global_reads.js` | `2.61×` (64.4 ms) | `1.15×` (29.6 ms) | **`1.19×`** | **28.9 ms** (-55%) |
+| `call_chain.js` | `2.37×` (122.0 ms) | `1.29×` (65.6 ms) | **`1.28×`** | **64.8 ms** (-47%) |
+| `strings.js` | `2.31×` (26.3 ms) | `1.86×` (22.2 ms) | **`1.90×`** | **21.6 ms** (-18%) |
 
 *Note:* Labeled-switch threaded dispatch with `noinline` cold handlers and expanding `FrameCache` with `stack`/`locals` pointers both regressed due to register spilling and I-cache bloat, and were reverted per §5.
 
@@ -59,9 +59,9 @@ Low-risk, localized changes that preserve the current bytecode architecture, ver
 
 Medium-sized refactors, only pursued if profiling after Tier 1 justifies them:
 
-1. **Shapes (hidden-class transition trees) + dense `[]Value` property arrays:**
-   - Move property names/descriptors out of per-object `AutoArrayHashMapUnmanaged` into shared immutable `Shape` descriptors, leaving each ordinary `Object` with a compact `shape: *Shape` + `slots: []Value`.
-   - Cuts per-object memory footprint and makes monomorphic/polymorphic ICs trivial and fast across all instances of a class or object literal.
+1. **Shapes (hidden-class transition trees) + dense `[]Value` property arrays (D88) — DONE (M58):**
+   - Moved property names/descriptors out of per-object `AutoArrayHashMapUnmanaged` into slab-pooled immutable `Shape` transition trees with 4 inline `Value` slots + overflow `[]Value` up to 64 properties (dictionary fallback for accessors, attribute mutations, non-tail deletes, and >64 props).
+   - Cut `objects.js` by 25.5% (`1.54× → 1.18×` QuickJS, -52% allocs) and slashed `game_1m` / `game_big_container` / `frame_loop_3600` peak heap RAM by 40–65%.
 2. **Register-based bytecode (or stack-top caching):**
    - Reduces instruction count and stack-shuffling overhead in numeric and loop-heavy workloads (the same architectural advantage JSC LLInt, V8 Ignition, and Lua 5.4 use to beat stack interpreters by 2×–3×).
 

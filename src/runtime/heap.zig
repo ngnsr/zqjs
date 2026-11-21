@@ -249,6 +249,215 @@ pub const Property = struct {
     is_accessor: bool = false,
 };
 
+/// Maximum number of own data properties held in a Shape before transitioning to dictionary mode (M58, D88).
+/// 64 keeps built-in prototypes (`Array.prototype`, `String.prototype`, `Object.prototype`) in Shape mode.
+pub const MAX_SHAPE_PROPS: usize = 64;
+/// Number of dense `Value` slots stored inline inside `Object` (zero heap allocation for small objects).
+pub const INLINE_SLOTS: usize = 4;
+/// Sentinel shape id for dictionary-mode objects (never matches any shaped IC entry).
+pub const DICT_SHAPE_ID: u32 = std.math.maxInt(u32);
+
+pub const PropAttrs = packed struct(u8) {
+    enumerable: bool = true,
+    writable: bool = true,
+    configurable: bool = true,
+    _pad: u5 = 0,
+
+    pub const default: PropAttrs = .{ .enumerable = true, .writable = true, .configurable = true };
+
+    pub inline fn fromProperty(p: Property) PropAttrs {
+        return .{ .enumerable = p.enumerable, .writable = p.writable, .configurable = p.configurable };
+    }
+
+    pub inline fn eql(a: PropAttrs, b: PropAttrs) bool {
+        return @as(u8, @bitCast(a)) == @as(u8, @bitCast(b));
+    }
+};
+
+/// Immutable hidden class node (M58, D88). Forms a transition tree rooted at `Heap.root_shape`.
+/// Only data properties live in shapes; accessors, attribute mutations, non-tail deletes, and
+/// objects exceeding `MAX_SHAPE_PROPS` transition to dictionary mode (`PropStore.dict`).
+pub const Shape = struct {
+    id: u32,
+    slot: u16,
+    count: u16,
+    attrs: PropAttrs,
+    marked: bool = false,
+    parent: ?*Shape,
+    key: PropKey,
+    /// Inline first child transition (zero heap allocation for linear shape chains).
+    first_transition: ?*Shape = null,
+    /// Overflow child transitions when a shape branches (2+ children).
+    extra_transitions: std.ArrayList(*Shape) = .empty,
+    next: ?*Shape = null,
+
+    pub inline fn find(sh: *const Shape, key: PropKey) ?*const Shape {
+        var cur: ?*const Shape = sh;
+        while (cur) |s| : (cur = s.parent) {
+            if (s.count == 0) return null;
+            if (s.key.obj == key.obj) return s;
+        }
+        return null;
+    }
+
+    pub inline fn findTransition(sh: *const Shape, key: PropKey, attrs: PropAttrs) ?*Shape {
+        if (sh.first_transition) |ch| {
+            if (ch.key.obj == key.obj and ch.attrs.eql(attrs)) return ch;
+            for (sh.extra_transitions.items) |child| {
+                if (child.key.obj == key.obj and child.attrs.eql(attrs)) return child;
+            }
+        }
+        return null;
+    }
+
+    fn addTransition(sh: *Shape, gpa: Allocator, child: *Shape) Allocator.Error!void {
+        if (sh.first_transition == null) {
+            sh.first_transition = child;
+            return;
+        }
+        try sh.extra_transitions.append(gpa, child);
+    }
+
+    fn removeTransition(sh: *Shape, child: *Shape) void {
+        if (sh.first_transition == child) {
+            sh.first_transition = sh.extra_transitions.pop();
+            return;
+        }
+        for (sh.extra_transitions.items, 0..) |ch, i| {
+            if (ch == child) {
+                _ = sh.extra_transitions.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Fills `buf[0..sh.count]` with shapes in forward insertion order (slot 0..count-1).
+    pub fn collectOrdered(sh: *const Shape, buf: *[MAX_SHAPE_PROPS]*const Shape) []*const Shape {
+        var cur: ?*const Shape = sh;
+        while (cur) |s| : (cur = s.parent) {
+            if (s.count == 0) break;
+            buf[s.slot] = s;
+        }
+        return buf[0..sh.count];
+    }
+};
+
+pub const PropStore = union(enum) {
+    shaped: struct {
+        shape: ?*Shape = null,
+        inline_slots: [INLINE_SLOTS]Value = @splat(.undefined),
+        extra: []Value = &.{},
+    },
+    dict: std.AutoArrayHashMapUnmanaged(PropKey, Property),
+
+    pub const empty: PropStore = .{ .shaped = .{} };
+
+    pub const Iterator = struct {
+        pub const Entry = struct {
+            key_ptr: *const PropKey,
+            value_ptr: *const Property,
+        };
+
+        shaped_nodes: [MAX_SHAPE_PROPS]*const Shape = undefined,
+        shaped_len: usize = 0,
+        shaped_idx: usize = 0,
+        store: ?*const PropStore = null,
+        dict_it: ?std.AutoArrayHashMapUnmanaged(PropKey, Property).Iterator = null,
+        cur_key: PropKey = undefined,
+        cur_prop: Property = undefined,
+
+        pub fn next(it: *Iterator) ?Entry {
+            if (it.dict_it) |*dit| {
+                const e = dit.next() orelse return null;
+                return .{ .key_ptr = e.key_ptr, .value_ptr = e.value_ptr };
+            }
+            if (it.shaped_idx >= it.shaped_len) return null;
+            const s = it.shaped_nodes[it.shaped_idx];
+            it.shaped_idx += 1;
+            it.cur_key = s.key;
+            it.cur_prop = .{
+                .value = it.store.?.getShapedSlot(s.slot),
+                .enumerable = s.attrs.enumerable,
+                .writable = s.attrs.writable,
+                .configurable = s.attrs.configurable,
+                .is_accessor = false,
+            };
+            return .{ .key_ptr = &it.cur_key, .value_ptr = &it.cur_prop };
+        }
+    };
+
+    pub inline fn getShapedSlot(self: *const PropStore, slot: usize) Value {
+        const sh = &self.shaped;
+        return if (slot < INLINE_SLOTS) sh.inline_slots[slot] else sh.extra[slot - INLINE_SLOTS];
+    }
+
+    pub inline fn setShapedSlot(self: *PropStore, slot: usize, val: Value) void {
+        const sh = &self.shaped;
+        if (slot < INLINE_SLOTS) sh.inline_slots[slot] = val else sh.extra[slot - INLINE_SLOTS] = val;
+    }
+
+    pub inline fn shapeId(self: *const PropStore) u32 {
+        return switch (self.*) {
+            .shaped => |sh| if (sh.shape) |s| s.id else 0,
+            .dict => DICT_SHAPE_ID,
+        };
+    }
+
+    pub inline fn count(self: *const PropStore) usize {
+        return switch (self.*) {
+            .shaped => |sh| if (sh.shape) |s| s.count else 0,
+            .dict => |*d| d.count(),
+        };
+    }
+
+    pub inline fn get(self: *const PropStore, key: PropKey) ?Property {
+        return switch (self.*) {
+            .shaped => |sh| blk: {
+                const leaf = sh.shape orelse break :blk null;
+                const s = leaf.find(key) orelse break :blk null;
+                break :blk .{
+                    .value = self.getShapedSlot(s.slot),
+                    .enumerable = s.attrs.enumerable,
+                    .writable = s.attrs.writable,
+                    .configurable = s.attrs.configurable,
+                    .is_accessor = false,
+                };
+            },
+            .dict => |*d| d.get(key),
+        };
+    }
+
+    pub inline fn contains(self: *const PropStore, key: PropKey) bool {
+        return switch (self.*) {
+            .shaped => |sh| if (sh.shape) |leaf| leaf.find(key) != null else false,
+            .dict => |*d| d.contains(key),
+        };
+    }
+
+    pub fn iterator(self: *const PropStore) Iterator {
+        return switch (self.*) {
+            .shaped => |sh| blk: {
+                var it: Iterator = .{ .store = self };
+                if (sh.shape) |leaf| {
+                    it.shaped_len = leaf.collectOrdered(&it.shaped_nodes).len;
+                }
+                break :blk it;
+            },
+            .dict => |*d| .{ .dict_it = d.iterator() },
+        };
+    }
+
+    pub fn deinit(self: *PropStore, alloc: Allocator) void {
+        switch (self.*) {
+            .shaped => |*sh| {
+                if (sh.extra.len > 0) alloc.free(sh.extra);
+                sh.* = .{};
+            },
+            .dict => |*d| d.deinit(alloc),
+        }
+    }
+};
+
 /// Insertion-ordered hash table with SameValueZero key equality, shared by Map and Set (M14).
 pub const OrderedTable = struct {
     pub const Entry = struct {
@@ -618,9 +827,9 @@ pub const Object = struct {
     /// The prototype. Only Object.create and the built-ins set it, always to an existing
     /// object or null, so a chain can never form a cycle.
     proto: ?*Object,
-    /// Own properties in insertion order, keyed by atom or symbol. Index-like keys of
-    /// ordinary objects live here too; `ownKeys` puts them first, ascending.
-    props: std.AutoArrayHashMapUnmanaged(PropKey, Property) = .empty,
+    /// Own properties in insertion order: shared Shape + dense slots (≤ MAX_SHAPE_PROPS data props)
+    /// or dictionary hash map fallback (M58, D88).
+    props: PropStore = .empty,
     /// Private fields/methods/accessors keyed by `(class_ctor, atom_name)` (M35, D65).
     private_props: ?*PrivateMap = null,
     kind: union(enum) {
@@ -695,6 +904,12 @@ pub const Heap = struct {
     limit_hit: ?Limit = null,
     /// Interned property keys (D11). Strong until the M8 GC makes it weak.
     atoms: std.HashMapUnmanaged(*String, void, AtomContext, 80) = .empty,
+    /// Root (empty) hidden class, live shapes list, and 64-shape slab pool (M58, D88).
+    root_shape: ?*Shape = null,
+    shapes: ?*Shape = null,
+    free_shapes: ?*Shape = null,
+    shape_slabs: std.ArrayList(*[64]Shape) = .empty,
+    next_shape_id: u32 = 0,
     /// `allocator()` refused an allocation because of the heap limit (see `failed`).
     refused: bool = false,
     /// When `bytes` passes this, a collection is requested for the next safepoint.
@@ -869,6 +1084,16 @@ pub const Heap = struct {
         while (h.gray) |obj| {
             h.gray = obj.gray_next;
             obj.gray_next = null;
+            if (!h.in_minor and obj.kind == .object) {
+                const o: *Object = @fieldParentPtr("obj", obj);
+                if (o.props == .shaped) {
+                    var cur = o.props.shaped.shape;
+                    while (cur) |s| : (cur = s.parent) {
+                        if (s.marked) break;
+                        s.marked = true;
+                    }
+                }
+            }
             forEachChild(obj, h, markObj);
         }
     }
@@ -948,6 +1173,8 @@ pub const Heap = struct {
         }
         h.in_minor = false;
         if (major) {
+            // Sweep unmarked shapes before rebuilding weak atoms so dead shapes don't pin atoms.
+            h.sweepShapes();
             // Weak atoms (D11, I6): rebuild the table from the marked atoms, before any atom
             // is freed. Walking the lists (not the table) keeps the rebuild deterministic,
             // and reinserting at most as many entries as were there needs no allocation.
@@ -1032,9 +1259,24 @@ pub const Heap = struct {
             }
             const o: *Object = @fieldParentPtr("obj", owner);
             if (o.proto) |p| scan.child(&p.obj);
-            if (h.prop_cards.get(o)) |words| {
-                scanDirty(words, o.props.count(), &scan, o, RememberedScan.entries);
-            } else scan.entries(o, 0, o.props.count());
+            switch (o.props) {
+                .shaped => |sh| if (sh.shape) |leaf| {
+                    var cur: ?*Shape = leaf;
+                    while (cur) |s| : (cur = s.parent) {
+                        if (s.count == 0) break;
+                        scan.child(s.key.obj);
+                    }
+                    const n = leaf.count;
+                    const inl = @min(n, INLINE_SLOTS);
+                    for (sh.inline_slots[0..inl]) |v| visitValue(v, &scan, RememberedScan.child);
+                    if (n > INLINE_SLOTS) {
+                        for (sh.extra[0 .. n - INLINE_SLOTS]) |v| visitValue(v, &scan, RememberedScan.child);
+                    }
+                },
+                .dict => |*d| if (h.prop_cards.get(o)) |words| {
+                    scanDirty(words, d.count(), &scan, o, RememberedScan.entries);
+                } else scan.entries(o, 0, d.count()),
+            }
             if (o.private_props) |pp| {
                 for (pp.keys(), pp.values()) |pk, pv| {
                     scan.child(&pk.brand.obj);
@@ -1110,7 +1352,8 @@ pub const Heap = struct {
             c.h.markObj(obj);
         }
         fn entries(c: *RememberedScan, o: *Object, lo: usize, hi: usize) void {
-            for (o.props.keys()[lo..hi], o.props.values()[lo..hi]) |k, p| {
+            const d = &o.props.dict;
+            for (d.keys()[lo..hi], d.values()[lo..hi]) |k, p| {
                 c.child(k.obj);
                 visitValue(p.value, c, child);
                 if (p.is_accessor) visitValue(p.setter, c, child);
@@ -1249,7 +1492,8 @@ pub const Heap = struct {
     /// key or value must sit under a dirty card. The bitmap is only ever the thing checked.
     fn checkCards(h: *const Heap, o: *Object) VerifyError!void {
         if (h.prop_cards.get(o)) |words| {
-            for (o.props.keys(), o.props.values(), 0..) |k, p, i| {
+            const d = &o.props.dict;
+            for (d.keys(), d.values(), 0..) |k, p, i| {
                 const young_val = isYoung(p.value) or (p.is_accessor and isYoung(p.setter));
                 if ((!k.obj.old or young_val) and !cardSet(words, i)) return error.CleanCardOverYoungProperty;
             }
@@ -1300,6 +1544,14 @@ pub const Heap = struct {
             t = obj.next;
             h.freeStruct(obj, if (gc_stress) obj.debug.was else unreachable);
         }
+        var sh = h.shapes;
+        while (sh) |s| {
+            sh = s.next;
+            s.extra_transitions.deinit(h.gpa);
+        }
+        if (h.root_shape) |r| r.extra_transitions.deinit(h.gpa);
+        for (h.shape_slabs.items) |slab| h.gpa.destroy(slab);
+        h.shape_slabs.deinit(h.gpa);
         h.* = undefined;
     }
 
@@ -1676,22 +1928,167 @@ pub const Heap = struct {
         return h.storePropKey(o, PropKey.fromAtom(key), value);
     }
 
-    /// Updates an existing own data property at known `index` (M52 IC fast path).
-    /// Caller must have verified `o.props.keys()[index].obj == &key.obj`,
-    /// `writable`, and `!is_accessor`.
+    /// Updates an existing own shaped data property at known `slot` (M58 IC fast path).
+    pub inline fn storeShapedSlot(h: *Heap, o: *Object, slot: usize, value: Value) void {
+        o.obj.checkLive();
+        const old = o.props.getShapedSlot(slot);
+        o.props.setShapedSlot(slot, value);
+        h.barrier(&o.obj, old, value);
+    }
+
+    /// Updates an existing own dictionary data property at known `index`.
     pub inline fn storePropertyAt(h: *Heap, o: *Object, index: usize, key: *String, value: Value) void {
         o.obj.checkLive();
-        const prop = &o.props.values()[index];
+        const prop = &o.props.dict.values()[index];
         const old = prop.value;
         prop.value = value;
         h.barrier(&o.obj, old, value);
         h.propertyBarrier(o, index, PropKey.fromAtom(key), value);
     }
 
+    /// Converts a shaped object into dictionary mode (transactional on OOM/limit).
+    pub fn toDictionary(h: *Heap, o: *Object) Error!void {
+        if (o.props == .dict) return;
+        const sh = &o.props.shaped;
+        var dict: std.AutoArrayHashMapUnmanaged(PropKey, Property) = .empty;
+        errdefer dict.deinit(h.allocator());
+        if (sh.shape) |leaf| {
+            var buf: [MAX_SHAPE_PROPS]*const Shape = undefined;
+            const ordered = leaf.collectOrdered(&buf);
+            dict.ensureTotalCapacity(h.allocator(), ordered.len) catch |e| return h.failed(e);
+            for (ordered) |s| {
+                dict.putAssumeCapacityNoClobber(s.key, .{
+                    .value = o.props.getShapedSlot(s.slot),
+                    .enumerable = s.attrs.enumerable,
+                    .writable = s.attrs.writable,
+                    .configurable = s.attrs.configurable,
+                    .is_accessor = false,
+                });
+            }
+        }
+        if (sh.extra.len > 0) h.allocator().free(sh.extra);
+        o.props = .{ .dict = dict };
+    }
+
+    fn allocShape(h: *Heap) Error!*Shape {
+        if (h.free_shapes) |s| {
+            h.free_shapes = s.next;
+            return s;
+        }
+        const slab = try h.gpa.create([64]Shape);
+        errdefer h.gpa.destroy(slab);
+        try h.shape_slabs.append(h.gpa, slab);
+        var i: usize = 63;
+        while (i >= 1) : (i -= 1) {
+            slab[i].next = h.free_shapes;
+            h.free_shapes = &slab[i];
+        }
+        return &slab[0];
+    }
+
+    fn transitionShape(h: *Heap, from: ?*Shape, key: PropKey, attrs: PropAttrs) Error!*Shape {
+        if (h.root_shape == null) {
+            const root = try h.allocShape();
+            root.* = .{
+                .id = 0,
+                .slot = 0,
+                .count = 0,
+                .attrs = .default,
+                .parent = null,
+                .key = undefined,
+            };
+            h.root_shape = root;
+        }
+        const parent = from orelse h.root_shape.?;
+        if (parent.findTransition(key, attrs)) |existing| return existing;
+        const child = try h.allocShape();
+        errdefer {
+            child.next = h.free_shapes;
+            h.free_shapes = child;
+        }
+        h.next_shape_id +%= 1;
+        if (h.next_shape_id == 0 or h.next_shape_id == DICT_SHAPE_ID) h.next_shape_id = 1;
+        child.* = .{
+            .id = h.next_shape_id,
+            .slot = parent.count,
+            .count = parent.count + 1,
+            .attrs = attrs,
+            .parent = parent,
+            .key = key,
+            .next = h.shapes,
+        };
+        try parent.addTransition(h.gpa, child);
+        h.shapes = child;
+        return child;
+    }
+
+    fn ensureShapedExtra(h: *Heap, o: *Object, need_extra: usize) Error!void {
+        const sh = &o.props.shaped;
+        if (sh.extra.len >= need_extra) return;
+        const new_len = @min(MAX_SHAPE_PROPS - INLINE_SLOTS, @max(need_extra, @max(@as(usize, 4), sh.extra.len * 2)));
+        const new_buf = h.allocator().alloc(Value, new_len) catch |e| return h.failed(e);
+        if (sh.extra.len > 0) {
+            @memcpy(new_buf[0..sh.extra.len], sh.extra);
+            h.allocator().free(sh.extra);
+        }
+        @memset(new_buf[sh.extra.len..], .undefined);
+        sh.extra = new_buf;
+    }
+
+    fn sweepShapes(h: *Heap) void {
+        var link: *?*Shape = &h.shapes;
+        while (link.*) |s| {
+            if (s.marked) {
+                s.marked = false;
+                link = &s.next;
+            } else {
+                link.* = s.next;
+                if (s.parent) |p| {
+                    if (p.marked or p == h.root_shape) p.removeTransition(s);
+                }
+                s.extra_transitions.deinit(h.gpa);
+                s.extra_transitions = .empty;
+                s.first_transition = null;
+                s.next = h.free_shapes;
+                h.free_shapes = s;
+            }
+        }
+        if (h.root_shape) |r| r.marked = false;
+    }
+
     pub fn storePropKey(h: *Heap, o: *Object, key: PropKey, value: Value) Error!void {
         o.obj.checkLive();
+        if (o.props == .shaped) {
+            const sh = &o.props.shaped;
+            if (sh.shape) |leaf| {
+                if (leaf.find(key)) |s| {
+                    const old = o.props.getShapedSlot(s.slot);
+                    o.props.setShapedSlot(s.slot, value);
+                    h.barrier(&o.obj, old, value);
+                    return;
+                }
+                if (leaf.count >= MAX_SHAPE_PROPS) {
+                    try h.toDictionary(o);
+                } else {
+                    const next_sh = try h.transitionShape(leaf, key, .default);
+                    if (next_sh.slot >= INLINE_SLOTS) try h.ensureShapedExtra(o, next_sh.count - INLINE_SLOTS);
+                    o.props.setShapedSlot(next_sh.slot, value);
+                    o.props.shaped.shape = next_sh;
+                    h.barrierObj(&o.obj, key.obj);
+                    h.barrier(&o.obj, null, value);
+                    return;
+                }
+            } else {
+                const next_sh = try h.transitionShape(null, key, .default);
+                o.props.setShapedSlot(0, value);
+                o.props.shaped.shape = next_sh;
+                h.barrierObj(&o.obj, key.obj);
+                h.barrier(&o.obj, null, value);
+                return;
+            }
+        }
         try h.growPropCards(o);
-        const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
+        const gop = o.props.dict.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
         const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
         if (gop.found_existing) gop.value_ptr.value = value else gop.value_ptr.* = .{ .value = value };
         if (!gop.found_existing) h.barrierObj(&o.obj, key.obj); // the key is a child too
@@ -1706,8 +2103,44 @@ pub const Heap = struct {
 
     pub fn definePropKey(h: *Heap, o: *Object, key: PropKey, p: Property) Error!void {
         o.obj.checkLive();
+        if (o.props == .shaped) {
+            if (!p.is_accessor) {
+                const attrs = PropAttrs.fromProperty(p);
+                const sh = &o.props.shaped;
+                if (sh.shape) |leaf| {
+                    if (leaf.find(key)) |s| {
+                        if (s.attrs.eql(attrs)) {
+                            const old = o.props.getShapedSlot(s.slot);
+                            o.props.setShapedSlot(s.slot, p.value);
+                            h.barrier(&o.obj, old, p.value);
+                            return;
+                        }
+                        try h.toDictionary(o);
+                    } else if (leaf.count >= MAX_SHAPE_PROPS) {
+                        try h.toDictionary(o);
+                    } else {
+                        const next_sh = try h.transitionShape(leaf, key, attrs);
+                        if (next_sh.slot >= INLINE_SLOTS) try h.ensureShapedExtra(o, next_sh.count - INLINE_SLOTS);
+                        o.props.setShapedSlot(next_sh.slot, p.value);
+                        o.props.shaped.shape = next_sh;
+                        h.barrierObj(&o.obj, key.obj);
+                        h.barrier(&o.obj, null, p.value);
+                        return;
+                    }
+                } else {
+                    const next_sh = try h.transitionShape(null, key, attrs);
+                    o.props.setShapedSlot(0, p.value);
+                    o.props.shaped.shape = next_sh;
+                    h.barrierObj(&o.obj, key.obj);
+                    h.barrier(&o.obj, null, p.value);
+                    return;
+                }
+            } else {
+                try h.toDictionary(o);
+            }
+        }
         try h.growPropCards(o);
-        const gop = o.props.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
+        const gop = o.props.dict.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
         const old_val: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
         const old_set: ?Value = if (gop.found_existing and gop.value_ptr.is_accessor) gop.value_ptr.setter else null;
         gop.value_ptr.* = p;
@@ -1726,14 +2159,26 @@ pub const Heap = struct {
     /// later entry moves down one index, so on a remembered carded table every card from
     /// the removed entry's on is dirtied (PC2): a young entry may have moved under a clean
     /// one. An owner that isn't remembered has nothing young to move.
-    pub fn removeProperty(h: *Heap, o: *Object, key: *String) void {
-        h.removePropKey(o, PropKey.fromAtom(key));
+    pub fn removeProperty(h: *Heap, o: *Object, key: *String) Error!void {
+        return h.removePropKey(o, PropKey.fromAtom(key));
     }
 
-    pub fn removePropKey(h: *Heap, o: *Object, key: PropKey) void {
-        const index = o.props.getIndex(key) orelse return;
-        const old = o.props.values()[index];
-        o.props.orderedRemoveAt(index);
+    pub fn removePropKey(h: *Heap, o: *Object, key: PropKey) Error!void {
+        if (o.props == .shaped) {
+            const leaf = o.props.shaped.shape orelse return;
+            if (leaf.find(key) == null) return;
+            if (leaf.key.obj == key.obj) {
+                const old = o.props.getShapedSlot(leaf.slot);
+                o.props.setShapedSlot(leaf.slot, .undefined);
+                o.props.shaped.shape = if (leaf.parent) |p| (if (p.count == 0) null else p) else null;
+                h.barrier(&o.obj, old, null);
+                return;
+            }
+            try h.toDictionary(o);
+        }
+        const index = o.props.dict.getIndex(key) orelse return;
+        const old = o.props.dict.values()[index];
+        o.props.dict.orderedRemoveAt(index);
         h.barrier(&o.obj, old.value, null);
         if (old.is_accessor) h.barrier(&o.obj, old.setter, null);
         if (!o.obj.remembered or mutation == .no_dirty_on_remove) return;
@@ -1751,7 +2196,7 @@ pub const Heap = struct {
     /// dirty (the hole rule, as for arrays).
     fn growPropCards(h: *Heap, o: *Object) Error!void {
         const per_word = 64 * card_elements;
-        const n = o.props.count() + 1;
+        const n = o.props.dict.count() + 1;
         if (n < card_elements or (n != card_elements and (n - 1) % per_word != 0)) return;
         const needed = (n + per_word - 1) / per_word;
         const gop = h.prop_cards.getOrPut(h.allocator(), o) catch |e| return h.failed(e);
@@ -2601,10 +3046,25 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
         .object => {
             const o: *Object = @fieldParentPtr("obj", obj);
             if (o.proto) |p| visit(ctx, &p.obj);
-            for (o.props.keys(), o.props.values()) |k, p| {
-                visit(ctx, k.obj);
-                visitValue(p.value, ctx, visit);
-                if (p.is_accessor) visitValue(p.setter, ctx, visit);
+            switch (o.props) {
+                .shaped => |sh| if (sh.shape) |leaf| {
+                    var cur: ?*Shape = leaf;
+                    while (cur) |s| : (cur = s.parent) {
+                        if (s.count == 0) break;
+                        visit(ctx, s.key.obj);
+                    }
+                    const n = leaf.count;
+                    const inl = @min(n, INLINE_SLOTS);
+                    for (sh.inline_slots[0..inl]) |v| visitValue(v, ctx, visit);
+                    if (n > INLINE_SLOTS) {
+                        for (sh.extra[0 .. n - INLINE_SLOTS]) |v| visitValue(v, ctx, visit);
+                    }
+                },
+                .dict => |*d| for (d.keys(), d.values()) |k, p| {
+                    visit(ctx, k.obj);
+                    visitValue(p.value, ctx, visit);
+                    if (p.is_accessor) visitValue(p.setter, ctx, visit);
+                },
             }
             if (o.private_props) |pp| {
                 for (pp.keys(), pp.values()) |pk, pv| {
@@ -2773,15 +3233,16 @@ test "object storage is charged to the heap limit and refunded exactly" {
     const arr = try h.newArray(o);
     const k = try h.internAscii("k");
     const before = h.bytes;
-    try o.props.put(h.allocator(), PropKey.fromAtom(k), .{ .value = .null });
+    try h.toDictionary(o);
+    try o.props.dict.put(h.allocator(), PropKey.fromAtom(k), .{ .value = .null });
     try arr.kind.array.append(h.allocator(), Value.fromNumber(1));
     try testing.expect(h.bytes > before);
-    _ = o.props.orderedRemove(PropKey.fromAtom(k));
-    o.props.clearAndFree(h.allocator());
+    _ = o.props.dict.orderedRemove(PropKey.fromAtom(k));
+    o.props.dict.clearAndFree(h.allocator());
     arr.kind.array.clearAndFree(h.allocator());
     try testing.expectEqual(before, h.bytes);
     // The limit refuses buffer growth too, reported as LimitExceeded, not OutOfMemory.
-    var small = Heap.init(testing.allocator, .{ .max_heap_bytes = 200 });
+    var small = Heap.init(testing.allocator, .{ .max_heap_bytes = 300 });
     defer small.deinit();
     const big = try small.newArray(null);
     try testing.expectError(error.LimitExceeded, big.kind.array.appendNTimes(small.allocator(), .null, 100) catch |e| small.failed(e));
@@ -2797,7 +3258,7 @@ test "forEachChild enumerates every reference edge (what the M8 GC will mark)" {
     const str = try h.ascii("value");
     const arr = try h.newArray(proto);
     try arr.kind.array.append(h.allocator(), Value.fromString(str));
-    try o.props.put(h.allocator(), PropKey.fromAtom(key), .{ .value = Value.fromObject(arr) });
+    try h.storeProperty(o, key, Value.fromObject(arr));
     const cell = try h.newCell(Value.fromObject(o));
     const env = try h.newEnv(null, 0, 1);
     env.values[0] = Value.fromString(str);

@@ -3630,9 +3630,12 @@ fn setIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!Value {
                 return target;
             }
             o.extensible = false;
-            for (o.props.values()) |*p| {
-                p.configurable = false;
-                if (freeze and !p.is_accessor) p.writable = false;
+            if (o.props.count() > 0) {
+                try rt.heap.toDictionary(o);
+                for (o.props.dict.values()) |*p| {
+                    p.configurable = false;
+                    if (freeze and !p.is_accessor) p.writable = false;
+                }
             }
             switch (o.kind) {
                 .array => {
@@ -3672,7 +3675,9 @@ fn testIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!bool {
     return switch (target.unpack()) {
         .object => |o| {
             if (o.extensible) return false;
-            for (o.props.values()) |p| {
+            var pit = o.props.iterator();
+            while (pit.next()) |entry| {
+                const p = entry.value_ptr.*;
                 if (p.configurable) return false;
                 if (freeze and !p.is_accessor and p.writable) return false;
             }
@@ -9331,7 +9336,7 @@ fn proxyRevokeFn(rt: *Runtime, env: *Object, _: []const Value) Error!Value {
         if (prop.value.isObject() and prop.value.asObject().kind == .proxy) {
             heap_mod.Heap.revokeProxy(prop.value.asObject());
         }
-        rt.heap.removePropKey(env, pk);
+        try rt.heap.removePropKey(env, pk);
     }
     return .undefined;
 }

@@ -836,7 +836,7 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
     if (o.props.count() == 0) return true;
     const pk = try propKey(rt, k);
     if (o.props.get(pk)) |p| if (!p.configurable) return false;
-    rt.heap.removePropKey(o, pk);
+    try rt.heap.removePropKey(o, pk);
     return true;
 }
 
@@ -997,6 +997,62 @@ fn appendPropsKeys(
     }
 }
 
+fn appendPropStoreKeys(
+    rt: *Runtime,
+    out: *std.ArrayList(Key),
+    props: *const heap_mod.PropStore,
+    first_named: usize,
+    include_symbols: bool,
+    include_non_enum: bool,
+) Error!void {
+    switch (props.*) {
+        .dict => |*d| return appendPropsKeys(rt, out, d.keys(), d.values(), first_named, include_symbols, include_non_enum),
+        .shaped => |sh| {
+            const leaf = sh.shape orelse return;
+            var buf: [heap_mod.MAX_SHAPE_PROPS]*const heap_mod.Shape = undefined;
+            const ordered = leaf.collectOrdered(&buf);
+            for (ordered) |s| {
+                if ((!include_non_enum and !s.attrs.enumerable) or s.key.isSymbol()) continue;
+                const a = s.key.asAtom();
+                if (a.atom.?.index) |i| {
+                    try out.insert(rt.gpa, first_named + indexPosition(out.items[first_named..], i), .{ .index = i });
+                } else {
+                    try out.append(rt.gpa, .{ .atom = a });
+                }
+            }
+            if (include_symbols) {
+                for (ordered) |s| {
+                    if ((!include_non_enum and !s.attrs.enumerable) or !s.key.isSymbol()) continue;
+                    try out.append(rt.gpa, .{ .symbol = s.key.asSymbol() });
+                }
+            }
+        },
+    }
+}
+
+fn collectPropStoreSymbolKeys(
+    rt: *Runtime,
+    props: *const heap_mod.PropStore,
+    include_non_enum: bool,
+) Error![]*heap_mod.Symbol {
+    switch (props.*) {
+        .dict => |*d| return collectSymbolKeys(rt, d.keys(), d.values(), include_non_enum),
+        .shaped => |sh| {
+            const leaf = sh.shape orelse return &.{};
+            var buf: [heap_mod.MAX_SHAPE_PROPS]*const heap_mod.Shape = undefined;
+            const ordered = leaf.collectOrdered(&buf);
+            var out: std.ArrayList(*heap_mod.Symbol) = .empty;
+            errdefer out.deinit(rt.gpa);
+            for (ordered) |s| {
+                if (!s.key.isSymbol()) continue;
+                if (!include_non_enum and !s.attrs.enumerable) continue;
+                try out.append(rt.gpa, s.key.asSymbol());
+            }
+            return out.toOwnedSlice(rt.gpa);
+        },
+    }
+}
+
 fn collectSymbolKeys(
     rt: *Runtime,
     prop_keys: []const heap_mod.PropKey,
@@ -1048,7 +1104,7 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
     const first_named = out.items.len;
-    try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false, false);
+    try appendPropStoreKeys(rt, &out, &o.props, first_named, false, false);
     return out.toOwnedSlice(rt.gpa);
 }
 
@@ -1066,7 +1122,7 @@ pub fn ownPropertyNames(rt: *Runtime, o: *Object) Error![]Key {
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
     const first_named = out.items.len;
-    try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, false, true);
+    try appendPropStoreKeys(rt, &out, &o.props, first_named, false, true);
     return out.toOwnedSlice(rt.gpa);
 }
 
@@ -1084,7 +1140,7 @@ pub fn ownAllKeys(rt: *Runtime, o: *Object) Error![]Key {
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
     const first_named = out.items.len;
-    try appendPropsKeys(rt, &out, o.props.keys(), o.props.values(), first_named, true, false);
+    try appendPropStoreKeys(rt, &out, &o.props, first_named, true, false);
     return out.toOwnedSlice(rt.gpa);
 }
 
@@ -1100,7 +1156,7 @@ pub fn ownAllKeysClosure(rt: *Runtime, c: *const heap_mod.Closure) Error![]Key {
 pub fn ownSymbolKeys(rt: *Runtime, o: *Object, include_non_enum: bool) Error![]*heap_mod.Symbol {
     if (o.kind == .proxy) return builtins.proxyOwnSymbolKeys(rt, o, include_non_enum);
     if (o.props.count() == 0) return &.{};
-    return collectSymbolKeys(rt, o.props.keys(), o.props.values(), include_non_enum);
+    return collectPropStoreSymbolKeys(rt, &o.props, include_non_enum);
 }
 
 pub fn ownSymbolKeysClosure(rt: *Runtime, c: *const heap_mod.Closure, include_non_enum: bool) Error![]*heap_mod.Symbol {

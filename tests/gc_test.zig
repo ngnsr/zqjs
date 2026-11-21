@@ -243,7 +243,7 @@ test "weak atoms (D11): kept by their objects, dropped with them, reusable after
         try testing.expectEqual(@as(f64, @floatFromInt(i)), o.props.get(heap.PropKey.fromAtom(k)).?.value.asNumber()); // same atom as the key
     }
     // delete o[k], collect, reuse k: a fresh atom works as the key.
-    h.removeProperty(o, try h.internAscii("k7"));
+    try h.removeProperty(o, try h.internAscii("k7"));
     collectMajor(&h, &.{&o.obj});
     try h.storeProperty(o, try h.internAscii("k7"), zqjs.Value.fromNumber(77));
     try testing.expectEqual(@as(f64, 77), o.props.get(heap.PropKey.fromAtom(try h.internAscii("k7"))).?.value.asNumber());
@@ -647,9 +647,9 @@ test "the heap verifier passes after real collections and catches each kind of c
     h.gray = null;
     // An edge from a live object to a collected one (a hand-made tombstone).
     var dead: heap.Object = .{ .obj = .{ .kind = .dead, .next = null }, .proto = null };
-    keep.props.getPtr(heap.PropKey.fromAtom(try h.internAscii("a"))).?.value = zqjs.Value.fromObject(&dead);
+    keep.props.setShapedSlot(0, zqjs.Value.fromObject(&dead));
     try testing.expectError(error.EdgeToCollectedObject, h.verify());
-    keep.props.getPtr(heap.PropKey.fromAtom(try h.internAscii("a"))).?.value = zqjs.Value.fromObject(arr);
+    keep.props.setShapedSlot(0, zqjs.Value.fromObject(arr));
     // A non-atom in the atom table.
     const plain = try h.ascii("not an atom");
     try h.atoms.putNoClobber(h.allocator(), plain, {});
@@ -1123,7 +1123,7 @@ fn oldKeys(h: *heap.Heap, root: *heap.Object, from: usize, to: usize) !void {
 }
 
 fn valueAt(o: *heap.Object, i: usize) []const u16 {
-    return o.props.values()[i].value.asString().units;
+    return o.props.dict.values()[i].value.asString().units;
 }
 
 test "property cards: a young value under an existing key at a card boundary dirties only its card" {
@@ -1160,7 +1160,7 @@ test "property cards: a new young key with an old value dirties the card it is a
     var h = heap.Heap.init(testing.allocator, .{});
     defer h.deinit();
     const o = try oldDict(&h, 4 * card - 1);
-    const old_value = o.props.values()[0].value;
+    const old_value = o.props.dict.values()[0].value;
     try h.storeProperty(o, try h.internAscii("a fresh key"), old_value); // entry 4·card − 1
     try testing.expect(o.obj.remembered);
     try h.verify();
@@ -1181,7 +1181,7 @@ test "property cards: deletes at the start, middle and end shift young entries a
         // them moves 2·card down into card 1, and the others down one place.
         const young = [_]usize{ 2 * card, 2 * card + 1, 3 * card };
         for (young) |i| try h.storeProperty(o, try h.internAscii(keyName(&buf, i)), zqjs.Value.fromString(try h.ascii("young")));
-        h.removeProperty(o, try h.internAscii(keyName(&buf, removed)));
+        try h.removeProperty(o, try h.internAscii(keyName(&buf, removed)));
         try h.verify(); // PC8: every young entry, wherever it moved, is under a dirty card
         try collectMinor(&h, &.{&o.obj});
         for (young) |i| {
@@ -1305,7 +1305,7 @@ test "mutation: a delete that doesn't dirty the shifted cards fails PC1" {
     const o = try oldDict(&h, 4 * card);
     var buf: [16]u8 = undefined;
     try h.storeProperty(o, try h.internAscii(keyName(&buf, 2 * card)), zqjs.Value.fromString(try h.ascii("young")));
-    h.removeProperty(o, try h.internAscii(keyName(&buf, 0))); // moves it to 2·card − 1: card 1
+    try h.removeProperty(o, try h.internAscii(keyName(&buf, 0))); // moves it to 2·card − 1: card 1
     try expectCaught(.no_dirty_on_remove, error.CleanCardOverYoungProperty, h.verify());
 }
 

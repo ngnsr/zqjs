@@ -1158,9 +1158,10 @@ pub const Vm = struct {
                 if (name_idx < p.name_atoms.len) {
                     const atom = p.name_atoms[name_idx];
                     if (!fastSetProp(rt, p, pc, base, atom, v)) {
+                        const old_sid: u32 = if (base.isObject()) base.asObject().props.shapeId() else heap.DICT_SHAPE_ID;
                         cache.syncSp(vm);
                         try object.set(rt, base, object.namedAtom(atom), v);
-                        populateSetPropIc(rt, p, pc, base, atom);
+                        populateSetPropIc(rt, p, pc, base, atom, old_sid);
                     }
                 } else {
                     cache.syncSp(vm);
@@ -2640,8 +2641,9 @@ fn fastArraySet(rt: *Runtime, base: Value, idx: Value, val: Value) bool {
     return true;
 }
 
-inline fn propIcSlot(rt: *Runtime, p: *const Proto, pc: u32) *u32 {
-    return &rt.prop_ic[((@intFromPtr(p) >> 4) ^ pc) & (rt.prop_ic.len - 1)];
+inline fn propIcSlot(rt: *Runtime, p: *const Proto, pc: u32) *rt_mod.PropIc {
+    const h = (@intFromPtr(p) >> 4) ^ pc;
+    return &rt.prop_ic[h & (rt.prop_ic.len - 1)];
 }
 
 inline fn isLengthAtom(atom: *const heap.String) bool {
@@ -2655,34 +2657,25 @@ fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
     const is_array = o.kind == .array;
     if (!is_array and (o.kind != .ordinary or o.builtin != null)) return null;
     o.obj.checkLive();
-    const entry = propIcSlot(rt, p, pc).*;
-    const idx: usize = entry & 0x7FFF_FFFF;
-    const keys = o.props.keys();
-    if ((entry & 0x8000_0000) == 0) {
-        if (!is_array and idx < keys.len and keys[idx].obj == &atom.obj) {
-            const prop = &o.props.values()[idx];
-            if (!prop.is_accessor) {
-                heap.checkValue(prop.value);
-                return prop.value;
-            }
-        }
-        return null;
+    const ic = propIcSlot(rt, p, pc).*;
+    if (ic.atom_addr != @intFromPtr(atom)) return null;
+    const sid = o.props.shapeId();
+    if (sid != ic.shape_id) return null;
+    if (ic.kind == 1) {
+        if (is_array) return null;
+        const v = o.props.getShapedSlot(ic.slot);
+        heap.checkValue(v);
+        return v;
     }
-    if (is_array and (atom.atom.?.index != null or isLengthAtom(atom))) return null;
-    if (keys.len <= 4) {
-        for (keys) |k| {
-            if (k.obj == &atom.obj) return null;
-        }
+    if (ic.kind == 2) {
+        if (is_array and (atom.atom.?.index != null or isLengthAtom(atom))) return null;
         if (o.proto) |proto| {
             if (proto.kind == .ordinary) {
                 proto.obj.checkLive();
-                const pkeys = proto.props.keys();
-                if (idx < pkeys.len and pkeys[idx].obj == &atom.obj) {
-                    const prop = &proto.props.values()[idx];
-                    if (!prop.is_accessor) {
-                        heap.checkValue(prop.value);
-                        return prop.value;
-                    }
+                if (proto.props.shapeId() == ic.proto_shape_id) {
+                    const v = proto.props.getShapedSlot(ic.slot);
+                    heap.checkValue(v);
+                    return v;
                 }
             }
         }
@@ -2695,22 +2688,36 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
     const o = base.asObject();
     const is_array = o.kind == .array;
     if (!is_array and (o.kind != .ordinary or o.builtin != null)) return;
+    if (o.props != .shaped) return;
+    const sid = o.props.shapeId();
     const key = heap.PropKey.fromAtom(atom);
     if (!is_array) {
-        if (o.props.getIndex(key)) |own_idx| {
-            if (!o.props.values()[own_idx].is_accessor and own_idx <= 0x7FFF_FFFF) {
-                propIcSlot(rt, p, pc).* = @intCast(own_idx);
+        if (o.props.shaped.shape) |leaf| {
+            if (leaf.find(key)) |s| {
+                propIcSlot(rt, p, pc).* = .{
+                    .shape_id = sid,
+                    .proto_shape_id = 0,
+                    .atom_addr = @intFromPtr(atom),
+                    .slot = s.slot,
+                    .kind = 1,
+                };
+                return;
             }
-            return;
         }
     } else if (atom.atom.?.index != null or isLengthAtom(atom)) {
         return;
     }
     if (o.proto) |proto| {
-        if (proto.kind == .ordinary) {
-            if (proto.props.getIndex(key)) |proto_idx| {
-                if (!proto.props.values()[proto_idx].is_accessor and proto_idx <= 0x7FFF_FFFF) {
-                    propIcSlot(rt, p, pc).* = @as(u32, @intCast(proto_idx)) | 0x8000_0000;
+        if (proto.kind == .ordinary and proto.props == .shaped) {
+            if (proto.props.shaped.shape) |pleaf| {
+                if (pleaf.find(key)) |ps| {
+                    propIcSlot(rt, p, pc).* = .{
+                        .shape_id = sid,
+                        .proto_shape_id = pleaf.id,
+                        .atom_addr = @intFromPtr(atom),
+                        .slot = ps.slot,
+                        .kind = 2,
+                    };
                 }
             }
         }
@@ -2722,30 +2729,82 @@ fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
     const o = base.asObject();
     if (o.kind != .ordinary or o.builtin != null) return false;
     o.obj.checkLive();
-    const entry = propIcSlot(rt, p, pc).*;
-    if ((entry & 0x8000_0000) != 0) return false;
-    const idx: usize = entry;
-    const keys = o.props.keys();
-    if (idx < keys.len and keys[idx].obj == &atom.obj) {
-        const prop = &o.props.values()[idx];
-        if (prop.writable and !prop.is_accessor) {
-            rt.heap.storePropertyAt(o, idx, atom, val);
+    const ic = propIcSlot(rt, p, pc).*;
+    if (ic.atom_addr != @intFromPtr(atom)) return false;
+    const sid = o.props.shapeId();
+    if (sid != ic.shape_id) return false;
+    if (ic.kind == 3) {
+        rt.heap.storeShapedSlot(o, ic.slot, val);
+        return true;
+    }
+    if (ic.kind == 4 and o.extensible) {
+        // Verify prototype chain up to 2 hops matches cached shapes (proving no Proxy / setter / non-writable prop).
+        const p1_sid: u32 = if (o.proto) |pr1| blk: {
+            if (pr1.kind != .ordinary) return false;
+            break :blk pr1.props.shapeId();
+        } else 0;
+        if (p1_sid != ic.proto_shape_id) return false;
+        if (o.proto) |pr1| {
+            const p2_sid: u32 = if (pr1.proto) |pr2| blk: {
+                if (pr2.kind != .ordinary or pr2.proto != null) return false;
+                break :blk pr2.props.shapeId();
+            } else 0;
+            if (p2_sid != ic.grandproto_shape_id) return false;
+        }
+        const parent = o.props.shaped.shape orelse (rt.heap.root_shape orelse return false);
+        const next_sh = parent.findTransition(heap.PropKey.fromAtom(atom), .default) orelse return false;
+        if (next_sh.slot < heap.INLINE_SLOTS) {
+            o.props.setShapedSlot(next_sh.slot, val);
+            o.props.shaped.shape = next_sh;
+            rt.heap.barrierObj(&o.obj, &atom.obj);
+            rt.heap.barrier(&o.obj, null, val);
             return true;
         }
     }
     return false;
 }
 
-noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) void {
+noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String, old_sid: u32) void {
     if (!base.isObject()) return;
     const o = base.asObject();
-    if (o.kind != .ordinary or o.builtin != null) return;
+    if (o.kind != .ordinary or o.builtin != null or o.props != .shaped) return;
+    const leaf = o.props.shaped.shape orelse return;
     const key = heap.PropKey.fromAtom(atom);
-    if (o.props.getIndex(key)) |own_idx| {
-        const prop = &o.props.values()[own_idx];
-        if (prop.writable and !prop.is_accessor and own_idx <= 0x7FFF_FFFF) {
-            propIcSlot(rt, p, pc).* = @intCast(own_idx);
+    const s = leaf.find(key) orelse return;
+    if (!s.attrs.writable) return;
+    if (old_sid == leaf.id) {
+        propIcSlot(rt, p, pc).* = .{
+            .shape_id = leaf.id,
+            .proto_shape_id = 0,
+            .grandproto_shape_id = 0,
+            .atom_addr = @intFromPtr(atom),
+            .slot = s.slot,
+            .kind = 3,
+        };
+        return;
+    }
+    // Property was just added via an inline default-attrs transition: cache the ADD transition
+    // if the prototype chain is at most 2 shaped hops (e.g. instance -> proto -> Object.prototype -> null).
+    if (old_sid != heap.DICT_SHAPE_ID and leaf.key.obj == key.obj and leaf.attrs.eql(.default) and leaf.slot < heap.INLINE_SLOTS) {
+        const p1_sid: u32 = if (o.proto) |pr1| blk: {
+            if (pr1.props != .shaped or pr1.kind != .ordinary) return;
+            break :blk pr1.props.shapeId();
+        } else 0;
+        var p2_sid: u32 = 0;
+        if (o.proto) |pr1| {
+            if (pr1.proto) |pr2| {
+                if (pr2.proto != null or pr2.props != .shaped or pr2.kind != .ordinary) return;
+                p2_sid = pr2.props.shapeId();
+            }
         }
+        propIcSlot(rt, p, pc).* = .{
+            .shape_id = old_sid,
+            .proto_shape_id = p1_sid,
+            .grandproto_shape_id = p2_sid,
+            .atom_addr = @intFromPtr(atom),
+            .slot = leaf.slot,
+            .kind = 4,
+        };
     }
 }
 

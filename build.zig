@@ -51,6 +51,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(exe);
+    const install_cli = b.addInstallArtifact(exe, .{});
+    b.step("cli", "Build and install only the zqjs CLI binary (skips libzqjs.a)").dependOn(&install_cli.step);
 
     // M9.2 C ABI static library + header
     const c_api_mod = b.createModule(.{
@@ -72,15 +74,15 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run the zqjs CLI").dependOn(&run.step);
 
     // Unit tests inside src/, an umbrella integration binary (`internal_tests`) so `zig build test`
-    // compiles `zqjs_internal` once instead of nine times, plus lazy `test-<name>` steps for
-    // running any single suite during iteration. `--fuzz=N` fuzzes only one test per run, so pick
-    // fuzz targets with -Dtest-filter:
+    // compiles `zqjs_internal` once instead of eleven times, plus lazy `test-fast` / `test-<name>`
+    // steps for running a single binary during iteration. `--fuzz=N` fuzzes only one test per run,
+    // so pick fuzz targets with -Dtest-filter:
     //   zig build test --fuzz=100K -Dtest-filter="fuzz: the verifier"
     const filters: []const []const u8 = if (b.option([]const u8, "test-filter", "Run only tests whose name contains this")) |f| &.{f} else &.{};
     const test_step = b.step("test", "Run unit and integration tests");
     const run_unit_tests = b.addRunArtifact(b.addTest(.{ .root_module = mod, .filters = filters }));
     test_step.dependOn(&run_unit_tests.step);
-    b.step("test-unit", "Run unit tests inside src/").dependOn(&run_unit_tests.step);
+    b.step("test-unit", "Run only unit tests inside src/").dependOn(&run_unit_tests.step);
 
     // Everything in tests/ goes through `zqjs_internal` / `zqjs`. Data files are generated
     // or checked with node by the scripts in tests/harness/.
@@ -92,6 +94,7 @@ pub fn build(b: *std.Build) void {
     }) }));
     internal_tests.setCwd(b.path(".")); // diff_test, gc_test, etc. read repo paths at runtime
     test_step.dependOn(&internal_tests.step);
+    b.step("test-fast", "Run only the umbrella integration test binary (1 compilation instead of 5)").dependOn(&internal_tests.step);
 
     for ([_]struct { step: []const u8, file: []const u8 }{
         .{ .step = "test-gc", .file = "gc_test" }, // the garbage collector: store-API scan, generations, cards, mutants
@@ -137,6 +140,7 @@ pub fn build(b: *std.Build) void {
     });
     const c_api_tests = b.addRunArtifact(b.addTest(.{ .name = "c_api_zig_test", .filters = filters, .root_module = c_api_test_mod }));
     test_step.dependOn(&c_api_tests.step);
+    b.step("test-c-zig", "Run only Zig-side C ABI unit tests").dependOn(&c_api_tests.step);
 
     // Pure C11 integration test linked against libzqjs.a (M9.2)
     const c_test_mod = b.createModule(.{

@@ -1,5 +1,5 @@
 //! Umbrella integration test suite for `zig build test`.
-//! Keeps `zqjs_internal` compiled once instead of nine times; individual suites
+//! Keeps `zqjs_internal` compiled once instead of eleven times; individual suites
 //! remain runnable via `zig build test-<name>`.
 
 comptime {

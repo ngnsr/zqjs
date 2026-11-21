@@ -297,6 +297,10 @@ pub const Expr = struct {
             rhs: *const Expr,
             span: Span,
         },
+        /// `import.meta` (M48, D78).
+        import_meta,
+        /// `import(specifier)` (M48, D78).
+        dynamic_import: *const Expr,
     };
 };
 

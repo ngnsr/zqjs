@@ -649,6 +649,8 @@ const Resolver = struct {
                 }
                 try r.expr(pi.rhs);
             },
+            .import_meta => {},
+            .dynamic_import => |spec| try r.expr(spec),
         }
     }
 

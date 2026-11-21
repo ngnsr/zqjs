@@ -152,7 +152,7 @@ pub const Closure = struct {
         /// `proto: *const bytecode.Proto`; `captures` filled by `make_closure`.
         vm: struct { proto: *const anyopaque, captures: []*Cell },
         /// `func: *const ast.Function`; `env` is the environment it was created in.
-        tree: struct { func: *const anyopaque, env: ?*Env, res: ?*const anyopaque = null, repl_cells: []*Cell = &.{} },
+        tree: struct { func: *const anyopaque, env: ?*Env, res: ?*const anyopaque = null, repl_cells: []*Cell = &.{}, module_record: ?*anyopaque = null },
         /// Native Promise resolve/reject capability (M18).
         promise_cap: struct { promise: *Object, is_reject: bool },
         /// Native closure with a bound environment object (M19).

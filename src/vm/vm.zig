@@ -51,6 +51,7 @@ const object = @import("../runtime/object.zig");
 const bigint = @import("../runtime/bigint.zig");
 const builtins = @import("../runtime/builtins.zig");
 const coroutine = @import("../runtime/coroutine.zig");
+const module = @import("../runtime/module.zig");
 const BinaryOp = @import("../frontend/ast.zig").BinaryOp;
 const bc = @import("../bytecode/bytecode.zig");
 const Op = bc.Op;
@@ -1007,6 +1008,8 @@ pub const Vm = struct {
             .async_iter_close_check,
             .async_yield_star_call,
             .async_yield_star_result,
+            .get_import_meta,
+            .dynamic_import,
             => {
                 cache.syncSp(vm);
                 if (try vm.executeCold(op, pc, next)) {
@@ -1382,6 +1385,21 @@ pub const Vm = struct {
                 try cache.ensurePush(vm);
                 const obj = try builtins.getTemplateObjectFromConsts(rt, @intFromPtr(site), site.cooked, site.raw, p.consts);
                 try cache.push(vm, obj);
+            },
+            .get_import_meta => {
+                cache.syncSp(vm);
+                const mod_ptr = p.module_record orelse return vm.bug("get_import_meta outside a module");
+                try cache.ensurePush(vm);
+                const meta_obj = try module.getImportMeta(rt, @ptrCast(@alignCast(mod_ptr)));
+                try cache.push(vm, .{ .object = meta_obj });
+            },
+            .dynamic_import => {
+                cache.syncSp(vm);
+                const spec_val = try cache.peek(vm, 0);
+                const mod_ptr: ?*module.ModuleRecord = if (p.module_record) |mp| @ptrCast(@alignCast(mp)) else null;
+                const promise_obj = try module.dynamicImport(rt, mod_ptr, spec_val, .vm);
+                try cache.drop(vm, 1);
+                try cache.push(vm, .{ .object = promise_obj });
             },
             .setup_class => {
                 const has_super = cache.operand(0) != 0;

@@ -275,9 +275,9 @@ test "M42: module early syntax errors and intentional unsupported boundaries" {
     const dup_imp = [_]MemEntry{.{ .id = "a.js", .src = "export const x = 1;" }};
     try expectBothEnginesErr(&dup_imp, "main.js", "import { x, x } from './a.js';", error.SyntaxError);
     try expectBothEnginesErr(&dup_imp, "main.js", "import { x } from './a.js'; let x = 2;", error.SyntaxError);
-    // Dynamic import and import.meta -> Unsupported
-    try expectBothEnginesErr(&.{}, "main.js", "import('./a.js');", error.Unsupported);
-    try expectBothEnginesErr(&.{}, "main.js", "import.meta;", error.Unsupported);
+    // Dynamic import with 2nd options argument -> Unsupported; invalid import.foo -> SyntaxError
+    try expectBothEnginesErr(&.{}, "main.js", "import('./a.js', {});", error.Unsupported);
+    try expectBothEnginesErr(&.{}, "main.js", "import.foo;", error.SyntaxError);
 }
 
 test "M42: Limits.max_modules enforced" {
@@ -312,4 +312,165 @@ test "M42: allocation failure handling (OOM) leaks nothing" {
             try testing.expectEqualStrings("10 10\n", res.out);
         }
     }.run, .{});
+}
+
+test "M48: import.meta identity, prototype, url, nested closures, and mutability" {
+    const entries = [_]MemEntry{
+        .{ .id = "sub/mod.js", .src =
+        \\export const getMeta = () => import.meta;
+        \\export function getUrl() { return import.meta.url; }
+        },
+    };
+    const main_src =
+        \\import { getMeta, getUrl } from './sub/mod.js';
+        \\print(Object.getPrototypeOf(import.meta) === null);
+        \\print(import.meta === import.meta);
+        \\print(import.meta.url);
+        \\import.meta.custom = 123;
+        \\function inner() { return import.meta.custom; }
+        \\print(inner(), import.meta?.url);
+        \\const m2 = getMeta();
+        \\print(m2 === getMeta(), m2 !== import.meta, getUrl());
+    ;
+    try expectBothEngines(
+        &entries,
+        "main.js",
+        main_src,
+        "true\ntrue\nmain.js\n123 main.js\ntrue true sub/mod.js\n",
+    );
+}
+
+test "M48: dynamic import() from modules, nested closures, Promise.all, namespace identity, and errors" {
+    const entries = [_]MemEntry{
+        .{ .id = "dep.js", .src = "export let count = 1; export function inc() { count++; }" },
+        .{ .id = "a.js", .src = "export const v = 'A';" },
+        .{ .id = "b.js", .src = "export const v = 'B';" },
+        .{ .id = "bad_syntax.js", .src = "export const x = ;" },
+        .{ .id = "throws.js", .src = "throw new Error('boom');" },
+    };
+    const main_src =
+        \\import * as staticNs from './dep.js';
+        \\async function loadDep() { return await import('./dep.js'); }
+        \\const dynNs = await loadDep();
+        \\print(dynNs === staticNs, dynNs.count);
+        \\staticNs.inc();
+        \\print(dynNs.count);
+        \\const [pa, pb] = await Promise.all([import('./a.js'), import('./b.js')]);
+        \\print(pa.v, pb.v);
+        \\try { await import('./missing.js'); print('nope1'); } catch (e) { print('err1', e instanceof TypeError); }
+        \\try { await import('./bad_syntax.js'); print('nope2'); } catch (e) { print('err2', e instanceof SyntaxError); }
+        \\try { await import('./throws.js'); print('nope3'); } catch (e) { print('err3', e.message); }
+        \\try { await import({ toString() { throw new Error('tostr'); } }); print('nope4'); } catch (e) { print('err4', e.message); }
+        \\try { await import(Symbol('s')); print('nope5'); } catch (e) { print('err5', e instanceof TypeError); }
+    ;
+    try expectBothEngines(
+        &entries,
+        "main.js",
+        main_src,
+        "true 1\n2\nA B\nerr1 true\nerr2 true\nerr3 boom\nerr4 tostr\nerr5 true\n",
+    );
+}
+
+test "M48: dynamic import() from plain script (both engines)" {
+    const entries = [_]MemEntry{
+        .{ .id = "lib.js", .src = "export const answer = 42;" },
+    };
+    for ([_]Engine{ .vm, .treewalk }) |engine| {
+        var out_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out_buf.deinit();
+        var rt = Runtime.init(testing.allocator, .{}, &out_buf.writer);
+        defer rt.deinit();
+        rt.stack_base = @frameAddress();
+        const ml: MemLoader = .{ .entries = &entries };
+        rt.modules.loader = ml.loader();
+
+        const src = "import('./lib.js').then(ns => print(ns.answer));";
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var diag: zqjs.Diagnostic = .{};
+        const script = try zqjs.parse(arena.allocator(), src, .{}, &diag);
+        const res = try zqjs.resolve(arena.allocator(), script, &diag);
+        if (engine == .vm) {
+            var p = try zqjs.compile(testing.allocator, &rt.heap, script, res, .{}, &diag);
+            defer p.deinit(testing.allocator);
+            var vm = try zqjs.Vm.init(&rt, &p);
+            defer vm.deinit();
+            try vm.run();
+            try rt.drainMicrotasks();
+        } else {
+            try zqjs.interpret(&rt, script, res);
+        }
+        try testing.expectEqualStrings("42\n", out_buf.written());
+    }
+}
+
+test "M48: top-level await, for await, linear/diamond/parallel TLA, sync->TLA, and cycles" {
+    // 1. Single TLA + for await + linear chain
+    const entries1 = [_]MemEntry{
+        .{ .id = "b.js", .src =
+        \\print('b1');
+        \\export const val = await Promise.resolve(21);
+        \\print('b2');
+        },
+        .{ .id = "a.js", .src =
+        \\import { val } from './b.js';
+        \\print('a1', val);
+        \\const asyncIter = {
+        \\  [Symbol.asyncIterator]() {
+        \\    let i = 0;
+        \\    return { next() { i++; return Promise.resolve(i <= 2 ? { value: i, done: false } : { value: undefined, done: true }); } };
+        \\  }
+        \\};
+        \\let sum = 0;
+        \\for await (const x of asyncIter) sum += x;
+        \\export const total = val + sum;
+        \\print('a2', total);
+        },
+    };
+    try expectBothEngines(
+        &entries1,
+        "main.js",
+        "import { total } from './a.js'; print('main', total);",
+        "b1\nb2\na1 21\na2 24\nmain 24\n",
+    );
+
+    // 2. Diamond & parallel sibling TLA ordering + sync module importing TLA module
+    const entries2 = [_]MemEntry{
+        .{ .id = "s1.js", .src = "print('s1 start'); export const x = await Promise.resolve(1); print('s1 end');" },
+        .{ .id = "s2.js", .src = "print('s2 start'); export const y = await Promise.resolve(2); print('s2 end');" },
+        .{ .id = "sync_mid.js", .src = "import { x } from './s1.js'; export const x2 = x * 10; print('sync_mid', x2);" },
+    };
+    try expectBothEngines(
+        &entries2,
+        "main.js",
+        "import { x2 } from './sync_mid.js'; import { y } from './s2.js'; print('main', x2, y);",
+        "s1 start\ns2 start\ns1 end\ns2 end\nsync_mid 10\nmain 10 2\n",
+    );
+
+    // 3. TLA rejection propagates to parent and entry
+    const entries3 = [_]MemEntry{
+        .{ .id = "fail_tla.js", .src = "await Promise.reject(new Error('tla_fail')); export const x = 1;" },
+    };
+    try expectBothEnginesErr(&entries3, "main.js", "import { x } from './fail_tla.js'; print(x);", error.Thrown);
+
+    // 4. Circular dependency with TLA
+    const entries4 = [_]MemEntry{
+        .{ .id = "cyc_b.js", .src =
+        \\import { fromA } from './cyc_a.js';
+        \\export const fromB = await Promise.resolve(10);
+        \\export function readA() { return fromA(); }
+        },
+        .{ .id = "cyc_a.js", .src =
+        \\import { fromB } from './cyc_b.js';
+        \\export function fromA() { return 5; }
+        \\print('cyc_a', fromB);
+        },
+    };
+    try expectBothEngines(&entries4, "cyc_a.js", entries4[1].src, "cyc_a 10\n");
+
+    // 5. Dynamic import of a TLA module
+    const entries5 = [_]MemEntry{
+        .{ .id = "tla_dyn.js", .src = "export const v = await Promise.resolve('async_ok');" },
+    };
+    try expectBothEngines(&entries5, "main.js", "const ns = await import('./tla_dyn.js'); print(ns.v);", "async_ok\n");
 }

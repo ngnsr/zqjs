@@ -2636,3 +2636,48 @@ test "M47: multi-limb BigInt churn and Map/Set/object/closure/constant survival 
     defer testing.allocator.free(tw_out);
     try testing.expectEqualStrings("true true\n", tw_out);
 }
+
+test "M48: forced GC across TLA suspension, dynamic import(), and import.meta (both engines)" {
+    const entries = [_]struct { id: []const u8, src: []const u8 }{
+        .{ .id = "dep.js", .src =
+        \\export const val = await Promise.resolve({ tag: 'ok' });
+        \\export function getMeta() { return import.meta; }
+        },
+    };
+    const Loader = struct {
+        entries: []const @TypeOf(entries[0]),
+        fn load(ctx: ?*anyopaque, _: ?[]const u8, spec: []const u8) zqjs.module.LoadError!zqjs.module.LoadedModule {
+            const self: *const @This() = @ptrCast(@alignCast(ctx.?));
+            const key = if (std.mem.startsWith(u8, spec, "./")) spec[2..] else spec;
+            for (self.entries) |e| {
+                if (std.mem.eql(u8, e.id, key)) return .{ .canonical_id = e.id, .source = e.src };
+            }
+            return error.ModuleNotFound;
+        }
+    };
+    const main_src =
+        \\import.meta.keep = { n: 42 };
+        \\let acc = 0;
+        \\for (let i = 0; i < 200; i++) {
+        \\  const obj = { i, arr: [i, i + 1] };
+        \\  acc += obj.arr[0];
+        \\}
+        \\const ns = await import('./dep.js');
+        \\const m = ns.getMeta();
+        \\print(import.meta.keep.n, ns.val.tag, m === ns.getMeta(), acc > 0);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        var out_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out_buf.deinit();
+        var rt = zqjs.Runtime.init(testing.allocator, .{ .max_heap_bytes = 256 << 10 }, &out_buf.writer);
+        defer rt.deinit();
+        rt.stack_base = @frameAddress();
+        rt.heap.collect_always = true;
+        const ml: Loader = .{ .entries = &entries };
+        rt.modules.loader = .{ .ctx = @constCast(&ml), .load = Loader.load };
+
+        var mod_diag: zqjs.module.ModuleDiag = .{};
+        _ = try zqjs.module.runEntry(&rt, "main.js", main_src, engine, &mod_diag);
+        try testing.expectEqualStrings("42 ok true true\n", out_buf.written());
+    }
+}

@@ -1945,3 +1945,22 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
 - **Frontend, Bytecode & Semantics (`lexer.zig`, `parser.zig`, `compiler.zig`, `verify.zig`, `ops.zig`, `object.zig`, `json.zig`, `vm.zig`, `machine.zig`):**
   - Lexer validates decimal/hex/octal/binary BigInt literals and rejects `01n`, `1.5n`, `1e5n`, `1__0n`, `0x_1n`, `10_n` as `SyntaxError`. Compiler deduplicates BigInt constants in `Proto.consts`.
   - Added `Op.to_numeric` for `++`/`--` (preserving `BigInt` while `.to_number` continues to throw `TypeError` for `+1n`), `ops.toBigInt` for `ToBigInt`, `JSON.stringify` `TypeError` unless `BigInt.prototype.toJSON` is defined, and `BigInt64Array`/`BigUint64Array` + `DataView` 64-bit BigInt accessors.
+
+---
+
+## D78. Modern ESM: Module Top-Level `await`, Dynamic `import()`, and `import.meta` (M48)
+
+**Decision:** Implement ES2020 `import.meta`, ES2020 dynamic `import(specifier)`, and ES2022 module top-level `await` / `for await` across both engines (`Vm` and tree-walking `Machine`), CLI, Zig embedding API, and C ABI, extending D56 and D72.
+
+- **Enclosing Module Context Propagation (`Proto`, `compiler.zig`, `heap.zig`, `machine.zig`, `module.zig`):**
+  - `Proto.module_record: ?*anyopaque` is set on a module's root `Proto` and propagated recursively to all nested child `Proto`s (`null` for plain scripts).
+  - `Closure.impl.tree.module_record: ?*anyopaque` and `Machine.module_record` propagate the enclosing `ModuleRecord` across nested functions, arrows, classes, and async closures on `--engine=treewalk`.
+- **`import.meta` (`ast.zig`, `parser.zig`, `bytecode.zig`, `vm.zig`, `machine.zig`, `module.zig`):**
+  - `import.meta` parses as `Expr.Data.import_meta` only in `.module` mode (`SyntaxError` in `.script` mode; any other `import.<ident>` or assignment target `import.meta = x` / `++import.meta` is `SyntaxError`).
+  - Cold opcode `get_import_meta` (`[] → [obj]`) and `Machine` eval arm lazily allocate `ModuleRecord.import_meta` (`proto = null`, own data property `url`, rooted in `ModuleRegistry.markRoots`), preserving object identity across the module and nested closures. `FsLoader` formats `url` as `file://<abs_path>`; custom host loaders use `canonical_id`.
+- **Dynamic `import(specifier)` (`ast.zig`, `parser.zig`, `bytecode.zig`, `vm.zig`, `machine.zig`, `module.zig`):**
+  - `import(assignmentExpr)` parses as `Expr.Data.dynamic_import` in both `.script` and `.module` modes with `CallExpression` precedence (`new import('x')` and `import()` are `SyntaxError`; 2nd options argument `import('x', opts)` is `Unsupported(syntax)`).
+  - Cold opcode `dynamic_import` (`[specifier] → [promise]`, calling `cache.syncSp(vm)` before runtime) and `Machine` `.dynamic_import` task delegate to shared `module.dynamicImport`. `ToString` errors, missing loader/module, parse/link `SyntaxError`, and evaluation throws/rejections reject the returned Promise; uncatchable engine faults (`LimitExceeded`, `OutOfMemory`, `Unsupported`) propagate normally (D14).
+- **Module Top-Level `await` & `for await` (`parser.zig`, `module.zig`, `machine.zig`):**
+  - `.module` mode sets `async_ctx = .body` (allowing `await` / `for await` at top level while keeping `await` reserved as an identifier).
+  - `ModuleRecord` tracks `Status.evaluating_async`, `has_tla`, `async_eval`, `pending_async_deps`, `async_parents`, `eval_promise` (GC-rooted), and Tarjan SCC state (`dfs_index`, `dfs_ancestor_index`, `cycle_root`). Synchronous subgraphs keep the synchronous evaluation path; async modules run with `Proto.is_async = true` / `machine.runModuleTopLevelAsync`, coordinate parent-child readiness and error propagation via `builtins.performPromiseThen` native reaction closures, and `runEntry` drains microtasks and surfaces uncaught TLA rejections as `error.Thrown`.

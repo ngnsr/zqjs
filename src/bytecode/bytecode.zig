@@ -217,6 +217,10 @@ pub const Op = enum(u8) {
     require_obj,
     /// [src, k0 … k(n-1)] → [rest_obj]: copy own enumerable properties of `src` except k0..k(n-1).
     object_rest,
+    /// [] → [obj]: `import.meta` object for the enclosing module (M48, D78).
+    get_import_meta,
+    /// [specifier] → [promise]: dynamic `import(specifier)` (M48, D78).
+    dynamic_import,
 
     // ---- operators (runtime/ops.zig): pop operands, push the result
     add,
@@ -426,6 +430,8 @@ pub const Op = enum(u8) {
             .async_yield_star_call => .{ .operands = &.{}, .pops = 3, .pushes = 2 },
             .async_yield_star_result => .{ .operands = &.{}, .pops = 2, .pushes = 2 },
             .throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
+            .get_import_meta => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
+            .dynamic_import => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
         };
     }
 
@@ -520,6 +526,8 @@ pub const Proto = struct {
     repl_cells: []*heap.Cell = &.{},
     /// True when compiled from an ES Module (`this` at top-level is `undefined`, D72).
     is_module: bool = false,
+    /// Borrowed `*ModuleRecord` for `import.meta` and relative dynamic `import()` (M48, D78).
+    module_record: ?*anyopaque = null,
 
     pub const TemplateSite = struct {
         /// Indices into `consts` (`std.math.maxInt(u32)` means `undefined` for invalid escapes).

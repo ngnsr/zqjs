@@ -34,6 +34,7 @@ const object = @import("../runtime/object.zig");
 const builtins = @import("../runtime/builtins.zig");
 const bigint = @import("../runtime/bigint.zig");
 const coroutine = @import("../runtime/coroutine.zig");
+const module = @import("../runtime/module.zig");
 
 /// Helper for `++` / `--` supporting both Number and BigInt.
 fn stepNumeric(rt: *Runtime, old_in: Value, is_inc: bool) Error!struct { old: Value, new: Value } {
@@ -51,13 +52,23 @@ pub fn run(rt: *Runtime, script: ast.Script, res: Resolution) Error!void {
     return runMeasured(rt, script, res, null);
 }
 
+/// Runs a resolved ES Module body without draining microtasks (D72, D78).
+pub fn runModuleBody(rt: *Runtime, script: ast.Script, res: *const Resolution, module_cells: []*heap.Cell, module_record: ?*anyopaque) Error!void {
+    return runModuleImpl(rt, script, res, module_cells, module_record, false);
+}
+
 /// Runs a resolved ES Module with pre-linked cells (D72).
-pub fn runModule(rt: *Runtime, script: ast.Script, res: *const Resolution, module_cells: []*heap.Cell) Error!void {
+pub fn runModule(rt: *Runtime, script: ast.Script, res: *const Resolution, module_cells: []*heap.Cell, module_record: ?*anyopaque) Error!void {
+    return runModuleImpl(rt, script, res, module_cells, module_record, true);
+}
+
+fn runModuleImpl(rt: *Runtime, script: ast.Script, res: *const Resolution, module_cells: []*heap.Cell, module_record: ?*anyopaque, drain: bool) Error!void {
     var m: Machine = .{
         .rt = rt,
         .res = res.*,
         .res_ptr = res,
         .repl_cells = module_cells,
+        .module_record = module_record,
         .is_module = true,
         .this = .undefined,
         .stack_top = if (builtin.is_test) @frameAddress() else 0,
@@ -65,15 +76,22 @@ pub fn runModule(rt: *Runtime, script: ast.Script, res: *const Resolution, modul
     };
     defer m.deinit();
     const prev_roots = rt.engine_roots;
-    rt.engine_roots = m.roots();
-    defer rt.engine_roots = prev_roots;
+    const is_nested = prev_roots != null;
+    if (is_nested) {
+        try rt.addRoots(m.roots());
+    } else {
+        rt.engine_roots = m.roots();
+    }
+    defer if (is_nested) rt.removeRoots(&m) else {
+        rt.engine_roots = prev_roots;
+    };
     const prev_caller = rt.closure_caller;
     rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
     defer rt.closure_caller = prev_caller;
 
     try m.pushBlock(script.statements);
     _ = try m.runLoop(0);
-    try rt.drainMicrotasks();
+    if (drain) try rt.drainMicrotasks();
 }
 
 /// Runs a resolved script in REPL mode with persistent bindings and completion value.
@@ -90,8 +108,15 @@ pub fn runRepl(rt: *Runtime, script: ast.Script, res: *const Resolution, repl_ce
     };
     defer m.deinit();
     const prev_roots = rt.engine_roots;
-    rt.engine_roots = m.roots();
-    defer rt.engine_roots = prev_roots;
+    const is_nested = prev_roots != null;
+    if (is_nested) {
+        try rt.addRoots(m.roots());
+    } else {
+        rt.engine_roots = m.roots();
+    }
+    defer if (is_nested) rt.removeRoots(&m) else {
+        rt.engine_roots = prev_roots;
+    };
     const prev_caller = rt.closure_caller;
     rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
     defer rt.closure_caller = prev_caller;
@@ -103,22 +128,36 @@ pub fn runRepl(rt: *Runtime, script: ast.Script, res: *const Resolution, repl_ce
 
 /// Starts a top-level-await REPL script as an async coroutine on the tree-walker.
 pub fn runReplTopLevelAsync(rt: *Runtime, script: ast.Script, res: *const Resolution, repl_cells: []*heap.Cell) Error!Value {
-    const ReplAsyncCtx = struct {
+    return runTopLevelAsyncImpl(rt, script, res, repl_cells, false, null);
+}
+
+/// Starts a top-level-await ES Module as an async coroutine on the tree-walker (D78).
+pub fn runModuleTopLevelAsync(rt: *Runtime, script: ast.Script, res: *const Resolution, module_cells: []*heap.Cell, module_record: ?*anyopaque) Error!Value {
+    return runTopLevelAsyncImpl(rt, script, res, module_cells, true, module_record);
+}
+
+fn runTopLevelAsyncImpl(rt: *Runtime, script: ast.Script, res: *const Resolution, cells: []*heap.Cell, is_module: bool, module_record: ?*anyopaque) Error!Value {
+    const TopLevelAsyncCtx = struct {
         rt: *Runtime,
         script: ast.Script,
         res: *const Resolution,
-        repl_cells: []*heap.Cell,
+        cells: []*heap.Cell,
+        is_module: bool,
+        module_record: ?*anyopaque,
     };
     const create_and_run = struct {
-        fn call(ctx: ReplAsyncCtx, co: *heap.Coroutine) Error!coroutine.Outcome {
+        fn call(ctx: TopLevelAsyncCtx, co: *heap.Coroutine) Error!coroutine.Outcome {
             const m_ptr = try ctx.rt.gpa.create(Machine);
             m_ptr.* = .{
                 .rt = ctx.rt,
                 .res = ctx.res.*,
                 .res_ptr = ctx.res,
-                .repl_cells = ctx.repl_cells,
-                .repl_mode = true,
-                .repl_top_stmts = ctx.script.statements,
+                .repl_cells = ctx.cells,
+                .module_record = ctx.module_record,
+                .repl_mode = !ctx.is_module,
+                .is_module = ctx.is_module,
+                .this = if (ctx.is_module) .undefined else null,
+                .repl_top_stmts = if (ctx.is_module) null else ctx.script.statements,
                 .is_coroutine = true,
                 .stack_top = if (builtin.is_test) @frameAddress() else 0,
                 .lowest_frame = if (builtin.is_test) @frameAddress() else 0,
@@ -136,11 +175,13 @@ pub fn runReplTopLevelAsync(rt: *Runtime, script: ast.Script, res: *const Resolu
             return Machine.runCoroMachine(m_ptr, 0, 0, .start);
         }
     }.call;
-    return coroutine.start(rt, &Machine.coro_vtable, ReplAsyncCtx{
+    return coroutine.start(rt, &Machine.coro_vtable, TopLevelAsyncCtx{
         .rt = rt,
         .script = script,
         .res = res,
-        .repl_cells = repl_cells,
+        .cells = cells,
+        .is_module = is_module,
+        .module_record = module_record,
     }, create_and_run);
 }
 
@@ -158,8 +199,15 @@ fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUs
     };
     defer m.deinit();
     const prev_roots = rt.engine_roots;
-    rt.engine_roots = m.roots();
-    defer rt.engine_roots = prev_roots;
+    const is_nested = prev_roots != null;
+    if (is_nested) {
+        try rt.addRoots(m.roots());
+    } else {
+        rt.engine_roots = m.roots();
+    }
+    defer if (is_nested) rt.removeRoots(&m) else {
+        rt.engine_roots = prev_roots;
+    };
     const prev_caller = rt.closure_caller;
     rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
     defer rt.closure_caller = prev_caller;
@@ -300,7 +348,9 @@ const Task = union(enum) {
         saved_res: Resolution = undefined,
         saved_res_ptr: ?*const Resolution = null,
         saved_repl_cells: []*heap.Cell = &.{},
+        saved_module_record: ?*anyopaque = null,
     },
+    dynamic_import,
     barrier: u32,
     await_suspend,
     /// A generator's suspension after its parameters are bound (D67).
@@ -375,6 +425,7 @@ const Machine = struct {
     res: Resolution,
     res_ptr: ?*const Resolution = null,
     repl_cells: []*heap.Cell = &.{},
+    module_record: ?*anyopaque = null,
     repl_mode: bool = false,
     is_module: bool = false,
     repl_top_stmts: ?[]const ast.Stmt = null,
@@ -596,6 +647,7 @@ const Machine = struct {
         const cl = try m.rt.heap.newTreeClosure(f, env);
         cl.impl.tree.res = if (m.res_ptr) |rp| @ptrCast(rp) else null;
         cl.impl.tree.repl_cells = m.repl_cells;
+        cl.impl.tree.module_record = m.module_record;
         return cl;
     }
 
@@ -752,6 +804,7 @@ const Machine = struct {
                     m.res = cr.saved_res;
                     m.res_ptr = cr.saved_res_ptr;
                     m.repl_cells = cr.saved_repl_cells;
+                    m.module_record = cr.saved_module_record;
                     m.calls -= 1;
                     m.depth -= 1;
                     m.values.shrinkRetainingCapacity(cr.values_base);
@@ -1044,6 +1097,13 @@ const Machine = struct {
                 m.depth -= 1;
             },
             .pop_value => _ = m.popVal(),
+            .dynamic_import => {
+                const spec_val = m.popVal();
+                const mod_ptr: ?*module.ModuleRecord = if (m.module_record) |mp| @ptrCast(@alignCast(mp)) else null;
+                const promise_obj = try module.dynamicImport(rt, mod_ptr, spec_val, .treewalk);
+                m.depth -= 1;
+                try m.pushVal(.{ .object = promise_obj });
+            },
             .barrier, .await_suspend, .generator_start, .yield_suspend => unreachable, // handled in runLoop
             .yield_star_wait, .async_yield_star_wait => unreachable, // consumed by the resume
             .async_yield_star_init => {
@@ -2228,6 +2288,7 @@ const Machine = struct {
                 m.res = cr.saved_res;
                 m.res_ptr = cr.saved_res_ptr;
                 m.repl_cells = cr.saved_repl_cells;
+                m.module_record = cr.saved_module_record;
                 m.calls -= 1;
                 m.depth -= 1;
                 m.values.shrinkRetainingCapacity(cr.values_base);
@@ -3243,6 +3304,16 @@ const Machine = struct {
                 try m.pushTask(.{ .private_in_finish = pi.name });
                 try m.pushEval(pi.rhs);
             },
+            .import_meta => {
+                const mod_ptr = m.module_record orelse return rt.bug("import.meta outside a module");
+                const meta_obj = try module.getImportMeta(rt, @ptrCast(@alignCast(mod_ptr)));
+                m.depth -= 1;
+                try m.pushVal(.{ .object = meta_obj });
+            },
+            .dynamic_import => |spec| {
+                try m.pushTask(.dynamic_import);
+                try m.pushEval(spec);
+            },
             .delete => |mem| {
                 try m.pushTask(.{ .member_base = .{ .key = mem.key, .is_delete = true } });
                 try m.pushEval(mem.object);
@@ -3459,6 +3530,7 @@ const Machine = struct {
             .saved_res = m.res,
             .saved_res_ptr = m.res_ptr,
             .saved_repl_cells = m.repl_cells,
+            .saved_module_record = m.module_record,
         } });
 
         if (closure.impl.tree.res) |rp| {
@@ -3467,6 +3539,7 @@ const Machine = struct {
             m.res_ptr = res_ptr;
             m.repl_cells = closure.impl.tree.repl_cells;
         }
+        m.module_record = closure.impl.tree.module_record;
         m.env = env;
         m.this = if (f.has_super_ctor) null else if (f.is_arrow) (if (closure.meta) |meta| meta.lexical_this else null) else this;
         m.current_closure = closure;
@@ -3615,6 +3688,7 @@ const Machine = struct {
             m_ptr.res_ptr = res_ptr;
             m_ptr.repl_cells = t.repl_cells;
         }
+        m_ptr.module_record = t.module_record;
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
         try m_ptr.values.appendSlice(rt.gpa, ctx.args);
         try m_ptr.pushClosureCallSync(ctx.closure, f, t.env, ctx.this, 0, 0, null, false);

@@ -665,3 +665,7 @@
 ["syntax", "import foo from './foo.js';"]
 ["syntax", "export const a = 1;"]
 ["syntax", "export default 42;"]
+["syntax", "import.meta;"]
+["ok", "import('x');"]
+["syntax", "new import('x');"]
+["syntax", "import();"]

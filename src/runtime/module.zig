@@ -19,8 +19,11 @@ const verify = @import("../bytecode/verify.zig");
 const heap = @import("heap.zig");
 const Value = @import("value.zig").Value;
 const builtins = @import("builtins.zig");
-const Runtime = @import("runtime.zig").Runtime;
-const RuntimeError = @import("runtime.zig").Error;
+const ops = @import("ops.zig");
+const rt_mod = @import("runtime.zig");
+const Runtime = rt_mod.Runtime;
+const RuntimeError = rt_mod.Error;
+const ValueRoots = rt_mod.ValueRoots;
 const Vm = @import("../vm/vm.zig").Vm;
 const machine = @import("../interp/machine.zig");
 const Engine = @import("../run.zig").Engine;
@@ -60,6 +63,7 @@ pub const Status = enum {
     linking,
     linked,
     evaluating,
+    evaluating_async,
     evaluated,
     errored,
 };
@@ -87,9 +91,20 @@ pub const ModuleRecord = struct {
     proto: ?*Proto = null,
     cells: []*heap.Cell = &.{},
     namespace: ?*heap.Object = null,
+    import_meta: ?*heap.Object = null,
     status: Status = .unlinked,
     eval_error: ?Value = null,
     eval_fault: ?RuntimeError = null,
+
+    has_tla: bool = false,
+    async_eval: bool = false,
+    pending_async_deps: u32 = 0,
+    async_parents: std.ArrayList(*ModuleRecord) = .empty,
+    eval_promise: ?*heap.Object = null,
+    dfs_index: u32 = 0,
+    dfs_ancestor_index: u32 = 0,
+    cycle_root: ?*ModuleRecord = null,
+    mod_index: u32 = 0,
 
     local_exports: std.StringHashMapUnmanaged(*heap.Cell) = .empty,
     indirect_exports: std.StringHashMapUnmanaged(IndirectExport) = .empty,
@@ -104,6 +119,7 @@ pub const ModuleRecord = struct {
             gpa.destroy(p);
         }
         if (m.cells.len > 0) gpa.free(m.cells);
+        m.async_parents.deinit(gpa);
         m.local_exports.deinit(gpa);
         m.indirect_exports.deinit(gpa);
         m.star_reexports.deinit(gpa);
@@ -135,6 +151,8 @@ pub const ModuleRegistry = struct {
         for (reg.list.items) |m| {
             for (m.cells) |cell| h.markObj(&cell.obj);
             if (m.namespace) |ns| h.markObj(&ns.obj);
+            if (m.import_meta) |im| h.markObj(&im.obj);
+            if (m.eval_promise) |ep| h.markObj(&ep.obj);
             if (m.eval_error) |v| h.markValue(v);
             var ns_it = m.ns_reexports.valueIterator();
             while (ns_it.next()) |entry| h.markObj(&entry.cell.obj);
@@ -155,6 +173,11 @@ fn setProtoReplCells(p: *Proto, cells: []*heap.Cell) void {
     for (p.functions) |*child| setProtoReplCells(child, cells);
 }
 
+fn setProtoModuleRecord(p: *Proto, mod: *ModuleRecord) void {
+    p.module_record = mod;
+    for (p.functions) |*child| setProtoModuleRecord(child, mod);
+}
+
 /// Loads, parses, compiles (if `.vm`), links, and evaluates an ES module graph.
 /// Returns the entry module's namespace object on success.
 pub fn runEntry(
@@ -166,6 +189,18 @@ pub fn runEntry(
 ) (ModuleError || RuntimeError)!*heap.Object {
     const entry = try loadAndLink(rt, specifier, entry_source, engine, mod_diag);
     try evaluateModule(rt, entry, engine);
+    if (entry.eval_promise) |ep| {
+        var held = [_]Value{.{ .object = ep }};
+        var roots: ValueRoots = .{ .values = &held };
+        try roots.register(rt);
+        defer roots.unregister(rt);
+        try rt.drainMicrotasks();
+        switch (ep.kind.promise.state) {
+            .fulfilled => {},
+            .rejected => return rt.throwValue(ep.kind.promise.result),
+            .pending => {},
+        }
+    }
     return try getNamespace(rt, entry);
 }
 
@@ -291,7 +326,7 @@ fn loadModule(
     if (engine == .vm) {
         const p = try gpa.create(Proto);
         errdefer gpa.destroy(p);
-        p.* = compiler.compileWithOptions(gpa, &rt.heap, script, res, rt.limits, .{ .is_module = true }, &diag) catch |e| switch (e) {
+        p.* = compiler.compileWithOptions(gpa, &rt.heap, script, res, rt.limits, .{ .is_module = true, .top_level_await = script.has_top_level_await }, &diag) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.LimitExceeded => {
                 mod_diag.diag = diag;
@@ -322,7 +357,10 @@ fn loadModule(
         .script = script,
         .res = res,
         .proto = proto_ptr,
+        .has_tla = script.has_top_level_await,
+        .mod_index = @intCast(rt.modules.list.items.len),
     };
+    if (proto_ptr) |p| setProtoModuleRecord(p, mod);
 
     try rt.modules.list.ensureUnusedCapacity(gpa, 1);
     try rt.modules.map.ensureUnusedCapacity(gpa, 1);
@@ -535,6 +573,7 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                     const cl = rt.heap.newTreeClosure(f, null) catch |e| return mapHeapErr(e, rt);
                     cl.impl.tree.res = @ptrCast(&m.res);
                     cl.impl.tree.repl_cells = m.cells;
+                    cl.impl.tree.module_record = m;
                     const ri = m.res.bindings[f.name.?.binding].repl_index.?;
                     rt.heap.storeCell(m.cells[ri], .{ .closure = cl });
                 },
@@ -543,6 +582,7 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                         const cl = rt.heap.newTreeClosure(f, null) catch |e| return mapHeapErr(e, rt);
                         cl.impl.tree.res = @ptrCast(&m.res);
                         cl.impl.tree.repl_cells = m.cells;
+                        cl.impl.tree.module_record = m;
                         const ri = m.res.bindings[f.name.?.binding].repl_index.?;
                         rt.heap.storeCell(m.cells[ri], .{ .closure = cl });
                     },
@@ -550,6 +590,7 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                         const cl = rt.heap.newTreeClosure(df.func, null) catch |e| return mapHeapErr(e, rt);
                         cl.impl.tree.res = @ptrCast(&m.res);
                         cl.impl.tree.repl_cells = m.cells;
+                        cl.impl.tree.module_record = m;
                         const def_ri = m.res.bindings[df.binding].repl_index.?;
                         rt.heap.storeCell(m.cells[def_ri], .{ .closure = cl });
                         if (df.func.name) |n| {
@@ -724,10 +765,257 @@ fn collectExportedNames(
     }
 }
 
+pub fn getImportMeta(rt: *Runtime, mod: *ModuleRecord) RuntimeError!*heap.Object {
+    if (mod.import_meta) |im| return im;
+
+    const obj = try rt.heap.newObject(null);
+    var held = [_]Value{ .{ .object = obj }, .undefined };
+    var roots: ValueRoots = .{ .values = &held };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const is_fs = if (rt.modules.loader) |l| l.load == FsLoader.load else false;
+    var owned_url: ?[]u8 = null;
+    defer if (owned_url) |u| rt.gpa.free(u);
+
+    const url_utf8: []const u8 = if (is_fs and !std.mem.startsWith(u8, mod.canonical_id, "file://")) blk: {
+        owned_url = try std.fmt.allocPrint(rt.gpa, "file://{s}", .{mod.canonical_id});
+        break :blk owned_url.?;
+    } else mod.canonical_id;
+
+    const url_str = try utf8ToHeapString(rt, url_utf8);
+    held[1] = .{ .string = url_str };
+
+    try rt.heap.defineProperty(obj, try rt.heap.internAscii("url"), .{
+        .value = held[1],
+        .writable = true,
+        .enumerable = true,
+        .configurable = true,
+    });
+    mod.import_meta = obj;
+    return obj;
+}
+
+fn utf8ToHeapString(rt: *Runtime, text: []const u8) RuntimeError!*heap.String {
+    if (std.unicode.utf8ValidateSlice(text)) {
+        const units = std.unicode.utf8ToUtf16LeAlloc(rt.gpa, text) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return rt.heap.internAscii(text),
+        };
+        defer rt.gpa.free(units);
+        return rt.heap.newString(&.{.{ .utf16 = units }});
+    }
+    return rt.heap.internAscii(text);
+}
+
+pub fn dynamicImport(
+    rt: *Runtime,
+    referrer_mod: ?*ModuleRecord,
+    specifier_val: Value,
+    engine: Engine,
+) RuntimeError!*heap.Object {
+    const r = try builtins.realm(rt);
+    const p = try rt.heap.newPromise(r.promise_prototype);
+
+    var held = [_]Value{ .{ .object = p }, specifier_val, .undefined, .undefined, .undefined };
+    var roots: ValueRoots = .{ .values = &held };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const spec_str_val = ops.toStringValue(rt, specifier_val) catch |e| switch (e) {
+        error.Thrown => {
+            const err_val = try rt.catchValue();
+            try builtins.settlePromiseFromJob(rt, p, true, err_val);
+            return p;
+        },
+        else => return e,
+    };
+    held[1] = spec_str_val;
+
+    const spec_utf8 = std.unicode.utf16LeToUtf8Alloc(rt.gpa, spec_str_val.string.units) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try rejectPromiseWithError(rt, p, .TypeError, "Invalid module specifier");
+            return p;
+        },
+    };
+    defer rt.gpa.free(spec_utf8);
+
+    const referrer_id: ?[]const u8 = if (referrer_mod) |rm| rm.canonical_id else null;
+    const start_len = rt.modules.list.items.len;
+    var mod_diag: ModuleDiag = .{};
+
+    const target_mod = loadAndLinkFromReferrer(rt, referrer_id, spec_utf8, engine, start_len, &mod_diag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.LimitExceeded => return error.LimitExceeded,
+        error.Unsupported => return error.Unsupported,
+        error.InvalidBytecode => return rt.bug("invalid module bytecode"),
+        error.SyntaxError => {
+            const msg = switch (mod_diag.diag.detail) {
+                .syntax_error => |m| m,
+                else => "SyntaxError",
+            };
+            try rejectPromiseWithError(rt, p, .SyntaxError, msg);
+            return p;
+        },
+        error.ModuleNotFound => {
+            try rejectPromiseWithError(rt, p, .TypeError, "Cannot find module");
+            return p;
+        },
+        error.HostError => {
+            try rejectPromiseWithError(rt, p, .TypeError, "Module load failed");
+            return p;
+        },
+    };
+
+    switch (target_mod.status) {
+        .evaluated => {
+            const ns = try getNamespace(rt, target_mod);
+            held[2] = .{ .object = ns };
+            try builtins.resolvePromiseValue(rt, p, held[2]);
+            return p;
+        },
+        .errored => {
+            if (target_mod.eval_error) |v| {
+                try builtins.settlePromiseFromJob(rt, p, true, v);
+                return p;
+            }
+            return target_mod.eval_fault.?;
+        },
+        .evaluating => {
+            const ns = try getNamespace(rt, target_mod);
+            held[2] = .{ .object = ns };
+            try builtins.resolvePromiseValue(rt, p, held[2]);
+            return p;
+        },
+        .evaluating_async => {
+            try attachDynImportReaction(rt, target_mod, p, &held);
+            return p;
+        },
+        .linked => {
+            evaluateModule(rt, target_mod, engine) catch |e| switch (e) {
+                error.Thrown => {
+                    const err_val = try rt.catchValue();
+                    try builtins.settlePromiseFromJob(rt, p, true, err_val);
+                    return p;
+                },
+                else => return e,
+            };
+            switch (target_mod.status) {
+                .evaluated => {
+                    const ns = try getNamespace(rt, target_mod);
+                    held[2] = .{ .object = ns };
+                    try builtins.resolvePromiseValue(rt, p, held[2]);
+                },
+                .evaluating_async => try attachDynImportReaction(rt, target_mod, p, &held),
+                .errored => {
+                    if (target_mod.eval_error) |v| {
+                        try builtins.settlePromiseFromJob(rt, p, true, v);
+                    } else {
+                        return target_mod.eval_fault.?;
+                    }
+                },
+                else => unreachable,
+            }
+            return p;
+        },
+        .unlinked, .linking => return rt.bug("evaluating unlinked module"),
+    }
+}
+
+fn loadAndLinkFromReferrer(
+    rt: *Runtime,
+    referrer_id: ?[]const u8,
+    specifier: []const u8,
+    engine: Engine,
+    start_len: usize,
+    mod_diag: *ModuleDiag,
+) ModuleError!*ModuleRecord {
+    errdefer rollbackNewModules(rt, start_len);
+    const mod = try loadModule(rt, referrer_id, specifier, null, engine, mod_diag);
+    try linkGraph(rt, engine, start_len, mod_diag);
+    return mod;
+}
+
+fn attachDynImportReaction(rt: *Runtime, target: *ModuleRecord, result_p: *heap.Object, held: *[5]Value) RuntimeError!void {
+    const ep = target.eval_promise orelse return rt.bug("evaluating_async module missing eval_promise");
+    const env = try rt.heap.newArray(null);
+    held[2] = .{ .object = env };
+    try rt.heap.appendElements(env, &.{ .{ .number = @floatFromInt(target.mod_index) }, .{ .object = result_p } });
+    const on_ful = try rt.heap.newNativeClosure(&dynImportFulfillCb, env);
+    held[3] = .{ .closure = on_ful };
+    const on_rej = try rt.heap.newNativeClosure(&dynImportRejectCb, env);
+    held[4] = .{ .closure = on_rej };
+    try builtins.performPromiseThen(rt, ep, held[3], held[4]);
+}
+
+fn dynImportFulfillCb(rt: *Runtime, env: *heap.Object, _: []const Value) RuntimeError!Value {
+    const mod_idx: usize = @intFromFloat(env.kind.array.items[0].number);
+    const result_p = env.kind.array.items[1].object;
+    const mod = rt.modules.list.items[mod_idx];
+    var held = [_]Value{ .{ .object = result_p }, .undefined };
+    var roots: ValueRoots = .{ .values = &held };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const ns = try getNamespace(rt, mod);
+    held[1] = .{ .object = ns };
+    try builtins.resolvePromiseValue(rt, result_p, held[1]);
+    return .undefined;
+}
+
+fn dynImportRejectCb(rt: *Runtime, env: *heap.Object, args: []const Value) RuntimeError!Value {
+    const result_p = env.kind.array.items[1].object;
+    const reason = if (args.len > 0) args[0] else .undefined;
+    try builtins.settlePromiseFromJob(rt, result_p, true, reason);
+    return .undefined;
+}
+
+fn rejectPromiseWithError(rt: *Runtime, p: *heap.Object, err_name: @FieldType(rt_mod.Exception, "name"), msg: []const u8) RuntimeError!void {
+    const e = rt.throw(err_name, &.{.{ .ascii = msg }});
+    if (e == error.Thrown) {
+        const err_val = try rt.catchValue();
+        try builtins.settlePromiseFromJob(rt, p, true, err_val);
+        return;
+    }
+    return e;
+}
+
 pub fn evaluateModule(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeError!void {
     switch (mod.status) {
-        .evaluated => return,
-        .evaluating => return,
+        .evaluated, .evaluating, .evaluating_async => return,
+        .errored => {
+            if (mod.eval_error) |v| return rt.throwValue(v);
+            return mod.eval_fault.?;
+        },
+        .linked => {},
+        .unlinked, .linking => return rt.bug("evaluating unlinked module"),
+    }
+
+    var stack: std.ArrayList(*ModuleRecord) = .empty;
+    defer stack.deinit(rt.gpa);
+
+    _ = innerModuleEvaluation(rt, mod, engine, &stack, 0) catch |e| {
+        const err_val: ?Value = if (e == error.Thrown) (rt.catchValue() catch null) else null;
+        for (stack.items) |w| {
+            if (w.status == .evaluating) {
+                w.status = .errored;
+                if (err_val) |v| w.eval_error = v else w.eval_fault = e;
+            }
+        }
+        if (err_val) |v| return rt.throwValue(v);
+        return e;
+    };
+}
+
+fn innerModuleEvaluation(
+    rt: *Runtime,
+    mod: *ModuleRecord,
+    engine: Engine,
+    stack: *std.ArrayList(*ModuleRecord),
+    index: u32,
+) RuntimeError!u32 {
+    switch (mod.status) {
+        .evaluated, .evaluating_async, .evaluating => return index,
         .errored => {
             if (mod.eval_error) |v| return rt.throwValue(v);
             return mod.eval_fault.?;
@@ -737,36 +1025,209 @@ pub fn evaluateModule(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeE
     }
 
     mod.status = .evaluating;
-    evaluateModuleBody(rt, mod, engine) catch |e| {
-        mod.status = .errored;
-        if (e == error.Thrown) {
-            if (rt.catchValue()) |val| {
-                mod.eval_error = val;
-                _ = rt.throwValue(val) catch {};
-            } else |_| {
-                mod.eval_fault = e;
-            }
-        } else {
-            mod.eval_fault = e;
-        }
-        return e;
-    };
+    mod.dfs_index = index;
+    mod.dfs_ancestor_index = index;
+    mod.pending_async_deps = 0;
+    var next_index = index + 1;
+    try stack.append(rt.gpa, mod);
 
-    mod.status = .evaluated;
-}
-
-fn evaluateModuleBody(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeError!void {
     for (mod.deps.items) |dep| {
-        try evaluateModule(rt, dep, engine);
+        next_index = try innerModuleEvaluation(rt, dep, engine, stack, next_index);
+        if (dep.status == .evaluating) {
+            mod.dfs_ancestor_index = @min(mod.dfs_ancestor_index, dep.dfs_ancestor_index);
+        } else {
+            const dep_root = dep.cycle_root orelse dep;
+            if (dep_root.status == .errored) {
+                if (dep_root.eval_error) |v| return rt.throwValue(v);
+                return dep_root.eval_fault.?;
+            }
+            if (dep_root.async_eval) {
+                mod.pending_async_deps += 1;
+                try dep_root.async_parents.append(rt.gpa, mod);
+            }
+        }
     }
 
+    if (mod.pending_async_deps > 0 or mod.has_tla) {
+        mod.async_eval = true;
+    }
+
+    if (mod.dfs_ancestor_index == mod.dfs_index) {
+        var scc: std.ArrayList(*ModuleRecord) = .empty;
+        defer scc.deinit(rt.gpa);
+        var has_async = false;
+        while (true) {
+            const w = stack.pop().?;
+            w.cycle_root = mod;
+            if (w.async_eval) has_async = true;
+            try scc.append(rt.gpa, w);
+            if (w == mod) break;
+        }
+
+        if (!has_async) {
+            for (scc.items) |w| {
+                runSyncModuleBody(rt, w, engine) catch |e| {
+                    w.status = .errored;
+                    if (e == error.Thrown) {
+                        if (rt.catchValue()) |val| {
+                            w.eval_error = val;
+                            _ = rt.throwValue(val) catch {};
+                        } else |_| {
+                            w.eval_fault = e;
+                        }
+                    } else {
+                        w.eval_fault = e;
+                    }
+                    return e;
+                };
+                w.status = .evaluated;
+            }
+        } else {
+            const r = try builtins.realm(rt);
+            for (scc.items) |w| {
+                w.async_eval = true;
+                w.status = .evaluating_async;
+                if (w.eval_promise == null) {
+                    w.eval_promise = try rt.heap.newPromise(r.promise_prototype);
+                }
+            }
+            // In a cycle with TLA, a non-TLA member depending on a TLA member in the same SCC must wait for it.
+            for (scc.items) |w| {
+                if (!w.has_tla and w.pending_async_deps == 0) {
+                    for (w.deps.items) |dep| {
+                        if (dep != w and dep.cycle_root == mod and dep.has_tla) {
+                            w.pending_async_deps += 1;
+                            try dep.async_parents.append(rt.gpa, w);
+                        }
+                    }
+                }
+            }
+            for (scc.items) |w| {
+                if (w.pending_async_deps == 0) {
+                    try executeAsyncModule(rt, w, engine);
+                }
+            }
+        }
+    }
+
+    return next_index;
+}
+
+fn runSyncModuleBody(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeError!void {
     if (engine == .vm) {
-        var vm = try Vm.init(rt, mod.proto.?);
-        defer vm.deinit();
-        try vm.run();
-        try rt.drainMicrotasks();
+        try runVmModule(rt, mod.proto.?, true);
     } else {
-        try machine.runModule(rt, mod.script, &mod.res, mod.cells);
+        try machine.runModule(rt, mod.script, &mod.res, mod.cells, mod);
+    }
+}
+
+fn runAsyncDepSyncBody(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeError!void {
+    if (engine == .vm) {
+        try runVmModule(rt, mod.proto.?, false);
+    } else {
+        try machine.runModuleBody(rt, mod.script, &mod.res, mod.cells, mod);
+    }
+}
+
+fn runVmModule(rt: *Runtime, proto: *const Proto, drain: bool) RuntimeError!void {
+    var vm = try Vm.init(rt, proto);
+    defer vm.deinit();
+    const is_nested = rt.engine_roots != null;
+    if (is_nested) {
+        vm.nested = true;
+        try rt.addRoots(vm.roots());
+    }
+    defer if (is_nested) rt.removeRoots(&vm);
+    try vm.run();
+    if (drain) try rt.drainMicrotasks();
+}
+
+fn executeAsyncModule(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeError!void {
+    if (mod.status == .errored) return;
+    if (!mod.has_tla) {
+        runAsyncDepSyncBody(rt, mod, engine) catch |e| {
+            return handleAsyncModuleFailure(rt, mod, e);
+        };
+        try fulfillAsyncModule(rt, mod, engine);
+        return;
+    }
+
+    const body_p_val = (if (engine == .vm)
+        Vm.startTopLevelAsync(rt, mod.proto.?)
+    else
+        machine.runModuleTopLevelAsync(rt, mod.script, &mod.res, mod.cells, mod)) catch |e| {
+        return handleAsyncModuleFailure(rt, mod, e);
+    };
+
+    var held = [_]Value{ body_p_val, .undefined, .undefined, .undefined };
+    var roots: ValueRoots = .{ .values = &held };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const env = try rt.heap.newArray(null);
+    held[1] = .{ .object = env };
+    try rt.heap.appendElements(env, &.{
+        .{ .number = @floatFromInt(mod.mod_index) },
+        .{ .number = @floatFromInt(@backingInt(engine)) },
+    });
+    const on_ful = try rt.heap.newNativeClosure(&asyncModFulfillCb, env);
+    held[2] = .{ .closure = on_ful };
+    const on_rej = try rt.heap.newNativeClosure(&asyncModRejectCb, env);
+    held[3] = .{ .closure = on_rej };
+    try builtins.performPromiseThen(rt, body_p_val.object, held[2], held[3]);
+}
+
+fn handleAsyncModuleFailure(rt: *Runtime, mod: *ModuleRecord, e: RuntimeError) RuntimeError!void {
+    if (e == error.Thrown) {
+        const val = try rt.catchValue();
+        try rejectAsyncModule(rt, mod, val);
+        return;
+    }
+    mod.status = .errored;
+    mod.eval_fault = e;
+    return e;
+}
+
+fn asyncModFulfillCb(rt: *Runtime, env: *heap.Object, _: []const Value) RuntimeError!Value {
+    const mod_idx: usize = @intFromFloat(env.kind.array.items[0].number);
+    const engine: Engine = @fromBackingInt(@intCast(@as(u8, @intFromFloat(env.kind.array.items[1].number))));
+    const mod = rt.modules.list.items[mod_idx];
+    try fulfillAsyncModule(rt, mod, engine);
+    return .undefined;
+}
+
+fn asyncModRejectCb(rt: *Runtime, env: *heap.Object, args: []const Value) RuntimeError!Value {
+    const mod_idx: usize = @intFromFloat(env.kind.array.items[0].number);
+    const mod = rt.modules.list.items[mod_idx];
+    const reason = if (args.len > 0) args[0] else .undefined;
+    try rejectAsyncModule(rt, mod, reason);
+    return .undefined;
+}
+
+fn fulfillAsyncModule(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeError!void {
+    if (mod.status == .errored) return;
+    mod.status = .evaluated;
+    if (mod.eval_promise) |ep| {
+        try builtins.resolvePromiseValue(rt, ep, .undefined);
+    }
+    for (mod.async_parents.items) |parent| {
+        if (parent.status != .evaluating_async) continue;
+        parent.pending_async_deps -= 1;
+        if (parent.pending_async_deps == 0) {
+            try executeAsyncModule(rt, parent, engine);
+        }
+    }
+}
+
+fn rejectAsyncModule(rt: *Runtime, mod: *ModuleRecord, reason: Value) RuntimeError!void {
+    if (mod.status == .errored) return;
+    mod.status = .errored;
+    mod.eval_error = reason;
+    if (mod.eval_promise) |ep| {
+        try builtins.settlePromiseFromJob(rt, ep, true, reason);
+    }
+    for (mod.async_parents.items) |parent| {
+        try rejectAsyncModule(rt, parent, reason);
     }
 }
 
@@ -808,16 +1269,28 @@ pub const FsLoader = struct {
 };
 
 pub fn resolveFsPath(gpa: Allocator, io: std.Io, referrer_id: ?[]const u8, specifier: []const u8) error{ ModuleNotFound, OutOfMemory }![]u8 {
-    _ = io;
     const is_rel = std.mem.startsWith(u8, specifier, "./") or
         std.mem.startsWith(u8, specifier, "../") or
         std.mem.eql(u8, specifier, ".") or
         std.mem.eql(u8, specifier, "..");
 
-    if (referrer_id == null or !is_rel) {
+    if (referrer_id == null) {
         if (!is_rel and !std.fs.path.isAbsolute(specifier)) {
             return error.ModuleNotFound;
         }
+        if (std.fs.path.isAbsolute(specifier)) return normalizePath(gpa, specifier);
+        const cwd = std.Io.Dir.cwd().realPathFileAlloc(io, ".", gpa) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return normalizePath(gpa, specifier),
+        };
+        defer gpa.free(cwd);
+        const joined = try std.fs.path.join(gpa, &.{ cwd, specifier });
+        defer gpa.free(joined);
+        return normalizePath(gpa, joined);
+    }
+
+    if (!is_rel) {
+        if (!std.fs.path.isAbsolute(specifier)) return error.ModuleNotFound;
         return normalizePath(gpa, specifier);
     }
 

@@ -90,7 +90,11 @@ const Shared = struct {
                 // Parameters arrive as plain values; box the captured ones.
                 for (func.params) |p| {
                     const b = p.pattern.data.binding.binding;
-                    if (c.binding(b).captured) try c.emit(.box_local, &.{c.slotOf(b)});
+                    if (c.binding(b).captured) {
+                        try c.emit(.box_local, &.{c.slotOf(b)});
+                    } else {
+                        c.markSlotInit(c.slotOf(b));
+                    }
                 }
             } else {
                 for (func.params) |p| try c.enterPatternBindings(p.pattern);
@@ -216,6 +220,8 @@ const Compiler = struct {
     function: u32,
     /// `yield` and `return e` await their operand; `yield*` is async (D68).
     is_async_generator: bool = false,
+    /// Bitset of local slots 0..63 guaranteed initialized on all paths reaching the current PC (M54).
+    init_slots: u64 = 0,
 
     code: std.ArrayList(u8) = .empty,
     consts: std.ArrayList(Value) = .empty,
@@ -472,8 +478,69 @@ const Compiler = struct {
     fn statementsImpl(c: *Compiler, stmts: []const ast.Stmt, span: ast.Span, repl_top: bool) Error!bool {
         c.span = span;
         const is_module_top = c.function == 0 and c.s.options.is_module;
-        for (stmts) |s| switch (s.data) {
-            .declaration => |decl| for (decl.declarators) |d| try c.enterPatternBindings(d.pattern),
+        const saved_init = c.init_slots;
+        defer c.init_slots = saved_init;
+
+        // Inside nested loops/blocks, skip dead `clear_local` for leading simple
+        // non-captured `let`/`const` declarations whose pure initializers cannot
+        // observe TDZ (M54).
+        var skip_clear_prefix: usize = 0;
+        if (c.controls.items.len > 0) {
+            var has_hoisted = false;
+            for (stmts) |s| switch (s.data) {
+                .function, .class => {
+                    has_hoisted = true;
+                    break;
+                },
+                else => {},
+            };
+            if (!has_hoisted) {
+                var pending_slots: u64 = 0;
+                for (stmts) |s| switch (s.data) {
+                    .declaration => |decl| for (decl.declarators) |d| {
+                        if (d.pattern.data == .binding) {
+                            const b = d.pattern.data.binding.binding;
+                            if (c.binding(b).repl_index == null and !c.binding(b).captured) {
+                                const sl = c.slotOf(b);
+                                if (sl < 64) pending_slots |= (@as(u64, 1) << @intCast(sl));
+                            }
+                        }
+                    },
+                    else => {},
+                };
+                for (stmts) |s| {
+                    if (s.data != .declaration) break;
+                    const decl = s.data.declaration;
+                    var all_safe = true;
+                    for (decl.declarators) |d| {
+                        if (d.pattern.data != .binding or d.init == null) {
+                            all_safe = false;
+                            break;
+                        }
+                        const b = d.pattern.data.binding.binding;
+                        if (c.binding(b).repl_index != null or c.binding(b).captured or c.slotOf(b) >= 64) {
+                            all_safe = false;
+                            break;
+                        }
+                        if (!c.isPureNoPendingTdz(d.init.?, pending_slots)) {
+                            all_safe = false;
+                            break;
+                        }
+                    }
+                    if (!all_safe) break;
+                    for (decl.declarators) |d| {
+                        const sl = c.slotOf(d.pattern.data.binding.binding);
+                        pending_slots &= ~(@as(u64, 1) << @intCast(sl));
+                    }
+                    skip_clear_prefix += 1;
+                }
+            }
+        }
+
+        for (stmts, 0..) |s, si| switch (s.data) {
+            .declaration => |decl| if (si >= skip_clear_prefix) {
+                for (decl.declarators) |d| try c.enterPatternBindings(d.pattern);
+            },
             .function => |f| {
                 const b = c.binding(f.name.?.binding);
                 if (b.repl_index == null and b.captured) try c.emit(.new_cell, &.{c.slotOf(f.name.?.binding)});
@@ -532,10 +599,42 @@ const Compiler = struct {
         }
     }
 
+    inline fn markSlotInit(c: *Compiler, slot: u32) void {
+        if (slot < 64) c.init_slots |= (@as(u64, 1) << @intCast(slot));
+    }
+
+    inline fn clearSlotInit(c: *Compiler, slot: u32) void {
+        if (slot < 64) c.init_slots &= ~(@as(u64, 1) << @intCast(slot));
+    }
+
+    inline fn isSlotInit(c: *const Compiler, slot: u32) bool {
+        return slot < 64 and (c.init_slots & (@as(u64, 1) << @intCast(slot))) != 0;
+    }
+
+    /// True if `e` is a side-effect-free expression that cannot read any binding in `pending_slots`.
+    fn isPureNoPendingTdz(c: *const Compiler, e: *const ast.Expr, pending_slots: u64) bool {
+        return switch (e.data) {
+            .number, .string, .boolean, .null, .bigint => true,
+            .identifier => |ref| switch (c.s.res.refs[ref.id]) {
+                .local => |b| blk: {
+                    if (c.binding(b).captured) break :blk false;
+                    const sl = c.slotOf(b);
+                    break :blk sl < 64 and (pending_slots & (@as(u64, 1) << @intCast(sl))) == 0;
+                },
+                else => false,
+            },
+            .unary => |u| u.op != .typeof and c.isPureNoPendingTdz(u.operand, pending_slots),
+            .binary => |b| c.isPureNoPendingTdz(b.lhs, pending_slots) and c.isPureNoPendingTdz(b.rhs, pending_slots),
+            else => false,
+        };
+    }
+
     /// The binding's scope is being entered: TDZ (a fresh cell if captured).
     fn enterBinding(c: *Compiler, b: u32) Error!void {
         if (c.binding(b).repl_index != null) return;
-        try c.emit(if (c.binding(b).captured) .new_cell else .clear_local, &.{c.slotOf(b)});
+        const sl = c.slotOf(b);
+        c.clearSlotInit(sl);
+        try c.emit(if (c.binding(b).captured) .new_cell else .clear_local, &.{sl});
     }
 
     /// Pops the top of the stack into binding `b` of this function (no TDZ/const check).
@@ -544,7 +643,13 @@ const Compiler = struct {
             try c.emit(.init_repl, &.{repl_idx});
             return;
         }
-        try c.emit(if (c.binding(b).captured) .init_cell else .init_local, &.{c.slotOf(b)});
+        const sl = c.slotOf(b);
+        if (c.binding(b).captured) {
+            try c.emit(.init_cell, &.{sl});
+        } else {
+            try c.emit(.init_local, &.{sl});
+            c.markSlotInit(sl);
+        }
     }
 
     fn declare(c: *Compiler, decl: ast.Declaration) Error!void {
@@ -644,6 +749,8 @@ const Compiler = struct {
             },
             .@"switch" => |sw| return c.compileSwitch(sw),
             .@"for" => |f| {
+                const saved_init = c.init_slots;
+                defer c.init_slots = saved_init;
                 // init; [copy]; top: [cond; jump_if_false end]; body;
                 // cont: [copy]; [update; pop]; jump top; end:
                 // `copy` gives captured `let` head bindings fresh cells per iteration
@@ -1445,6 +1552,24 @@ const Compiler = struct {
                             try c.emit(fop, &.{try c.number(b.rhs.data.number)});
                             return;
                         }
+                    } else if (b.rhs.data == .identifier) {
+                        const ref = b.rhs.data.identifier;
+                        if (c.s.res.refs[ref.id] == .local) {
+                            const lb = c.s.res.refs[ref.id].local;
+                            if (!c.binding(lb).captured) {
+                                const fused: ?Op = switch (b.op) {
+                                    .add => .add_local,
+                                    .sub => .sub_local,
+                                    .mul => .mul_local,
+                                    .mod => .mod_local,
+                                    else => null,
+                                };
+                                if (fused) |fop| {
+                                    try c.emit(fop, &.{ c.slotOf(lb), try c.name(ref.name) });
+                                    return;
+                                }
+                            }
+                        }
                     }
                     try c.expr(b.rhs);
                     try c.emit(binaryOp(b.op), &.{});
@@ -2152,6 +2277,22 @@ const Compiler = struct {
 
     /// `o.name` / `o[k]`, read or deleted.
     fn member(c: *Compiler, m: ast.Member, comptime what: enum { get, delete }) Error!void {
+        if (what == .get and !m.is_private and m.key == .computed and m.object.data == .identifier and m.key.computed.data == .identifier) {
+            const oref = m.object.data.identifier;
+            const kref = m.key.computed.data.identifier;
+            if (c.s.res.refs[oref.id] == .local and c.s.res.refs[kref.id] == .local) {
+                const ob = c.s.res.refs[oref.id].local;
+                const kb = c.s.res.refs[kref.id].local;
+                if (!c.binding(ob).captured and !c.binding(kb).captured) {
+                    const os = c.slotOf(ob);
+                    const ks = c.slotOf(kb);
+                    if (c.isSlotInit(os) and c.isSlotInit(ks)) {
+                        try c.emit(.get_elem_local, &.{ os, ks });
+                        return;
+                    }
+                }
+            }
+        }
         try c.expr(m.object);
         switch (m.key) {
             .name => |n| {

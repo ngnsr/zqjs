@@ -57,9 +57,10 @@ const bc = @import("../bytecode/bytecode.zig");
 const Op = bc.Op;
 const Proto = bc.Proto;
 
-/// A local slot: a plain binding's value (`null` = TDZ), or a captured binding's cell.
+/// A local slot: uninitialized (TDZ), a plain binding's value, or a captured binding's cell (M54).
 pub const Slot = union(enum) {
-    value: ?Value,
+    uninit,
+    value: Value,
     cell: *Cell,
 };
 
@@ -564,9 +565,10 @@ pub const Vm = struct {
             return &vm.locals[self.locals_base + i];
         }
 
-        inline fn value(self: FrameCache, vm: *Vm, i: u32) Error!*?Value {
+        inline fn value(self: FrameCache, vm: *Vm, i: u32) Error!?*Value {
             return switch ((try self.slot(vm, i)).*) {
                 .value => |*v| v,
+                .uninit => null,
                 .cell => return vm.bug("value access to a cell slot"),
             };
         }
@@ -692,7 +694,8 @@ pub const Vm = struct {
     fn visitRoots(vm: *const Vm, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *heap.Obj) void) void {
         for (vm.stack[0..vm.sp]) |v| heap.visitValue(v, ctx, visit);
         for (vm.locals[0..vm.locals_len]) |s| switch (s) {
-            .value => |v| if (v) |x| heap.visitValue(x, ctx, visit),
+            .uninit => {},
+            .value => |v| heap.visitValue(v, ctx, visit),
             .cell => |c| visit(ctx, &c.obj),
         };
         for (vm.frames.items) |f| {
@@ -793,23 +796,21 @@ pub const Vm = struct {
             },
 
             .get_local => {
-                const v = (try cache.value(vm, cache.operand(0))).* orelse return vm.tdz(cache.operand(1));
-                try cache.push(vm, v);
+                const v = (try cache.value(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                try cache.push(vm, v.*);
             },
             .set_local => {
-                const s = try cache.value(vm, cache.operand(0));
-                if (s.* == null) return vm.tdz(cache.operand(1));
+                const s = (try cache.value(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
                 s.* = try cache.peek(vm, 0); // the assignment's value stays on the stack
             },
             .set_local_pop => {
-                const s = try cache.value(vm, cache.operand(0));
-                if (s.* == null) return vm.tdz(cache.operand(1));
+                const s = (try cache.value(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
                 s.* = try cache.peek(vm, 0);
                 try cache.drop(vm, 1);
             },
             .inc_local, .dec_local => {
-                const s = try cache.value(vm, cache.operand(0));
-                const v = s.* orelse return vm.tdz(cache.operand(1));
+                const s = (try cache.value(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                const v = s.*;
                 if (v == .number) {
                     s.* = .{ .number = v.number + @as(f64, if (op == .inc_local) 1 else -1) };
                 } else {
@@ -825,9 +826,9 @@ pub const Vm = struct {
                 (try cache.slot(vm, cache.operand(0))).* = .{ .value = try cache.peek(vm, 0) };
                 try cache.drop(vm, 1);
             },
-            .clear_local => (try cache.slot(vm, cache.operand(0))).* = .{ .value = null },
+            .clear_local => (try cache.slot(vm, cache.operand(0))).* = .uninit,
             .assign_const => {
-                if ((try cache.value(vm, cache.operand(0))).* == null) return vm.tdz(cache.operand(1));
+                if ((try cache.value(vm, cache.operand(0))) == null) return vm.tdz(cache.operand(1));
                 return vm.constAssignment();
             },
             .get_global => {
@@ -845,7 +846,8 @@ pub const Vm = struct {
             .box_local => {
                 const s = try cache.slot(vm, cache.operand(0));
                 const v: Value = switch (s.*) {
-                    .value => |v| v orelse return vm.bug("boxing a slot in the TDZ"),
+                    .value => |v| v,
+                    .uninit => return vm.bug("boxing a slot in the TDZ"),
                     .cell => return vm.bug("boxing a cell"),
                 };
                 s.* = .{ .cell = try rt.heap.newCell(v) };
@@ -1083,6 +1085,19 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = r;
             },
+            .get_elem_local => {
+                const base_ptr = (try cache.value(vm, cache.operand(0))) orelse return vm.bug("uninit base in get_elem_local");
+                const idx_ptr = (try cache.value(vm, cache.operand(1))) orelse return vm.bug("uninit key in get_elem_local");
+                const base = base_ptr.*;
+                const idx = idx_ptr.*;
+                try cache.ensurePush(vm);
+                const r: Value = fastArrayGet(base, idx) orelse fastTypedArrayGet(base, idx) orelse blk: {
+                    cache.syncSp(vm);
+                    const k = try object.key(rt, idx);
+                    break :blk try object.get(rt, base, k);
+                };
+                try cache.push(vm, r);
+            },
             .set_prop, .set_prop_pop => {
                 const v = try cache.peek(vm, 0);
                 const base = try cache.peek(vm, 1);
@@ -1157,6 +1172,29 @@ pub const Vm = struct {
                         .sub_const => .sub,
                         .mul_const => .mul,
                         .mod_const => .mod,
+                        else => unreachable,
+                    };
+                    break :blk try ops.binary(rt, bop, lhs, rhs);
+                };
+                vm.stack[cache.sp - 1] = r;
+            },
+            .add_local, .sub_local, .mul_local, .mod_local => {
+                const lhs = try cache.peek(vm, 0);
+                const rhs_ptr = (try cache.value(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                const rhs = rhs_ptr.*;
+                const r: Value = if (lhs == .number and rhs == .number) switch (op) {
+                    .add_local => .{ .number = lhs.number + rhs.number },
+                    .sub_local => .{ .number = lhs.number - rhs.number },
+                    .mul_local => .{ .number = lhs.number * rhs.number },
+                    .mod_local => .{ .number = fastRemainder(lhs.number, rhs.number) },
+                    else => unreachable,
+                } else blk: {
+                    cache.syncSp(vm);
+                    const bop: BinaryOp = switch (op) {
+                        .add_local => .add,
+                        .sub_local => .sub,
+                        .mul_local => .mul,
+                        .mod_local => .mod,
                         else => unreachable,
                     };
                     break :blk try ops.binary(rt, bop, lhs, rhs);
@@ -2282,10 +2320,10 @@ pub const Vm = struct {
         const ps = p.param_slot;
         const pe = ps + p.param_count;
         const copy_n = @min(p.param_count, args.len);
-        @memset(dst[0..ps], .{ .value = null });
+        @memset(dst[0..ps], .uninit);
         for (dst[ps..][0..copy_n], args[0..copy_n]) |*s, arg| s.* = .{ .value = arg };
         @memset(dst[ps + copy_n .. pe], .{ .value = .undefined });
-        @memset(dst[pe..], .{ .value = null });
+        @memset(dst[pe..], .uninit);
     }
 
     // ---- checked accessors (see "Defensive checks"). Every one either returns its
@@ -2298,7 +2336,7 @@ pub const Vm = struct {
                 c.obj.checkLive(); // stress builds: a collected cell
                 break :blk c;
             },
-            .value => return vm.bug("cell access to a value slot"),
+            .uninit, .value => return vm.bug("cell access to a value slot"),
         };
     }
 

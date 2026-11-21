@@ -22,7 +22,7 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | **done** |
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | **done** |
 | 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
-| 11.1–53 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1 VM perf (see milestone log below; D55–D83) | **done** |
+| 11.1–54 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1 VM perf (see milestone log below; D55–D84) | **done** |
 | Perf | Remaining Tier 1–2 interpreter optimizations toward QuickJS parity (see `PERF_PLAN.md`) | in progress |
 
 ## Direction after M8.1 (reviewed 2026-11-15)
@@ -507,3 +507,6 @@ runs on both engines unless noted.
 
 **M53 (done — Tier 1 VM Performance Part 2: Arithmetic-Const, Comparison-Jump & Store-Pop Superinstructions)**
 - **M53:** Implemented D83 across `bytecode.zig`, `compiler.zig`, `verify.zig`, `vm.zig`, and `builtins.zig`: added `add_const`/`sub_const`/`mul_const`/`mod_const`, `gt`/`ge`/`strict_eq`/`strict_ne_jump_if_false`, `set_prop_pop`/`set_elem_pop`, `fastRemainder` `0 < a < b` short-circuit, and 1-arg `arrayPush` fast path. Improved CLI-to-QuickJS ratios further to `0.69×` (`closures.js`), `1.29×` (`branch_dense.js`), `1.41×` (`int_loop.js`), `1.45×` (`arrays.js`), `1.57×` (`float_math.js`), `1.67×` (`scopes.js`), and `1.79×` (`fib.js`).
+
+**M54 (done — Tier 1 VM Performance Part 3: Flattened `Slot`, Local-RHS Ops, `get_elem_local` & Dead `clear_local`)**
+- **M54:** Implemented D84 across `bytecode.zig`, `compiler.zig`, and `vm.zig`: flattened `Vm.Slot` from 32 B to 24 B (`uninit | value | cell`), added `add_local`/`sub_local`/`mul_local`/`mod_local` and `get_elem_local` (with `Compiler.init_slots` TDZ-safety tracking), and eliminated dead per-iteration `clear_local`s for leading pure declarations inside loops. Brought CLI-to-QuickJS ratios down to `0.68×` (`closures.js`), `1.25×` (`branch_dense.js`), `1.26×` (`arrays.js`, -48% vs pre-M52), `1.28×` (`float_math.js`, -40%), `1.32×` (`int_loop.js`, -36%), `1.36×` (`scopes.js`, -43%), and `1.72×` (`global_reads.js`, -35%).

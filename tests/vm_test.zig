@@ -65,7 +65,7 @@ test "step executes one instruction at a time; after halt nothing runs" {
     try testing.expectEqual(@as(u64, 4), s.rt.steps);
     try testing.expectEqual(zqjs.Vm.State.halted, try vm.step());
     try testing.expectEqual(@as(u64, 4), s.rt.steps); // nothing executed, nothing charged
-    try testing.expectEqual(zqjs.Value{ .number = 1 }, vm.locals[0].value.?);
+    try testing.expectEqual(zqjs.Value{ .number = 1 }, vm.locals[0].value);
 }
 
 test "an empty script has max_stack 0 and halts" {
@@ -109,13 +109,21 @@ test "a native that fails leaves a valid pre-call stack" {
 }
 
 test "operator errors leave both operands on the stack" {
-    const s = try Setup.create("let s = 'ab'; s + s;", .{ .max_string_length = 3 });
+    const s = try Setup.create("'ab' + 'cd';", .{ .max_string_length = 3 });
     defer s.destroy();
     var vm = try zqjs.Vm.init(&s.rt, &s.proto);
     defer vm.deinit();
     try testing.expectEqual(error.LimitExceeded, runToFault(&vm));
     try testing.expectEqual(Op.add, s.opAt(vm.pc));
     try testing.expectEqual(@as(usize, 2), vm.operands().len);
+
+    const s2 = try Setup.create("let s = 'ab'; s + s;", .{ .max_string_length = 3 });
+    defer s2.destroy();
+    var vm2 = try zqjs.Vm.init(&s2.rt, &s2.proto);
+    defer vm2.deinit();
+    try testing.expectEqual(error.LimitExceeded, runToFault(&vm2));
+    try testing.expectEqual(Op.add_local, s2.opAt(vm2.pc));
+    try testing.expectEqual(@as(usize, 1), vm2.operands().len);
 }
 
 test "the budget is charged before an instruction runs" {
@@ -413,7 +421,8 @@ test "chain: engine records stack with proof and teardown discipline (D52)" {
 /// The script's first closure value, after a run created it (the declaration's slot).
 fn firstClosure(vm: *zqjs.Vm) !*const zqjs.heap.Closure {
     for (vm.locals[0..vm.locals_len]) |s| switch (s) {
-        .value => |v| if (v) |x| if (x == .closure) return x.closure,
+        .uninit => {},
+        .value => |x| if (x == .closure) return x.closure,
         .cell => |c| if (c.value) |x| if (x == .closure) return x.closure,
     };
     return error.TestUnexpectedResult;
@@ -470,7 +479,7 @@ test "nested call: `this` binds by the VM's sloppy rule (D41)" {
     var vm = try zqjs.Vm.init(&script.rt, &script.proto);
     defer vm.deinit();
     try testing.expect(runUntilStop(&vm) == null);
-    const obj = vm.locals[0].value.?;
+    const obj = vm.locals[0].value;
     const c = try firstClosure(&vm);
 
     const cx = &script.rt.exec_ctx;
@@ -696,8 +705,8 @@ test "chain edge cases: nested call does not reset budget, latched budget fault 
     var setup_vm = try zqjs.Vm.init(&script.rt, &script.proto);
     defer setup_vm.deinit();
     try testing.expect(runUntilStop(&setup_vm) == null);
-    const work_c = setup_vm.locals[0].value.?.closure;
-    const loop_c = setup_vm.locals[1].value.?.closure;
+    const work_c = setup_vm.locals[0].value.closure;
+    const loop_c = setup_vm.locals[1].value.closure;
 
     // 1. Nested calls share one cumulative budget and never reset it.
     const cx = &script.rt.exec_ctx;
@@ -777,8 +786,8 @@ test "chain edge cases: nested call does not reset budget, latched budget fault 
         call_script.rt.exec_ctx.call_depth = @intCast(outer.frames.items.len);
 
         // Step until both function declarations (`loop` and `nf`) are initialized in locals.
-        while (outer.locals[0].value == null or outer.locals[1].value == null) _ = try outer.step();
-        Ctx.loop_closure = outer.locals[0].value.?.closure;
+        while (outer.locals[0] == .uninit or outer.locals[1] == .uninit) _ = try outer.step();
+        Ctx.loop_closure = outer.locals[0].value.closure;
         outer.locals[1] = .{ .value = .{ .native = &.{ .name = "hostNative", .call = Ctx.hostNative } } };
 
         // Regardless of whether the native returned 999 or threw TypeError, the outer VM
@@ -863,10 +872,10 @@ test "public Runtime.call: poisoned runtime returns Internal, closure round-trip
         const sum_tok = try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[0].cell.value.?.closure });
         const sum_h: api.Handle = .{ .owner = sum_tok.owner, .slot = sum_tok.slot, .generation = sum_tok.generation };
         defer sum_h.release();
-        const throw_tok = try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[1].value.?.closure });
+        const throw_tok = try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[1].value.closure });
         const throw_h: api.Handle = .{ .owner = throw_tok.owner, .slot = throw_tok.slot, .generation = throw_tok.generation };
         defer throw_h.release();
-        const unsup_tok = try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[2].value.?.closure });
+        const unsup_tok = try zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[2].value.closure });
         const unsup_h: api.Handle = .{ .owner = unsup_tok.owner, .slot = unsup_tok.slot, .generation = unsup_tok.generation };
         defer unsup_h.release();
 
@@ -936,7 +945,7 @@ fn checkClosureCallAllocFailOnce(allocator: std.mem.Allocator) !void {
 
     const irt: *zqjs.Runtime = @ptrCast(@alignCast(arg.owner));
     const ex_vm: *zqjs.Vm = @ptrCast(@alignCast(irt.extra_roots.items[1].ctx));
-    const fn_tok = zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[0].value.?.closure }) catch |e| switch (e) {
+    const fn_tok = zqjs.handles.Table.mint(irt, .{ .closure = ex_vm.locals[0].value.closure }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.TestUnexpectedResult,
     };
@@ -1424,7 +1433,7 @@ test "M28b VM: uncatchable fault during resume leaves promise pending" {
     try testing.expectEqual(zqjs.Limit.steps, rt.limitHit().?);
 
     // `inf` is in script slot 0, `p` is in script slot 1; `p` must still be pending.
-    const p_val = vm.locals[1].value.?;
+    const p_val = vm.locals[1].value;
     try testing.expect(p_val == .object and p_val.object.kind == .promise);
     try testing.expectEqual(zqjs.heap.PromiseStateTag.pending, p_val.object.kind.promise.state);
 }
@@ -1591,6 +1600,54 @@ test "M53: arithmetic-const, comparison-jump, set_prop/elem_pop, and fastRemaind
     try rt.run(prog, null);
     try testing.expectEqualStrings(
         "x1 12 7 40 4\n3 5.5 5 true false\n213\n42 99 7 3\n",
+        out.buffered(),
+    );
+}
+
+test "M54: flattened Slot, *_local arithmetic, get_elem_local, and loop clear_local TDZ preservation" {
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\// *_local with numbers, strings, objects, and BigInt
+        \\let a = 10, b = 3, s = 'hi', o = { valueOf() { return 4; } };
+        \\print(a + b, a - b, a * b, a % b, s + b, o + b);
+        \\
+        \\// TDZ on *_local preserves exact variable name
+        \\let tdzMsg = '';
+        \\try { 1 + lateVar; let lateVar = 2; } catch (e) { tdzMsg = e.name + ':' + (e.message.indexOf('lateVar') >= 0); }
+        \\print(tdzMsg);
+        \\
+        \\// get_elem_local on array, object, string, and sibling-block slot reuse TDZ safety
+        \\let arr = [10, 20, 30];
+        \\let sum = 0;
+        \\for (let i = 0; i < arr.length; i++) sum = sum + arr[i];
+        \\let obj = { k: 77 };
+        \\let key = 'k';
+        \\let str = 'abc';
+        \\let si = 1;
+        \\print(sum, obj[key], str[si]);
+        \\
+        \\let sibTdz = false;
+        \\{ let tmp = 1; }
+        \\{ try { arr[reused]; } catch (e) { sibTdz = e instanceof ReferenceError; } let reused = 0; }
+        \\print(sibTdz);
+        \\
+        \\// Loop-body TDZ must still throw even with dead clear_local elimination
+        \\let loopTdz = 0;
+        \\for (let i = 0; i < 2; i++) {
+        \\  let ok = i + 1;
+        \\  try { let bad = bad + ok; } catch (e) { if (e instanceof ReferenceError) loopTdz++; }
+        \\}
+        \\print(loopTdz);
+    ;
+    const prog = try rt.compile("m54_super.js", src, null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+    try testing.expectEqualStrings(
+        "13 7 30 1 hi3 7\nReferenceError:true\n60 77 b\ntrue\n2\n",
         out.buffered(),
     );
 }

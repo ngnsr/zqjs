@@ -182,6 +182,8 @@ pub const Op = enum(u8) {
     get_prop,
     /// [base, key] → [base[key]].
     get_elem,
+    /// [] → [locals[s0][locals[s1]]] (M54 superinstruction; both slots guaranteed initialized).
+    get_elem_local,
     /// [base, value] → [value]: base.name = value.
     set_prop,
     /// [base, value] → []: base.name = value (discarded, M53).
@@ -242,6 +244,11 @@ pub const Op = enum(u8) {
     sub_const,
     mul_const,
     mod_const,
+    /// [lhs] → [lhs op locals[s]] (M54 superinstructions; TDZ check with `name`).
+    add_local,
+    sub_local,
+    mul_local,
+    mod_local,
     pow,
     shl,
     shr,
@@ -423,6 +430,7 @@ pub const Op = enum(u8) {
             .define_elem => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
             .get_prop, .delete_prop => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
             .get_elem, .delete_elem => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
+            .get_elem_local => .{ .operands = &.{ .slot, .slot }, .pops = 0, .pushes = 1 },
             .set_prop => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
             .set_prop_pop => .{ .operands = &.{.name}, .pops = 2, .pushes = 0 },
             .set_elem => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
@@ -438,6 +446,7 @@ pub const Op = enum(u8) {
             .call_method => .{ .operands = &.{.argc}, .pops = 2, .pushes = 1 },
             .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .add_const, .sub_const, .mul_const, .mod_const => .{ .operands = &.{.@"const"}, .pops = 1, .pushes = 1 },
+            .add_local, .sub_local, .mul_local, .mod_local => .{ .operands = &.{ .slot, .name }, .pops = 1, .pushes = 1 },
             .neg, .to_number, .to_numeric, .to_string, .not, .bit_not, .typeof, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .jump => .{ .operands = &.{.target}, .pops = 0, .pushes = 0 },
             .jump_if_false, .jump_if_true => .{ .operands = &.{.target}, .pops = 1, .pushes = 0 },

@@ -60,7 +60,7 @@ code
       5  return
 
 function #1.1.1 inner: params 0, captures ^0 ^1
-slots 1, max_stack 2, code 59 bytes
+slots 1, max_stack 2, code 58 bytes
 names
   n0  depth
   n1  p
@@ -78,9 +78,8 @@ code
      29  get_capture    ^1 n1         ; p
      38  get_capture    ^0 n0         ; depth
      47  add
-     48  get_local      s0 n2         ; inner
-     57  add
-     58  return
+     48  add_local      s0 n2         ; inner
+     57  return
 
 function #2 (anonymous): params 0, captures s2
 slots 0, max_stack 1, code 10 bytes

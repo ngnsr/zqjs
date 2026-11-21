@@ -2056,3 +2056,18 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
 - **Hot Runtime Fast Paths:**
   - `fastRemainder` short-circuits `a > 0 and a < b and b != inf` directly to `a` (preserving `-0`, `NaN`, infinities, and fractional values while skipping 64-bit hardware divisions on modulo-guarded accumulators).
   - `arrayPush` dispatches `args.len == 1` directly to `Heap.appendElement`.
+
+---
+
+## D84. Tier 1 VM Performance Part 3: Flattened `Slot`, Local-RHS Arithmetic, `get_elem_local`, and Dead `clear_local` Elimination *(M54)*
+
+**Decision:** Shrink VM local slots, add local-operand superinstructions, and elide provably dead per-iteration `clear_local` instructions inside loops without changing `Value`'s layout or weakening TDZ/verifier/GC invariants.
+
+- **Flattened `Vm.Slot` (`src/vm/vm.zig`):**
+  - Replaced `union(enum) { value: ?Value, cell: *Cell }` (32 bytes, two tag checks per local access) with `union(enum) { uninit, value: Value, cell: *Cell }` (24 bytes, single tag check).
+- **Local-RHS Arithmetic Superinstructions (`add_local`, `sub_local`, `mul_local`, `mod_local`):**
+  - Emitted by `compiler.zig` when the RHS of `+`, `-`, `*`, or `%` is a non-captured local identifier, preserving exact left-to-right evaluation order and exact TDZ variable-name diagnostics via the `.name` operand.
+- **Direct Indexed Element Read (`get_elem_local`):**
+  - Tracked `Compiler.init_slots: u64` (slots 0..63 guaranteed initialized on all paths, saved/restored across blocks and loops to stay sound under sibling-block slot reuse). When both base and key of `o[k]` are non-captured initialized locals, emits `get_elem_local(s0, s1)` (collapsing 3 ops → 1 op and routing directly through `fastArrayGet`/`fastTypedArrayGet`).
+- **Loop-Body Dead `clear_local` Elimination (`compiler.zig`):**
+  - Inside nested loops/blocks (`c.controls.items.len > 0`), skips emitting `clear_local` for leading simple non-captured `let`/`const` declarations whose pure initializers (`isPureNoPendingTdz`) cannot observe TDZ before `init_local`, preserving top-level step counts and all loop-body TDZ errors.

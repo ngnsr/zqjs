@@ -372,7 +372,7 @@ static void test_shared_runtime_step_limit(void) {
 
 static void test_isolated_runtime_heap_limit_recovery(void) {
     zqjs_options opts = zqjs_options_default();
-    opts.limits.max_heap_bytes = 64u * 1024u;
+    opts.limits.max_heap_bytes = 128u * 1024u;
     opts.limits.nursery_bytes = 16u * 1024u;
 
     zqjs_runtime *rt_iso = NULL;

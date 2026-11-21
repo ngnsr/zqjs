@@ -495,6 +495,10 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try constant(rt, r.array_namespace, "prototype", .{ .object = r.array_prototype });
     try constant(rt, r.string_namespace, "prototype", .{ .object = r.string_prototype });
     try constant(rt, r.number_namespace, "prototype", .{ .object = r.number_prototype });
+    try constant(rt, r.number_prototype, "constructor", .{ .native = &number_global });
+    try method(rt, r.number_prototype, "toString", &number_to_string);
+    try method(rt, r.number_prototype, "toLocaleString", &number_to_locale_string);
+    try method(rt, r.number_prototype, "valueOf", &number_value_of);
     try constant(rt, r.map_namespace, "prototype", .{ .object = r.map_prototype });
     try constant(rt, r.set_namespace, "prototype", .{ .object = r.set_prototype });
     try constant(rt, r.weak_map_namespace, "prototype", .{ .object = r.weak_map_prototype });
@@ -729,10 +733,10 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
 // ---------------------------------------------------------------- globals
 
 pub const print: Native = .{ .name = "print", .call = printImpl };
-pub const object_global: Native = .{ .name = "Object", .call = notCallable, .namespace = .object };
-pub const array_global: Native = .{ .name = "Array", .call = notCallable, .namespace = .array };
-pub const string_global: Native = .{ .name = "String", .call = stringCall, .namespace = .string };
-pub const number_global: Native = .{ .name = "Number", .call = numberCall, .namespace = .number };
+pub const object_global: Native = .{ .name = "Object", .length = 1, .call = notCallable, .namespace = .object };
+pub const array_global: Native = .{ .name = "Array", .length = 1, .call = notCallable, .namespace = .array };
+pub const string_global: Native = .{ .name = "String", .length = 1, .call = stringCall, .namespace = .string };
+pub const number_global: Native = .{ .name = "Number", .length = 1, .call = numberCall, .namespace = .number };
 pub const function_global: Native = .{ .name = "Function", .length = 1, .call = notCallable, .namespace = .function };
 pub const parse_int_global: Native = .{ .name = "parseInt", .length = 2, .call = parseIntImpl };
 pub const parse_float_global: Native = .{ .name = "parseFloat", .call = parseFloatImpl };
@@ -1064,10 +1068,10 @@ fn functionApply(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     if (arg_array == .undefined or arg_array == .null) {
         return rt.callCallable(this, this_arg, &.{});
     }
-    if (arg_array != .object) {
+    if (!arg_array.isObjectLike()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "CreateListFromArrayLike called on non-object" }});
     }
-    if (arg_array.object.kind == .array) {
+    if (arg_array == .object and arg_array.object.kind == .array) {
         const items = arg_array.object.kind.array.items;
         const copy = try rt.gpa.dupe(Value, items);
         defer rt.gpa.free(copy);
@@ -1210,7 +1214,7 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
             },
             .regexp => "RegExp",
             .module_namespace => "Module",
-            .ordinary => if (o.is_error) "Error" else "Object",
+            .ordinary => if (o.is_error) "Error" else if (o.builtin == .number_prototype) "Number" else "Object",
             else => "Object",
         },
     };
@@ -2061,33 +2065,33 @@ fn sortCompare(rt: *Runtime, cb: ?Value, x: Value, y: Value, root_a: *Value, roo
 
 // ---------------------------------------------------------------- String.prototype
 
-const string_char_at: Native = .{ .name = "charAt", .call = stringCharAt };
-const string_char_code_at: Native = .{ .name = "charCodeAt", .call = stringCharCodeAt };
+const string_char_at: Native = .{ .name = "charAt", .length = 1, .call = stringCharAt };
+const string_char_code_at: Native = .{ .name = "charCodeAt", .length = 1, .call = stringCharCodeAt };
 const string_code_point_at: Native = .{ .name = "codePointAt", .length = 1, .call = stringCodePointAt };
 const string_from_char_code: Native = .{ .name = "fromCharCode", .length = 1, .call = stringFromCharCode };
 const string_from_code_point: Native = .{ .name = "fromCodePoint", .length = 1, .call = stringFromCodePoint };
-const string_slice: Native = .{ .name = "slice", .call = stringSlice };
-const string_index_of: Native = .{ .name = "indexOf", .call = stringIndexOf };
-const string_includes: Native = .{ .name = "includes", .call = stringIncludes };
+const string_slice: Native = .{ .name = "slice", .length = 2, .call = stringSlice };
+const string_index_of: Native = .{ .name = "indexOf", .length = 1, .call = stringIndexOf };
+const string_includes: Native = .{ .name = "includes", .length = 1, .call = stringIncludes };
 const string_to_lower_case: Native = .{ .name = "toLowerCase", .call = stringToLowerCase };
 const string_to_upper_case: Native = .{ .name = "toUpperCase", .call = stringToUpperCase };
-const string_split: Native = .{ .name = "split", .call = stringSplit };
+const string_split: Native = .{ .name = "split", .length = 2, .call = stringSplit };
 const string_trim: Native = .{ .name = "trim", .call = stringTrim };
 const string_trim_start: Native = .{ .name = "trimStart", .call = stringTrimStart };
 const string_trim_end: Native = .{ .name = "trimEnd", .call = stringTrimEnd };
-const string_starts_with: Native = .{ .name = "startsWith", .call = stringStartsWith };
-const string_ends_with: Native = .{ .name = "endsWith", .call = stringEndsWith };
-const string_repeat: Native = .{ .name = "repeat", .call = stringRepeat };
-const string_pad_start: Native = .{ .name = "padStart", .call = stringPadStart };
-const string_pad_end: Native = .{ .name = "padEnd", .call = stringPadEnd };
-const string_substring: Native = .{ .name = "substring", .call = stringSubstring };
-const string_last_index_of: Native = .{ .name = "lastIndexOf", .call = stringLastIndexOf };
-const string_at: Native = .{ .name = "at", .call = stringAt };
-const string_replace: Native = .{ .name = "replace", .call = stringReplace };
-const string_replace_all: Native = .{ .name = "replaceAll", .call = stringReplaceAll };
-const string_match: Native = .{ .name = "match", .call = stringMatch };
+const string_starts_with: Native = .{ .name = "startsWith", .length = 1, .call = stringStartsWith };
+const string_ends_with: Native = .{ .name = "endsWith", .length = 1, .call = stringEndsWith };
+const string_repeat: Native = .{ .name = "repeat", .length = 1, .call = stringRepeat };
+const string_pad_start: Native = .{ .name = "padStart", .length = 1, .call = stringPadStart };
+const string_pad_end: Native = .{ .name = "padEnd", .length = 1, .call = stringPadEnd };
+const string_substring: Native = .{ .name = "substring", .length = 2, .call = stringSubstring };
+const string_last_index_of: Native = .{ .name = "lastIndexOf", .length = 1, .call = stringLastIndexOf };
+const string_at: Native = .{ .name = "at", .length = 1, .call = stringAt };
+const string_replace: Native = .{ .name = "replace", .length = 2, .call = stringReplace };
+const string_replace_all: Native = .{ .name = "replaceAll", .length = 2, .call = stringReplaceAll };
+const string_match: Native = .{ .name = "match", .length = 1, .call = stringMatch };
 const string_match_all: Native = .{ .name = "matchAll", .length = 1, .call = stringMatchAll };
-const string_search: Native = .{ .name = "search", .call = stringSearch };
+const string_search: Native = .{ .name = "search", .length = 1, .call = stringSearch };
 
 fn thisString(rt: *Runtime, this: Value, name: []const u8) Error!*const heap_mod.String {
     return switch (this) {
@@ -2576,12 +2580,12 @@ fn stringReplaceAll(rt: *Runtime, this: Value, args: []const Value) Error!Value 
 
 // ---------------------------------------------------------------- Object, Array
 
-const object_keys: Native = .{ .name = "keys", .call = objectKeys };
-const object_values: Native = .{ .name = "values", .call = objectValues };
-const object_entries: Native = .{ .name = "entries", .call = objectEntries };
-const object_assign: Native = .{ .name = "assign", .call = objectAssign };
-const object_create: Native = .{ .name = "create", .call = objectCreate };
-const object_get_prototype_of: Native = .{ .name = "getPrototypeOf", .call = objectGetPrototypeOf };
+const object_keys: Native = .{ .name = "keys", .length = 1, .call = objectKeys };
+const object_values: Native = .{ .name = "values", .length = 1, .call = objectValues };
+const object_entries: Native = .{ .name = "entries", .length = 1, .call = objectEntries };
+const object_assign: Native = .{ .name = "assign", .length = 2, .call = objectAssign };
+const object_create: Native = .{ .name = "create", .length = 2, .call = objectCreate };
+const object_get_prototype_of: Native = .{ .name = "getPrototypeOf", .length = 1, .call = objectGetPrototypeOf };
 const object_define_property: Native = .{ .name = "defineProperty", .length = 3, .call = objectDefineProperty };
 const object_define_properties: Native = .{ .name = "defineProperties", .length = 2, .call = objectDefineProperties };
 const object_get_own_property_descriptor: Native = .{ .name = "getOwnPropertyDescriptor", .length = 2, .call = objectGetOwnPropertyDescriptor };
@@ -2602,13 +2606,13 @@ const object_group_by: Native = .{ .name = "groupBy", .length = 2, .call = objec
 const object_proto_has_own_property: Native = .{ .name = "hasOwnProperty", .length = 1, .call = objectProtoHasOwnProperty };
 const object_proto_is_prototype_of: Native = .{ .name = "isPrototypeOf", .length = 1, .call = objectProtoIsPrototypeOf };
 const object_proto_property_is_enumerable: Native = .{ .name = "propertyIsEnumerable", .length = 1, .call = objectProtoPropertyIsEnumerable };
-const array_is_array: Native = .{ .name = "isArray", .call = arrayIsArray };
-const array_from: Native = .{ .name = "from", .call = arrayFrom };
+const array_is_array: Native = .{ .name = "isArray", .length = 1, .call = arrayIsArray };
+const array_from: Native = .{ .name = "from", .length = 1, .call = arrayFrom };
 const array_of: Native = .{ .name = "of", .call = arrayOf };
-const number_is_integer: Native = .{ .name = "isInteger", .call = numberIsInteger };
-const number_is_finite: Native = .{ .name = "isFinite", .call = numberIsFinite };
-const number_is_nan: Native = .{ .name = "isNaN", .call = numberIsNaN };
-const number_is_safe_integer: Native = .{ .name = "isSafeInteger", .call = numberIsSafeInteger };
+const number_is_integer: Native = .{ .name = "isInteger", .length = 1, .call = numberIsInteger };
+const number_is_finite: Native = .{ .name = "isFinite", .length = 1, .call = numberIsFinite };
+const number_is_nan: Native = .{ .name = "isNaN", .length = 1, .call = numberIsNaN };
+const number_is_safe_integer: Native = .{ .name = "isSafeInteger", .length = 1, .call = numberIsSafeInteger };
 
 fn objectKeys(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const r = try realm(rt);
@@ -3048,6 +3052,13 @@ fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Parsed
         return unsupportedReceiver(rt, "defineProperty");
     }
 
+    if (target == .object and target.object.kind == .array and k == .atom and object.isNamed(k, "length") and d.has_val) {
+        const n = try ops.toNumber(rt, d.val);
+        if (!(n >= 0 and n <= @as(f64, std.math.maxInt(u32)) and @floor(n) == n)) {
+            return rt.throw(.RangeError, &.{.{ .ascii = "Invalid array length" }});
+        }
+    }
+
     const current = try getOwnPropertyRaw(rt, target, k);
     var next: heap_mod.Property = undefined;
 
@@ -3209,6 +3220,10 @@ fn objectDefineProperties(rt: *Runtime, _: Value, args: []const Value) Error!Val
     const keys: []object.Key = switch (props) {
         .object => |o| try object.ownAllKeys(rt, o),
         .closure => |c| try object.ownAllKeysClosure(rt, c),
+        .string => |s| blk: {
+            if (s.units.len > 0) return rt.throw(.TypeError, &.{.{ .ascii = "Property description must be an object" }});
+            break :blk &.{};
+        },
         else => &.{},
     };
     defer rt.gpa.free(keys);
@@ -3233,7 +3248,7 @@ fn objectDefineProperties(rt: *Runtime, _: Value, args: []const Value) Error!Val
 pub fn isArray(rt: *Runtime, v: Value) Error!bool {
     var cur = v;
     while (cur == .object) {
-        if (cur.object.kind == .array) return true;
+        if (cur.object.kind == .array or cur.object.builtin == .array_prototype) return true;
         if (cur.object.kind != .proxy) return false;
         try rt.checkNativeStack();
         cur = cur.object.kind.proxy.target orelse return rt.throw(.TypeError, &.{.{ .ascii = "Cannot perform 'IsArray' on a proxy that has been revoked" }});
@@ -3485,6 +3500,37 @@ fn objectIsExtensible(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 fn setIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!Value {
     switch (target) {
         .object => |o| {
+            if (o.kind == .proxy) {
+                if (!try preventExtensionsValue(rt, target)) {
+                    return rt.throw(.TypeError, &.{.{ .ascii = "Cannot prevent extensions" }});
+                }
+                var root_buf = [_]Value{target};
+                var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+                try roots.register(rt);
+                defer roots.unregister(rt);
+
+                const keys = try object.ownAllKeys(rt, o);
+                defer rt.gpa.free(keys);
+                const key_vals = try rt.gpa.alloc(Value, keys.len);
+                defer rt.gpa.free(key_vals);
+                for (keys, key_vals) |k, *dst| dst.* = keyToRootValue(k);
+                var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+                try key_roots.register(rt);
+                defer key_roots.unregister(rt);
+
+                for (keys) |k| {
+                    const desc = try getOwnPropertyRaw(rt, target, k);
+                    if (desc) |d| {
+                        var pd: ParsedDesc = .{ .has_conf = true, .conf_val = false };
+                        if (freeze and !d.is_accessor) {
+                            pd.has_writ = true;
+                            pd.writ_val = false;
+                        }
+                        _ = try defineOwnPropertyParsed(rt, target, k, pd, true);
+                    }
+                }
+                return target;
+            }
             o.extensible = false;
             for (o.props.values()) |*p| {
                 p.configurable = false;
@@ -3733,11 +3779,11 @@ fn objectProtoHasOwnProperty(rt: *Runtime, this: Value, args: []const Value) Err
 }
 
 fn objectProtoIsPrototypeOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const v = arg(args, 0);
+    if (v != .object and v != .closure and v != .native) return .{ .boolean = false };
     if (this == .undefined or this == .null) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
     }
-    const v = arg(args, 0);
-    if (v != .object and v != .closure and v != .native) return .{ .boolean = false };
     var cur = try object.getPrototypeOfValue(rt, v);
     while (cur != .null) {
         if (sameValue(cur, this)) return .{ .boolean = true };
@@ -3858,8 +3904,32 @@ pub fn forInNext(rt: *Runtime, iter: *Object) Error!?Value {
     return null;
 }
 
-fn arrayOf(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+fn arrayOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const r = try realm(rt);
+    if (this != .native or this.native != &array_global) {
+        if (isConstructor(this)) {
+            const len_val: Value = .{ .number = @floatFromInt(args.len) };
+            const a = try constructWithNewTarget(rt, this, &.{len_val}, this);
+            var root_buf = [_]Value{a};
+            var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+            for (args, 0..) |v, i| {
+                _ = try defineOwnPropertyParsed(rt, a, .{ .index = @intCast(i) }, .{
+                    .has_val = true,
+                    .val = v,
+                    .has_writ = true,
+                    .writ_val = true,
+                    .has_enum = true,
+                    .enum_val = true,
+                    .has_conf = true,
+                    .conf_val = true,
+                }, true);
+            }
+            _ = try object.setWithReceiver(rt, a, try object.named(rt, "length"), len_val, a, true);
+            return a;
+        }
+    }
     const out = try rt.heap.newArray(r.array_prototype);
     try rt.heap.appendElements(out, args);
     return .{ .object = out };
@@ -3878,17 +3948,38 @@ fn arrayFrom(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const iter = try getIterator(rt, items);
-    root_buf[4] = .{ .object = iter };
+    if (items == .undefined or items == .null) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
 
-    var k: usize = 0;
-    while (try iteratorNextVal(rt, iter)) |elem| : (k += 1) {
+    if (try object.getMethod(rt, items, .{ .symbol = r.sym_iterator })) |iter_fn| {
+        const iter = try getIteratorWithMethod(rt, items, iter_fn);
+        root_buf[4] = .{ .object = iter };
+
+        var k: usize = 0;
+        while (try iteratorNextVal(rt, iter)) |elem| : (k += 1) {
+            root_buf[5] = elem;
+            const val = if (has_map)
+                rt.callCallable(map_fn, this_arg, &.{ root_buf[5], .{ .number = @floatFromInt(k) } }) catch |e| {
+                    if (e == error.Thrown) try iteratorClose(rt, iter, true);
+                    return e;
+                }
+            else
+                elem;
+            root_buf[5] = val;
+            try rt.heap.appendElement(out, val);
+            root_buf[5] = .undefined;
+        }
+        return .{ .object = out };
+    }
+
+    const len_f = try toLength(rt, try object.get(rt, items, try object.named(rt, "length")));
+    const len: usize = @intFromFloat(len_f);
+    for (0..len) |k| {
+        const elem = try object.get(rt, items, .{ .index = @intCast(k) });
         root_buf[5] = elem;
         const val = if (has_map)
-            rt.callCallable(map_fn, this_arg, &.{ root_buf[5], .{ .number = @floatFromInt(k) } }) catch |e| {
-                if (e == error.Thrown) try iteratorClose(rt, iter, true);
-                return e;
-            }
+            try rt.callCallable(map_fn, this_arg, &.{ elem, .{ .number = @floatFromInt(k) } })
         else
             elem;
         root_buf[5] = val;
@@ -4041,6 +4132,60 @@ const bigint_as_int_n: Native = .{ .name = "asIntN", .length = 2, .call = bigint
 const bigint_as_uint_n: Native = .{ .name = "asUintN", .length = 2, .call = bigintAsUintN };
 const bigint_to_string: Native = .{ .name = "toString", .length = 0, .call = bigintToString };
 const bigint_value_of: Native = .{ .name = "valueOf", .length = 0, .call = bigintValueOf };
+
+const number_to_string: Native = .{ .name = "toString", .length = 0, .call = numberToString };
+const number_to_locale_string: Native = .{ .name = "toLocaleString", .length = 0, .call = numberToLocaleString };
+const number_value_of: Native = .{ .name = "valueOf", .length = 0, .call = numberValueOf };
+
+fn thisNumber(rt: *Runtime, this: Value) Error!f64 {
+    if (this == .number) return this.number;
+    if (this == .object and this.object.builtin == .number_prototype) return 0.0;
+    return rt.throw(.TypeError, &.{.{ .ascii = "Number.prototype method requires a Number receiver" }});
+}
+
+fn numberValueOf(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return .{ .number = try thisNumber(rt, this) };
+}
+
+fn numberToString(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const n = try thisNumber(rt, this);
+    if (args.len > 0 and args[0] != .undefined) {
+        const r_num = try toIntegerOrInfinity(rt, args[0]);
+        if (r_num < 2.0 or r_num > 36.0) {
+            return rt.throw(.RangeError, &.{.{ .ascii = "toString() radix argument must be between 2 and 36" }});
+        }
+        const radix: u8 = @intFromFloat(r_num);
+        if (radix != 10) {
+            if (std.math.isNan(n)) return .{ .string = try rt.heap.ascii("NaN") };
+            if (n == 0.0) return .{ .string = try rt.heap.ascii("0") };
+            if (!std.math.isFinite(n)) return .{ .string = try rt.heap.ascii(if (n < 0) "-Infinity" else "Infinity") };
+            if (@trunc(n) == n and @abs(n) <= 9007199254740991.0) {
+                const neg = n < 0;
+                const abs_i: u64 = @intFromFloat(@abs(n));
+                var out_buf: [70]u8 = undefined;
+                var idx: usize = out_buf.len;
+                var v = abs_i;
+                const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+                while (v > 0) {
+                    idx -= 1;
+                    out_buf[idx] = digits[v % radix];
+                    v /= radix;
+                }
+                if (neg) {
+                    idx -= 1;
+                    out_buf[idx] = '-';
+                }
+                return .{ .string = try rt.heap.ascii(out_buf[idx..]) };
+            }
+        }
+    }
+    return .{ .string = try toStringObj(rt, .{ .number = n }) };
+}
+
+fn numberToLocaleString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const n = try thisNumber(rt, this);
+    return .{ .string = try toStringObj(rt, .{ .number = n }) };
+}
 
 fn numberIsNaN(_: *Runtime, _: Value, args: []const Value) Error!Value {
     const v = arg(args, 0);
@@ -4387,8 +4532,8 @@ const math_floor: Native = .{ .name = "floor", .call = mathFloor };
 const math_ceil: Native = .{ .name = "ceil", .call = mathCeil };
 const math_round: Native = .{ .name = "round", .call = mathRound };
 const math_trunc: Native = .{ .name = "trunc", .call = mathTrunc };
-const math_min: Native = .{ .name = "min", .call = mathMin };
-const math_max: Native = .{ .name = "max", .call = mathMax };
+const math_min: Native = .{ .name = "min", .length = 2, .call = mathMin };
+const math_max: Native = .{ .name = "max", .length = 2, .call = mathMax };
 const math_pow: Native = .{ .name = "pow", .call = mathPow };
 const math_sqrt: Native = .{ .name = "sqrt", .call = mathSqrt };
 const math_sin: Native = .{ .name = "sin", .call = mathSin };
@@ -4585,10 +4730,14 @@ fn mapConstruct(rt: *Runtime, args: []const Value) Error!Value {
     const iterable = arg(args, 0);
     if (iterable == .undefined or iterable == .null) return .{ .object = m };
 
-    var root_buf = [_]Value{ iterable, .{ .object = m }, .undefined, .undefined, .undefined, .undefined };
+    var root_buf = [_]Value{ iterable, .{ .object = m }, .undefined, .undefined, .undefined, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
+
+    const adder = try object.get(rt, .{ .object = m }, try object.named(rt, "set"));
+    if (!adder.isFunction()) return rt.throw(.TypeError, &.{.{ .ascii = "Map.prototype.set is not a function" }});
+    root_buf[6] = adder;
 
     const iter = try getIterator(rt, iterable);
     root_buf[2] = .{ .object = iter };
@@ -4609,7 +4758,14 @@ fn mapConstruct(rt: *Runtime, args: []const Value) Error!Value {
             return e;
         };
         root_buf[5] = v;
-        try rt.heap.mapSet(m, k, v);
+        if (adder == .native and adder.native == &map_set) {
+            try rt.heap.mapSet(m, k, v);
+        } else {
+            _ = rt.callCallable(adder, .{ .object = m }, &.{ k, v }) catch |e| {
+                if (e == error.Thrown) try iteratorClose(rt, iter, true);
+                return e;
+            };
+        }
         root_buf[3] = .undefined;
         root_buf[4] = .undefined;
         root_buf[5] = .undefined;
@@ -4753,16 +4909,27 @@ fn setConstruct(rt: *Runtime, args: []const Value) Error!Value {
     const iterable = arg(args, 0);
     if (iterable == .undefined or iterable == .null) return .{ .object = s };
 
-    var root_buf = [_]Value{ iterable, .{ .object = s }, .undefined, .undefined };
+    var root_buf = [_]Value{ iterable, .{ .object = s }, .undefined, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
+
+    const adder = try object.get(rt, .{ .object = s }, try object.named(rt, "add"));
+    if (!adder.isFunction()) return rt.throw(.TypeError, &.{.{ .ascii = "Set.prototype.add is not a function" }});
+    root_buf[4] = adder;
 
     const iter = try getIterator(rt, iterable);
     root_buf[2] = .{ .object = iter };
     while (try iteratorNextVal(rt, iter)) |v| {
         root_buf[3] = v;
-        try rt.heap.setAdd(s, v);
+        if (adder == .native and adder.native == &set_add) {
+            try rt.heap.setAdd(s, v);
+        } else {
+            _ = rt.callCallable(adder, .{ .object = s }, &.{v}) catch |e| {
+                if (e == error.Thrown) try iteratorClose(rt, iter, true);
+                return e;
+            };
+        }
         root_buf[3] = .undefined;
     }
     return .{ .object = s };
@@ -5238,10 +5405,10 @@ const promise_resolve_static: Native = .{ .name = "resolve", .call = promiseReso
 const promise_reject_static: Native = .{ .name = "reject", .call = promiseRejectStatic };
 const promise_with_resolvers_static: Native = .{ .name = "withResolvers", .call = promiseWithResolversStatic };
 const promise_try_static: Native = .{ .name = "try", .length = 1, .call = promiseTryStatic };
-const promise_all_static: Native = .{ .name = "all", .call = promiseAllStatic };
-const promise_all_settled_static: Native = .{ .name = "allSettled", .call = promiseAllSettledStatic };
-const promise_race_static: Native = .{ .name = "race", .call = promiseRaceStatic };
-const promise_any_static: Native = .{ .name = "any", .call = promiseAnyStatic };
+const promise_all_static: Native = .{ .name = "all", .length = 1, .call = promiseAllStatic };
+const promise_all_settled_static: Native = .{ .name = "allSettled", .length = 1, .call = promiseAllSettledStatic };
+const promise_race_static: Native = .{ .name = "race", .length = 1, .call = promiseRaceStatic };
+const promise_any_static: Native = .{ .name = "any", .length = 1, .call = promiseAnyStatic };
 const promise_then: Native = .{ .name = "then", .call = promiseThen };
 const promise_catch: Native = .{ .name = "catch", .call = promiseCatch };
 const promise_finally: Native = .{ .name = "finally", .call = promiseFinally };
@@ -5497,139 +5664,229 @@ fn promiseTryStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 
 const CombinatorKind = enum { all, all_settled, race, any };
 
-fn promiseAllStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
-    return promiseCombinator(rt, .all, arg(args, 0));
+fn promiseAllStatic(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return promiseCombinator(rt, .all, this, arg(args, 0));
 }
 
-fn promiseAllSettledStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
-    return promiseCombinator(rt, .all_settled, arg(args, 0));
+fn promiseAllSettledStatic(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return promiseCombinator(rt, .all_settled, this, arg(args, 0));
 }
 
-fn promiseRaceStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
-    return promiseCombinator(rt, .race, arg(args, 0));
+fn promiseRaceStatic(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return promiseCombinator(rt, .race, this, arg(args, 0));
 }
 
-fn promiseAnyStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
-    return promiseCombinator(rt, .any, arg(args, 0));
+fn promiseAnyStatic(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return promiseCombinator(rt, .any, this, arg(args, 0));
 }
 
-fn promiseCombinator(rt: *Runtime, comptime kind: CombinatorKind, iterable: Value) Error!Value {
+fn capabilityExecutor(rt: *Runtime, cap_arr: *Object, args: []const Value) Error!Value {
+    if (cap_arr.kind.array.items[0] != .undefined or cap_arr.kind.array.items[1] != .undefined) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Promise capability executor already called" }});
+    }
+    rt.heap.storeElement(cap_arr, 0, arg(args, 0));
+    rt.heap.storeElement(cap_arr, 1, arg(args, 1));
+    return .undefined;
+}
+
+fn rejectCapabilityCaught(rt: *Runtime, rej_cap: Value, p_out: Value) Error!Value {
+    const err_val = try rt.catchValue();
+    var root_buf = [_]Value{ p_out, rej_cap, err_val };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    _ = try rt.callCallable(rej_cap, .undefined, &.{err_val});
+    return p_out;
+}
+
+fn promiseCombinator(rt: *Runtime, comptime kind: CombinatorKind, ctor: Value, iterable: Value) Error!Value {
+    if (!isConstructor(ctor)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Promise combinator requires a constructor" }});
+    }
     const r = try realm(rt);
-    const p_out = try rt.heap.newPromise(r.promise_prototype);
 
     var root_buf = [_]Value{
-        .{ .object = p_out },
+        ctor,
         iterable,
-        .undefined, // [2] iter
-        .undefined, // [3] results_arr
-        .undefined, // [4] state_arr: [p_out, results_arr, remaining]
-        .undefined, // [5] res_cap
-        .undefined, // [6] rej_cap
-        .undefined, // [7] elem
-        .undefined, // [8] next_p
-        .undefined, // [9] elem_env: [state_arr, index]
-        .undefined, // [10] cb_f
-        .undefined, // [11] cb_r
+        .undefined, // [2] p_out
+        .undefined, // [3] res_cap
+        .undefined, // [4] rej_cap
+        .undefined, // [5] promise_resolve
+        .undefined, // [6] iter
+        .undefined, // [7] results_arr
+        .undefined, // [8] state_arr: [p_out, results_arr, remaining, res_cap, rej_cap, settled]
+        .undefined, // [9] elem / next_p
+        .undefined, // [10] elem_env: [state_arr, index, called]
+        .undefined, // [11] cb_f
+        .undefined, // [12] cb_r
     };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
+    const is_builtin_promise = ctor == .native and ctor.native == &promise_global;
+    if (is_builtin_promise) {
+        const p_obj = try rt.heap.newPromise(r.promise_prototype);
+        root_buf[2] = .{ .object = p_obj };
+        root_buf[3] = .{ .closure = try rt.heap.newPromiseCapability(p_obj, false) };
+        root_buf[4] = .{ .closure = try rt.heap.newPromiseCapability(p_obj, true) };
+    } else {
+        const cap_arr = try rt.heap.newArray(null);
+        root_buf[9] = .{ .object = cap_arr };
+        try rt.heap.appendElements(cap_arr, &.{ .undefined, .undefined });
+        const exec = try rt.heap.newNativeClosure(&capabilityExecutor, cap_arr);
+        root_buf[10] = .{ .closure = exec };
+        root_buf[2] = try constructWithNewTarget(rt, ctor, &.{.{ .closure = exec }}, ctor);
+        const res_cap = cap_arr.kind.array.items[0];
+        const rej_cap = cap_arr.kind.array.items[1];
+        if (!res_cap.isFunction() or !rej_cap.isFunction()) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Promise resolve or reject function is not callable" }});
+        }
+        root_buf[3] = res_cap;
+        root_buf[4] = rej_cap;
+        root_buf[9] = .undefined;
+        root_buf[10] = .undefined;
+    }
+
+    const p_out = root_buf[2];
+    const res_cap = root_buf[3];
+    const rej_cap = root_buf[4];
+
+    const promise_resolve = object.get(rt, ctor, try object.named(rt, "resolve")) catch |e| {
+        if (e != error.Thrown) return e;
+        return rejectCapabilityCaught(rt, rej_cap, p_out);
+    };
+    root_buf[5] = promise_resolve;
+    if (!promise_resolve.isFunction()) {
+        const err_val = try makeEngineError(rt, .TypeError, try rt.heap.ascii("Promise resolve is not a function"));
+        root_buf[9] = err_val;
+        _ = try rt.callCallable(rej_cap, .undefined, &.{err_val});
+        return p_out;
+    }
+
     const iter = getIterator(rt, iterable) catch |e| {
         if (e != error.Thrown) return e;
-        const err_val = try rt.catchValue();
-        try settlePromiseFromJob(rt, p_out, true, err_val);
-        return .{ .object = p_out };
+        return rejectCapabilityCaught(rt, rej_cap, p_out);
     };
-    root_buf[2] = .{ .object = iter };
+    root_buf[6] = .{ .object = iter };
 
     if (kind != .race) {
         const results_arr = try rt.heap.newArray(r.array_prototype);
-        root_buf[3] = .{ .object = results_arr };
+        root_buf[7] = .{ .object = results_arr };
         const state_arr = try rt.heap.newArray(null);
-        root_buf[4] = .{ .object = state_arr };
-        try rt.heap.appendElements(state_arr, &.{ .{ .object = p_out }, .{ .object = results_arr }, .{ .number = 0 } });
-    }
-    if (kind == .race or kind == .any) {
-        const res_cap = try rt.heap.newPromiseCapability(p_out, false);
-        root_buf[5] = .{ .closure = res_cap };
-    }
-    if (kind == .all or kind == .race) {
-        const rej_cap = try rt.heap.newPromiseCapability(p_out, true);
-        root_buf[6] = .{ .closure = rej_cap };
+        root_buf[8] = .{ .object = state_arr };
+        try rt.heap.appendElements(state_arr, &.{
+            p_out,
+            .{ .object = results_arr },
+            .{ .number = 0 },
+            res_cap,
+            rej_cap,
+            .{ .boolean = false },
+        });
     }
 
     var count: usize = 0;
     while (true) {
         const maybe_elem = iteratorNextVal(rt, iter) catch |e| {
             if (e != error.Thrown) return e;
-            const err_val = try rt.catchValue();
-            try settlePromiseFromJob(rt, p_out, true, err_val);
-            return .{ .object = p_out };
+            return rejectCapabilityCaught(rt, rej_cap, p_out);
         };
         const elem = maybe_elem orelse break;
-        root_buf[7] = elem;
+        root_buf[9] = elem;
 
-        const next_p = try resolveToPromise(rt, elem);
-        root_buf[8] = next_p;
+        const next_p = (if (is_builtin_promise and promise_resolve == .native and promise_resolve.native == &promise_resolve_static)
+            resolveToPromise(rt, elem)
+        else
+            rt.callCallable(promise_resolve, ctor, &.{elem})) catch |e| {
+            if (e != error.Thrown) return e;
+            try iteratorClose(rt, iter, true);
+            return rejectCapabilityCaught(rt, rej_cap, p_out);
+        };
+        root_buf[9] = next_p;
 
         if (kind != .race) {
-            try rt.heap.appendElements(root_buf[3].object, &.{.undefined});
+            try rt.heap.appendElements(root_buf[7].object, &.{.undefined});
             const elem_env = try rt.heap.newArray(null);
-            root_buf[9] = .{ .object = elem_env };
-            try rt.heap.appendElements(elem_env, &.{ root_buf[4], .{ .number = @floatFromInt(count) } });
+            root_buf[10] = .{ .object = elem_env };
+            try rt.heap.appendElements(elem_env, &.{ root_buf[8], .{ .number = @floatFromInt(count) }, .{ .boolean = false } });
         }
 
         const cb_f: Value = switch (kind) {
-            .all => .{ .closure = try rt.heap.newNativeClosure(&allFulfillCb, root_buf[9].object) },
-            .all_settled => .{ .closure = try rt.heap.newNativeClosure(&allSettledFulfillCb, root_buf[9].object) },
-            .race, .any => root_buf[5],
+            .all => .{ .closure = try rt.heap.newNativeClosure(&allFulfillCb, root_buf[10].object) },
+            .all_settled => .{ .closure = try rt.heap.newNativeClosure(&allSettledFulfillCb, root_buf[10].object) },
+            .race, .any => res_cap,
         };
-        root_buf[10] = cb_f;
+        root_buf[11] = cb_f;
 
         const cb_r: Value = switch (kind) {
-            .all, .race => root_buf[6],
-            .all_settled => .{ .closure = try rt.heap.newNativeClosure(&allSettledRejectCb, root_buf[9].object) },
-            .any => .{ .closure = try rt.heap.newNativeClosure(&anyRejectCb, root_buf[9].object) },
+            .all, .race => rej_cap,
+            .all_settled => .{ .closure = try rt.heap.newNativeClosure(&allSettledRejectCb, root_buf[10].object) },
+            .any => .{ .closure = try rt.heap.newNativeClosure(&anyRejectCb, root_buf[10].object) },
         };
-        root_buf[11] = cb_r;
+        root_buf[12] = cb_r;
 
-        _ = try promiseThen(rt, next_p, &.{ cb_f, cb_r });
+        const then_fn = object.get(rt, next_p, try object.named(rt, "then")) catch |e| {
+            if (e != error.Thrown) return e;
+            try iteratorClose(rt, iter, true);
+            return rejectCapabilityCaught(rt, rej_cap, p_out);
+        };
+        _ = rt.callCallable(then_fn, next_p, &.{ cb_f, cb_r }) catch |e| {
+            if (e != error.Thrown) return e;
+            try iteratorClose(rt, iter, true);
+            return rejectCapabilityCaught(rt, rej_cap, p_out);
+        };
         count += 1;
     }
 
     if (count == 0) {
         switch (kind) {
-            .all, .all_settled => try settlePromiseFromJob(rt, p_out, false, root_buf[3]),
+            .all, .all_settled => _ = try rt.callCallable(res_cap, .undefined, &.{root_buf[7]}),
             .race => {},
             .any => {
-                const agg = try makeAggregateError(rt, root_buf[3]);
-                root_buf[7] = agg;
-                try settlePromiseFromJob(rt, p_out, true, agg);
+                const agg = try makeAggregateError(rt, root_buf[7]);
+                root_buf[9] = agg;
+                _ = try rt.callCallable(rej_cap, .undefined, &.{agg});
             },
         }
     } else if (kind != .race) {
         // Set remaining count after iteration so reactions (queued via microtasks) see final count.
-        rt.heap.storeElement(root_buf[4].object, 2, .{ .number = @floatFromInt(count) });
+        const state_arr = root_buf[8].object;
+        const cur_rem: isize = @intFromFloat(state_arr.kind.array.items[2].number);
+        const total_rem = cur_rem + @as(isize, @intCast(count));
+        rt.heap.storeElement(state_arr, 2, .{ .number = @floatFromInt(total_rem) });
+        if (total_rem == 0 and !state_arr.kind.array.items[5].boolean) {
+            rt.heap.storeElement(state_arr, 5, .{ .boolean = true });
+            switch (kind) {
+                .all, .all_settled => _ = try rt.callCallable(res_cap, .undefined, &.{root_buf[7]}),
+                .any => {
+                    const agg = try makeAggregateError(rt, root_buf[7]);
+                    root_buf[9] = agg;
+                    _ = try rt.callCallable(rej_cap, .undefined, &.{agg});
+                },
+                .race => unreachable,
+            }
+        }
     }
 
-    return .{ .object = p_out };
+    return p_out;
 }
 
 fn allFulfillCb(rt: *Runtime, elem_env: *Object, args: []const Value) Error!Value {
+    if (elem_env.kind.array.items[2].boolean) return .undefined;
+    rt.heap.storeElement(elem_env, 2, .{ .boolean = true });
     const state_arr = elem_env.kind.array.items[0].object;
-    const idx: usize = @intFromFloat(elem_env.kind.array.items[1].number);
-    const p_out = state_arr.kind.array.items[0].object;
-    if (p_out.kind.promise.already_resolved) return .undefined;
+    if (state_arr.kind.array.items[5].boolean) return .undefined;
 
+    const idx: usize = @intFromFloat(elem_env.kind.array.items[1].number);
     const results_arr = state_arr.kind.array.items[1].object;
     rt.heap.storeElement(results_arr, idx, arg(args, 0));
 
-    const rem: usize = @intFromFloat(state_arr.kind.array.items[2].number);
+    const rem: isize = @intFromFloat(state_arr.kind.array.items[2].number);
     const next_rem = rem - 1;
     rt.heap.storeElement(state_arr, 2, .{ .number = @floatFromInt(next_rem) });
     if (next_rem == 0) {
-        try settlePromiseFromJob(rt, p_out, false, .{ .object = results_arr });
+        rt.heap.storeElement(state_arr, 5, .{ .boolean = true });
+        _ = try rt.callCallable(state_arr.kind.array.items[3], .undefined, &.{.{ .object = results_arr }});
     }
     return .undefined;
 }
@@ -5643,8 +5900,11 @@ fn allSettledRejectCb(rt: *Runtime, elem_env: *Object, args: []const Value) Erro
 }
 
 fn allSettledCb(rt: *Runtime, elem_env: *Object, val: Value, is_rejected: bool) Error!Value {
-    // An iteration fault rejects p_out with `remaining` still 0; late reactions must not underflow it.
-    if (elem_env.kind.array.items[0].object.kind.array.items[0].object.kind.promise.already_resolved) return .undefined;
+    if (elem_env.kind.array.items[2].boolean) return .undefined;
+    rt.heap.storeElement(elem_env, 2, .{ .boolean = true });
+    const state_arr = elem_env.kind.array.items[0].object;
+    if (state_arr.kind.array.items[5].boolean) return .undefined;
+
     var root_buf = [_]Value{ .{ .object = elem_env }, val, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
@@ -5658,42 +5918,43 @@ fn allSettledCb(rt: *Runtime, elem_env: *Object, val: Value, is_rejected: bool) 
     try object.define(rt, obj, try object.named(rt, "status"), root_buf[3]);
     try object.define(rt, obj, try object.named(rt, if (is_rejected) "reason" else "value"), val);
 
-    const state_arr = elem_env.kind.array.items[0].object;
     const idx: usize = @intFromFloat(elem_env.kind.array.items[1].number);
-    const p_out = state_arr.kind.array.items[0].object;
     const results_arr = state_arr.kind.array.items[1].object;
 
     rt.heap.storeElement(results_arr, idx, root_buf[2]);
-    const rem: usize = @intFromFloat(state_arr.kind.array.items[2].number);
+    const rem: isize = @intFromFloat(state_arr.kind.array.items[2].number);
     const next_rem = rem - 1;
     rt.heap.storeElement(state_arr, 2, .{ .number = @floatFromInt(next_rem) });
     if (next_rem == 0) {
-        try settlePromiseFromJob(rt, p_out, false, .{ .object = results_arr });
+        rt.heap.storeElement(state_arr, 5, .{ .boolean = true });
+        _ = try rt.callCallable(state_arr.kind.array.items[3], .undefined, &.{.{ .object = results_arr }});
     }
     return .undefined;
 }
 
 fn anyRejectCb(rt: *Runtime, elem_env: *Object, args: []const Value) Error!Value {
+    if (elem_env.kind.array.items[2].boolean) return .undefined;
+    rt.heap.storeElement(elem_env, 2, .{ .boolean = true });
     const state_arr = elem_env.kind.array.items[0].object;
-    const p_out = state_arr.kind.array.items[0].object;
-    if (p_out.kind.promise.already_resolved) return .undefined;
+    if (state_arr.kind.array.items[5].boolean) return .undefined;
 
     const idx: usize = @intFromFloat(elem_env.kind.array.items[1].number);
     const errors_arr = state_arr.kind.array.items[1].object;
     rt.heap.storeElement(errors_arr, idx, arg(args, 0));
 
-    const rem: usize = @intFromFloat(state_arr.kind.array.items[2].number);
+    const rem: isize = @intFromFloat(state_arr.kind.array.items[2].number);
     const next_rem = rem - 1;
     rt.heap.storeElement(state_arr, 2, .{ .number = @floatFromInt(next_rem) });
     if (next_rem == 0) {
-        var root_buf = [_]Value{ .{ .object = p_out }, .{ .object = errors_arr }, .undefined };
+        rt.heap.storeElement(state_arr, 5, .{ .boolean = true });
+        var root_buf = [_]Value{ .{ .object = state_arr }, .{ .object = errors_arr }, .undefined };
         var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
         try roots.register(rt);
         defer roots.unregister(rt);
 
         const agg = try makeAggregateError(rt, .{ .object = errors_arr });
         root_buf[2] = agg;
-        try settlePromiseFromJob(rt, p_out, true, agg);
+        _ = try rt.callCallable(state_arr.kind.array.items[4], .undefined, &.{agg});
     }
     return .undefined;
 }
@@ -5839,7 +6100,7 @@ pub fn getIterator(rt: *Runtime, iterable: Value) Error!*Object {
         return rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }});
     }
     const r = try realm(rt);
-    var root_buf = [_]Value{ iterable, .undefined, .undefined, .undefined };
+    var root_buf = [_]Value{ iterable, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -5849,6 +6110,16 @@ pub fn getIterator(rt: *Runtime, iterable: Value) Error!*Object {
     if (method_fn == .undefined or method_fn == .null or !method_fn.isFunction()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }});
     }
+    return getIteratorWithMethod(rt, iterable, method_fn);
+}
+
+fn getIteratorWithMethod(rt: *Runtime, iterable: Value, method_fn: Value) Error!*Object {
+    const r = try realm(rt);
+    var root_buf = [_]Value{ iterable, method_fn, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     const iter_val = try rt.callCallable(method_fn, iterable, &.{});
     root_buf[2] = iter_val;
     if (!iter_val.isObjectLike()) {
@@ -8103,10 +8374,24 @@ fn constructorTypedArrayKind(v: Value) ?heap_mod.TypedArrayKind {
 const ta_from: Native = .{ .name = "from", .length = 1, .call = taFrom };
 const ta_of: Native = .{ .name = "of", .length = 0, .call = taOf };
 
+fn typedArrayCreateLen(rt: *Runtime, ctor: Value, len: usize) Error!*Object {
+    if (constructorTypedArrayKind(ctor)) |kind| {
+        return allocateTypedArray(rt, kind, len);
+    }
+    const res = try constructWithNewTarget(rt, ctor, &.{.{ .number = @floatFromInt(len) }}, ctor);
+    if (res != .object or res.object.kind != .typed_array) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray constructor did not return a TypedArray" }});
+    }
+    if (res.object.kind.typed_array.length < len) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Derived TypedArray constructor created an array that was too small" }});
+    }
+    return res.object;
+}
+
 fn taFrom(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const kind = constructorTypedArrayKind(this) orelse {
-        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray.from requires a TypedArray constructor" }});
-    };
+    if (!isConstructor(this)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray.from requires a constructor" }});
+    }
     const source = arg(args, 0);
     if (source == .undefined or source == .null) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
@@ -8118,39 +8403,39 @@ fn taFrom(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     }
     const this_arg = arg(args, 2);
     const r = try realm(rt);
-    var root_buf = [_]Value{ source, map_fn, this_arg, .undefined, .undefined };
+    var root_buf = [_]Value{ this, source, map_fn, this_arg, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
     if (try object.getMethod(rt, source, .{ .symbol = r.sym_iterator })) |iter_fn| {
         const arr = try collectIterableToArray(rt, source, iter_fn);
-        root_buf[3] = .{ .object = arr };
+        root_buf[4] = .{ .object = arr };
         const len = arr.kind.array.items.len;
-        const dst = try allocateTypedArray(rt, kind, len);
-        root_buf[4] = .{ .object = dst };
+        const dst = try typedArrayCreateLen(rt, this, len);
+        root_buf[5] = .{ .object = dst };
         for (0..len) |i| {
             const elem = arr.kind.array.items[i];
             const val = if (has_map)
                 try rt.callCallable(map_fn, this_arg, &.{ elem, .{ .number = @floatFromInt(i) } })
             else
                 elem;
-            try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, val);
+            _ = try object.setWithReceiver(rt, .{ .object = dst }, .{ .index = @intCast(i) }, val, .{ .object = dst }, true);
         }
         return .{ .object = dst };
     }
 
     const len_f = try toLength(rt, try object.get(rt, source, try object.named(rt, "length")));
     const len: usize = @intFromFloat(len_f);
-    const dst = try allocateTypedArray(rt, kind, len);
-    root_buf[3] = .{ .object = dst };
+    const dst = try typedArrayCreateLen(rt, this, len);
+    root_buf[4] = .{ .object = dst };
     for (0..len) |i| {
         const elem = try object.get(rt, source, .{ .index = @intCast(i) });
         const val = if (has_map)
             try rt.callCallable(map_fn, this_arg, &.{ elem, .{ .number = @floatFromInt(i) } })
         else
             elem;
-        try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, val);
+        _ = try object.setWithReceiver(rt, .{ .object = dst }, .{ .index = @intCast(i) }, val, .{ .object = dst }, true);
     }
     return .{ .object = dst };
 }

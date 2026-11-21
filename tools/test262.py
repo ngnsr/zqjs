@@ -76,6 +76,13 @@ DEFAULT_SKIP_FEATURES = {
     "regexp-duplicate-named-groups",
     "symbols-as-weakmap-keys",
     "hashbang",
+    "import-defer",
+    "iterator-chunking",
+    "iterator-includes",
+    "Math.sumPrecise",
+    "await-dictionary",
+    "Iterator.prototype.join",
+    "json-parse-with-source",
 }
 
 FRONTMATTER_RE = re.compile(r"/\*---\s*\n(.*?)\n---\*/", re.DOTALL)
@@ -238,8 +245,8 @@ def run_single_test(args: tuple[Any, ...]) -> dict[str, Any]:
 
     # Assemble source
     parts: list[str] = []
-    if not is_raw and not is_module:
-        if use_strict:
+    if not is_raw:
+        if use_strict and not is_module:
             parts.append('"use strict";\n')
         parts.append(HOST_SHIM)
         parts.append(harness_bundle_cache["sta.js"])
@@ -262,13 +269,21 @@ def run_single_test(args: tuple[Any, ...]) -> dict[str, Any]:
 
     tmp_file = None
     try:
-        if is_module:
-            # Module imports resolve relative to the file's directory, so run original file
-            # if no harness is needed; otherwise write temp file in same dir? Better: run original
-            # if no includes, or skip if includes needed.
-            if not is_raw and includes:
-                return {"path": rel_path, "status": "skip", "reason": "module_with_includes"}
+        if is_module and is_raw:
             cmd.append(test_path_str)
+        elif is_module:
+            # Write in the test's directory so relative module imports resolve.
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=str(test_path.parent),
+                prefix=".zqjs_t262_",
+                suffix=".mjs",
+                delete=False,
+                encoding="utf-8",
+            ) as tf:
+                tf.write(full_source)
+                tmp_file = tf.name
+            cmd.append(tmp_file)
         else:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False, encoding="utf-8") as tf:
                 tf.write(full_source)

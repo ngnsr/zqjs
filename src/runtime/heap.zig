@@ -2079,6 +2079,21 @@ pub const Heap = struct {
         return h.internAdapted(text, AsciiAdapter{});
     }
 
+    /// The atom for UTF-8 identifier text (decoded escapes or ASCII).
+    pub fn internUtf8(h: *Heap, text: []const u8) Error!*String {
+        for (text) |b| {
+            if (b >= 0x80) {
+                const units = std.unicode.utf8ToUtf16LeAlloc(h.allocator(), text) catch |e| switch (e) {
+                    error.OutOfMemory => return h.failed(error.OutOfMemory),
+                    error.InvalidUtf8 => return h.internAscii(text),
+                };
+                defer h.allocator().free(units);
+                return h.intern(units);
+            }
+        }
+        return h.internAscii(text);
+    }
+
     fn internAdapted(h: *Heap, key: anytype, adapter: anytype) Error!*String {
         const gop = h.atoms.getOrPutContextAdapted(h.allocator(), key, adapter, .{}) catch |e| return h.failed(e);
         if (gop.found_existing) return gop.key_ptr.*;

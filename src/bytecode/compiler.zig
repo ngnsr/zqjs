@@ -290,7 +290,7 @@ const Compiler = struct {
         const name_atoms = try gpa.alloc(*@import("../runtime/heap.zig").String, c.names.items.len);
         errdefer gpa.free(name_atoms);
         for (c.names.items, 0..) |n, i| {
-            name_atoms[i] = c.s.heap.internAscii(n) catch |e| switch (e) {
+            name_atoms[i] = c.s.heap.internUtf8(n) catch |e| switch (e) {
                 error.LimitExceeded => return c.limit(c.s.heap.limit_hit.?),
                 error.OutOfMemory => return error.OutOfMemory,
             };
@@ -1363,6 +1363,8 @@ const Compiler = struct {
             .super_member => |k| switch (k) {
                 .name => |n| try c.emit(.super_get_prop, &.{try c.name(n)}),
                 .computed => |ke| {
+                    try c.emit(.push_this, &.{});
+                    try c.emit(.pop, &.{});
                     try c.expr(ke);
                     try c.emit(.super_get_elem, &.{});
                 },
@@ -1551,6 +1553,8 @@ const Compiler = struct {
                     const named = switch (k) {
                         .name => |n| n,
                         .computed => |ke| blk: {
+                            try c.emit(.push_this, &.{});
+                            try c.emit(.pop, &.{});
                             try c.expr(ke);
                             break :blk null;
                         },
@@ -1647,6 +1651,8 @@ const Compiler = struct {
                     const named = switch (k) {
                         .name => |n| n,
                         .computed => |ke| blk: {
+                            try c.emit(.push_this, &.{});
+                            try c.emit(.pop, &.{});
                             try c.expr(ke);
                             break :blk null;
                         },
@@ -2000,6 +2006,8 @@ const Compiler = struct {
                             try c.emit(.super_set_prop, &.{try c.name(n)});
                         },
                         .computed => |ke| {
+                            try c.emit(.push_this, &.{});
+                            try c.emit(.pop, &.{});
                             try c.expr(ke);
                             try c.emit(.get_local, &.{ val_slot, try c.name("<val>") });
                             try c.emit(.super_set_elem, &.{});

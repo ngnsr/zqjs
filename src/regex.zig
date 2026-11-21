@@ -532,12 +532,29 @@ fn isClassSetDoublePunctuatorChar(c: u21) bool {
     };
 }
 
-fn isGroupNameStart(c: u16) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
+fn isGroupNameStartCp(cp: u21) bool {
+    if (cp == '$' or cp == '_') return true;
+    if ((cp >= 'a' and cp <= 'z') or (cp >= 'A' and cp <= 'Z')) return true;
+    if (cp >= 0x80) {
+        if (unicode.lookupProperty("ID_Start")) |ranges| return unicode.inRanges(cp, ranges);
+    }
+    return false;
 }
 
-fn isGroupNamePart(c: u16) bool {
-    return isGroupNameStart(c) or isAsciiDigit(c);
+fn isGroupNamePartCp(cp: u21) bool {
+    if (isGroupNameStartCp(cp)) return true;
+    if ((cp >= '0' and cp <= '9') or cp == 0x200C or cp == 0x200D) return true;
+    if (cp >= 0x80) {
+        if (unicode.lookupProperty("ID_Continue")) |ranges| return unicode.inRanges(cp, ranges);
+    }
+    return false;
+}
+
+fn hexDigitVal(cu: u16) ?u21 {
+    if (cu >= '0' and cu <= '9') return cu - '0';
+    if (cu >= 'a' and cu <= 'f') return cu - 'a' + 10;
+    if (cu >= 'A' and cu <= 'F') return cu - 'A' + 10;
+    return null;
 }
 
 const GroupKind = enum {
@@ -760,6 +777,92 @@ const Compiler = struct {
         return null;
     }
 
+    fn parseGroupNameUnit(self: *Compiler, idx: *usize) CompileError!u21 {
+        const p = self.pattern;
+        if (idx.* >= p.len) return self.failSyntax("unterminated capture group name");
+        if (p[idx.*] == '\\') {
+            if (idx.* + 1 >= p.len or p[idx.* + 1] != 'u') return self.failSyntax("invalid capture group name");
+            idx.* += 2;
+            if (idx.* < p.len and p[idx.*] == '{') {
+                idx.* += 1;
+                var cp: u21 = 0;
+                var digits: usize = 0;
+                while (idx.* < p.len and p[idx.*] != '}') : (idx.* += 1) {
+                    const d = hexDigitVal(p[idx.*]) orelse return self.failSyntax("invalid capture group name");
+                    cp = cp * 16 + d;
+                    if (cp > 0x10FFFF) return self.failSyntax("invalid capture group name");
+                    digits += 1;
+                }
+                if (digits == 0 or idx.* >= p.len or p[idx.*] != '}') return self.failSyntax("invalid capture group name");
+                idx.* += 1;
+                return cp;
+            }
+            if (idx.* + 4 > p.len) return self.failSyntax("invalid capture group name");
+            var cu: u21 = 0;
+            for (0..4) |k| {
+                const d = hexDigitVal(p[idx.* + k]) orelse return self.failSyntax("invalid capture group name");
+                cu = cu * 16 + d;
+            }
+            idx.* += 4;
+            if (cu >= 0xD800 and cu <= 0xDBFF and idx.* + 6 <= p.len and p[idx.*] == '\\' and p[idx.* + 1] == 'u' and p[idx.* + 2] != '{') {
+                var lo: u21 = 0;
+                var ok = true;
+                for (0..4) |k| {
+                    if (hexDigitVal(p[idx.* + 2 + k])) |d| {
+                        lo = lo * 16 + d;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok and lo >= 0xDC00 and lo <= 0xDFFF) {
+                    idx.* += 6;
+                    return 0x10000 + ((cu - 0xD800) << 10) + (lo - 0xDC00);
+                }
+            }
+            return cu;
+        }
+        const cu = p[idx.*];
+        idx.* += 1;
+        if (cu >= 0xD800 and cu <= 0xDBFF and idx.* < p.len) {
+            const lo = p[idx.*];
+            if (lo >= 0xDC00 and lo <= 0xDFFF) {
+                idx.* += 1;
+                return 0x10000 + ((@as(u21, cu) - 0xD800) << 10) + (@as(u21, lo) - 0xDC00);
+            }
+        }
+        return cu;
+    }
+
+    fn parseGroupNameAt(self: *Compiler, start_pos: usize) CompileError!struct { name: []u16, next_pos: usize } {
+        var j = start_pos;
+        if (j >= self.pattern.len) return self.failSyntax("unterminated capture group name");
+        if (self.pattern[j] == '>') return self.failSyntax("invalid capture group name");
+
+        var buf: std.ArrayList(u16) = .empty;
+        errdefer buf.deinit(self.gpa);
+
+        var first = true;
+        while (j < self.pattern.len and self.pattern[j] != '>') {
+            const cp = try self.parseGroupNameUnit(&j);
+            if (first) {
+                if (!isGroupNameStartCp(cp)) return self.failSyntax("invalid capture group name");
+                first = false;
+            } else {
+                if (!isGroupNamePartCp(cp)) return self.failSyntax("invalid capture group name");
+            }
+            if (cp <= 0xFFFF) {
+                try buf.append(self.gpa, @intCast(cp));
+            } else {
+                const adj = cp - 0x10000;
+                try buf.append(self.gpa, @intCast(0xD800 + (adj >> 10)));
+                try buf.append(self.gpa, @intCast(0xDC00 + (adj & 0x3FF)));
+            }
+        }
+        if (j >= self.pattern.len) return self.failSyntax("unterminated capture group name");
+        return .{ .name = try buf.toOwnedSlice(self.gpa), .next_pos = j + 1 };
+    }
+
     /// Pre-pass to count capturing groups and register named groups so `\N` and `\k<name>`
     /// (including forward references) can be validated before emitting instructions.
     fn countCapturesPrepass(self: *Compiler) CompileError!u16 {
@@ -792,30 +895,16 @@ const Compiler = struct {
                         if (self.pattern[i + 3] != '=' and self.pattern[i + 3] != '!') {
                             count += 1;
                             if (count > max_captures) return self.failComplex("too many capturing groups");
-                            var j = i + 3;
-                            if (j >= self.pattern.len or !isGroupNameStart(self.pattern[j])) {
-                                return self.failSyntax("invalid capture group name");
-                            }
-                            j += 1;
-                            while (j < self.pattern.len and self.pattern[j] != '>') : (j += 1) {
-                                if (!isGroupNamePart(self.pattern[j])) {
-                                    return self.failSyntax("invalid capture group name");
-                                }
-                            }
-                            if (j >= self.pattern.len) {
-                                return self.failSyntax("unterminated capture group name");
-                            }
-                            const name = self.pattern[i + 3 .. j];
-                            if (self.findNamedGroup(name) != null) {
+                            const parsed = try self.parseGroupNameAt(i + 3);
+                            errdefer self.gpa.free(parsed.name);
+                            if (self.findNamedGroup(parsed.name) != null) {
                                 return self.failSyntax("duplicate capture group name");
                             }
-                            const duped = try self.gpa.dupe(u16, name);
-                            errdefer self.gpa.free(duped);
                             try self.named_groups.append(self.gpa, .{
-                                .name = duped,
+                                .name = parsed.name,
                                 .capture_index = @intCast(count),
                             });
-                            i = j + 1;
+                            i = parsed.next_pos;
                             continue;
                         }
                     }
@@ -1601,14 +1690,10 @@ const Compiler = struct {
                     return self.failSyntax("invalid named backreference");
                 }
                 self.pos += 1;
-                const name_start = self.pos;
-                while (self.pos < self.pattern.len and self.pattern[self.pos] != '>') : (self.pos += 1) {}
-                if (self.pos >= self.pattern.len) {
-                    return self.failSyntax("unterminated named backreference");
-                }
-                const name = self.pattern[name_start..self.pos];
-                self.pos += 1;
-                const cap_idx = self.findNamedGroup(name) orelse {
+                const parsed = try self.parseGroupNameAt(self.pos);
+                defer self.gpa.free(parsed.name);
+                self.pos = parsed.next_pos;
+                const cap_idx = self.findNamedGroup(parsed.name) orelse {
                     return self.failSyntax("unknown named capture group");
                 };
                 const inst: Inst = if (self.flags.ignore_case)

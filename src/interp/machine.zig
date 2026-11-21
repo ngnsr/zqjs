@@ -648,6 +648,17 @@ const Machine = struct {
         cl.impl.tree.res = if (m.res_ptr) |rp| @ptrCast(rp) else null;
         cl.impl.tree.repl_cells = m.repl_cells;
         cl.impl.tree.module_record = m.module_record;
+        if (m.current_closure) |pc| {
+            if (pc.meta) |pm| {
+                if (pm.brand) |br| {
+                    var root_buf = [_]Value{.{ .closure = cl }};
+                    var val_roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+                    try val_roots.register(m.rt);
+                    defer val_roots.unregister(m.rt);
+                    try m.rt.heap.storeClosureBrand(cl, br);
+                }
+            }
+        }
         return cl;
     }
 
@@ -3241,6 +3252,7 @@ const Machine = struct {
                     try m.pushEval(mem.object);
                 },
                 .super_member => |k| {
+                    _ = try m.requireThis();
                     if (a.op == .plain) {
                         switch (k) {
                             .name => |n| {
@@ -3285,6 +3297,7 @@ const Machine = struct {
                     try m.pushTask(.{ .eval = mem.object });
                 },
                 .super_member => |k| {
+                    _ = try m.requireThis();
                     try m.pushTask(.depth_pop);
                     switch (k) {
                         .name => |n| try m.pushTask(.{ .super_update_finish = .{ .op = u.op, .prefix = u.prefix, .named = n } }),
@@ -3833,6 +3846,7 @@ const Machine = struct {
                     try m.pushEval(mem.object);
                 },
                 .super_member => |k| {
+                    _ = try m.requireThis();
                     try m.pushVal(val);
                     switch (k) {
                         .name => |n| try m.pushTask(.{ .bind_target_super_finish = n }),

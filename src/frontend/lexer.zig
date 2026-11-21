@@ -34,9 +34,8 @@ pub const Lexer = struct {
             const tag = try l.number();
             return l.make(tag, start, newline_before);
         }
-        if (isIdentStart(c)) {
-            while (isIdentPart(l.peekAt(l.pos))) l.pos += 1;
-            return l.make(keyword(l.source[start..l.pos]), start, newline_before);
+        if (isIdentStart(c) or (c == '\\' and l.peekAt(start + 1) == 'u')) {
+            return l.scanIdentifier(start, newline_before);
         }
         if (c == '#' and isIdentStart(l.peekAt(start + 1))) {
             l.pos += 1;
@@ -96,13 +95,19 @@ pub const Lexer = struct {
                 },
                 '/' => switch (l.peekAt(l.pos + 1)) {
                     '/' => {
-                        while (l.pos < l.source.len and l.source[l.pos] != '\n' and l.source[l.pos] != '\r') l.pos += 1;
+                        while (l.pos < l.source.len and !isLineTerminatorAt(l.source, l.pos)) l.pos += 1;
                     },
                     '*' => {
                         const start = l.pos;
                         const close = std.mem.indexOfPos(u8, l.source, start + 2, "*/") orelse
                             return l.fail(.{ .syntax_error = "unterminated comment" }, start, start + 2);
-                        if (std.mem.indexOfAny(u8, l.source[start..close], "\r\n") != null) newline = true;
+                        const body = l.source[start..close];
+                        if (std.mem.indexOfAny(u8, body, "\r\n") != null or
+                            std.mem.indexOf(u8, body, "\xE2\x80\xA8") != null or
+                            std.mem.indexOf(u8, body, "\xE2\x80\xA9") != null)
+                        {
+                            newline = true;
+                        }
                         l.pos = @intCast(close + 2);
                     },
                     else => return newline,
@@ -263,6 +268,65 @@ pub const Lexer = struct {
         };
     }
 
+    fn scanIdentEscape(l: *Lexer) Error!u21 {
+        const esc_start = l.pos;
+        l.pos += 2; // skip `\u`
+        if (l.pos < l.source.len and l.source[l.pos] == '{') {
+            l.pos += 1;
+            var cp: u21 = 0;
+            var digit_count: usize = 0;
+            while (l.pos < l.source.len and l.source[l.pos] != '}') : (l.pos += 1) {
+                const d = std.fmt.charToDigit(l.source[l.pos], 16) catch
+                    return l.fail(.{ .syntax_error = "invalid Unicode escape sequence" }, esc_start, l.pos + 1);
+                cp = cp * 16 + d;
+                if (cp > 0x10FFFF) return l.fail(.{ .syntax_error = "Unicode code point out of range" }, esc_start, l.pos + 1);
+                digit_count += 1;
+            }
+            if (digit_count == 0 or l.pos >= l.source.len or l.source[l.pos] != '}') {
+                return l.fail(.{ .syntax_error = "invalid Unicode escape sequence" }, esc_start, l.pos);
+            }
+            l.pos += 1;
+            return cp;
+        }
+        if (l.pos + 4 > l.source.len) return l.fail(.{ .syntax_error = "invalid Unicode escape sequence" }, esc_start, l.source.len);
+        var cp: u21 = 0;
+        for (0..4) |_| {
+            const d = std.fmt.charToDigit(l.source[l.pos], 16) catch
+                return l.fail(.{ .syntax_error = "invalid Unicode escape sequence" }, esc_start, l.pos + 1);
+            cp = cp * 16 + d;
+            l.pos += 1;
+        }
+        return cp;
+    }
+
+    fn scanIdentifier(l: *Lexer, start: u32, newline_before: bool) Error!Token {
+        var has_escape = false;
+        var first = true;
+        while (l.pos < l.source.len) {
+            const c = l.source[l.pos];
+            if (if (first) isIdentStart(c) else isIdentPart(c)) {
+                l.pos += 1;
+                first = false;
+                continue;
+            }
+            if (c == '\\' and l.peekAt(l.pos + 1) == 'u') {
+                has_escape = true;
+                const esc_start = l.pos;
+                const cp = try l.scanIdentEscape();
+                if (cp < 0x80) {
+                    const b: u8 = @intCast(cp);
+                    const ok = if (first) isIdentStart(b) else isIdentPart(b);
+                    if (!ok) return l.fail(.{ .syntax_error = "invalid identifier escape" }, esc_start, l.pos);
+                }
+                first = false;
+                continue;
+            }
+            break;
+        }
+        const tag: Tag = if (has_escape) .identifier else keyword(l.source[start..l.pos]);
+        return l.make(tag, start, newline_before);
+    }
+
     fn isLineTerminatorAt(s: []const u8, i: usize) bool {
         const c = s[i];
         if (c == '\n' or c == '\r') return true;
@@ -292,6 +356,10 @@ pub const Lexer = struct {
         }
     }
 };
+
+pub fn isKeywordText(s: []const u8) bool {
+    return keyword(s) != .identifier;
+}
 
 fn keyword(s: []const u8) Tag {
     const map = std.StaticStringMap(Tag).initComptime(.{

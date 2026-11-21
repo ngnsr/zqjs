@@ -7,7 +7,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
-const Lexer = @import("lexer.zig").Lexer;
+const lexer_mod = @import("lexer.zig");
+const Lexer = lexer_mod.Lexer;
 const number = @import("number.zig");
 const token = @import("token.zig");
 const Token = token.Token;
@@ -45,6 +46,7 @@ pub fn parseWithOptions(arena: Allocator, source: []const u8, limits: Limits, op
         .tok = undefined,
         .async_ctx = if (options.allow_top_level_await or options.source_kind == .module) .body else .none,
         .source_kind = options.source_kind,
+        .in_strict_mode = options.source_kind == .module,
     };
     p.tok = try p.lexer.next();
 
@@ -153,6 +155,8 @@ const Parser = struct {
     for_await_head: bool = false,
     /// Yield expressions parsed so far: arrow parameters must not contain one.
     yield_count: u32 = 0,
+    in_strict_mode: bool = false,
+    in_static_block: bool = false,
     /// When probing `async (...)` at `.none`, defer `await` identifier error until we know if `=>` follows.
     in_async_paren: bool = false,
     async_paren_await_span: ?ast.Span = null,
@@ -913,7 +917,7 @@ const Parser = struct {
     /// reported as Unsupported like any other ASI.
     fn returnStatement(p: *Parser) Error!ast.Stmt {
         const t = p.tok;
-        if (p.function_depth == 0) return p.fail(.{ .syntax_error = "'return' outside a function" }, t);
+        if (p.function_depth == 0 or p.in_static_block) return p.fail(.{ .syntax_error = "'return' outside a function" }, t);
         try p.advance();
         if (p.tok.tag == .semicolon) {
             const end = p.tok;
@@ -1052,7 +1056,11 @@ const Parser = struct {
             p.in_class_method = outer_method;
             p.function_depth -= 1;
         }
+        const outer_static_block = p.in_static_block;
+        p.in_static_block = false;
+        defer p.in_static_block = outer_static_block;
         const parsed_body = try p.parseFunctionBody();
+        try p.checkDirectivePrologue(parsed_body.body, params);
 
         const f = try p.arena.create(ast.Function);
         f.* = .{
@@ -1115,15 +1123,81 @@ const Parser = struct {
         return .{ .body = body.items, .end = close.end };
     }
 
+    fn isSimpleParams(params: []const ast.Param) bool {
+        for (params) |param| {
+            if (param.is_rest or param.default != null or param.pattern.data != .binding) return false;
+        }
+        return true;
+    }
+
+    fn checkDirectivePrologue(p: *Parser, body: []const ast.Stmt, params: []const ast.Param) Error!void {
+        const src = p.source();
+        for (body) |stmt| {
+            if (stmt.data != .expression) break;
+            const expr = stmt.data.expression;
+            if (expr.data != .string) break;
+            const raw = src[expr.span.start..expr.span.end];
+            if (std.mem.eql(u8, raw, "\"use strict\"") or std.mem.eql(u8, raw, "'use strict'")) {
+                if (!isSimpleParams(params)) {
+                    return p.failAt(.{ .syntax_error = "Illegal 'use strict' directive in function with non-simple parameter list" }, stmt.span.start, stmt.span.end);
+                }
+            }
+        }
+    }
+
+    fn isStrictReservedWord(name: []const u8) bool {
+        const strict_words = std.StaticStringMap(void).initComptime(.{
+            .{"implements"}, .{"interface"}, .{"let"},    .{"package"},
+            .{"private"},    .{"protected"}, .{"public"}, .{"static"},
+            .{"yield"},
+        });
+        return strict_words.has(name);
+    }
+
+    fn identText(p: *Parser, t: Token) Error![]const u8 {
+        const raw = t.text(p.source());
+        if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
+        var buf: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < raw.len) {
+            if (raw[i] == '\\' and i + 1 < raw.len and raw[i + 1] == 'u') {
+                i += 2;
+                var cp: u21 = 0;
+                if (i < raw.len and raw[i] == '{') {
+                    i += 1;
+                    while (i < raw.len and raw[i] != '}') : (i += 1) {
+                        cp = cp * 16 + (std.fmt.charToDigit(raw[i], 16) catch unreachable);
+                    }
+                    i += 1; // skip '}'
+                } else {
+                    for (0..4) |_| {
+                        cp = cp * 16 + (std.fmt.charToDigit(raw[i], 16) catch unreachable);
+                        i += 1;
+                    }
+                }
+                var utf8_buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &utf8_buf) catch return p.fail(.{ .syntax_error = "invalid Unicode escape sequence" }, t);
+                try buf.appendSlice(p.arena, utf8_buf[0..n]);
+            } else {
+                try buf.append(p.arena, raw[i]);
+                i += 1;
+            }
+        }
+        return buf.items;
+    }
+
     /// A function or parameter name. Reserved words are SyntaxErrors; `let` is a legal
     /// sloppy-mode name ZQJS doesn't support (unless inside let/const, where it's a SyntaxError);
     /// `arguments` would shadow the arguments object.
     fn bindingName(p: *Parser, is_lexical_decl: bool) Error!ast.Declarator {
         const t = p.tok;
-        const name = t.text(p.source());
+        const name = try p.identText(t);
         if (t.tag != .identifier and !token.isKeyword(t.tag)) return p.fail(.{ .unsupported = .syntax }, t);
-        if (token.isKeyword(t.tag) or token.reserved_identifiers.has(name))
+        if (token.isKeyword(t.tag) or token.reserved_identifiers.has(name) or lexer_mod.isKeywordText(name))
             return p.fail(.{ .syntax_error = "reserved word cannot be a binding name" }, t);
+        if (p.in_strict_mode and isStrictReservedWord(name)) {
+            return p.fail(.{ .syntax_error = "Unexpected strict mode reserved word" }, t);
+        }
         if (std.mem.eql(u8, name, "let")) {
             if (is_lexical_decl) return p.fail(.{ .syntax_error = "let is disallowed as a lexically bound name" }, t);
             return p.fail(.{ .unsupported = .syntax }, t);
@@ -1661,6 +1735,7 @@ const Parser = struct {
         var end: u32 = undefined;
         if (p.tok.tag == .l_brace) {
             const parsed_body = try p.parseFunctionBody();
+            try p.checkDirectivePrologue(parsed_body.body, params);
             body = parsed_body.body;
             end = parsed_body.end;
         } else {
@@ -1944,7 +2019,7 @@ const Parser = struct {
                     break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = name.text(p.source()) }, .is_private = true } }, callee.depth);
                 }
                 const name = try p.expectPropertyName();
-                break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = name.text(p.source()) } } }, callee.depth);
+                break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = try p.identText(name) } } }, callee.depth);
             },
             .l_bracket => blk: {
                 try p.rejectCoverExpr(callee);
@@ -2034,7 +2109,7 @@ const Parser = struct {
                     end = name.end;
                 } else {
                     const name = try p.expectPropertyName();
-                    try steps.append(p.arena, .{ .optional = true, .kind = .{ .prop = name.text(p.source()) } });
+                    try steps.append(p.arena, .{ .optional = true, .kind = .{ .prop = try p.identText(name) } });
                     end = name.end;
                 }
             } else if (p.tok.tag == .l_paren) {
@@ -2059,7 +2134,7 @@ const Parser = struct {
                     end = name.end;
                 } else {
                     const name = try p.expectPropertyName();
-                    try steps.append(p.arena, .{ .optional = false, .kind = .{ .prop = name.text(p.source()) } });
+                    try steps.append(p.arena, .{ .optional = false, .kind = .{ .prop = try p.identText(name) } });
                     end = name.end;
                 }
             } else break;
@@ -2476,7 +2551,7 @@ const Parser = struct {
                         try p.advance();
                         if (p.tok.tag == .private_ident) return p.fail(.{ .syntax_error = "Private fields cannot be accessed on super" }, p.tok);
                         const prop = try p.expectPropertyName();
-                        return p.node(.{ .start = t.start, .end = prop.end }, .{ .super_member = .{ .name = prop.text(p.source()) } }, 0);
+                        return p.node(.{ .start = t.start, .end = prop.end }, .{ .super_member = .{ .name = try p.identText(prop) } }, 0);
                     }
                     if (p.tok.tag == .l_bracket) {
                         try p.advance();
@@ -3100,6 +3175,10 @@ const Parser = struct {
         try p.enter();
         defer p.depth -= 1;
 
+        const outer_strict = p.in_strict_mode;
+        p.in_strict_mode = true;
+        defer p.in_strict_mode = outer_strict;
+
         const start = p.tok.start;
         try p.advance(); // `class`
         const class_id = p.class_count;
@@ -3158,6 +3237,7 @@ const Parser = struct {
                 const outer_method = p.in_class_method;
                 const outer_async_ctx = p.async_ctx;
                 const outer_yield_ctx = p.yield_ctx;
+                const outer_static_block = p.in_static_block;
                 p.loop_depth = 0;
                 p.switch_depth = 0;
                 p.labels = .empty;
@@ -3166,6 +3246,7 @@ const Parser = struct {
                 p.async_ctx = .none;
                 p.yield_ctx = .none;
                 p.function_depth += 1;
+                p.in_static_block = true;
                 defer {
                     p.loop_depth = outer_loops;
                     p.switch_depth = outer_switches;
@@ -3175,6 +3256,7 @@ const Parser = struct {
                     p.async_ctx = outer_async_ctx;
                     p.yield_ctx = outer_yield_ctx;
                     p.function_depth -= 1;
+                    p.in_static_block = outer_static_block;
                 }
                 const parsed_body = try p.parseFunctionBody();
                 const blk_fn = try p.arena.create(ast.Function);
@@ -3240,7 +3322,7 @@ const Parser = struct {
                 },
                 else => blk: {
                     const prop_tok = try p.expectPropertyName();
-                    break :blk .{ .name = prop_tok.text(p.source()) };
+                    break :blk .{ .name = try p.identText(prop_tok) };
                 },
             };
 
@@ -3372,6 +3454,7 @@ const Parser = struct {
                 p.function_depth -= 1;
             }
             const parsed_body = try p.parseFunctionBody();
+            try p.checkDirectivePrologue(parsed_body.body, params);
 
             const f = try p.arena.create(ast.Function);
             f.* = .{

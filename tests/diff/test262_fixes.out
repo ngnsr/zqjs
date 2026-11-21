@@ -1,0 +1,22 @@
+[null,null,null]
+["0:a","1:undefined","2:c"]
+["object",42,null,null]
+["object",42,null,null]
+1 1 1 1
+1 2 1 1
+2 2
+1 1 1 1 1 1
+true true true
+[object Number] ff
+true
+false false
+TypeError
+RangeError
+TypeError
+true true 3 10 20 30
+a a
+true x
+brk cs
+ReferenceError
+ReferenceError
+bad_resolve TypeError 0

@@ -222,6 +222,9 @@ pub const Runtime = struct {
     host_message_truncated: bool = false,
     /// The built-in objects, created on first use (builtins.zig).
     realm: ?@import("builtins.zig").Realm = null,
+    /// Direct-mapped monomorphic property inline cache (M52, D82): stores only
+    /// `(is_proto << 31) | prop_index` (no GC pointers; verified by atom pointer equality).
+    prop_ic: [128]u32 = @splat(0),
     /// Arrays being converted to strings right now (cycle detection, object.join).
     joining: std.ArrayList(*heap_mod.Object) = .empty,
     /// The running engine's roots (its stacks and frames), marked by `collect` (D8).

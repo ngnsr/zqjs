@@ -2020,3 +2020,24 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
   - `options.transfer` is consumed via `getIterator` (`[Symbol.iterator]`), validating every entry is a non-detached `ArrayBuffer` with no duplicates (closing the iterator and throwing `DataCloneError` on error).
   - Cloning completes before any buffer in `transfer` is detached, so errors during cloning never prematurely detach buffers. On success, backing `[]u8` slices move zero-copy into cloned `ArrayBuffer`s and originals are detached via `Heap.detachArrayBuffer` (`detached = true, data = &.{}`), preserving exact `Heap` byte accounting.
   - `TypedArray.prototype.subarray` checks `requireLiveTypedArray` (throwing `TypeError` on detached buffers matching Node). `api.zig` `bufferBytes` / `c_api.zig` `zqjs_handle_buffer_data` return an empty slice / `0` bytes (never a dangling pointer) on detached buffers.
+
+---
+
+## D82. Tier 1 VM Performance: Direct-Key Property IC, Dense Array Fast Set, and Loop Superinstructions *(M52)*
+
+**Decision:** Accelerate the bytecode VM without changing `Value`'s layout or adding GC-traced cache structures by combining: (1) a fixed-size, zero-allocation direct-mapped property inline cache (`Runtime.prop_ic: [128]u32`) verified by interned atom pointer equality, (2) a dense-array `fastArraySet` path in `.set_elem` routed through `Heap.storeElement`, and (3) four compiler-emitted loop superinstructions (`inc_local`, `dec_local`, `set_local_pop`, `lt_jump_if_false`, `le_jump_if_false`).
+
+- **Zero-Pointer Monomorphic Property IC (`Runtime.prop_ic`, `Heap.storePropertyAt`, `vm.zig`):**
+  - Each IC entry packs `(is_proto << 31) | prop_index` into a single `u32` (no GC pointers, no tracing, no OOM paths, no `Proto` mutation).
+  - Indexed by `((@intFromPtr(p) >> 4) ^ pc) & 127`. Soundness relies on verifying `o.props.keys()[idx].obj == &atom.obj` (and `!prop.is_accessor`, plus `prop.writable` on writes) on every hit, so hash collisions, property deletions/re-insertions, `Object.defineProperty` descriptor changes, `Object.freeze`, and `Object.setPrototypeOf` are all safely self-invalidating without shape-version hooks.
+  - Supports own data properties on ordinary objects and 1-hop prototype data properties on ordinary objects and dense arrays (`o.kind == .array`, excluding array indices and `"length"`), turning hot `Array.prototype` method lookups (`arr.push`) and prototype method/field reads (`this.scale`, `r.area`) into direct indexed hits.
+  - `set_prop` IC hits update existing writable data slots via `Heap.storePropertyAt`, preserving `obj.checkLive()`, `Heap.barrier`, and `Heap.propertyBarrier` under `-Dgc-stress` and `gc-mutants`.
+- **Dense Array Fast Set (`fastArraySet` in `vm.zig`):**
+  - Mirrors M10.5c's `fastArrayGet` in `.set_elem`: for `o.kind == .array` with `o.array_elements_writable` and a finite non-negative integral index `< elems.len` (handling `-0`), writes directly via `rt.heap.storeElement`, avoiding `object.key` number-to-string conversion and `object.set`.
+- **Loop Superinstructions (`bytecode.zig`, `compiler.zig`, `vm.zig`):**
+  - `inc_local` / `dec_local` (`slot, name`): emitted for discarded `i++`/`++i`/`i--`/`--i` on non-captured mutable locals (collapsing 7 ops → 1 op while preserving TDZ, `BigInt`, and `ToNumeric` semantics).
+  - `set_local_pop` (`slot, name`): emitted for discarded plain assignments `x = expr;` on non-captured mutable locals (2 ops → 1 op).
+  - `lt_jump_if_false` / `le_jump_if_false` (`target`): emitted for `<` / `<=` conditions in `if`/`while`/`for` (2 ops → 1 op, avoiding boolean boxing on the two-`.number` fast path while preserving exact D35 fault precision on slow-path throws).
+- **Measured Rejections (PERF_PLAN §5):**
+  - Labeled-switch threaded dispatch with outlined `noinline` handlers and a local `StepBudget` regressed all 11 benchmarks (+4% to +43%) due to `FrameCache`/`StepBudget` register spilling and I-cache bloat; reverted.
+  - Adding `stack`/`locals` pointers to `FrameCache` (7 → 9 fields) also regressed (+2% to +9%) due to register pressure across calls; reverted.

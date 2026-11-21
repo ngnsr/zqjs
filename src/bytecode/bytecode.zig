@@ -51,6 +51,11 @@ pub const Op = enum(u8) {
     /// Store the top of the stack into slot s and *keep* it (the value of an assignment
     /// expression); ReferenceError if s is in the TDZ.
     set_local,
+    /// Store the top of the stack into slot s and pop it (M52 superinstruction).
+    set_local_pop,
+    /// Increment/decrement a non-captured mutable local in place (M52 superinstruction).
+    inc_local,
+    dec_local,
     /// Pop into slot s: initialises a declaration, so no TDZ or const check.
     init_local,
     /// Put slot s back into the TDZ: emitted on entering a block, so a re-entered loop
@@ -258,6 +263,9 @@ pub const Op = enum(u8) {
     /// Pop; jump if falsy / truthy (ToBoolean).
     jump_if_false,
     jump_if_true,
+    /// Pop rhs, lhs; jump if `!(lhs < rhs)` / `!(lhs <= rhs)` (M52 superinstruction).
+    lt_jump_if_false,
+    le_jump_if_false,
     /// [iterable] → [iterator]: obtain built-in iterator for `for...of` (M14.4).
     get_iter,
     /// [iterator] → [iterator, value, done_bool]: advance iterator (M14.4).
@@ -348,6 +356,8 @@ pub const Op = enum(u8) {
             .push_const => .{ .operands = &.{.@"const"}, .pops = 0, .pushes = 1 },
             .get_local => .{ .operands = &.{ .slot, .name }, .pops = 0, .pushes = 1 },
             .set_local, .assign_const => .{ .operands = &.{ .slot, .name }, .pops = 1, .pushes = 1 },
+            .set_local_pop => .{ .operands = &.{ .slot, .name }, .pops = 1, .pushes = 0 },
+            .inc_local, .dec_local => .{ .operands = &.{ .slot, .name }, .pops = 0, .pushes = 0 },
             .init_local => .{ .operands = &.{.slot}, .pops = 1, .pushes = 0 },
             .clear_local => .{ .operands = &.{.slot}, .pops = 0, .pushes = 0 },
             .get_global, .get_global_or_undefined => .{ .operands = &.{.name}, .pops = 0, .pushes = 1 },
@@ -415,6 +425,7 @@ pub const Op = enum(u8) {
             .neg, .to_number, .to_numeric, .to_string, .not, .bit_not, .typeof, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .jump => .{ .operands = &.{.target}, .pops = 0, .pushes = 0 },
             .jump_if_false, .jump_if_true => .{ .operands = &.{.target}, .pops = 1, .pushes = 0 },
+            .lt_jump_if_false, .le_jump_if_false => .{ .operands = &.{.target}, .pops = 2, .pushes = 0 },
             .get_iter, .for_in_init => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .iter_next, .for_in_next => .{ .operands = &.{}, .pops = 1, .pushes = 2 },
             .iter_close, .iter_close_throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },

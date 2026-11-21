@@ -1679,6 +1679,18 @@ pub const Heap = struct {
         return h.storePropKey(o, PropKey.fromAtom(key), value);
     }
 
+    /// Updates an existing own data property at known `index` (M52 IC fast path).
+    /// Caller must have verified `o.props.keys()[index].obj == &key.obj`,
+    /// `writable`, and `!is_accessor`.
+    pub inline fn storePropertyAt(h: *Heap, o: *Object, index: usize, key: *String, value: Value) void {
+        o.obj.checkLive();
+        const prop = &o.props.values()[index];
+        const old = prop.value;
+        prop.value = value;
+        h.barrier(&o.obj, old, value);
+        h.propertyBarrier(o, index, PropKey.fromAtom(key), value);
+    }
+
     pub fn storePropKey(h: *Heap, o: *Object, key: PropKey, value: Value) Error!void {
         o.obj.checkLive();
         try h.growPropCards(o);

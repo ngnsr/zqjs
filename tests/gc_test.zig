@@ -2748,3 +2748,26 @@ test "M51: ArrayBuffer transfer under forced GC preserves exact heap accounting 
     defer testing.allocator.free(tw_out);
     try testing.expectEqualStrings("210\n", tw_out);
 }
+
+test "M52: set_prop IC (storePropertyAt) and fastArraySet generational write barriers under forced GC" {
+    const src =
+        \\const holder = { a: 0, b: 0 };
+        \\const arr = [0, 0, 0, 0];
+        \\function updateProp(o, v) { o.b = v; }
+        \\function updateElem(a, i, v) { a[i] = v; }
+        \\// Warm up ICs and promote `holder` and `arr` to the old generation.
+        \\updateProp(holder, { tag: 'init' });
+        \\updateElem(arr, 2, { tag: 'init-elem' });
+        \\for (let i = 0; i < 200; i++) { let junk = { k: i, s: 'p' + i }; }
+        \\// Store fresh young objects into old `holder.b` (IC hit) and old `arr[2]` (fastArraySet).
+        \\updateProp(holder, { tag: 'young-prop-' + 42 });
+        \\updateElem(arr, 2, { tag: 'young-elem-' + 99 });
+        \\for (let i = 0; i < 200; i++) { let junk = { k: i, s: 'q' + i }; }
+        \\print(holder.b.tag, arr[2].tag);
+    ;
+    for ([_]zqjs.Engine{ .vm, .treewalk }) |engine| {
+        const got = try runCollecting(src, engine, .{});
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("young-prop-42 young-elem-99\n", got);
+    }
+}

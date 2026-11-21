@@ -1,4 +1,4 @@
-slots 3, max_stack 2, code 140 bytes
+slots 3, max_stack 2, code 137 bytes
 constants
   k0  1
   k1  0
@@ -16,29 +16,26 @@ code
      26  push_const     k0            ; 1
      31  init_cell      s2
      36  make_closure   #2
-     41  set_local      s0 n0         ; a
-     50  pop
-     51  new_cell       s2
-     56  push_const     k1            ; 0
-     61  init_cell      s2
-     66  fresh_cell     s2
-     71  get_cell       s2 n1         ; i
-     80  push_const     k2            ; 2
-     85  lt
-     86  jump_if_false  @139
-     91  make_closure   #3
-     96  set_local      s0 n0         ; a
-    105  pop
-    106  fresh_cell     s2
-    111  get_cell       s2 n1         ; i
-    120  to_numeric
-    121  dup
-    122  inc
-    123  set_cell       s2 n1         ; i
-    132  pop
-    133  pop
-    134  jump           @71
-    139  halt
+     41  set_local_pop  s0 n0         ; a
+     50  new_cell       s2
+     55  push_const     k1            ; 0
+     60  init_cell      s2
+     65  fresh_cell     s2
+     70  get_cell       s2 n1         ; i
+     79  push_const     k2            ; 2
+     84  lt_jump_if_false @136
+     89  make_closure   #3
+     94  set_local_pop  s0 n0         ; a
+    103  fresh_cell     s2
+    108  get_cell       s2 n1         ; i
+    117  to_numeric
+    118  dup
+    119  inc
+    120  set_cell       s2 n1         ; i
+    129  pop
+    130  pop
+    131  jump           @70
+    136  halt
 
 function #1 outer: params 1
 slots 3, max_stack 1, code 40 bytes

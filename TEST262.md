@@ -43,46 +43,37 @@ ZQJS includes a parallel [tc39/test262](https://github.com/tc39/test262) conform
 
 ---
 
-## Baseline Results (M47, `3894732`)
+## Results (M49, D79)
 
 Measured with `zig build -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
 
 | Suite | Collected | Skipped (meta) | Executed | Unsupported | Limit | Applicable | Pass | Fail | Pass / Executed | Pass / Applicable |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `built-ins` | 23,885 | 7,150 | 16,735 | 14,743 | 1 | 1,991 | 1,826 | 165 | 10.91% | **91.71%** |
-| `language` | 23,832 | 764 | 23,068 | 19,292 | 0 | 3,776 | 3,230 | 546 | 14.00% | **85.54%** |
-| **Combined** | **47,717** | **7,914** | **39,803** | **34,035** | **1** | **5,767** | **5,056** | **711** | **12.70%** | **87.67%** |
+| `built-ins` | 23,885 | 7,414 | 16,471 | 14,501 | 1 | 1,969 | 1,921 | 48 | 11.66% | **97.56%** |
+| `language` | 23,832 | 971 | 22,861 | 18,647 | 0 | 4,214 | 3,681 | 533 | 16.10% | **87.35%** |
+| **Combined** | **47,717** | **8,385** | **39,332** | **33,148** | **1** | **6,183** | **5,602** | **581** | **14.24%** | **90.60%** |
 
-- **0 internal errors** (`exit=70` / crashes) across all 39,803 executed tests.
-- Top `Unsupported` causes in unmodified Test262 files: `syntax` (mostly `var`: 25,606), `arguments` (4,352), `builtin` (1,866), `asi` (1,048), `sloppy_this` (396), `block_function` (156), `global_assignment` (146), `loose_equality` (109).
+- **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,332 executed tests.
+- `built-ins` jumped from **91.71% → 97.56%** (+5.85 pp); `language` jumped from **85.54% → 87.35%** (+1.81 pp) even with `--module` harness injection unlocking previously skipped module tests.
 
 ### Built-ins Breakdown (Applicable Tests)
 
-- **100.0%:** `AggregateError` (3/3), `ArrayBuffer` (13/13), `AsyncFromSyncIteratorPrototype` (1/1), `AsyncFunction` (1/1), `BigInt` (29/29), `Error` (15/15), `GeneratorPrototype` (3/3), `Infinity` (1/1), `NaN` (1/1), `NativeErrors` (36/36), `Proxy` (17/17), `Reflect` (40/40), `WeakMap` (14/14), `WeakSet` (12/12), `global` (4/4), `isFinite` (6/6), `isNaN` (6/6), `parseFloat` (45/45), `parseInt` (34/34).
-- **90–99%:** `RegExp` (295/305, 96.7%), `Object` (249/258, 96.5%), `Array` (190/197, 96.4%), `DataView` (27/28, 96.4%), `JSON` (47/49, 95.9%), `String` (206/216, 95.4%), `Math` (118/125, 94.4%), `Map` (25/27, 92.6%), `Number` (113/122, 92.6%), `decodeURI` (10/11, 90.9%), `decodeURIComponent` (11/12, 91.7%).
-- **< 90%:** `TypedArrayConstructors` (33/37, 89.2%), `Set` (16/18, 88.9%), `encodeURI` (8/9, 88.9%), `encodeURIComponent` (8/9, 88.9%), `Symbol` (13/16, 81.2%), `Function` (38/47, 80.9%), `Promise` (132/176, 75.0%), `TypedArray` (1/4, 25.0%), `Iterator` (5/44, 11.4% — mostly Stage 2/3 `Iterator.prototype.chunks` / `includes`).
+- **100.0%:** `AggregateError` (3/3), `Array` (197/197), `ArrayBuffer` (13/13), `AsyncFromSyncIteratorPrototype` (1/1), `AsyncFunction` (1/1), `BigInt` (29/29), `Error` (15/15), `GeneratorPrototype` (3/3), `Infinity` (1/1), `JSON` (47/47), `Map` (27/27), `Math` (120/120), `NaN` (1/1), `NativeErrors` (36/36), `Object` (258/258), `Proxy` (17/17), `Reflect` (40/40), `Set` (18/18), `String` (216/216), `WeakMap` (14/14), `WeakSet` (12/12), `global` (4/4), `isFinite` (6/6), `isNaN` (6/6), `parseFloat` (45/45), `parseInt` (34/34).
+- **90–99%:** `Number` (161/164, 98.2%), `RegExp` (295/301, 98.0%), `DataView` (27/28, 96.4%), `decodeURIComponent` (11/12, 91.7%), `decodeURI` (10/11, 90.9%), `Promise` (152/168, 90.5%).
+- **< 90%:** `TypedArrayConstructors` (33/37, 89.2%), `encodeURI` (8/9, 88.9%), `encodeURIComponent` (8/9, 88.9%), `Function` (38/44, 86.4%), `Symbol` (13/16, 81.2%), `TypedArray` (1/4, 25.0%), `Iterator` (0/2, 0.0%).
 
 ---
 
-## Spec Edge Cases for Future Improvements
+## Remaining Spec Edge Cases for Future Improvements
 
 ### Runtime & Built-ins
-1. **`Array.from` on array-like objects** (`built-ins/Array/from/array-like-has-length-but-no-indexes-with-values.js`): throws `TypeError: value is not iterable` when `[Symbol.iterator]` is absent instead of falling back to `ToLength(arrayLike.length)`.
-2. **`Function.prototype.apply(thisArg, null | undefined)`** (`built-ins/Function/prototype/apply/15.3.4.3-1-s.js`..`3-s.js`): throws `TypeError: CreateListFromArrayLike called on non-object` instead of treating `null`/`undefined` `argArray` as `[]`.
-3. **`Promise.any` / `Promise.race` / `Promise.all` abrupt completion & iterator closing** (`built-ins/Promise/any/capability-resolve-throws-no-close.js`, `capability-resolve-throws-reject.js`): capability `resolve` throwing and iterator-close ordering edge cases.
-4. **Built-in method `.length` and property descriptors**:
-   - `String.prototype.{charAt,charCodeAt,includes,indexOf,lastIndexOf,search}` (`S15.5.4.*_A11.js`)
-   - `Number.prototype` (`S15.7.4_A3.1.js`..`A3.5.js`)
-   - `Array.isArray` (`15.4.3.2-0-2.js`, `15.4.3.2-0-5.js`), `Array.of`, `Array.prototype.length` (`define-own-prop-length-error.js`)
-   - `Object.create` (`properties-arg-to-object-non-empty-string.js`), `Object.freeze` (`throws-when-false.js`), `Object.getPrototypeOf`, `Object.keys`
-5. **`TypedArray.from`** (`built-ins/TypedArray/from/*`): throws `TypeError: TypedArray.from requires a TypedArray constructor` on valid `TypedArray` subclasses / `this` bindings.
-6. **`RegExp` named capture groups**: `built-ins/RegExp/named-groups/non-unicode-property-names.js` (`SyntaxError: invalid capture group name`).
+1. **`Number.prototype.{toFixed, toExponential, toPrecision}`** (`S15.7.4_A3.5.js`..`A3.7.js`): not yet implemented.
+2. **`Promise` combinators (`Object.defineProperty` on `Promise` / `C`)**: `Promise` constructor is a `.native` function, so `Object.defineProperty(Promise, "resolve", ...)` fails with `Object.defineProperty called on non-object` (`function_properties`).
+3. **`Function.prototype.bind`** (`instance-length-exceeds-int32.js`, `instance-length-tointeger.js`): `length` clamping / `ToIntegerOrInfinity` edge cases.
+4. **Host test hooks**: `$262.createRealm` / `$262.detachArrayBuffer` (`class-ctor-realm.js`, `detached-buffer.js`).
 
 ### Parser & Static Semantics (`language`)
-7. **`"use strict";` directive with non-simple parameter lists**: `language/expressions/arrow-function/array-destructuring-param-strict-body.js`, `rest-param-strict-body.js` (and `function` / `async` equivalents) are not rejected with an early `SyntaxError`.
-8. **Strict-mode class identifier restrictions**: `language/statements/class/class-name-ident-static.js`, `class-name-ident-yield.js` are not rejected with an early `SyntaxError`.
-9. **Escaped keywords as class method names**: `language/statements/class/ident-name-method-def-break-escaped.js`, `ident-name-method-def-case-escaped.js` fail with `SyntaxError: expected ';' after class field`.
-10. **`super[expr]` before `super()`**: `language/expressions/super/prop-expr-uninitialized-this-*.js`.
-11. **Runner / harness gaps** (not ZQJS bugs):
-    - Module tests using `assert` (`language/module-code/namespace/*`, `language/eval-code/*/export.js`) fail with `ReferenceError: assert is not defined` because `tools/test262.py` does not prepend harness files to `--module` tests.
-    - Stage 2/3 proposals not yet tagged in `DEFAULT_SKIP_FEATURES`: `language/import/import-defer/*` (79), `built-ins/Iterator/prototype/{chunks,includes}` (~39), `built-ins/Math/sumPrecise/*` (5), `built-ins/Promise/{allKeyed,allSettledKeyed}/*` (6).
+5. **`dynamic-import` & self-importing module tests**: tests that self-import `./<self>.js` cannot see the harness injected into the temporary entry module without a native `--preload` flag in `zqjs`.
+6. **Generator / async-generator / destructuring `yield` & `eval` early errors**: `param-dflt-yield-id-strict.js`, `early-errors-expression-binding-identifier-eval.js`, and destructuring assignment `yield` checks.
+7. **Computed static `"prototype"` method on classes**: `computed-property-names/class/static/*-prototype.js` should throw `TypeError` when redefining non-configurable `C.prototype`.
+8. **Unicode line terminators (`U+2028`/`U+2029`) in `for-await-of` / destructuring shorthand**: remaining `for-await-of` destructuring edge cases.

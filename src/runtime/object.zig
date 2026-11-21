@@ -80,7 +80,7 @@ pub fn keyUnits(rt: *Runtime, units: []const u16) Error!Key {
 
 /// The key named by ASCII source text (`o.name`, `{name: …}`).
 pub fn named(rt: *Runtime, text: []const u8) Error!Key {
-    const a = try rt.heap.internAscii(text);
+    const a = try rt.heap.internUtf8(text);
     return namedAtom(a);
 }
 

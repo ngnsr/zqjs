@@ -1964,3 +1964,25 @@ Observable ordering (microtask ticks) must equal Node's, checked by differential
 - **Module Top-Level `await` & `for await` (`parser.zig`, `module.zig`, `machine.zig`):**
   - `.module` mode sets `async_ctx = .body` (allowing `await` / `for await` at top level while keeping `await` reserved as an identifier).
   - `ModuleRecord` tracks `Status.evaluating_async`, `has_tla`, `async_eval`, `pending_async_deps`, `async_parents`, `eval_promise` (GC-rooted), and Tarjan SCC state (`dfs_index`, `dfs_ancestor_index`, `cycle_root`). Synchronous subgraphs keep the synchronous evaluation path; async modules run with `Proto.is_async = true` / `machine.runModuleTopLevelAsync`, coordinate parent-child readiness and error propagation via `builtins.performPromiseThen` native reaction closures, and `runEntry` drains microtasks and surfaces uncaught TLA rejections as `error.Thrown`.
+
+---
+
+## D79. Test262 Conformance Polish (M49)
+
+**Decision:** Address ECMAScript conformance edge cases surfaced by `tools/test262.py` across `built-ins`, `language`, and the Test262 runner itself, preserving all GC, rooting, barrier, and `FrameCache` invariants across both `Vm` and tree-walking `Machine`.
+
+- **Built-ins & Runtime (`src/runtime/builtins.zig`, `src/regex.zig`):**
+  - `Array.from`: falls back to `ToLength(items.length)` indexing `0..len-1` when `items[Symbol.iterator]` is `undefined` or `null` (via `object.getMethod`), applying `mapFn` and `thisArg` per spec.
+  - `Function.prototype.apply`: accepts any object-like `argArray` (including functions/closures) in `CreateListFromArrayLike` while treating `null`/`undefined` as `[]`.
+  - `Promise.{all, allSettled, race, any}`: implements `NewPromiseCapability(C)` and `GetPromiseResolve(C)` before `GetIterator`, invokes `nextPromise.then` via property lookup, and calls `iteratorClose(iter, true)` on abrupt completion after `IteratorStep` succeeds (never closing an unobtained or already-done iterator).
+  - Built-in `.length` & descriptors: aligns `.length` on `Object`, `Array`, `String`, `Number`, `Math.{min,max}`, `Object.{keys,create,getPrototypeOf}`, `Array.isArray`, and `String.prototype.*`; adds `Number.prototype.{constructor,toString,toLocaleString,valueOf}` and `"[object Number]"` brand; checks `V` before `ToObject(this)` in `Object.prototype.isPrototypeOf`; validates `ArraySetLength` `RangeError` before descriptor compatibility; rejects non-empty string `Properties` in `Object.defineProperties`; routes `Proxy` through `preventExtensionsValue` + `defineOwnPropertyParsed` in `setIntegrityLevel`; validates `Set`/`Map` `add`/`set` methods during construction; and treats `Array.prototype` as an array in `Array.isArray`.
+  - `TypedArray.from`: supports any `TypedArray` constructor or subclass via `TypedArrayCreate` (`constructWithNewTarget` + `length` check) and writes elements through `object.setWithReceiver` (handling detached buffers safely).
+  - `RegExp` named capture groups (`src/regex.zig`): validates `RegExpIdentifierName` using `regex_unicode` `ID_Start`/`ID_Continue` tables and decodes `\uXXXX` / `\u{XXXXX}` escapes (including surrogate pairs) in both `(?<name>...)` and `\k<name>`.
+- **Frontend, Compiler, VM & Machine (`lexer.zig`, `parser.zig`, `compiler.zig`, `machine.zig`):**
+  - Rejects `"use strict";` in the directive prologue of functions/arrows/methods with non-simple parameter lists (destructuring, default, or rest parameters) as `SyntaxError`.
+  - Enforces strict-mode reserved identifier restrictions (`static`, `yield`, `implements`, `interface`, `let`, `package`, `private`, `protected`, `public`) on class names and inside class bodies, and disallows `return` inside class `static {}` blocks.
+  - Scans `\uXXXX` / `\u{XXXXX}` escapes in identifiers (`lexer.zig`) and decodes escaped property/method names (`parser.zig`), supporting escaped keywords as property and class method names while rejecting them as binding names.
+  - Recognizes `U+2028` / `U+2029` line terminators in `/* ... */` and `//` comments for ASI.
+  - Evaluates `this` TDZ (`push_this`/`pop` in `compiler.zig`, `requireThis()` in `machine.zig`) before evaluating `expr` in `super[expr]` get/set/update expressions per ES 13.3.7.1.
+- **Test262 Runner (`tools/test262.py`):**
+  - Injects harness shims (and `globalThis` bindings) for non-raw `--module` tests in the test's directory so relative imports resolve, and skips Stage 2/3 proposals (`import-defer`, `iterator-chunking`, `iterator-includes`, `Math.sumPrecise`, `await-dictionary`, `Iterator.prototype.join`, `json-parse-with-source`).

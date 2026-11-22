@@ -1,7 +1,6 @@
 # Agents
 
-Rules for any coding agent working in this repo (opencode reads this file automatically),
-plus how to hand work to opencode's free models.
+Rules for any coding agent working in this repo.
 
 ## Rules for every agent
 - Zig **0.17.1** exactly. You probably don't know its std API from memory: read the source in
@@ -27,33 +26,3 @@ compiles 5 binaries in parallel (~4.7 GB RAM). To iterate fast without thrashing
   - `zig build test -Doptimize=ReleaseSafe --summary all`
   - `zig build test -Dgc-stress -Dstack-stress -Doptimize=ReleaseSafe --summary all`
 - **Avoid `-fincremental` on macOS arm64** (experimental with Mach-O / LLVM and can spike memory), and avoid launching overlapping full `zig build test` runs across multiple worktrees at the same time.
-
-## Delegating to opencode
-Use it for self-contained pieces with a fixed interface and tests written in advance:
-a new opcode handler, one `runtime/ops.zig` operation, parser cases for one syntax form,
-more tests and fixtures under `tests/`.
-
-Keep for yourself (or a stronger model): compiler and VM design, `runtime/heap.zig` and the
-GC, anything that changes or needs a new entry in `DESIGN_DECISIONS.md`.
-
-Models (measured 2026-11-14 on a Zig 0.17 task, checked against a hidden test):
-1. `opencode/glm-5.3-flash-free`: cleanest, most idiomatic code. Default.
-2. `opencode/minimax-m3.1-flash-free`: fastest, careful with `errdefer`. Fallback.
-
-Also passed: `deepseek-v4.1-flash-free`, `big-pickle` (4-6 min), `flint-40b-free` (11 min, slow).
-Avoid: `longcat-2.5-free` (ended with code that doesn't compile), `mimo-v2.6-flash-free` (no file after 15 min).
-
-Run it in a separate worktree, because `--auto` approves every command it wants to run:
-
-```sh
-git worktree add ../zqjs-oc -b oc/<task>
-cd ../zqjs-oc
-opencode run --standalone --auto -m opencode/glm-5.3-flash-free "<task>"
-```
-
-The prompt must state: the exact files to touch, the function signatures, the test that must
-pass, and "run `zig build test` and iterate until it passes". Expect 4-6 minutes for a small task.
-
-Then review the diff yourself before merging. Look for missed edge cases (allocation failure
-mid-update, `-0`, limits), style drift, and tests that were changed instead of the code.
-Don't put secrets in prompts: free models may keep what you send.

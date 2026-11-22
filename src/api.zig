@@ -1,4 +1,4 @@
-//! ZQJS's public embedding API (M9.0; design in M9_0_PLAN.md, decisions D46-D49).
+//! ZQJS's public embedding API (see EMBEDDING.md, decisions D46-D49).
 //!
 //! This is the only module an embedder's build gets (`zqjs`). It is built on the internal
 //! module (`zqjs_internal`, src/root.zig) and exposes none of it: the VM, the heap, bytecode

@@ -11,6 +11,7 @@ const Token = token.Token;
 const Tag = token.Tag;
 const Diagnostic = @import("diag.zig").Diagnostic;
 const Feature = @import("diag.zig").Feature;
+const unicode_id = @import("unicode_id.zig");
 
 pub const Error = error{ SyntaxError, Unsupported };
 
@@ -34,10 +35,10 @@ pub const Lexer = struct {
             const tag = try l.number();
             return l.make(tag, start, newline_before);
         }
-        if (isIdentStart(c) or (c == '\\' and l.peekAt(start + 1) == 'u')) {
+        if (isIdentStart(c) or (c == '\\' and l.peekAt(start + 1) == 'u') or (c >= 0x80 and l.isUnicodeIdentStartAt(start))) {
             return l.scanIdentifier(start, newline_before);
         }
-        if (c == '#' and (isIdentStart(l.peekAt(start + 1)) or (l.peekAt(start + 1) == '\\' and l.peekAt(start + 2) == 'u'))) {
+        if (c == '#' and (isIdentStart(l.peekAt(start + 1)) or (l.peekAt(start + 1) == '\\' and l.peekAt(start + 2) == 'u') or (l.peekAt(start + 1) >= 0x80 and l.isUnicodeIdentStartAt(start + 1)))) {
             l.pos += 1;
             _ = try l.scanIdentifier(l.pos, newline_before);
             return l.make(.private_ident, start, newline_before);
@@ -51,7 +52,8 @@ pub const Lexer = struct {
         }
         if (c >= 0x80) {
             const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
-            return l.fail(.{ .unsupported = .non_ascii_source }, start, @min(start + len, l.source.len));
+            l.pos = @intCast(@min(start + len, l.source.len));
+            return l.make(.unknown, start, newline_before);
         }
         for (token.punctuators) |p| {
             if (std.mem.startsWith(u8, l.source[start..], p[0])) {
@@ -112,7 +114,22 @@ pub const Lexer = struct {
                     },
                     else => return newline,
                 },
-                else => return newline,
+                else => {
+                    if (l.source[l.pos] >= 0x80) {
+                        if (decodeUtf8At(l.source, l.pos)) |u| {
+                            if (u.cp == 0x2028 or u.cp == 0x2029) {
+                                newline = true;
+                                l.pos += u.len;
+                                continue;
+                            }
+                            if (isUnicodeWhitespace(u.cp)) {
+                                l.pos += u.len;
+                                continue;
+                            }
+                        }
+                    }
+                    return newline;
+                },
             }
         }
         return newline;
@@ -299,6 +316,11 @@ pub const Lexer = struct {
         return cp;
     }
 
+    fn isUnicodeIdentStartAt(l: *const Lexer, idx: usize) bool {
+        const u = decodeUtf8At(l.source, idx) orelse return false;
+        return unicode_id.isIdStart(u.cp);
+    }
+
     fn scanIdentifier(l: *Lexer, start: u32, newline_before: bool) Error!Token {
         var has_escape = false;
         var first = true;
@@ -309,15 +331,26 @@ pub const Lexer = struct {
                 first = false;
                 continue;
             }
+            if (c >= 0x80) {
+                if (decodeUtf8At(l.source, l.pos)) |u| {
+                    const ok = if (first) unicode_id.isIdStart(u.cp) else unicode_id.isIdContinue(u.cp);
+                    if (ok) {
+                        l.pos += u.len;
+                        first = false;
+                        continue;
+                    }
+                }
+                break;
+            }
             if (c == '\\' and l.peekAt(l.pos + 1) == 'u') {
                 has_escape = true;
                 const esc_start = l.pos;
                 const cp = try l.scanIdentEscape();
-                if (cp < 0x80) {
-                    const b: u8 = @intCast(cp);
-                    const ok = if (first) isIdentStart(b) else isIdentPart(b);
-                    if (!ok) return l.fail(.{ .syntax_error = "invalid identifier escape" }, esc_start, l.pos);
-                }
+                const ok = if (cp < 0x80)
+                    (if (first) isIdentStart(@intCast(cp)) else isIdentPart(@intCast(cp)))
+                else
+                    (if (first) unicode_id.isIdStart(cp) else unicode_id.isIdContinue(cp));
+                if (!ok) return l.fail(.{ .syntax_error = "invalid identifier escape" }, esc_start, l.pos);
                 first = false;
                 continue;
             }
@@ -384,6 +417,21 @@ fn isDigit(c: u8) bool {
 fn isRadixDigit(c: u8, radix: u8) bool {
     const d = std.fmt.charToDigit(c, radix) catch return false;
     return d < radix;
+}
+
+fn decodeUtf8At(s: []const u8, i: usize) ?struct { cp: u21, len: u32 } {
+    if (i >= s.len) return null;
+    const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return null;
+    if (i + len > s.len) return null;
+    const cp = std.unicode.utf8Decode(s[i .. i + len]) catch return null;
+    return .{ .cp = cp, .len = len };
+}
+
+fn isUnicodeWhitespace(cp: u21) bool {
+    return switch (cp) {
+        0x00A0, 0x1680, 0x2000...0x200A, 0x202F, 0x205F, 0x3000, 0xFEFF => true,
+        else => false,
+    };
 }
 
 fn isIdentStart(c: u8) bool {
@@ -473,8 +521,9 @@ test "trivia and newlines" {
     try expectFailure("1 /* x", error.SyntaxError, .{ .syntax_error = "unterminated comment" });
 }
 
-test "non-ASCII only inside strings and comments" {
+test "Unicode identifiers and whitespace" {
     try expectTags("'é😀' // ünïcode", &.{.string});
-    try expectFailure("é", error.Unsupported, .{ .unsupported = .non_ascii_source });
-    try expectFailure("1\xC2\xA0", error.Unsupported, .{ .unsupported = .non_ascii_source }); // NBSP
+    try expectTags("é", &.{.identifier});
+    try expectTags("1\xC2\xA0", &.{.number}); // NBSP
+    try expectTags("#℘", &.{.private_ident});
 }

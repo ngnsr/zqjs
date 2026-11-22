@@ -4,49 +4,55 @@
 source ─▶ Lexer ─▶ Parser ─▶ AST ─▶ Resolver ─▶ Compiler ─▶ FunctionProto (bytecode)
           └───── frontend: arena, freed after compile ────┘           │
                                                                        ▼
-                        Runtime { Heap (GC), atoms, globals, Limits } ◀─▶ VM
+                        Runtime { Heap (GC), Shapes, atoms, globals, Limits } ◀─▶ VM
                                               ▲
-                                  Embedding API (Zig, later C ABI)
+                                   Embedding API (Zig + C11 ABI)
 ```
 
 Dependencies point one way: frontend → compiler → runtime/VM. The frontend knows nothing about
 the runtime.
 
-## Built so far (M18)
+## Module layout
 
 | file | role |
 |---|---|
-| `src/api.zig` | public `zqjs` embedding module: `Runtime`, `Program`, `Execution`, `Handle`, `PromiseCapability`, `PromiseState`, `newPromise`, `promiseState`, `defineGlobalFunction`, `call`, `throwJs`, `Diagnostic`, `Failure`, and the re-entrant entry guard (D46–D54, D57) |
-| `src/c_api.zig` | C11 ABI (`include/zqjs.h`, `libzqjs.a`, ABI 1.2.0): opaque handles, error codes, native callbacks, host promises, cooperative slices |
+| `src/api.zig` | public `zqjs` embedding module: `Runtime`, `Program`, `Execution`, `Handle`, `PromiseCapability`, `PromiseState`, `newPromise`, `promiseState`, `defineGlobalFunction`, `call`, `throwJs`, `setModuleLoader`, `runModule`, `newArrayBuffer`, `bufferBytes`, `Diagnostic`, `Failure`, and the re-entrant entry guard (D46–D54, D57, D72–D73) |
+| `src/c_api.zig` | C11 ABI (`include/zqjs.h`, `libzqjs.a`, ABI 1.4.0): opaque handles, error codes, native callbacks, host promises, ES module loader, zero-copy binary buffers, cooperative slices |
 | `src/frontend/token.zig` | `Token` (tag + byte span + `newline_before`) and the full JS punctuator set |
 | `src/frontend/lexer.zig` | pull-based, allocation-free tokenizer. Validates numbers; finds string ends |
+| `src/frontend/number.zig` | exact numeric literal & `BigInt` literal parsing |
 | `src/frontend/ast.zig` | `Expr` and `Stmt` nodes, `Ref` (variable use), `Declarator`, `Script` |
 | `src/frontend/parser.zig` | statements + Pratt expression parser; decodes string literals to UTF-16; classifies errors |
 | `src/frontend/resolver.zig` | scopes and names → binding ids, slots, globals; function slots, captured bindings and capture lists; redeclaration and global-write checks |
 | `src/frontend/dump.zig` | S-expression dump with resolved names (`x#binding@slot`, `x@global`) |
 | `src/frontend/diag.zig` | `Diagnostic` (kind, feature, span), line/column, rendering with caret |
-| `src/runtime/value.zig` | `Value` (tagged union) and `Native` |
-| `src/runtime/heap.zig` | `Heap`: all objects (`String`, `Cell`, `Closure`, `Env`, `Object`), atoms (weak table), counting allocator, byte accounting and limits, the store API (barrier hook), the collector (mark through `forEachChild`, weak-atom cleanup, sweep, scheduling, stats), tombstones and the heap verifier (D8-D11, GC_DESIGN) |
-| `src/runtime/handles.zig` | `Table` and `Token`: reference-counted GC-rooted value slots and generation-checked handle tokens (D50, D54) |
+| `src/runtime/value.zig` | 8-byte IEEE-754 negative quiet-NaN boxed `Value` (`packed struct(u64)`, D85) and `Native` |
+| `src/runtime/heap.zig` | `Heap`: all GC objects (`String`, `BigInt`, `Symbol`, `Cell`, `Closure`, `Env`, `Object` with hybrid `PropStore` — immutable slab-pooled `Shape` hidden classes + 4 inline property slots + `.dict` fallback, D88 — plus `ArrayBuffer`/`TypedArray`/`DataView`/`Map`/`Set`/`WeakMap`/`WeakSet`/`RegExp`/`Promise`/`Proxy`), weak atoms, generational nursery & card bitmaps, ephemeron tracing, major-GC shape sweeping, byte accounting, limits, tombstones, and heap verifier (D8–D11, D88, GC_DESIGN) |
+| `src/runtime/handles.zig` | `Table` and `Token`: GC-rooted value slots and generation-checked handle tokens (D50, D54) |
 | `src/runtime/runtime.zig` | `Runtime`: heap, output, `ExecContext` (shared step budget, call depth, active VM roots, native records), exception / stop reason (D51–D53) |
-| `src/runtime/ops.zig` | all JS value semantics: ToNumber, ToString (number formatting), ToBoolean, operators |
-| `src/runtime/object.zig` | property get/set/define/delete/`in`, keys, prototype chains, ToPrimitive, join (D38, D40) |
-| `src/runtime/builtins.zig` | the realm (built-in objects), implemented built-ins, global lookup (D39) |
-| `src/runtime/coroutine.zig` | engine-agnostic `async` driver (D56): starts a coroutine, suspends it on `await` (resolve, react, shrink, charge, `remember`), resumes it from `.await_resume` microtasks, settles its promise |
-| `src/runtime/json.zig` | `JSON.parse` and `JSON.stringify` |
+| `src/runtime/ops.zig` | all JS value semantics: ToNumber, ToString (including fast `i32` decimal & concat paths, D89), ToBoolean, operators |
+| `src/runtime/object.zig` | property get/set/define/delete/`in`, shape transitions, keys, prototype chains, ToPrimitive, join (D38, D40, D88) |
+| `src/runtime/builtins.zig` | the realm (built-in objects), implemented built-ins, `StaticStringMap` global lookup (D39, D86) |
+| `src/runtime/bigint.zig` | arbitrary-precision `BigInt` arithmetic, conversions, and bit-length limits |
+| `src/runtime/date.zig` | `Date` parsing, calendar math, and formatting |
+| `src/runtime/coroutine.zig` | engine-agnostic `async` driver (D56): starts a coroutine, suspends on `await`, resumes from `.await_resume` microtasks, settles its promise |
+| `src/runtime/json.zig` | `JSON.parse` and `JSON.stringify` (`reviver`/`replacer`/`space`/`toJSON`) |
+| `src/runtime/clone.zig` | `structuredClone` with cycle handling and zero-copy `ArrayBuffer` transfer |
+| `src/runtime/module.zig` | ES Modules: graph loading, linking, live bindings, cycles, `import.meta`, dynamic `import()`, top-level `await` (D72) |
 | `src/runtime/builtin_names.zig` | GENERATED by `tools/gen_builtins.js`: node's own property names per built-in |
 | `src/runtime/pow.zig` | `pow` ported from musl (Arm optimized-routines); `pow_data.zig`: its tables, generated |
 | `src/regex.zig` | standalone UTF-16 regex compiler (explicit group stack) and non-recursive backtracking matcher, wired into `Object.kind.regexp` and `Limits` (D61) |
-| `src/interp/machine.zig` | explicit-stack tree-walking interpreter (the oracle): spec-style environment records, two explicit stacks (`tasks` + `values`), runs on caller's thread (D59) |
-| `src/bytecode/bytecode.zig` | instruction set (`Op`, one table of operands and stack effects), `Proto` |
-| `src/bytecode/compiler.zig` | AST + Resolution → `Proto`: constant pool, name table, `max_stack`, no dead code |
+| `src/regex_unicode.zig` | GENERATED by `tools/gen_regex_unicode.js`: Unicode property escapes & case-folding tables |
+| `src/interp/machine.zig` | explicit-stack tree-walking interpreter (the reference oracle): spec-style environment records, two explicit stacks (`tasks` + `values`), runs on caller's thread (D59) |
+| `src/bytecode/bytecode.zig` | instruction set (`Op`, one table of operands and stack effects, including fused superinstructions, D87), `Proto` |
+| `src/bytecode/compiler.zig` | AST + Resolution → `Proto`: constant pool, name table, `max_stack`, peephole fusions, no dead code |
 | `src/bytecode/verify.zig` | checks a `Proto` as untrusted input (D33); reports measured stack depth |
 | `src/bytecode/disasm.zig` | listing for `--dump-bytecode` |
-| `src/vm/vm.zig` | the stack VM: frames, locals and operand stacks, transactional calls, cells and captures, `Vm.step()` / `run()`, defensive checks, precise faults (D35, D36) |
+| `src/vm/vm.zig` | the stack VM: frames, 8-byte NaN-boxed `Slot` (D85), fast JS→JS call/return (D86), shape-keyed read/write/ADD-transition property ICs (D88), inline `str.length`/`arr.length` fast paths (D89), cells and captures, `Vm.runLoop()` / `Vm.step()`, defensive checks, precise faults (D35, D36) |
 | `src/run.zig` | source → parse → resolve → engine (VM: compile → verify → run; or tree-walker), with outcome reporting and `--trace` (CLI and tests share it) |
-| `src/limits.zig` | `Limits` (only the limits enforced so far, see DESIGN_DECISIONS D15) |
+| `src/limits.zig` | `Limits` (every resource bound in one place, D15) |
 | `src/root.zig` | library entry: `parse`, `resolve`, `dump`, `Runtime`, `interpret`, `runSource`, `compile`, `verify`, `disassemble`, `repl` |
-| `src/main.zig` | CLI: `zqjs` (REPL), `zqjs FILE`, `zqjs -e SRC`, `--repl`, `--no-color`, `--test` (harness output), `--dump-ast`, `--dump-bytecode`, `--engine=vm\|treewalk`, `--trace` |
+| `src/main.zig` | CLI: `zqjs` (REPL), `zqjs FILE`, `zqjs -e SRC`, `--module`, `--max-steps`, `--repl`, `--no-color`, `--test`, `--dump-ast`, `--dump-bytecode`, `--engine=vm\|treewalk`, `--trace` |
 | `src/repl/session.zig` | interactive REPL session: persistent `ReplEnv`, `Proto` pool, top-level `await`, input heuristics, dot-commands (D71) |
 | `src/repl/inspect.zig` | cycle-safe, depth-bounded, ANSI-colorized value inspector (`util.inspect` style; never invokes getters) |
 | `src/repl/complete.zig` | `Lexer`-driven multi-line completeness check, read-only `Tab` completion, live syntax highlighting |
@@ -70,25 +76,27 @@ continue an expression in *any* JavaScript (`;` `)` `]` `}` `,` EOF, a literal w
 line break) is a SyntaxError, while a valid-but-unimplemented token (`?`, `=`, `,` inside
 parentheses, an identifier) is `Unsupported(syntax)`.
 
-## Planned components
-See DESIGN_DECISIONS.md: heap and GC (D7–D11), stack (D12), objects (D13), limits (D15),
-oracle (D16).
-
-### Runtime ownership (M3)
+### Runtime ownership
 - Runtime values point into the `Heap`, never into the frontend arena; nothing created at
   runtime depends on the AST.
-- Every heap object is on one linked list and is freed by `Runtime.deinit` (no GC until M8).
-- The interpreter's slot array is allocated per run and freed when the run ends.
-- A thrown exception's message is a heap string: it outlives unwinding, and the host reads
-  it before `Runtime.deinit` (DESIGN_DECISIONS D27).
+- Every heap object is managed by the non-moving generational collector (`young` nursery +
+  `old` generation with card bitmaps, remembered set, ephemeron `WeakMap`/`WeakSet`, weak
+  atoms, and slab-pooled `Shape` trees; see `GC_DESIGN.md` and `DESIGN_DECISIONS.md` D88).
+  `Runtime.deinit` sweeps and frees all remaining heap objects and shape slabs.
+- Active VM stacks, compiled `Proto` constants, loaded ES modules, and live host `Handle`
+  slots are registered as explicit GC roots.
+- A thrown exception's value/message lives on the heap and stays rooted until handled or
+  read by the host before `Runtime.deinit` (DESIGN_DECISIONS D27).
 
 ## Tests
 ```
 src/**                    unit tests next to the code (`test` blocks)
-tests/*_test.zig          integration tests, one binary per file
-tests/api_test.zig        public `zqjs` embedding API, handles, native callbacks, R1/R2, guard panics
+tests/*_test.zig          integration tests (also combined in internal_tests / test-fast)
+tests/api_test.zig        public `zqjs` embedding API, handles, native callbacks, guard panics
+tests/c_api_test.c        C11 ABI integration tests against libzqjs.a + include/zqjs.h
 tests/vm_test.zig         VM execution, step contract, nested-call VMs, shared execution context
 tests/gc_test.zig         generational GC, cards, remembered set, adaptive scheduling, raw-store scanner
+tests/module_test.zig     ES modules: resolution, live bindings, cycles, top-level await, host loader
 tests/frontend_test.zig   allocation-failure paths + fuzzing of parse → resolve → dump
 tests/interpreter_test.zig limits, allocation failures, exception ownership, fuzzing of runs
 tests/syntax_test.zig     tests/syntax/cases.jsonl: outcome + resolved dump per source
@@ -97,6 +105,10 @@ tests/diff_test.zig       tests/diff/*.js: program output must equal node's test
 tests/regex_test.zig      tests/regex/cases.jsonl: standalone regex compiler and matcher vs node
 tests/repl_test.zig       interactive REPL: session, inspector, completion, editor, GC stress
 tests/harness/            node scripts: golden.js (regenerate/check goldens), check_syntax_cases.js
+tools/bench_js.zig        split-phase VM & GC benchmark harness (`zig build bench-js`)
+tools/bench_c.c           C-ABI embedding & game-loop benchmark harness (`zig build bench-c`)
+tools/bench_compare.py    CLI-to-CLI comparison vs QuickJS + Node parity (`bench/suite/baseline-qjs.md`)
+tools/test262.py          official Test262 conformance runner (`TEST262.md`)
 tools/gen_pow_data.js     generates src/runtime/pow_data.zig from musl's C (hash-pinned)
 tools/pow_reference.py    correctly rounded x ** y reference values (Python stdlib `decimal`)
 tools/pow_bits.zig        hashes pow results, to compare targets and optimisation modes

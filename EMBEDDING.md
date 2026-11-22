@@ -69,7 +69,7 @@ Any JavaScript value held by the host across an allocation, garbage collection, 
 - **Generation-Checked Reusable Slots & Rooting:** A `Handle` is a small value token (`owner`, `slot`, `generation`) referencing an owned slot in the runtime's reusable handle table. Every live slot (`live == true`) is a GC root: the collector traces it during both minor and major collections.
 - **Creating & Reading Handles:**
   - `rt.newNumber(f64)`, `rt.newBoolean(bool)`, and `rt.newStringUtf16([]const u16)` mint a new handle owned by the caller.
-  - `h.kind()` returns `HandleKind` (`.undefined`, `.null`, `.boolean`, `.number`, `.string`, `.function`, `.object`, `.array`).
+  - `h.kind()` returns `HandleKind` (`.undefined`, `.null`, `.boolean`, `.number`, `.string`, `.symbol`, `.function`, `.object`, `.array`, `.bigint`).
   - `h.number()` (`?f64`) and `h.boolean()` (`?bool`) copy primitive values out without allocating (`null` if wrong kind).
   - `h.string(buf: []u16)` (`?usize`) returns `null` if `h` is not a string; otherwise it copies `min(len, buf.len)` UTF-16 code units into `buf` **without allocating** and returns the string's **full UTF-16 length** (so truncation is visible whenever `full_len > buf.len`).
 - **`dup` and `release`:**
@@ -243,12 +243,12 @@ Every C ABI function returns `zqjs_status` rather than panicking or unwinding ac
 - **`host_message` lifetime:** `out->host_message` (`out->host_message_len`) is borrowed only until `zqjs_native_fn` returns and is copied into ZQJS's fixed 256-byte NUL-terminated `zqjs_failure.message` buffer (empty `host_message` on `ZQJS_ERR_HOST` defaults to `"host error"`).
 - **Error mapping:** `ZQJS_ERR_THROWN` (paired with `zqjs_runtime_throw_js`) → `ZQJS_FAILURE_THROWN`; `ZQJS_ERR_HOST` → `ZQJS_FAILURE_HOST`; `ZQJS_ERR_LIMIT_EXCEEDED` → `ZQJS_FAILURE_LIMIT`; `ZQJS_ERR_UNSUPPORTED` → `ZQJS_FAILURE_UNSUPPORTED`; `ZQJS_ERR_OUT_OF_MEMORY` → `ZQJS_FAILURE_OUT_OF_MEMORY`; `ZQJS_ERR_INTERNAL` → `ZQJS_FAILURE_INTERNAL` (poisons runtime).
 
-#### ABI Versioning & `zqjs_options` Compatibility (M12.3, M29)
-- **`ZQJS_ABI_VERSION` / `zqjs_abi_version()`:** encoded as `(major << 16) | (minor << 8) | patch` (`1.2.0` = `0x00010200u`). Major bumps only on breaking layout/signature/semantic changes; minor bumps on backward-compatible additive changes (new functions or trailing `zqjs_options` fields). Hosts should check `(zqjs_abi_version() >> 16) == ZQJS_ABI_MAJOR` at startup.
+#### ABI Versioning & `zqjs_options` Compatibility
+- **`ZQJS_ABI_VERSION` / `zqjs_abi_version()`:** encoded as `(major << 16) | (minor << 8) | patch` (`1.4.0` = `0x00010400u`). Major bumps only on breaking layout/signature/semantic changes; minor bumps on backward-compatible additive changes (new functions or trailing `zqjs_options` fields). Hosts should check `(zqjs_abi_version() >> 16) == ZQJS_ABI_MAJOR` at startup.
 - **`zqjs_options.struct_size`:**
   - Always initialize with `zqjs_options_default()`, which sets `struct_size = sizeof(zqjs_options)` and populates all defaults (including `random_seed` and `max_native_stack_bytes`).
   - Passing `NULL` to `zqjs_runtime_create` uses `zqjs_options_default()`.
-  - Smaller/older structs (`>= offsetof(zqjs_options, clock_ctx) + sizeof(void *)`) are accepted; omitted trailing fields (`random_seed`, `max_native_stack_bytes`) keep their defaults (`zqjs_limits` layout is unchanged across 1.0–1.2).
+  - Smaller/older structs (`>= offsetof(zqjs_options, clock_ctx) + sizeof(void *)`) are accepted; omitted trailing fields (`random_seed`, `max_native_stack_bytes`) keep their defaults (`zqjs_limits` layout is unchanged across 1.0–1.4).
   - Zero, truncated, or oversized structs (`struct_size > sizeof(zqjs_options)`) are rejected with `ZQJS_ERR_INVALID_ARG`.
 
 #### Structured Handles, Promises & Global Access (M12.2–M12.3, M29)

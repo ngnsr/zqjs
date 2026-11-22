@@ -152,6 +152,23 @@ fn keyPiece(k: Key, buf: *[10]u8) Piece {
 // ---------------------------------------------------------------- get
 
 /// `base[k]` / `base.k`.
+pub fn requireObjectCoercible(rt: *Runtime, base: Value, key_hint: ?Value) Error!void {
+    if (base.isUndefined() or base.isNull()) {
+        if (key_hint) |kh| {
+            if (kh.isString()) {
+                return rt.throw(.TypeError, &.{
+                    .{ .ascii = "Cannot read properties of " },
+                    .{ .ascii = @tagName(base.tag()) },
+                    .{ .ascii = " (reading '" },
+                    .{ .utf16 = kh.asString().units },
+                    .{ .ascii = "')" },
+                });
+            }
+        }
+        return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot read properties of " }, .{ .ascii = @tagName(base.tag()) } });
+    }
+}
+
 pub fn get(rt: *Runtime, base: Value, k: Key) Error!Value {
     return getWithReceiver(rt, base, base, k);
 }
@@ -275,7 +292,7 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
             },
             .symbol => {},
         },
-        .map, .set => |table| if (isNamed(k, "size")) return .{ .value = Value.fromNumber(@floatFromInt(table.live_count)), .enumerable = false, .writable = false },
+        .map, .set => {},
         .regexp => |re| {
             if (isNamed(k, "lastIndex")) return .{
                 .value = re.last_index,
@@ -623,10 +640,7 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!b
                     .atom => if (isNamed(k, "length")) return setLength(rt, o, v, strict),
                     .symbol => {},
                 },
-                .map, .set => if (isNamed(k, "size")) {
-                    if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot set property size" }});
-                    return false; // Map/Set size is a read-only getter
-                },
+                .map, .set => {},
                 .regexp => {
                     if (isNamed(k, "lastIndex")) {
                         if (!o.regexp_last_index_writable) {

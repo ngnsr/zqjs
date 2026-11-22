@@ -1159,6 +1159,7 @@ pub const Vm = struct {
                 const base = try cache.peek(vm, 1);
                 const r: Value = fastArrayGet(base, idx) orelse fastTypedArrayGet(base, idx) orelse blk: {
                     cache.syncSp(vm);
+                    try object.requireObjectCoercible(rt, base, idx);
                     const k = try object.key(rt, idx);
                     break :blk try object.get(rt, base, k);
                 };
@@ -1173,6 +1174,7 @@ pub const Vm = struct {
                 try cache.ensurePush(vm);
                 const r: Value = fastArrayGet(base, idx) orelse fastTypedArrayGet(base, idx) orelse blk: {
                     cache.syncSp(vm);
+                    try object.requireObjectCoercible(rt, base, idx);
                     const k = try object.key(rt, idx);
                     break :blk try object.get(rt, base, k);
                 };
@@ -1207,6 +1209,7 @@ pub const Vm = struct {
                 const base = try cache.peek(vm, 2);
                 if (!fastArraySet(rt, base, idx, v) and !fastTypedArraySet(base, idx, v)) {
                     cache.syncSp(vm);
+                    try object.requireObjectCoercible(rt, base, idx);
                     const k = try object.key(rt, idx); // after the value: JS's order for `=`
                     _ = try object.setWithReceiver(rt, base, k, v, base, p.is_strict);
                 }

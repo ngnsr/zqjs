@@ -270,11 +270,41 @@ def run_single_test(args: tuple[Any, ...]) -> dict[str, Any]:
         cmd.append("--module")
 
     tmp_file = None
+    tmp_harness = None
     try:
         if is_module and is_raw:
             cmd.append(test_path_str)
         elif is_module:
-            # Write in the test's directory so relative module imports resolve.
+            # Put core harness in a sibling module imported FIRST so it evaluates
+            # before any static `import` declarations in `source` (including self-imports).
+            harness_parts: list[str] = [
+                HOST_SHIM,
+                harness_bundle_cache["sta.js"],
+                harness_bundle_cache["assert.js"],
+                "globalThis.Test262Error = Test262Error; globalThis.assert = assert; globalThis.$262 = $262;\n",
+            ]
+            if is_async:
+                harness_parts.append(harness_bundle_cache["doneprintHandle.js"])
+                harness_parts.append("globalThis.$DONE = $DONE;\n")
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=str(test_path.parent),
+                prefix=".zqjs_t262_h_",
+                suffix=".mjs",
+                delete=False,
+                encoding="utf-8",
+            ) as hf:
+                hf.write("\n".join(harness_parts))
+                tmp_harness = hf.name
+            mod_parts: list[str] = [f"import './{Path(tmp_harness).name}';\n"]
+            for inc in includes:
+                if inc in ("sta.js", "assert.js", "doneprintHandle.js"):
+                    continue
+                inc_src = harness_bundle_cache.get(inc, "")
+                if not inc_src:
+                    return {"path": rel_path, "status": "skip", "reason": f"missing_include:{inc}"}
+                mod_parts.append(inc_src)
+            mod_parts.append(source)
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 dir=str(test_path.parent),
@@ -283,7 +313,7 @@ def run_single_test(args: tuple[Any, ...]) -> dict[str, Any]:
                 delete=False,
                 encoding="utf-8",
             ) as tf:
-                tf.write(full_source)
+                tf.write("\n".join(mod_parts))
                 tmp_file = tf.name
             cmd.append(tmp_file)
         else:
@@ -310,11 +340,12 @@ def run_single_test(args: tuple[Any, ...]) -> dict[str, Any]:
     except subprocess.TimeoutExpired:
         return {"path": rel_path, "status": "timeout", "reason": f">{timeout_s}s"}
     finally:
-        if tmp_file:
-            try:
-                os.unlink(tmp_file)
-            except OSError:
-                pass
+        for p_tmp in (tmp_file, tmp_harness):
+            if p_tmp:
+                try:
+                    os.unlink(p_tmp)
+                except OSError:
+                    pass
 
     rc = proc.returncode
     stdout = proc.stdout

@@ -12,8 +12,8 @@ const ops = @import("ops.zig");
 const object = @import("object.zig");
 const builtins = @import("builtins.zig");
 
-pub const parse_native: Native = .{ .name = "parse", .call = jsonParse };
-pub const stringify_native: Native = .{ .name = "stringify", .call = jsonStringify };
+pub const parse_native: Native = .{ .name = "parse", .length = 2, .call = jsonParse };
+pub const stringify_native: Native = .{ .name = "stringify", .length = 3, .call = jsonStringify };
 
 fn jsonParse(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const text = if (args.len > 0) args[0] else Value.undefined;

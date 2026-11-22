@@ -1713,6 +1713,7 @@ const Machine = struct {
                             try m.pushTask(.{ .assign_member_compound_finish = .{ .op = op, .key = .{ .index = 0 }, .priv_name = am.named.? } });
                             try m.pushEval(am.value);
                         } else {
+                            try object.requireObjectCoercible(rt, base, if (kv == .value) kv.value else null);
                             const k = try m.toKey(kv);
                             const old = try object.get(rt, base, k);
                             try m.pushVal(old);
@@ -1733,6 +1734,7 @@ const Machine = struct {
                                 try m.pushEval(am.value);
                             }
                         } else {
+                            try object.requireObjectCoercible(rt, base, if (kv == .value) kv.value else null);
                             const k = try m.toKey(kv);
                             const old = try object.get(rt, base, k);
                             if (!logicalAssignShouldWrite(am.op, old)) {
@@ -1756,6 +1758,7 @@ const Machine = struct {
                 } else {
                     const kv: KeyValue = if (am.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                     const base = m.popVal();
+                    try object.requireObjectCoercible(rt, base, if (kv == .value) kv.value else null);
                     try m.setProp(base, try m.toKey(kv), v);
                 }
                 m.depth -= 1;
@@ -1802,6 +1805,7 @@ const Machine = struct {
                     try object.setPrivate(rt, base, brand, name_str, s.new);
                     try m.pushVal(if (um.prefix) s.new else s.old);
                 } else {
+                    try object.requireObjectCoercible(rt, base, if (kv == .value) kv.value else null);
                     const k = try m.toKey(kv);
                     const s = try stepNumeric(rt, try object.get(rt, base, k), um.op == .inc);
                     try m.setProp(base, k, s.new);
@@ -1832,6 +1836,7 @@ const Machine = struct {
             .member_finish => |mf| {
                 const kv: KeyValue = if (mf.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.popVal();
+                try object.requireObjectCoercible(rt, base, if (kv == .value) kv.value else null);
                 const k = try m.toKey(kv);
                 const res_v: Value = if (mf.is_delete) try m.deleteProp(base, k) else try object.get(rt, base, k);
                 m.depth -= 1;

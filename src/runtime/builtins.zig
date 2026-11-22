@@ -618,6 +618,12 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     });
     try immutableConstant(rt, r.function_namespace, "prototype", Value.fromObject(r.function_prototype));
     try constant(rt, r.function_prototype, "constructor", Value.fromNative(&function_global));
+    try rt.heap.defineProperty(r.function_prototype, try rt.heap.internAscii("length"), .{
+        .value = Value.fromNumber(0),
+        .enumerable = false,
+        .writable = false,
+        .configurable = true,
+    });
     try immutableConstant(rt, r.object_namespace, "prototype", Value.fromObject(r.object_prototype));
     try constant(rt, r.object_prototype, "constructor", Value.fromNative(&object_global));
     try immutableConstant(rt, r.array_namespace, "prototype", Value.fromObject(r.array_prototype));
@@ -640,8 +646,10 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.boolean_prototype, "valueOf", &boolean_value_of);
     try immutableConstant(rt, r.map_namespace, "prototype", Value.fromObject(r.map_prototype));
     try constant(rt, r.map_prototype, "constructor", Value.fromNative(&map_global));
+    try object.defineAccessor(rt, Value.fromObject(r.map_prototype), try object.named(rt, "size"), Value.fromNative(&map_size_getter), false, false);
     try immutableConstant(rt, r.set_namespace, "prototype", Value.fromObject(r.set_prototype));
     try constant(rt, r.set_prototype, "constructor", Value.fromNative(&set_global));
+    try object.defineAccessor(rt, Value.fromObject(r.set_prototype), try object.named(rt, "size"), Value.fromNative(&set_size_getter), false, false);
     try immutableConstant(rt, r.weak_map_namespace, "prototype", Value.fromObject(r.weak_map_prototype));
     try immutableConstant(rt, r.weak_set_namespace, "prototype", Value.fromObject(r.weak_set_prototype));
     try immutableConstant(rt, r.promise_namespace, "prototype", Value.fromObject(r.promise_prototype));
@@ -758,6 +766,12 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try defineToStringTag(rt, r.weak_set_prototype, r.sym_to_string_tag, "WeakSet");
     try defineToStringTag(rt, r.promise_prototype, r.sym_to_string_tag, "Promise");
     try defineToStringTag(rt, r.symbol_prototype, r.sym_to_string_tag, "Symbol");
+    try rt.heap.definePropKey(r.symbol_prototype, heap_mod.PropKey.fromSymbol(r.sym_to_primitive), .{
+        .value = Value.fromNative(&symbol_to_primitive),
+        .enumerable = false,
+        .writable = false,
+        .configurable = true,
+    });
     try defineToStringTag(rt, r.math, r.sym_to_string_tag, "Math");
     try defineToStringTag(rt, r.json, r.sym_to_string_tag, "JSON");
     try defineToStringTag(rt, r.generator_prototype, r.sym_to_string_tag, "Generator");
@@ -1701,43 +1715,43 @@ fn objectValueOf(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 
 // ---------------------------------------------------------------- Array.prototype
 
-const array_push: Native = .{ .name = "push", .call = arrayPush };
+const array_push: Native = .{ .name = "push", .length = 1, .call = arrayPush };
 const array_pop: Native = .{ .name = "pop", .call = arrayPop };
-const array_slice: Native = .{ .name = "slice", .call = arraySlice };
-const array_index_of: Native = .{ .name = "indexOf", .call = arrayIndexOf };
-const array_includes: Native = .{ .name = "includes", .call = arrayIncludes };
-const array_join: Native = .{ .name = "join", .call = arrayJoin };
+const array_slice: Native = .{ .name = "slice", .length = 2, .call = arraySlice };
+const array_index_of: Native = .{ .name = "indexOf", .length = 1, .call = arrayIndexOf };
+const array_includes: Native = .{ .name = "includes", .length = 1, .call = arrayIncludes };
+const array_join: Native = .{ .name = "join", .length = 1, .call = arrayJoin };
 const array_to_string: Native = .{ .name = "toString", .call = arrayToString };
 const array_keys: Native = .{ .name = "keys", .call = arrayKeys };
 const array_values: Native = .{ .name = "values", .call = arrayValues };
 const array_entries: Native = .{ .name = "entries", .call = arrayEntries };
-const array_for_each: Native = .{ .name = "forEach", .call = arrayForEach };
-const array_map: Native = .{ .name = "map", .call = arrayMap };
-const array_filter: Native = .{ .name = "filter", .call = arrayFilter };
-const array_reduce: Native = .{ .name = "reduce", .call = arrayReduce };
-const array_find: Native = .{ .name = "find", .call = arrayFind };
-const array_find_index: Native = .{ .name = "findIndex", .call = arrayFindIndex };
-const array_find_last: Native = .{ .name = "findLast", .call = arrayFindLast };
-const array_find_last_index: Native = .{ .name = "findLastIndex", .call = arrayFindLastIndex };
-const array_some: Native = .{ .name = "some", .call = arraySome };
-const array_every: Native = .{ .name = "every", .call = arrayEvery };
-const array_concat: Native = .{ .name = "concat", .call = arrayConcat };
+const array_for_each: Native = .{ .name = "forEach", .length = 1, .call = arrayForEach };
+const array_map: Native = .{ .name = "map", .length = 1, .call = arrayMap };
+const array_filter: Native = .{ .name = "filter", .length = 1, .call = arrayFilter };
+const array_reduce: Native = .{ .name = "reduce", .length = 1, .call = arrayReduce };
+const array_find: Native = .{ .name = "find", .length = 1, .call = arrayFind };
+const array_find_index: Native = .{ .name = "findIndex", .length = 1, .call = arrayFindIndex };
+const array_find_last: Native = .{ .name = "findLast", .length = 1, .call = arrayFindLast };
+const array_find_last_index: Native = .{ .name = "findLastIndex", .length = 1, .call = arrayFindLastIndex };
+const array_some: Native = .{ .name = "some", .length = 1, .call = arraySome };
+const array_every: Native = .{ .name = "every", .length = 1, .call = arrayEvery };
+const array_concat: Native = .{ .name = "concat", .length = 1, .call = arrayConcat };
 const array_reverse: Native = .{ .name = "reverse", .call = arrayReverse };
-const array_at: Native = .{ .name = "at", .call = arrayAt };
-const array_last_index_of: Native = .{ .name = "lastIndexOf", .call = arrayLastIndexOf };
-const array_fill: Native = .{ .name = "fill", .call = arrayFill };
+const array_at: Native = .{ .name = "at", .length = 1, .call = arrayAt };
+const array_last_index_of: Native = .{ .name = "lastIndexOf", .length = 1, .call = arrayLastIndexOf };
+const array_fill: Native = .{ .name = "fill", .length = 1, .call = arrayFill };
 const array_shift: Native = .{ .name = "shift", .call = arrayShift };
-const array_unshift: Native = .{ .name = "unshift", .call = arrayUnshift };
-const array_splice: Native = .{ .name = "splice", .call = arraySplice };
-const array_sort: Native = .{ .name = "sort", .call = arraySort };
-const array_reduce_right: Native = .{ .name = "reduceRight", .call = arrayReduceRight };
+const array_unshift: Native = .{ .name = "unshift", .length = 1, .call = arrayUnshift };
+const array_splice: Native = .{ .name = "splice", .length = 2, .call = arraySplice };
+const array_sort: Native = .{ .name = "sort", .length = 1, .call = arraySort };
+const array_reduce_right: Native = .{ .name = "reduceRight", .length = 1, .call = arrayReduceRight };
 const array_flat: Native = .{ .name = "flat", .call = arrayFlat };
-const array_flat_map: Native = .{ .name = "flatMap", .call = arrayFlatMap };
-const array_copy_within: Native = .{ .name = "copyWithin", .call = arrayCopyWithin };
+const array_flat_map: Native = .{ .name = "flatMap", .length = 1, .call = arrayFlatMap };
+const array_copy_within: Native = .{ .name = "copyWithin", .length = 2, .call = arrayCopyWithin };
 const array_to_reversed: Native = .{ .name = "toReversed", .call = arrayToReversed };
-const array_to_sorted: Native = .{ .name = "toSorted", .call = arrayToSorted };
-const array_to_spliced: Native = .{ .name = "toSpliced", .call = arrayToSpliced };
-const array_with: Native = .{ .name = "with", .call = arrayWith };
+const array_to_sorted: Native = .{ .name = "toSorted", .length = 1, .call = arrayToSorted };
+const array_to_spliced: Native = .{ .name = "toSpliced", .length = 2, .call = arrayToSpliced };
+const array_with: Native = .{ .name = "with", .length = 2, .call = arrayWith };
 
 fn requireCallable(rt: *Runtime, v: Value) Error!Value {
     return switch (v.unpack()) {
@@ -3507,7 +3521,7 @@ fn stringSplit(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype.split called on null or undefined" }});
     }
     const sep_arg = arg(args, 0);
-    if (!sep_arg.isUndefined() and !sep_arg.isNull()) {
+    if (sep_arg.isObjectLike()) {
         const r = try realm(rt);
         if (try object.getMethod(rt, sep_arg, .{ .symbol = r.sym_split })) |splitter| {
             return rt.callCallable(splitter, sep_arg, &.{ this, arg(args, 1) });
@@ -3620,7 +3634,7 @@ fn stringReplaceImpl(rt: *Runtime, this: Value, args: []const Value, _: []const 
         return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype.replace called on null or undefined" }});
     }
     const search_arg = arg(args, 0);
-    if (!search_arg.isUndefined() and !search_arg.isNull()) {
+    if (search_arg.isObjectLike()) {
         if (is_all and search_arg.isObject() and search_arg.asObject().kind == .regexp) {
             const flags_val = try object.get(rt, search_arg, try object.named(rt, "flags"));
             if (flags_val.isUndefined() or flags_val.isNull()) {
@@ -5756,6 +5770,12 @@ fn symbolValueOf(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     return Value.fromSymbol(try thisSymbol(rt, this, "valueOf"));
 }
 
+const symbol_to_primitive: Native = .{ .name = "[Symbol.toPrimitive]", .length = 1, .call = symbolToPrimitive };
+
+fn symbolToPrimitive(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return Value.fromSymbol(try thisSymbol(rt, this, "[Symbol.toPrimitive]"));
+}
+
 fn symbolDescriptionGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     const sym = try thisSymbol(rt, this, "description");
     return if (sym.description) |d| Value.fromString(d) else .undefined;
@@ -5843,7 +5863,7 @@ const bigint_as_uint_n: Native = .{ .name = "asUintN", .length = 2, .call = bigi
 const bigint_to_string: Native = .{ .name = "toString", .length = 0, .call = bigintToString };
 const bigint_value_of: Native = .{ .name = "valueOf", .length = 0, .call = bigintValueOf };
 
-const number_to_string: Native = .{ .name = "toString", .length = 0, .call = numberToString };
+const number_to_string: Native = .{ .name = "toString", .length = 1, .call = numberToString };
 const number_to_fixed: Native = .{ .name = "toFixed", .length = 1, .call = numberToFixed };
 const number_to_exponential: Native = .{ .name = "toExponential", .length = 1, .call = numberToExponential };
 const number_to_precision: Native = .{ .name = "toPrecision", .length = 1, .call = numberToPrecision };
@@ -6378,29 +6398,29 @@ fn registerMath(rt: *Runtime, m: *Object) Error!void {
     try method(rt, m, "random", &math_random);
 }
 
-const math_abs: Native = .{ .name = "abs", .call = mathAbs };
-const math_floor: Native = .{ .name = "floor", .call = mathFloor };
-const math_ceil: Native = .{ .name = "ceil", .call = mathCeil };
-const math_round: Native = .{ .name = "round", .call = mathRound };
-const math_trunc: Native = .{ .name = "trunc", .call = mathTrunc };
+const math_abs: Native = .{ .name = "abs", .length = 1, .call = mathAbs };
+const math_floor: Native = .{ .name = "floor", .length = 1, .call = mathFloor };
+const math_ceil: Native = .{ .name = "ceil", .length = 1, .call = mathCeil };
+const math_round: Native = .{ .name = "round", .length = 1, .call = mathRound };
+const math_trunc: Native = .{ .name = "trunc", .length = 1, .call = mathTrunc };
 const math_min: Native = .{ .name = "min", .length = 2, .call = mathMin };
 const math_max: Native = .{ .name = "max", .length = 2, .call = mathMax };
-const math_pow: Native = .{ .name = "pow", .call = mathPow };
-const math_sqrt: Native = .{ .name = "sqrt", .call = mathSqrt };
-const math_sin: Native = .{ .name = "sin", .call = mathSin };
-const math_cos: Native = .{ .name = "cos", .call = mathCos };
-const math_tan: Native = .{ .name = "tan", .call = mathTan };
-const math_asin: Native = .{ .name = "asin", .call = mathAsin };
-const math_acos: Native = .{ .name = "acos", .call = mathAcos };
-const math_atan: Native = .{ .name = "atan", .call = mathAtan };
-const math_atan2: Native = .{ .name = "atan2", .call = mathAtan2 };
-const math_log: Native = .{ .name = "log", .call = mathLog };
-const math_exp: Native = .{ .name = "exp", .call = mathExp };
-const math_sign: Native = .{ .name = "sign", .call = mathSign };
-const math_clz32: Native = .{ .name = "clz32", .call = mathClz32 };
-const math_imul: Native = .{ .name = "imul", .call = mathImul };
-const math_fround: Native = .{ .name = "fround", .call = mathFround };
-const math_hypot: Native = .{ .name = "hypot", .call = mathHypot };
+const math_pow: Native = .{ .name = "pow", .length = 2, .call = mathPow };
+const math_sqrt: Native = .{ .name = "sqrt", .length = 1, .call = mathSqrt };
+const math_sin: Native = .{ .name = "sin", .length = 1, .call = mathSin };
+const math_cos: Native = .{ .name = "cos", .length = 1, .call = mathCos };
+const math_tan: Native = .{ .name = "tan", .length = 1, .call = mathTan };
+const math_asin: Native = .{ .name = "asin", .length = 1, .call = mathAsin };
+const math_acos: Native = .{ .name = "acos", .length = 1, .call = mathAcos };
+const math_atan: Native = .{ .name = "atan", .length = 1, .call = mathAtan };
+const math_atan2: Native = .{ .name = "atan2", .length = 2, .call = mathAtan2 };
+const math_log: Native = .{ .name = "log", .length = 1, .call = mathLog };
+const math_exp: Native = .{ .name = "exp", .length = 1, .call = mathExp };
+const math_sign: Native = .{ .name = "sign", .length = 1, .call = mathSign };
+const math_clz32: Native = .{ .name = "clz32", .length = 1, .call = mathClz32 };
+const math_imul: Native = .{ .name = "imul", .length = 2, .call = mathImul };
+const math_fround: Native = .{ .name = "fround", .length = 1, .call = mathFround };
+const math_hypot: Native = .{ .name = "hypot", .length = 2, .call = mathHypot };
 const math_random: Native = .{ .name = "random", .call = mathRandom };
 
 fn mathAbs(rt: *Runtime, _: Value, args: []const Value) Error!Value {
@@ -6560,15 +6580,21 @@ fn mathRandom(rt: *Runtime, _: Value, _: []const Value) Error!Value {
 
 // ---------------------------------------------------------------- Map
 
-const map_get: Native = .{ .name = "get", .call = mapGet };
-const map_set: Native = .{ .name = "set", .call = mapSet };
-const map_has: Native = .{ .name = "has", .call = mapHas };
-const map_delete: Native = .{ .name = "delete", .call = mapDelete };
+const map_size_getter: Native = .{ .name = "get size", .call = mapSizeGetter };
+const map_get: Native = .{ .name = "get", .length = 1, .call = mapGet };
+const map_set: Native = .{ .name = "set", .length = 2, .call = mapSet };
+const map_has: Native = .{ .name = "has", .length = 1, .call = mapHas };
+const map_delete: Native = .{ .name = "delete", .length = 1, .call = mapDelete };
 const map_clear: Native = .{ .name = "clear", .call = mapClear };
 const map_keys: Native = .{ .name = "keys", .call = mapKeys };
 const map_values: Native = .{ .name = "values", .call = mapValues };
 const map_entries: Native = .{ .name = "entries", .call = mapEntries };
-const map_for_each: Native = .{ .name = "forEach", .call = mapForEach };
+const map_for_each: Native = .{ .name = "forEach", .length = 1, .call = mapForEach };
+
+fn mapSizeGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const m = try thisMap(rt, this, "get size");
+    return Value.fromNumber(@floatFromInt(m.kind.map.live_count));
+}
 const map_group_by: Native = .{ .name = "groupBy", .length = 2, .call = mapGroupBy };
 
 fn mapWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
@@ -6735,13 +6761,19 @@ fn mapGroupBy(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 
 // ---------------------------------------------------------------- Set
 
-const set_add: Native = .{ .name = "add", .call = setAdd };
-const set_has: Native = .{ .name = "has", .call = setHas };
-const set_delete: Native = .{ .name = "delete", .call = setDelete };
+const set_size_getter: Native = .{ .name = "get size", .call = setSizeGetter };
+const set_add: Native = .{ .name = "add", .length = 1, .call = setAdd };
+const set_has: Native = .{ .name = "has", .length = 1, .call = setHas };
+const set_delete: Native = .{ .name = "delete", .length = 1, .call = setDelete };
 const set_clear: Native = .{ .name = "clear", .call = setClear };
 const set_values: Native = .{ .name = "values", .call = setValues };
 const set_entries: Native = .{ .name = "entries", .call = setEntries };
-const set_for_each: Native = .{ .name = "forEach", .call = setForEach };
+const set_for_each: Native = .{ .name = "forEach", .length = 1, .call = setForEach };
+
+fn setSizeGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const s = try thisSet(rt, this, "get size");
+    return Value.fromNumber(@floatFromInt(s.kind.set.live_count));
+}
 const set_union: Native = .{ .name = "union", .length = 1, .call = setUnion };
 const set_intersection: Native = .{ .name = "intersection", .length = 1, .call = setIntersection };
 const set_difference: Native = .{ .name = "difference", .length = 1, .call = setDifference };
@@ -7252,17 +7284,17 @@ fn weakSetDelete(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 
 // ---------------------------------------------------------------- Promise (M18)
 
-const promise_resolve_static: Native = .{ .name = "resolve", .call = promiseResolveStatic };
-const promise_reject_static: Native = .{ .name = "reject", .call = promiseRejectStatic };
+const promise_resolve_static: Native = .{ .name = "resolve", .length = 1, .call = promiseResolveStatic };
+const promise_reject_static: Native = .{ .name = "reject", .length = 1, .call = promiseRejectStatic };
 const promise_with_resolvers_static: Native = .{ .name = "withResolvers", .call = promiseWithResolversStatic };
 const promise_try_static: Native = .{ .name = "try", .length = 1, .call = promiseTryStatic };
 const promise_all_static: Native = .{ .name = "all", .length = 1, .call = promiseAllStatic };
 const promise_all_settled_static: Native = .{ .name = "allSettled", .length = 1, .call = promiseAllSettledStatic };
 const promise_race_static: Native = .{ .name = "race", .length = 1, .call = promiseRaceStatic };
 const promise_any_static: Native = .{ .name = "any", .length = 1, .call = promiseAnyStatic };
-const promise_then: Native = .{ .name = "then", .call = promiseThen };
-const promise_catch: Native = .{ .name = "catch", .call = promiseCatch };
-const promise_finally: Native = .{ .name = "finally", .call = promiseFinally };
+const promise_then: Native = .{ .name = "then", .length = 2, .call = promiseThen };
+const promise_catch: Native = .{ .name = "catch", .length = 1, .call = promiseCatch };
+const promise_finally: Native = .{ .name = "finally", .length = 1, .call = promiseFinally };
 
 fn thisPromise(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
     if (this.isObject() and this.asObject().kind == .promise) return this.asObject();
@@ -9051,11 +9083,7 @@ pub fn getAsyncIterator(rt: *Runtime, iterable: Value) Error!*Object {
     const method_fn = try object.get(rt, iterable, .{ .symbol = r.sym_async_iterator });
     root_buf[1] = method_fn;
     if (method_fn.isUndefined() or method_fn.isNull()) {
-        const sync = getIterator(rt, iterable) catch |e| {
-            if (e != error.Thrown) return e;
-            rt.clearThrown();
-            return rt.throw(.TypeError, &.{.{ .ascii = "value is not async iterable" }});
-        };
+        const sync = try getIterator(rt, iterable);
         root_buf[2] = Value.fromObject(sync);
         const afs = try rt.heap.newIterator(r.async_from_sync_iterator_prototype, root_buf[2], .async_from_sync);
         root_buf[3] = Value.fromObject(afs);
@@ -10474,49 +10502,23 @@ fn stringMatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype.match called on null or undefined" }});
     }
     const rx_arg = arg(args, 0);
-    if (!rx_arg.isUndefined() and !rx_arg.isNull()) {
-        const r = try realm(rt);
+    const r = try realm(rt);
+    if (rx_arg.isObjectLike()) {
         if (try object.getMethod(rt, rx_arg, .{ .symbol = r.sym_match })) |matcher| {
             return rt.callCallable(matcher, rx_arg, &.{this});
         }
     }
     const s = try toStringObj(rt, this);
-    var root_buf = [_]Value{ Value.fromString(s), rx_arg, .undefined, .undefined, .undefined };
+    var root_buf = [_]Value{ Value.fromString(s), rx_arg, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
     const rx_obj = try coerceToRegExp(rt, root_buf[1]);
     root_buf[2] = Value.fromObject(rx_obj);
-
-    if (!rx_obj.kind.regexp.global) {
-        return regexpExecImpl(rt, rx_obj, s);
-    }
-
-    rt.heap.storeRegExpLastIndex(rx_obj, Value.fromNumber(0));
-    const r = try realm(rt);
-    const out = try rt.heap.newArray(r.array_prototype);
-    root_buf[3] = Value.fromObject(out);
-
-    const cap_len = @as(usize, rx_obj.kind.regexp.program.capture_count) + 1;
-    const captures = try rt.gpa.alloc(?regex.Range, cap_len);
-    defer rt.gpa.free(captures);
-
-    const is_unicode = rx_obj.kind.regexp.program.flags.isUnicodeMode();
-    while (try regexpExecInto(rt, rx_obj, s, captures)) {
-        const rng = captures[0].?;
-        const sub = try rt.heap.newString(&.{.{ .utf16 = s.units[rng.start..rng.end] }});
-        root_buf[4] = Value.fromString(sub);
-        try rt.heap.appendElement(out, root_buf[4]);
-        root_buf[4] = .undefined;
-        if (rng.start == rng.end) {
-            const this_idx = try toLength(rt, rx_obj.kind.regexp.last_index);
-            const next_idx = advanceStringIndex(s.units, @intFromFloat(this_idx), is_unicode);
-            rt.heap.storeRegExpLastIndex(rx_obj, Value.fromNumber(@floatFromInt(next_idx)));
-        }
-    }
-    if (out.kind.array.items.len == 0) return .null;
-    return Value.fromObject(out);
+    const matcher = try object.get(rt, root_buf[2], .{ .symbol = r.sym_match });
+    root_buf[3] = matcher;
+    return rt.callCallable(matcher, root_buf[2], &.{root_buf[0]});
 }
 
 fn stringMatchAll(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -10524,7 +10526,8 @@ fn stringMatchAll(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype.matchAll called on null or undefined" }});
     }
     const rx_arg = arg(args, 0);
-    if (!rx_arg.isUndefined() and !rx_arg.isNull()) {
+    const r = try realm(rt);
+    if (rx_arg.isObjectLike()) {
         if (rx_arg.isObject() and rx_arg.asObject().kind == .regexp) {
             const flags_val = try object.get(rt, rx_arg, try object.named(rt, "flags"));
             if (flags_val.isUndefined() or flags_val.isNull()) {
@@ -10535,12 +10538,11 @@ fn stringMatchAll(rt: *Runtime, this: Value, args: []const Value) Error!Value {
                 return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype.matchAll called with a non-global RegExp argument" }});
             }
         }
-        const r = try realm(rt);
         if (try object.getMethod(rt, rx_arg, .{ .symbol = r.sym_match_all })) |matcher| {
             return rt.callCallable(matcher, rx_arg, &.{this});
         }
     }
-    var root_buf = [_]Value{ this, rx_arg, .undefined, .undefined };
+    var root_buf = [_]Value{ this, rx_arg, .undefined, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -10552,9 +10554,9 @@ fn stringMatchAll(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const created = try regexpBuild(rt, &.{ rx_arg, g_str }, true);
     root_buf[3] = created;
 
-    const r = try realm(rt);
-    const is_unicode = created.asObject().kind.regexp.program.flags.isUnicodeMode();
-    return Value.fromObject(try rt.heap.newMatchAllIterator(r.iterator_prototype, created, s, true, is_unicode));
+    const matcher = try object.get(rt, created, .{ .symbol = r.sym_match_all });
+    root_buf[4] = matcher;
+    return rt.callCallable(matcher, created, &.{root_buf[2]});
 }
 
 fn stringSearch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -10562,29 +10564,23 @@ fn stringSearch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype.search called on null or undefined" }});
     }
     const rx_arg = arg(args, 0);
-    if (!rx_arg.isUndefined() and !rx_arg.isNull()) {
-        const r = try realm(rt);
+    const r = try realm(rt);
+    if (rx_arg.isObjectLike()) {
         if (try object.getMethod(rt, rx_arg, .{ .symbol = r.sym_search })) |searcher| {
             return rt.callCallable(searcher, rx_arg, &.{this});
         }
     }
     const s = try toStringObj(rt, this);
-    var root_buf = [_]Value{ Value.fromString(s), rx_arg, .undefined };
+    var root_buf = [_]Value{ Value.fromString(s), rx_arg, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
     const rx_obj = try coerceToRegExp(rt, root_buf[1]);
     root_buf[2] = Value.fromObject(rx_obj);
-
-    const cap_len = @as(usize, rx_obj.kind.regexp.program.capture_count) + 1;
-    const captures = try rt.gpa.alloc(?regex.Range, cap_len);
-    defer rt.gpa.free(captures);
-
-    if (try runRegExpMatcher(rt, &rx_obj.kind.regexp.program, s.units, 0, captures)) {
-        return Value.fromNumber(@floatFromInt(captures[0].?.start));
-    }
-    return Value.fromNumber(-1);
+    const searcher = try object.get(rt, root_buf[2], .{ .symbol = r.sym_search });
+    root_buf[3] = searcher;
+    return rt.callCallable(searcher, root_buf[2], &.{root_buf[0]});
 }
 
 fn expandRegExpReplacement(

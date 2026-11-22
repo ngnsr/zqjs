@@ -283,16 +283,6 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
                 .writable = o.regexp_last_index_writable,
                 .configurable = false,
             };
-            if (isNamed(k, "source")) return .{ .value = Value.fromString(re.source), .enumerable = false, .writable = false };
-            if (isNamed(k, "flags")) return .{ .value = Value.fromString(re.flags), .enumerable = false, .writable = false };
-            if (isNamed(k, "hasIndices")) return .{ .value = Value.fromBool(re.program.flags.has_indices), .enumerable = false, .writable = false };
-            if (isNamed(k, "global")) return .{ .value = Value.fromBool(re.global), .enumerable = false, .writable = false };
-            if (isNamed(k, "ignoreCase")) return .{ .value = Value.fromBool(re.program.flags.ignore_case), .enumerable = false, .writable = false };
-            if (isNamed(k, "multiline")) return .{ .value = Value.fromBool(re.program.flags.multiline), .enumerable = false, .writable = false };
-            if (isNamed(k, "dotAll")) return .{ .value = Value.fromBool(re.program.flags.dot_all), .enumerable = false, .writable = false };
-            if (isNamed(k, "unicode")) return .{ .value = Value.fromBool(re.program.flags.unicode), .enumerable = false, .writable = false };
-            if (isNamed(k, "unicodeSets")) return .{ .value = Value.fromBool(re.program.flags.unicode_sets), .enumerable = false, .writable = false };
-            if (isNamed(k, "sticky")) return .{ .value = Value.fromBool(re.program.flags.sticky), .enumerable = false, .writable = false };
         },
         .module_namespace => |ns| {
             if (k == .atom) {
@@ -348,19 +338,6 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
         return builtins.globalOwnProp(rt, k.atom);
     }
     return null;
-}
-
-fn isRegExpGetter(k: Key) bool {
-    return isNamed(k, "source") or
-        isNamed(k, "flags") or
-        isNamed(k, "hasIndices") or
-        isNamed(k, "global") or
-        isNamed(k, "ignoreCase") or
-        isNamed(k, "multiline") or
-        isNamed(k, "dotAll") or
-        isNamed(k, "unicode") or
-        isNamed(k, "unicodeSets") or
-        isNamed(k, "sticky");
 }
 
 /// Own lookup that never allocates (atoms only; for built-in tables).
@@ -647,10 +624,6 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!b
                         }
                         rt.heap.storeRegExpLastIndex(o, v);
                         return true;
-                    }
-                    if (isRegExpGetter(k)) {
-                        if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
-                        return false;
                     }
                 },
                 .module_namespace => {

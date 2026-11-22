@@ -473,6 +473,7 @@ pub const Runtime = struct {
             h.markObj(&r.sym_to_primitive.obj);
             h.markObj(&r.sym_to_string_tag.obj);
             h.markObj(&r.sym_has_instance.obj);
+            h.markObj(&r.sym_species.obj);
         }
         var sym_it = rt.global_symbols.iterator();
         while (sym_it.next()) |e| {

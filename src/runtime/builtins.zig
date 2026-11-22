@@ -108,6 +108,7 @@ pub const Realm = struct {
     sym_to_primitive: *heap_mod.Symbol,
     sym_to_string_tag: *heap_mod.Symbol,
     sym_has_instance: *heap_mod.Symbol,
+    sym_species: *heap_mod.Symbol,
     math: *Object,
     json: *Object,
     global_object: *Object,
@@ -293,6 +294,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .sym_to_primitive = try h.newSymbol(try h.ascii("Symbol.toPrimitive"), false),
         .sym_to_string_tag = try h.newSymbol(try h.ascii("Symbol.toStringTag"), false),
         .sym_has_instance = try h.newSymbol(try h.ascii("Symbol.hasInstance"), false),
+        .sym_species = try h.newSymbol(try h.ascii("Symbol.species"), false),
         .math = try builtin(h, object_prototype, .math),
         .json = try builtin(h, object_prototype, .json),
         .global_object = try builtin(h, object_prototype, .global),
@@ -346,6 +348,9 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.string_prototype, "includes", &string_includes);
     try method(rt, r.string_prototype, "toLowerCase", &string_to_lower_case);
     try method(rt, r.string_prototype, "toUpperCase", &string_to_upper_case);
+    try method(rt, r.string_prototype, "toLocaleLowerCase", &string_to_locale_lower_case);
+    try method(rt, r.string_prototype, "toLocaleUpperCase", &string_to_locale_upper_case);
+    try method(rt, r.string_prototype, "concat", &string_concat);
     try method(rt, r.string_prototype, "split", &string_split);
     try method(rt, r.string_prototype, "trim", &string_trim);
     try method(rt, r.string_prototype, "trimStart", &string_trim_start);
@@ -366,6 +371,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.string_prototype, "codePointAt", &string_code_point_at);
     try method(rt, r.string_namespace, "fromCharCode", &string_from_char_code);
     try method(rt, r.string_namespace, "fromCodePoint", &string_from_code_point);
+    try method(rt, r.string_namespace, "raw", &string_raw);
     try method(rt, r.object_namespace, "keys", &object_keys);
     try method(rt, r.object_namespace, "values", &object_values);
     try method(rt, r.object_namespace, "entries", &object_entries);
@@ -503,6 +509,16 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.regexp_prototype, "exec", &regexp_exec);
     try method(rt, r.regexp_prototype, "test", &regexp_test);
     try method(rt, r.regexp_prototype, "toString", &regexp_to_string);
+    try object.defineAccessor(rt, Value.fromObject(r.regexp_prototype), try object.named(rt, "source"), Value.fromNative(&regexp_source_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.regexp_prototype), try object.named(rt, "flags"), Value.fromNative(&regexp_flags_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.regexp_prototype), try object.named(rt, "hasIndices"), Value.fromNative(&regexp_has_indices_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.regexp_prototype), try object.named(rt, "global"), Value.fromNative(&regexp_global_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.regexp_prototype), try object.named(rt, "ignoreCase"), Value.fromNative(&regexp_ignore_case_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.regexp_prototype), try object.named(rt, "multiline"), Value.fromNative(&regexp_multiline_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.regexp_prototype), try object.named(rt, "dotAll"), Value.fromNative(&regexp_dot_all_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.regexp_prototype), try object.named(rt, "unicode"), Value.fromNative(&regexp_unicode_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.regexp_prototype), try object.named(rt, "unicodeSets"), Value.fromNative(&regexp_unicode_sets_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.regexp_prototype), try object.named(rt, "sticky"), Value.fromNative(&regexp_sticky_getter), false, false);
     try immutableConstant(rt, r.date_namespace, "prototype", Value.fromObject(r.date_prototype));
     try method(rt, r.date_namespace, "now", &date_now);
     try method(rt, r.date_namespace, "UTC", &date_utc);
@@ -620,6 +636,17 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .writable = false,
         .configurable = false,
     });
+    try rt.heap.defineProperty(r.symbol_namespace, try rt.heap.internAscii("species"), .{
+        .value = Value.fromSymbol(r.sym_species),
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
+    try object.defineAccessor(rt, Value.fromObject(r.array_namespace), .{ .symbol = r.sym_species }, Value.fromNative(&species_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.regexp_namespace), .{ .symbol = r.sym_species }, Value.fromNative(&species_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.promise_namespace), .{ .symbol = r.sym_species }, Value.fromNative(&species_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.map_namespace), .{ .symbol = r.sym_species }, Value.fromNative(&species_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.set_namespace), .{ .symbol = r.sym_species }, Value.fromNative(&species_getter), false, false);
     try defineToStringTag(rt, r.map_prototype, r.sym_to_string_tag, "Map");
     try defineToStringTag(rt, r.set_prototype, r.sym_to_string_tag, "Set");
     try defineToStringTag(rt, r.weak_map_prototype, r.sym_to_string_tag, "WeakMap");
@@ -705,6 +732,12 @@ pub const function_has_instance: Native = .{ .name = "[Symbol.hasInstance]", .le
 
 fn functionHasInstance(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return Value.fromBool(try object.ordinaryHasInstance(rt, this, arg(args, 0)));
+}
+
+const species_getter: Native = .{ .name = "get [Symbol.species]", .call = speciesGetter };
+
+fn speciesGetter(_: *Runtime, this: Value, _: []const Value) Error!Value {
+    return this;
 }
 
 pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
@@ -2465,11 +2498,15 @@ const string_char_code_at: Native = .{ .name = "charCodeAt", .length = 1, .call 
 const string_code_point_at: Native = .{ .name = "codePointAt", .length = 1, .call = stringCodePointAt };
 const string_from_char_code: Native = .{ .name = "fromCharCode", .length = 1, .call = stringFromCharCode };
 const string_from_code_point: Native = .{ .name = "fromCodePoint", .length = 1, .call = stringFromCodePoint };
+const string_raw: Native = .{ .name = "raw", .length = 1, .call = stringRaw };
 const string_slice: Native = .{ .name = "slice", .length = 2, .call = stringSlice };
 const string_index_of: Native = .{ .name = "indexOf", .length = 1, .call = stringIndexOf };
 const string_includes: Native = .{ .name = "includes", .length = 1, .call = stringIncludes };
 const string_to_lower_case: Native = .{ .name = "toLowerCase", .call = stringToLowerCase };
 const string_to_upper_case: Native = .{ .name = "toUpperCase", .call = stringToUpperCase };
+const string_to_locale_lower_case: Native = .{ .name = "toLocaleLowerCase", .call = stringToLocaleLowerCase };
+const string_to_locale_upper_case: Native = .{ .name = "toLocaleUpperCase", .call = stringToLocaleUpperCase };
+const string_concat: Native = .{ .name = "concat", .length = 1, .call = stringConcat };
 const string_split: Native = .{ .name = "split", .length = 2, .call = stringSplit };
 const string_trim: Native = .{ .name = "trim", .call = stringTrim };
 const string_trim_start: Native = .{ .name = "trimStart", .call = stringTrimStart };
@@ -2494,6 +2531,13 @@ fn thisString(rt: *Runtime, this: Value, name: []const u8) Error!*const heap_mod
         .object => |o| if (o.kind == .primitive_wrapper and o.kind.primitive_wrapper.isString()) o.kind.primitive_wrapper.asString() else unsupportedReceiver(rt, name),
         else => unsupportedReceiver(rt, name),
     };
+}
+
+fn requireStringCoercible(rt: *Runtime, this: Value) Error!*const heap_mod.String {
+    if (this.isUndefined() or this.isNull()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype method called on null or undefined" }});
+    }
+    return toStringObj(rt, this);
 }
 
 pub fn toStringObj(rt: *Runtime, v: Value) Error!*const heap_mod.String {
@@ -2525,14 +2569,22 @@ fn stringCharAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn stringCharCodeAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "charCodeAt");
+    const s = try requireStringCoercible(rt, this);
+    var root_buf = [_]Value{Value.fromString(s)};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
     const pos = try toIntegerOrInfinity(rt, arg(args, 0));
     if (pos < 0 or pos >= @as(f64, @floatFromInt(s.units.len))) return Value.fromNumber(std.math.nan(f64));
     return Value.fromNumber(@floatFromInt(s.units[@intFromFloat(pos)])); // a UTF-16 code unit
 }
 
 fn stringCodePointAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "codePointAt");
+    const s = try requireStringCoercible(rt, this);
+    var root_buf = [_]Value{Value.fromString(s)};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
     const pos = try toIntegerOrInfinity(rt, arg(args, 0));
     if (pos < 0 or pos >= @as(f64, @floatFromInt(s.units.len))) return .undefined;
     const i: usize = @intFromFloat(pos);
@@ -2582,6 +2634,51 @@ fn stringFromCodePoint(rt: *Runtime, _: Value, args: []const Value) Error!Value 
     return Value.fromString(try rt.heap.newString(&.{.{ .utf16 = buf.items }}));
 }
 
+fn stringRaw(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const tmpl = arg(args, 0);
+    if (tmpl.isUndefined() or tmpl.isNull()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    const raw = try object.get(rt, tmpl, try object.named(rt, "raw"));
+    if (raw.isUndefined() or raw.isNull()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    var root_buf = [_]Value{ raw, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const len_val = try object.get(rt, raw, try object.named(rt, "length"));
+    const literal_segments = try toLength(rt, len_val);
+    if (literal_segments <= 0) return Value.fromString(try rt.heap.newString(&.{}));
+
+    const max_len = rt.heap.max_string_length;
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(rt.gpa);
+
+    var next_index: f64 = 0;
+    while (next_index < literal_segments) : (next_index += 1) {
+        const key: object.Key = if (next_index <= @as(f64, @floatFromInt(std.math.maxInt(u32))))
+            .{ .index = @intFromFloat(next_index) }
+        else
+            try object.key(rt, Value.fromNumber(next_index));
+        const seg_val = try object.get(rt, raw, key);
+        const seg = try toStringObj(rt, seg_val);
+        root_buf[1] = Value.fromString(seg);
+        try appendUnits(rt, &out, seg.units);
+        if (next_index + 1 == literal_segments) break;
+        const sub_idx_f = next_index + 1;
+        if (sub_idx_f < @as(f64, @floatFromInt(args.len))) {
+            const sub_idx: usize = @intFromFloat(sub_idx_f);
+            const sub = try toStringObj(rt, args[sub_idx]);
+            root_buf[1] = Value.fromString(sub);
+            try appendUnits(rt, &out, sub.units);
+        }
+        if (out.items.len > max_len) return rt.limit(.string_length);
+    }
+    return Value.fromString(try rt.heap.newString(&.{.{ .utf16 = out.items }}));
+}
+
 fn stringSlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const s = try thisString(rt, this, "slice");
     const len = s.units.len;
@@ -2592,24 +2689,38 @@ fn stringSlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn stringIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "indexOf");
-    const search = try toStringUnits(rt, arg(args, 0));
+    const s = try requireStringCoercible(rt, this);
+    var root_buf = [_]Value{ Value.fromString(s), .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const search_obj = try toStringObj(rt, arg(args, 0));
+    root_buf[1] = Value.fromString(search_obj);
     const pos = try toIntegerOrInfinity(rt, arg(args, 1));
     const len = s.units.len;
     const start: usize = if (pos <= 0) 0 else if (pos >= @as(f64, @floatFromInt(len))) len else @intFromFloat(pos);
-    if (search.len == 0) return Value.fromNumber(@floatFromInt(start));
-    if (std.mem.indexOfPos(u16, s.units, start, search)) |idx| return Value.fromNumber(@floatFromInt(idx));
+    if (search_obj.units.len == 0) return Value.fromNumber(@floatFromInt(start));
+    if (std.mem.indexOfPos(u16, s.units, start, search_obj.units)) |idx| return Value.fromNumber(@floatFromInt(idx));
     return Value.fromNumber(-1);
 }
 
 fn stringIncludes(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "includes");
-    const search = try toStringUnits(rt, arg(args, 0));
+    const s = try requireStringCoercible(rt, this);
+    var root_buf = [_]Value{ Value.fromString(s), .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const search_arg = arg(args, 0);
+    if (search_arg.isObject() and search_arg.asObject().kind == .regexp) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "First argument to String.prototype.includes must not be a regular expression" }});
+    }
+    const search_obj = try toStringObj(rt, search_arg);
+    root_buf[1] = Value.fromString(search_obj);
     const pos = try toIntegerOrInfinity(rt, arg(args, 1));
     const len = s.units.len;
     const start: usize = if (pos <= 0) 0 else if (pos >= @as(f64, @floatFromInt(len))) len else @intFromFloat(pos);
-    if (search.len == 0) return Value.fromBool(true);
-    return Value.fromBool(std.mem.indexOfPos(u16, s.units, start, search) != null);
+    if (search_obj.units.len == 0) return Value.fromBool(true);
+    return Value.fromBool(std.mem.indexOfPos(u16, s.units, start, search_obj.units) != null);
 }
 
 /// Compatibility restriction: JavaScript case conversion is Unicode-aware, whereas
@@ -2630,17 +2741,50 @@ fn asciiCase(rt: *Runtime, s: *const heap_mod.String, name: []const u8, comptime
 }
 
 fn stringToLowerCase(rt: *Runtime, this: Value, _: []const Value) Error!Value {
-    const s = try thisString(rt, this, "toLowerCase");
+    const s = try requireStringCoercible(rt, this);
     return asciiCase(rt, s, "toLowerCase", false);
 }
 
 fn stringToUpperCase(rt: *Runtime, this: Value, _: []const Value) Error!Value {
-    const s = try thisString(rt, this, "toUpperCase");
+    const s = try requireStringCoercible(rt, this);
     return asciiCase(rt, s, "toUpperCase", true);
 }
 
+fn stringToLocaleLowerCase(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const s = try requireStringCoercible(rt, this);
+    return asciiCase(rt, s, "toLocaleLowerCase", false);
+}
+
+fn stringToLocaleUpperCase(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const s = try requireStringCoercible(rt, this);
+    return asciiCase(rt, s, "toLocaleUpperCase", true);
+}
+
+fn stringConcat(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const s = try requireStringCoercible(rt, this);
+    if (args.len == 0) return Value.fromString(s);
+    var root_buf = [_]Value{ Value.fromString(s), .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(rt.gpa);
+    try appendUnits(rt, &out, s.units);
+    for (args) |a| {
+        const part = try toStringObj(rt, a);
+        root_buf[1] = Value.fromString(part);
+        try appendUnits(rt, &out, part.units);
+    }
+    return Value.fromString(try rt.heap.newString(&.{.{ .utf16 = out.items }}));
+}
+
 fn stringAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "at");
+    const s = try requireStringCoercible(rt, this);
+    var root_buf = [_]Value{Value.fromString(s)};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
     const len = s.units.len;
     const rel = try toIntegerOrInfinity(rt, arg(args, 0));
     const k = if (rel >= 0) rel else @as(f64, @floatFromInt(len)) + rel;
@@ -2650,7 +2794,11 @@ fn stringAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn stringSubstring(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "substring");
+    const s = try requireStringCoercible(rt, this);
+    var root_buf = [_]Value{Value.fromString(s)};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
     const len_f: f64 = @floatFromInt(s.units.len);
     const int_start = try toIntegerOrInfinity(rt, arg(args, 0));
     const int_end = if (arg(args, 1).isUndefined()) len_f else try toIntegerOrInfinity(rt, arg(args, 1));
@@ -2662,43 +2810,66 @@ fn stringSubstring(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn stringLastIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "lastIndexOf");
-    const search = try toStringUnits(rt, arg(args, 0));
+    const s = try requireStringCoercible(rt, this);
+    var root_buf = [_]Value{ Value.fromString(s), .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const search_obj = try toStringObj(rt, arg(args, 0));
+    root_buf[1] = Value.fromString(search_obj);
     const num_pos = if (args.len < 2) std.math.nan(f64) else try ops.toNumber(rt, args[1]);
     const pos = if (std.math.isNan(num_pos)) std.math.inf(f64) else if (num_pos == 0) 0 else @trunc(num_pos);
     const start: usize = @intFromFloat(@min(@max(pos, 0), @as(f64, @floatFromInt(s.units.len))));
-    if (search.len == 0) return Value.fromNumber(@floatFromInt(start));
-    if (search.len > s.units.len) return Value.fromNumber(-1);
-    var k: usize = @min(start, s.units.len - search.len);
+    if (search_obj.units.len == 0) return Value.fromNumber(@floatFromInt(start));
+    if (search_obj.units.len > s.units.len) return Value.fromNumber(-1);
+    var k: usize = @min(start, s.units.len - search_obj.units.len);
     while (true) : (k -= 1) {
-        if (std.mem.eql(u16, s.units[k .. k + search.len], search)) return Value.fromNumber(@floatFromInt(k));
+        if (std.mem.eql(u16, s.units[k .. k + search_obj.units.len], search_obj.units)) return Value.fromNumber(@floatFromInt(k));
         if (k == 0) break;
     }
     return Value.fromNumber(-1);
 }
 
 fn stringStartsWith(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "startsWith");
-    const search = try toStringUnits(rt, arg(args, 0));
+    const s = try requireStringCoercible(rt, this);
+    var root_buf = [_]Value{ Value.fromString(s), .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const search_arg = arg(args, 0);
+    if (search_arg.isObject() and search_arg.asObject().kind == .regexp) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "First argument to String.prototype.startsWith must not be a regular expression" }});
+    }
+    const search_obj = try toStringObj(rt, search_arg);
+    root_buf[1] = Value.fromString(search_obj);
     const pos = try toIntegerOrInfinity(rt, arg(args, 1));
     const start: usize = @intFromFloat(@min(@max(pos, 0), @as(f64, @floatFromInt(s.units.len))));
-    if (search.len == 0) return Value.fromBool(true);
-    if (s.units.len - start < search.len) return Value.fromBool(false);
-    return Value.fromBool(std.mem.eql(u16, s.units[start .. start + search.len], search));
+    if (search_obj.units.len == 0) return Value.fromBool(true);
+    if (s.units.len - start < search_obj.units.len) return Value.fromBool(false);
+    return Value.fromBool(std.mem.eql(u16, s.units[start .. start + search_obj.units.len], search_obj.units));
 }
 
 fn stringEndsWith(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "endsWith");
-    const search = try toStringUnits(rt, arg(args, 0));
+    const s = try requireStringCoercible(rt, this);
+    var root_buf = [_]Value{ Value.fromString(s), .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const search_arg = arg(args, 0);
+    if (search_arg.isObject() and search_arg.asObject().kind == .regexp) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "First argument to String.prototype.endsWith must not be a regular expression" }});
+    }
+    const search_obj = try toStringObj(rt, search_arg);
+    root_buf[1] = Value.fromString(search_obj);
     const len_f: f64 = @floatFromInt(s.units.len);
     const pos = if (arg(args, 1).isUndefined()) len_f else try toIntegerOrInfinity(rt, arg(args, 1));
     const end: usize = @intFromFloat(@min(@max(pos, 0), len_f));
-    if (search.len > end) return Value.fromBool(false);
-    return Value.fromBool(std.mem.eql(u16, s.units[end - search.len .. end], search));
+    if (search_obj.units.len > end) return Value.fromBool(false);
+    return Value.fromBool(std.mem.eql(u16, s.units[end - search_obj.units.len .. end], search_obj.units));
 }
 
-fn stringTrimImpl(rt: *Runtime, this: Value, name: []const u8, trim_start: bool, trim_end: bool) Error!Value {
-    const s = try thisString(rt, this, name);
+fn stringTrimImpl(rt: *Runtime, this: Value, _: []const u8, trim_start: bool, trim_end: bool) Error!Value {
+    const s = try requireStringCoercible(rt, this);
     var start: usize = 0;
     var end: usize = s.units.len;
     if (trim_start) while (start < end and isJsWhitespace(s.units[start])) {
@@ -2723,7 +2894,11 @@ fn stringTrimEnd(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 }
 
 fn stringRepeat(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "repeat");
+    const s = try requireStringCoercible(rt, this);
+    var root_buf = [_]Value{Value.fromString(s)};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
     const n = try toIntegerOrInfinity(rt, arg(args, 0));
     if (n < 0 or n == std.math.inf(f64)) return rt.throw(.RangeError, &.{.{ .ascii = "Invalid count value" }});
     if (n == 0 or s.units.len == 0) return Value.fromString(try rt.heap.newString(&.{}));
@@ -2741,15 +2916,23 @@ fn stringRepeat(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return Value.fromString(try rt.heap.newString(&.{.{ .utf16 = buf }}));
 }
 
-fn stringPadImpl(rt: *Runtime, this: Value, args: []const Value, name: []const u8, comptime is_start: bool) Error!Value {
-    const s = try thisString(rt, this, name);
+fn stringPadImpl(rt: *Runtime, this: Value, args: []const Value, _: []const u8, comptime is_start: bool) Error!Value {
+    const s = try requireStringCoercible(rt, this);
+    const s_val = Value.fromString(s);
+    var root_buf = [_]Value{ s_val, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
     const max_len_f = try toIntegerOrInfinity(rt, arg(args, 0));
-    if (max_len_f <= @as(f64, @floatFromInt(s.units.len))) return this;
+    if (max_len_f <= @as(f64, @floatFromInt(s.units.len))) return s_val;
     const filler: []const u16 = if (arg(args, 1).isUndefined())
         &.{' '}
-    else
-        try toStringUnits(rt, arg(args, 1));
-    if (filler.len == 0) return this;
+    else blk: {
+        const f_obj = try toStringObj(rt, arg(args, 1));
+        root_buf[1] = Value.fromString(f_obj);
+        break :blk f_obj.units;
+    };
+    if (filler.len == 0) return s_val;
     const max_str = rt.heap.max_string_length;
     if (max_len_f > @as(f64, @floatFromInt(max_str))) return rt.limit(.string_length);
     const target_len: usize = @intFromFloat(max_len_f);
@@ -2777,30 +2960,30 @@ fn stringPadEnd(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn stringSplit(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "split");
+    const s = try requireStringCoercible(rt, this);
+    const s_val = Value.fromString(s);
     const sep_arg = arg(args, 0);
     if (sep_arg.isObject() and sep_arg.asObject().kind == .regexp) {
-        return stringSplitRegExp(rt, this, s, sep_arg.asObject(), arg(args, 1));
+        return stringSplitRegExp(rt, s_val, s, sep_arg.asObject(), arg(args, 1));
     }
+    var root_buf = [_]Value{ s_val, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     const lim: u32 = if (arg(args, 1).isUndefined()) std.math.maxInt(u32) else ops.toUint32(try ops.toNumber(rt, arg(args, 1)));
     const r = try realm(rt);
 
     if (sep_arg.isUndefined()) {
         const out = try rt.heap.newArray(r.array_prototype);
         if (lim == 0) return Value.fromObject(out);
-        var root_buf = [_]Value{ this, Value.fromObject(out) };
-        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
-        try roots.register(rt);
-        defer roots.unregister(rt);
-        try rt.heap.appendElement(out, this);
+        root_buf[2] = Value.fromObject(out);
+        try rt.heap.appendElement(out, s_val);
         return Value.fromObject(out);
     }
 
     const sep = try toStringObj(rt, sep_arg);
-    var root_buf = [_]Value{ this, Value.fromString(sep), .undefined, .undefined };
-    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
-    try roots.register(rt);
-    defer roots.unregister(rt);
+    root_buf[1] = Value.fromString(sep);
 
     const out = try rt.heap.newArray(r.array_prototype);
     root_buf[2] = Value.fromObject(out);
@@ -2818,7 +3001,7 @@ fn stringSplit(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     }
 
     if (s.units.len == 0) {
-        try rt.heap.appendElement(out, this);
+        try rt.heap.appendElement(out, s_val);
         return Value.fromObject(out);
     }
 
@@ -2883,23 +3066,25 @@ fn expandReplacement(
     }
 }
 
-fn stringReplaceImpl(rt: *Runtime, this: Value, args: []const Value, name: []const u8, comptime is_all: bool) Error!Value {
-    const s = try thisString(rt, this, name);
+fn stringReplaceImpl(rt: *Runtime, this: Value, args: []const Value, _: []const u8, comptime is_all: bool) Error!Value {
+    const s = try requireStringCoercible(rt, this);
+    const s_val = Value.fromString(s);
     const search_arg = arg(args, 0);
     if (search_arg.isObject() and search_arg.asObject().kind == .regexp) {
         if (is_all and !search_arg.asObject().kind.regexp.global) {
             return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype.replaceAll called with a non-global RegExp argument" }});
         }
-        return stringReplaceRegExp(rt, this, s, search_arg.asObject(), arg(args, 1));
+        return stringReplaceRegExp(rt, s_val, s, search_arg.asObject(), arg(args, 1));
     }
-    const search = try toStringObj(rt, search_arg);
-    const repl_arg = arg(args, 1);
-    const is_func = repl_arg.isNative() or repl_arg.isClosure();
-
-    var root_buf = [_]Value{ this, Value.fromString(search), repl_arg, .undefined, .undefined };
+    var root_buf = [_]Value{ s_val, .undefined, arg(args, 1), .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
+
+    const search = try toStringObj(rt, search_arg);
+    root_buf[1] = Value.fromString(search);
+    const repl_arg = arg(args, 1);
+    const is_func = repl_arg.isNative() or repl_arg.isClosure();
 
     const repl_str: ?*const heap_mod.String = if (!is_func) blk: {
         const rs = try toStringObj(rt, repl_arg);
@@ -2911,12 +3096,12 @@ fn stringReplaceImpl(rt: *Runtime, this: Value, args: []const Value, name: []con
     defer out.deinit(rt.gpa);
 
     if (!is_all) {
-        const pos = if (search.units.len == 0) 0 else std.mem.indexOf(u16, s.units, search.units) orelse return this;
+        const pos = if (search.units.len == 0) 0 else std.mem.indexOf(u16, s.units, search.units) orelse return s_val;
         try appendUnits(rt, &out, s.units[0..pos]);
         if (is_func) {
             const matched = try rt.heap.newString(&.{.{ .utf16 = s.units[pos .. pos + search.units.len] }});
             root_buf[4] = Value.fromString(matched);
-            const res = try rt.callCallable(repl_arg, .undefined, &.{ Value.fromString(matched), Value.fromNumber(@floatFromInt(pos)), this });
+            const res = try rt.callCallable(repl_arg, .undefined, &.{ Value.fromString(matched), Value.fromNumber(@floatFromInt(pos)), s_val });
             const rs = try toStringObj(rt, res);
             root_buf[4] = Value.fromString(rs);
             try appendUnits(rt, &out, rs.units);
@@ -2936,7 +3121,7 @@ fn stringReplaceImpl(rt: *Runtime, this: Value, args: []const Value, name: []con
         for (0..s.units.len + 1) |pos| {
             if (pos > 0) try appendUnits(rt, &out, s.units[pos - 1 .. pos]);
             if (is_func) {
-                const res = try rt.callCallable(repl_arg, .undefined, &.{ Value.fromString(empty_s.?), Value.fromNumber(@floatFromInt(pos)), this });
+                const res = try rt.callCallable(repl_arg, .undefined, &.{ Value.fromString(empty_s.?), Value.fromNumber(@floatFromInt(pos)), s_val });
                 const rs = try toStringObj(rt, res);
                 root_buf[4] = Value.fromString(rs);
                 try appendUnits(rt, &out, rs.units);
@@ -2953,7 +3138,7 @@ fn stringReplaceImpl(rt: *Runtime, this: Value, args: []const Value, name: []con
         if (is_func) {
             const matched = try rt.heap.newString(&.{.{ .utf16 = s.units[idx .. idx + search.units.len] }});
             root_buf[4] = Value.fromString(matched);
-            const res = try rt.callCallable(repl_arg, .undefined, &.{ Value.fromString(matched), Value.fromNumber(@floatFromInt(idx)), this });
+            const res = try rt.callCallable(repl_arg, .undefined, &.{ Value.fromString(matched), Value.fromNumber(@floatFromInt(idx)), s_val });
             const rs = try toStringObj(rt, res);
             root_buf[4] = Value.fromString(rs);
             try appendUnits(rt, &out, rs.units);
@@ -7835,14 +8020,134 @@ fn regexpTest(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return Value.fromBool(try regexpExecInto(rt, rx_obj, s, captures));
 }
 
+const regexp_source_getter: Native = .{ .name = "get source", .call = regexpSourceGetter };
+const regexp_flags_getter: Native = .{ .name = "get flags", .call = regexpFlagsGetter };
+const regexp_has_indices_getter: Native = .{ .name = "get hasIndices", .call = regexpHasIndicesGetter };
+const regexp_global_getter: Native = .{ .name = "get global", .call = regexpGlobalGetter };
+const regexp_ignore_case_getter: Native = .{ .name = "get ignoreCase", .call = regexpIgnoreCaseGetter };
+const regexp_multiline_getter: Native = .{ .name = "get multiline", .call = regexpMultilineGetter };
+const regexp_dot_all_getter: Native = .{ .name = "get dotAll", .call = regexpDotAllGetter };
+const regexp_unicode_getter: Native = .{ .name = "get unicode", .call = regexpUnicodeGetter };
+const regexp_unicode_sets_getter: Native = .{ .name = "get unicodeSets", .call = regexpUnicodeSetsGetter };
+const regexp_sticky_getter: Native = .{ .name = "get sticky", .call = regexpStickyGetter };
+
+fn regexpSourceGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    if (!this.isObject()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype.source getter called on non-object" }});
+    }
+    const o = this.asObject();
+    if (o.kind == .regexp) return Value.fromString(o.kind.regexp.source);
+    if (o == (try realm(rt)).regexp_prototype) return Value.fromString(try rt.heap.ascii("(?:)"));
+    return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype.source getter called on incompatible receiver" }});
+}
+
+fn regexpFlagsGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    if (!this.isObject() and !this.isClosure() and !this.isNative()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype.flags getter called on non-object" }});
+    }
+    var root_buf = [_]Value{this};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const spec = [_]struct { name: []const u8, ch: u8 }{
+        .{ .name = "hasIndices", .ch = 'd' },
+        .{ .name = "global", .ch = 'g' },
+        .{ .name = "ignoreCase", .ch = 'i' },
+        .{ .name = "multiline", .ch = 'm' },
+        .{ .name = "dotAll", .ch = 's' },
+        .{ .name = "unicode", .ch = 'u' },
+        .{ .name = "unicodeSets", .ch = 'v' },
+        .{ .name = "sticky", .ch = 'y' },
+    };
+    var buf: [8]u8 = undefined;
+    var len: usize = 0;
+    for (spec) |entry| {
+        const v = try object.get(rt, this, try object.named(rt, entry.name));
+        if (ops.toBoolean(v)) {
+            buf[len] = entry.ch;
+            len += 1;
+        }
+    }
+    return Value.fromString(try rt.heap.ascii(buf[0..len]));
+}
+
+fn regexpFlagGetter(
+    rt: *Runtime,
+    this: Value,
+    comptime field: enum { has_indices, global, ignore_case, multiline, dot_all, unicode, unicode_sets, sticky },
+) Error!Value {
+    if (!this.isObject()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype flag getter called on non-object" }});
+    }
+    const o = this.asObject();
+    if (o.kind == .regexp) {
+        const re = o.kind.regexp;
+        return Value.fromBool(switch (field) {
+            .has_indices => re.program.flags.has_indices,
+            .global => re.global,
+            .ignore_case => re.program.flags.ignore_case,
+            .multiline => re.program.flags.multiline,
+            .dot_all => re.program.flags.dot_all,
+            .unicode => re.program.flags.unicode,
+            .unicode_sets => re.program.flags.unicode_sets,
+            .sticky => re.program.flags.sticky,
+        });
+    }
+    if (o == (try realm(rt)).regexp_prototype) return .undefined;
+    return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype flag getter called on incompatible receiver" }});
+}
+
+fn regexpHasIndicesGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return regexpFlagGetter(rt, this, .has_indices);
+}
+
+fn regexpGlobalGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return regexpFlagGetter(rt, this, .global);
+}
+
+fn regexpIgnoreCaseGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return regexpFlagGetter(rt, this, .ignore_case);
+}
+
+fn regexpMultilineGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return regexpFlagGetter(rt, this, .multiline);
+}
+
+fn regexpDotAllGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return regexpFlagGetter(rt, this, .dot_all);
+}
+
+fn regexpUnicodeGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return regexpFlagGetter(rt, this, .unicode);
+}
+
+fn regexpUnicodeSetsGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return regexpFlagGetter(rt, this, .unicode_sets);
+}
+
+fn regexpStickyGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return regexpFlagGetter(rt, this, .sticky);
+}
+
 fn regexpToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
-    const rx_obj = try thisRegExp(rt, this, "toString");
-    const re = rx_obj.kind.regexp;
+    if (!this.isObject() and !this.isClosure() and !this.isNative()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype.toString requires that 'this' be an Object" }});
+    }
+    var root_buf = [_]Value{ this, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const pattern = try toStringObj(rt, try object.get(rt, this, try object.named(rt, "source")));
+    root_buf[1] = Value.fromString(pattern);
+    const flags = try toStringObj(rt, try object.get(rt, this, try object.named(rt, "flags")));
+    root_buf[2] = Value.fromString(flags);
     return Value.fromString(try rt.heap.newString(&.{
         .{ .ascii = "/" },
-        .{ .utf16 = re.source.units },
+        .{ .utf16 = pattern.units },
         .{ .ascii = "/" },
-        .{ .utf16 = re.flags.units },
+        .{ .utf16 = flags.units },
     }));
 }
 
@@ -7853,8 +8158,8 @@ fn coerceToRegExp(rt: *Runtime, v: Value) Error!*Object {
 }
 
 fn stringMatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "match");
-    var root_buf = [_]Value{ this, arg(args, 0), .undefined, .undefined, .undefined };
+    const s = try requireStringCoercible(rt, this);
+    var root_buf = [_]Value{ Value.fromString(s), arg(args, 0), .undefined, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -7927,8 +8232,8 @@ fn stringMatchAll(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn stringSearch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try thisString(rt, this, "search");
-    var root_buf = [_]Value{ this, arg(args, 0), .undefined };
+    const s = try requireStringCoercible(rt, this);
+    var root_buf = [_]Value{ Value.fromString(s), arg(args, 0), .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -8356,6 +8661,7 @@ fn initArrayBufferAndViews(rt: *Runtime, r: *const Realm, v: *ViewsRealm) Error!
         .configurable = false,
     });
     try method(rt, v.array_buffer_namespace, "isView", &ab_is_view);
+    try object.defineAccessor(rt, Value.fromObject(v.array_buffer_namespace), .{ .symbol = r.sym_species }, Value.fromNative(&species_getter), false, false);
     try constant(rt, v.array_buffer_prototype, "constructor", Value.fromNative(&array_buffer_global));
     try object.defineAccessor(rt, Value.fromObject(v.array_buffer_prototype), try object.named(rt, "byteLength"), Value.fromNative(&ab_byte_length_getter), false, false);
     try method(rt, v.array_buffer_prototype, "slice", &ab_slice);
@@ -8403,6 +8709,7 @@ fn initArrayBufferAndViews(rt: *Runtime, r: *const Realm, v: *ViewsRealm) Error!
     });
     try method(rt, v.typed_array_namespace, "from", &ta_from);
     try method(rt, v.typed_array_namespace, "of", &ta_of);
+    try object.defineAccessor(rt, Value.fromObject(v.typed_array_namespace), .{ .symbol = r.sym_species }, Value.fromNative(&species_getter), false, false);
     try constant(rt, v.typed_array_prototype, "constructor", Value.fromNative(&typed_array_global));
     try object.defineAccessor(rt, Value.fromObject(v.typed_array_prototype), try object.named(rt, "buffer"), Value.fromNative(&ta_buffer_getter), false, false);
     try object.defineAccessor(rt, Value.fromObject(v.typed_array_prototype), try object.named(rt, "byteLength"), Value.fromNative(&ta_byte_length_getter), false, false);
@@ -8433,6 +8740,7 @@ fn initArrayBufferAndViews(rt: *Runtime, r: *const Realm, v: *ViewsRealm) Error!
     try method(rt, v.typed_array_prototype, "at", &ta_at);
     try method(rt, v.typed_array_prototype, "join", &ta_join);
     try method(rt, v.typed_array_prototype, "toString", &array_to_string);
+    try method(rt, v.typed_array_prototype, "toLocaleString", &ta_to_locale_string);
     try method(rt, v.typed_array_prototype, "keys", &ta_keys);
     try method(rt, v.typed_array_prototype, "values", &ta_values);
     try method(rt, v.typed_array_prototype, "entries", &ta_entries);
@@ -9149,6 +9457,7 @@ const ta_reduce: Native = .{ .name = "reduce", .length = 1, .call = taReduce };
 const ta_reduce_right: Native = .{ .name = "reduceRight", .length = 1, .call = taReduceRight };
 const ta_at: Native = .{ .name = "at", .length = 1, .call = taAt };
 const ta_join: Native = .{ .name = "join", .length = 1, .call = taJoin };
+const ta_to_locale_string: Native = .{ .name = "toLocaleString", .length = 0, .call = taToLocaleString };
 const ta_keys: Native = .{ .name = "keys", .length = 0, .call = taKeys };
 const ta_values: Native = .{ .name = "values", .length = 0, .call = taValues };
 const ta_entries: Native = .{ .name = "entries", .length = 0, .call = taEntries };
@@ -9595,6 +9904,39 @@ fn taJoin(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         switch (try ops.toPiece(rt, elem, &buf)) {
             .ascii => |s| for (s) |c| try out.append(rt.gpa, c),
             .utf16 => |u| try out.appendSlice(rt.gpa, u),
+        }
+        if (out.items.len > rt.heap.max_string_length) return rt.limit(.string_length);
+    }
+    return Value.fromString(try rt.heap.newString(&.{.{ .utf16 = out.items }}));
+}
+
+fn taToLocaleString(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const ta = o.kind.typed_array;
+    var root_buf = [_]Value{ this, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(rt.gpa);
+    for (0..ta.length) |i| {
+        if (i > 0) try out.append(rt.gpa, ',');
+        const elem = try object.readTypedArrayElement(rt, ta, i);
+        if (elem.isUndefined() or elem.isNull()) continue;
+        root_buf[1] = elem;
+        const m = try object.get(rt, elem, try object.named(rt, "toLocaleString"));
+        if (m.isNative() or m.isClosure()) {
+            const res = try rt.callCallable(m, elem, args);
+            const str = try toStringObj(rt, res);
+            root_buf[2] = Value.fromString(str);
+            try appendUnits(rt, &out, str.units);
+        } else {
+            var buf: ops.NumberBuf = undefined;
+            switch (try ops.toPiece(rt, elem, &buf)) {
+                .ascii => |s| for (s) |c| try out.append(rt.gpa, c),
+                .utf16 => |u| try appendUnits(rt, &out, u),
+            }
         }
         if (out.items.len > rt.heap.max_string_length) return rt.limit(.string_length);
     }

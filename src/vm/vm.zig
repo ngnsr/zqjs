@@ -211,7 +211,7 @@ pub const Vm = struct {
             .tree, .promise_cap, .native_closure, .bound => return rt.bug("a non-VM closure in a nested call"),
         };
         const callee: *const Proto = @ptrCast(@alignCast(v.proto));
-        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else this;
+        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else if (is_construct) this else try builtins.coerceThis(rt, this, callee.is_strict);
         const argc: u32 = @intCast(args.len);
         if (@as(u64, argc) + callee.slot_count + callee.max_stack > rt.limits.max_stack_slots) return rt.limit(.stack_slots);
         var vm: Vm = .{ .rt = rt, .nested = true };
@@ -880,6 +880,10 @@ pub const Vm = struct {
                 try cache.ensurePush(vm);
                 try cache.push(vm, try builtins.tryGlobal(rt, try vm.name(cache.operand(0))));
             },
+            .set_global => {
+                cache.syncSp(vm);
+                try builtins.setGlobal(rt, try vm.name(cache.operand(0)), try cache.peek(vm, 0), p.is_strict);
+            },
 
             .new_cell => {
                 (try cache.slot(vm, cache.operand(0))).* = Slot.fromCell(try rt.heap.newCell(null));
@@ -1520,19 +1524,17 @@ pub const Vm = struct {
                             cache.sp = base + 1;
                         },
                         .vm => |v_impl| {
-                            // Sloppy JS would box a primitive receiver; ZQJS leaves `this` unset.
-                            const this: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
                             cache.syncSp(vm);
                             const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
                             if (callee_proto.is_async) {
                                 @branchHint(.unlikely);
-                                vm.stack[base] = try vm.startAsyncFromVm(c, this, vm.stack[args..cache.sp]);
+                                vm.stack[base] = try vm.startAsyncFromVm(c, receiver, vm.stack[args..cache.sp]);
                                 cache.sp = base + 1;
                             } else if (callee_proto.is_class_constructor) {
                                 @branchHint(.unlikely);
                                 return rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
                             } else {
-                                try vm.enterCall(c, callee_proto, base, args, argc, next, this);
+                                try vm.enterCall(c, callee_proto, base, args, argc, next, receiver);
                                 cache.* = FrameCache.fromVm(vm, 0);
                                 return .running; // pc is the callee's 0
                             }
@@ -1730,24 +1732,29 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
             },
             .get_private => {
-                const brand_val = vm.frame().closure.?.meta.?.brand orelse return vm.bug("get_private without brand");
+                const brand = try vm.currentBrand();
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                const r = try object.getPrivate(rt, try cache.peek(vm, 0), brand_val.asClosure(), name_str);
+                const r = try object.getPrivate(rt, try cache.peek(vm, 0), brand, name_str);
                 (try cache.top(vm)).* = r;
             },
             .set_private => {
                 const v = try cache.peek(vm, 0);
-                const brand_val = vm.frame().closure.?.meta.?.brand orelse return vm.bug("set_private without brand");
+                const brand = try vm.currentBrand();
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                try object.setPrivate(rt, try cache.peek(vm, 1), brand_val.asClosure(), name_str, v);
+                try object.setPrivate(rt, try cache.peek(vm, 1), brand, name_str, v);
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = v;
             },
             .in_private => {
-                const brand_val = vm.frame().closure.?.meta.?.brand orelse return vm.bug("in_private without brand");
-                const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                const b = try object.hasPrivate(rt, try cache.peek(vm, 0), brand_val.asClosure(), name_str);
-                (try cache.top(vm)).* = Value.fromBool(b);
+                const rhs = try cache.peek(vm, 0);
+                if (vm.currentBrandOrNull()) |brand| {
+                    const name_str = (try vm.nameKey(cache.operand(0))).atom;
+                    const b = try object.hasPrivate(rt, rhs, brand, name_str);
+                    (try cache.top(vm)).* = Value.fromBool(b);
+                } else {
+                    if (!rhs.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot use 'in' operator to search for private field in non-object" }});
+                    (try cache.top(vm)).* = Value.fromBool(false);
+                }
             },
             .store_field_key => {
                 const key_val = try cache.peek(vm, 0);
@@ -2001,13 +2008,12 @@ pub const Vm = struct {
                             cache.sp = base + 1;
                         },
                         .vm => |v_impl| {
-                            const this: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
                             const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
                             if (callee_proto.is_async) {
-                                vm.stack[base] = try vm.startAsyncFromVm(c, this, args_slice);
+                                vm.stack[base] = try vm.startAsyncFromVm(c, receiver, args_slice);
                                 cache.sp = base + 1;
                             } else {
-                                try vm.enterSlice(c, base, args_slice, next, this, false, false, null);
+                                try vm.enterSlice(c, base, args_slice, next, receiver, false, false, null);
                                 return true;
                             }
                         },
@@ -2148,13 +2154,12 @@ pub const Vm = struct {
                     return false;
                 },
                 .vm => |v_impl| {
-                    const this: ?Value = if (b.bound_this.isObjectLike()) b.bound_this else null;
                     const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
                     if (callee_proto.is_async) {
-                        vm.stack[base] = try vm.startAsyncFromVm(tc, this, combined);
+                        vm.stack[base] = try vm.startAsyncFromVm(tc, b.bound_this, combined);
                         return false;
                     }
-                    try vm.enterSlice(tc, base, combined, next, this, false, false, null);
+                    try vm.enterSlice(tc, base, combined, next, b.bound_this, false, false, null);
                     return true;
                 },
                 .tree, .bound => return vm.bug("invalid bound target in the VM"),
@@ -2215,13 +2220,26 @@ pub const Vm = struct {
         return true;
     }
 
+    fn currentBrandOrNull(vm: *Vm) ?*const heap.Closure {
+        if (vm.frame().closure) |c| {
+            if (c.meta) |m| {
+                if (m.brand) |b| return b.asClosure();
+            }
+        }
+        return null;
+    }
+
+    fn currentBrand(vm: *Vm) Error!*const heap.Closure {
+        return vm.currentBrandOrNull() orelse vm.rt.throw(.TypeError, &.{.{ .ascii = "Cannot access private member outside its class" }});
+    }
+
     fn requireThis(vm: *Vm) Error!Value {
         const f = vm.frame();
         if (f.this) |t| return t;
         if (f.proto.has_super_ctor) {
             return vm.rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
         }
-        return vm.rt.fail(.sloppy_this);
+        return if (f.proto.is_module) .undefined else Value.fromObject((try builtins.realm(vm.rt)).global_object);
     }
 
     noinline fn callSuper(vm: *Vm, base: u32, args_slice: []const Value, is_spread: bool, next: u32) Error!bool {
@@ -2321,7 +2339,7 @@ pub const Vm = struct {
     /// Out-of-line with <= 8 register args (no FrameCache pointer) so `runLoop` keeps `cache` in registers.
     noinline fn enterCall(vm: *Vm, c: *const Closure, callee: *const Proto, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value) Error!void {
         c.obj.checkLive();
-        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else this;
+        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else try builtins.coerceThis(vm.rt, this, callee.is_strict);
         const limits = vm.rt.limits;
         if (vm.chain) |cx| {
             if (cx.call_depth >= limits.max_call_depth) return vm.rt.limit(.call_depth);
@@ -2370,7 +2388,7 @@ pub const Vm = struct {
         if (!is_construct and callee.is_class_constructor) {
             return vm.rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
         }
-        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else this;
+        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else if (is_construct) this else try builtins.coerceThis(vm.rt, this, callee.is_strict);
         const limits = vm.rt.limits;
         // 1. limits — a chained VM checks the chain's shared depth (D51 #2: every VM's
         // frames plus every native record, one `max_call_depth` across the chain); a
@@ -2423,7 +2441,7 @@ pub const Vm = struct {
         if (!is_construct and callee.is_class_constructor) {
             return vm.rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
         }
-        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else this;
+        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else if (is_construct) this else try builtins.coerceThis(vm.rt, this, callee.is_strict);
         const limits = vm.rt.limits;
         if (vm.chain) |cx| {
             if (cx.call_depth >= limits.max_call_depth) return vm.rt.limit(.call_depth);

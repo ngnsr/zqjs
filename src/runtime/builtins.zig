@@ -1090,6 +1090,16 @@ fn resolveGlobalTarget(rt: *Runtime, target: GlobalTarget) Error!Value {
 }
 
 fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
+    if (rt.realm) |r| {
+        const k = try object.named(rt, name);
+        if (r.global_object.props.get(try object.propKey(rt, k))) |p| {
+            if (p.is_accessor) {
+                if (p.value.isUndefined()) return .undefined;
+                return try rt.callCallable(p.value, Value.fromObject(r.global_object), &.{});
+            }
+            return p.value;
+        }
+    }
     if (builtin_globals.get(name)) |target| {
         return try resolveGlobalTarget(rt, target);
     }
@@ -1099,6 +1109,37 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
         return rt.fail(.builtin);
     }
     return null;
+}
+
+pub fn setGlobal(rt: *Runtime, name: []const u8, val: Value, strict: bool) Error!void {
+    const r = try realm(rt);
+    var root_buf = [_]Value{val};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const k = try object.named(rt, name);
+    var exists = r.global_object.props.get(try object.propKey(rt, k)) != null or builtin_globals.get(name) != null;
+    if (!exists) {
+        for (rt.host_globals.items) |n| {
+            if (std.mem.eql(u8, n.name, name)) {
+                exists = true;
+                break;
+            }
+        }
+    }
+    if (!exists and strict) {
+        return rt.throw(.ReferenceError, &.{ .{ .ascii = name }, .{ .ascii = " is not defined" } });
+    }
+    _ = try object.setWithReceiver(rt, Value.fromObject(r.global_object), k, val, Value.fromObject(r.global_object), strict);
+}
+
+pub fn coerceThis(rt: *Runtime, raw: ?Value, is_strict: bool) Error!?Value {
+    const v: Value = raw orelse .undefined;
+    if (is_strict) return v;
+    if (v.isUndefined() or v.isNull()) return null; // requireThis lazily resolves to globalThis
+    if (v.isObjectLike()) return v;
+    return try toObjectReceiver(rt, v);
 }
 
 pub fn globalOwnProp(rt: *Runtime, atom: *const heap_mod.String) Error!?heap_mod.Property {

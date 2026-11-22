@@ -305,12 +305,21 @@ fn expectUnsupported(source: []const u8, output: []const u8, diagnostic: []const
     }
 }
 
-test "this: decided by the call; an unbound call or a primitive receiver is Unsupported" {
+test "this: decided by the call; sloppy unbound calls bind globalThis, primitive writes remain Unsupported" {
     const obj = "const obj = { value: 42, getValue() { return this.value; } }; ";
-    try expectUnsupported(obj ++ "print(obj.getValue()); const fn = obj.getValue; fn();", "42\n", "Unsupported(sloppy_this)");
-    try expectUnsupported("function outer() { function inner() { return this; } return inner(); } print(1); outer();", "1\n", "Unsupported(sloppy_this)");
-    // Not lexical: a nested function called plainly gets no receiver, even inside a method.
-    try expectUnsupported("const o = { m() { const f = function () { return this; }; return f(); } }; o.m();", "", "Unsupported(sloppy_this)");
+    for (support.engines) |engine| {
+        var r1 = try support.run(testing.allocator, obj ++ "print(obj.getValue()); const fn = obj.getValue; print(fn());", .{}, engine, .normal);
+        defer r1.deinit(testing.allocator);
+        try testing.expectEqualStrings("42\nundefined\n", r1.out);
+
+        var r2 = try support.run(testing.allocator, "function outer() { function inner() { return this === globalThis; } return inner(); } print(outer());", .{}, engine, .normal);
+        defer r2.deinit(testing.allocator);
+        try testing.expectEqualStrings("true\n", r2.out);
+
+        var r3 = try support.run(testing.allocator, "const o = { m() { const f = function () { return this === globalThis; }; return f(); } }; print(o.m());", .{}, engine, .normal);
+        defer r3.deinit(testing.allocator);
+        try testing.expectEqualStrings("true\n", r3.out);
+    }
     try expectUnsupported("let o = { f() { return this; } }; let p = 'str'; p.f = o.f;", "", "Unsupported(primitive_write)");
 }
 
@@ -598,15 +607,22 @@ test "M16.2: Array/Map/Set callback receivers, map shrink deviation, limits, and
     try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
 }
 
-test "M17.1: documented ZQJS deviations on callback thisArg and detached receivers" {
-    // Ordinary non-strict callbacks: null, undefined, and primitive thisArg trigger Unsupported(sloppy_this) when `this` is read (D41).
-    try expectUnsupported("[1].forEach(function () { return this; }, null);", "", "Unsupported(sloppy_this)");
-    try expectUnsupported("[1].forEach(function () { return this; }, undefined);", "", "Unsupported(sloppy_this)");
-    try expectUnsupported("[1].forEach(function () { return this; }, 42);", "", "Unsupported(sloppy_this)");
-    try expectUnsupported("[1].map(function () { return this; }, 'x');", "", "Unsupported(sloppy_this)");
-    try expectUnsupported("[1].filter(function () { return this; }, true);", "", "Unsupported(sloppy_this)");
-    try expectUnsupported("new Map([['a', 1]]).forEach(function () { return this; }, 42);", "", "Unsupported(sloppy_this)");
-    try expectUnsupported("new Set([1]).forEach(function () { return this; }, 42);", "", "Unsupported(sloppy_this)");
+test "M17.1: callback thisArg boxing in sloppy mode and detached receivers" {
+    for (support.engines) |engine| {
+        var r = try support.run(
+            testing.allocator,
+            "[1].forEach(function () { print(this === globalThis); }, null);" ++
+                "[1].forEach(function () { print(this === globalThis); }, undefined);" ++
+                "[1].forEach(function () { print(typeof this, this.valueOf()); }, 42);" ++
+                "[1].map(function () { print(typeof this, this.valueOf()); }, 'x');" ++
+                "[1].filter(function () { print(typeof this, this.valueOf()); }, true);",
+            .{},
+            engine,
+            .normal,
+        );
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("true\ntrue\nobject 42\nobject x\nobject true\n", r.out);
+    }
 
     // Detached/missing receiver on prototype methods reports Unsupported(builtin).
     try expectUnsupported("const f = new Map().forEach; f(function () {});", "", "Unsupported(builtin)");
@@ -816,8 +832,12 @@ test "M25: Error construction, AggregateError, and instanceof OOM safety" {
     try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{OomCtx{ .script = script, .res = res }});
 }
 
-test "M31: arrow lexical this when enclosing function has no receiver reports sloppy_this" {
-    try expectUnsupported("function f() { return () => this; } f()();", "", "Unsupported(sloppy_this)");
+test "M31: arrow lexical this inherits sloppy globalThis from unbound enclosing function" {
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, "function f() { return () => this === globalThis; } print(f()());", .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("true\n", r.out);
+    }
 }
 
 test "M27: LimitExceeded(steps) skips finally on both engines" {

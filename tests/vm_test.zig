@@ -471,11 +471,12 @@ test "nested call: arity variants bind like a call does (D41)" {
     try testing.expectEqual(@as(f64, 7), extra.asNumber());
 }
 
-test "nested call: `this` binds by the VM's sloppy rule (D41)" {
-    // No receiver: `this` is unset (Unsupported.sloppy_this).
-    try testing.expectError(error.Unsupported, runCall("function f() { return this; } 0;", null, &.{}));
-    // An explicit value passed to initCall is bound as `this`.
-    const prim = try runCall("function f() { return this; } 0;", zqjs.Value.fromNumber(42), &.{});
+test "nested call: `this` binds by ES sloppy/strict rules" {
+    // Sloppy mode with no receiver binds `this` to globalThis.
+    const glob = try runCall("function f() { return this === globalThis; } 0;", null, &.{});
+    try testing.expect(glob.asBool());
+    // Strict mode preserves primitive `this` unboxed.
+    const prim = try runCall("function f() { 'use strict'; return this; } 0;", zqjs.Value.fromNumber(42), &.{});
     try testing.expectEqual(@as(f64, 42), prim.asNumber());
     // An object receiver binds `this` to that object.
     const script = try Setup.create("let o = { a: 7 }; function f() { return this.a; } 0;", .{});
@@ -855,7 +856,7 @@ test "public Runtime.call: poisoned runtime returns Internal, closure round-trip
         const src =
             \\function sum(n) { if (n <= 0) return 0; return n + sum(n - 1); }
             \\function failThrow() { let a = null; return a(); }
-            \\function failUnsupported() { return this; }
+            \\function failUnsupported() { return [1].toLocaleString; }
             \\let res = sum(4);
             \\print(res);
         ;

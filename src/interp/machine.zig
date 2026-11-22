@@ -715,7 +715,10 @@ const Machine = struct {
             m.rt.heap.storeCell(m.repl_cells[ri], v);
             return;
         }
-        const b = m.bindingOf(ref).?;
+        const b = m.bindingOf(ref) orelse {
+            try builtins.setGlobal(m.rt, ref.name, v, m.isStrict());
+            return;
+        };
         if (m.load(b) == null) return m.tdz(ref);
         if (m.res.bindings[b].kind == .@"const")
             return m.rt.throw(.TypeError, &.{.{ .ascii = "Assignment to constant variable." }});
@@ -1704,7 +1707,7 @@ const Machine = struct {
                     },
                     .compound => |op| {
                         if (am.is_private) {
-                            const brand = m.current_closure.?.meta.?.brand.?.asClosure();
+                            const brand = try m.currentBrand();
                             const old = try object.getPrivate(rt, base, brand, try rt.heap.internUtf8(am.named.?));
                             try m.pushVal(old);
                             try m.pushTask(.{ .assign_member_compound_finish = .{ .op = op, .key = .{ .index = 0 }, .priv_name = am.named.? } });
@@ -1719,7 +1722,7 @@ const Machine = struct {
                     },
                     .logical_and, .logical_or, .nullish => {
                         if (am.is_private) {
-                            const brand = m.current_closure.?.meta.?.brand.?.asClosure();
+                            const brand = try m.currentBrand();
                             const old = try object.getPrivate(rt, base, brand, try rt.heap.internUtf8(am.named.?));
                             if (!logicalAssignShouldWrite(am.op, old)) {
                                 _ = m.popVal();
@@ -1748,7 +1751,7 @@ const Machine = struct {
                 const v = m.popVal();
                 if (am.is_private) {
                     const base = m.popVal();
-                    const brand = m.current_closure.?.meta.?.brand.?.asClosure();
+                    const brand = try m.currentBrand();
                     try object.setPrivate(rt, base, brand, try rt.heap.internUtf8(am.named.?), v);
                 } else {
                     const kv: KeyValue = if (am.named) |n| .{ .named = n } else .{ .value = m.popVal() };
@@ -1771,7 +1774,7 @@ const Machine = struct {
                 const base = m.popVal();
                 const v = try ops.binary(rt, ac.op, old, rhs);
                 if (ac.priv_name) |pn| {
-                    const brand = m.current_closure.?.meta.?.brand.?.asClosure();
+                    const brand = try m.currentBrand();
                     try object.setPrivate(rt, base, brand, try rt.heap.internUtf8(pn), v);
                 } else {
                     try m.setProp(base, ac.key, v);
@@ -1793,7 +1796,7 @@ const Machine = struct {
                 const kv: KeyValue = if (um.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.popVal();
                 if (um.is_private) {
-                    const brand = m.current_closure.?.meta.?.brand.?.asClosure();
+                    const brand = try m.currentBrand();
                     const name_str = try rt.heap.internUtf8(um.named.?);
                     const s = try stepNumeric(rt, try object.getPrivate(rt, base, brand, name_str), um.op == .inc);
                     try object.setPrivate(rt, base, brand, name_str, s.new);
@@ -1810,7 +1813,7 @@ const Machine = struct {
                     .name => |n| {
                         const base = m.popVal();
                         const res_v: Value = if (mb.is_private) blk: {
-                            const brand = m.current_closure.?.meta.?.brand.?.asClosure();
+                            const brand = try m.currentBrand();
                             break :blk try object.getPrivate(rt, base, brand, try rt.heap.internUtf8(n));
                         } else blk: {
                             const k = try object.named(rt, n);
@@ -1836,7 +1839,7 @@ const Machine = struct {
             },
             .private_in_finish => |name| {
                 const rhs = m.popVal();
-                const brand = m.current_closure.?.meta.?.brand.?.asClosure();
+                const brand = try m.currentBrand();
                 const b = try object.hasPrivate(rt, rhs, brand, try rt.heap.internUtf8(name));
                 m.depth -= 1;
                 try m.pushVal(Value.fromBool(b));
@@ -1891,7 +1894,7 @@ const Machine = struct {
                         try m.pushTask(.{ .opt_step = .{ .oc = os.oc, .idx = os.idx + 1, .is_delete = os.is_delete } });
                     },
                     .private_prop => |n| {
-                        const brand = m.current_closure.?.meta.?.brand.?.asClosure();
+                        const brand = try m.currentBrand();
                         const next_val = try object.getPrivate(rt, val, brand, try rt.heap.internUtf8(n));
                         const vals = m.values.items;
                         vals[vals.len - 2] = val; // receiver = val
@@ -2137,7 +2140,7 @@ const Machine = struct {
                 const kv: KeyValue = if (cm.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.values.items[m.values.items.len - 1];
                 const callee = if (cm.is_private) blk: {
-                    const brand = m.current_closure.?.meta.?.brand.?.asClosure();
+                    const brand = try m.currentBrand();
                     break :blk try object.getPrivate(rt, base, brand, try rt.heap.internUtf8(cm.named.?));
                 } else try object.get(rt, base, try m.toKey(kv));
                 try m.pushVal(callee);
@@ -2614,7 +2617,7 @@ const Machine = struct {
                 const base = m.popVal();
                 const val = m.popVal();
                 if (bf.is_private) {
-                    const brand = m.current_closure.?.meta.?.brand.?.asClosure();
+                    const brand = try m.currentBrand();
                     try object.setPrivate(rt, base, brand, try rt.heap.internUtf8(bf.named.?), val);
                 } else {
                     const k = try m.toKey(kv);
@@ -2710,7 +2713,7 @@ const Machine = struct {
                 const kv: KeyValue = if (ba.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.popVal();
                 if (el.pattern.data.target.member.is_private) {
-                    const brand = m.current_closure.?.meta.?.brand.?.asClosure();
+                    const brand = try m.currentBrand();
                     try object.setPrivate(rt, base, brand, try rt.heap.internUtf8(ba.named.?), v);
                 } else {
                     try m.setProp(base, try m.toKey(kv), v);
@@ -2729,7 +2732,7 @@ const Machine = struct {
                     };
                     const base = m.popVal();
                     if (mem.is_private) {
-                        const brand = m.current_closure.?.meta.?.brand.?.asClosure();
+                        const brand = try m.currentBrand();
                         try object.setPrivate(rt, base, brand, try rt.heap.internUtf8(mem.key.name), v);
                     } else {
                         try m.setProp(base, try m.toKey(kv), v);
@@ -3487,12 +3490,25 @@ const Machine = struct {
         return Value.fromClosure(c);
     }
 
+    fn currentBrandOrNull(m: *Machine) ?*const heap.Closure {
+        if (m.current_closure) |c| {
+            if (c.meta) |meta| {
+                if (meta.brand) |b| return b.asClosure();
+            }
+        }
+        return null;
+    }
+
+    fn currentBrand(m: *Machine) Error!*const heap.Closure {
+        return m.currentBrandOrNull() orelse m.rt.throw(.TypeError, &.{.{ .ascii = "Cannot access private member outside its class" }});
+    }
+
     fn requireThis(m: *Machine) Error!Value {
         if (m.this) |t| return t;
         if (m.current_func) |cf| if (cf.has_super_ctor) {
             return m.rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
         };
-        return m.rt.fail(.sloppy_this);
+        return if (m.is_module) .undefined else Value.fromObject((try builtins.realm(m.rt)).global_object);
     }
 
     fn invokeCallable(m: *Machine, callee: Value, receiver: ?Value, args_base: usize, result_base: usize) Error!void {
@@ -3512,8 +3528,7 @@ const Machine = struct {
                 try m.pushVal(res_v);
             },
             .closure => |cl| {
-                const this_val: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
-                try m.pushClosureCall(cl, this_val, args_base, result_base);
+                try m.pushClosureCall(cl, receiver, args_base, result_base);
             },
             .object => |o| {
                 if (o.kind != .proxy or !o.kind.proxy.is_callable) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
@@ -3589,7 +3604,7 @@ const Machine = struct {
         }
         m.module_record = closure.impl.tree.module_record;
         m.env = env;
-        m.this = if (f.has_super_ctor) null else if (f.is_arrow) (if (closure.meta) |meta| meta.lexical_this else null) else this;
+        m.this = if (f.has_super_ctor) null else if (f.is_arrow) (if (closure.meta) |meta| meta.lexical_this else null) else if (construct_instance != null) this else try builtins.coerceThis(m.rt, this, f.is_strict);
         m.current_closure = closure;
         m.current_func = f;
         m.construct_instance = construct_instance;

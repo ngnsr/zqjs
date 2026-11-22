@@ -72,6 +72,8 @@ pub const Op = enum(u8) {
     get_global,
     /// Push the global `name`, or `undefined` if there is none (for `typeof undeclared`).
     get_global_or_undefined,
+    /// Write top-of-stack to global `name` (strict ReferenceError or sloppy globalThis write), keeping value.
+    set_global,
 
     // ---- cells: slots holding captured bindings (same checks as the *_local forms)
     /// Put a fresh cell (in the TDZ) into slot s: emitted on scope entry, so every
@@ -390,6 +392,7 @@ pub const Op = enum(u8) {
             .init_local => .{ .operands = &.{.slot}, .pops = 1, .pushes = 0 },
             .clear_local => .{ .operands = &.{.slot}, .pops = 0, .pushes = 0 },
             .get_global, .get_global_or_undefined => .{ .operands = &.{.name}, .pops = 0, .pushes = 1 },
+            .set_global => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
             .new_cell, .box_local, .fresh_cell => .{ .operands = &.{.slot}, .pops = 0, .pushes = 0 },
             .get_cell => .{ .operands = &.{ .slot, .name }, .pops = 0, .pushes = 1 },
             .set_cell, .assign_const_cell => .{ .operands = &.{ .slot, .name }, .pops = 1, .pushes = 1 },

@@ -861,11 +861,7 @@ const Resolver = struct {
                 .cover_init => unreachable,
             },
             .array => |items| for (items) |item| try r.expr(item),
-            .this => if (!r.module_mode) {
-                for (r.fns.items[1..]) |fn_state| {
-                    if (!fn_state.is_arrow) break;
-                } else return r.fail(.{ .unsupported = .sloppy_this }, e.span);
-            },
+            .this => {},
             .await => |inner| try r.expr(inner),
             .yield => |y| if (y.value) |v| try r.expr(v),
             .call, .new_call => |c| {
@@ -1001,7 +997,10 @@ const Resolver = struct {
     fn target(r: *Resolver, ref: ast.Ref) Error!void {
         const res = try r.lookup(ref.name);
         const b = switch (res) {
-            .global => return r.fail(.{ .unsupported = .global_assignment }, ref.span),
+            .global => {
+                r.refs[ref.id] = res;
+                return;
+            },
             .local => |b| b,
             .capture => |c| c.binding,
             .repl => {
@@ -1276,18 +1275,14 @@ test "undefined, NaN and Infinity: SyntaxError only at script level" {
     _ = try resolveSource(arena.allocator(), "{ let undefined = 1; } for (let NaN = 0;;) {} let globalThis;", &d);
 }
 
-test "globals: reading is fine, writing is Unsupported" {
+test "globals: reading and writing both resolve to .global" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var d: Diagnostic = .{};
-    const r = try resolveSource(arena.allocator(), "undefined; y;", &d);
+    const r = try resolveSource(arena.allocator(), "undefined; y; y = 1; y += 1; y++; { let y; } y = 2;", &d);
     try testing.expectEqual(@as(?u32, null), refBinding(r, 0));
     try testing.expectEqual(@as(?u32, null), refBinding(r, 1));
-    const unsupported: Diagnostic.Detail = .{ .unsupported = .global_assignment };
-    try expectFailure("y = 1;", error.Unsupported, unsupported);
-    try expectFailure("y += 1;", error.Unsupported, unsupported);
-    try expectFailure("y++;", error.Unsupported, unsupported);
-    try expectFailure("{ let y; } y = 1;", error.Unsupported, unsupported); // out of scope
+    try testing.expectEqual(@as(?u32, null), refBinding(r, 2));
 }
 
 test "assigning to a const resolves normally (the error is a runtime TypeError)" {

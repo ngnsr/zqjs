@@ -551,7 +551,7 @@ pub const Runtime = struct {
                     .vm, .tree => {
                         try rt.checkNativeStack();
                         const cc = rt.closure_caller orelse return rt.bug("closure called without an active engine");
-                        return cc.call(cc.ctx, c, if (this_val.isObjectLike()) this_val else null, args);
+                        return cc.call(cc.ctx, c, this_val, args);
                     },
                 }
             },

@@ -43,18 +43,18 @@ ZQJS includes a parallel [tc39/test262](https://github.com/tc39/test262) conform
 
 ---
 
-## Results (M62 — Strict Mode, ES2025 Iterator Helpers, Thenables, `Array.fromAsync`, `Number` Formatting, `Symbol.*`, `RegExp` Getters)
+## Results (M63 — Sloppy `this` & Global Writes, Strict Mode, ES2025 Iterator Helpers, Thenables, `Array.fromAsync`, `Number` Formatting, `Symbol.*`, `RegExp` Getters)
 
 Measured with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
 
 | Suite | Collected | Skipped (meta) | Executed | Unsupported | Limit | Applicable | Pass | Fail | Pass / Executed | Pass / Applicable |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `built-ins` | 23,885 | 7,188 | 16,697 | 2,218 | 469 | 14,010 | **13,042** | 968 | **78.11%** | **93.09%** |
-| `language` | 23,832 | 971 | 22,861 | 3,363 | 0 | 19,498 | **18,364** | 1,134 | **80.33%** | **94.18%** |
-| **Combined** | **47,717** | **8,159** | **39,558** | **5,581** | **469** | **33,508** | **31,406** | **2,102** | **79.39%** | **93.73%** |
+| `built-ins` | 23,885 | 7,188 | 16,697 | 1,925 | 469 | 14,303 | **13,283** | 1,020 | **79.55%** | **92.87%** |
+| `language` | 23,832 | 971 | 22,861 | 2,896 | 0 | 19,965 | **18,826** | 1,139 | **82.35%** | **94.30%** |
+| **Combined** | **47,717** | **8,159** | **39,558** | **4,821** | **469** | **34,268** | **32,109** | **2,159** | **81.17%** | **93.70%** |
 
 - **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,558 executed tests.
-- Building on M60 (`29,434` PASS), adding `"use strict"` directive prologue & strict property writes, `$262.detachArrayBuffer` + detached `ArrayBuffer` guards, `Symbol.{species, match, replace, search, split, matchAll, isConcatSpreadable}`, `RegExp.prototype` accessor getters & generic `toString`/`[Symbol.match]`/`[Symbol.search]`, `String.raw` / `String.prototype.{concat, toLocaleLowerCase, toLocaleUpperCase}`, generic `String.prototype` & `Array.prototype` receivers, `TypedArray.prototype.toLocaleString`, `super` in object literal methods/accessors, `Number.prototype.{toFixed, toExponential, toPrecision}`, `Array.fromAsync`, ES2025 `Iterator` helpers, and full Promise/thenable assimilation unlocked **+1,972** more passes (`29,434 → 31,406`, **93.73%** Pass / Applicable, **80.33%** Pass / Executed on `language`).
+- Building on M60 (`29,434` PASS), adding `"use strict"` directive prologue & strict property writes, sloppy-mode `this` coercion & global writes (`globalThis`), `$262.detachArrayBuffer` + detached `ArrayBuffer` guards, `Symbol.{species, match, replace, search, split, matchAll, isConcatSpreadable}`, `RegExp.prototype` accessor getters & generic `toString`/`[Symbol.match]`/`[Symbol.search]`, `String.raw` / `String.prototype.{concat, toLocaleLowerCase, toLocaleUpperCase}`, generic `String.prototype` & `Array.prototype` receivers, `TypedArray.prototype.toLocaleString`, `super` in object literal methods/accessors, `Number.prototype.{toFixed, toExponential, toPrecision}`, `Array.fromAsync`, ES2025 `Iterator` helpers, and full Promise/thenable assimilation unlocked **+2,675** more passes (`29,434 → 32,109`, **93.70%** Pass / Applicable, **82.35%** Pass / Executed on `language`).
 
 ### Built-ins Breakdown (Applicable Tests)
 

@@ -2634,9 +2634,6 @@ const Parser = struct {
             .identifier => {
                 const name = t.text(p.source());
                 if (std.mem.eql(u8, name, "this")) {
-                    // At script level `this` is the global object, which ZQJS doesn't have.
-                    // At module top level `this` is `undefined`.
-                    if (p.function_depth == 0 and p.source_kind == .script) return p.fail(.{ .unsupported = .sloppy_this }, t);
                     try p.advance();
                     return p.node(s, .this, 0);
                 }

@@ -2462,7 +2462,7 @@ const Compiler = struct {
                 const op: Op = if (c.binding(cap.binding).kind == .@"const") .assign_const_capture else .set_capture;
                 try c.emit(op, &.{ cap.index, try c.name(ref.name) });
             },
-            .global => unreachable,
+            .global => try c.emit(.set_global, &.{try c.name(ref.name)}),
             .repl => |idx| {
                 const op: Op = if (c.s.res.repl_bindings[idx].kind == .@"const") .assign_const_repl else .set_repl;
                 try c.emit(op, &.{ idx, try c.name(ref.name) });

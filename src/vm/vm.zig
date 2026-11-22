@@ -1163,12 +1163,12 @@ pub const Vm = struct {
                     if (!fastSetProp(rt, p, pc, base, atom, v)) {
                         const old_sid: u32 = if (base.isObject()) base.asObject().props.shapeId() else heap.DICT_SHAPE_ID;
                         cache.syncSp(vm);
-                        try object.set(rt, base, object.namedAtom(atom), v);
+                        _ = try object.setWithReceiver(rt, base, object.namedAtom(atom), v, base, p.is_strict);
                         populateSetPropIc(rt, p, pc, base, atom, old_sid);
                     }
                 } else {
                     cache.syncSp(vm);
-                    try object.set(rt, base, try vm.nameKey(name_idx), v);
+                    _ = try object.setWithReceiver(rt, base, try vm.nameKey(name_idx), v, base, p.is_strict);
                 }
                 if (op == .set_prop_pop) {
                     try cache.drop(vm, 2);
@@ -1184,7 +1184,7 @@ pub const Vm = struct {
                 if (!fastArraySet(rt, base, idx, v) and !fastTypedArraySet(base, idx, v)) {
                     cache.syncSp(vm);
                     const k = try object.key(rt, idx); // after the value: JS's order for `=`
-                    try object.set(rt, base, k, v);
+                    _ = try object.setWithReceiver(rt, base, k, v, base, p.is_strict);
                 }
                 if (op == .set_elem_pop) {
                     try cache.drop(vm, 3);
@@ -1810,7 +1810,7 @@ pub const Vm = struct {
                 const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_set_prop without home_object");
                 const val = try cache.peek(vm, 0);
-                try object.setSuper(rt, home, this_val, try vm.nameKey(cache.operand(0)), val);
+                try object.setSuper(rt, home, this_val, try vm.nameKey(cache.operand(0)), val, p.is_strict);
             },
             .super_set_elem => {
                 cache.syncSp(vm);
@@ -1819,7 +1819,7 @@ pub const Vm = struct {
                 const val = try cache.peek(vm, 0);
                 const key_val = try cache.peek(vm, 1);
                 const k = try object.key(rt, key_val);
-                try object.setSuper(rt, home, this_val, k, val);
+                try object.setSuper(rt, home, this_val, k, val, p.is_strict);
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = val;
             },

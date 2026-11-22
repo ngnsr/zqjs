@@ -362,6 +362,7 @@ pub const Function = struct {
     is_arrow: bool = false,
     is_async: bool = false,
     is_generator: bool = false,
+    is_strict: bool = false,
     /// Concise object-literal method (`{ m() {} }`): not constructable and has no `.prototype` (D62).
     is_method: bool = false,
     /// Class constructor (`class C { constructor() {} }`): requires `new` (D63).
@@ -511,5 +512,6 @@ pub const Script = struct {
     function_count: u32,
     /// True when the top-level script itself uses `await` or `for await` (REPL mode).
     has_top_level_await: bool = false,
+    is_strict: bool = false,
     source_kind: SourceKind = .script,
 };

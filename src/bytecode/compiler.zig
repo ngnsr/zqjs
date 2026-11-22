@@ -54,7 +54,7 @@ pub fn compile(gpa: Allocator, heap: *Heap, script: ast.Script, res: Resolution,
 pub fn compileWithOptions(gpa: Allocator, heap: *Heap, script: ast.Script, res: Resolution, limits: Limits, options: CompileOptions, diag: *Diagnostic) Error!Proto {
     const heap_mark = heap.mark();
     errdefer heap.rollback(heap_mark);
-    var shared: Shared = .{ .gpa = gpa, .heap = heap, .res = res, .limits = limits, .options = options, .diag = diag };
+    var shared: Shared = .{ .gpa = gpa, .heap = heap, .res = res, .limits = limits, .options = options, .diag = diag, .script_strict = script.is_strict or options.is_module };
     return shared.proto(.script, null, script.statements);
 }
 
@@ -66,6 +66,7 @@ const Shared = struct {
     limits: Limits,
     options: CompileOptions = .{},
     diag: *Diagnostic,
+    script_strict: bool = false,
     /// Code bytes of all Protos so far (Limits.max_code_bytes bounds the whole script).
     code_bytes: usize = 0,
 
@@ -339,6 +340,7 @@ const Compiler = struct {
             .is_async_generator = if (f) |func| func.is_async and func.is_generator else false,
             .is_method = if (f) |func| func.is_method else false,
             .is_class_constructor = if (f) |func| func.is_class_constructor else false,
+            .is_strict = if (f) |func| func.is_strict else c.s.script_strict,
             .has_super_ctor = if (f) |func| func.has_super_ctor else false,
             .has_home_object = if (f) |func| func.has_home_object else false,
             .length = if (f) |func| func.length else 0,

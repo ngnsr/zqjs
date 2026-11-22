@@ -51,13 +51,25 @@ pub fn parseWithOptions(arena: Allocator, source: []const u8, limits: Limits, op
     p.tok = try p.lexer.next();
 
     var statements: std.ArrayList(ast.Stmt) = .empty;
-    while (p.tok.tag != .eof) try statements.append(arena, try p.statementListItem(.body));
+    var in_prologue = true;
+    while (p.tok.tag != .eof) {
+        const stmt = try p.statementListItem(.body);
+        if (in_prologue) {
+            if (p.isStringDirective(stmt)) |is_use_strict| {
+                if (is_use_strict) p.in_strict_mode = true;
+            } else {
+                in_prologue = false;
+            }
+        }
+        try statements.append(arena, stmt);
+    }
     return .{
         .statements = statements.items,
         .ref_count = p.ref_count,
         .binding_count = p.binding_count,
         .function_count = p.function_count,
         .has_top_level_await = p.has_top_level_await,
+        .is_strict = p.in_strict_mode,
         .source_kind = options.source_kind,
     };
 }
@@ -1074,10 +1086,15 @@ const Parser = struct {
             p.function_depth -= 1;
         }
         const outer_static_block = p.in_static_block;
+        const outer_strict = p.in_strict_mode;
         p.in_static_block = false;
-        defer p.in_static_block = outer_static_block;
+        defer {
+            p.in_static_block = outer_static_block;
+            p.in_strict_mode = outer_strict;
+        }
         const parsed_body = try p.parseFunctionBody();
-        try p.checkDirectivePrologue(parsed_body.body, params);
+        const is_strict = p.in_strict_mode;
+        try p.checkDirectivePrologue(parsed_body.body, params, name, is_strict);
 
         const f = try p.arena.create(ast.Function);
         f.* = .{
@@ -1086,6 +1103,7 @@ const Parser = struct {
             .kind = kind,
             .is_async = is_async,
             .is_generator = is_generator,
+            .is_strict = is_strict,
             .length = paramLength(params),
             .name = name,
             .params = params,
@@ -1124,6 +1142,14 @@ const Parser = struct {
         return params.items;
     }
 
+    fn isStringDirective(p: *const Parser, stmt: ast.Stmt) ?bool {
+        if (stmt.data != .expression) return null;
+        const expr = stmt.data.expression;
+        if (expr.data != .string) return null;
+        const raw = p.source()[expr.span.start..expr.span.end];
+        return std.mem.eql(u8, raw, "\"use strict\"") or std.mem.eql(u8, raw, "'use strict'");
+    }
+
     fn parseFunctionBody(p: *Parser) Error!struct { body: []const ast.Stmt, end: u32 } {
         const open = p.tok;
         try p.advance();
@@ -1131,9 +1157,18 @@ const Parser = struct {
         p.no_in = false;
         defer p.no_in = saved_no_in;
         var body: std.ArrayList(ast.Stmt) = .empty;
+        var in_prologue = true;
         while (p.tok.tag != .r_brace) {
             if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated function body" }, open);
-            try body.append(p.arena, try p.statementListItem(.body));
+            const stmt = try p.statementListItem(.body);
+            if (in_prologue) {
+                if (p.isStringDirective(stmt)) |is_use_strict| {
+                    if (is_use_strict) p.in_strict_mode = true;
+                } else {
+                    in_prologue = false;
+                }
+            }
+            try body.append(p.arena, stmt);
         }
         const close = p.tok;
         try p.advance();
@@ -1147,7 +1182,29 @@ const Parser = struct {
         return true;
     }
 
-    fn checkDirectivePrologue(p: *Parser, body: []const ast.Stmt, params: []const ast.Param) Error!void {
+    fn validateStrictPattern(p: *Parser, pat: *const ast.Pattern) Error!void {
+        switch (pat.data) {
+            .binding => |d| {
+                if (std.mem.eql(u8, d.name, "arguments") or std.mem.eql(u8, d.name, "eval")) {
+                    return p.failAt(.{ .syntax_error = "Unexpected eval or arguments in strict mode" }, d.span.start, d.span.end);
+                }
+                if (isStrictReservedWord(d.name)) {
+                    return p.failAt(.{ .syntax_error = "Unexpected strict mode reserved word" }, d.span.start, d.span.end);
+                }
+            },
+            .array => |arr| {
+                for (arr.elems) |maybe| if (maybe) |el| try p.validateStrictPattern(el.pattern);
+                if (arr.rest) |r| try p.validateStrictPattern(r);
+            },
+            .object => |obj| {
+                for (obj.props) |pr| try p.validateStrictPattern(pr.pattern);
+                if (obj.rest) |r| try p.validateStrictPattern(r);
+            },
+            .target => {},
+        }
+    }
+
+    fn checkDirectivePrologue(p: *Parser, body: []const ast.Stmt, params: []const ast.Param, fn_name: ?ast.Declarator, is_strict: bool) Error!void {
         const src = p.source();
         for (body) |stmt| {
             if (stmt.data != .expression) break;
@@ -1159,6 +1216,17 @@ const Parser = struct {
                     return p.failAt(.{ .syntax_error = "Illegal 'use strict' directive in function with non-simple parameter list" }, stmt.span.start, stmt.span.end);
                 }
             }
+        }
+        if (is_strict) {
+            if (fn_name) |d| {
+                if (std.mem.eql(u8, d.name, "arguments") or std.mem.eql(u8, d.name, "eval")) {
+                    return p.failAt(.{ .syntax_error = "Unexpected eval or arguments in strict mode" }, d.span.start, d.span.end);
+                }
+                if (isStrictReservedWord(d.name)) {
+                    return p.failAt(.{ .syntax_error = "Unexpected strict mode reserved word" }, d.span.start, d.span.end);
+                }
+            }
+            for (params) |param| try p.validateStrictPattern(param.pattern);
         }
     }
 
@@ -1219,7 +1287,7 @@ const Parser = struct {
             if (is_lexical_decl) return p.fail(.{ .syntax_error = "let is disallowed as a lexically bound name" }, t);
             return p.fail(.{ .unsupported = .syntax }, t);
         }
-        if (std.mem.eql(u8, name, "arguments") and p.in_strict_mode) {
+        if (p.in_strict_mode and (std.mem.eql(u8, name, "arguments") or std.mem.eql(u8, name, "eval"))) {
             return p.fail(.{ .syntax_error = "Unexpected eval or arguments in strict mode" }, t);
         }
         if (std.mem.eql(u8, name, "await")) {
@@ -1354,13 +1422,14 @@ const Parser = struct {
                 try props.append(p.arena, .{ .key = k, .pattern = pat, .default = default, .shorthand = false, .span = .{ .start = t.start, .end = end_pos } });
             } else {
                 if (k != .name or t.tag != .identifier) return p.fail(.{ .syntax_error = "unexpected token in object pattern" }, p.tok);
-                const name = k.name;
-                if (token.reserved_identifiers.has(name)) return p.fail(.{ .syntax_error = "reserved word cannot be a binding name" }, t);
+                const name = try p.identText(t);
+                if (token.reserved_identifiers.has(name) or lexer_mod.isKeywordText(name)) return p.fail(.{ .syntax_error = "reserved word cannot be a binding name" }, t);
+                if (p.in_strict_mode and isStrictReservedWord(name)) return p.fail(.{ .syntax_error = "Unexpected strict mode reserved word" }, t);
                 if (std.mem.eql(u8, name, "let")) {
                     if (is_lexical_decl) return p.fail(.{ .syntax_error = "let is disallowed as a lexically bound name" }, t);
                     return p.fail(.{ .unsupported = .syntax }, t);
                 }
-                if (std.mem.eql(u8, name, "arguments") and p.in_strict_mode) {
+                if (p.in_strict_mode and (std.mem.eql(u8, name, "arguments") or std.mem.eql(u8, name, "eval"))) {
                     return p.fail(.{ .syntax_error = "Unexpected eval or arguments in strict mode" }, t);
                 }
                 if (std.mem.eql(u8, name, "await")) {
@@ -1735,6 +1804,7 @@ const Parser = struct {
         const outer_async_ctx = p.async_ctx;
         const outer_yield_ctx = p.yield_ctx;
         const outer_derived = p.in_derived_ctor;
+        const outer_strict = p.in_strict_mode;
         p.loop_depth = 0;
         p.switch_depth = 0;
         p.labels = .empty;
@@ -1750,13 +1820,16 @@ const Parser = struct {
             p.function_depth -= 1;
             p.async_ctx = outer_async_ctx;
             p.yield_ctx = outer_yield_ctx;
+            p.in_strict_mode = outer_strict;
         }
 
         var body: []const ast.Stmt = undefined;
         var end: u32 = undefined;
+        var is_strict = p.in_strict_mode;
         if (p.tok.tag == .l_brace) {
             const parsed_body = try p.parseFunctionBody();
-            try p.checkDirectivePrologue(parsed_body.body, params);
+            is_strict = p.in_strict_mode;
+            try p.checkDirectivePrologue(parsed_body.body, params, null, is_strict);
             body = parsed_body.body;
             end = parsed_body.end;
         } else {
@@ -1774,6 +1847,7 @@ const Parser = struct {
             .kind = .expression,
             .is_arrow = true,
             .is_async = is_async,
+            .is_strict = is_strict,
             .length = paramLength(params),
             .name = null,
             .params = params,
@@ -1817,7 +1891,12 @@ const Parser = struct {
     /// Variables and members can be assigned to; anything else can't.
     fn assignTarget(p: *Parser, e: *const ast.Expr, msg: []const u8) Error!ast.Target {
         return switch (e.data) {
-            .identifier => |r| .{ .ref = r },
+            .identifier => |r| blk: {
+                if (p.in_strict_mode and (std.mem.eql(u8, r.name, "arguments") or std.mem.eql(u8, r.name, "eval"))) {
+                    return p.failAt(.{ .syntax_error = "Invalid strict mode assignment target" }, r.span.start, r.span.end);
+                }
+                break :blk .{ .ref = r };
+            },
             .member => |m| .{ .member = m },
             .super_member => |k| .{ .super_member = k },
             else => p.invalidTarget(e, msg),
@@ -2708,6 +2787,9 @@ const Parser = struct {
         switch (e.data) {
             .identifier => |r| {
                 try p.rejectCoverExpr(e);
+                if (p.in_strict_mode and (std.mem.eql(u8, r.name, "arguments") or std.mem.eql(u8, r.name, "eval"))) {
+                    return p.failAt(.{ .syntax_error = "Invalid strict mode assignment target" }, r.span.start, r.span.end);
+                }
                 return p.patNode(e.span, .{ .target = .{ .ref = r } }, 0);
             },
             .member => |m| {
@@ -2805,8 +2887,10 @@ const Parser = struct {
     fn refToDeclarator(p: *Parser, r: ast.Ref) Error!ast.Declarator {
         if (token.reserved_identifiers.has(r.name))
             return p.failAt(.{ .syntax_error = "reserved word cannot be a binding name" }, r.span.start, r.span.end);
+        if (p.in_strict_mode and isStrictReservedWord(r.name))
+            return p.failAt(.{ .syntax_error = "Unexpected strict mode reserved word" }, r.span.start, r.span.end);
         if (std.mem.eql(u8, r.name, "let")) return p.failAt(.{ .unsupported = .syntax }, r.span.start, r.span.end);
-        if (std.mem.eql(u8, r.name, "arguments") and p.in_strict_mode) {
+        if (p.in_strict_mode and (std.mem.eql(u8, r.name, "arguments") or std.mem.eql(u8, r.name, "eval"))) {
             return p.failAt(.{ .syntax_error = "Unexpected eval or arguments in strict mode" }, r.span.start, r.span.end);
         }
         const d: ast.Declarator = .{ .name = r.name, .span = r.span, .binding = p.binding_count, .init = null };
@@ -3309,6 +3393,7 @@ const Parser = struct {
                     .kind = .expression,
                     .is_arrow = false,
                     .is_async = false,
+                    .is_strict = true,
                     .is_method = true,
                     .has_home_object = true,
                     .length = 0,
@@ -3428,6 +3513,7 @@ const Parser = struct {
                         .kind = .expression,
                         .is_arrow = false,
                         .is_async = false,
+                        .is_strict = true,
                         .is_method = true,
                         .has_home_object = true,
                         .length = 0,
@@ -3500,7 +3586,7 @@ const Parser = struct {
                 p.function_depth -= 1;
             }
             const parsed_body = try p.parseFunctionBody();
-            try p.checkDirectivePrologue(parsed_body.body, params);
+            try p.checkDirectivePrologue(parsed_body.body, params, null, true);
 
             const f = try p.arena.create(ast.Function);
             f.* = .{
@@ -3510,6 +3596,7 @@ const Parser = struct {
                 .is_arrow = false,
                 .is_async = is_async,
                 .is_generator = is_generator,
+                .is_strict = true,
                 .is_method = !is_ctor,
                 .is_class_constructor = is_ctor,
                 .has_super_ctor = is_ctor and has_super,
@@ -3566,6 +3653,7 @@ const Parser = struct {
                 .span = sp,
                 .id = fn_id,
                 .kind = .expression,
+                .is_strict = true,
                 .is_class_constructor = true,
                 .has_home_object = true,
                 .name = null,
@@ -3601,6 +3689,7 @@ const Parser = struct {
             .span = sp,
             .id = fn_id,
             .kind = .expression,
+            .is_strict = true,
             .is_class_constructor = true,
             .has_super_ctor = true,
             .has_home_object = true,

@@ -779,7 +779,7 @@ const Resolver = struct {
         r.functions[f.id].is_simple_params = is_simple;
         r.functions[f.id].param_slot = @intCast(r.live.items.len - r.current().live_start);
         r.functions[f.id].param_count = if (is_simple) @intCast(f.params.len) else 0;
-        for (f.params) |p| try r.declarePattern(p.pattern, .param, false, !is_simple, null);
+        for (f.params) |p| try r.declarePattern(p.pattern, .param, false, !is_simple or f.is_strict or f.is_method or f.is_class_constructor, null);
         for (f.params) |p| {
             try r.resolvePatternExprs(p.pattern);
             if (p.default) |def| try r.expr(def);

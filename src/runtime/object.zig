@@ -537,19 +537,23 @@ pub fn setWithReceiver(rt: *Runtime, base: Value, k: Key, v: Value, receiver: Va
     return setOwnData(rt, base, k, v, strict);
 }
 
-pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value) Error!void {
+pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value, strict: bool) Error!void {
     const proto = try getPrototypeOfValue(rt, home);
     if (!proto.isNull() and !proto.isUndefined()) {
         switch (try lookupSetChain(rt, proto, null, k)) {
             .proxy => |px_obj| {
-                _ = try builtins.proxySet(rt, px_obj, k, v, receiver);
+                const ok = try builtins.proxySet(rt, px_obj, k, v, receiver);
+                if (!ok and strict) return rt.throw(.TypeError, &.{.{ .ascii = "'set' on proxy: trap returned falsish" }});
                 return;
             },
             .accessor => |p| {
-                _ = try invokeSetter(rt, p, receiver, v, false);
+                _ = try invokeSetter(rt, p, receiver, v, strict);
                 return;
             },
-            .data => |d| if (!d.writable) return,
+            .data => |d| if (!d.writable) {
+                if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
+                return;
+            },
             .none => {},
         }
     }
@@ -557,34 +561,45 @@ pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value) Er
     switch (receiver.unpack()) {
         .object => |o| {
             if (o.kind == .proxy) {
-                _ = try builtins.ordinarySetWithReceiver(rt, receiver, k, v, false);
+                _ = try builtins.ordinarySetWithReceiver(rt, receiver, k, v, strict);
                 return;
             }
             if (try ownProp(rt, o, k)) |p| {
                 if (p.is_accessor) {
-                    _ = try invokeSetter(rt, p, receiver, v, false);
+                    _ = try invokeSetter(rt, p, receiver, v, strict);
                     return;
                 }
-                if (!p.writable) return;
+                if (!p.writable) {
+                    if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
+                    return;
+                }
             }
         },
         .closure => |c| {
-            if (isNamed(k, "name") or isNamed(k, "length")) return;
+            if ((isNamed(k, "name") and !(c.meta != null and c.meta.?.name_deleted)) or
+                (isNamed(k, "length") and !(c.meta != null and c.meta.?.length_deleted)))
+            {
+                if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
+                return;
+            }
             if (c.meta) |m| if (m.props.get(try propKey(rt, k))) |p| {
                 if (p.is_accessor) {
-                    _ = try invokeSetter(rt, p, receiver, v, false);
+                    _ = try invokeSetter(rt, p, receiver, v, strict);
                     return;
                 }
-                if (!p.writable) return;
+                if (!p.writable) {
+                    if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
+                    return;
+                }
             };
         },
         .undefined, .null => {
             var buf: [10]u8 = undefined;
             return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot set properties of " }, .{ .ascii = @tagName(receiver.tag()) }, .{ .ascii = " (setting '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
         },
-        else => return rt.fail(.primitive_write),
+        else => return if (strict) rt.throw(.TypeError, &.{.{ .ascii = "Cannot create property on primitive" }}) else rt.fail(.primitive_write),
     }
-    _ = try setOwnData(rt, receiver, k, v, false);
+    _ = try setOwnData(rt, receiver, k, v, strict);
 }
 
 fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!bool {
@@ -1415,18 +1430,21 @@ pub fn toUint8Clamp(n: f64) u8 {
 }
 
 pub fn readTypedArrayI64(ta: heap_mod.TypedArrayState, idx: usize) i64 {
+    if (ta.buffer.kind.array_buffer.detached) return 0;
     const data = ta.buffer.kind.array_buffer.data;
     const off = ta.byte_offset + idx * 8;
     return std.mem.readInt(i64, data[off..][0..8], native_endian);
 }
 
 pub fn readTypedArrayU64(ta: heap_mod.TypedArrayState, idx: usize) u64 {
+    if (ta.buffer.kind.array_buffer.detached) return 0;
     const data = ta.buffer.kind.array_buffer.data;
     const off = ta.byte_offset + idx * 8;
     return std.mem.readInt(u64, data[off..][0..8], native_endian);
 }
 
 pub fn readTypedArrayNumber(ta: heap_mod.TypedArrayState, idx: usize) Value {
+    if (ta.buffer.kind.array_buffer.detached) return .undefined;
     const data = ta.buffer.kind.array_buffer.data;
     const off = ta.byte_offset + idx * ta.kind.bytesPerElement();
     return Value.fromNumber(switch (ta.kind) {
@@ -1443,6 +1461,7 @@ pub fn readTypedArrayNumber(ta: heap_mod.TypedArrayState, idx: usize) Value {
 }
 
 pub fn readTypedArrayElement(rt: *Runtime, ta: heap_mod.TypedArrayState, idx: usize) Error!Value {
+    if (ta.buffer.kind.array_buffer.detached) return .undefined;
     return switch (ta.kind) {
         .bigint64 => Value.fromBigInt(try bigint.fromI64(rt, readTypedArrayI64(ta, idx))),
         .biguint64 => Value.fromBigInt(try bigint.fromU64(rt, readTypedArrayU64(ta, idx))),
@@ -1451,6 +1470,7 @@ pub fn readTypedArrayElement(rt: *Runtime, ta: heap_mod.TypedArrayState, idx: us
 }
 
 pub fn writeTypedArrayBigInt(ta: heap_mod.TypedArrayState, idx: usize, b: *const heap_mod.BigInt) void {
+    if (ta.buffer.kind.array_buffer.detached) return;
     const data = ta.buffer.kind.array_buffer.data;
     const off = ta.byte_offset + idx * 8;
     switch (ta.kind) {
@@ -1461,6 +1481,7 @@ pub fn writeTypedArrayBigInt(ta: heap_mod.TypedArrayState, idx: usize, b: *const
 }
 
 pub fn writeTypedArrayNumber(ta: heap_mod.TypedArrayState, idx: usize, n: f64) void {
+    if (ta.buffer.kind.array_buffer.detached) return;
     const data = ta.buffer.kind.array_buffer.data;
     const off = ta.byte_offset + idx * ta.kind.bytesPerElement();
     switch (ta.kind) {
@@ -1483,9 +1504,11 @@ pub fn writeTypedArrayNumber(ta: heap_mod.TypedArrayState, idx: usize, n: f64) v
 pub fn writeTypedArrayElement(rt: *Runtime, ta: heap_mod.TypedArrayState, idx: usize, v: Value) Error!void {
     if (ta.kind.isBigInt()) {
         const b = try ops.toBigInt(rt, v);
+        if (ta.buffer.kind.array_buffer.detached) return;
         writeTypedArrayBigInt(ta, idx, b);
     } else {
         const n = try ops.toNumber(rt, v);
+        if (ta.buffer.kind.array_buffer.detached) return;
         writeTypedArrayNumber(ta, idx, n);
     }
 }

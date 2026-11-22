@@ -83,6 +83,9 @@ DEFAULT_SKIP_FEATURES = {
     "await-dictionary",
     "Iterator.prototype.join",
     "json-parse-with-source",
+    "upsert",
+    "joint-iteration",
+    "iterator-sequencing",
 }
 
 FRONTMATTER_RE = re.compile(r"/\*---\s*\n(.*?)\n---\*/", re.DOTALL)
@@ -103,7 +106,7 @@ const $262 = {
   gc: function () {},
   evalScript: function () { throw new Error("evalScript not supported"); },
   createRealm: function () { throw new Error("createRealm not supported"); },
-  detachArrayBuffer: function () { throw new Error("detachArrayBuffer not supported"); }
+  detachArrayBuffer: function (ab) { structuredClone(ab, { transfer: [ab] }); }
 };
 """
 

@@ -539,6 +539,7 @@ pub const Proto = struct {
     is_async_generator: bool = false,
     is_method: bool = false,
     is_class_constructor: bool = false,
+    is_strict: bool = false,
     has_super_ctor: bool = false,
     has_home_object: bool = false,
     length: u16 = 0,

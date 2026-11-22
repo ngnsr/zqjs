@@ -8548,6 +8548,7 @@ fn abSlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const new_len = if (final > first) final - first else 0;
     const vr = try viewsRealm(rt);
     const new_ab = try rt.heap.newArrayBuffer(vr.array_buffer_prototype, new_len);
+    if (o.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot slice a detached ArrayBuffer" }});
     if (new_len > 0) {
         @memcpy(new_ab.kind.array_buffer.data, o.kind.array_buffer.data[first .. first + new_len]);
     }
@@ -8578,6 +8579,7 @@ fn dataViewConstruct(rt: *Runtime, args: []const Value) Error!Value {
         ab.data.len - offset
     else blk: {
         const l = try toIndex(rt, arg(args, 2));
+        if (ab.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot construct DataView on a detached ArrayBuffer" }});
         const end = std.math.add(usize, offset, l) catch return rt.throw(.RangeError, &.{.{ .ascii = "Invalid DataView length" }});
         if (end > ab.data.len) return rt.throw(.RangeError, &.{.{ .ascii = "Invalid DataView length" }});
         break :blk l;
@@ -8932,14 +8934,17 @@ fn typedArrayConstructKind(rt: *Runtime, kind: heap_mod.TypedArrayKind, args: []
             }
             const ab = arg0.asObject().kind.array_buffer;
             if (ab.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
-            const buf_len = ab.data.len;
             const new_len: usize = if (arg(args, 2).isUndefined()) blk: {
+                if (ab.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
+                const buf_len = ab.data.len;
                 if (buf_len % bpe != 0 or offset > buf_len) {
                     return rt.throw(.RangeError, &.{.{ .ascii = "Byte length of TypedArray should be a multiple of element size" }});
                 }
                 break :blk (buf_len - offset) / bpe;
             } else blk: {
                 const l = try toIndex(rt, arg(args, 2));
+                if (ab.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
+                const buf_len = ab.data.len;
                 const needed = std.math.mul(usize, l, bpe) catch return rt.throw(.RangeError, &.{.{ .ascii = "Invalid typed array length" }});
                 const end = std.math.add(usize, offset, needed) catch return rt.throw(.RangeError, &.{.{ .ascii = "Invalid typed array length" }});
                 if (end > buf_len) return rt.throw(.RangeError, &.{.{ .ascii = "Invalid typed array length" }});
@@ -9254,6 +9259,7 @@ fn taSlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const count = if (end_idx > start_idx) end_idx - start_idx else 0;
     const dst = try allocateTypedArray(rt, ta.kind, count);
     if (count > 0) {
+        if (ta.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
         const bpe = ta.kind.bytesPerElement();
         const src_bytes = ta.buffer.kind.array_buffer.data[ta.byte_offset + start_idx * bpe ..][0 .. count * bpe];
         @memcpy(dst.kind.typed_array.buffer.kind.array_buffer.data, src_bytes);
@@ -9273,6 +9279,7 @@ fn taFill(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const b = try ops.toBigInt(rt, arg(args, 0));
         const start_idx = try relativeIndex(rt, arg(args, 1), ta.length, 0);
         const end_idx = try relativeIndex(rt, arg(args, 2), ta.length, ta.length);
+        if (ta.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
         if (end_idx > start_idx) {
             for (start_idx..end_idx) |i| object.writeTypedArrayBigInt(ta, i, b);
         }
@@ -9280,6 +9287,7 @@ fn taFill(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const val = try ops.toNumber(rt, arg(args, 0));
         const start_idx = try relativeIndex(rt, arg(args, 1), ta.length, 0);
         const end_idx = try relativeIndex(rt, arg(args, 2), ta.length, ta.length);
+        if (ta.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
         if (end_idx > start_idx) {
             for (start_idx..end_idx) |i| object.writeTypedArrayNumber(ta, i, val);
         }
@@ -9300,6 +9308,7 @@ fn taCopyWithin(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const end_idx = try relativeIndex(rt, arg(args, 2), ta.length, ta.length);
     if (end_idx <= from_idx or to_idx >= ta.length) return this;
     const count = @min(end_idx - from_idx, ta.length - to_idx);
+    if (ta.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
     const bpe = ta.kind.bytesPerElement();
     const data = ta.buffer.kind.array_buffer.data;
     const dst_bytes = data[ta.byte_offset + to_idx * bpe ..][0 .. count * bpe];
@@ -9490,10 +9499,11 @@ fn taIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const ta = o.kind.typed_array;
     if (ta.length == 0) return Value.fromNumber(-1);
     const search = arg(args, 0);
+    const from_n = if (args.len > 1) try toIntegerOrInfinity(rt, arg(args, 1)) else 0.0;
     if (ta.kind.isBigInt()) {
         if (!search.isBigInt()) return Value.fromNumber(-1);
     } else if (!search.isNumber()) return Value.fromNumber(-1);
-    const from_n = if (args.len > 1) try toIntegerOrInfinity(rt, arg(args, 1)) else 0.0;
+    if (ta.buffer.kind.array_buffer.detached) return Value.fromNumber(-1);
     const len_f: f64 = @floatFromInt(ta.length);
     if (from_n >= len_f) return Value.fromNumber(-1);
     const start: usize = if (from_n < 0) blk: {
@@ -9501,6 +9511,7 @@ fn taIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         break :blk if (k <= 0) 0 else @intFromFloat(k);
     } else @intFromFloat(from_n);
     for (start..ta.length) |i| {
+        if (ta.buffer.kind.array_buffer.detached) return Value.fromNumber(-1);
         const elem = try object.readTypedArrayElement(rt, ta, i);
         if (ops.strictEquals(elem, search)) return Value.fromNumber(@floatFromInt(i));
     }
@@ -9512,15 +9523,17 @@ fn taLastIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const ta = o.kind.typed_array;
     if (ta.length == 0) return Value.fromNumber(-1);
     const search = arg(args, 0);
+    const len_f: f64 = @floatFromInt(ta.length);
+    const from_n = if (args.len > 1) try toIntegerOrInfinity(rt, arg(args, 1)) else len_f - 1.0;
     if (ta.kind.isBigInt()) {
         if (!search.isBigInt()) return Value.fromNumber(-1);
     } else if (!search.isNumber()) return Value.fromNumber(-1);
-    const len_f: f64 = @floatFromInt(ta.length);
-    const from_n = if (args.len > 1) try toIntegerOrInfinity(rt, arg(args, 1)) else len_f - 1.0;
+    if (ta.buffer.kind.array_buffer.detached) return Value.fromNumber(-1);
     const k_f = if (from_n >= 0) @min(from_n, len_f - 1.0) else len_f + from_n;
     if (k_f < 0) return Value.fromNumber(-1);
     var i: usize = @intFromFloat(k_f);
     while (true) {
+        if (ta.buffer.kind.array_buffer.detached) return Value.fromNumber(-1);
         const elem = try object.readTypedArrayElement(rt, ta, i);
         if (ops.strictEquals(elem, search)) return Value.fromNumber(@floatFromInt(i));
         if (i == 0) break;
@@ -9534,9 +9547,6 @@ fn taIncludes(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const ta = o.kind.typed_array;
     if (ta.length == 0) return Value.fromBool(false);
     const search = arg(args, 0);
-    if (ta.kind.isBigInt()) {
-        if (!search.isBigInt()) return Value.fromBool(false);
-    } else if (!search.isNumber()) return Value.fromBool(false);
     const from_n = if (args.len > 1) try toIntegerOrInfinity(rt, arg(args, 1)) else 0.0;
     const len_f: f64 = @floatFromInt(ta.length);
     if (from_n >= len_f) return Value.fromBool(false);
@@ -9581,6 +9591,7 @@ fn taJoin(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         if (i > 0) try out.appendSlice(rt.gpa, sep);
         var buf: ops.NumberBuf = undefined;
         const elem = try object.readTypedArrayElement(rt, ta, i);
+        if (elem.isUndefined()) continue;
         switch (try ops.toPiece(rt, elem, &buf)) {
             .ascii => |s| for (s) |c| try out.append(rt.gpa, c),
             .utf16 => |u| try out.appendSlice(rt.gpa, u),
@@ -9717,36 +9728,27 @@ fn taFilter(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const cb = try requireCallable(rt, arg(args, 0));
     const this_arg = arg(args, 1);
     const ta = o.kind.typed_array;
-    var root_buf = [_]Value{ this, cb, this_arg };
+    var root_buf = [_]Value{ this, cb, this_arg, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
-    if (ta.kind.isBigInt()) {
-        var kept: std.ArrayList(u64) = .empty;
-        defer kept.deinit(rt.gpa);
-        for (0..ta.length) |i| {
-            const raw = object.readTypedArrayU64(ta, i);
-            const elem = try object.readTypedArrayElement(rt, ta, i);
-            const res = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), this });
-            if (ops.toBoolean(res)) try kept.append(rt.gpa, raw);
-        }
-        const dst = try allocateTypedArray(rt, ta.kind, kept.items.len);
-        const data = dst.kind.typed_array.buffer.kind.array_buffer.data;
-        const native_endian = @import("builtin").cpu.arch.endian();
-        for (kept.items, 0..) |raw, i| {
-            std.mem.writeInt(u64, data[i * 8 ..][0..8], raw, native_endian);
-        }
-        return Value.fromObject(dst);
-    }
-    var kept: std.ArrayList(f64) = .empty;
+    var kept: std.ArrayList(Value) = .empty;
     defer kept.deinit(rt.gpa);
     for (0..ta.length) |i| {
-        const elem = object.readTypedArrayNumber(ta, i);
+        const elem = try object.readTypedArrayElement(rt, ta, i);
+        root_buf[3] = elem;
+        var kept_roots: rt_mod.ValueRoots = .{ .values = kept.items };
+        try kept_roots.register(rt);
+        defer kept_roots.unregister(rt);
         const res = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), this });
-        if (ops.toBoolean(res)) try kept.append(rt.gpa, elem.asNumber());
+        if (ops.toBoolean(res)) try kept.append(rt.gpa, root_buf[3]);
     }
+    var kept_roots: rt_mod.ValueRoots = .{ .values = kept.items };
+    try kept_roots.register(rt);
+    defer kept_roots.unregister(rt);
     const dst = try allocateTypedArray(rt, ta.kind, kept.items.len);
-    for (kept.items, 0..) |n, i| object.writeTypedArrayNumber(dst.kind.typed_array, i, n);
+    root_buf[3] = Value.fromObject(dst);
+    for (kept.items, 0..) |v, i| try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, v);
     return Value.fromObject(dst);
 }
 

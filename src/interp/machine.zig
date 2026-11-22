@@ -70,6 +70,7 @@ fn runModuleImpl(rt: *Runtime, script: ast.Script, res: *const Resolution, modul
         .repl_cells = module_cells,
         .module_record = module_record,
         .is_module = true,
+        .script_strict = true,
         .this = .undefined,
         .stack_top = if (builtin.is_test) @frameAddress() else 0,
         .lowest_frame = if (builtin.is_test) @frameAddress() else 0,
@@ -102,6 +103,7 @@ pub fn runRepl(rt: *Runtime, script: ast.Script, res: *const Resolution, repl_ce
         .res_ptr = res,
         .repl_cells = repl_cells,
         .repl_mode = true,
+        .script_strict = script.is_strict,
         .repl_top_stmts = script.statements,
         .stack_top = if (builtin.is_test) @frameAddress() else 0,
         .lowest_frame = if (builtin.is_test) @frameAddress() else 0,
@@ -156,6 +158,7 @@ fn runTopLevelAsyncImpl(rt: *Runtime, script: ast.Script, res: *const Resolution
                 .module_record = ctx.module_record,
                 .repl_mode = !ctx.is_module,
                 .is_module = ctx.is_module,
+                .script_strict = ctx.script.is_strict or ctx.is_module,
                 .this = if (ctx.is_module) .undefined else null,
                 .repl_top_stmts = if (ctx.is_module) null else ctx.script.statements,
                 .is_coroutine = true,
@@ -191,6 +194,7 @@ fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUs
     var m: Machine = .{
         .rt = rt,
         .res = res,
+        .script_strict = script.is_strict or script.source_kind == .module,
         .stack_top = if (builtin.is_test) @frameAddress() else 0,
         .lowest_frame = if (builtin.is_test) @frameAddress() else 0,
     };
@@ -428,6 +432,7 @@ const Machine = struct {
     module_record: ?*anyopaque = null,
     repl_mode: bool = false,
     is_module: bool = false,
+    script_strict: bool = false,
     repl_top_stmts: ?[]const ast.Stmt = null,
     env: ?*Env = null,
     depth: u32 = 0,
@@ -1748,7 +1753,7 @@ const Machine = struct {
                 } else {
                     const kv: KeyValue = if (am.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                     const base = m.popVal();
-                    try object.set(rt, base, try m.toKey(kv), v);
+                    try m.setProp(base, try m.toKey(kv), v);
                 }
                 m.depth -= 1;
                 try m.pushVal(v);
@@ -1756,7 +1761,7 @@ const Machine = struct {
             .assign_member_plain_finish_key => |k| {
                 const v = m.popVal();
                 const base = m.popVal();
-                try object.set(rt, base, k, v);
+                try m.setProp(base, k, v);
                 m.depth -= 1;
                 try m.pushVal(v);
             },
@@ -1769,7 +1774,7 @@ const Machine = struct {
                     const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                     try object.setPrivate(rt, base, brand, try rt.heap.internUtf8(pn), v);
                 } else {
-                    try object.set(rt, base, ac.key, v);
+                    try m.setProp(base, ac.key, v);
                 }
                 m.depth -= 1;
                 try m.pushVal(v);
@@ -1796,7 +1801,7 @@ const Machine = struct {
                 } else {
                     const k = try m.toKey(kv);
                     const s = try stepNumeric(rt, try object.get(rt, base, k), um.op == .inc);
-                    try object.set(rt, base, k, s.new);
+                    try m.setProp(base, k, s.new);
                     try m.pushVal(if (um.prefix) s.new else s.old);
                 }
             },
@@ -1942,7 +1947,7 @@ const Machine = struct {
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_assign without home_object");
                 const val = m.popVal();
                 const kv: KeyValue = if (named) |n| .{ .named = n } else .{ .value = m.popVal() };
-                try object.setSuper(rt, home, this_val, try m.toKey(kv), val);
+                try object.setSuper(rt, home, this_val, try m.toKey(kv), val, m.isStrict());
                 try m.pushVal(val);
             },
             .super_assign_after_key => |sa| {
@@ -1976,7 +1981,7 @@ const Machine = struct {
                 const old = m.popVal();
                 const kv: KeyValue = if (sc.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const new_val = try ops.binary(rt, sc.op, old, rhs);
-                try object.setSuper(rt, home, this_val, try m.toKey(kv), new_val);
+                try object.setSuper(rt, home, this_val, try m.toKey(kv), new_val, m.isStrict());
                 try m.pushVal(new_val);
             },
             .super_assign_logical => |sl| {
@@ -1984,7 +1989,7 @@ const Machine = struct {
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_assign without home_object");
                 const rhs = m.popVal();
                 const kv: KeyValue = if (sl.named) |n| .{ .named = n } else .{ .value = m.popVal() };
-                try object.setSuper(rt, home, this_val, try m.toKey(kv), rhs);
+                try object.setSuper(rt, home, this_val, try m.toKey(kv), rhs, m.isStrict());
                 try m.pushVal(rhs);
             },
             .super_update_finish => |su| {
@@ -1993,7 +1998,7 @@ const Machine = struct {
                 const kv: KeyValue = if (su.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const k = try m.toKey(kv);
                 const s = try stepNumeric(rt, try object.getSuper(rt, home, this_val, k), su.op == .inc);
-                try object.setSuper(rt, home, this_val, k, s.new);
+                try object.setSuper(rt, home, this_val, k, s.new, m.isStrict());
                 try m.pushVal(if (su.prefix) s.new else s.old);
             },
             .super_call_member_key => |sm| {
@@ -2573,9 +2578,10 @@ const Machine = struct {
         switch (task) {
             .bind_target_super_finish => |named| {
                 const this_val = try m.requireThis();
+                const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_assign without home_object");
                 const kv: KeyValue = if (named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const val = m.popVal();
-                try object.set(rt, this_val, try m.toKey(kv), val);
+                try object.setSuper(rt, home, this_val, try m.toKey(kv), val, m.isStrict());
             },
             .bind_pattern => |bp| {
                 const val = m.popVal();
@@ -2601,7 +2607,7 @@ const Machine = struct {
                     try object.setPrivate(rt, base, brand, try rt.heap.internUtf8(bf.named.?), val);
                 } else {
                     const k = try m.toKey(kv);
-                    try object.set(rt, base, k, val);
+                    try m.setProp(base, k, val);
                 }
             },
             .bind_array_elem => |ba| {
@@ -2696,7 +2702,7 @@ const Machine = struct {
                     const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                     try object.setPrivate(rt, base, brand, try rt.heap.internUtf8(ba.named.?), v);
                 } else {
-                    try object.set(rt, base, try m.toKey(kv), v);
+                    try m.setProp(base, try m.toKey(kv), v);
                 }
                 try m.pushTask(.{ .bind_array_elem = .{ .pat = ba.pat, .idx = ba.idx + 1, .mode = ba.mode } });
             },
@@ -2715,7 +2721,7 @@ const Machine = struct {
                         const brand = m.current_closure.?.meta.?.brand.?.asClosure();
                         try object.setPrivate(rt, base, brand, try rt.heap.internUtf8(mem.key.name), v);
                     } else {
-                        try object.set(rt, base, try m.toKey(kv), v);
+                        try m.setProp(base, try m.toKey(kv), v);
                     }
                     try m.pushTask(.{ .bind_array_elem = .{ .pat = ba.pat, .idx = ba.idx + 1, .mode = ba.mode } });
                 } else {
@@ -2747,7 +2753,7 @@ const Machine = struct {
                 const kv2: KeyValue = if (named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base2 = m.popVal();
                 _ = m.popVal(); // iter
-                try object.set(rt, base2, try m.toKey(kv2), ra);
+                try m.setProp(base2, try m.toKey(kv2), ra);
             },
             .bind_object_prop => |bo| {
                 // values: [..., val, (excl_0, ..., excl_{excl_count-1})]
@@ -2837,7 +2843,7 @@ const Machine = struct {
                 const kv: KeyValue = if (bo.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.popVal();
                 _ = m.popVal(); // prop_key_val
-                try object.set(rt, base, try m.toKey(kv), v);
+                try m.setProp(base, try m.toKey(kv), v);
                 try m.pushTask(.{ .bind_object_prop = .{
                     .pat = bo.pat,
                     .idx = bo.idx + 1,
@@ -2858,7 +2864,7 @@ const Machine = struct {
                     };
                     const base = m.popVal();
                     _ = m.popVal(); // prop_key_val
-                    try object.set(rt, base, try m.toKey(kv), v);
+                    try m.setProp(base, try m.toKey(kv), v);
                     try m.pushTask(.{ .bind_object_prop = .{
                         .pat = bo.pat,
                         .idx = bo.idx + 1,
@@ -2896,7 +2902,7 @@ const Machine = struct {
                 try m.pushVal(Value.fromObject(rest_obj));
                 try m.copyExcludedDataProperties(rest_obj, val, bo.excl_base, bo.excl_count);
                 _ = m.popVal(); // rest_obj
-                try object.set(rt, base, try m.toKey(kv), Value.fromObject(rest_obj));
+                try m.setProp(base, try m.toKey(kv), Value.fromObject(rest_obj));
                 m.values.shrinkRetainingCapacity(bo.excl_base - 1);
             },
             .array_iter_close => |ac| try builtins.iteratorClose(rt, ac.iter, false),
@@ -3982,6 +3988,15 @@ const Machine = struct {
             };
         }
         try copyDataProperties(rt, dst, src, excluded);
+    }
+
+    fn isStrict(m: *const Machine) bool {
+        if (m.current_func) |f| return f.is_strict;
+        return m.script_strict or m.is_module;
+    }
+
+    fn setProp(m: *Machine, base: Value, k: object.Key, v: Value) Error!void {
+        _ = try object.setWithReceiver(m.rt, base, k, v, base, m.isStrict());
     }
 
     fn toKey(m: *Machine, kv: KeyValue) Error!object.Key {

@@ -540,6 +540,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.json, "parse", &json.parse_native);
     try method(rt, r.json, "stringify", &json.stringify_native);
     try initErrorProto(rt, r.error_prototype, r.error_namespace, "Error", &error_global);
+    try method(rt, r.error_namespace, "isError", &error_is_error);
     try method(rt, r.error_prototype, "toString", &error_to_string);
     try initErrorProto(rt, r.type_error_prototype, r.type_error_namespace, "TypeError", &type_error_global);
     try initErrorProto(rt, r.range_error_prototype, r.range_error_namespace, "RangeError", &range_error_global);
@@ -550,6 +551,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try initErrorProto(rt, r.aggregate_error_prototype, r.aggregate_error_namespace, "AggregateError", &aggregate_error_global);
     try immutableConstant(rt, r.regexp_namespace, "prototype", Value.fromObject(r.regexp_prototype));
     try constant(rt, r.regexp_prototype, "constructor", Value.fromNative(&regexp_global));
+    try method(rt, r.regexp_namespace, "escape", &regexp_escape);
     try method(rt, r.regexp_prototype, "exec", &regexp_exec);
     try method(rt, r.regexp_prototype, "test", &regexp_test);
     try method(rt, r.regexp_prototype, "toString", &regexp_to_string);
@@ -841,6 +843,83 @@ const species_getter: Native = .{ .name = "get [Symbol.species]", .call = specie
 
 fn speciesGetter(_: *Runtime, this: Value, _: []const Value) Error!Value {
     return this;
+}
+
+fn constructValue(rt: *Runtime, ctor: Value, args: []const Value) Error!Value {
+    return switch (ctor.unpack()) {
+        .closure => |c| rt.constructClosure(c, args, ctor),
+        .native => construct(rt, ctor, args),
+        .object => |o| if (o.kind == .proxy) callProxyConstruct(rt, o, args, ctor) else rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }}),
+        else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a constructor" }}),
+    };
+}
+
+fn speciesConstructor(rt: *Runtime, o_val: Value, default_ctor: Value) Error!Value {
+    var root_buf = [_]Value{ o_val, default_ctor, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const ctor = try object.get(rt, o_val, try object.named(rt, "constructor"));
+    if (ctor.isUndefined()) return default_ctor;
+    if (!ctor.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Species constructor is not an object" }});
+    }
+    root_buf[2] = ctor;
+    const r = try realm(rt);
+    const s = try object.get(rt, ctor, .{ .symbol = r.sym_species });
+    if (s.isUndefined() or s.isNull()) return default_ctor;
+    if (!isConstructor(s)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Species is not a constructor" }});
+    }
+    return s;
+}
+
+fn arraySpeciesCreate(rt: *Runtime, original: Value, len: usize) Error!Value {
+    const r = try realm(rt);
+    if (!original.isObject() or original.asObject().kind != .array) {
+        return Value.fromObject(try rt.heap.newArray(r.array_prototype));
+    }
+    var root_buf = [_]Value{ original, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const ctor = try object.get(rt, original, try object.named(rt, "constructor"));
+    if (ctor.isUndefined()) {
+        return Value.fromObject(try rt.heap.newArray(r.array_prototype));
+    }
+    if (!ctor.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Array constructor is not an object" }});
+    }
+    root_buf[1] = ctor;
+    const s = try object.get(rt, ctor, .{ .symbol = r.sym_species });
+    if (s.isUndefined() or s.isNull() or (s.isNative() and s.asNative() == &array_global)) {
+        return Value.fromObject(try rt.heap.newArray(r.array_prototype));
+    }
+    if (!isConstructor(s)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Array species is not a constructor" }});
+    }
+    return constructValue(rt, s, &.{Value.fromNumber(@floatFromInt(len))});
+}
+
+fn arrayAppendOrDefine(rt: *Runtime, out: Value, idx: usize, val: Value) Error!void {
+    if (out.isObject() and out.asObject().kind == .array and idx == out.asObject().kind.array.items.len) {
+        try rt.heap.appendElement(out.asObject(), val);
+        return;
+    }
+    if (out.isObject()) {
+        try object.define(rt, out.asObject(), .{ .index = @intCast(idx) }, val);
+        return;
+    }
+    try object.setStrict(rt, out, .{ .index = @intCast(idx) }, val);
+}
+
+const error_is_error: Native = .{ .name = "isError", .length = 1, .call = errorIsError };
+
+fn errorIsError(_: *Runtime, _: Value, args: []const Value) Error!Value {
+    const v = arg(args, 0);
+    return Value.fromBool(v.isObject() and v.asObject().ordinary_tag == .@"error");
 }
 
 pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
@@ -1745,13 +1824,36 @@ fn toObjectReceiver(rt: *Runtime, this: Value) Error!Value {
 /// sparse-array hole preservation is not supported because holes are rejected at creation.
 fn arraySlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     if (this.isObject() and this.asObject().kind == .array) {
-        const items = this.asObject().kind.array.items;
-        const start = if (arg(args, 0).isUndefined()) 0 else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 0)), items.len);
-        const end = if (arg(args, 1).isUndefined()) items.len else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 1)), items.len);
-        const r = try realm(rt);
-        const out = try rt.heap.newArray(r.array_prototype);
-        if (start < end) try rt.heap.appendElements(out, items[start..end]);
-        return Value.fromObject(out);
+        var root_buf = [_]Value{ this, .undefined };
+        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+        try roots.register(rt);
+        defer roots.unregister(rt);
+
+        const a = this.asObject();
+        const len = a.kind.array.items.len;
+        const start = if (arg(args, 0).isUndefined()) 0 else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 0)), len);
+        const end = if (arg(args, 1).isUndefined()) len else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 1)), len);
+        const count = if (end > start) end - start else 0;
+        const out_val = try arraySpeciesCreate(rt, this, count);
+        root_buf[1] = out_val;
+        if (out_val.isObject() and out_val.asObject().kind == .array and out_val.asObject().kind.array.items.len == 0) {
+            const cur_items = a.kind.array.items;
+            const actual_end = @min(end, cur_items.len);
+            if (start < actual_end) try rt.heap.appendElements(out_val.asObject(), cur_items[start..actual_end]);
+            return out_val;
+        }
+        var n: usize = 0;
+        var k: usize = start;
+        while (k < end) : ({
+            k += 1;
+            n += 1;
+        }) {
+            if (k < a.kind.array.items.len) {
+                try arrayAppendOrDefine(rt, out_val, n, a.kind.array.items[k]);
+            }
+        }
+        try object.setStrict(rt, out_val, try object.named(rt, "length"), Value.fromNumber(@floatFromInt(n)));
+        return out_val;
     }
     const o_val = try toObjectReceiver(rt, this);
     const r = try realm(rt);
@@ -9736,6 +9838,75 @@ fn regexpToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     }));
 }
 
+const regexp_escape: Native = .{ .name = "escape", .length = 1, .call = regexpEscape };
+
+fn appendHexEscape(rt: *Runtime, out: *std.ArrayList(u16), cp: u16) Error!void {
+    const hex = "0123456789abcdef";
+    if (cp < 0x100) {
+        try appendUnits(rt, out, &.{ '\\', 'x', hex[(cp >> 4) & 0xF], hex[cp & 0xF] });
+    } else {
+        try appendUnits(rt, out, &.{ '\\', 'u', hex[(cp >> 12) & 0xF], hex[(cp >> 8) & 0xF], hex[(cp >> 4) & 0xF], hex[cp & 0xF] });
+    }
+}
+
+fn regexpEscape(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const v = arg(args, 0);
+    if (!v.isString()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.escape requires a string argument" }});
+    }
+    const units = v.asString().units;
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(rt.gpa);
+
+    var i: usize = 0;
+    while (i < units.len) {
+        const u = units[i];
+        // Valid surrogate pair passes through verbatim
+        if (u >= 0xD800 and u <= 0xDBFF and i + 1 < units.len) {
+            const lo_u = units[i + 1];
+            if (lo_u >= 0xDC00 and lo_u <= 0xDFFF) {
+                try appendUnits(rt, &out, units[i .. i + 2]);
+                i += 2;
+                continue;
+            }
+        }
+        // Lone surrogate -> \uHHHH
+        if (u >= 0xD800 and u <= 0xDFFF) {
+            try appendHexEscape(rt, &out, u);
+            i += 1;
+            continue;
+        }
+        // Leading ASCII letter or digit -> \xHH
+        if (i == 0 and ((u >= '0' and u <= '9') or (u >= 'A' and u <= 'Z') or (u >= 'a' and u <= 'z'))) {
+            try appendHexEscape(rt, &out, u);
+            i += 1;
+            continue;
+        }
+        switch (u) {
+            '^', '$', '\\', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '/' => {
+                try appendUnits(rt, &out, &.{ '\\', u });
+            },
+            0x09 => try appendUnits(rt, &out, &.{ '\\', 't' }),
+            0x0A => try appendUnits(rt, &out, &.{ '\\', 'n' }),
+            0x0B => try appendUnits(rt, &out, &.{ '\\', 'v' }),
+            0x0C => try appendUnits(rt, &out, &.{ '\\', 'f' }),
+            0x0D => try appendUnits(rt, &out, &.{ '\\', 'r' }),
+            ',', '-', '=', '<', '>', '#', '&', '!', '%', ':', ';', '@', '~', '\'', '`', '"', ' ' => {
+                try appendHexEscape(rt, &out, u);
+            },
+            else => {
+                if (isJsWhitespace(u)) {
+                    try appendHexEscape(rt, &out, u);
+                } else {
+                    try appendUnits(rt, &out, &.{u});
+                }
+            },
+        }
+        i += 1;
+    }
+    return Value.fromString(try rt.heap.newString(&.{.{ .utf16 = out.items }}));
+}
+
 const regexp_sym_match: Native = .{ .name = "[Symbol.match]", .length = 1, .call = regexpSymMatch };
 const regexp_sym_replace: Native = .{ .name = "[Symbol.replace]", .length = 2, .call = regexpSymReplace };
 const regexp_sym_search: Native = .{ .name = "[Symbol.search]", .length = 1, .call = regexpSymSearch };
@@ -11303,6 +11474,30 @@ fn taSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return .undefined;
 }
 
+fn typedArraySpeciesCreate(rt: *Runtime, exemplar: *Object, args: []const Value, min_len: ?usize) Error!*Object {
+    const ta = exemplar.kind.typed_array;
+    const default_ctor = Value.fromNative(&typed_array_ctors[@backingInt(ta.kind)]);
+    const ctor = try speciesConstructor(rt, Value.fromObject(exemplar), default_ctor);
+    if (ctor.isNative() and ctor.asNative() == &typed_array_ctors[@backingInt(ta.kind)]) {
+        const created = try typedArrayConstructKind(rt, ta.kind, args);
+        const dst = created.asObject();
+        if (min_len) |ml| {
+            if (dst.kind.typed_array.length < ml) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "Derived TypedArray constructor created too small array" }});
+            }
+        }
+        return dst;
+    }
+    const created = try constructValue(rt, ctor, args);
+    const dst = try requireLiveTypedArray(rt, created);
+    if (min_len) |ml| {
+        if (dst.kind.typed_array.length < ml) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Derived TypedArray constructor created too small array" }});
+        }
+    }
+    return dst;
+}
+
 fn taSubarray(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const o = try requireLiveTypedArray(rt, this);
     const ta = o.kind.typed_array;
@@ -11315,14 +11510,18 @@ fn taSubarray(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const end_idx = try relativeIndex(rt, arg(args, 1), ta.length, ta.length);
     const new_len = if (end_idx > begin_idx) end_idx - begin_idx else 0;
     const new_off = ta.byte_offset + begin_idx * ta.kind.bytesPerElement();
-    const vr = try viewsRealm(rt);
-    return Value.fromObject(try rt.heap.newTypedArray(vr.typed_array_prototypes[@backingInt(ta.kind)], ta.buffer, ta.kind, new_off, new_len));
+    const dst = try typedArraySpeciesCreate(rt, o, &.{
+        Value.fromObject(ta.buffer),
+        Value.fromNumber(@floatFromInt(new_off)),
+        Value.fromNumber(@floatFromInt(new_len)),
+    }, null);
+    return Value.fromObject(dst);
 }
 
 fn taSlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const o = try requireLiveTypedArray(rt, this);
     const ta = o.kind.typed_array;
-    var root_buf = [_]Value{this};
+    var root_buf = [_]Value{ this, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -11330,12 +11529,25 @@ fn taSlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const start_idx = try relativeIndex(rt, arg(args, 0), ta.length, 0);
     const end_idx = try relativeIndex(rt, arg(args, 1), ta.length, ta.length);
     const count = if (end_idx > start_idx) end_idx - start_idx else 0;
-    const dst = try allocateTypedArray(rt, ta.kind, count);
+    const dst = try typedArraySpeciesCreate(rt, o, &.{Value.fromNumber(@floatFromInt(count))}, count);
+    root_buf[1] = Value.fromObject(dst);
     if (count > 0) {
         if (ta.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
-        const bpe = ta.kind.bytesPerElement();
-        const src_bytes = ta.buffer.kind.array_buffer.data[ta.byte_offset + start_idx * bpe ..][0 .. count * bpe];
-        @memcpy(dst.kind.typed_array.buffer.kind.array_buffer.data, src_bytes);
+        const dst_ta = dst.kind.typed_array;
+        if (dst_ta.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
+        if (dst_ta.kind == ta.kind and dst_ta.buffer != ta.buffer) {
+            const bpe = ta.kind.bytesPerElement();
+            const src_bytes = ta.buffer.kind.array_buffer.data[ta.byte_offset + start_idx * bpe ..][0 .. count * bpe];
+            @memcpy(dst_ta.buffer.kind.array_buffer.data[dst_ta.byte_offset..][0 .. count * bpe], src_bytes);
+        } else {
+            if (ta.kind.isBigInt() != dst_ta.kind.isBigInt()) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "Cannot mix BigInt and other TypedArray types" }});
+            }
+            for (0..count) |i| {
+                const v = try object.readTypedArrayElement(rt, ta, start_idx + i);
+                try object.writeTypedArrayElement(rt, dst_ta, i, v);
+            }
+        }
     }
     return Value.fromObject(dst);
 }
@@ -11816,11 +12028,12 @@ fn taMap(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const cb = try requireCallable(rt, arg(args, 0));
     const this_arg = arg(args, 1);
     const ta = o.kind.typed_array;
-    const dst = try allocateTypedArray(rt, ta.kind, ta.length);
-    var root_buf = [_]Value{ this, cb, this_arg, Value.fromObject(dst) };
+    var root_buf = [_]Value{ this, cb, this_arg, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
+    const dst = try typedArraySpeciesCreate(rt, o, &.{Value.fromNumber(@floatFromInt(ta.length))}, ta.length);
+    root_buf[3] = Value.fromObject(dst);
     for (0..ta.length) |i| {
         const elem = try object.readTypedArrayElement(rt, ta, i);
         const mapped = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), this });
@@ -11852,7 +12065,7 @@ fn taFilter(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     var kept_roots: rt_mod.ValueRoots = .{ .values = kept.items };
     try kept_roots.register(rt);
     defer kept_roots.unregister(rt);
-    const dst = try allocateTypedArray(rt, ta.kind, kept.items.len);
+    const dst = try typedArraySpeciesCreate(rt, o, &.{Value.fromNumber(@floatFromInt(kept.items.len))}, kept.items.len);
     root_buf[3] = Value.fromObject(dst);
     for (kept.items, 0..) |v, i| try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, v);
     return Value.fromObject(dst);

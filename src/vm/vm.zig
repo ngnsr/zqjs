@@ -1103,14 +1103,34 @@ pub const Vm = struct {
             .define_prop => {
                 const o = try cache.peek(vm, 1);
                 if (!o.isObject()) return vm.bug("define on a non-object");
-                try object.define(rt, o.asObject(), try vm.nameKey(cache.operand(0)), try cache.peek(vm, 0));
+                const v = try cache.peek(vm, 0);
+                if (v.isClosure()) {
+                    const c = v.asClosure();
+                    if (c.impl == .vm) {
+                        const fn_proto: *const bc.Proto = @ptrCast(@alignCast(c.impl.vm.proto));
+                        if (fn_proto.has_home_object and (c.meta == null or c.meta.?.home_object == null)) {
+                            try rt.heap.storeClosureHomeObject(@constCast(c), o);
+                        }
+                    }
+                }
+                try object.define(rt, o.asObject(), try vm.nameKey(cache.operand(0)), v);
                 try cache.drop(vm, 1);
             },
             .define_elem => {
                 cache.syncSp(vm);
                 const o = try cache.peek(vm, 2);
                 if (!o.isObject()) return vm.bug("define on a non-object");
-                try object.define(rt, o.asObject(), try object.key(rt, try cache.peek(vm, 1)), try cache.peek(vm, 0));
+                const v = try cache.peek(vm, 0);
+                if (v.isClosure()) {
+                    const c = v.asClosure();
+                    if (c.impl == .vm) {
+                        const fn_proto: *const bc.Proto = @ptrCast(@alignCast(c.impl.vm.proto));
+                        if (fn_proto.has_home_object and (c.meta == null or c.meta.?.home_object == null)) {
+                            try rt.heap.storeClosureHomeObject(@constCast(c), o);
+                        }
+                    }
+                }
+                try object.define(rt, o.asObject(), try object.key(rt, try cache.peek(vm, 1)), v);
                 try cache.drop(vm, 2);
             },
             .get_prop => {

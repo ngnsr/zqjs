@@ -2086,7 +2086,18 @@ const Machine = struct {
                 const o = m.values.items[m.values.items.len - 1].asObject();
                 const pr = op.props[op.idx].prop;
                 switch (pr.kind) {
-                    .init => try object.define(rt, o, op.key, v),
+                    .init => {
+                        if (v.isClosure()) {
+                            const c = v.asClosure();
+                            if (c.impl == .tree) {
+                                const f: *const ast.Function = @ptrCast(@alignCast(c.impl.tree.func));
+                                if (f.has_home_object and (c.meta == null or c.meta.?.home_object == null)) {
+                                    try rt.heap.storeClosureHomeObject(@constCast(c), Value.fromObject(o));
+                                }
+                            }
+                        }
+                        try object.define(rt, o, op.key, v);
+                    },
                     .getter, .setter => {
                         if (!v.isClosure()) return rt.bug("object accessor expects closure");
                         try rt.heap.storeClosureHomeObject(@constCast(v.asClosure()), Value.fromObject(o));

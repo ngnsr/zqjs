@@ -474,6 +474,11 @@ pub const Runtime = struct {
             h.markObj(&r.sym_to_string_tag.obj);
             h.markObj(&r.sym_has_instance.obj);
             h.markObj(&r.sym_species.obj);
+            h.markObj(&r.sym_replace.obj);
+            h.markObj(&r.sym_search.obj);
+            h.markObj(&r.sym_split.obj);
+            h.markObj(&r.sym_match_all.obj);
+            h.markObj(&r.sym_is_concat_spreadable.obj);
         }
         var sym_it = rt.global_symbols.iterator();
         while (sym_it.next()) |e| {

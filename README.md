@@ -9,7 +9,7 @@ Designed for host-controlled scripting (games, plugins, tools, sandboxed automat
 - **Faster than QuickJS on average (`0.96×` geomean):** Pure bytecode interpreter (no JIT / no RWX) with 8-byte NaN-boxed values, Shapes (hidden classes), inline caches, and fused superinstructions.
 - **Zero dependencies & compact footprint:** Pure Zig (`0.17.1`), `2.2 MB` stripped `ReleaseFast` CLI (`1.5 MB` `ReleaseSmall`). Embedders (`@import("zqjs")` / `libzqjs.a`) link only the engine.
 - **Modern JavaScript (ES2025 core):** Classes & private fields, closures, generators, `async`/`await`, ES Modules, `BigInt`, `Symbol`, `Proxy`/`Reflect`, `Map`/`Set`/`WeakMap`/`WeakSet`, `ArrayBuffer`/`TypedArray`/`DataView`, `RegExp`, `Date`, `Promise`, `JSON`, and `structuredClone` ([LANGUAGE.md](LANGUAGE.md)).
-- **Explicit Compatibility Contract & Test262 Verified:** Unsupported features report `Unsupported(<feature>)` cleanly instead of silently misbehaving. Verified against **39,332 Test262 tests** (**`29,434` PASS** — `78.53%` of all `language` tests, `91.90%` of applicable tests, **0 crashes / 0 internal errors / 0 timeouts** — [TEST262.md](TEST262.md)).
+- **Explicit Compatibility Contract & Test262 Verified:** Unsupported features report `Unsupported(<feature>)` cleanly instead of silently misbehaving. Verified against **39,147 Test262 tests** (**`30,699` PASS** — `79.97%` of all `language` tests, `93.03%` of applicable tests, **0 crashes / 0 internal errors / 0 timeouts** — [TEST262.md](TEST262.md)).
 - **Generational GC & Hard Sandboxing:** Non-moving generational GC (~0.06 ms p95 minor pauses at 100k–1M live objects), cooperative step slicing, and hard caps on heap, call depth, stack, strings, and `BigInt` ([GC_DESIGN.md](GC_DESIGN.md)).
 - **Embeddable & Interactive:** Opaque Zig API, C11 ABI (`include/zqjs.h`), differential tree-walker oracle (`--engine=treewalk`), and an interactive REPL with syntax highlighting, `Tab` completion, and `Ctrl-R` history.
 
@@ -65,7 +65,7 @@ Legacy sloppy-mode hazards are **intentionally excluded** by design rather than 
 - `with`, `eval` / `Function(...)`, implicit global writes, sparse array holes, legacy octals, and sloppy `this` boxing.
 - Standard built-ins outside ZQJS's scope (e.g. `Intl`, `Temporal`, `Atomics`, `SharedArrayBuffer`, `WeakRef`, `FinalizationRegistry`) report `Unsupported(builtin)` naming the exact identifier.
 
-See [LANGUAGE.md](LANGUAGE.md) for the complete specification and [TEST262.md](TEST262.md) for the full 39,332-test conformance breakdown.
+See [LANGUAGE.md](LANGUAGE.md) for the complete specification and [TEST262.md](TEST262.md) for the full 39,147-test conformance breakdown.
 
 ---
 

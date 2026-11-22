@@ -2481,12 +2481,16 @@ const Parser = struct {
                     depth = @max(depth, value.depth);
                 },
                 .l_paren => {
+                    const outer_method = p.in_class_method;
+                    p.in_class_method = true;
+                    defer p.in_class_method = outer_method;
                     const f = try p.functionRest(t.start, .expression, null, is_async_method, is_generator_method);
                     if (prop_kind != .init) {
                         try p.validateAccessorParams(prop_kind == .getter, f.params, t);
                     }
                     const mut_f = @constCast(f);
                     mut_f.is_method = true;
+                    mut_f.has_home_object = true;
                     if (try p.keyInferredName(k)) |inferred| mut_f.inferred_name = inferred;
                     const value = try p.node(f.span, .{ .function = f }, 0);
                     try props.append(p.arena, .{ .prop = .{ .key = k, .value = value, .shorthand = false, .kind = prop_kind, .span = .{ .start = t.start, .end = value.span.end } } });

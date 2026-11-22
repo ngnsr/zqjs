@@ -43,18 +43,18 @@ ZQJS includes a parallel [tc39/test262](https://github.com/tc39/test262) conform
 
 ---
 
-## Results (M60 — `var`, `arguments`, ASI, `==`/`!=`)
+## Results (M61 — Strict Mode, `Symbol.*`, `RegExp.prototype` Getters, Generic Receivers, Object `super`)
 
 Measured with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
 
 | Suite | Collected | Skipped (meta) | Executed | Unsupported | Limit | Applicable | Pass | Fail | Pass / Executed | Pass / Applicable |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `built-ins` | 23,885 | 7,414 | 16,471 | 3,375 | 456 | 12,640 | **11,481** | 1,159 | **69.70%** | **90.83%** |
-| `language` | 23,832 | 971 | 22,861 | 3,473 | 0 | 19,388 | **17,953** | 1,435 | **78.53%** | **92.60%** |
-| **Combined** | **47,717** | **8,385** | **39,332** | **6,848** | **456** | **32,028** | **29,434** | **2,594** | **74.83%** | **91.90%** |
+| `built-ins` | 23,885 | 7,599 | 16,286 | 2,327 | 459 | 13,500 | **12,416** | 1,084 | **76.24%** | **91.97%** |
+| `language` | 23,832 | 971 | 22,861 | 3,361 | 0 | 19,500 | **18,283** | 1,217 | **79.97%** | **93.76%** |
+| **Combined** | **47,717** | **8,570** | **39,147** | **5,688** | **459** | **33,000** | **30,699** | **2,301** | **78.42%** | **93.03%** |
 
-- **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,332 executed tests (~45 s total on Apple M4).
-- Adding `var` hoisting, unmapped `arguments`, ASI, loose equality (`==`/`!=`), `Boolean`, `Object(...)`/`new Object(...)`, `Array(...)`/`new Array(...)`, primitive wrapper objects (`new Boolean`/`new Number`/`new String`), generic `Array.prototype` receivers, `void`, `globalThis`, `#\u{...}` private & object-literal identifier escapes, and closure/constructor descriptor conformance unlocked **+25,667** applicable tests and **+23,663 passes** (`5,771 → 29,434`, **5.1×** more official tests passing) with **0% VM benchmark regression**.
+- **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,147 executed tests.
+- Building on M60 (`29,434` PASS), adding `"use strict"` directive prologue & strict property writes, `$262.detachArrayBuffer` + detached `ArrayBuffer` guards, `Symbol.species` / `Symbol.{replace, search, split, matchAll, isConcatSpreadable}`, `RegExp.prototype` accessor getters & generic `toString`, `String.raw` / `String.prototype.{concat, toLocaleLowerCase, toLocaleUpperCase}`, generic `String.prototype` & `Array.prototype` receivers, `TypedArray.prototype.toLocaleString`, and `super` in object literal methods/accessors unlocked **+1,265** more passes (`29,434 → 30,699`, **93.03%** Pass / Applicable).
 
 ### Built-ins Breakdown (Applicable Tests)
 

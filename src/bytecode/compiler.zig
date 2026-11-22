@@ -2533,10 +2533,11 @@ const Compiler = struct {
     fn emitPropertyKeyExpr(c: *Compiler, pk: ast.PropertyKey) Error!void {
         switch (pk) {
             .name => |n| {
-                const units = try c.s.gpa.alloc(u16, n.len);
-                defer c.s.gpa.free(units);
-                for (n, 0..) |ch, i| units[i] = ch;
-                try c.emit(.push_const, &.{try c.string(units)});
+                const str = c.s.heap.internUtf8(n) catch |e| switch (e) {
+                    error.LimitExceeded => return error.LimitExceeded,
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                try c.emit(.push_const, &.{try c.constant(Value.fromString(str))});
             },
             .string => |units| try c.emit(.push_const, &.{try c.string(units)}),
             .number => |num| try c.emit(.push_const, &.{try c.number(num)}),

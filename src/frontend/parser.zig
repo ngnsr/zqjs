@@ -171,6 +171,7 @@ const Parser = struct {
     yield_count: u32 = 0,
     in_strict_mode: bool = false,
     in_static_block: bool = false,
+    disallow_return: bool = false,
     /// When probing `async (...)` at `.none`, defer `await` identifier error until we know if `=>` follows.
     in_async_paren: bool = false,
     async_paren_await_span: ?ast.Span = null,
@@ -329,7 +330,19 @@ const Parser = struct {
         var chain: std.ArrayList([]const u8) = .empty;
         while (p.tok.tag == .identifier and (try p.peek()).tag == .colon) {
             const lbl_tok = p.tok;
-            const name = lbl_tok.text(p.source());
+            const name = try p.identText(lbl_tok);
+            if (token.reserved_identifiers.has(name) or lexer_mod.isKeywordText(name)) {
+                return p.fail(.{ .syntax_error = "reserved word cannot be a label" }, lbl_tok);
+            }
+            if (p.in_strict_mode and isStrictReservedWord(name)) {
+                return p.fail(.{ .syntax_error = "Unexpected strict mode reserved word" }, lbl_tok);
+            }
+            if (std.mem.eql(u8, name, "await") and p.async_ctx != .none) {
+                return p.fail(.{ .syntax_error = "'await' is not a valid label in an async function" }, lbl_tok);
+            }
+            if (std.mem.eql(u8, name, "yield") and p.yield_ctx != .none) {
+                return p.fail(.{ .syntax_error = "'yield' is not a valid label in a generator" }, lbl_tok);
+            }
             for (p.labels.items) |existing| {
                 if (std.mem.eql(u8, existing.name, name)) {
                     return p.fail(.{ .syntax_error = "label has already been declared" }, lbl_tok);
@@ -850,7 +863,13 @@ const Parser = struct {
         try p.advance();
         var label: ?[]const u8 = null;
         if (p.tok.tag == .identifier and !p.tok.newline_before) {
-            const name = p.tok.text(p.source());
+            const name = try p.identText(p.tok);
+            if (std.mem.eql(u8, name, "await") and p.async_ctx != .none) {
+                return p.fail(.{ .syntax_error = "'await' is not a valid label in an async function" }, p.tok);
+            }
+            if (std.mem.eql(u8, name, "yield") and p.yield_ctx != .none) {
+                return p.fail(.{ .syntax_error = "'yield' is not a valid label in a generator" }, p.tok);
+            }
             var found: ?LabelEntry = null;
             var i = p.labels.items.len;
             while (i > 0) {
@@ -944,7 +963,7 @@ const Parser = struct {
     /// reported as Unsupported like any other ASI.
     fn returnStatement(p: *Parser) Error!ast.Stmt {
         const t = p.tok;
-        if (p.function_depth == 0 or p.in_static_block) return p.fail(.{ .syntax_error = "'return' outside a function" }, t);
+        if (p.function_depth == 0 or p.disallow_return) return p.fail(.{ .syntax_error = "'return' outside a function" }, t);
         try p.advance();
         if (p.tok.tag == .semicolon) {
             const end = p.tok;
@@ -1086,10 +1105,13 @@ const Parser = struct {
             p.function_depth -= 1;
         }
         const outer_static_block = p.in_static_block;
+        const outer_disallow_return = p.disallow_return;
         const outer_strict = p.in_strict_mode;
         p.in_static_block = false;
+        p.disallow_return = false;
         defer {
             p.in_static_block = outer_static_block;
+            p.disallow_return = outer_disallow_return;
             p.in_strict_mode = outer_strict;
         }
         const parsed_body = try p.parseFunctionBody();
@@ -1805,6 +1827,7 @@ const Parser = struct {
         const outer_yield_ctx = p.yield_ctx;
         const outer_derived = p.in_derived_ctor;
         const outer_strict = p.in_strict_mode;
+        const outer_disallow_return = p.disallow_return;
         p.loop_depth = 0;
         p.switch_depth = 0;
         p.labels = .empty;
@@ -1812,6 +1835,7 @@ const Parser = struct {
         p.function_depth += 1;
         p.async_ctx = if (is_async) .body else .none;
         p.yield_ctx = .none;
+        p.disallow_return = false;
         defer {
             p.loop_depth = outer_loops;
             p.switch_depth = outer_switches;
@@ -1821,6 +1845,7 @@ const Parser = struct {
             p.async_ctx = outer_async_ctx;
             p.yield_ctx = outer_yield_ctx;
             p.in_strict_mode = outer_strict;
+            p.disallow_return = outer_disallow_return;
         }
 
         var body: []const ast.Stmt = undefined;
@@ -2721,6 +2746,12 @@ const Parser = struct {
                 if (p.in_strict_mode and isStrictReservedWord(decoded)) {
                     return p.fail(.{ .syntax_error = "Unexpected strict mode reserved word" }, t);
                 }
+                if (std.mem.eql(u8, decoded, "await") and p.async_ctx != .none) {
+                    return p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t);
+                }
+                if (std.mem.eql(u8, decoded, "yield") and p.yield_ctx != .none) {
+                    return p.fail(.{ .syntax_error = "'yield' is not a valid identifier name in a generator" }, t);
+                }
                 if (p.in_static_block and std.mem.eql(u8, decoded, "arguments")) {
                     return p.fail(.{ .syntax_error = "'arguments' is not allowed in class field or static initializer" }, t);
                 }
@@ -3366,6 +3397,7 @@ const Parser = struct {
                 const outer_async_ctx = p.async_ctx;
                 const outer_yield_ctx = p.yield_ctx;
                 const outer_static_block = p.in_static_block;
+                const outer_disallow_return = p.disallow_return;
                 p.loop_depth = 0;
                 p.switch_depth = 0;
                 p.labels = .empty;
@@ -3375,6 +3407,7 @@ const Parser = struct {
                 p.yield_ctx = .none;
                 p.function_depth += 1;
                 p.in_static_block = true;
+                p.disallow_return = true;
                 defer {
                     p.loop_depth = outer_loops;
                     p.switch_depth = outer_switches;
@@ -3385,6 +3418,7 @@ const Parser = struct {
                     p.yield_ctx = outer_yield_ctx;
                     p.function_depth -= 1;
                     p.in_static_block = outer_static_block;
+                    p.disallow_return = outer_disallow_return;
                 }
                 const parsed_body = try p.parseFunctionBody();
                 const blk_fn = try p.arena.create(ast.Function);
@@ -3417,7 +3451,7 @@ const Parser = struct {
                 }
             } else if (p.isText(p.tok, "get") or p.isText(p.tok, "set")) {
                 const next = try p.peek();
-                if (next.tag != .l_paren and next.tag != .semicolon and next.tag != .r_brace and next.tag != .eq) {
+                if (next.tag != .l_paren and next.tag != .semicolon and next.tag != .r_brace and next.tag != .eq and next.tag != .star) {
                     method_kind = if (p.isText(p.tok, "get")) .getter else .setter;
                     try p.advance();
                 }
@@ -3455,7 +3489,8 @@ const Parser = struct {
                 },
             };
 
-            const is_ctor = !is_static and !is_private and key == .name and std.mem.eql(u8, key.name, "constructor");
+            const key_is_ctor = !is_private and propKeyEqualsAscii(key, "constructor");
+            const is_ctor = !is_static and key_is_ctor;
             if (is_ctor and is_async) {
                 return p.fail(.{ .syntax_error = "class constructor may not be an async method" }, key_tok);
             }
@@ -3468,14 +3503,14 @@ const Parser = struct {
             if (is_ctor and explicit_ctor != null) {
                 return p.fail(.{ .syntax_error = "a class may only have one constructor" }, key_tok);
             }
-            if (is_static and !is_private and key == .name and std.mem.eql(u8, key.name, "prototype")) {
+            if (is_static and !is_private and propKeyEqualsAscii(key, "prototype")) {
                 return p.fail(.{ .syntax_error = "classes may not have a static property named 'prototype'" }, key_tok);
             }
             if (p.tok.tag != .l_paren) {
                 if (is_async or is_generator or method_kind != .method) {
                     return p.fail(.{ .syntax_error = "expected '('" }, p.tok);
                 }
-                if (is_ctor) {
+                if (key_is_ctor) {
                     return p.fail(.{ .syntax_error = "Classes may not have a field named 'constructor'" }, key_tok);
                 }
                 var init_fn: ?*const ast.Function = null;
@@ -3489,11 +3524,13 @@ const Parser = struct {
                     const outer_async_ctx = p.async_ctx;
                     const outer_yield_ctx = p.yield_ctx;
                     const outer_static_block = p.in_static_block;
+                    const outer_disallow_return = p.disallow_return;
                     p.in_derived_ctor = .none;
                     p.in_class_method = true;
                     p.async_ctx = .none;
                     p.yield_ctx = .none;
                     p.in_static_block = true;
+                    p.disallow_return = true;
                     p.function_depth += 1;
                     defer {
                         p.in_derived_ctor = outer_derived;
@@ -3501,6 +3538,7 @@ const Parser = struct {
                         p.async_ctx = outer_async_ctx;
                         p.yield_ctx = outer_yield_ctx;
                         p.in_static_block = outer_static_block;
+                        p.disallow_return = outer_disallow_return;
                         p.function_depth -= 1;
                     }
                     const init_expr = try p.nested();
@@ -3570,11 +3608,15 @@ const Parser = struct {
             const outer_labels = p.labels;
             const outer_derived = p.in_derived_ctor;
             const outer_method = p.in_class_method;
+            const outer_static_block = p.in_static_block;
+            const outer_disallow_return = p.disallow_return;
             p.loop_depth = 0;
             p.switch_depth = 0;
             p.labels = .empty;
             p.in_derived_ctor = if (is_ctor and has_super) .direct else .none;
             p.in_class_method = true;
+            p.in_static_block = false;
+            p.disallow_return = false;
             p.function_depth += 1;
             p.async_ctx = if (is_async) .body else .none;
             p.yield_ctx = if (is_generator) .body else .none;
@@ -3584,6 +3626,8 @@ const Parser = struct {
                 p.labels = outer_labels;
                 p.in_derived_ctor = outer_derived;
                 p.in_class_method = outer_method;
+                p.in_static_block = outer_static_block;
+                p.disallow_return = outer_disallow_return;
                 p.function_depth -= 1;
             }
             const parsed_body = try p.parseFunctionBody();
@@ -3643,6 +3687,20 @@ const Parser = struct {
             .static_items = static_items.items,
         };
         return cls;
+    }
+
+    fn propKeyEqualsAscii(key: ast.PropertyKey, comptime ascii: []const u8) bool {
+        return switch (key) {
+            .name => |n| std.mem.eql(u8, n, ascii),
+            .string => |units| blk: {
+                if (units.len != ascii.len) break :blk false;
+                for (units, ascii) |u, c| {
+                    if (u != c) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        };
     }
 
     fn synthDefaultCtor(p: *Parser, sp: ast.Span, name_decl: ?ast.Declarator, has_super: bool) Error!*const ast.Function {

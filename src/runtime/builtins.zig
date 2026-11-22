@@ -112,6 +112,7 @@ pub const Realm = struct {
     sym_to_string_tag: *heap_mod.Symbol,
     sym_has_instance: *heap_mod.Symbol,
     sym_species: *heap_mod.Symbol,
+    sym_match: *heap_mod.Symbol,
     sym_replace: *heap_mod.Symbol,
     sym_search: *heap_mod.Symbol,
     sym_split: *heap_mod.Symbol,
@@ -309,6 +310,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .sym_to_string_tag = try h.newSymbol(try h.ascii("Symbol.toStringTag"), false),
         .sym_has_instance = try h.newSymbol(try h.ascii("Symbol.hasInstance"), false),
         .sym_species = try h.newSymbol(try h.ascii("Symbol.species"), false),
+        .sym_match = try h.newSymbol(try h.ascii("Symbol.match"), false),
         .sym_replace = try h.newSymbol(try h.ascii("Symbol.replace"), false),
         .sym_search = try h.newSymbol(try h.ascii("Symbol.search"), false),
         .sym_split = try h.newSymbol(try h.ascii("Symbol.split"), false),
@@ -687,6 +689,12 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .writable = false,
         .configurable = false,
     });
+    try rt.heap.defineProperty(r.symbol_namespace, try rt.heap.internAscii("match"), .{
+        .value = Value.fromSymbol(r.sym_match),
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
     try rt.heap.defineProperty(r.symbol_namespace, try rt.heap.internAscii("replace"), .{
         .value = Value.fromSymbol(r.sym_replace),
         .enumerable = false,
@@ -716,6 +724,10 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .enumerable = false,
         .writable = false,
         .configurable = false,
+    });
+    try rt.heap.definePropKey(r.regexp_prototype, heap_mod.PropKey.fromSymbol(r.sym_match), .{
+        .value = Value.fromNative(&regexp_sym_match),
+        .enumerable = false,
     });
     try rt.heap.definePropKey(r.regexp_prototype, heap_mod.PropKey.fromSymbol(r.sym_replace), .{
         .value = Value.fromNative(&regexp_sym_replace),
@@ -7604,7 +7616,79 @@ pub fn resolvePromiseValue(rt: *Runtime, p_obj: *Object, val: Value) Error!void 
         return;
     }
 
+    if (val.isObjectLike()) {
+        var root_buf = [_]Value{ Value.fromObject(p_obj), val, .undefined, .undefined, .undefined };
+        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+        try roots.register(rt);
+        defer roots.unregister(rt);
+
+        const then_val = object.get(rt, val, try object.named(rt, "then")) catch |e| {
+            if (e == error.Thrown) {
+                try settlePromiseFromJob(rt, p_obj, true, try rt.catchValue());
+                return;
+            }
+            return e;
+        };
+        root_buf[2] = then_val;
+        if (then_val.isFunction()) {
+            const env = try rt.heap.newArray(null);
+            root_buf[3] = Value.fromObject(env);
+            try rt.heap.appendElements(env, &.{ Value.fromObject(p_obj), val, then_val, Value.fromBool(false) });
+            const job_cb = try rt.heap.newNativeClosure(&thenableJobCb, env);
+            root_buf[4] = Value.fromClosure(job_cb);
+            try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
+            p_obj.kind.promise.already_resolved = true;
+            rt.microtasks.appendAssumeCapacity(.{
+                .kind = .reaction,
+                .child = null,
+                .cb = root_buf[4],
+                .arg = .undefined,
+            });
+            return;
+        }
+    }
+
     try settlePromiseFromJob(rt, p_obj, false, val);
+}
+
+fn thenableJobCb(rt: *Runtime, env: *Object, _: []const Value) Error!Value {
+    var root_buf = [_]Value{ Value.fromObject(env), .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const res_fn = try rt.heap.newNativeClosure(&thenableResolveCb, env);
+    root_buf[1] = Value.fromClosure(res_fn);
+    const rej_fn = try rt.heap.newNativeClosure(&thenableRejectCb, env);
+    root_buf[2] = Value.fromClosure(rej_fn);
+
+    _ = rt.callCallable(env.kind.array.items[2], env.kind.array.items[1], &.{ root_buf[1], root_buf[2] }) catch |e| {
+        if (e == error.Thrown) {
+            if (!env.kind.array.items[3].asBool()) {
+                rt.heap.storeElement(env, 3, Value.fromBool(true));
+                try settlePromiseFromJob(rt, env.kind.array.items[0].asObject(), true, try rt.catchValue());
+            } else {
+                _ = rt.catchValue() catch {};
+            }
+            return .undefined;
+        }
+        return e;
+    };
+    return .undefined;
+}
+
+fn thenableResolveCb(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
+    if (env.kind.array.items[3].asBool()) return .undefined;
+    rt.heap.storeElement(env, 3, Value.fromBool(true));
+    try resolvePromiseValue(rt, env.kind.array.items[0].asObject(), arg(args, 0));
+    return .undefined;
+}
+
+fn thenableRejectCb(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
+    if (env.kind.array.items[3].asBool()) return .undefined;
+    rt.heap.storeElement(env, 3, Value.fromBool(true));
+    try settlePromiseFromJob(rt, env.kind.array.items[0].asObject(), true, arg(args, 0));
+    return .undefined;
 }
 
 pub fn adoptPromiseNow(rt: *Runtime, p_obj: *Object, other: *Object) Error!void {
@@ -9611,10 +9695,86 @@ fn regexpToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     }));
 }
 
+const regexp_sym_match: Native = .{ .name = "[Symbol.match]", .length = 1, .call = regexpSymMatch };
 const regexp_sym_replace: Native = .{ .name = "[Symbol.replace]", .length = 2, .call = regexpSymReplace };
 const regexp_sym_search: Native = .{ .name = "[Symbol.search]", .length = 1, .call = regexpSymSearch };
 const regexp_sym_split: Native = .{ .name = "[Symbol.split]", .length = 2, .call = regexpSymSplit };
 const regexp_sym_match_all: Native = .{ .name = "[Symbol.matchAll]", .length = 1, .call = regexpSymMatchAll };
+
+fn regExpExecGeneric(rt: *Runtime, rx: Value, s_val: Value) Error!Value {
+    var root_buf = [_]Value{ rx, s_val, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const exec_fn = try object.get(rt, rx, try object.named(rt, "exec"));
+    root_buf[2] = exec_fn;
+    if (exec_fn.isFunction()) {
+        const res = try rt.callCallable(exec_fn, rx, &.{s_val});
+        if (!res.isObjectLike() and !res.isNull()) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "RegExp exec method returned something other than an Object or null" }});
+        }
+        return res;
+    }
+    if (rx.isObject() and rx.asObject().kind == .regexp) {
+        return regexpExecImpl(rt, rx.asObject(), s_val.asString());
+    }
+    return rt.throw(.TypeError, &.{.{ .ascii = "RegExp exec called on incompatible receiver" }});
+}
+
+fn regexpSymMatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype[Symbol.match] called on non-object" }});
+    }
+    var root_buf = [_]Value{ this, arg(args, 0), .undefined, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const s = try toStringObj(rt, root_buf[1]);
+    const s_val = Value.fromString(s);
+    root_buf[2] = s_val;
+
+    const flags_val = try object.get(rt, this, try object.named(rt, "flags"));
+    if (flags_val.isUndefined() or flags_val.isNull()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype[Symbol.match] flags is null or undefined" }});
+    }
+    const flags_s = try toStringObj(rt, flags_val);
+    root_buf[3] = Value.fromString(flags_s);
+    const is_global = std.mem.indexOfScalar(u16, flags_s.units, 'g') != null;
+
+    if (!is_global) {
+        return regExpExecGeneric(rt, this, s_val);
+    }
+
+    const full_unicode = std.mem.indexOfScalar(u16, flags_s.units, 'u') != null or
+        std.mem.indexOfScalar(u16, flags_s.units, 'v') != null;
+    try object.setStrict(rt, this, try object.named(rt, "lastIndex"), Value.fromNumber(0));
+
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    root_buf[4] = Value.fromObject(out);
+
+    while (true) {
+        const res = try regExpExecGeneric(rt, this, s_val);
+        if (res.isNull()) {
+            if (out.kind.array.items.len == 0) return .null;
+            return Value.fromObject(out);
+        }
+        root_buf[5] = res;
+        const m0 = try object.get(rt, res, .{ .index = 0 });
+        const m_str = try toStringObj(rt, m0);
+        root_buf[5] = Value.fromString(m_str);
+        try rt.heap.appendElement(out, root_buf[5]);
+        if (m_str.units.len == 0) {
+            const li_val = try object.get(rt, this, try object.named(rt, "lastIndex"));
+            const this_idx = try toLength(rt, li_val);
+            const next_idx = advanceStringIndex(s.units, @intFromFloat(this_idx), full_unicode);
+            try object.setStrict(rt, this, try object.named(rt, "lastIndex"), Value.fromNumber(@floatFromInt(next_idx)));
+        }
+        root_buf[5] = .undefined;
+    }
+}
 
 fn regexpSymReplace(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     if (!this.isObject() and !this.isClosure() and !this.isNative()) {
@@ -9628,29 +9788,32 @@ fn regexpSymReplace(rt: *Runtime, this: Value, args: []const Value) Error!Value 
 }
 
 fn regexpSymSearch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    if (!this.isObject() and !this.isClosure() and !this.isNative()) {
+    if (!this.isObjectLike()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype[Symbol.search] called on non-object" }});
     }
-    if (this.isObject() and this.asObject().kind == .regexp) {
-        const rx_obj = this.asObject();
-        var root_buf = [_]Value{ this, arg(args, 0), .undefined };
-        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
-        try roots.register(rt);
-        defer roots.unregister(rt);
+    var root_buf = [_]Value{ this, arg(args, 0), .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
 
-        const s = try toStringObj(rt, root_buf[1]);
-        root_buf[2] = Value.fromString(s);
+    const s = try toStringObj(rt, root_buf[1]);
+    const s_val = Value.fromString(s);
+    root_buf[2] = s_val;
 
-        const cap_len = @as(usize, rx_obj.kind.regexp.program.capture_count) + 1;
-        const captures = try rt.gpa.alloc(?regex.Range, cap_len);
-        defer rt.gpa.free(captures);
-
-        if (try runRegExpMatcher(rt, &rx_obj.kind.regexp.program, s.units, 0, captures)) {
-            return Value.fromNumber(@floatFromInt(captures[0].?.start));
-        }
-        return Value.fromNumber(-1);
+    const li_key = try object.named(rt, "lastIndex");
+    const prev_li = try object.get(rt, this, li_key);
+    root_buf[3] = prev_li;
+    if (!sameValue(prev_li, Value.fromNumber(0))) {
+        try object.setStrict(rt, this, li_key, Value.fromNumber(0));
     }
-    return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype[Symbol.search] requires a RegExp receiver" }});
+    const res = try regExpExecGeneric(rt, this, s_val);
+    root_buf[4] = res;
+    const cur_li = try object.get(rt, this, li_key);
+    if (!sameValue(cur_li, prev_li)) {
+        try object.setStrict(rt, this, li_key, prev_li);
+    }
+    if (res.isNull()) return Value.fromNumber(-1);
+    return object.get(rt, res, try object.named(rt, "index"));
 }
 
 fn regexpSymSplit(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -9695,8 +9858,18 @@ fn coerceToRegExp(rt: *Runtime, v: Value) Error!*Object {
 }
 
 fn stringMatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const s = try requireStringCoercible(rt, this);
-    var root_buf = [_]Value{ Value.fromString(s), arg(args, 0), .undefined, .undefined, .undefined };
+    if (this.isUndefined() or this.isNull()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype.match called on null or undefined" }});
+    }
+    const rx_arg = arg(args, 0);
+    if (!rx_arg.isUndefined() and !rx_arg.isNull()) {
+        const r = try realm(rt);
+        if (try object.getMethod(rt, rx_arg, .{ .symbol = r.sym_match })) |matcher| {
+            return rt.callCallable(matcher, rx_arg, &.{this});
+        }
+    }
+    const s = try toStringObj(rt, this);
+    var root_buf = [_]Value{ Value.fromString(s), rx_arg, .undefined, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);

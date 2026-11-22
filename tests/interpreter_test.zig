@@ -398,7 +398,7 @@ test "M14.3: Set unsupported methods, non-Set receivers, and non-array iterables
 }
 
 test "M14.4: unsupported iterables, Iterator.prototype methods, and member for-of targets" {
-    try expectUnsupported("Symbol.match;", "", "('match')");
+    try expectUnsupported("Symbol.unscopables;", "", "('unscopables')");
 }
 
 test "M15.1: JSON.parse unsupported properties, new JSON(), nesting limit, and OOM" {

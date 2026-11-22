@@ -474,6 +474,7 @@ pub const Runtime = struct {
             h.markObj(&r.sym_to_string_tag.obj);
             h.markObj(&r.sym_has_instance.obj);
             h.markObj(&r.sym_species.obj);
+            h.markObj(&r.sym_match.obj);
             h.markObj(&r.sym_replace.obj);
             h.markObj(&r.sym_search.obj);
             h.markObj(&r.sym_split.obj);

@@ -328,7 +328,7 @@ test "built-ins: known to node but not implemented is Unsupported, naming the me
     try expectUnsupported("(1).toFixed;", "", "('toFixed')");
     try expectUnsupported("Object.prototype.__defineGetter__;", "", "('__defineGetter__')");
     try expectUnsupported("({}).toLocaleString;", "", "('toLocaleString')");
-    try expectUnsupported("({}).constructor;", "", "('constructor')");
+    try expectUnsupported("({}).__lookupGetter__;", "", "('__lookupGetter__')");
     try expectUnsupported("console;", "", "('console')");
     try expectUnsupported("Function('return 1');", "", "Unsupported(builtin)");
     // Names node doesn't have are plain misses (undefined / ReferenceError), not Unsupported.
@@ -387,13 +387,13 @@ test "M11.3b: Array/String unimplemented methods, non-matching receivers, and no
 }
 
 test "M14.2: Map unsupported methods, non-Map receivers, and non-Map new() targets" {
-    try expectUnsupported("new Map().constructor;", "", "('constructor')");
+    try expectUnsupported("new Map().getOrInsert;", "", "('getOrInsert')");
     try expectUnsupported("let o = { get: new Map().get }; o.get('x');", "", "Unsupported(builtin)");
     try expectUnsupported("new Function();", "", "Unsupported(builtin)");
 }
 
 test "M14.3: Set unsupported methods, non-Set receivers, and non-array iterables" {
-    try expectUnsupported("new Set().constructor;", "", "('constructor')");
+    try expectUnsupported("new Set().__lookupGetter__;", "", "('__lookupGetter__')");
     try expectUnsupported("let o = { has: new Set().has }; o.has('x');", "", "Unsupported(builtin)");
 }
 

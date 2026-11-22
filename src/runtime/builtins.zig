@@ -397,14 +397,14 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.number_namespace, "isFinite", &number_is_finite);
     try method(rt, r.number_namespace, "isNaN", &number_is_nan);
     try method(rt, r.number_namespace, "isSafeInteger", &number_is_safe_integer);
-    try constant(rt, r.number_namespace, "MAX_SAFE_INTEGER", Value.fromNumber(9007199254740991.0));
-    try constant(rt, r.number_namespace, "MIN_SAFE_INTEGER", Value.fromNumber(-9007199254740991.0));
-    try constant(rt, r.number_namespace, "EPSILON", Value.fromNumber(std.math.floatEps(f64)));
-    try constant(rt, r.number_namespace, "MAX_VALUE", Value.fromNumber(std.math.floatMax(f64)));
-    try constant(rt, r.number_namespace, "MIN_VALUE", Value.fromNumber(std.math.floatTrueMin(f64)));
-    try constant(rt, r.number_namespace, "POSITIVE_INFINITY", Value.fromNumber(std.math.inf(f64)));
-    try constant(rt, r.number_namespace, "NEGATIVE_INFINITY", Value.fromNumber(-std.math.inf(f64)));
-    try constant(rt, r.number_namespace, "NaN", Value.fromNumber(std.math.nan(f64)));
+    try immutableConstant(rt, r.number_namespace, "MAX_SAFE_INTEGER", Value.fromNumber(9007199254740991.0));
+    try immutableConstant(rt, r.number_namespace, "MIN_SAFE_INTEGER", Value.fromNumber(-9007199254740991.0));
+    try immutableConstant(rt, r.number_namespace, "EPSILON", Value.fromNumber(std.math.floatEps(f64)));
+    try immutableConstant(rt, r.number_namespace, "MAX_VALUE", Value.fromNumber(std.math.floatMax(f64)));
+    try immutableConstant(rt, r.number_namespace, "MIN_VALUE", Value.fromNumber(std.math.floatTrueMin(f64)));
+    try immutableConstant(rt, r.number_namespace, "POSITIVE_INFINITY", Value.fromNumber(std.math.inf(f64)));
+    try immutableConstant(rt, r.number_namespace, "NEGATIVE_INFINITY", Value.fromNumber(-std.math.inf(f64)));
+    try immutableConstant(rt, r.number_namespace, "NaN", Value.fromNumber(std.math.nan(f64)));
     try method(rt, r.proxy_namespace, "revocable", &proxy_revocable);
     try defineToStringTag(rt, r.reflect, r.sym_to_string_tag, "Reflect");
     try method(rt, r.reflect, "get", &reflect_get);
@@ -498,12 +498,12 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try initErrorProto(rt, r.eval_error_prototype, r.eval_error_namespace, "EvalError", &eval_error_global);
     try initErrorProto(rt, r.uri_error_prototype, r.uri_error_namespace, "URIError", &uri_error_global);
     try initErrorProto(rt, r.aggregate_error_prototype, r.aggregate_error_namespace, "AggregateError", &aggregate_error_global);
-    try constant(rt, r.regexp_namespace, "prototype", Value.fromObject(r.regexp_prototype));
+    try immutableConstant(rt, r.regexp_namespace, "prototype", Value.fromObject(r.regexp_prototype));
     try constant(rt, r.regexp_prototype, "constructor", Value.fromNative(&regexp_global));
     try method(rt, r.regexp_prototype, "exec", &regexp_exec);
     try method(rt, r.regexp_prototype, "test", &regexp_test);
     try method(rt, r.regexp_prototype, "toString", &regexp_to_string);
-    try constant(rt, r.date_namespace, "prototype", Value.fromObject(r.date_prototype));
+    try immutableConstant(rt, r.date_namespace, "prototype", Value.fromObject(r.date_prototype));
     try method(rt, r.date_namespace, "now", &date_now);
     try method(rt, r.date_namespace, "UTC", &date_utc);
     try method(rt, r.date_namespace, "parse", &date_parse);
@@ -554,34 +554,33 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .writable = false,
         .configurable = true,
     });
-    try constant(rt, r.function_namespace, "prototype", Value.fromObject(r.function_prototype));
+    try immutableConstant(rt, r.function_namespace, "prototype", Value.fromObject(r.function_prototype));
     try constant(rt, r.function_prototype, "constructor", Value.fromNative(&function_global));
-    try constant(rt, r.object_namespace, "prototype", Value.fromObject(r.object_prototype));
-    try constant(rt, r.array_namespace, "prototype", Value.fromObject(r.array_prototype));
+    try immutableConstant(rt, r.object_namespace, "prototype", Value.fromObject(r.object_prototype));
+    try constant(rt, r.object_prototype, "constructor", Value.fromNative(&object_global));
+    try immutableConstant(rt, r.array_namespace, "prototype", Value.fromObject(r.array_prototype));
     try constant(rt, r.array_prototype, "constructor", Value.fromNative(&array_global));
-    try constant(rt, r.string_namespace, "prototype", Value.fromObject(r.string_prototype));
+    try immutableConstant(rt, r.string_namespace, "prototype", Value.fromObject(r.string_prototype));
     try constant(rt, r.string_prototype, "constructor", Value.fromNative(&string_global));
     try method(rt, r.string_prototype, "toString", &string_to_string);
     try method(rt, r.string_prototype, "valueOf", &string_value_of);
-    try constant(rt, r.number_namespace, "prototype", Value.fromObject(r.number_prototype));
+    try immutableConstant(rt, r.number_namespace, "prototype", Value.fromObject(r.number_prototype));
     try constant(rt, r.number_prototype, "constructor", Value.fromNative(&number_global));
     try method(rt, r.number_prototype, "toString", &number_to_string);
     try method(rt, r.number_prototype, "toLocaleString", &number_to_locale_string);
     try method(rt, r.number_prototype, "valueOf", &number_value_of);
-    try rt.heap.defineProperty(r.boolean_namespace, try rt.heap.internAscii("prototype"), .{
-        .value = Value.fromObject(r.boolean_prototype),
-        .enumerable = false,
-        .writable = false,
-        .configurable = false,
-    });
+    try immutableConstant(rt, r.boolean_namespace, "prototype", Value.fromObject(r.boolean_prototype));
     try constant(rt, r.boolean_prototype, "constructor", Value.fromNative(&boolean_global));
     try method(rt, r.boolean_prototype, "toString", &boolean_to_string);
     try method(rt, r.boolean_prototype, "valueOf", &boolean_value_of);
-    try constant(rt, r.map_namespace, "prototype", Value.fromObject(r.map_prototype));
-    try constant(rt, r.set_namespace, "prototype", Value.fromObject(r.set_prototype));
-    try constant(rt, r.weak_map_namespace, "prototype", Value.fromObject(r.weak_map_prototype));
-    try constant(rt, r.weak_set_namespace, "prototype", Value.fromObject(r.weak_set_prototype));
-    try constant(rt, r.promise_namespace, "prototype", Value.fromObject(r.promise_prototype));
+    try immutableConstant(rt, r.map_namespace, "prototype", Value.fromObject(r.map_prototype));
+    try constant(rt, r.map_prototype, "constructor", Value.fromNative(&map_global));
+    try immutableConstant(rt, r.set_namespace, "prototype", Value.fromObject(r.set_prototype));
+    try constant(rt, r.set_prototype, "constructor", Value.fromNative(&set_global));
+    try immutableConstant(rt, r.weak_map_namespace, "prototype", Value.fromObject(r.weak_map_prototype));
+    try immutableConstant(rt, r.weak_set_namespace, "prototype", Value.fromObject(r.weak_set_prototype));
+    try immutableConstant(rt, r.promise_namespace, "prototype", Value.fromObject(r.promise_prototype));
+    try constant(rt, r.promise_prototype, "constructor", Value.fromNative(&promise_global));
     try method(rt, r.function_prototype, "call", &function_call);
     try method(rt, r.function_prototype, "apply", &function_apply);
     try method(rt, r.function_prototype, "bind", &function_bind);
@@ -695,6 +694,11 @@ fn link(rt: *Runtime, o: *Object, name: []const u8, target: *Object) Error!void 
 fn constant(rt: *Runtime, o: *Object, name: []const u8, v: Value) Error!void {
     const k = try rt.heap.internAscii(name);
     try rt.heap.defineProperty(o, k, .{ .value = v, .enumerable = false });
+}
+
+fn immutableConstant(rt: *Runtime, o: *Object, name: []const u8, v: Value) Error!void {
+    const k = try rt.heap.internAscii(name);
+    try rt.heap.defineProperty(o, k, .{ .value = v, .enumerable = false, .writable = false, .configurable = false });
 }
 
 pub const function_has_instance: Native = .{ .name = "[Symbol.hasInstance]", .length = 1, .call = functionHasInstance };
@@ -822,27 +826,27 @@ pub const number_global: Native = .{ .name = "Number", .length = 1, .call = numb
 pub const boolean_global: Native = .{ .name = "Boolean", .length = 1, .call = booleanCall, .construct = booleanConstruct, .namespace = .boolean };
 pub const function_global: Native = .{ .name = "Function", .length = 1, .call = notCallable, .namespace = .function };
 pub const parse_int_global: Native = .{ .name = "parseInt", .length = 2, .call = parseIntImpl };
-pub const parse_float_global: Native = .{ .name = "parseFloat", .call = parseFloatImpl };
-pub const is_nan_global: Native = .{ .name = "isNaN", .call = globalIsNaN };
-pub const is_finite_global: Native = .{ .name = "isFinite", .call = globalIsFinite };
-pub const encode_uri_global: Native = .{ .name = "encodeURI", .call = globalEncodeURI };
-pub const decode_uri_global: Native = .{ .name = "decodeURI", .call = globalDecodeURI };
-pub const encode_uri_component_global: Native = .{ .name = "encodeURIComponent", .call = globalEncodeURIComponent };
-pub const decode_uri_component_global: Native = .{ .name = "decodeURIComponent", .call = globalDecodeURIComponent };
+pub const parse_float_global: Native = .{ .name = "parseFloat", .length = 1, .call = parseFloatImpl };
+pub const is_nan_global: Native = .{ .name = "isNaN", .length = 1, .call = globalIsNaN };
+pub const is_finite_global: Native = .{ .name = "isFinite", .length = 1, .call = globalIsFinite };
+pub const encode_uri_global: Native = .{ .name = "encodeURI", .length = 1, .call = globalEncodeURI };
+pub const decode_uri_global: Native = .{ .name = "decodeURI", .length = 1, .call = globalDecodeURI };
+pub const encode_uri_component_global: Native = .{ .name = "encodeURIComponent", .length = 1, .call = globalEncodeURIComponent };
+pub const decode_uri_component_global: Native = .{ .name = "decodeURIComponent", .length = 1, .call = globalDecodeURIComponent };
 pub const map_global: Native = .{ .name = "Map", .call = mapWithoutNew, .construct = mapConstruct, .namespace = .map };
 pub const set_global: Native = .{ .name = "Set", .call = setWithoutNew, .construct = setConstruct, .namespace = .set };
 pub const weak_map_global: Native = .{ .name = "WeakMap", .call = weakMapWithoutNew, .construct = weakMapConstruct, .namespace = .weak_map };
 pub const weak_set_global: Native = .{ .name = "WeakSet", .call = weakSetWithoutNew, .construct = weakSetConstruct, .namespace = .weak_set };
-pub const promise_global: Native = .{ .name = "Promise", .call = promiseWithoutNew, .construct = promiseConstruct, .namespace = .promise };
-pub const error_global: Native = .{ .name = "Error", .call = errorCall, .construct = errorConstruct, .namespace = .@"error" };
-pub const type_error_global: Native = .{ .name = "TypeError", .call = typeErrorCall, .construct = typeErrorConstruct, .namespace = .type_error };
-pub const range_error_global: Native = .{ .name = "RangeError", .call = rangeErrorCall, .construct = rangeErrorConstruct, .namespace = .range_error };
-pub const syntax_error_global: Native = .{ .name = "SyntaxError", .call = syntaxErrorCall, .construct = syntaxErrorConstruct, .namespace = .syntax_error };
-pub const reference_error_global: Native = .{ .name = "ReferenceError", .call = referenceErrorCall, .construct = referenceErrorConstruct, .namespace = .reference_error };
-pub const eval_error_global: Native = .{ .name = "EvalError", .call = evalErrorCall, .construct = evalErrorConstruct, .namespace = .eval_error };
-pub const uri_error_global: Native = .{ .name = "URIError", .call = uriErrorCall, .construct = uriErrorConstruct, .namespace = .uri_error };
-pub const aggregate_error_global: Native = .{ .name = "AggregateError", .call = aggregateErrorCall, .construct = aggregateErrorConstruct, .namespace = .aggregate_error };
-pub const regexp_global: Native = .{ .name = "RegExp", .call = regexpCall, .construct = regexpConstruct, .namespace = .regexp };
+pub const promise_global: Native = .{ .name = "Promise", .length = 1, .call = promiseWithoutNew, .construct = promiseConstruct, .namespace = .promise };
+pub const error_global: Native = .{ .name = "Error", .length = 1, .call = errorCall, .construct = errorConstruct, .namespace = .@"error" };
+pub const type_error_global: Native = .{ .name = "TypeError", .length = 1, .call = typeErrorCall, .construct = typeErrorConstruct, .namespace = .type_error };
+pub const range_error_global: Native = .{ .name = "RangeError", .length = 1, .call = rangeErrorCall, .construct = rangeErrorConstruct, .namespace = .range_error };
+pub const syntax_error_global: Native = .{ .name = "SyntaxError", .length = 1, .call = syntaxErrorCall, .construct = syntaxErrorConstruct, .namespace = .syntax_error };
+pub const reference_error_global: Native = .{ .name = "ReferenceError", .length = 1, .call = referenceErrorCall, .construct = referenceErrorConstruct, .namespace = .reference_error };
+pub const eval_error_global: Native = .{ .name = "EvalError", .length = 1, .call = evalErrorCall, .construct = evalErrorConstruct, .namespace = .eval_error };
+pub const uri_error_global: Native = .{ .name = "URIError", .length = 1, .call = uriErrorCall, .construct = uriErrorConstruct, .namespace = .uri_error };
+pub const aggregate_error_global: Native = .{ .name = "AggregateError", .length = 2, .call = aggregateErrorCall, .construct = aggregateErrorConstruct, .namespace = .aggregate_error };
+pub const regexp_global: Native = .{ .name = "RegExp", .length = 2, .call = regexpCall, .construct = regexpConstruct, .namespace = .regexp };
 pub const date_global: Native = .{ .name = "Date", .length = 7, .call = dateCall, .construct = dateConstruct, .namespace = .date };
 pub const symbol_global: Native = .{ .name = "Symbol", .call = symbolCall, .namespace = .symbol };
 pub const bigint_global: Native = .{ .name = "BigInt", .length = 1, .call = bigintCall, .namespace = .bigint };
@@ -3216,13 +3220,16 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
             return null;
         },
         .closure => |c| {
-            if (object.isNamed(k, "length")) return .{
+            if (c.meta) |m| if (m.props.count() > 0) {
+                if (m.props.get(try object.propKey(rt, k))) |p| return p;
+            };
+            if (object.isNamed(k, "length") and !(c.meta != null and c.meta.?.length_deleted)) return .{
                 .value = Value.fromNumber(@floatFromInt(closureLength(c))),
                 .enumerable = false,
                 .writable = false,
                 .configurable = if (c.meta) |m| m.length_configurable else true,
             };
-            if (object.isNamed(k, "name")) return .{
+            if (object.isNamed(k, "name") and !(c.meta != null and c.meta.?.name_deleted)) return .{
                 .value = Value.fromString(try closureName(rt, c)),
                 .enumerable = false,
                 .writable = false,
@@ -3238,7 +3245,6 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                     return .{ .value = Value.fromObject(p), .enumerable = false, .writable = proto_w, .configurable = false };
                 }
             }
-            if (c.meta) |m| if (m.props.count() > 0) return m.props.get(try object.propKey(rt, k));
             return null;
         },
         .string => |s| switch (k) {
@@ -3572,10 +3578,16 @@ fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Parsed
         return true;
     }
     if (target.isClosure() and (object.isNamed(k, "name") or object.isNamed(k, "length"))) {
-        if (d.has_conf and !next.configurable) {
-            const m = try rt.heap.ensureClosureMeta(@constCast(target.asClosure()));
-            if (object.isNamed(k, "name")) m.name_configurable = false else m.length_configurable = false;
+        const m = try rt.heap.ensureClosureMeta(@constCast(target.asClosure()));
+        if (object.isNamed(k, "name")) {
+            m.name_configurable = next.configurable;
+            m.name_deleted = false;
+        } else {
+            m.length_configurable = next.configurable;
+            m.length_deleted = false;
         }
+        const pk = try object.propKey(rt, k);
+        try rt.heap.defineClosurePropKey(@constCast(target.asClosure()), pk, next);
         return true;
     }
     if (target.isNative()) {
@@ -4108,21 +4120,31 @@ fn objectGetOwnPropertyNames(rt: *Runtime, _: Value, args: []const Value) Error!
             }
         },
         .closure => |c| {
-            try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("length")));
-            try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("name")));
+            if (!(c.meta != null and c.meta.?.length_deleted)) {
+                try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("length")));
+            }
+            if (!(c.meta != null and c.meta.?.name_deleted)) {
+                try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("name")));
+            }
             if (hasAutoPrototype(c)) {
                 try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("prototype")));
             }
             const keys = try object.ownPropertyNamesClosure(rt, c);
             defer rt.gpa.free(keys);
             for (keys) |k| {
+                if ((object.isNamed(k, "length") and !(c.meta != null and c.meta.?.length_deleted)) or
+                    (object.isNamed(k, "name") and !(c.meta != null and c.meta.?.name_deleted))) continue;
                 const s = try keyToString(rt, k);
                 try rt.heap.appendElement(out, Value.fromString(s));
             }
         },
-        .native => {
-            try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("length")));
-            try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("name")));
+        .native => |n| {
+            if (!rt.isNativePropDeleted(n, true)) {
+                try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("length")));
+            }
+            if (!rt.isNativePropDeleted(n, false)) {
+                try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("name")));
+            }
         },
         .string => |s| {
             for (0..s.units.len) |i| {
@@ -5064,14 +5086,14 @@ fn parseIntImpl(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 // ---------------------------------------------------------------- Math (M11.3)
 
 fn registerMath(rt: *Runtime, m: *Object) Error!void {
-    try constant(rt, m, "E", Value.fromNumber(std.math.e));
-    try constant(rt, m, "LN2", Value.fromNumber(std.math.ln2));
-    try constant(rt, m, "LN10", Value.fromNumber(std.math.ln10));
-    try constant(rt, m, "LOG2E", Value.fromNumber(std.math.log2e));
-    try constant(rt, m, "LOG10E", Value.fromNumber(std.math.log10e));
-    try constant(rt, m, "PI", Value.fromNumber(std.math.pi));
-    try constant(rt, m, "SQRT1_2", Value.fromNumber(std.math.sqrt1_2));
-    try constant(rt, m, "SQRT2", Value.fromNumber(std.math.sqrt2));
+    try immutableConstant(rt, m, "E", Value.fromNumber(std.math.e));
+    try immutableConstant(rt, m, "LN2", Value.fromNumber(std.math.ln2));
+    try immutableConstant(rt, m, "LN10", Value.fromNumber(std.math.ln10));
+    try immutableConstant(rt, m, "LOG2E", Value.fromNumber(std.math.log2e));
+    try immutableConstant(rt, m, "LOG10E", Value.fromNumber(std.math.log10e));
+    try immutableConstant(rt, m, "PI", Value.fromNumber(std.math.pi));
+    try immutableConstant(rt, m, "SQRT1_2", Value.fromNumber(std.math.sqrt1_2));
+    try immutableConstant(rt, m, "SQRT2", Value.fromNumber(std.math.sqrt2));
 
     try method(rt, m, "abs", &math_abs);
     try method(rt, m, "floor", &math_floor);
@@ -7297,7 +7319,7 @@ fn iteratorNext(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 const error_to_string: Native = .{ .name = "toString", .call = errorToString };
 
 fn initErrorProto(rt: *Runtime, proto: *Object, ns: *Object, name_ascii: []const u8, ctor: *const Native) Error!void {
-    try constant(rt, ns, "prototype", Value.fromObject(proto));
+    try immutableConstant(rt, ns, "prototype", Value.fromObject(proto));
     try constant(rt, proto, "constructor", Value.fromNative(ctor));
     try constant(rt, proto, "name", Value.fromString(try rt.heap.ascii(name_ascii)));
     try constant(rt, proto, "message", Value.fromString(try rt.heap.ascii("")));
@@ -10215,21 +10237,33 @@ fn ownKeysAllValue(rt: *Runtime, target: Value) Error![]object.Key {
             for (syms) |s| try out.append(rt.gpa, .{ .symbol = s });
         },
         .closure => |c| {
-            try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("length") });
-            try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("name") });
+            if (!(c.meta != null and c.meta.?.length_deleted)) {
+                try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("length") });
+            }
+            if (!(c.meta != null and c.meta.?.name_deleted)) {
+                try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("name") });
+            }
             if (hasAutoPrototype(c)) {
                 try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("prototype") });
             }
             const prop_names = try object.ownPropertyNamesClosure(rt, c);
             defer rt.gpa.free(prop_names);
-            try out.appendSlice(rt.gpa, prop_names);
+            for (prop_names) |k| {
+                if ((object.isNamed(k, "length") and !(c.meta != null and c.meta.?.length_deleted)) or
+                    (object.isNamed(k, "name") and !(c.meta != null and c.meta.?.name_deleted))) continue;
+                try out.append(rt.gpa, k);
+            }
             const syms = try object.ownSymbolKeysClosure(rt, c, true);
             defer rt.gpa.free(syms);
             for (syms) |s| try out.append(rt.gpa, .{ .symbol = s });
         },
-        .native => {
-            try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("length") });
-            try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("name") });
+        .native => |n| {
+            if (!rt.isNativePropDeleted(n, true)) {
+                try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("length") });
+            }
+            if (!rt.isNativePropDeleted(n, false)) {
+                try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("name") });
+            }
         },
         else => {},
     }

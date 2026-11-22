@@ -1979,6 +1979,9 @@ const Parser = struct {
                             if (p.async_paren_await_span == null) p.async_paren_await_span = span(t, t);
                             return p.postfix(try p.calls(try p.callPrimary()));
                         }
+                        if (p.in_static_block) {
+                            return p.fail(.{ .syntax_error = "await is not valid in class static initializer or field" }, t);
+                        }
                         return p.fail(.{ .unsupported = .syntax }, t);
                     },
                     .params => return p.fail(.{ .syntax_error = "await is not valid in async function parameters" }, t),
@@ -2157,7 +2160,7 @@ const Parser = struct {
                 if (p.tok.tag == .private_ident) {
                     const name = p.tok;
                     try p.advance();
-                    try steps.append(p.arena, .{ .optional = false, .kind = .{ .private_prop = name.text(p.source()) } });
+                    try steps.append(p.arena, .{ .optional = false, .kind = .{ .private_prop = try p.identText(name) } });
                     end = name.end;
                 } else {
                     const name = try p.expectPropertyName();
@@ -2299,7 +2302,7 @@ const Parser = struct {
                     return p.fail(.{ .syntax_error = "expected property name" }, kt);
                 }
                 try p.advance();
-                return .{ .name = kt.text(p.source()) };
+                return .{ .name = try p.identText(kt) };
             },
         };
     }
@@ -2381,7 +2384,7 @@ const Parser = struct {
                         }
                     }
                     try p.advance();
-                    break :blk .{ .name = name };
+                    break :blk .{ .name = try p.identText(t) };
                 },
             };
             if ((is_async_method or is_generator_method or prop_kind != .init) and p.tok.tag != .l_paren) {
@@ -2412,11 +2415,12 @@ const Parser = struct {
                 .comma, .r_brace => {
                     // Shorthand `{ x }` is a reference to the variable x.
                     if (k != .name or t.tag != .identifier) return p.fail(.{ .syntax_error = "unexpected token in object literal" }, p.tok);
-                    if (token.reserved_identifiers.has(k.name)) return p.fail(.{ .syntax_error = "reserved word as shorthand property" }, t);
+                    if (token.reserved_identifiers.has(k.name) or lexer_mod.isKeywordText(k.name)) return p.fail(.{ .syntax_error = "reserved word as shorthand property" }, t);
+                    if (p.in_strict_mode and isStrictReservedWord(k.name)) return p.fail(.{ .syntax_error = "Unexpected strict mode reserved word" }, t);
                     if (std.mem.eql(u8, k.name, "let")) return p.fail(.{ .unsupported = .syntax }, t);
                     if (std.mem.eql(u8, k.name, "await")) {
                         return switch (p.async_ctx) {
-                            .none => p.fail(.{ .unsupported = .syntax }, t),
+                            .none => if (p.in_static_block) p.fail(.{ .syntax_error = "'await' is not a valid identifier name in class static initializer" }, t) else p.fail(.{ .unsupported = .syntax }, t),
                             .params, .body => p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t),
                         };
                     }
@@ -2431,11 +2435,12 @@ const Parser = struct {
                 .eq => {
                     // CoverInitializedName `{ a = 1 }`: only valid inside a destructuring pattern.
                     if (k != .name or t.tag != .identifier) return p.fail(.{ .syntax_error = "unexpected '=' in object literal" }, p.tok);
-                    if (token.reserved_identifiers.has(k.name)) return p.fail(.{ .syntax_error = "reserved word as shorthand property" }, t);
+                    if (token.reserved_identifiers.has(k.name) or lexer_mod.isKeywordText(k.name)) return p.fail(.{ .syntax_error = "reserved word as shorthand property" }, t);
+                    if (p.in_strict_mode and isStrictReservedWord(k.name)) return p.fail(.{ .syntax_error = "Unexpected strict mode reserved word" }, t);
                     if (std.mem.eql(u8, k.name, "let")) return p.fail(.{ .unsupported = .syntax }, t);
                     if (std.mem.eql(u8, k.name, "await")) {
                         return switch (p.async_ctx) {
-                            .none => p.fail(.{ .unsupported = .syntax }, t),
+                            .none => if (p.in_static_block) p.fail(.{ .syntax_error = "'await' is not a valid identifier name in class static initializer" }, t) else p.fail(.{ .unsupported = .syntax }, t),
                             .params, .body => p.fail(.{ .syntax_error = "'await' is not a valid identifier name in an async function" }, t),
                         };
                     }
@@ -2629,12 +2634,25 @@ const Parser = struct {
                 if (std.mem.eql(u8, name, "export")) {
                     return p.fail(.{ .syntax_error = "Unexpected token 'export'" }, t);
                 }
-                if (token.reserved_identifiers.has(name) or std.mem.eql(u8, name, "let"))
+                const decoded = try p.identText(t);
+                if (decoded.ptr != name.ptr and (token.reserved_identifiers.has(decoded) or lexer_mod.isKeywordText(decoded))) {
+                    return p.fail(.{ .syntax_error = "Keyword must not contain escaped characters" }, t);
+                }
+                if (p.in_strict_mode and isStrictReservedWord(decoded)) {
+                    return p.fail(.{ .syntax_error = "Unexpected strict mode reserved word" }, t);
+                }
+                if (p.in_static_block and std.mem.eql(u8, decoded, "arguments")) {
+                    return p.fail(.{ .syntax_error = "'arguments' is not allowed in class field or static initializer" }, t);
+                }
+                if (p.in_static_block and std.mem.eql(u8, decoded, "await")) {
+                    return p.fail(.{ .syntax_error = "'await' is not allowed in class field or static initializer" }, t);
+                }
+                if (token.reserved_identifiers.has(decoded) or std.mem.eql(u8, decoded, "let"))
                     return p.fail(.{ .unsupported = .syntax }, t);
                 try p.advance();
                 const id = p.ref_count;
                 p.ref_count += 1;
-                return p.node(s, .{ .identifier = .{ .name = name, .span = s, .id = id } }, 0);
+                return p.node(s, .{ .identifier = .{ .name = decoded, .span = s, .id = id } }, 0);
             },
             .l_paren => {
                 const res = try p.parseParenList();
@@ -3384,16 +3402,19 @@ const Parser = struct {
                     const outer_method = p.in_class_method;
                     const outer_async_ctx = p.async_ctx;
                     const outer_yield_ctx = p.yield_ctx;
+                    const outer_static_block = p.in_static_block;
                     p.in_derived_ctor = .none;
                     p.in_class_method = true;
                     p.async_ctx = .none;
                     p.yield_ctx = .none;
+                    p.in_static_block = true;
                     p.function_depth += 1;
                     defer {
                         p.in_derived_ctor = outer_derived;
                         p.in_class_method = outer_method;
                         p.async_ctx = outer_async_ctx;
                         p.yield_ctx = outer_yield_ctx;
+                        p.in_static_block = outer_static_block;
                         p.function_depth -= 1;
                     }
                     const init_expr = try p.nested();

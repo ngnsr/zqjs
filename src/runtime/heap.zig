@@ -125,6 +125,8 @@ pub const ClosureMeta = struct {
     prototype_writable: bool = true,
     name_configurable: bool = true,
     length_configurable: bool = true,
+    name_deleted: bool = false,
+    length_deleted: bool = false,
 };
 
 pub const InstanceInit = struct {

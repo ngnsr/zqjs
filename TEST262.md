@@ -49,12 +49,12 @@ Measured with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=non
 
 | Suite | Collected | Skipped (meta) | Executed | Unsupported | Limit | Applicable | Pass | Fail | Pass / Executed | Pass / Applicable |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `built-ins` | 23,885 | 7,414 | 16,471 | 4,975 | 454 | 11,042 | **10,080** | 962 | **61.20%** | **91.29%** |
-| `language` | 23,832 | 971 | 22,861 | 3,531 | 0 | 19,330 | **17,445** | 1,885 | **76.31%** | **90.25%** |
-| **Combined** | **47,717** | **8,385** | **39,332** | **8,506** | **454** | **30,372** | **27,525** | **2,847** | **69.98%** | **90.63%** |
+| `built-ins` | 23,885 | 7,414 | 16,471 | 3,375 | 456 | 12,640 | **11,481** | 1,159 | **69.70%** | **90.83%** |
+| `language` | 23,832 | 971 | 22,861 | 3,473 | 0 | 19,388 | **17,953** | 1,435 | **78.53%** | **92.60%** |
+| **Combined** | **47,717** | **8,385** | **39,332** | **6,848** | **456** | **32,028** | **29,434** | **2,594** | **74.83%** | **91.90%** |
 
-- **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,332 executed tests (~46 s total on Apple M4).
-- Adding `var` hoisting, unmapped `arguments`, ASI, loose equality (`==`/`!=`), `Boolean`, `Object(...)`/`new Object(...)`, `Array(...)`/`new Array(...)`, primitive wrapper objects (`new Boolean`/`new Number`/`new String`), generic `Array.prototype` receivers, `void`, `globalThis`, and `#\u{...}` private identifier escapes unlocked **+24,011** applicable tests and **+21,754 passes** (`5,771 → 27,525`, **4.8×** more official tests passing) with **0% VM benchmark regression**.
+- **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,332 executed tests (~45 s total on Apple M4).
+- Adding `var` hoisting, unmapped `arguments`, ASI, loose equality (`==`/`!=`), `Boolean`, `Object(...)`/`new Object(...)`, `Array(...)`/`new Array(...)`, primitive wrapper objects (`new Boolean`/`new Number`/`new String`), generic `Array.prototype` receivers, `void`, `globalThis`, `#\u{...}` private & object-literal identifier escapes, and closure/constructor descriptor conformance unlocked **+25,667** applicable tests and **+23,663 passes** (`5,771 → 29,434`, **5.1×** more official tests passing) with **0% VM benchmark regression**.
 
 ### Built-ins Breakdown (Applicable Tests)
 

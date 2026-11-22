@@ -197,17 +197,17 @@ pub fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error
             return getWithReceiver(rt, try builtins.nativeProto(rt, n), receiver, k);
         },
         .closure => |c| {
-            if (isNamed(k, "name")) return Value.fromString(try builtins.closureName(rt, c));
-            if (isNamed(k, "length")) return Value.fromNumber(@floatFromInt(builtins.closureLength(c)));
+            if (c.meta) |m| if (m.props.count() > 0) {
+                if (m.props.get(try propKey(rt, k))) |p| return resolvePropValue(rt, receiver, p);
+            };
+            if (isNamed(k, "name") and !(c.meta != null and c.meta.?.name_deleted)) return Value.fromString(try builtins.closureName(rt, c));
+            if (isNamed(k, "length") and !(c.meta != null and c.meta.?.length_deleted)) return Value.fromNumber(@floatFromInt(builtins.closureLength(c)));
             if (isNamed(k, "prototype")) {
                 if (c.meta) |m| if (m.prototype) |p| return p;
                 if (builtins.hasAutoPrototype(c)) {
                     return Value.fromObject(try builtins.materializeClosurePrototype(rt, @constCast(c)));
                 }
             }
-            if (c.meta) |m| if (m.props.count() > 0) {
-                if (m.props.get(try propKey(rt, k))) |p| return resolvePropValue(rt, receiver, p);
-            };
             if (c.meta) |m| if (m.proto) |p| return getWithReceiver(rt, p, receiver, k);
             return getFrom(rt, try builtins.closureDefaultProto(rt, c), receiver, k);
         },
@@ -405,7 +405,15 @@ fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainH
             },
             .closure => |c| {
                 c.obj.checkLive();
-                if (isNamed(k, "name") or isNamed(k, "length")) {
+                if (c.meta) |m| if (m.props.count() > 0) {
+                    if (m.props.get(try propKey(rt, k))) |p| {
+                        if (p.is_accessor) return .{ .accessor = p };
+                        return .{ .data = .{ .is_own = sameTarget(cur, base), .writable = p.writable } };
+                    }
+                };
+                if ((isNamed(k, "name") and !(c.meta != null and c.meta.?.name_deleted)) or
+                    (isNamed(k, "length") and !(c.meta != null and c.meta.?.length_deleted)))
+                {
                     return .{ .data = .{ .is_own = sameTarget(cur, base), .writable = false } };
                 }
                 if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) {
@@ -413,12 +421,6 @@ fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainH
                     return .{ .data = .{ .is_own = sameTarget(cur, base), .writable = writable } };
                 }
                 if (c.meta) |m| {
-                    if (m.props.count() > 0) {
-                        if (m.props.get(try propKey(rt, k))) |p| {
-                            if (p.is_accessor) return .{ .accessor = p };
-                            return .{ .data = .{ .is_own = sameTarget(cur, base), .writable = p.writable } };
-                        }
-                    }
                     if (m.proto) |p| {
                         cur = p;
                         continue;
@@ -840,8 +842,34 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
             return true;
         },
         .closure => |c| {
-            if (isNamed(k, "name")) return if (c.meta) |m| m.name_configurable else true;
-            if (isNamed(k, "length")) return if (c.meta) |m| m.length_configurable else true;
+            if (isNamed(k, "name")) {
+                if (c.meta) |m| {
+                    const pk = try propKey(rt, k);
+                    if (m.props.get(pk)) |p| {
+                        if (!p.configurable) return false;
+                        rt.heap.removeClosurePropKey(@constCast(c), pk);
+                        m.name_deleted = true;
+                        return true;
+                    }
+                    if (!m.name_configurable) return false;
+                }
+                (try rt.heap.ensureClosureMeta(@constCast(c))).name_deleted = true;
+                return true;
+            }
+            if (isNamed(k, "length")) {
+                if (c.meta) |m| {
+                    const pk = try propKey(rt, k);
+                    if (m.props.get(pk)) |p| {
+                        if (!p.configurable) return false;
+                        rt.heap.removeClosurePropKey(@constCast(c), pk);
+                        m.length_deleted = true;
+                        return true;
+                    }
+                    if (!m.length_configurable) return false;
+                }
+                (try rt.heap.ensureClosureMeta(@constCast(c))).length_deleted = true;
+                return true;
+            }
             if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return false;
             if (c.meta == null or c.meta.?.props.count() == 0) return true;
             const pk = try propKey(rt, k);
@@ -895,9 +923,10 @@ pub fn hasOwn(rt: *Runtime, base: Value, k: Key) Error!bool {
     return switch (base.unpack()) {
         .object => |o| if (o.kind == .proxy) (try builtins.proxyGetOwnPropertyDescriptor(rt, o, k)) != null else (try ownProp(rt, o, k)) != null,
         .closure => |c| {
-            if (isNamed(k, "name") or isNamed(k, "length")) return true;
+            if (c.meta) |m| if (m.props.count() > 0) if (m.props.contains(try propKey(rt, k))) return true;
+            if (isNamed(k, "name") and !(c.meta != null and c.meta.?.name_deleted)) return true;
+            if (isNamed(k, "length") and !(c.meta != null and c.meta.?.length_deleted)) return true;
             if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return true;
-            if (c.meta) |m| if (m.props.count() > 0) return m.props.contains(try propKey(rt, k));
             return false;
         },
         .native => |n| {
@@ -931,9 +960,10 @@ pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
             return has(rt, k, try builtins.nativeProto(rt, n));
         },
         .closure => |c| {
-            if (isNamed(k, "name") or isNamed(k, "length")) return true;
-            if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return true;
             if (c.meta) |m| if (m.props.count() > 0) if (m.props.contains(try propKey(rt, k))) return true;
+            if (isNamed(k, "name") and !(c.meta != null and c.meta.?.name_deleted)) return true;
+            if (isNamed(k, "length") and !(c.meta != null and c.meta.?.length_deleted)) return true;
+            if (isNamed(k, "prototype") and builtins.hasAutoPrototype(c)) return true;
             if (c.meta) |m| if (m.proto) |p| return has(rt, k, p);
             return hasInChain(rt, try builtins.closureDefaultProto(rt, c), k);
         },

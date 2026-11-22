@@ -1,44 +1,21 @@
 # zqjs
 
-A small, embeddable JavaScript-like runtime written from scratch in Zig, built as a learning
-project: lexer, parser, AST, bytecode compiler, stack VM, object model and garbage collector.
-Inspired by QuickJS and Crafting Interpreters; it does not reuse their code.
+A fast, embeddable, zero-dependency JavaScript engine written from scratch in Zig — lexer, parser, resolver, bytecode compiler & verifier, NaN-boxed stack VM with Shapes and inline caches, generational garbage collector, interactive REPL, Zig embedding API, and C11 ABI.
 
-Priorities: correctness, simplicity, inspectability. Speed comes last.
+Designed for host-controlled scripting (games, plugins, tools, sandboxed automation) where deterministic limits, small footprint, and portable interpreter performance (no JIT / no RWX memory) matter.
 
-## Status
-Milestones 1–41 done ([ROADMAP.md](ROADMAP.md), [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md)). ZQJS has:
+## Highlights
 
-- **the language so far:** `let`/`const`, destructuring, blocks, `if`/`while`/`for`, `for...of`, `for...in`, `switch`,
-  `break`/`continue`, `try`/`catch`/`finally`/`throw`; functions, arrows, classes (inheritance, `super`, private
-  fields/methods), closures, recursion, generators (`function*`/`yield`/`yield*`), `async`/`await`, and async
-  generators (`async function*`/`for await`); numbers, UTF-16 strings, template literals, `RegExp`, `Symbol`
-  (`Symbol.for`/`keyFor`, well-known symbols), `-0`, the temporal dead zone, `const`; `Map`, `Set`, built-in
-  iterators, `JSON.parse`/`JSON.stringify`, `Promise` (`.then`/`.catch` and microtask checkpoints), and `Object` /
-  `Array` / `String` / `Number` / `Math` / `Error` built-ins. Everything else node has is reported as
-  `Unsupported(…)`, never silently wrong ([LANGUAGE.md](LANGUAGE.md)).
-- **interactive REPL (`zqjs`):** persistent `let`/`const`/`function`/`class` bindings across lines, top-level
-  `await`/`for await`, cycle-safe Node-style value inspector, raw-mode UTF-8 line editor with `Ctrl-R` history
-  search, live syntax highlighting, read-only `Tab` completion, and dot-commands (`.help`, `.ast`, `.bc`, `.gc`, …).
-- **two engines that must agree:** a bytecode compiler, verifier and stack VM (the default),
-  and a tree-walking reference interpreter (`--engine=treewalk`). Their output is checked byte
-  for byte against node, and against each other under fuzzing.
-- **a generational garbage collector:** non-moving and precise, running at safepoints in both
-  engines.
-  - A 256 KiB nursery is swept by minor collections that never trace the old generation.
-  - A remembered set with array and property-table cards keeps track of old-to-young
-    references.
-  - Major collections are adaptively scheduled. Atoms are weak.
-  - It comes with a stress mode (`-Dgc-stress`), a heap verifier, and deliberately broken
-    builds the verifier must catch (`zig build gc-mutants`).
-  - On the game workloads, minor pauses are about 0.06 ms (p95) at 100k or 1M live objects
-    ([GC_DESIGN.md](GC_DESIGN.md) §15).
-  - A program whose live data fits the heap limit runs as long as its step budget allows,
-    however much garbage it makes.
+- **Faster than QuickJS on average (`0.96×` QuickJS geomean):** Pure bytecode interpreter with 8-byte NaN-boxed `Value`/`Slot`, Shapes (hidden classes) + 4 inline property slots, shape-keyed read/write/ADD-transition inline caches, and fused superinstructions — beating QuickJS on closures (`0.50×`), dense branches (`0.70×`), integer loops (`0.89×`), and arrays (`0.94×`), and matching QuickJS on strings (`1.02×`), scopes (`1.04×`), and floats (`1.05×`).
+- **Zero dependencies & compact footprint:** Pure Zig (`0.17.1`), `2.2 MB` stripped `ReleaseFast` CLI (`1.5 MB` `ReleaseSmall`). Embedders (`@import("zqjs")` / `libzqjs.a`) link only the engine — Zig's lazy compilation drops the REPL and tree-walker oracle completely.
+- **Broad Modern JavaScript (ES2025 core):** `let`/`const`, destructuring, blocks, `if`/`while`/`for`/`for...of`/`for...in`/`switch`, `try`/`catch`/`finally`/`throw`; functions, arrows, classes (inheritance, `super`, private fields/methods/accessors, static blocks), closures, generators (`function*`/`yield`/`yield*`), `async`/`await`, async generators (`async function*`/`for await`), ES Modules (`import`/`export`, live bindings, cycles, `import.meta`, dynamic `import()`, top-level `await`); `BigInt`, `Symbol` (well-known & global registry), `Proxy` & `Reflect`, `Map`, `Set` (including ES2025 set-theory methods), `WeakMap` & `WeakSet` (ephemeron GC), `ArrayBuffer`, all 11 `TypedArray`s & `DataView`, `RegExp`, `Date`, `Promise` + microtasks, `JSON` (`reviver`/`replacer`/`space`/`toJSON`), `structuredClone` (with zero-copy `ArrayBuffer` transfer), and `Object`/`Array`/`String`/`Number`/`Math`/`Error`/URI built-ins.
+- **Explicit Compatibility Contract & Test262 Verified:** Everything outside ZQJS's supported subset is reported cleanly as `Unsupported(<feature>)` rather than silently misbehaving ([LANGUAGE.md](LANGUAGE.md)). Verified against **39,332 official Test262 tests** (`97.34%` applicable `built-ins`, `87.36%` applicable `language`, **0 crashes / 0 internal errors / 0 timeouts** — see [TEST262.md](TEST262.md)).
+- **Precise Generational GC & Hard Sandboxing:** Non-moving generational collector with a 256 KiB nursery (~0.06 ms p95 minor pauses at 100k–1M live objects), array & property-table card bitmaps, ephemeron `WeakMap`/`WeakSet`, weak atoms, adaptive major scheduling, cooperative step budgets, and hard limits on heap bytes, call depth, stack slots, string length, and `BigInt` bits ([GC_DESIGN.md](GC_DESIGN.md)).
+- **Dual-Engine Verification:** Ships a bytecode VM (default) alongside a tree-walking reference oracle (`--engine=treewalk`) that must agree byte-for-byte with each other and with Node 22 under differential testing, fuzzing, `-Dgc-stress`, `-Dstack-stress`, and `zig build gc-mutants`.
+- **Interactive REPL:** Persistent `let`/`const`/`function`/`class` bindings across lines, top-level `await`/`for await`, cycle-safe value inspector, raw-mode UTF-8 line editor with `Ctrl-R` history search, live syntax highlighting, read-only `Tab` completion, and dot-commands (`.help`, `.ast`, `.bc`, `.gc`, …).
 
 ```js
-// ZQJS prints 6765 hi box:3 0,1,b,a. `print` is ZQJS's own built-in, so node needs one defined
-// first to print the same (tests/harness/golden.js uses `console.log(a.map(String).join(' '))`).
+// ZQJS prints: 6765 hi box:3 0,1,b,a
 function fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }
 const base = { describe() { return this.kind + ':' + this.size; } };
 const box = Object.create(base); box.kind = 'box'; box.size = 3;
@@ -46,64 +23,108 @@ const greet = (function () { const word = 'hi'; return function () { return word
 print(fib(20), greet(), box.describe(), Object.keys({ b: 1, a: 2, 1: 3, 0: 4 }));
 ```
 
-See [ROADMAP.md](ROADMAP.md) for milestone details, required regression tests, and planned work.
+---
+
+## Performance vs QuickJS
+
+CLI-to-CLI end-to-end medians (startup + parse + compile + execute, 11 alternating runs, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`; full methodology and raw samples in [bench/suite/baseline-qjs.md](bench/suite/baseline-qjs.md) and [PERF_PLAN.md](PERF_PLAN.md)):
+
+| Benchmark | ZQJS med | QuickJS med | Ratio (`zqjs/qjs`) |
+|---|---:|---:|---:|
+| `closures.js` | **60.7 ms** | 121.5 ms | **`0.50×`** (2× faster) |
+| `branch_dense.js` | **73.8 ms** | 106.1 ms | **`0.70×`** (30% faster) |
+| `int_loop.js` | **60.1 ms** | 67.7 ms | **`0.89×`** (11% faster) |
+| `arrays.js` | **155.6 ms** | 164.7 ms | **`0.94×`** (6% faster) |
+| `strings.js` | **12.4 ms** | 12.2 ms | **`1.02×`** |
+| `scopes.js` | **36.4 ms** | 35.0 ms | **`1.04×`** |
+| `float_math.js` | **139.5 ms** | 133.0 ms | **`1.05×`** |
+| `fib.js` | **36.9 ms** | 32.8 ms | **`1.13×`** |
+| `global_reads.js` | **28.7 ms** | 24.2 ms | **`1.19×`** |
+| `objects.js` | **38.0 ms** | 32.0 ms | **`1.19×`** |
+| `call_chain.js` | **64.5 ms** | 50.7 ms | **`1.27×`** |
+| **Geometric mean** | — | — | **`0.96×`** |
+
+**C-ABI embedding throughput (`zig build bench-c`):**
+- `js_to_c_native`: **7.3M–8.3M calls/s** (~120–137 ns/call)
+- `host_js_c_js_roundtrip`: **~4.0M round-trips/s** (~252 ns/trip)
+- `frame_loop_3600` (3,600 game frames): **`11.0 µs` p50** / `12.0 µs` p95 per frame, `141 KiB` live heap
+
+---
+
+## Compatibility & Intentional Restrictions
+
+ZQJS implements a clean, modern subset of ECMAScript with an explicit, testable contract ([LANGUAGE.md](LANGUAGE.md)):
+
+| Outcome | Guarantee |
+|---|---|
+| **`ok`** | Matches Node 22 stdout and uncaught exception *name* |
+| **`SyntaxError`** | Node 22 also rejects the program with a `SyntaxError` |
+| **`Unsupported(id)`** | Explicitly outside ZQJS (terminates immediately; uncatchable, never silently wrong) |
+| **`LimitExceeded(limit)`** | Configured resource limit hit (terminates immediately; uncatchable) |
+
+Legacy sloppy-mode hazards are **intentionally excluded** by design rather than partially emulated:
+- `var` (use `let`/`const`), Automatic Semicolon Insertion (`asi` — semicolons required outside REPL), loose equality (`==`/`!=` — use `===`/`!==`), `with`, `eval` / `Function(...)`, `arguments` (use rest parameters `...args`), implicit global writes, sparse array holes, legacy octals, and sloppy `this` boxing.
+- Standard built-ins outside ZQJS's scope (e.g. `Intl`, `Temporal`, `Atomics`, `SharedArrayBuffer`, `WeakRef`, `FinalizationRegistry`) report `Unsupported(builtin)` naming the exact identifier.
+
+See [LANGUAGE.md](LANGUAGE.md) for the complete specification and [TEST262.md](TEST262.md) for the full 39,332-test conformance breakdown.
+
+---
 
 ## Requirements
-**Zig 0.17.1 exactly** (the build refuses other versions; see DESIGN_DECISIONS D17).
 
-```sh
-brew install zig && brew pin zig
-```
-
-node **22.x exactly** and Python 3 (standard library only) are needed only to regenerate or check
-test data and the node-generated built-in inventory (`zig build update-golden`,
-`zig build check-goldens`), not to build or test. The goldens record node 22's answers and a newer
-node gives different ones (26 prints `1e-29` where 22 prints `1.0000000000000001e-29`), so
-`check-goldens` fails under it.
+- **Zig `0.17.1` exactly** (enforced by `build.zig`; see `DESIGN_DECISIONS.md` D17).
+- **Optional (dev/golden checks only):** Node `22.x` and Python 3 (stdlib only) for `zig build check-goldens`, `tools/bench_compare.py`, and `tools/test262.py`. Not required to build, embed, or run `zig build test`.
 
 ## Usage
+
 ```sh
-zig build                                   # builds zig-out/bin/zqjs (or -Doptimize=ReleaseSafe)
-zig-out/bin/zqjs                            # start interactive REPL (--repl, --no-color)
-zig-out/bin/zqjs program.js                 # run a script (stops after 200M steps; --max-steps N, 0 = no limit)
-zig-out/bin/zqjs -e "let s = ''; for (let i = 0; i < 3; i++) { s += i; } print(s, 0.1 + 0.2);"
-# 012 0.30000000000000004
-zig-out/bin/zqjs --dump-ast -e "let x = 1; { let x = x + 2; }"
-# (let (x#0@0 1))
-# (block (let (x#1@1 (+ x#1 2))))           ← inner x refers to itself: a TDZ error if run
-zig-out/bin/zqjs --dump-bytecode -e "let x = 1; x += 2;"   # compiled, verified, listed (M4)
-zig-out/bin/zqjs --trace -e "print(1 + 2);"                # each VM instruction and the stack, on stderr
-zig-out/bin/zqjs --engine=treewalk program.js               # the reference interpreter instead of the VM
-zig build test                              # unit + integration tests (tests/*_test.zig, in parallel)
-zig build test -Dstack-stress               # same, with the VM moving its stacks on every call
-zig build test -Dgc-stress                  # same, collecting at every safepoint, with tombstones and a heap verifier
-zig build test --fuzz=100K -Dtest-filter="fuzz: frontend"   # fuzz one target (only one runs per call):
-                                            #   "fuzz: frontend", "fuzz: both engines agree",
-                                            #   "fuzz: anything the front end", "fuzz: the verifier"
-zig build bench                             # bench/*.js on both engines: steps, heap bytes, median ms
-zig build m10-bench                         # M10 split-phase ZQJS benchmarks (ReleaseFast)
-zig build m10-c-bench                       # M10 C-ABI embedding benchmarks (ReleaseFast)
-zig build gc-report                         # GC pauses (minor/major), rates, GC share; bench/ and bench/gc/
-zig build gc-report -- --nursery=1M game_   # another nursery size, only the game workloads
-zig build gc-mutants                        # each deliberately broken GC piece must be caught
-zig build check-goldens                     # verify syntax cases against node; generated files up to date
-zig build update-golden                     # regenerate goldens (node) and pow references (Python)
-zig build example                           # run the embedding API example (examples/embed.zig)
-zig build plugin-host                       # build and run the M13 multi-plugin C11 host (examples/plugin_host.c)
+# Build
+zig build                                        # Debug CLI + libzqjs.a + include/zqjs.h
+zig build cli -Doptimize=ReleaseFast -Dstrip=true # 2.2 MB stripped fast CLI
+zig build cli -Doptimize=ReleaseSmall            # 1.5 MB auto-stripped compact CLI
+
+# Run scripts & REPL
+zig-out/bin/zqjs                                 # start interactive REPL (--repl, --no-color)
+zig-out/bin/zqjs program.js                      # run script (--max-steps N, 0 = unlimited)
+zig-out/bin/zqjs --module app.mjs                # run ES module (.mjs auto-enables --module)
+zig-out/bin/zqjs -e "print(0.1 + 0.2);"
+zig-out/bin/zqjs --dump-ast -e "let x = 1;"
+zig-out/bin/zqjs --dump-bytecode -e "let x = 1; x += 2;"
+zig-out/bin/zqjs --trace -e "print(1 + 2);"      # instruction + operand stack trace
+zig-out/bin/zqjs --engine=treewalk program.js    # run on the reference interpreter
+
+# Test & verify
+zig build test -Doptimize=ReleaseSafe --summary all
+zig build test -Dgc-stress -Dstack-stress -Doptimize=ReleaseSafe --summary all
+zig build gc-mutants                             # deliberately broken GC builds must be caught
+zig build check-goldens                          # verify syntax/diff goldens against Node 22
+zig build test --fuzz=100K -Dtest-filter="fuzz: frontend"
+
+# Benchmarks
+zig build bench-js                               # split-phase VM benchmarks (bench/suite/js/)
+zig build bench-js -- --gc                       # include 100k/1M-object game GC workloads
+zig build bench-c                                # C-ABI embedding benchmarks
+python3 tools/bench_compare.py                   # full CLI-to-CLI comparison vs QuickJS
+zig build gc-report                              # detailed GC pause & allocation-rate report
+
+# Examples
+zig build example                                # Zig embedding API example (examples/embed.zig)
+zig build plugin-host                            # C11 multi-plugin host (examples/plugin_host.c)
 ```
 
+---
+
 ## Embedding
-ZQJS provides a private-VM Zig embedding API (`@import("zqjs")`) designed for host-controlled execution (games, tools, event loops):
-- **Opaque handles:** `Runtime`, `Program`, `Execution`. The VM, stack layout, and GC internals remain private.
-- **Slices and step limits:** cooperative multitasking running executions in bounded step slices per frame, under cumulative lifetime caps.
-- **Results over panics:** syntax and execution errors return Zig errors and non-allocating UTF-8 `Failure` records.
 
-See [EMBEDDING.md](EMBEDDING.md) for full details, semantics, and examples.
+### Zig API (`@import("zqjs")`)
+ZQJS exposes an opaque, GC-safe embedding API ([EMBEDDING.md](EMBEDDING.md)) designed for host-controlled loops:
+- **Private internals:** `Runtime`, `Program`, `Execution`, and generational `Handle`s keep the VM, stack, and GC private.
+- **Cooperative slicing & hard caps:** run scripts in bounded step slices per frame under cumulative step/heap/stack limits.
+- **Errors over panics:** all syntax, runtime, and limit failures return Zig errors and non-allocating UTF-8 `Failure` records.
 
-### C ABI (`include/zqjs.h`, `libzqjs.a`)
-Build and install the C header and static library with `zig build`:
+### C11 ABI (`include/zqjs.h`, `libzqjs.a`)
 ```sh
-zig build
+zig build -Doptimize=ReleaseFast -Dstrip=true
 cc -std=c11 -Izig-out/include examples/c_embed.c zig-out/lib/libzqjs.a -lpthread -o c_embed
 ./c_embed
 ```
@@ -139,39 +160,22 @@ int main(void) {
 }
 ```
 
-For a C11 multi-plugin cooperative host example, see [examples/plugin_host.c](examples/plugin_host.c) (`zig build plugin-host`).
-
-For a full C11 host loop with structured `initGame({ update, draw, state })` handles (optional Raylib dependency — `zig build test` stays Raylib-free; pass `-Draylib-prefix=<path>` if Raylib isn't in a default location), see [examples/raylib_c_demo.c](examples/raylib_c_demo.c) or the standalone [zqjs-raylib](https://github.com/ngnsr/zqjs-raylib) repository:
+For a C11 multi-plugin cooperative host, see [examples/plugin_host.c](examples/plugin_host.c) (`zig build plugin-host`). For a Raylib game demo scripted in ZQJS (optional Raylib dependency; `zig build test` stays Raylib-free), see [examples/raylib_c_demo.c](examples/raylib_c_demo.c) or [zqjs-raylib](https://github.com/ngnsr/zqjs-raylib):
 ```sh
 zig build raylib-smoke   # headless 60-frame + error-handling smoke test
 zig build raylib-demo    # interactive GUI window (requires Raylib)
 ```
 
-## Benchmarks
-`zig build bench` (always ReleaseFast) runs every `bench/*.js` five times in-process on both
-engines, each run with a fresh runtime and heap. `steps` and the heap columns are
-deterministic (identical on every machine, and checked identical across runs): `allocated` is
-the cumulative volume charged, `peak` the highest live total, `end` what is live at the end
-(they differ as soon as garbage is collected during a run). `median ms` only compares on the same
-machine. `collections` counts garbage collections during the run. `bench/baseline.txt` is the
-current baseline (end of M8.1, Apple M4, smp_allocator). The older ones are kept to compare
-against:
-- `bench/baseline-m8-smp.txt`: M8's code on the same allocator;
-- `bench/baseline-m8.txt` and `bench/baseline-m7.txt`: the end of M8 and M7, on libc malloc;
-- the M6 reference point is commit abbf773.
-
-Times compare only between rows on the same allocator. `zig build gc-report` measures the
-collector itself: pauses (minor and major), allocation rate and GC share, 5 runs per row, on
-bench/ and the game-like workloads in bench/gc/. Its baselines are in `bench/gc/`. Rerun and diff before and after a change: a
-change in steps or heap means different work, a change in time alone means the same work got
-faster or slower.
+---
 
 ## Documents
-- [EMBEDDING.md](EMBEDDING.md): embedding ZQJS in Zig (lifecycle, slices, step caps, errors)
-- [LANGUAGE.md](LANGUAGE.md): what ZQJS accepts and the compatibility contract with node
-- [ARCHITECTURE.md](ARCHITECTURE.md): components and ownership
-- [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md): why things are the way they are
-- [ROADMAP.md](ROADMAP.md): milestones, required regression tests, technical debt
-- [GC_DESIGN.md](GC_DESIGN.md): the garbage collector's design (M8; generations in §15, M8.1)
-- [TEST262.md](TEST262.md): ECMAScript Test262 conformance runner, baseline results (M47), and spec edge cases
-- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): licenses of ported code (musl/Arm `pow`)
+
+- [EMBEDDING.md](EMBEDDING.md) — Zig & C11 embedding API (lifecycle, handles, step slices, modules, errors)
+- [LANGUAGE.md](LANGUAGE.md) — supported JavaScript subset and Node compatibility contract
+- [TEST262.md](TEST262.md) — ECMAScript Test262 conformance runner and M59 results (39,332 tests)
+- [PERF_PLAN.md](PERF_PLAN.md) — performance architecture, M52–M59 progression, and why JIT is deferred
+- [ARCHITECTURE.md](ARCHITECTURE.md) — module layout and ownership
+- [GC_DESIGN.md](GC_DESIGN.md) — generational collector, card tables, ephemerons, and verification
+- [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — architectural decision log (D1–D89)
+- [ROADMAP.md](ROADMAP.md) — milestone history (M1–M59) and remaining work
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — licenses of ported code (musl/Arm `pow`)

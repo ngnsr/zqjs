@@ -43,18 +43,18 @@ ZQJS includes a parallel [tc39/test262](https://github.com/tc39/test262) conform
 
 ---
 
-## Results (M49, D79)
+## Results (M59, D89)
 
 Measured with `zig build -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
 
 | Suite | Collected | Skipped (meta) | Executed | Unsupported | Limit | Applicable | Pass | Fail | Pass / Executed | Pass / Applicable |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `built-ins` | 23,885 | 7,414 | 16,471 | 14,501 | 1 | 1,969 | 1,921 | 48 | 11.66% | **97.56%** |
-| `language` | 23,832 | 971 | 22,861 | 18,647 | 0 | 4,214 | 3,681 | 533 | 16.10% | **87.35%** |
-| **Combined** | **47,717** | **8,385** | **39,332** | **33,148** | **1** | **6,183** | **5,602** | **581** | **14.24%** | **90.60%** |
+| `built-ins` | 23,885 | 7,414 | 16,471 | 14,326 | 1 | 2,144 | 2,087 | 57 | 12.67% | **97.34%** |
+| `language` | 23,832 | 971 | 22,861 | 18,644 | 0 | 4,217 | 3,684 | 533 | 16.11% | **87.36%** |
+| **Combined** | **47,717** | **8,385** | **39,332** | **32,970** | **1** | **6,361** | **5,771** | **590** | **14.67%** | **90.72%** |
 
-- **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,332 executed tests.
-- `built-ins` jumped from **91.71% → 97.56%** (+5.85 pp); `language` jumped from **85.54% → 87.35%** (+1.81 pp) even with `--module` harness injection unlocking previously skipped module tests.
+- **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,332 executed tests (~45 s total on Apple M4).
+- Compared to the M49 checkpoint (`5,602` passes), M50 (`Date`) + M51 (`structuredClone`) unlocked +178 applicable tests and **+169 passes**, with **0 regressions** across the M52–M59 VM performance rewrites (NaN-boxing, Shapes, ICs, superinstructions, back-edge safepoints).
 
 ### Built-ins Breakdown (Applicable Tests)
 

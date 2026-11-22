@@ -1,4 +1,4 @@
-// M10.0 pure-JS benchmark: closure creation and captured cell access
+// Pure-JS benchmark: closure creation and captured cell access
 // Iterations: 500,000
 function makeCounter(start) {
   let n = start;

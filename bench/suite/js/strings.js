@@ -1,4 +1,4 @@
-// M10.0 pure-JS benchmark: string concatenation and length
+// Pure-JS benchmark: string concatenation and length
 // Iterations: 100,000
 let total = 0;
 for (let i = 0; i < 100000; i++) {

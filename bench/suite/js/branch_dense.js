@@ -1,4 +1,4 @@
-// M10.0 pure-JS benchmark: branch-dense comparisons & control flow
+// Pure-JS benchmark: branch-dense comparisons & control flow
 // Iterations: 2,000,000 (fixed; no heap allocations)
 let a = 1;
 let b = 2;

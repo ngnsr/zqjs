@@ -250,21 +250,21 @@ pub fn build(b: *std.Build) void {
     bench.setCwd(b.path("."));
     b.step("bench", "Run bench/*.js on both engines (ReleaseFast): steps, heap, median time").dependOn(&bench.step);
 
-    // M10.0 split-phase ZQJS benchmark (tools/m10_bench.zig): ReleaseFast.
-    const m10_bench = b.addRunArtifact(b.addExecutable(.{
-        .name = "m10-bench",
+    // Split-phase ZQJS VM benchmark suite (tools/bench_js.zig): ReleaseFast.
+    const bench_js = b.addRunArtifact(b.addExecutable(.{
+        .name = "bench-js",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/m10_bench.zig"),
+            .root_source_file = b.path("tools/bench_js.zig"),
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{.{ .name = "zqjs_internal", .module = bench_mod }},
         }),
     }));
-    m10_bench.setCwd(b.path("."));
-    m10_bench.addPassthruArgs();
-    b.step("m10-bench", "Run M10 split-phase ZQJS benchmarks (ReleaseFast)").dependOn(&m10_bench.step);
+    bench_js.setCwd(b.path("."));
+    bench_js.addPassthruArgs();
+    b.step("bench-js", "Run split-phase JS benchmark suite (ReleaseFast)").dependOn(&bench_js.step);
 
-    // M10.0 C-ABI embedding benchmark (tools/m10_c_bench.c): ReleaseFast.
+    // C-ABI embedding benchmark suite (tools/bench_c.c): ReleaseFast.
     const bench_api = b.createModule(.{
         .root_source_file = b.path("src/api.zig"),
         .target = target,
@@ -281,23 +281,23 @@ pub fn build(b: *std.Build) void {
             .imports = &.{ .{ .name = "zqjs_internal", .module = bench_mod }, .{ .name = "zqjs", .module = bench_api } },
         }),
     });
-    const m10_c_mod = b.createModule(.{
+    const bench_c_mod = b.createModule(.{
         .target = target,
         .optimize = .ReleaseFast,
         .link_libc = true,
     });
-    m10_c_mod.addIncludePath(b.path("include"));
-    m10_c_mod.addCSourceFile(.{
-        .file = b.path("tools/m10_c_bench.c"),
+    bench_c_mod.addIncludePath(b.path("include"));
+    bench_c_mod.addCSourceFile(.{
+        .file = b.path("tools/bench_c.c"),
         .flags = &.{ "-std=c11", "-O3", "-Wall", "-Wextra", "-Werror" },
     });
-    m10_c_mod.linkLibrary(bench_libzqjs);
-    const m10_c_bench = b.addRunArtifact(b.addExecutable(.{
-        .name = "m10-c-bench",
-        .root_module = m10_c_mod,
+    bench_c_mod.linkLibrary(bench_libzqjs);
+    const bench_c = b.addRunArtifact(b.addExecutable(.{
+        .name = "bench-c",
+        .root_module = bench_c_mod,
     }));
-    m10_c_bench.setCwd(b.path("."));
-    b.step("m10-c-bench", "Run M10 C-ABI embedding benchmarks (ReleaseFast)").dependOn(&m10_c_bench.step);
+    bench_c.setCwd(b.path("."));
+    b.step("bench-c", "Run C-ABI embedding benchmarks (ReleaseFast)").dependOn(&bench_c.step);
 
     // GC report (tools/gc_report.zig): pauses, rates and per-collection series, ReleaseFast.
     const gc_report = b.addRunArtifact(b.addExecutable(.{

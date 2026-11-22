@@ -1,4 +1,4 @@
-// M10.0 pure-JS benchmark: repeated top-level global reads in loop
+// Pure-JS benchmark: repeated top-level global reads in loop
 // Iterations: 1,000,000
 const G_A = 3;
 const G_B = 7;

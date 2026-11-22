@@ -1,4 +1,4 @@
-/* M10.0 C-ABI embedding benchmark harness (ReleaseFast).
+/* C-ABI embedding benchmark harness (ReleaseFast).
  *
  * Measures ZQJS's C11 embedding boundary directly (reported separately from CLI-to-CLI
  * QuickJS comparisons):

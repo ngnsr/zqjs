@@ -1,4 +1,4 @@
-// M10.0 pure-JS benchmark: object creation, property reads/writes, prototype methods
+// Pure-JS benchmark: object creation, property reads/writes, prototype methods
 // Iterations: 200,000
 const proto = { scale: 2, area() { return this.w * this.h * this.scale; } };
 let total = 0;

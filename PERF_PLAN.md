@@ -6,7 +6,7 @@ This document records the post-M10 performance roadmap for ZQJS: what we already
 
 ## 1. Where We Stand
 
-At the M10 checkpoint (`05c0c7a`, see `ROADMAP.md` and `bench/m10/baseline-qjs.md`), ZQJS's stack VM — **without** NaN-boxing, hidden classes, inline caches, or threaded dispatch — measured:
+At the M10 checkpoint (`05c0c7a`, see `ROADMAP.md` and `bench/suite/baseline-qjs.md`), ZQJS's stack VM — **without** NaN-boxing, hidden classes, inline caches, or threaded dispatch — measured:
 
 - **Closures (`closures.js`):** `0.75×` QuickJS (faster than QuickJS)
 - **Objects, fib, loops, arrays, calls:** `1.66×–2.33×` QuickJS
@@ -14,7 +14,7 @@ At the M10 checkpoint (`05c0c7a`, see `ROADMAP.md` and `bench/m10/baseline-qjs.m
 
 ### M52–M59 Checkpoints (D82–D89 — QuickJS Parity Reached: Geomean `0.96×` QuickJS!)
 
-After M52–M59 (measured via `python3 tools/m10_compare.py`, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`), ZQJS **surpassed QuickJS on geometric mean across all 11 CLI benchmarks (`0.96×` QuickJS)** — every single benchmark now sits between `0.50×` and `1.27×` QuickJS, game-loop GC peak RAM dropped **40–65%**, and C-ABI `frame_loop_3600` p50 dropped from `18.0 µs → 11.0 µs`:
+After M52–M59 (measured via `python3 tools/bench_compare.py`, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`), ZQJS **surpassed QuickJS on geometric mean across all 11 CLI benchmarks (`0.96×` QuickJS)** — every single benchmark now sits between `0.50×` and `1.27×` QuickJS, game-loop GC peak RAM dropped **40–65%**, and C-ABI `frame_loop_3600` p50 dropped from `18.0 µs → 11.0 µs`:
 
 | Benchmark | Pre-M52 (`zqjs/qjs`) | M58 (`zqjs/qjs`) | **M59 (`zqjs/qjs`)** | ZQJS CLI med |
 |---|---:|---:|---:|---:|
@@ -89,6 +89,6 @@ Medium-sized refactors, only pursued if profiling after Tier 1 justifies them:
 ## 5. Measurement & Correctness Rules
 
 Every optimization step must follow the M10 discipline:
-1. **Profile first, measure before & after** using `zig build bench` and `tools/m10_compare.py` (comparing against both the previous commit and QuickJS).
+1. **Profile first, measure before & after** using `zig build bench-js` and `python3 tools/bench_compare.py` (comparing against both the previous commit and QuickJS).
 2. **Revert any change that does not show a real speedup** (as in M10.4a).
 3. **Never weaken invariants:** `zig fmt --check .`, `zig build check-goldens`, `ReleaseSafe`, `-Dgc-stress -Dstack-stress`, `gc-mutants`, and Test262 (`0` internal errors) must stay green after every optimization commit.

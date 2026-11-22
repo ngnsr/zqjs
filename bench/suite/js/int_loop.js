@@ -1,4 +1,4 @@
-// M10.0 pure-JS benchmark: integer-style arithmetic & locals
+// Pure-JS benchmark: integer-style arithmetic & locals
 // Iterations: 2,000,000 (fixed; no heap allocations)
 let s = 0;
 for (let i = 0; i < 2000000; i++) {

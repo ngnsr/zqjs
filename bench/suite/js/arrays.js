@@ -1,4 +1,4 @@
-// M10.0 pure-JS benchmark: array push, pop, indexed read/write
+// Pure-JS benchmark: array push, pop, indexed read/write
 // Iterations: 100,000 outer * 20 elements
 let total = 0;
 for (let k = 0; k < 100000; k++) {

@@ -1,6 +1,5 @@
-//! M10.0 split-phase ZQJS VM benchmark harness (always ReleaseFast, smp_allocator).
+//! Split-phase ZQJS VM benchmark harness (always ReleaseFast, smp_allocator).
 //!
-//! Does NOT modify `tools/bench.zig` or `bench/baseline.txt`.
 //! For each script, measures:
 //!   1. Split-phase samples (fresh Runtime per sample):
 //!      - `compile_ns`: parse + resolve + compile + verify (after `Runtime.init`)
@@ -9,8 +8,8 @@
 //!      - `total_ns`:   `Runtime.init` + parse + resolve + compile + verify + `Vm.init` + `vm.run()` + teardown
 //!
 //! Usage:
-//!   zig build m10-bench                 # runs bench/m10/js/*.js
-//!   zig build m10-bench -- --gc         # also runs bench/gc/*.js
+//!   zig build bench-js                 # runs bench/suite/js/*.js
+//!   zig build bench-js -- --gc         # also runs bench/gc/*.js
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -197,7 +196,7 @@ pub fn main(init: std.process.Init) !u8 {
     const out = &stdout.interface;
     defer out.flush() catch {};
 
-    try out.print("# m10-bench: zig {s}, {s}-{s} ({s}), {s}, warmups={d}, measured={d}, smp_allocator\n", .{
+    try out.print("# bench-js: zig {s}, {s}-{s} ({s}), {s}, warmups={d}, measured={d}, smp_allocator\n", .{
         builtin.zig_version_string,
         @tagName(builtin.cpu.arch),
         @tagName(builtin.os.tag),
@@ -208,7 +207,7 @@ pub fn main(init: std.process.Init) !u8 {
     });
     try out.writeAll("program\tsteps\tallocated\tpeak\tend\tgc(m/M)\tcompile_med_ms\tcompile_min_ms\tcompile_max_ms\texec_med_ms\texec_min_ms\texec_max_ms\ttotal_med_ms\ttotal_min_ms\ttotal_max_ms\n");
 
-    try benchDir(gpa, arena, io, out, "bench/m10/js");
+    try benchDir(gpa, arena, io, out, "bench/suite/js");
     if (include_gc) {
         try benchDir(gpa, arena, io, out, "bench/gc");
     }

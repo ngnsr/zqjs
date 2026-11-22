@@ -1,4 +1,4 @@
-// M10.0 pure-JS benchmark: nested lexical scopes without closure capture
+// Pure-JS benchmark: nested lexical scopes without closure capture
 // Iterations: 1,000,000
 let sum = 0;
 for (let i = 0; i < 1000000; i++) {

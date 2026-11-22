@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M10.0 reproducible ZQJS vs QuickJS CLI-to-CLI & ZQJS embedding baseline runner."""
+"""Reproducible ZQJS vs QuickJS CLI-to-CLI & ZQJS embedding benchmark runner."""
 
 import hashlib
 import math
@@ -12,8 +12,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-JS_DIR = ROOT / "bench" / "m10" / "js"
-OUT_PATH = ROOT / "bench" / "m10" / "baseline-qjs.md"
+JS_DIR = ROOT / "bench" / "suite" / "js"
+OUT_PATH = ROOT / "bench" / "suite" / "baseline-qjs.md"
 
 WARMUPS = 2
 RUNS = 11
@@ -92,7 +92,7 @@ def measure_rss_mac(argv) -> int | None:
 
 
 def main() -> None:
-    print("[M10.0] Building ReleaseFast CLI + m10-bench + m10-c-bench...")
+    print("[bench] Building ReleaseFast CLI + bench-js + bench-c...")
     run_cmd(["zig", "build", "-Doptimize=ReleaseFast"], capture=False)
     zqjs_bin = str(ROOT / "zig-out" / "bin" / "zqjs")
     qjs_path = shutil.which("qjs")
@@ -116,7 +116,7 @@ def main() -> None:
     scripts = sorted(JS_DIR.glob("*.js"))
 
     # 1. Correctness parity check
-    print("[M10.0] Checking normalized result parity (zqjs vs qjs)...")
+    print("[bench] Checking normalized result parity (zqjs vs qjs)...")
     parity_rows = []
     for s in scripts:
         rule = BENCH_RULES.get(s.name, "exact_int")
@@ -131,7 +131,7 @@ def main() -> None:
         parity_rows.append((s.name, rule, z_out, q_out, n_out))
 
     # 2. Alternating CLI-to-CLI timings
-    print("[M10.0] Running alternating CLI-to-CLI benchmarks...")
+    print("[bench] Running alternating CLI-to-CLI benchmarks...")
     cli_rows = []
     raw_samples = []
     for s in scripts:
@@ -160,16 +160,16 @@ def main() -> None:
         raw_samples.append((s.name, order, z_times, q_times))
 
     # 3. Split-phase ZQJS harness + GC workloads
-    print("[M10.0] Running zig build m10-bench -- --gc...")
-    m10_bench_out = run_cmd(["zig", "build", "m10-bench", "--", "--gc"]).stdout.strip()
+    print("[bench] Running zig build bench-js -- --gc...")
+    bench_js_out = run_cmd(["zig", "build", "bench-js", "--", "--gc"]).stdout.strip()
 
     # 4. ZQJS C-ABI embedding harness
-    print("[M10.0] Running zig build m10-c-bench...")
-    m10_c_out = run_cmd(["zig", "build", "m10-c-bench"]).stdout.strip()
+    print("[bench] Running zig build bench-c...")
+    bench_c_out = run_cmd(["zig", "build", "bench-c"]).stdout.strip()
 
     # Write baseline report
     lines = [
-        "# ZQJS M10.0 Performance Baseline",
+        "# ZQJS Performance Baseline",
         "",
         "## Environment & Pinning",
         f"- **Date (UTC):** {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
@@ -199,14 +199,14 @@ def main() -> None:
 
     lines += [
         "",
-        "## 3. ZQJS Split-Phase & GC Benchmarks (`zig build m10-bench -- --gc`)",
+        "## 3. ZQJS Split-Phase & GC Benchmarks (`zig build bench-js -- --gc`)",
         "```text",
-        m10_bench_out,
+        bench_js_out,
         "```",
         "",
-        "## 4. ZQJS C-ABI Embedding Benchmarks (`zig build m10-c-bench`, separate from QuickJS)",
+        "## 4. ZQJS C-ABI Embedding Benchmarks (`zig build bench-c`, separate from QuickJS)",
         "```text",
-        m10_c_out,
+        bench_c_out,
         "```",
         "",
         "## 5. Individual CLI Sample Timings (ms, alternating order)",
@@ -217,7 +217,7 @@ def main() -> None:
         lines.append(f"- **`{name}`** (`{order[0]}`, alternating): zqjs=[{z_str}] | qjs=[{q_str}]")
 
     OUT_PATH.write_text("\n".join(lines) + "\n")
-    print(f"[M10.0] Wrote {OUT_PATH}")
+    print(f"[bench] Wrote {OUT_PATH}")
 
 
 if __name__ == "__main__":

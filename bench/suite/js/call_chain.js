@@ -1,4 +1,4 @@
-// M10.0 pure-JS benchmark: small non-recursive function calls
+// Pure-JS benchmark: small non-recursive function calls
 // Iterations: 1,000,000 outer iterations * 3 calls = 3,000,000 calls
 function step1(x, y) { return x + y * 2; }
 function step2(a, b) { return step1(a, b) - 3; }

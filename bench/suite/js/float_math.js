@@ -1,4 +1,4 @@
-// M10.0 pure-JS benchmark: floating-point arithmetic (exact dyadic steps)
+// Pure-JS benchmark: floating-point arithmetic (exact dyadic steps)
 // Iterations: 2,000,000 (fixed; no heap allocations)
 let x = 1.5;
 let y = -0.75;

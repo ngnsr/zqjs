@@ -149,7 +149,7 @@ pub fn main(init: std.process.Init) !u8 {
                 return zqjs.runModule(gpa, name, source, io, limits, options, out, err);
             }
             if (options.engine == .vm and options.trace == null and !options.verify_heap) {
-                return runPublic(gpa, name, source, limits, out, err);
+                return runPublic(gpa, io, name, source, limits, out, err);
             }
             return zqjs.runSource(gpa, name, source, limits, options, out, err);
         },
@@ -166,9 +166,17 @@ pub fn main(init: std.process.Init) !u8 {
     }
 }
 
-fn runPublic(gpa: std.mem.Allocator, name: []const u8, source: []const u8, limits: api.Limits, out: *std.Io.Writer, err: *std.Io.Writer) !u8 {
+fn runPublic(gpa: std.mem.Allocator, io: std.Io, name: []const u8, source: []const u8, limits: api.Limits, out: *std.Io.Writer, err: *std.Io.Writer) !u8 {
     const rt = try api.Runtime.create(gpa, .{ .limits = limits, .output = out });
     defer rt.destroy();
+
+    var fs_loader: zqjs.module.FsLoader = .{
+        .gpa = gpa,
+        .io = io,
+        .max_source_bytes = limits.max_source_bytes,
+        .fallback_referrer = name,
+    };
+    rt.setModuleLoader(fs_loader.loader()) catch unreachable;
 
     var diag: api.Diagnostic = .{};
     const program = rt.compile(name, source, &diag) catch |e| switch (e) {

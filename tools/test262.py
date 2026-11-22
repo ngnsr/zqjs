@@ -251,6 +251,7 @@ def run_single_test(args: tuple[Any, ...]) -> dict[str, Any]:
         parts.append(HOST_SHIM)
         parts.append(harness_bundle_cache["sta.js"])
         parts.append(harness_bundle_cache["assert.js"])
+        parts.append("globalThis.Test262Error = Test262Error; globalThis.assert = assert; globalThis.$262 = $262;\n")
         if is_async:
             parts.append(harness_bundle_cache["doneprintHandle.js"])
             parts.append("globalThis.$DONE = $DONE;\n")
@@ -286,7 +287,15 @@ def run_single_test(args: tuple[Any, ...]) -> dict[str, Any]:
                 tmp_file = tf.name
             cmd.append(tmp_file)
         else:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False, encoding="utf-8") as tf:
+            tmp_dir = str(test_path.parent) if "import(" in source else None
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=tmp_dir,
+                prefix=".zqjs_t262_",
+                suffix=".js",
+                delete=False,
+                encoding="utf-8",
+            ) as tf:
                 tf.write(full_source)
                 tmp_file = tf.name
             cmd.append(tmp_file)

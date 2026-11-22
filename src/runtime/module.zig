@@ -1242,6 +1242,7 @@ pub const FsLoader = struct {
     gpa: Allocator,
     io: std.Io,
     max_source_bytes: u32,
+    fallback_referrer: ?[]const u8 = null,
 
     pub fn loader(self: *FsLoader) ModuleLoader {
         return .{ .ctx = self, .load = load };
@@ -1249,7 +1250,7 @@ pub const FsLoader = struct {
 
     fn load(ctx: ?*anyopaque, referrer_id: ?[]const u8, specifier: []const u8) LoadError!LoadedModule {
         const self: *FsLoader = @ptrCast(@alignCast(ctx.?));
-        const resolved = try resolveFsPath(self.gpa, self.io, referrer_id, specifier);
+        const resolved = try resolveFsPath(self.gpa, self.io, referrer_id orelse self.fallback_referrer, specifier);
         errdefer self.gpa.free(resolved);
 
         const source = std.Io.Dir.cwd().readFileAlloc(self.io, resolved, self.gpa, .limited(self.max_source_bytes + 1)) catch |e| switch (e) {

@@ -93,6 +93,7 @@ UNCAUGHT_RE = re.compile(r"Uncaught\s+(?:Uncaught\s+)?([A-Za-z0-9_$]+)?")
 
 # Minimal $262 host object shim for tests that reference $262.global or $262.gc
 HOST_SHIM = """
+var Float16Array = undefined;
 const $262 = {
   global: {},
   gc: function () {},

@@ -37,9 +37,9 @@ pub const Lexer = struct {
         if (isIdentStart(c) or (c == '\\' and l.peekAt(start + 1) == 'u')) {
             return l.scanIdentifier(start, newline_before);
         }
-        if (c == '#' and isIdentStart(l.peekAt(start + 1))) {
+        if (c == '#' and (isIdentStart(l.peekAt(start + 1)) or (l.peekAt(start + 1) == '\\' and l.peekAt(start + 2) == 'u'))) {
             l.pos += 1;
-            while (isIdentPart(l.peekAt(l.pos))) l.pos += 1;
+            _ = try l.scanIdentifier(l.pos, newline_before);
             return l.make(.private_ident, start, newline_before);
         }
         if (c == '\'' or c == '"') {

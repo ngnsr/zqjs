@@ -257,6 +257,8 @@ pub const Runtime = struct {
     template_cache: std.AutoHashMapUnmanaged(usize, *heap_mod.Object) = .empty,
     /// Global symbol registry (`Symbol.for` / `Symbol.keyFor`, M36 D66). Strong roots.
     global_symbols: std.HashMapUnmanaged(*const heap_mod.String, *heap_mod.Symbol, SymbolRegistryContext, 80) = .empty,
+    /// Deleted `name` (bit 0 = 0) or `length` (bit 0 = 1) properties on static `Native` functions.
+    deleted_native_props: std.AutoHashMapUnmanaged(usize, void) = .empty,
     limit_hit: ?Limit = null,
     /// Set by a defensive-check failure (D49): an invariant of the VM, compiler or
     /// verifier is broken, so nothing about the state can be trusted. The embedding API
@@ -277,6 +279,21 @@ pub const Runtime = struct {
     wall_clock_ctx: ?*anyopaque = null,
 
     pub const default_random_seed: u64 = 0x9e3779b97f4a7c15;
+
+    pub fn isNativePropDeleted(rt: *const Runtime, n: *const Native, is_length: bool) bool {
+        if (rt.deleted_native_props.count() == 0) return false;
+        const key = @intFromPtr(n) | @as(usize, if (is_length) 1 else 0);
+        return rt.deleted_native_props.contains(key);
+    }
+
+    pub fn setNativePropDeleted(rt: *Runtime, n: *const Native, is_length: bool, deleted: bool) Error!void {
+        const key = @intFromPtr(n) | @as(usize, if (is_length) 1 else 0);
+        if (deleted) {
+            try rt.deleted_native_props.put(rt.gpa, key, {});
+        } else {
+            _ = rt.deleted_native_props.remove(key);
+        }
+    }
 
     pub fn nowMs(rt: *const Runtime) f64 {
         if (rt.wall_clock) |cb| {
@@ -319,6 +336,7 @@ pub const Runtime = struct {
         rt.extra_roots.deinit(rt.gpa);
         rt.template_cache.deinit(rt.gpa);
         rt.global_symbols.deinit(rt.gpa);
+        rt.deleted_native_props.deinit(rt.gpa);
         rt.microtasks.deinit(rt.gpa);
         rt.modules.deinit(rt.gpa);
         rt.heap.deinit();

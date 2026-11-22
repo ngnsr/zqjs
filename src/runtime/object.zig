@@ -188,8 +188,8 @@ pub fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error
         .boolean => return getFrom(rt, (try builtins.realm(rt)).boolean_prototype, receiver, k),
         .object => |o| return getFrom(rt, o, receiver, k),
         .native => |n| {
-            if (isNamed(k, "name")) return Value.fromString(try rt.heap.ascii(n.name));
-            if (isNamed(k, "length")) return Value.fromNumber(@floatFromInt(n.length));
+            if (isNamed(k, "name") and !rt.isNativePropDeleted(n, false)) return Value.fromString(try rt.heap.ascii(n.name));
+            if (isNamed(k, "length") and !rt.isNativePropDeleted(n, true)) return Value.fromNumber(@floatFromInt(n.length));
             if (try builtins.namespaceObject(rt, n)) |ns| {
                 if (try ownProp(rt, ns, k)) |p| return resolvePropValue(rt, receiver, p);
                 if (ns.builtin) |b| if (nodeHas(b, k)) return unsupportedBuiltin(rt, k);
@@ -321,6 +321,24 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
                 return null;
             }
         },
+        .primitive_wrapper => |pv| if (pv.isString()) {
+            const s = pv.asString();
+            switch (k) {
+                .index => |i| if (i < s.units.len) return .{
+                    .value = Value.fromString(try rt.heap.newString(&.{.{ .utf16 = s.units[i..][0..1] }})),
+                    .enumerable = true,
+                    .writable = false,
+                    .configurable = false,
+                },
+                .atom => if (isNamed(k, "length")) return .{
+                    .value = Value.fromNumber(@floatFromInt(s.units.len)),
+                    .enumerable = false,
+                    .writable = false,
+                    .configurable = false,
+                },
+                .symbol => {},
+            }
+        },
         .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
     if (o.props.count() > 0) {
@@ -439,11 +457,16 @@ pub fn setWithReceiver(rt: *Runtime, base: Value, k: Key, v: Value, receiver: Va
             return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot set properties of " }, .{ .ascii = @tagName(base.tag()) }, .{ .ascii = " (setting '" }, keyPiece(k, &buf), .{ .ascii = "')" } });
         },
         .string, .number, .boolean, .symbol, .bigint => return if (strict) rt.throw(.TypeError, &.{.{ .ascii = "Cannot create property on primitive" }}) else rt.fail(.primitive_write),
-        .native => {
+        .native => |n| {
             if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
-            if (isNamed(k, "name") or isNamed(k, "length")) {
+            if ((isNamed(k, "name") and !rt.isNativePropDeleted(n, false)) or
+                (isNamed(k, "length") and !rt.isNativePropDeleted(n, true)))
+            {
                 if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
                 return false;
+            }
+            if (try builtins.namespaceObject(rt, n)) |ns| {
+                return setWithReceiver(rt, Value.fromObject(ns), k, v, Value.fromObject(ns), strict);
             }
             return rt.fail(.function_properties);
         },
@@ -629,7 +652,7 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!b
                         return true;
                     }
                 },
-                .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
+                .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date, .primitive_wrapper => {},
             }
             const pk = try propKey(rt, k);
             if (!o.extensible and !o.props.contains(pk)) {
@@ -802,7 +825,20 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
     const o = switch (base.unpack()) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
         .string, .number, .boolean, .symbol, .bigint => return rt.fail(.primitive_write),
-        .native => return rt.fail(.function_properties),
+        .native => |n| {
+            if (isNamed(k, "name")) {
+                try rt.setNativePropDeleted(n, false, true);
+                return true;
+            }
+            if (isNamed(k, "length")) {
+                try rt.setNativePropDeleted(n, true, true);
+                return true;
+            }
+            if (try builtins.namespaceObject(rt, n)) |ns| {
+                return delete(rt, Value.fromObject(ns), k);
+            }
+            return true;
+        },
         .closure => |c| {
             if (isNamed(k, "name")) return if (c.meta) |m| m.name_configurable else true;
             if (isNamed(k, "length")) return if (c.meta) |m| m.length_configurable else true;
@@ -836,6 +872,14 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
             }
         },
         .proxy => return builtins.proxyDeleteProperty(rt, o, k),
+        .primitive_wrapper => |pv| if (pv.isString()) {
+            const s = pv.asString();
+            switch (k) {
+                .index => |i| if (i < s.units.len) return false,
+                .atom => if (isNamed(k, "length")) return false,
+                .symbol => {},
+            }
+        },
         .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .date => {},
     }
     if (o.props.count() == 0) return true;
@@ -857,7 +901,8 @@ pub fn hasOwn(rt: *Runtime, base: Value, k: Key) Error!bool {
             return false;
         },
         .native => |n| {
-            if (isNamed(k, "name") or isNamed(k, "length")) return true;
+            if (isNamed(k, "name") and !rt.isNativePropDeleted(n, false)) return true;
+            if (isNamed(k, "length") and !rt.isNativePropDeleted(n, true)) return true;
             if (try builtins.namespaceObject(rt, n)) |ns| return (try ownProp(rt, ns, k)) != null;
             return false;
         },
@@ -877,7 +922,8 @@ pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
     const start: *Object = switch (base.unpack()) {
         .object => |o| o,
         .native => |n| {
-            if (isNamed(k, "name") or isNamed(k, "length")) return true;
+            if (isNamed(k, "name") and !rt.isNativePropDeleted(n, false)) return true;
+            if (isNamed(k, "length") and !rt.isNativePropDeleted(n, true)) return true;
             if (try builtins.namespaceObject(rt, n)) |ns| {
                 if (try ownProp(rt, ns, k) != null) return true;
                 if (ns.builtin) |b| if (nodeHas(b, k)) return true;
@@ -1106,6 +1152,9 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
             for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
         .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
+        .primitive_wrapper => |pv| if (pv.isString()) {
+            for (0..pv.asString().units.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
+        },
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
     const first_named = out.items.len;
@@ -1124,10 +1173,19 @@ pub fn ownPropertyNames(rt: *Runtime, o: *Object) Error![]Key {
             for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
         .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
+        .primitive_wrapper => |pv| if (pv.isString()) {
+            for (0..pv.asString().units.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
+        },
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
     const first_named = out.items.len;
     try appendPropStoreKeys(rt, &out, &o.props, first_named, false, true);
+    if (o.kind == .primitive_wrapper and o.kind.primitive_wrapper.isString()) {
+        const len_atom = try rt.heap.internAscii("length");
+        if (!o.props.contains(heap_mod.PropKey.fromAtom(len_atom))) {
+            try out.append(rt.gpa, .{ .atom = len_atom });
+        }
+    }
     return out.toOwnedSlice(rt.gpa);
 }
 
@@ -1142,6 +1200,9 @@ pub fn ownAllKeys(rt: *Runtime, o: *Object) Error![]Key {
             for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
         .module_namespace => |ns| for (ns.entries) |e| try out.append(rt.gpa, .{ .atom = e.name }),
+        .primitive_wrapper => |pv| if (pv.isString()) {
+            for (0..pv.asString().units.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
+        },
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
     const first_named = out.items.len;

@@ -189,6 +189,18 @@ fn cloneObject(ctx: *CloneContext, src: *Object) Error!*Object {
         .map => try cloneMap(ctx, src),
         .set => try cloneSet(ctx, src),
         .date => try cloneDate(ctx, src),
+        .primitive_wrapper => |pv| blk: {
+            const r = try builtins.realm(rt);
+            const dst = switch (pv.unpack()) {
+                .boolean => try rt.heap.newPrimitiveWrapper(r.boolean_prototype, pv),
+                .number => try rt.heap.newPrimitiveWrapper(r.number_prototype, pv),
+                .bigint => try rt.heap.newPrimitiveWrapper(r.bigint_prototype, pv),
+                .string => |s| try rt.heap.newPrimitiveWrapper(r.string_prototype, Value.fromString(try rt.heap.newString(&.{.{ .utf16 = s.units }}))),
+                else => return throwDataCloneError(rt, "Symbol object could not be cloned"),
+            };
+            try ctx.visited.put(rt.gpa, src, dst);
+            break :blk dst;
+        },
         .regexp => try cloneRegExp(ctx, src),
         .array_buffer => try cloneArrayBuffer(ctx, src),
         .typed_array => try cloneTypedArray(ctx, src),

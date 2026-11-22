@@ -330,7 +330,7 @@ test "built-ins: known to node but not implemented is Unsupported, naming the me
     try expectUnsupported("({}).toLocaleString;", "", "('toLocaleString')");
     try expectUnsupported("({}).constructor;", "", "('constructor')");
     try expectUnsupported("console;", "", "('console')");
-    try expectUnsupported("Object(1);", "", "Unsupported(builtin)");
+    try expectUnsupported("Function('return 1');", "", "Unsupported(builtin)");
     // Names node doesn't have are plain misses (undefined / ReferenceError), not Unsupported.
     for (support.engines) |engine| {
         var r = try support.run(testing.allocator, "print([].nope, ({}).nope, 'x'.nope, Object.nope); nope;", .{}, engine, .normal);
@@ -376,9 +376,9 @@ test "object limits: heap, string length of a join, conversion depth" {
 
 test "M11.3b: Array/String unimplemented methods, non-matching receivers, and non-ASCII case report Unsupported" {
     try expectUnsupported("[1].toLocaleString;", "", "('toLocaleString')");
-    try expectUnsupported("let o = { length: 1, slice: [].slice }; o.slice();", "", "Unsupported(builtin)");
-    try expectUnsupported("let o = { length: 1, indexOf: [].indexOf }; o.indexOf(1);", "", "Unsupported(builtin)");
-    try expectUnsupported("let o = { length: 1, includes: [].includes }; o.includes(1);", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { length: 1, slice: [].slice }; o.slice();", "", "Unsupported(sparse_array)");
+    try expectUnsupported("let o = { length: 1, push: [].push }; o.push(1);", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { length: 1, pop: [].pop }; o.pop();", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { charAt: ''.charAt }; o.charAt(0);", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { slice: ''.slice }; o.slice(0);", "", "Unsupported(builtin)");
     try expectUnsupported("'\\u00e9'.toLowerCase();", "", "('toLowerCase')");
@@ -389,8 +389,7 @@ test "M11.3b: Array/String unimplemented methods, non-matching receivers, and no
 test "M14.2: Map unsupported methods, non-Map receivers, and non-Map new() targets" {
     try expectUnsupported("new Map().constructor;", "", "('constructor')");
     try expectUnsupported("let o = { get: new Map().get }; o.get('x');", "", "Unsupported(builtin)");
-    try expectUnsupported("new Number();", "", "Unsupported(builtin)");
-    try expectUnsupported("new String();", "", "Unsupported(builtin)");
+    try expectUnsupported("new Function();", "", "Unsupported(builtin)");
 }
 
 test "M14.3: Set unsupported methods, non-Set receivers, and non-array iterables" {
@@ -577,10 +576,7 @@ test "M16.2: Array/Map/Set callback receivers, map shrink deviation, limits, and
     try expectUnsupported("[1, 2, 3].map(function (v, i, a) { if (i === 0) a.pop(); return v; });", "", "Unsupported(sparse_array)");
 
     // Non-matching receivers
-    try expectUnsupported("let o = { length: 1, forEach: [].forEach }; o.forEach(function () {});", "", "Unsupported(builtin)");
-    try expectUnsupported("let o = { length: 1, map: [].map }; o.map(function () {});", "", "Unsupported(builtin)");
-    try expectUnsupported("let o = { length: 1, filter: [].filter }; o.filter(function () {});", "", "Unsupported(builtin)");
-    try expectUnsupported("let o = { length: 1, reduce: [].reduce }; o.reduce(function () {});", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { length: 1, map: [].map }; o.map(function () {});", "", "Unsupported(sparse_array)");
     try expectUnsupported("let o = { forEach: new Map().forEach }; o.forEach(function () {});", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { forEach: new Set().forEach }; o.forEach(function () {});", "", "Unsupported(builtin)");
 
@@ -614,10 +610,6 @@ test "M17.1: documented ZQJS deviations on callback thisArg and detached receive
     try expectUnsupported("new Set([1]).forEach(function () { return this; }, 42);", "", "Unsupported(sloppy_this)");
 
     // Detached/missing receiver on prototype methods reports Unsupported(builtin).
-    try expectUnsupported("const f = [].map; f(function (x) { return x; });", "", "Unsupported(builtin)");
-    try expectUnsupported("const f = [].forEach; f(function () {});", "", "Unsupported(builtin)");
-    try expectUnsupported("const f = [].filter; f(function () { return true; });", "", "Unsupported(builtin)");
-    try expectUnsupported("const f = [].reduce; f(function (a, b) { return a + b; }, 0);", "", "Unsupported(builtin)");
     try expectUnsupported("const f = new Map().forEach; f(function () {});", "", "Unsupported(builtin)");
     try expectUnsupported("const f = new Set().forEach; f(function () {});", "", "Unsupported(builtin)");
 }

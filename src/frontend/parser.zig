@@ -1857,7 +1857,7 @@ const Parser = struct {
                 try p.rejectCoverExpr(rhs);
                 const lhs = try p.node(
                     .{ .start = priv_tok.start, .end = rhs.span.end },
-                    .{ .private_in = .{ .name = priv_tok.text(p.source()), .rhs = rhs, .span = .{ .start = priv_tok.start, .end = priv_tok.end } } },
+                    .{ .private_in = .{ .name = try p.identText(priv_tok), .rhs = rhs, .span = .{ .start = priv_tok.start, .end = priv_tok.end } } },
                     rhs.depth,
                 );
                 return p.binaryFrom(lhs, min_bp);
@@ -2043,7 +2043,7 @@ const Parser = struct {
                 if (p.tok.tag == .private_ident) {
                     const name = p.tok;
                     try p.advance();
-                    break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = name.text(p.source()) }, .is_private = true } }, callee.depth);
+                    break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = try p.identText(name) }, .is_private = true } }, callee.depth);
                 }
                 const name = try p.expectPropertyName();
                 break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = try p.identText(name) } } }, callee.depth);
@@ -2132,7 +2132,7 @@ const Parser = struct {
                 } else if (p.tok.tag == .private_ident) {
                     const name = p.tok;
                     try p.advance();
-                    try steps.append(p.arena, .{ .optional = true, .kind = .{ .private_prop = name.text(p.source()) } });
+                    try steps.append(p.arena, .{ .optional = true, .kind = .{ .private_prop = try p.identText(name) } });
                     end = name.end;
                 } else {
                     const name = try p.expectPropertyName();
@@ -3327,7 +3327,7 @@ const Parser = struct {
             const is_private = p.tok.tag == .private_ident;
             const key: ast.PropertyKey = switch (p.tok.tag) {
                 .private_ident => blk: {
-                    const name = p.tok.text(p.source());
+                    const name = try p.identText(p.tok);
                     if (std.mem.eql(u8, name, "#constructor")) {
                         return p.fail(.{ .syntax_error = "Classes may not have a private element named '#constructor'" }, key_tok);
                     }

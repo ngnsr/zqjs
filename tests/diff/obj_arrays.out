@@ -16,3 +16,8 @@ RangeError
 RangeError
 undefined undefined 7
 true true true 42 true
+object true 2 object 42 50 object abc 3 b 0,1,2
+true true true
+60 0 1,2,3 20,30 true true 1 2 true 20,30
+1,99,100 3
+55

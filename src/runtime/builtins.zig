@@ -817,9 +817,9 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
 pub const print: Native = .{ .name = "print", .call = printImpl };
 pub const object_global: Native = .{ .name = "Object", .length = 1, .call = objectCall, .construct = objectConstruct, .namespace = .object };
 pub const array_global: Native = .{ .name = "Array", .length = 1, .call = arrayCall, .construct = arrayConstruct, .namespace = .array };
-pub const string_global: Native = .{ .name = "String", .length = 1, .call = stringCall, .namespace = .string };
-pub const number_global: Native = .{ .name = "Number", .length = 1, .call = numberCall, .namespace = .number };
-pub const boolean_global: Native = .{ .name = "Boolean", .length = 1, .call = booleanCall, .namespace = .boolean };
+pub const string_global: Native = .{ .name = "String", .length = 1, .call = stringCall, .construct = stringConstruct, .namespace = .string };
+pub const number_global: Native = .{ .name = "Number", .length = 1, .call = numberCall, .construct = numberConstruct, .namespace = .number };
+pub const boolean_global: Native = .{ .name = "Boolean", .length = 1, .call = booleanCall, .construct = booleanConstruct, .namespace = .boolean };
 pub const function_global: Native = .{ .name = "Function", .length = 1, .call = notCallable, .namespace = .function };
 pub const parse_int_global: Native = .{ .name = "parseInt", .length = 2, .call = parseIntImpl };
 pub const parse_float_global: Native = .{ .name = "parseFloat", .call = parseFloatImpl };
@@ -1403,6 +1403,12 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
                 .@"error" => "Error",
                 .plain => if (o.builtin == .number_prototype) "Number" else if (o.builtin == .boolean_prototype) "Boolean" else if (o.builtin == .string_prototype) "String" else "Object",
             },
+            .primitive_wrapper => |pv| switch (pv.unpack()) {
+                .boolean => "Boolean",
+                .number => "Number",
+                .string => "String",
+                else => "Object",
+            },
             else => "Object",
         },
     };
@@ -1421,8 +1427,10 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 }
 
 fn objectValueOf(rt: *Runtime, this: Value, _: []const Value) Error!Value {
-    if (this.isObjectLike()) return this;
-    return unsupportedReceiver(rt, "valueOf"); // ToObject: a wrapper object
+    if (this.isUndefined() or this.isNull()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    return objectConstruct(rt, &.{this});
 }
 
 // ---------------------------------------------------------------- Array.prototype
@@ -1539,41 +1547,104 @@ fn arrayPop(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     return rt.heap.popElement(a) orelse .undefined;
 }
 
+fn toObjectReceiver(rt: *Runtime, this: Value) Error!Value {
+    if (this.isUndefined() or this.isNull()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    return if (this.isObjectLike()) this else objectConstruct(rt, &.{this});
+}
+
 /// ZQJS arrays are always dense (D13), so `slice()` always returns a dense array;
 /// sparse-array hole preservation is not supported because holes are rejected at creation.
 fn arraySlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const a = try thisArray(rt, this, "slice");
-    const items = a.kind.array.items;
-    const start = if (arg(args, 0).isUndefined()) 0 else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 0)), items.len);
-    const end = if (arg(args, 1).isUndefined()) items.len else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 1)), items.len);
+    if (this.isObject() and this.asObject().kind == .array) {
+        const items = this.asObject().kind.array.items;
+        const start = if (arg(args, 0).isUndefined()) 0 else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 0)), items.len);
+        const end = if (arg(args, 1).isUndefined()) items.len else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 1)), items.len);
+        const r = try realm(rt);
+        const out = try rt.heap.newArray(r.array_prototype);
+        if (start < end) try rt.heap.appendElements(out, items[start..end]);
+        return Value.fromObject(out);
+    }
+    const o_val = try toObjectReceiver(rt, this);
     const r = try realm(rt);
     const out = try rt.heap.newArray(r.array_prototype);
-    if (start < end) try rt.heap.appendElements(out, items[start..end]);
+    var root_buf = [_]Value{ o_val, Value.fromObject(out), .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const len_f = try toLength(rt, try object.get(rt, o_val, try object.named(rt, "length")));
+    const len: usize = @intFromFloat(len_f);
+    const start = if (arg(args, 0).isUndefined()) 0 else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 0)), len);
+    const end = if (arg(args, 1).isUndefined()) len else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 1)), len);
+    var k: usize = start;
+    while (k < end) : (k += 1) {
+        if (!try object.has(rt, .{ .index = @intCast(k) }, o_val)) return rt.fail(.sparse_array);
+        root_buf[2] = try object.get(rt, o_val, .{ .index = @intCast(k) });
+        try rt.heap.appendElement(out, root_buf[2]);
+        root_buf[2] = .undefined;
+    }
     return Value.fromObject(out);
 }
 
 fn arrayIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const a = try thisArray(rt, this, "indexOf");
-    const items = a.kind.array.items;
-    if (items.len == 0) return Value.fromNumber(-1);
+    if (this.isObject() and this.asObject().kind == .array) {
+        const items = this.asObject().kind.array.items;
+        if (items.len == 0) return Value.fromNumber(-1);
+        const needle = arg(args, 0);
+        const from_n = if (args.len >= 2) try toIntegerOrInfinity(rt, args[1]) else 0;
+        const start = resolveSearchStart(from_n, items.len) orelse return Value.fromNumber(-1);
+        for (items[start..], start..) |item, i| {
+            if (ops.strictEquals(item, needle)) return Value.fromNumber(@floatFromInt(i));
+        }
+        return Value.fromNumber(-1);
+    }
+    const o_val = try toObjectReceiver(rt, this);
     const needle = arg(args, 0);
+    var root_buf = [_]Value{ o_val, needle };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const len_f = try toLength(rt, try object.get(rt, o_val, try object.named(rt, "length")));
+    const len: usize = @intFromFloat(len_f);
+    if (len == 0) return Value.fromNumber(-1);
     const from_n = if (args.len >= 2) try toIntegerOrInfinity(rt, args[1]) else 0;
-    const start = resolveSearchStart(from_n, items.len) orelse return Value.fromNumber(-1);
-    for (items[start..], start..) |item, i| {
-        if (ops.strictEquals(item, needle)) return Value.fromNumber(@floatFromInt(i));
+    const start = resolveSearchStart(from_n, len) orelse return Value.fromNumber(-1);
+    for (start..len) |i| {
+        if (try object.has(rt, .{ .index = @intCast(i) }, o_val)) {
+            const elem = try object.get(rt, o_val, .{ .index = @intCast(i) });
+            if (ops.strictEquals(elem, needle)) return Value.fromNumber(@floatFromInt(i));
+        }
     }
     return Value.fromNumber(-1);
 }
 
 fn arrayIncludes(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const a = try thisArray(rt, this, "includes");
-    const items = a.kind.array.items;
-    if (items.len == 0) return Value.fromBool(false);
+    if (this.isObject() and this.asObject().kind == .array) {
+        const items = this.asObject().kind.array.items;
+        if (items.len == 0) return Value.fromBool(false);
+        const needle = arg(args, 0);
+        const from_n = if (args.len >= 2) try toIntegerOrInfinity(rt, args[1]) else 0;
+        const start = resolveSearchStart(from_n, items.len) orelse return Value.fromBool(false);
+        for (items[start..]) |item| {
+            if (sameValueZero(item, needle)) return Value.fromBool(true);
+        }
+        return Value.fromBool(false);
+    }
+    const o_val = try toObjectReceiver(rt, this);
     const needle = arg(args, 0);
+    var root_buf = [_]Value{ o_val, needle };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const len_f = try toLength(rt, try object.get(rt, o_val, try object.named(rt, "length")));
+    const len: usize = @intFromFloat(len_f);
+    if (len == 0) return Value.fromBool(false);
     const from_n = if (args.len >= 2) try toIntegerOrInfinity(rt, args[1]) else 0;
-    const start = resolveSearchStart(from_n, items.len) orelse return Value.fromBool(false);
-    for (items[start..]) |item| {
-        if (sameValueZero(item, needle)) return Value.fromBool(true);
+    const start = resolveSearchStart(from_n, len) orelse return Value.fromBool(false);
+    for (start..len) |i| {
+        const elem = try object.get(rt, o_val, .{ .index = @intCast(i) });
+        if (sameValueZero(elem, needle)) return Value.fromBool(true);
     }
     return Value.fromBool(false);
 }
@@ -1623,39 +1694,66 @@ fn arrayEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 }
 
 fn arrayForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const a = try thisArray(rt, this, "forEach");
-    const cb = try requireCallable(rt, arg(args, 0));
+    const o_val = try toObjectReceiver(rt, this);
     const this_arg = arg(args, 1);
-    const len = a.kind.array.items.len;
-    var root_buf = [_]Value{ this, cb, this_arg };
+    var root_buf = [_]Value{ o_val, arg(args, 0), this_arg };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
+    if (o_val.isObject() and o_val.asObject().kind == .array) {
+        const a = o_val.asObject();
+        const len = a.kind.array.items.len;
+        const cb = try requireCallable(rt, root_buf[1]);
+        for (0..len) |i| {
+            if (i >= a.kind.array.items.len) continue;
+            const elem = a.kind.array.items[i];
+            _ = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
+        }
+        return .undefined;
+    }
+    const len_f = try toLength(rt, try object.get(rt, o_val, try object.named(rt, "length")));
+    const len: usize = @intFromFloat(len_f);
+    const cb = try requireCallable(rt, root_buf[1]);
     for (0..len) |i| {
-        if (i >= a.kind.array.items.len) continue;
-        const elem = a.kind.array.items[i];
-        _ = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), this });
+        if (try object.has(rt, .{ .index = @intCast(i) }, o_val)) {
+            const elem = try object.get(rt, o_val, .{ .index = @intCast(i) });
+            _ = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
+        }
     }
     return .undefined;
 }
 
 fn arrayMap(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const a = try thisArray(rt, this, "map");
-    const cb = try requireCallable(rt, arg(args, 0));
+    const o_val = try toObjectReceiver(rt, this);
     const this_arg = arg(args, 1);
-    const len = a.kind.array.items.len;
     const r = try realm(rt);
     const out = try rt.heap.newArray(r.array_prototype);
-    var root_buf = [_]Value{ this, cb, this_arg, Value.fromObject(out), .undefined };
+    var root_buf = [_]Value{ o_val, arg(args, 0), this_arg, Value.fromObject(out), .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
+    if (o_val.isObject() and o_val.asObject().kind == .array) {
+        const a = o_val.asObject();
+        const len = a.kind.array.items.len;
+        const cb = try requireCallable(rt, root_buf[1]);
+        for (0..len) |i| {
+            if (i >= a.kind.array.items.len) return rt.fail(.sparse_array);
+            const elem = a.kind.array.items[i];
+            root_buf[4] = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
+            try rt.heap.appendElement(out, root_buf[4]);
+            root_buf[4] = .undefined;
+        }
+        return Value.fromObject(out);
+    }
+    const len_f = try toLength(rt, try object.get(rt, o_val, try object.named(rt, "length")));
+    const len: usize = @intFromFloat(len_f);
+    const cb = try requireCallable(rt, root_buf[1]);
     for (0..len) |i| {
-        if (i >= a.kind.array.items.len) return rt.fail(.sparse_array);
-        const elem = a.kind.array.items[i];
-        root_buf[4] = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), this });
+        if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) return rt.fail(.sparse_array);
+        const elem = try object.get(rt, o_val, .{ .index = @intCast(i) });
+        root_buf[4] = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
         try rt.heap.appendElement(out, root_buf[4]);
         root_buf[4] = .undefined;
     }
@@ -1663,50 +1761,90 @@ fn arrayMap(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn arrayFilter(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const a = try thisArray(rt, this, "filter");
-    const cb = try requireCallable(rt, arg(args, 0));
+    const o_val = try toObjectReceiver(rt, this);
     const this_arg = arg(args, 1);
-    const len = a.kind.array.items.len;
     const r = try realm(rt);
     const out = try rt.heap.newArray(r.array_prototype);
-    var root_buf = [_]Value{ this, cb, this_arg, Value.fromObject(out), .undefined };
+    var root_buf = [_]Value{ o_val, arg(args, 0), this_arg, Value.fromObject(out), .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
+    if (o_val.isObject() and o_val.asObject().kind == .array) {
+        const a = o_val.asObject();
+        const len = a.kind.array.items.len;
+        const cb = try requireCallable(rt, root_buf[1]);
+        for (0..len) |i| {
+            if (i >= a.kind.array.items.len) continue;
+            const elem = a.kind.array.items[i];
+            root_buf[4] = elem;
+            const keep = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
+            if (ops.toBoolean(keep)) try rt.heap.appendElement(out, root_buf[4]);
+            root_buf[4] = .undefined;
+        }
+        return Value.fromObject(out);
+    }
+    const len_f = try toLength(rt, try object.get(rt, o_val, try object.named(rt, "length")));
+    const len: usize = @intFromFloat(len_f);
+    const cb = try requireCallable(rt, root_buf[1]);
     for (0..len) |i| {
-        if (i >= a.kind.array.items.len) continue;
-        const elem = a.kind.array.items[i];
-        root_buf[4] = elem;
-        const keep = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), this });
-        if (ops.toBoolean(keep)) try rt.heap.appendElement(out, root_buf[4]);
-        root_buf[4] = .undefined;
+        if (try object.has(rt, .{ .index = @intCast(i) }, o_val)) {
+            const elem = try object.get(rt, o_val, .{ .index = @intCast(i) });
+            root_buf[4] = elem;
+            const keep = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
+            if (ops.toBoolean(keep)) try rt.heap.appendElement(out, root_buf[4]);
+            root_buf[4] = .undefined;
+        }
     }
     return Value.fromObject(out);
 }
 
 fn arrayReduce(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const a = try thisArray(rt, this, "reduce");
-    const cb = try requireCallable(rt, arg(args, 0));
-    const len = a.kind.array.items.len;
-    var start: usize = 0;
-    var acc: Value = undefined;
-    if (args.len >= 2) {
-        acc = args[1];
-    } else {
-        if (len == 0) return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty array with no initial value" }});
-        acc = a.kind.array.items[0];
-        start = 1;
-    }
-    var root_buf = [_]Value{ this, cb, acc };
+    const o_val = try toObjectReceiver(rt, this);
+    var root_buf = [_]Value{ o_val, arg(args, 0), arg(args, 1) };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    for (start..len) |i| {
-        if (i >= a.kind.array.items.len) continue;
-        const elem = a.kind.array.items[i];
-        root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, Value.fromNumber(@floatFromInt(i)), this });
+    if (o_val.isObject() and o_val.asObject().kind == .array) {
+        const a = o_val.asObject();
+        const cb = try requireCallable(rt, root_buf[1]);
+        const elems = a.kind.array.items;
+        const len = elems.len;
+        var start: usize = 0;
+        if (args.len < 2) {
+            if (len == 0) return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty array with no initial value" }});
+            root_buf[2] = elems[0];
+            start = 1;
+        }
+        for (start..len) |i| {
+            if (i >= a.kind.array.items.len) continue;
+            const elem = a.kind.array.items[i];
+            root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, Value.fromNumber(@floatFromInt(i)), o_val });
+        }
+        return root_buf[2];
+    }
+    const len_f = try toLength(rt, try object.get(rt, o_val, try object.named(rt, "length")));
+    const len: usize = @intFromFloat(len_f);
+    const cb = try requireCallable(rt, root_buf[1]);
+    var k: usize = 0;
+    if (args.len < 2) {
+        var found = false;
+        while (k < len) : (k += 1) {
+            if (try object.has(rt, .{ .index = @intCast(k) }, o_val)) {
+                root_buf[2] = try object.get(rt, o_val, .{ .index = @intCast(k) });
+                k += 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty array with no initial value" }});
+    }
+    while (k < len) : (k += 1) {
+        if (try object.has(rt, .{ .index = @intCast(k) }, o_val)) {
+            const elem = try object.get(rt, o_val, .{ .index = @intCast(k) });
+            root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, Value.fromNumber(@floatFromInt(k)), o_val });
+        }
     }
     return root_buf[2];
 }
@@ -1759,23 +1897,39 @@ fn arrayFindLastIndex(rt: *Runtime, this: Value, args: []const Value) Error!Valu
     return arrayFindImpl(rt, this, args, "findLastIndex", .find_last_index);
 }
 
-fn arraySomeEveryImpl(rt: *Runtime, this: Value, args: []const Value, name: []const u8, comptime is_every: bool) Error!Value {
-    const a = try thisArray(rt, this, name);
-    const cb = try requireCallable(rt, arg(args, 0));
+fn arraySomeEveryImpl(rt: *Runtime, this: Value, args: []const Value, _: []const u8, comptime is_every: bool) Error!Value {
+    const o_val = try toObjectReceiver(rt, this);
     const this_arg = arg(args, 1);
-    const len = a.kind.array.items.len;
-    var root_buf = [_]Value{ this, cb, this_arg };
+    var root_buf = [_]Value{ o_val, arg(args, 0), this_arg };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
+    if (o_val.isObject() and o_val.asObject().kind == .array) {
+        const a = o_val.asObject();
+        const len = a.kind.array.items.len;
+        const cb = try requireCallable(rt, root_buf[1]);
+        for (0..len) |i| {
+            if (i >= a.kind.array.items.len) continue;
+            const elem = a.kind.array.items[i];
+            const res = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
+            const b = ops.toBoolean(res);
+            if (is_every and !b) return Value.fromBool(false);
+            if (!is_every and b) return Value.fromBool(true);
+        }
+        return Value.fromBool(is_every);
+    }
+    const len_f = try toLength(rt, try object.get(rt, o_val, try object.named(rt, "length")));
+    const len: usize = @intFromFloat(len_f);
+    const cb = try requireCallable(rt, root_buf[1]);
     for (0..len) |i| {
-        if (i >= a.kind.array.items.len) continue;
-        const elem = a.kind.array.items[i];
-        const res = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), this });
-        const b = ops.toBoolean(res);
-        if (is_every and !b) return Value.fromBool(false);
-        if (!is_every and b) return Value.fromBool(true);
+        if (try object.has(rt, .{ .index = @intCast(i) }, o_val)) {
+            const elem = try object.get(rt, o_val, .{ .index = @intCast(i) });
+            const res = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
+            const b = ops.toBoolean(res);
+            if (is_every and !b) return Value.fromBool(false);
+            if (!is_every and b) return Value.fromBool(true);
+        }
     }
     return Value.fromBool(is_every);
 }
@@ -1832,17 +1986,38 @@ fn arrayAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn arrayLastIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const a = try thisArray(rt, this, "lastIndexOf");
-    const items = a.kind.array.items;
-    if (items.len == 0) return Value.fromNumber(-1);
+    if (this.isObject() and this.asObject().kind == .array) {
+        const items = this.asObject().kind.array.items;
+        if (items.len == 0) return Value.fromNumber(-1);
+        const needle = arg(args, 0);
+        const len_f: f64 = @floatFromInt(items.len);
+        const n = if (args.len >= 2) try toIntegerOrInfinity(rt, args[1]) else len_f - 1;
+        const k_f = if (n >= 0) @min(n, len_f - 1) else len_f + n;
+        if (k_f < 0) return Value.fromNumber(-1);
+        var k: usize = @intFromFloat(k_f);
+        while (true) : (k -= 1) {
+            if (ops.strictEquals(items[k], needle)) return Value.fromNumber(@floatFromInt(k));
+            if (k == 0) break;
+        }
+        return Value.fromNumber(-1);
+    }
+    const o_val = try toObjectReceiver(rt, this);
     const needle = arg(args, 0);
-    const len_f: f64 = @floatFromInt(items.len);
+    var root_buf = [_]Value{ o_val, needle };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const len_f = try toLength(rt, try object.get(rt, o_val, try object.named(rt, "length")));
+    if (len_f == 0) return Value.fromNumber(-1);
     const n = if (args.len >= 2) try toIntegerOrInfinity(rt, args[1]) else len_f - 1;
     const k_f = if (n >= 0) @min(n, len_f - 1) else len_f + n;
     if (k_f < 0) return Value.fromNumber(-1);
     var k: usize = @intFromFloat(k_f);
     while (true) : (k -= 1) {
-        if (ops.strictEquals(items[k], needle)) return Value.fromNumber(@floatFromInt(k));
+        if (try object.has(rt, .{ .index = @intCast(k) }, o_val)) {
+            const elem = try object.get(rt, o_val, .{ .index = @intCast(k) });
+            if (ops.strictEquals(elem, needle)) return Value.fromNumber(@floatFromInt(k));
+        }
         if (k == 0) break;
     }
     return Value.fromNumber(-1);
@@ -2031,28 +2206,52 @@ fn mergeSortRange(
 }
 
 fn arrayReduceRight(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const a = try thisArray(rt, this, "reduceRight");
-    const cb = try requireCallable(rt, arg(args, 0));
-    const len = a.kind.array.items.len;
-    var idx: usize = len;
-    var acc: Value = undefined;
-    if (args.len >= 2) {
-        acc = args[1];
-    } else {
-        if (len == 0) return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty array with no initial value" }});
-        idx = len - 1;
-        acc = a.kind.array.items[idx];
-    }
-    var root_buf = [_]Value{ this, cb, acc };
+    const o_val = try toObjectReceiver(rt, this);
+    var root_buf = [_]Value{ o_val, arg(args, 0), arg(args, 1) };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
+    if (o_val.isObject() and o_val.asObject().kind == .array) {
+        const a = o_val.asObject();
+        const cb = try requireCallable(rt, root_buf[1]);
+        const elems = a.kind.array.items;
+        const len = elems.len;
+        var idx: usize = len;
+        if (args.len < 2) {
+            if (len == 0) return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty array with no initial value" }});
+            idx = len - 1;
+            root_buf[2] = elems[idx];
+        }
+        while (idx > 0) {
+            idx -= 1;
+            if (idx >= a.kind.array.items.len) continue;
+            const elem = a.kind.array.items[idx];
+            root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, Value.fromNumber(@floatFromInt(idx)), o_val });
+        }
+        return root_buf[2];
+    }
+    const len_f = try toLength(rt, try object.get(rt, o_val, try object.named(rt, "length")));
+    var idx: usize = @intFromFloat(len_f);
+    const cb = try requireCallable(rt, root_buf[1]);
+    if (args.len < 2) {
+        var found = false;
+        while (idx > 0) {
+            idx -= 1;
+            if (try object.has(rt, .{ .index = @intCast(idx) }, o_val)) {
+                root_buf[2] = try object.get(rt, o_val, .{ .index = @intCast(idx) });
+                found = true;
+                break;
+            }
+        }
+        if (!found) return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty array with no initial value" }});
+    }
     while (idx > 0) {
         idx -= 1;
-        if (idx >= a.kind.array.items.len) continue;
-        const elem = a.kind.array.items[idx];
-        root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, Value.fromNumber(@floatFromInt(idx)), this });
+        if (try object.has(rt, .{ .index = @intCast(idx) }, o_val)) {
+            const elem = try object.get(rt, o_val, .{ .index = @intCast(idx) });
+            root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, Value.fromNumber(@floatFromInt(idx)), o_val });
+        }
     }
     return root_buf[2];
 }
@@ -2288,6 +2487,7 @@ const string_search: Native = .{ .name = "search", .length = 1, .call = stringSe
 fn thisString(rt: *Runtime, this: Value, name: []const u8) Error!*const heap_mod.String {
     return switch (this.unpack()) {
         .string => |s| s,
+        .object => |o| if (o.kind == .primitive_wrapper and o.kind.primitive_wrapper.isString()) o.kind.primitive_wrapper.asString() else unsupportedReceiver(rt, name),
         else => unsupportedReceiver(rt, name),
     };
 }
@@ -2992,6 +3192,19 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                     }
                 },
                 .proxy => return proxyGetOwnPropertyDescriptor(rt, o, k),
+                .primitive_wrapper => |pv| if (pv.isString()) {
+                    const s = pv.asString();
+                    switch (k) {
+                        .index => |i| if (i < s.units.len) {
+                            const ch = try rt.heap.newString(&.{.{ .utf16 = s.units[i..][0..1] }});
+                            return .{ .value = Value.fromString(ch), .writable = false, .configurable = false };
+                        },
+                        .atom => if (object.isNamed(k, "length")) {
+                            return .{ .value = Value.fromNumber(@floatFromInt(s.units.len)), .enumerable = false, .writable = false, .configurable = false };
+                        },
+                        .symbol => {},
+                    }
+                },
                 .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .date => {},
             }
             if (o.props.count() > 0) {
@@ -3039,8 +3252,8 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
             .symbol => {},
         },
         .native => |n| {
-            if (object.isNamed(k, "length")) return .{ .value = Value.fromNumber(@floatFromInt(n.length)), .enumerable = false, .writable = false };
-            if (object.isNamed(k, "name")) return .{ .value = Value.fromString(try rt.heap.ascii(n.name)), .enumerable = false, .writable = false };
+            if (object.isNamed(k, "length") and !rt.isNativePropDeleted(n, true)) return .{ .value = Value.fromNumber(@floatFromInt(n.length)), .enumerable = false, .writable = false };
+            if (object.isNamed(k, "name") and !rt.isNativePropDeleted(n, false)) return .{ .value = Value.fromString(try rt.heap.ascii(n.name)), .enumerable = false, .writable = false };
             if (try namespaceObject(rt, n)) |ns| return ns.props.get(try object.propKey(rt, k));
         },
         else => {},
@@ -3245,10 +3458,6 @@ fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Parsed
         return ok;
     }
 
-    if (target.isObject() and target.asObject().kind == .array and k == .index) {
-        return unsupportedReceiver(rt, "defineProperty");
-    }
-
     if (target.isObject() and target.asObject().kind == .array and k == .atom and object.isNamed(k, "length") and d.has_val) {
         const n = try ops.toNumber(rt, d.val);
         if (!(n >= 0 and n <= @as(f64, std.math.maxInt(u32)) and @floor(n) == n)) {
@@ -3263,6 +3472,7 @@ fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Parsed
         const extensible = switch (target.unpack()) {
             .object => |o| o.extensible,
             .closure => |c| if (c.meta) |m| m.extensible else true,
+            .native => true,
             else => false,
         };
         if (!extensible) {
@@ -3319,6 +3529,25 @@ fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Parsed
         if (d.has_conf) next.configurable = d.conf_val;
     }
 
+    if (target.isObject() and target.asObject().kind == .array and k == .index) {
+        const arr = target.asObject();
+        const cur_len = arr.kind.array.items.len;
+        if (k.index >= cur_len and !arr.array_length_writable) {
+            if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot add property to array with non-writable length" }});
+            return false;
+        }
+        if (k.index > cur_len) return rt.fail(.sparse_array);
+        if (next.is_accessor or !next.enumerable or next.writable != arr.array_elements_writable or next.configurable != arr.array_elements_configurable) {
+            return unsupportedReceiver(rt, "defineProperty");
+        }
+        if (k.index < cur_len) {
+            if (d.has_val) rt.heap.storeElement(arr, k.index, next.value);
+        } else {
+            try rt.heap.appendElement(arr, next.value);
+        }
+        return true;
+    }
+
     if (target.isObject() and target.asObject().kind == .array and k == .atom and object.isNamed(k, "length")) {
         if (d.has_val) {
             if (!try object.setWithReceiver(rt, target, k, next.value, target, throw_on_reject)) return false;
@@ -3348,6 +3577,20 @@ fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Parsed
             if (object.isNamed(k, "name")) m.name_configurable = false else m.length_configurable = false;
         }
         return true;
+    }
+    if (target.isNative()) {
+        const n = target.asNative();
+        if (object.isNamed(k, "name") or object.isNamed(k, "length")) {
+            const is_len = object.isNamed(k, "length");
+            try rt.setNativePropDeleted(n, is_len, false);
+            return true;
+        }
+        if (try namespaceObject(rt, n)) |ns| {
+            const pk = try object.propKey(rt, k);
+            try rt.heap.definePropKey(ns, pk, next);
+            return true;
+        }
+        return rt.fail(.function_properties);
     }
 
     const pk = try object.propKey(rt, k);
@@ -3392,7 +3635,7 @@ pub fn ordinarySetWithReceiver(rt: *Runtime, receiver: Value, k: object.Key, v: 
 
 fn objectDefineProperty(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const target = arg(args, 0);
-    if (!target.isObject() and !target.isClosure()) {
+    if (!target.isObjectLike()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Object.defineProperty called on non-object" }});
     }
     const k = try object.key(rt, arg(args, 1));
@@ -3402,7 +3645,7 @@ fn objectDefineProperty(rt: *Runtime, _: Value, args: []const Value) Error!Value
 
 fn objectDefineProperties(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const target = arg(args, 0);
-    if (!target.isObject() and !target.isClosure()) {
+    if (!target.isObjectLike()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Object.defineProperties called on non-object" }});
     }
     const props = arg(args, 1);
@@ -3550,13 +3793,12 @@ fn objectEntries(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 }
 
 fn objectAssign(rt: *Runtime, _: Value, args: []const Value) Error!Value {
-    const target = arg(args, 0);
-    switch (target.unpack()) {
-        .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .boolean, .number, .bigint, .string, .symbol => return unsupportedReceiver(rt, "assign"),
-        .native => return rt.fail(.function_properties),
-        .object, .closure => {},
+    const target_in = arg(args, 0);
+    if (target_in.isUndefined() or target_in.isNull()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
     }
+    if (target_in.isNative()) return rt.fail(.function_properties);
+    const target = if (target_in.isObjectLike()) target_in else try objectConstruct(rt, &.{target_in});
     if (args.len <= 1) return target;
 
     var root_buf = [_]Value{ target, .undefined, .undefined };
@@ -3685,7 +3927,7 @@ fn isExtensibleValue(rt: *Runtime, target: Value) Error!bool {
     return switch (target.unpack()) {
         .object => |o| if (o.kind == .proxy) proxyIsExtensible(rt, o) else o.extensible,
         .closure => |c| if (c.meta) |m| m.extensible else true,
-        .native => rt.fail(.function_properties),
+        .native => true,
         else => false,
     };
 }
@@ -3770,7 +4012,7 @@ fn setIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!Value {
     return target;
 }
 
-fn testIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!bool {
+fn testIntegrityLevel(_: *Runtime, target: Value, freeze: bool) Error!bool {
     return switch (target.unpack()) {
         .object => |o| {
             if (o.extensible) return false;
@@ -3805,7 +4047,7 @@ fn testIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!bool {
             }
             return true;
         },
-        .native => return rt.fail(.function_properties),
+        .native => return false,
         else => true,
     };
 }
@@ -4197,12 +4439,26 @@ fn stringCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     return Value.fromString(try toStringObj(rt, args[0]));
 }
 
+fn stringConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const s = if (args.len == 0) try rt.heap.newString(&.{}) else try toStringObj(rt, args[0]);
+    var root_buf = [_]Value{Value.fromString(s)};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const r = try realm(rt);
+    return Value.fromObject(try rt.heap.newPrimitiveWrapper(r.string_prototype, root_buf[0]));
+}
+
 const string_to_string: Native = .{ .name = "toString", .length = 0, .call = stringToString };
 const string_value_of: Native = .{ .name = "valueOf", .length = 0, .call = stringValueOf };
 
 fn thisStringExact(rt: *Runtime, this: Value) Error!*const heap_mod.String {
     if (this.isString()) return this.asString();
-    if (this.isObject() and this.asObject().builtin == .string_prototype) return rt.heap.newString(&.{});
+    if (this.isObject()) {
+        const o = this.asObject();
+        if (o.kind == .primitive_wrapper and o.kind.primitive_wrapper.isString()) return o.kind.primitive_wrapper.asString();
+        if (o.builtin == .string_prototype) return rt.heap.newString(&.{});
+    }
     return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype method requires a String receiver" }});
 }
 
@@ -4220,11 +4476,16 @@ fn objectCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 
 fn objectConstruct(rt: *Runtime, args: []const Value) Error!Value {
     const v = arg(args, 0);
-    if (v.isUndefined() or v.isNull()) {
-        return Value.fromObject(try rt.heap.newObject((try realm(rt)).object_prototype));
-    }
-    if (v.isObjectLike()) return v;
-    return rt.fail(.builtin);
+    const r = try realm(rt);
+    return switch (v.unpack()) {
+        .undefined, .null => Value.fromObject(try rt.heap.newObject(r.object_prototype)),
+        .object, .closure, .native => v,
+        .boolean => Value.fromObject(try rt.heap.newPrimitiveWrapper(r.boolean_prototype, v)),
+        .number => Value.fromObject(try rt.heap.newPrimitiveWrapper(r.number_prototype, v)),
+        .string => Value.fromObject(try rt.heap.newPrimitiveWrapper(r.string_prototype, v)),
+        .symbol => Value.fromObject(try rt.heap.newPrimitiveWrapper(r.symbol_prototype, v)),
+        .bigint => Value.fromObject(try rt.heap.newPrimitiveWrapper(r.bigint_prototype, v)),
+    };
 }
 
 fn arrayCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
@@ -4263,9 +4524,19 @@ fn booleanCall(_: *Runtime, _: Value, args: []const Value) Error!Value {
     return Value.fromBool(ops.toBoolean(arg(args, 0)));
 }
 
+fn booleanConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const b = Value.fromBool(ops.toBoolean(arg(args, 0)));
+    const r = try realm(rt);
+    return Value.fromObject(try rt.heap.newPrimitiveWrapper(r.boolean_prototype, b));
+}
+
 fn thisBoolean(rt: *Runtime, this: Value) Error!bool {
     if (this.isBool()) return this.asBool();
-    if (this.isObject() and this.asObject().builtin == .boolean_prototype) return false;
+    if (this.isObject()) {
+        const o = this.asObject();
+        if (o.kind == .primitive_wrapper and o.kind.primitive_wrapper.isBool()) return o.kind.primitive_wrapper.asBool();
+        if (o.builtin == .boolean_prototype) return false;
+    }
     return rt.throw(.TypeError, &.{.{ .ascii = "Boolean.prototype method requires a Boolean receiver" }});
 }
 
@@ -4326,6 +4597,10 @@ fn symbolKeyFor(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 fn thisSymbol(rt: *Runtime, this: Value, name: []const u8) Error!*const heap_mod.Symbol {
     return switch (this.unpack()) {
         .symbol => |s| s,
+        .object => |o| if (o.kind == .primitive_wrapper and o.kind.primitive_wrapper.isSymbol())
+            o.kind.primitive_wrapper.asSymbol()
+        else
+            rt.throw(.TypeError, &.{ .{ .ascii = "Symbol.prototype." }, .{ .ascii = name }, .{ .ascii = " requires that 'this' be a Symbol" } }),
         else => rt.throw(.TypeError, &.{ .{ .ascii = "Symbol.prototype." }, .{ .ascii = name }, .{ .ascii = " requires that 'this' be a Symbol" } }),
     };
 }
@@ -4349,6 +4624,12 @@ fn numberCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const prim = if (args[0].isObjectLike()) try object.toPrimitive(rt, args[0], .number) else args[0];
     if (prim.isBigInt()) return Value.fromNumber(bigint.toF64(prim.asBigInt()));
     return Value.fromNumber(try ops.toNumber(rt, prim));
+}
+
+fn numberConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const n_val = try numberCall(rt, .undefined, args);
+    const r = try realm(rt);
+    return Value.fromObject(try rt.heap.newPrimitiveWrapper(r.number_prototype, n_val));
 }
 
 fn bigintCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
@@ -4389,6 +4670,10 @@ fn bigintAsUintN(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 
 fn thisBigInt(rt: *Runtime, this: Value) Error!*const heap_mod.BigInt {
     if (this.isBigInt()) return this.asBigInt();
+    if (this.isObject()) {
+        const o = this.asObject();
+        if (o.kind == .primitive_wrapper and o.kind.primitive_wrapper.isBigInt()) return o.kind.primitive_wrapper.asBigInt();
+    }
     return rt.throw(.TypeError, &.{.{ .ascii = "BigInt.prototype method called on non-BigInt" }});
 }
 
@@ -4422,7 +4707,11 @@ const number_value_of: Native = .{ .name = "valueOf", .length = 0, .call = numbe
 
 fn thisNumber(rt: *Runtime, this: Value) Error!f64 {
     if (this.isNumber()) return this.asNumber();
-    if (this.isObject() and this.asObject().builtin == .number_prototype) return 0.0;
+    if (this.isObject()) {
+        const o = this.asObject();
+        if (o.kind == .primitive_wrapper and o.kind.primitive_wrapper.isNumber()) return o.kind.primitive_wrapper.asNumber();
+        if (o.builtin == .number_prototype) return 0.0;
+    }
     return rt.throw(.TypeError, &.{.{ .ascii = "Number.prototype method requires a Number receiver" }});
 }
 

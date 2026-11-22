@@ -33,3 +33,29 @@ let side = 0;
 print(void 0, void (side += 7), side);
 globalThis.customGlobal = 42;
 print(globalThis === globalThis.globalThis, globalThis.Array === Array, globalThis.Boolean === Boolean, globalThis.customGlobal, Object.hasOwn(globalThis, "NaN"));
+// Primitive wrappers, generic Array.prototype receivers, defineProperty on array index, private unicode escape.
+let wb = new Boolean(true), wn = new Number(42), ws = new String("abc");
+print(typeof wb, wb.valueOf(), wb + 1, typeof wn, wn.valueOf(), wn + 8, typeof ws, ws.valueOf(), ws.length, ws[1], Object.keys(ws).join(","));
+print(Object(true) instanceof Boolean, Object(7) instanceof Number, Object("x") instanceof String);
+let al = { 0: 10, 1: 20, 2: 30, length: 3 };
+print(
+  Array.prototype.reduce.call(al, (a, b) => a + b, 0),
+  Array.prototype.reduceRight.call(al, (a, b) => a - b),
+  Array.prototype.map.call(al, x => x / 10).join(","),
+  Array.prototype.filter.call(al, x => x > 15).join(","),
+  Array.prototype.some.call(al, x => x === 20),
+  Array.prototype.every.call(al, x => x >= 10),
+  Array.prototype.indexOf.call(al, 20),
+  Array.prototype.lastIndexOf.call(al, 30),
+  Array.prototype.includes.call(al, 10),
+  Array.prototype.slice.call(al, 1).join(",")
+);
+let da = [1, 2];
+Object.defineProperty(da, "1", { value: 99 });
+Object.defineProperty(da, "2", { value: 100, writable: true, enumerable: true, configurable: true });
+print(da.join(","), da.length);
+class PrivEsc {
+  #\u{6F} = 55;
+  getO() { return this.#o; }
+}
+print(new PrivEsc().getO());

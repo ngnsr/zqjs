@@ -411,7 +411,16 @@ fn jsonStringify(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     var gap_buf: [10]u16 = undefined;
     var gap_len: usize = 0;
     if (args.len >= 3) {
-        switch (args[2].unpack()) {
+        var space = args[2];
+        if (space.isObject() and space.asObject().kind == .primitive_wrapper) {
+            const pv = space.asObject().kind.primitive_wrapper;
+            if (pv.isNumber()) {
+                space = Value.fromNumber(try ops.toNumber(rt, space));
+            } else if (pv.isString()) {
+                space = try ops.toStringValue(rt, space);
+            }
+        }
+        switch (space.unpack()) {
             .number => |n| {
                 if (!std.math.isNan(n)) {
                     const clamped = if (std.math.isInf(n))
@@ -547,6 +556,19 @@ const Stringifier = struct {
         if (s.replacer_fn) |rf| {
             v = try s.rt.callCallable(rf, holder_val, &.{ key_val, v });
             roots_buf[1] = v;
+        }
+        if (v.isObject() and v.asObject().kind == .primitive_wrapper) {
+            const pv = v.asObject().kind.primitive_wrapper;
+            if (pv.isNumber()) {
+                v = Value.fromNumber(try ops.toNumber(s.rt, v));
+                roots_buf[1] = v;
+            } else if (pv.isString()) {
+                v = try ops.toStringValue(s.rt, v);
+                roots_buf[1] = v;
+            } else if (pv.isBool() or pv.isBigInt()) {
+                v = pv;
+                roots_buf[1] = v;
+            }
         }
 
         switch (v.unpack()) {

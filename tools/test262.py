@@ -63,7 +63,6 @@ DEFAULT_SKIP_FEATURES = {
     "source-phase-imports-module-source",
     "explicit-resource-management",
     "decorators",
-    "iterator-helpers",
     "set-methods",
     "regexp-v-flag",
     "resizable-arraybuffer",

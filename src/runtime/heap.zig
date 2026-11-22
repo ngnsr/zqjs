@@ -611,6 +611,9 @@ pub const IteratorKind = enum {
     for_in,
     /// `String.prototype.matchAll` iterator (M44): `target` is the cloned RegExp, `next_method` is the target `*String`.
     regexp_match_all,
+    /// ES2025 Iterator helper / `Iterator.from` wrapper: `target` is an internal env Array.
+    helper,
+    wrap,
 };
 
 pub const IteratorState = struct {

@@ -289,6 +289,7 @@ pub const Native = struct {
         set,
         weak_map,
         weak_set,
+        iterator,
         proxy,
         promise,
         @"error",

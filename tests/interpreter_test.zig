@@ -398,7 +398,6 @@ test "M14.3: Set unsupported methods, non-Set receivers, and non-array iterables
 }
 
 test "M14.4: unsupported iterables, Iterator.prototype methods, and member for-of targets" {
-    try expectUnsupported("[1].values().map;", "", "('map')");
     try expectUnsupported("Symbol.match;", "", "('match')");
 }
 

@@ -2268,7 +2268,7 @@ const Machine = struct {
                     return;
                 }
                 if (target.isNative()) {
-                    const res_v = if (target.asNative() == &builtins.object_global)
+                    const res_v = if (target.asNative() == &builtins.object_global or target.asNative() == &builtins.iterator_global)
                         Value.fromObject(inst)
                     else blk: {
                         const r = try builtins.construct(rt, target, m.values.items[args_base..]);

@@ -53,7 +53,10 @@ pub const Realm = struct {
     weak_map_prototype: *Object,
     weak_set_prototype: *Object,
     promise_prototype: *Object,
+    iterator_namespace: *Object,
     iterator_prototype: *Object,
+    iterator_helper_prototype: *Object,
+    iterator_wrap_prototype: *Object,
     /// %GeneratorPrototype% (D67).
     generator_prototype: *Object,
     /// D68: %AsyncIteratorPrototype%, %AsyncGeneratorPrototype%, the internal
@@ -120,7 +123,7 @@ pub const Realm = struct {
     views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [59]*Object {
+    pub fn objects(r: *const Realm) [62]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -134,7 +137,10 @@ pub const Realm = struct {
             r.weak_map_prototype,
             r.weak_set_prototype,
             r.promise_prototype,
+            r.iterator_namespace,
             r.iterator_prototype,
+            r.iterator_helper_prototype,
+            r.iterator_wrap_prototype,
             r.generator_prototype,
             r.async_iterator_prototype,
             r.async_generator_prototype,
@@ -250,7 +256,10 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .weak_map_prototype = try builtin(h, object_prototype, .weak_map_prototype),
         .weak_set_prototype = try builtin(h, object_prototype, .weak_set_prototype),
         .promise_prototype = try builtin(h, object_prototype, .promise_prototype),
+        .iterator_namespace = try h.newObject(function_prototype),
         .iterator_prototype = iterator_prototype,
+        .iterator_helper_prototype = try h.newObject(iterator_prototype),
+        .iterator_wrap_prototype = try h.newObject(iterator_prototype),
         .generator_prototype = try builtin(h, iterator_prototype, .generator_prototype),
         .async_iterator_prototype = async_iterator_prototype,
         .async_generator_prototype = try builtin(h, async_iterator_prototype, .async_generator_prototype),
@@ -487,6 +496,28 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try symbolMethod(rt, r.map_prototype, r.sym_iterator, &map_entries);
     try symbolMethod(rt, r.set_prototype, r.sym_iterator, &set_values);
     try symbolMethod(rt, r.iterator_prototype, r.sym_iterator, &iterator_self);
+    try immutableConstant(rt, r.iterator_namespace, "prototype", Value.fromObject(r.iterator_prototype));
+    try method(rt, r.iterator_namespace, "from", &iterator_from);
+    try object.defineAccessor(rt, Value.fromObject(r.iterator_prototype), try object.named(rt, "constructor"), Value.fromNative(&iterator_proto_ctor_get), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.iterator_prototype), try object.named(rt, "constructor"), Value.fromNative(&iterator_proto_ctor_set), true, false);
+    try object.defineAccessor(rt, Value.fromObject(r.iterator_prototype), .{ .symbol = r.sym_to_string_tag }, Value.fromNative(&iterator_proto_tag_get), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.iterator_prototype), .{ .symbol = r.sym_to_string_tag }, Value.fromNative(&iterator_proto_tag_set), true, false);
+    try method(rt, r.iterator_prototype, "map", &iterator_map);
+    try method(rt, r.iterator_prototype, "filter", &iterator_filter);
+    try method(rt, r.iterator_prototype, "take", &iterator_take);
+    try method(rt, r.iterator_prototype, "drop", &iterator_drop);
+    try method(rt, r.iterator_prototype, "flatMap", &iterator_flat_map);
+    try method(rt, r.iterator_prototype, "reduce", &iterator_reduce);
+    try method(rt, r.iterator_prototype, "toArray", &iterator_to_array);
+    try method(rt, r.iterator_prototype, "forEach", &iterator_for_each);
+    try method(rt, r.iterator_prototype, "some", &iterator_some);
+    try method(rt, r.iterator_prototype, "every", &iterator_every);
+    try method(rt, r.iterator_prototype, "find", &iterator_find);
+    try method(rt, r.iterator_helper_prototype, "next", &iterator_helper_next);
+    try method(rt, r.iterator_helper_prototype, "return", &iterator_helper_return);
+    try defineToStringTag(rt, r.iterator_helper_prototype, r.sym_to_string_tag, "Iterator Helper");
+    try method(rt, r.iterator_wrap_prototype, "next", &iterator_wrap_next);
+    try method(rt, r.iterator_wrap_prototype, "return", &iterator_wrap_return);
     try method(rt, r.generator_prototype, "next", &generator_next);
     try method(rt, r.generator_prototype, "return", &generator_return);
     try method(rt, r.generator_prototype, "throw", &generator_throw);
@@ -814,6 +845,7 @@ pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
         .set => r.set_namespace,
         .weak_map => r.weak_map_namespace,
         .weak_set => r.weak_set_namespace,
+        .iterator => r.iterator_namespace,
         .proxy => r.proxy_namespace,
         .promise => r.promise_namespace,
         .@"error" => r.error_namespace,
@@ -878,6 +910,7 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
         .set => r.set_prototype,
         .weak_map => r.weak_map_prototype,
         .weak_set => r.weak_set_prototype,
+        .iterator => r.iterator_prototype,
         .proxy => null,
         .promise => r.promise_prototype,
         .@"error" => r.error_prototype,
@@ -930,6 +963,7 @@ pub const map_global: Native = .{ .name = "Map", .call = mapWithoutNew, .constru
 pub const set_global: Native = .{ .name = "Set", .call = setWithoutNew, .construct = setConstruct, .namespace = .set };
 pub const weak_map_global: Native = .{ .name = "WeakMap", .call = weakMapWithoutNew, .construct = weakMapConstruct, .namespace = .weak_map };
 pub const weak_set_global: Native = .{ .name = "WeakSet", .call = weakSetWithoutNew, .construct = weakSetConstruct, .namespace = .weak_set };
+pub const iterator_global: Native = .{ .name = "Iterator", .call = iteratorWithoutNew, .construct = iteratorConstruct, .namespace = .iterator };
 pub const promise_global: Native = .{ .name = "Promise", .length = 1, .call = promiseWithoutNew, .construct = promiseConstruct, .namespace = .promise };
 pub const error_global: Native = .{ .name = "Error", .length = 1, .call = errorCall, .construct = errorConstruct, .namespace = .@"error" };
 pub const type_error_global: Native = .{ .name = "TypeError", .length = 1, .call = typeErrorCall, .construct = typeErrorConstruct, .namespace = .type_error };
@@ -996,6 +1030,7 @@ const builtin_globals = std.StaticStringMap(GlobalTarget).initComptime([_]struct
     .{ "Set", .{ .native = &set_global } },
     .{ "WeakMap", .{ .native = &weak_map_global } },
     .{ "WeakSet", .{ .native = &weak_set_global } },
+    .{ "Iterator", .{ .native = &iterator_global } },
     .{ "Proxy", .{ .native = &proxy_global } },
     .{ "Reflect", .reflect },
     .{ "Promise", .{ .native = &promise_global } },
@@ -1490,6 +1525,8 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
                 .array_values, .array_keys, .array_entries => "Array Iterator",
                 .string_chars => "String Iterator",
                 .regexp_match_all => "RegExp String Iterator",
+                .helper => "Iterator Helper",
+                .wrap => "Iterator",
                 .custom, .async_from_sync, .for_in => "Object",
             },
             .regexp => "RegExp",
@@ -7638,6 +7675,663 @@ fn iteratorSelf(_: *Runtime, this: Value, _: []const Value) Error!Value {
     return this;
 }
 
+// ---------------------------------------------------------------- ES2025 Iterator Helpers
+
+const iterator_from: Native = .{ .name = "from", .length = 1, .call = iteratorFrom };
+const iterator_proto_ctor_get: Native = .{ .name = "get constructor", .call = iteratorProtoCtorGet };
+const iterator_proto_ctor_set: Native = .{ .name = "set constructor", .length = 1, .call = iteratorProtoCtorSet };
+const iterator_proto_tag_get: Native = .{ .name = "get [Symbol.toStringTag]", .call = iteratorProtoTagGet };
+const iterator_proto_tag_set: Native = .{ .name = "set [Symbol.toStringTag]", .length = 1, .call = iteratorProtoTagSet };
+const iterator_map: Native = .{ .name = "map", .length = 1, .call = iteratorMap };
+const iterator_filter: Native = .{ .name = "filter", .length = 1, .call = iteratorFilter };
+const iterator_take: Native = .{ .name = "take", .length = 1, .call = iteratorTake };
+const iterator_drop: Native = .{ .name = "drop", .length = 1, .call = iteratorDrop };
+const iterator_flat_map: Native = .{ .name = "flatMap", .length = 1, .call = iteratorFlatMap };
+const iterator_reduce: Native = .{ .name = "reduce", .length = 1, .call = iteratorReduce };
+const iterator_to_array: Native = .{ .name = "toArray", .length = 0, .call = iteratorToArray };
+const iterator_for_each: Native = .{ .name = "forEach", .length = 1, .call = iteratorForEach };
+const iterator_some: Native = .{ .name = "some", .length = 1, .call = iteratorSome };
+const iterator_every: Native = .{ .name = "every", .length = 1, .call = iteratorEvery };
+const iterator_find: Native = .{ .name = "find", .length = 1, .call = iteratorFind };
+const iterator_helper_next: Native = .{ .name = "next", .length = 0, .call = iteratorHelperNext };
+const iterator_helper_return: Native = .{ .name = "return", .length = 0, .call = iteratorHelperReturn };
+const iterator_wrap_next: Native = .{ .name = "next", .length = 0, .call = iteratorWrapNext };
+const iterator_wrap_return: Native = .{ .name = "return", .length = 0, .call = iteratorWrapReturn };
+
+fn iteratorWithoutNew(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "Constructor Iterator requires 'new'" }});
+}
+
+fn iteratorConstruct(rt: *Runtime, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "Abstract class Iterator not directly constructable" }});
+}
+
+fn iteratorProtoCtorGet(_: *Runtime, _: Value, _: []const Value) Error!Value {
+    return Value.fromNative(&iterator_global);
+}
+
+fn iteratorProtoCtorSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    if (!this.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.constructor setter called on non-object" }});
+    }
+    if (this.isObject() and this.asObject() == r.iterator_prototype) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot set constructor on Iterator.prototype" }});
+    }
+    const v = arg(args, 0);
+    const k = try object.named(rt, "constructor");
+    if (this.isObject()) {
+        if (try object.ownProp(rt, this.asObject(), k)) |_| {
+            try object.setStrict(rt, this, k, v);
+            return .undefined;
+        }
+        try object.define(rt, this.asObject(), k, v);
+        return .undefined;
+    }
+    try object.setStrict(rt, this, k, v);
+    return .undefined;
+}
+
+fn iteratorProtoTagGet(rt: *Runtime, _: Value, _: []const Value) Error!Value {
+    return Value.fromString(try rt.heap.ascii("Iterator"));
+}
+
+fn iteratorProtoTagSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    if (!this.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype[Symbol.toStringTag] setter called on non-object" }});
+    }
+    if (this.isObject() and this.asObject() == r.iterator_prototype) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot set Symbol.toStringTag on Iterator.prototype" }});
+    }
+    const v = arg(args, 0);
+    const k: object.Key = .{ .symbol = r.sym_to_string_tag };
+    if (this.isObject()) {
+        if (try object.ownProp(rt, this.asObject(), k)) |_| {
+            try object.setStrict(rt, this, k, v);
+            return .undefined;
+        }
+        try object.define(rt, this.asObject(), k, v);
+        return .undefined;
+    }
+    try object.setStrict(rt, this, k, v);
+    return .undefined;
+}
+
+fn iteratorCloseDirect(rt: *Runtime, iter: Value, is_throw: bool) Error!void {
+    if (!iter.isObjectLike()) return;
+    if (is_throw) {
+        const saved_thrown = rt.thrown_value;
+        const saved_exc = rt.exception;
+        rt.thrown_value = null;
+        rt.exception = null;
+        if (object.getMethod(rt, iter, try object.named(rt, "return")) catch null) |ret_fn| {
+            _ = rt.callCallable(ret_fn, iter, &.{}) catch {};
+        }
+        rt.thrown_value = saved_thrown;
+        rt.exception = saved_exc;
+        return;
+    }
+    if (try object.getMethod(rt, iter, try object.named(rt, "return"))) |ret_fn| {
+        const res = try rt.callCallable(ret_fn, iter, &.{});
+        if (!res.isObjectLike()) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Iterator return result is not an object" }});
+        }
+    }
+}
+
+fn iteratorStepDirect(rt: *Runtime, iter: Value, next_method: Value) Error!?Value {
+    const res = try rt.callCallable(next_method, iter, &.{});
+    if (!res.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
+    }
+    var root_buf = [_]Value{res};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const done = try object.get(rt, res, try object.named(rt, "done"));
+    if (ops.toBoolean(done)) return null;
+    return try object.get(rt, res, try object.named(rt, "value"));
+}
+
+fn makeIterResult(rt: *Runtime, val: Value, done: bool) Error!Value {
+    const r = try realm(rt);
+    var root_buf = [_]Value{ val, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const o = try rt.heap.newObject(r.object_prototype);
+    root_buf[1] = Value.fromObject(o);
+    try object.define(rt, o, try object.named(rt, "value"), val);
+    try object.define(rt, o, try object.named(rt, "done"), Value.fromBool(done));
+    return Value.fromObject(o);
+}
+
+fn iteratorFrom(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const o = arg(args, 0);
+    if (!o.isObjectLike() and !o.isString()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.from called on non-object" }});
+    }
+    const r = try realm(rt);
+    var root_buf = [_]Value{ o, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var iter_val: Value = o;
+    if (try object.getMethod(rt, o, .{ .symbol = r.sym_iterator })) |iter_fn| {
+        iter_val = try rt.callCallable(iter_fn, o, &.{});
+        root_buf[1] = iter_val;
+        if (!iter_val.isObjectLike()) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.from: Symbol.iterator did not return an object" }});
+        }
+    }
+    const next_fn = try object.get(rt, iter_val, try object.named(rt, "next"));
+    root_buf[2] = next_fn;
+
+    // If iter_val already inherits from Iterator.prototype, return it directly.
+    if (try object.ordinaryHasInstance(rt, Value.fromNative(&iterator_global), iter_val)) {
+        return iter_val;
+    }
+
+    const env = try rt.heap.newArray(null);
+    root_buf[3] = Value.fromObject(env);
+    try rt.heap.appendElements(env, &.{ iter_val, next_fn });
+    return Value.fromObject(try rt.heap.newIterator(r.iterator_wrap_prototype, root_buf[3], .wrap));
+}
+
+fn iteratorWrapNextVal(rt: *Runtime, iter: *Object) Error!?Value {
+    const env = iter.kind.iterator.target.asObject();
+    return iteratorStepDirect(rt, env.kind.array.items[0], env.kind.array.items[1]);
+}
+
+fn iteratorWrapNext(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    if (!this.isObject() or this.asObject().kind != .iterator or this.asObject().kind.iterator.kind != .wrap) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "WrapForValidIterator.next called on incompatible receiver" }});
+    }
+    const env = this.asObject().kind.iterator.target.asObject();
+    return rt.callCallable(env.kind.array.items[1], env.kind.array.items[0], &.{});
+}
+
+fn iteratorWrapReturn(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    if (!this.isObject() or this.asObject().kind != .iterator or this.asObject().kind.iterator.kind != .wrap) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "WrapForValidIterator.return called on incompatible receiver" }});
+    }
+    const env = this.asObject().kind.iterator.target.asObject();
+    const underlying = env.kind.array.items[0];
+    if (try object.getMethod(rt, underlying, try object.named(rt, "return"))) |ret_fn| {
+        return rt.callCallable(ret_fn, underlying, &.{});
+    }
+    return makeIterResult(rt, .undefined, true);
+}
+
+// Helper env layout:
+// [0]=kind (0=map, 1=filter, 2=take, 3=drop, 4=flatMap)
+// [1]=underlying iter, [2]=underlying next_method, [3]=fn or remaining,
+// [4]=counter, [5]=state (0=suspendedStart, 1=executing, 2=completed),
+// [6]=inner_iter (flatMap), [7]=inner_next (flatMap)
+fn newIteratorHelper(rt: *Runtime, kind_id: f64, iter: Value, next_fn: Value, param: Value) Error!Value {
+    const r = try realm(rt);
+    const env = try rt.heap.newArray(null);
+    var root_buf = [_]Value{ iter, next_fn, param, Value.fromObject(env) };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    try rt.heap.appendElements(env, &.{
+        Value.fromNumber(kind_id),
+        iter,
+        next_fn,
+        param,
+        Value.fromNumber(0),
+        Value.fromNumber(0),
+        .undefined,
+        .undefined,
+    });
+    return Value.fromObject(try rt.heap.newIterator(r.iterator_helper_prototype, Value.fromObject(env), .helper));
+}
+
+fn iteratorMap(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.map called on non-object" }});
+    const cb = arg(args, 0);
+    if (!cb.isFunction()) {
+        try iteratorCloseDirect(rt, this, false);
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.map callback is not callable" }});
+    }
+    var root_buf = [_]Value{ this, cb, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const next_fn = try object.get(rt, this, try object.named(rt, "next"));
+    root_buf[2] = next_fn;
+    return newIteratorHelper(rt, 0, this, next_fn, cb);
+}
+
+fn iteratorFilter(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.filter called on non-object" }});
+    const cb = arg(args, 0);
+    if (!cb.isFunction()) {
+        try iteratorCloseDirect(rt, this, false);
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.filter callback is not callable" }});
+    }
+    var root_buf = [_]Value{ this, cb, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const next_fn = try object.get(rt, this, try object.named(rt, "next"));
+    root_buf[2] = next_fn;
+    return newIteratorHelper(rt, 1, this, next_fn, cb);
+}
+
+fn iteratorTakeOrDrop(rt: *Runtime, this: Value, args: []const Value, kind_id: f64) Error!Value {
+    if (!this.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator helper called on non-object" }});
+    var root_buf = [_]Value{ this, arg(args, 0), .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const num_lim = ops.toNumber(rt, root_buf[1]) catch |e| {
+        if (e == error.Thrown) try iteratorCloseDirect(rt, this, true);
+        return e;
+    };
+    if (std.math.isNan(num_lim)) {
+        try iteratorCloseDirect(rt, this, false);
+        return rt.throw(.RangeError, &.{.{ .ascii = "Iterator limit must not be NaN" }});
+    }
+    const int_lim = if (!std.math.isFinite(num_lim) or num_lim == 0.0) num_lim else @trunc(num_lim);
+    if (int_lim < 0.0) {
+        try iteratorCloseDirect(rt, this, false);
+        return rt.throw(.RangeError, &.{.{ .ascii = "Iterator limit must be non-negative" }});
+    }
+    const next_fn = try object.get(rt, this, try object.named(rt, "next"));
+    root_buf[2] = next_fn;
+    return newIteratorHelper(rt, kind_id, this, next_fn, Value.fromNumber(if (int_lim == 0.0) 0.0 else int_lim));
+}
+
+fn iteratorTake(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return iteratorTakeOrDrop(rt, this, args, 2);
+}
+
+fn iteratorDrop(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return iteratorTakeOrDrop(rt, this, args, 3);
+}
+
+fn iteratorFlatMap(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.flatMap called on non-object" }});
+    const cb = arg(args, 0);
+    if (!cb.isFunction()) {
+        try iteratorCloseDirect(rt, this, false);
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.flatMap callback is not callable" }});
+    }
+    var root_buf = [_]Value{ this, cb, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const next_fn = try object.get(rt, this, try object.named(rt, "next"));
+    root_buf[2] = next_fn;
+    return newIteratorHelper(rt, 4, this, next_fn, cb);
+}
+
+fn iteratorHelperNextVal(rt: *Runtime, iter: *Object) Error!?Value {
+    const env = iter.kind.iterator.target.asObject();
+    const state = env.kind.array.items[5].asNumber();
+    if (state == 2.0) return null;
+    if (state == 1.0) return rt.throw(.TypeError, &.{.{ .ascii = "Generator is already executing" }});
+
+    var root_buf = [_]Value{ Value.fromObject(iter), Value.fromObject(env), .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    rt.heap.storeElement(env, 5, Value.fromNumber(1.0));
+    errdefer rt.heap.storeElement(env, 5, Value.fromNumber(2.0));
+
+    const kind_id: u8 = @intFromFloat(env.kind.array.items[0].asNumber());
+    const underlying = env.kind.array.items[1];
+    const next_fn = env.kind.array.items[2];
+
+    switch (kind_id) {
+        0 => { // map
+            const val = (try iteratorStepDirect(rt, underlying, next_fn)) orelse {
+                rt.heap.storeElement(env, 5, Value.fromNumber(2.0));
+                return null;
+            };
+            root_buf[2] = val;
+            const counter = env.kind.array.items[4].asNumber();
+            rt.heap.storeElement(env, 4, Value.fromNumber(counter + 1.0));
+            const mapped = rt.callCallable(env.kind.array.items[3], .undefined, &.{ val, Value.fromNumber(counter) }) catch |e| {
+                if (e == error.Thrown) try iteratorCloseDirect(rt, underlying, true);
+                return e;
+            };
+            rt.heap.storeElement(env, 5, Value.fromNumber(0.0));
+            return mapped;
+        },
+        1 => { // filter
+            while (true) {
+                const val = (try iteratorStepDirect(rt, underlying, next_fn)) orelse {
+                    rt.heap.storeElement(env, 5, Value.fromNumber(2.0));
+                    return null;
+                };
+                root_buf[2] = val;
+                const counter = env.kind.array.items[4].asNumber();
+                rt.heap.storeElement(env, 4, Value.fromNumber(counter + 1.0));
+                const keep = rt.callCallable(env.kind.array.items[3], .undefined, &.{ val, Value.fromNumber(counter) }) catch |e| {
+                    if (e == error.Thrown) try iteratorCloseDirect(rt, underlying, true);
+                    return e;
+                };
+                if (ops.toBoolean(keep)) {
+                    rt.heap.storeElement(env, 5, Value.fromNumber(0.0));
+                    return root_buf[2];
+                }
+            }
+        },
+        2 => { // take
+            const rem = env.kind.array.items[3].asNumber();
+            if (rem == 0.0) {
+                rt.heap.storeElement(env, 5, Value.fromNumber(2.0));
+                try iteratorCloseDirect(rt, underlying, false);
+                return null;
+            }
+            if (std.math.isFinite(rem)) rt.heap.storeElement(env, 3, Value.fromNumber(rem - 1.0));
+            const val = (try iteratorStepDirect(rt, underlying, next_fn)) orelse {
+                rt.heap.storeElement(env, 5, Value.fromNumber(2.0));
+                return null;
+            };
+            rt.heap.storeElement(env, 5, Value.fromNumber(0.0));
+            return val;
+        },
+        3 => { // drop
+            var rem = env.kind.array.items[3].asNumber();
+            while (rem > 0.0) {
+                if (std.math.isFinite(rem)) {
+                    rem -= 1.0;
+                    rt.heap.storeElement(env, 3, Value.fromNumber(rem));
+                }
+                if ((try iteratorStepDirect(rt, underlying, next_fn)) == null) {
+                    rt.heap.storeElement(env, 5, Value.fromNumber(2.0));
+                    return null;
+                }
+            }
+            const val = (try iteratorStepDirect(rt, underlying, next_fn)) orelse {
+                rt.heap.storeElement(env, 5, Value.fromNumber(2.0));
+                return null;
+            };
+            rt.heap.storeElement(env, 5, Value.fromNumber(0.0));
+            return val;
+        },
+        4 => { // flatMap
+            const r = try realm(rt);
+            while (true) {
+                if (!env.kind.array.items[6].isUndefined()) {
+                    const inner_iter = env.kind.array.items[6];
+                    const inner_next = env.kind.array.items[7];
+                    const maybe_inner = iteratorStepDirect(rt, inner_iter, inner_next) catch |e| {
+                        rt.heap.storeElement(env, 6, .undefined);
+                        rt.heap.storeElement(env, 7, .undefined);
+                        if (e == error.Thrown) try iteratorCloseDirect(rt, underlying, true);
+                        return e;
+                    };
+                    if (maybe_inner) |iv| {
+                        rt.heap.storeElement(env, 5, Value.fromNumber(0.0));
+                        return iv;
+                    }
+                    rt.heap.storeElement(env, 6, .undefined);
+                    rt.heap.storeElement(env, 7, .undefined);
+                }
+                const val = (try iteratorStepDirect(rt, underlying, next_fn)) orelse {
+                    rt.heap.storeElement(env, 5, Value.fromNumber(2.0));
+                    return null;
+                };
+                root_buf[2] = val;
+                const counter = env.kind.array.items[4].asNumber();
+                rt.heap.storeElement(env, 4, Value.fromNumber(counter + 1.0));
+                const mapped = rt.callCallable(env.kind.array.items[3], .undefined, &.{ val, Value.fromNumber(counter) }) catch |e| {
+                    if (e == error.Thrown) try iteratorCloseDirect(rt, underlying, true);
+                    return e;
+                };
+                root_buf[2] = mapped;
+                if (!mapped.isObjectLike()) {
+                    try iteratorCloseDirect(rt, underlying, false);
+                    return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.flatMap mapper did not return an object" }});
+                }
+                const inner_iter: Value = blk: {
+                    const maybe_sym = object.getMethod(rt, mapped, .{ .symbol = r.sym_iterator }) catch |e| {
+                        if (e == error.Thrown) try iteratorCloseDirect(rt, underlying, true);
+                        return e;
+                    };
+                    if (maybe_sym) |iter_m| {
+                        const res = rt.callCallable(iter_m, mapped, &.{}) catch |e| {
+                            if (e == error.Thrown) try iteratorCloseDirect(rt, underlying, true);
+                            return e;
+                        };
+                        if (!res.isObjectLike()) {
+                            try iteratorCloseDirect(rt, underlying, false);
+                            return rt.throw(.TypeError, &.{.{ .ascii = "flatMap inner iterator is not an object" }});
+                        }
+                        break :blk res;
+                    }
+                    break :blk mapped;
+                };
+                root_buf[3] = inner_iter;
+                const inner_next = object.get(rt, inner_iter, try object.named(rt, "next")) catch |e| {
+                    if (e == error.Thrown) try iteratorCloseDirect(rt, underlying, true);
+                    return e;
+                };
+                rt.heap.storeElement(env, 6, inner_iter);
+                rt.heap.storeElement(env, 7, inner_next);
+            }
+        },
+        else => unreachable,
+    }
+}
+
+fn iteratorHelperNext(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    if (!this.isObject() or this.asObject().kind != .iterator or this.asObject().kind.iterator.kind != .helper) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator Helper.next called on incompatible receiver" }});
+    }
+    if (try iteratorHelperNextVal(rt, this.asObject())) |v| {
+        return makeIterResult(rt, v, false);
+    }
+    return makeIterResult(rt, .undefined, true);
+}
+
+fn iteratorHelperReturn(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    if (!this.isObject() or this.asObject().kind != .iterator or this.asObject().kind.iterator.kind != .helper) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator Helper.return called on incompatible receiver" }});
+    }
+    const env = this.asObject().kind.iterator.target.asObject();
+    const state = env.kind.array.items[5].asNumber();
+    if (state == 1.0) return rt.throw(.TypeError, &.{.{ .ascii = "Generator is already executing" }});
+    if (state == 2.0) return makeIterResult(rt, .undefined, true);
+
+    var root_buf = [_]Value{ this, Value.fromObject(env) };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    rt.heap.storeElement(env, 5, Value.fromNumber(2.0));
+    const inner_iter = env.kind.array.items[6];
+    const underlying = env.kind.array.items[1];
+    if (!inner_iter.isUndefined()) {
+        rt.heap.storeElement(env, 6, .undefined);
+        rt.heap.storeElement(env, 7, .undefined);
+        iteratorCloseDirect(rt, inner_iter, false) catch |e| {
+            if (e == error.Thrown) try iteratorCloseDirect(rt, underlying, true);
+            return e;
+        };
+    }
+    try iteratorCloseDirect(rt, underlying, false);
+    return makeIterResult(rt, .undefined, true);
+}
+
+fn iteratorToArray(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    if (!this.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.toArray called on non-object" }});
+    const r = try realm(rt);
+    const out = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ this, Value.fromObject(out), .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const next_fn = try object.get(rt, this, try object.named(rt, "next"));
+    root_buf[2] = next_fn;
+    while (try iteratorStepDirect(rt, this, next_fn)) |val| {
+        root_buf[3] = val;
+        try rt.heap.appendElement(out, val);
+        root_buf[3] = .undefined;
+    }
+    return Value.fromObject(out);
+}
+
+fn iteratorForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.forEach called on non-object" }});
+    const cb = arg(args, 0);
+    if (!cb.isFunction()) {
+        try iteratorCloseDirect(rt, this, false);
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.forEach callback is not callable" }});
+    }
+    var root_buf = [_]Value{ this, cb, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const next_fn = try object.get(rt, this, try object.named(rt, "next"));
+    root_buf[2] = next_fn;
+    var counter: f64 = 0;
+    while (try iteratorStepDirect(rt, this, next_fn)) |val| : (counter += 1) {
+        root_buf[3] = val;
+        _ = rt.callCallable(cb, .undefined, &.{ val, Value.fromNumber(counter) }) catch |e| {
+            if (e == error.Thrown) try iteratorCloseDirect(rt, this, true);
+            return e;
+        };
+        root_buf[3] = .undefined;
+    }
+    return .undefined;
+}
+
+fn iteratorReduce(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.reduce called on non-object" }});
+    const cb = arg(args, 0);
+    if (!cb.isFunction()) {
+        try iteratorCloseDirect(rt, this, false);
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.reduce callback is not callable" }});
+    }
+    var root_buf = [_]Value{ this, cb, arg(args, 1), .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const next_fn = try object.get(rt, this, try object.named(rt, "next"));
+    root_buf[3] = next_fn;
+    var counter: f64 = 0;
+    if (args.len < 2) {
+        const first = (try iteratorStepDirect(rt, this, next_fn)) orelse {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty iterator with no initial value" }});
+        };
+        root_buf[2] = first;
+        counter = 1;
+    }
+    while (try iteratorStepDirect(rt, this, next_fn)) |val| : (counter += 1) {
+        root_buf[4] = val;
+        root_buf[2] = rt.callCallable(cb, .undefined, &.{ root_buf[2], val, Value.fromNumber(counter) }) catch |e| {
+            if (e == error.Thrown) try iteratorCloseDirect(rt, this, true);
+            return e;
+        };
+        root_buf[4] = .undefined;
+    }
+    return root_buf[2];
+}
+
+fn iteratorSome(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.some called on non-object" }});
+    const cb = arg(args, 0);
+    if (!cb.isFunction()) {
+        try iteratorCloseDirect(rt, this, false);
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.some callback is not callable" }});
+    }
+    var root_buf = [_]Value{ this, cb, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const next_fn = try object.get(rt, this, try object.named(rt, "next"));
+    root_buf[2] = next_fn;
+    var counter: f64 = 0;
+    while (try iteratorStepDirect(rt, this, next_fn)) |val| : (counter += 1) {
+        root_buf[3] = val;
+        const res = rt.callCallable(cb, .undefined, &.{ val, Value.fromNumber(counter) }) catch |e| {
+            if (e == error.Thrown) try iteratorCloseDirect(rt, this, true);
+            return e;
+        };
+        if (ops.toBoolean(res)) {
+            try iteratorCloseDirect(rt, this, false);
+            return Value.fromBool(true);
+        }
+        root_buf[3] = .undefined;
+    }
+    return Value.fromBool(false);
+}
+
+fn iteratorEvery(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.every called on non-object" }});
+    const cb = arg(args, 0);
+    if (!cb.isFunction()) {
+        try iteratorCloseDirect(rt, this, false);
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.every callback is not callable" }});
+    }
+    var root_buf = [_]Value{ this, cb, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const next_fn = try object.get(rt, this, try object.named(rt, "next"));
+    root_buf[2] = next_fn;
+    var counter: f64 = 0;
+    while (try iteratorStepDirect(rt, this, next_fn)) |val| : (counter += 1) {
+        root_buf[3] = val;
+        const res = rt.callCallable(cb, .undefined, &.{ val, Value.fromNumber(counter) }) catch |e| {
+            if (e == error.Thrown) try iteratorCloseDirect(rt, this, true);
+            return e;
+        };
+        if (!ops.toBoolean(res)) {
+            try iteratorCloseDirect(rt, this, false);
+            return Value.fromBool(false);
+        }
+        root_buf[3] = .undefined;
+    }
+    return Value.fromBool(true);
+}
+
+fn iteratorFind(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.find called on non-object" }});
+    const cb = arg(args, 0);
+    if (!cb.isFunction()) {
+        try iteratorCloseDirect(rt, this, false);
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.find callback is not callable" }});
+    }
+    var root_buf = [_]Value{ this, cb, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const next_fn = try object.get(rt, this, try object.named(rt, "next"));
+    root_buf[2] = next_fn;
+    var counter: f64 = 0;
+    while (try iteratorStepDirect(rt, this, next_fn)) |val| : (counter += 1) {
+        root_buf[3] = val;
+        const res = rt.callCallable(cb, .undefined, &.{ val, Value.fromNumber(counter) }) catch |e| {
+            if (e == error.Thrown) try iteratorCloseDirect(rt, this, true);
+            return e;
+        };
+        if (ops.toBoolean(res)) {
+            try iteratorCloseDirect(rt, this, false);
+            return root_buf[3];
+        }
+        root_buf[3] = .undefined;
+    }
+    return .undefined;
+}
+
 pub fn getIterator(rt: *Runtime, iterable: Value) Error!*Object {
     if (iterable.isUndefined() or iterable.isNull()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }});
@@ -7781,6 +8475,8 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
             }
         },
         .async_from_sync => return rt.bug("a sync step on an async-from-sync iterator"),
+        .helper => return iteratorHelperNextVal(rt, iter),
+        .wrap => return iteratorWrapNextVal(rt, iter),
         .regexp_match_all => {
             const rx_obj = it.target.asObject();
             const s = it.next_method.asString();

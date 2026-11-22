@@ -1771,12 +1771,12 @@ pub const Heap = struct {
         return o;
     }
 
-    /// Creates a `matchAll` iterator holding the cloned RegExp and target string (M44).
-    pub fn newMatchAllIterator(h: *Heap, proto: ?*Object, rx: *Object, str: *const String) Error!*Object {
+    /// Creates a `matchAll` iterator holding the matcher, target string, and global/unicode flags.
+    pub fn newMatchAllIterator(h: *Heap, proto: ?*Object, rx_val: Value, str: *const String, is_global: bool, is_unicode: bool) Error!*Object {
         const o = try h.newObject(proto);
-        const rx_val: Value = Value.fromObject(rx);
         const str_val: Value = Value.fromString(str);
-        o.kind = .{ .iterator = .{ .target = rx_val, .next_method = str_val, .kind = .regexp_match_all } };
+        const flags_bits: usize = (@as(usize, @intFromBool(is_global))) | (@as(usize, @intFromBool(is_unicode)) << 1);
+        o.kind = .{ .iterator = .{ .target = rx_val, .next_method = str_val, .cursor = flags_bits, .kind = .regexp_match_all } };
         h.barrier(&o.obj, null, rx_val);
         h.barrier(&o.obj, null, str_val);
         return o;

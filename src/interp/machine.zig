@@ -1817,7 +1817,7 @@ const Machine = struct {
                             break :blk try object.getPrivate(rt, base, brand, try rt.heap.internUtf8(n));
                         } else blk: {
                             const k = try object.named(rt, n);
-                            break :blk if (mb.is_delete) Value.fromBool(try object.delete(rt, base, k)) else try object.get(rt, base, k);
+                            break :blk if (mb.is_delete) try m.deleteProp(base, k) else try object.get(rt, base, k);
                         };
                         m.depth -= 1;
                         try m.pushVal(res_v);
@@ -1833,7 +1833,7 @@ const Machine = struct {
                 const kv: KeyValue = if (mf.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.popVal();
                 const k = try m.toKey(kv);
-                const res_v: Value = if (mf.is_delete) Value.fromBool(try object.delete(rt, base, k)) else try object.get(rt, base, k);
+                const res_v: Value = if (mf.is_delete) try m.deleteProp(base, k) else try object.get(rt, base, k);
                 m.depth -= 1;
                 try m.pushVal(res_v);
             },
@@ -1884,7 +1884,7 @@ const Machine = struct {
                         if (os.is_delete and os.idx == os.oc.steps.len - 1) {
                             _ = m.popVal();
                             _ = m.popVal();
-                            try m.pushVal(Value.fromBool(try object.delete(rt, val, key)));
+                            try m.pushVal(try m.deleteProp(val, key));
                             return;
                         }
                         const next_val = try object.get(rt, val, key);
@@ -1921,7 +1921,7 @@ const Machine = struct {
                 if (oe.is_delete and oe.idx == oe.oc.steps.len - 1) {
                     _ = m.popVal();
                     _ = m.popVal();
-                    try m.pushVal(Value.fromBool(try object.delete(rt, val, key)));
+                    try m.pushVal(try m.deleteProp(val, key));
                     return;
                 }
                 const next_val = try object.get(rt, val, key);
@@ -4019,6 +4019,12 @@ const Machine = struct {
     fn isStrict(m: *const Machine) bool {
         if (m.current_func) |f| return f.is_strict;
         return m.script_strict or m.is_module;
+    }
+
+    fn deleteProp(m: *Machine, base: Value, k: object.Key) Error!Value {
+        const r = try object.delete(m.rt, base, k);
+        if (!r and m.isStrict()) return m.rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property" }});
+        return Value.fromBool(r);
     }
 
     fn setProp(m: *Machine, base: Value, k: object.Key, v: Value) Error!void {

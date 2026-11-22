@@ -356,6 +356,7 @@ const ChainHit = union(enum) {
     accessor: Property,
     data: struct { is_own: bool, writable: bool },
     proxy: *Object,
+    typed_array_oob,
 };
 
 fn sameTarget(a: Value, b: ?Value) bool {
@@ -374,6 +375,11 @@ fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainH
             .object => |o| {
                 o.obj.checkLive();
                 if (o.kind == .proxy) return .{ .proxy = o };
+                if (o.kind == .typed_array) {
+                    if (canonicalNumericIndex(k)) |n| {
+                        if (validIntegerIndex(o.kind.typed_array, n) == null) return .typed_array_oob;
+                    }
+                }
                 if (try ownProp(rt, o, k)) |p| {
                     if (p.is_accessor) return .{ .accessor = p };
                     return .{ .data = .{ .is_own = sameTarget(cur, base), .writable = p.writable } };
@@ -475,18 +481,21 @@ pub fn setWithReceiver(rt: *Runtime, base: Value, k: Key, v: Value, receiver: Va
             if (isNamed(k, "__proto__")) return unsupportedBuiltin(rt, k);
             if (o.kind == .typed_array) {
                 if (canonicalNumericIndex(k)) |n| {
-                    if (o.kind.typed_array.kind.isBigInt()) {
-                        const b = try ops.toBigInt(rt, v);
-                        if (validIntegerIndex(o.kind.typed_array, n)) |idx| {
-                            writeTypedArrayBigInt(o.kind.typed_array, idx, b);
+                    if (sameTarget(base, receiver)) {
+                        if (o.kind.typed_array.kind.isBigInt()) {
+                            const b = try ops.toBigInt(rt, v);
+                            if (validIntegerIndex(o.kind.typed_array, n)) |idx| {
+                                writeTypedArrayBigInt(o.kind.typed_array, idx, b);
+                            }
+                        } else {
+                            const num = try ops.toNumber(rt, v);
+                            if (validIntegerIndex(o.kind.typed_array, n)) |idx| {
+                                writeTypedArrayNumber(o.kind.typed_array, idx, num);
+                            }
                         }
-                    } else {
-                        const num = try ops.toNumber(rt, v);
-                        if (validIntegerIndex(o.kind.typed_array, n)) |idx| {
-                            writeTypedArrayNumber(o.kind.typed_array, idx, num);
-                        }
+                        return true;
                     }
-                    return true;
+                    if (validIntegerIndex(o.kind.typed_array, n) == null) return true;
                 }
             }
         },
@@ -497,6 +506,7 @@ pub fn setWithReceiver(rt: *Runtime, base: Value, k: Key, v: Value, receiver: Va
             if (!ok and strict) return rt.throw(.TypeError, &.{.{ .ascii = "'set' on proxy: trap returned falsish" }});
             return ok;
         },
+        .typed_array_oob => return true,
         .accessor => |p| return invokeSetter(rt, p, receiver, v, strict),
         .data => |d| if (!d.writable) {
             if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
@@ -523,6 +533,7 @@ pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value, st
                 if (!ok and strict) return rt.throw(.TypeError, &.{.{ .ascii = "'set' on proxy: trap returned falsish" }});
                 return;
             },
+            .typed_array_oob => return,
             .accessor => |p| {
                 _ = try invokeSetter(rt, p, receiver, v, strict);
                 return;

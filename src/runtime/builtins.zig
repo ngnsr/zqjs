@@ -2045,9 +2045,7 @@ fn arrayForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 fn arrayMap(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const o_val = try toObjectReceiver(rt, this);
     const this_arg = arg(args, 1);
-    const r = try realm(rt);
-    const out = try rt.heap.newArray(r.array_prototype);
-    var root_buf = [_]Value{ o_val, arg(args, 0), this_arg, Value.fromObject(out), .undefined };
+    var root_buf = [_]Value{ o_val, arg(args, 0), this_arg, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -2056,34 +2054,36 @@ fn arrayMap(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const a = o_val.asObject();
         const len = a.kind.array.items.len;
         const cb = try requireCallable(rt, root_buf[1]);
+        const out_val = try arraySpeciesCreate(rt, o_val, len);
+        root_buf[3] = out_val;
         for (0..len) |i| {
             if (i >= a.kind.array.items.len) return rt.fail(.sparse_array);
             const elem = a.kind.array.items[i];
             root_buf[4] = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
-            try rt.heap.appendElement(out, root_buf[4]);
+            try arrayAppendOrDefine(rt, out_val, i, root_buf[4]);
             root_buf[4] = .undefined;
         }
-        return Value.fromObject(out);
+        return out_val;
     }
     const len_f = try toLength(rt, try object.get(rt, o_val, try object.named(rt, "length")));
     const len: usize = @intFromFloat(len_f);
     const cb = try requireCallable(rt, root_buf[1]);
+    const out_val = try arraySpeciesCreate(rt, o_val, len);
+    root_buf[3] = out_val;
     for (0..len) |i| {
         if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) return rt.fail(.sparse_array);
         const elem = try object.get(rt, o_val, .{ .index = @intCast(i) });
         root_buf[4] = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
-        try rt.heap.appendElement(out, root_buf[4]);
+        try arrayAppendOrDefine(rt, out_val, i, root_buf[4]);
         root_buf[4] = .undefined;
     }
-    return Value.fromObject(out);
+    return out_val;
 }
 
 fn arrayFilter(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const o_val = try toObjectReceiver(rt, this);
     const this_arg = arg(args, 1);
-    const r = try realm(rt);
-    const out = try rt.heap.newArray(r.array_prototype);
-    var root_buf = [_]Value{ o_val, arg(args, 0), this_arg, Value.fromObject(out), .undefined };
+    var root_buf = [_]Value{ o_val, arg(args, 0), this_arg, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -2092,29 +2092,41 @@ fn arrayFilter(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const a = o_val.asObject();
         const len = a.kind.array.items.len;
         const cb = try requireCallable(rt, root_buf[1]);
+        const out_val = try arraySpeciesCreate(rt, o_val, 0);
+        root_buf[3] = out_val;
+        var to: usize = 0;
         for (0..len) |i| {
             if (i >= a.kind.array.items.len) continue;
             const elem = a.kind.array.items[i];
             root_buf[4] = elem;
             const keep = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
-            if (ops.toBoolean(keep)) try rt.heap.appendElement(out, root_buf[4]);
+            if (ops.toBoolean(keep)) {
+                try arrayAppendOrDefine(rt, out_val, to, root_buf[4]);
+                to += 1;
+            }
             root_buf[4] = .undefined;
         }
-        return Value.fromObject(out);
+        return out_val;
     }
     const len_f = try toLength(rt, try object.get(rt, o_val, try object.named(rt, "length")));
     const len: usize = @intFromFloat(len_f);
     const cb = try requireCallable(rt, root_buf[1]);
+    const out_val = try arraySpeciesCreate(rt, o_val, 0);
+    root_buf[3] = out_val;
+    var to: usize = 0;
     for (0..len) |i| {
         if (try object.has(rt, .{ .index = @intCast(i) }, o_val)) {
             const elem = try object.get(rt, o_val, .{ .index = @intCast(i) });
             root_buf[4] = elem;
             const keep = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
-            if (ops.toBoolean(keep)) try rt.heap.appendElement(out, root_buf[4]);
+            if (ops.toBoolean(keep)) {
+                try arrayAppendOrDefine(rt, out_val, to, root_buf[4]);
+                to += 1;
+            }
             root_buf[4] = .undefined;
         }
     }
-    return Value.fromObject(out);
+    return out_val;
 }
 
 fn arrayReduce(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -2288,39 +2300,56 @@ fn isConcatSpreadable(rt: *Runtime, v: Value) Error!bool {
     return v.isObject() and v.asObject().kind == .array;
 }
 
-fn concatAppendItem(rt: *Runtime, out: *Object, item: Value, elem_root: *Value) Error!void {
+fn concatAppendItem(rt: *Runtime, out: Value, n: *usize, item: Value, elem_root: *Value) Error!void {
     if (try isConcatSpreadable(rt, item)) {
         if (item.isObject() and item.asObject().kind == .array) {
-            try rt.heap.appendElements(out, item.asObject().kind.array.items);
+            const items = item.asObject().kind.array.items;
+            if (out.isObject() and out.asObject().kind == .array and n.* == out.asObject().kind.array.items.len) {
+                try rt.heap.appendElements(out.asObject(), items);
+                n.* += items.len;
+            } else {
+                for (items) |v| {
+                    elem_root.* = v;
+                    try arrayAppendOrDefine(rt, out, n.*, v);
+                    n.* += 1;
+                    elem_root.* = .undefined;
+                }
+            }
         } else {
             const len_f = try toLength(rt, try object.get(rt, item, try object.named(rt, "length")));
             const len: usize = @intFromFloat(len_f);
             for (0..len) |i| {
                 if (!try object.has(rt, .{ .index = @intCast(i) }, item)) return rt.fail(.sparse_array);
                 elem_root.* = try object.get(rt, item, .{ .index = @intCast(i) });
-                try rt.heap.appendElement(out, elem_root.*);
+                try arrayAppendOrDefine(rt, out, n.*, elem_root.*);
+                n.* += 1;
                 elem_root.* = .undefined;
             }
         }
     } else {
-        try rt.heap.appendElement(out, item);
+        try arrayAppendOrDefine(rt, out, n.*, item);
+        n.* += 1;
     }
 }
 
 fn arrayConcat(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const o_val = try toObjectReceiver(rt, this);
-    const r = try realm(rt);
-    const out = try rt.heap.newArray(r.array_prototype);
-    var root_buf = [_]Value{ o_val, Value.fromObject(out), .undefined };
+    var root_buf = [_]Value{ o_val, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    try concatAppendItem(rt, out, o_val, &root_buf[2]);
+    const out = try arraySpeciesCreate(rt, o_val, 0);
+    root_buf[1] = out;
+    var n: usize = 0;
+    try concatAppendItem(rt, out, &n, o_val, &root_buf[2]);
     for (args) |v| {
-        try concatAppendItem(rt, out, v, &root_buf[2]);
+        try concatAppendItem(rt, out, &n, v, &root_buf[2]);
     }
-    return Value.fromObject(out);
+    if (!out.isObject() or out.asObject().kind != .array) {
+        try object.setStrict(rt, out, try object.named(rt, "length"), Value.fromNumber(@floatFromInt(n)));
+    }
+    return out;
 }
 
 fn arrayReverse(rt: *Runtime, this: Value, _: []const Value) Error!Value {
@@ -2572,14 +2601,23 @@ fn arraySplice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         .write_length = insert_count != actual_delete,
     });
 
-    const r = try realm(rt);
-    const out = try rt.heap.newArray(r.array_prototype);
-    var root_buf = [_]Value{ this, Value.fromObject(out) };
+    var root_buf = [_]Value{ this, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    try rt.heap.appendElements(out, a.kind.array.items[actual_start .. actual_start + actual_delete]);
+    const out = try arraySpeciesCreate(rt, this, actual_delete);
+    root_buf[1] = out;
+
+    if (out.isObject() and out.asObject().kind == .array and out.asObject().kind.array.items.len == 0) {
+        try rt.heap.appendElements(out.asObject(), a.kind.array.items[actual_start .. actual_start + actual_delete]);
+    } else {
+        for (0..actual_delete) |k| {
+            const elem = if (actual_start + k < a.kind.array.items.len) a.kind.array.items[actual_start + k] else Value.undefined;
+            try arrayAppendOrDefine(rt, out, k, elem);
+        }
+        try object.setStrict(rt, out, try object.named(rt, "length"), Value.fromNumber(@floatFromInt(actual_delete)));
+    }
 
     if (insert_count > actual_delete) {
         const delta = insert_count - actual_delete;
@@ -2601,7 +2639,7 @@ fn arraySplice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     for (insert_items, 0..) |v, j| {
         rt.heap.storeElement(a, actual_start + j, v);
     }
-    return Value.fromObject(out);
+    return out;
 }
 
 fn arraySort(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -4172,6 +4210,35 @@ fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Parsed
             return rt.throw(.TypeError, &.{.{ .ascii = "'defineProperty' on proxy: trap returned falsish" }});
         }
         return ok;
+    }
+
+    if (target.isObject() and target.asObject().kind == .typed_array) {
+        if (object.canonicalNumericIndex(k)) |n| {
+            const ta = target.asObject().kind.typed_array;
+            if (object.validIntegerIndex(ta, n) == null or
+                (d.has_conf and !d.conf_val) or
+                (d.has_enum and !d.enum_val) or
+                d.isAccessor() or
+                (d.has_writ and !d.writ_val))
+            {
+                if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
+                return false;
+            }
+            if (d.has_val) {
+                if (ta.kind.isBigInt()) {
+                    const b = try ops.toBigInt(rt, d.val);
+                    if (object.validIntegerIndex(ta, n)) |idx| {
+                        object.writeTypedArrayBigInt(ta, idx, b);
+                    }
+                } else {
+                    const num = try ops.toNumber(rt, d.val);
+                    if (object.validIntegerIndex(ta, n)) |idx| {
+                        object.writeTypedArrayNumber(ta, idx, num);
+                    }
+                }
+            }
+            return true;
+        }
     }
 
     if (target.isObject() and target.asObject().kind == .array and k == .atom and object.isNamed(k, "length") and d.has_val) {
@@ -8754,14 +8821,16 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
         .helper => return iteratorHelperNextVal(rt, iter),
         .wrap => return iteratorWrapNextVal(rt, iter),
         .regexp_match_all => {
-            const rx_obj = it.target.asObject();
+            const matcher = it.target;
             const s = it.next_method.asString();
-            var root_buf = [_]Value{ Value.fromObject(iter), Value.fromObject(rx_obj), Value.fromString(s), .undefined };
+            const is_global = (it.cursor & 1) != 0;
+            const is_unicode = (it.cursor & 2) != 0;
+            var root_buf = [_]Value{ Value.fromObject(iter), matcher, Value.fromString(s), .undefined };
             var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
             try roots.register(rt);
             defer roots.unregister(rt);
 
-            const match_val = try regexpExecImpl(rt, rx_obj, s);
+            const match_val = try regExpExecGeneric(rt, matcher, Value.fromString(s));
             if (match_val.isNull()) {
                 it.done = true;
                 it.target = .undefined;
@@ -8769,12 +8838,19 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
                 return null;
             }
             root_buf[3] = match_val;
-            const match_str = try toStringObj(rt, match_val.asObject().kind.array.items[0]);
+            if (!is_global) {
+                it.done = true;
+                it.target = .undefined;
+                it.next_method = .undefined;
+                return match_val;
+            }
+            const m0 = try object.get(rt, match_val, .{ .index = 0 });
+            const match_str = try toStringObj(rt, m0);
             if (match_str.units.len == 0) {
-                const this_idx = try toLength(rt, rx_obj.kind.regexp.last_index);
-                const is_unicode = rx_obj.kind.regexp.program.flags.isUnicodeMode();
+                const li_key = try object.named(rt, "lastIndex");
+                const this_idx = try toLength(rt, try object.get(rt, matcher, li_key));
                 const next_idx = advanceStringIndex(s.units, @intFromFloat(this_idx), is_unicode);
-                rt.heap.storeRegExpLastIndex(rx_obj, Value.fromNumber(@floatFromInt(next_idx)));
+                try object.setStrict(rt, matcher, li_key, Value.fromNumber(@floatFromInt(next_idx)));
             }
             return match_val;
         },
@@ -10355,27 +10431,36 @@ fn regexpSymSplit(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn regexpSymMatchAll(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    if (!this.isObject() and !this.isClosure() and !this.isNative()) {
+    if (!this.isObjectLike()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype[Symbol.matchAll] called on non-object" }});
     }
-    if (this.isObject() and this.asObject().kind == .regexp) {
-        var root_buf = [_]Value{ this, arg(args, 0), .undefined, .undefined };
-        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
-        try roots.register(rt);
-        defer roots.unregister(rt);
+    var root_buf = [_]Value{ this, arg(args, 0), .undefined, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
 
-        const s = try toStringObj(rt, root_buf[1]);
-        root_buf[2] = Value.fromString(s);
+    const s = try toStringObj(rt, root_buf[1]);
+    root_buf[2] = Value.fromString(s);
 
-        const orig = this.asObject().kind.regexp;
-        const cloned = try newRegExpFromStrings(rt, orig.source, orig.flags);
-        root_buf[3] = cloned;
-        const last_idx = try toLength(rt, orig.last_index);
-        rt.heap.storeRegExpLastIndex(cloned.asObject(), Value.fromNumber(last_idx));
-        const r = try realm(rt);
-        return Value.fromObject(try rt.heap.newMatchAllIterator(r.iterator_prototype, cloned.asObject(), s));
-    }
-    return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype[Symbol.matchAll] requires a RegExp receiver" }});
+    const ctor = try speciesConstructor(rt, this, Value.fromNative(&regexp_global));
+    root_buf[3] = ctor;
+
+    const flags_val = try object.get(rt, this, try object.named(rt, "flags"));
+    const flags_s = try toStringObj(rt, flags_val);
+    root_buf[4] = Value.fromString(flags_s);
+
+    const matcher = try constructValue(rt, ctor, &.{ this, Value.fromString(flags_s) });
+    root_buf[5] = matcher;
+
+    const li_key = try object.named(rt, "lastIndex");
+    const last_idx = try toLength(rt, try object.get(rt, this, li_key));
+    try object.setStrict(rt, matcher, li_key, Value.fromNumber(last_idx));
+
+    const is_global = std.mem.indexOfScalar(u16, flags_s.units, 'g') != null;
+    const is_unicode = std.mem.indexOfScalar(u16, flags_s.units, 'u') != null or
+        std.mem.indexOfScalar(u16, flags_s.units, 'v') != null;
+    const r = try realm(rt);
+    return Value.fromObject(try rt.heap.newMatchAllIterator(r.iterator_prototype, matcher, s, is_global, is_unicode));
 }
 
 fn coerceToRegExp(rt: *Runtime, v: Value) Error!*Object {
@@ -10468,7 +10553,8 @@ fn stringMatchAll(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     root_buf[3] = created;
 
     const r = try realm(rt);
-    return Value.fromObject(try rt.heap.newMatchAllIterator(r.iterator_prototype, created.asObject(), s));
+    const is_unicode = created.asObject().kind.regexp.program.flags.isUnicodeMode();
+    return Value.fromObject(try rt.heap.newMatchAllIterator(r.iterator_prototype, created, s, true, is_unicode));
 }
 
 fn stringSearch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -11094,7 +11180,7 @@ fn abByteLengthGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 
 fn abSlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const o = try requireArrayBuffer(rt, this);
-    var root_buf = [_]Value{this};
+    var root_buf = [_]Value{ this, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -11104,11 +11190,33 @@ fn abSlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const first = try relativeIndex(rt, arg(args, 0), len, 0);
     const final = try relativeIndex(rt, arg(args, 1), len, len);
     const new_len = if (final > first) final - first else 0;
-    const vr = try viewsRealm(rt);
-    const new_ab = try rt.heap.newArrayBuffer(vr.array_buffer_prototype, new_len);
+
+    const ctor = try speciesConstructor(rt, this, Value.fromNative(&array_buffer_global));
+    root_buf[1] = ctor;
+    var new_ab: *Object = undefined;
+    if (ctor.isNative() and ctor.asNative() == &array_buffer_global) {
+        const vr = try viewsRealm(rt);
+        new_ab = try rt.heap.newArrayBuffer(vr.array_buffer_prototype, new_len);
+    } else {
+        const new_val = try constructValue(rt, ctor, &.{Value.fromNumber(@floatFromInt(new_len))});
+        root_buf[2] = new_val;
+        if (!new_val.isObject() or new_val.asObject().kind != .array_buffer) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer species constructor did not return an ArrayBuffer" }});
+        }
+        new_ab = new_val.asObject();
+        if (new_ab.kind.array_buffer.detached) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer species constructor returned a detached ArrayBuffer" }});
+        }
+        if (new_ab == o) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer species constructor returned the same ArrayBuffer" }});
+        }
+        if (new_ab.kind.array_buffer.data.len < new_len) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer species constructor returned a buffer that is too small" }});
+        }
+    }
     if (o.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot slice a detached ArrayBuffer" }});
     if (new_len > 0) {
-        @memcpy(new_ab.kind.array_buffer.data, o.kind.array_buffer.data[first .. first + new_len]);
+        @memcpy(new_ab.kind.array_buffer.data[0..new_len], o.kind.array_buffer.data[first .. first + new_len]);
     }
     return Value.fromObject(new_ab);
 }

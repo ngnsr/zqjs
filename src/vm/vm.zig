@@ -1854,12 +1854,14 @@ pub const Vm = struct {
             .delete_prop => {
                 cache.syncSp(vm);
                 const r = try object.delete(rt, try cache.peek(vm, 0), try vm.nameKey(cache.operand(0)));
+                if (!r and p.is_strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property" }});
                 (try cache.top(vm)).* = Value.fromBool(r);
             },
             .delete_elem => {
                 cache.syncSp(vm);
                 const k = try object.key(rt, try cache.peek(vm, 0));
                 const r = try object.delete(rt, try cache.peek(vm, 1), k);
+                if (!r and p.is_strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property" }});
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = Value.fromBool(r);
             },

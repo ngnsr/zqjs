@@ -221,13 +221,14 @@ test "M42: module namespace exotic object" {
         \\const forInKeys = [];
         \\for (const k in ns) forInKeys.push(k);
         \\print(forInKeys.join(','));
-        \\print(delete ns.a);
+        \\print(Reflect.deleteProperty(ns, 'a'));
+        \\try { delete ns.a; print('no-throw'); } catch (e) { print(e instanceof TypeError); }
     ;
     try expectBothEngines(
         &entries,
         "main.js",
         main_src,
-        "a,default,setZ,z\ntrue\nfalse true\n[object Module]\n2 1 3\n99\na,default,setZ,z\nfalse\n",
+        "a,default,setZ,z\ntrue\nfalse true\n[object Module]\n2 1 3\n99\na,default,setZ,z\nfalse\ntrue\n",
     );
 }
 

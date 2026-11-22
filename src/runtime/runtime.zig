@@ -187,7 +187,12 @@ pub const PropIc = struct {
     atom_addr: usize = 0,
     slot: u16 = 0,
     /// 0 = empty, 1 = own shaped read, 2 = 1-hop proto shaped read,
-    /// 3 = own shaped writable write, 4 = own shaped inline ADD transition.
+    /// 3 = own shaped writable write, 4 = own shaped inline ADD transition,
+    /// 5 = 1-hop proto dict read, 6 = own dict read,
+    /// 7 = 2-hop grandproto shaped read, 8 = 2-hop grandproto dict read,
+    /// 9 = negative (missing property -> undefined) up to 2 proto hops,
+    /// 10 = String.prototype shaped read, 11 = String.prototype dict read,
+    /// 12 = builtin global target (validated against global_object version).
     kind: u8 = 0,
 };
 
@@ -236,7 +241,7 @@ pub const Runtime = struct {
     realm: ?@import("builtins.zig").Realm = null,
     /// Direct-mapped monomorphic property inline cache (M52/M58, D82/D88): stores shape ids,
     /// atom address (never dereferenced), slot index, and hit kind (zero GC pointers).
-    prop_ic: [128]PropIc = @splat(.{}),
+    prop_ic: [2048][2]PropIc = @splat(@splat(.{})),
     /// Arrays being converted to strings right now (cycle detection, object.join).
     joining: std.ArrayList(*heap_mod.Object) = .empty,
     /// The running engine's roots (its stacks and frames), marked by `collect` (D8).

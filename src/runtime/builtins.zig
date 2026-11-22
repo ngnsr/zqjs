@@ -1192,6 +1192,28 @@ const builtin_globals = std.StaticStringMap(GlobalTarget).initComptime([_]struct
     .{ "structuredClone", .{ .native = &structured_clone_global } },
 });
 
+pub inline fn realmIfInit(rt: *const Runtime) ?*const Realm {
+    return if (rt.realm) |*r| r else null;
+}
+
+pub fn globalTargetIndex(name: []const u8) ?u16 {
+    const idx = builtin_globals.getIndex(name) orelse return null;
+    return @intCast(idx);
+}
+
+pub inline fn resolveGlobalTargetByIndex(r: *const Realm, idx: u16) Value {
+    return switch (builtin_globals.values()[idx]) {
+        .undefined => .undefined,
+        .nan => Value.fromNumber(std.math.nan(f64)),
+        .inf => Value.fromNumber(std.math.inf(f64)),
+        .math => Value.fromObject(r.math),
+        .json => Value.fromObject(r.json),
+        .reflect => Value.fromObject(r.reflect),
+        .global_this => Value.fromObject(r.global_object),
+        .native => |n| Value.fromNative(n),
+    };
+}
+
 fn resolveGlobalTarget(rt: *Runtime, target: GlobalTarget) Error!Value {
     return switch (target) {
         .undefined => .undefined,

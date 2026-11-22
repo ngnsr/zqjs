@@ -98,6 +98,7 @@ pub const ModuleRecord = struct {
 
     has_tla: bool = false,
     async_eval: bool = false,
+    proto_promoted: bool = false,
     pending_async_deps: u32 = 0,
     async_parents: std.ArrayList(*ModuleRecord) = .empty,
     eval_promise: ?*heap.Object = null,
@@ -156,14 +157,18 @@ pub const ModuleRegistry = struct {
             if (m.eval_error) |v| h.markValue(v);
             var ns_it = m.ns_reexports.valueIterator();
             while (ns_it.next()) |entry| h.markObj(&entry.cell.obj);
-            if (m.proto) |p| markProto(p, h);
+            if (m.proto) |p| {
+                if (!h.in_minor or !m.proto_promoted) {
+                    markProto(p, h);
+                    m.proto_promoted = true;
+                }
+            }
         }
     }
 
     fn markProto(p: *const Proto, h: *heap.Heap) void {
         for (p.consts) |c| h.markValue(c);
         for (p.name_atoms) |a| h.markObj(@constCast(&a.obj));
-        for (p.repl_cells) |cell| h.markObj(&cell.obj);
         for (p.functions) |*child| markProto(child, h);
     }
 };

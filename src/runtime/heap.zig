@@ -879,6 +879,9 @@ pub const Object = struct {
     array_length_writable: bool = true,
     regexp_last_index_writable: bool = true,
     ordinary_tag: enum(u8) { plain, @"error", arguments } = .plain,
+    /// Monotonic version bumped on every structural/descriptor mutation while in `.dict` mode;
+    /// used by VM property ICs to cache dictionary-mode objects and prototypes in O(1).
+    dict_version: u32 = 0,
 };
 
 /// A part of a string being built: either UTF-16 units or ASCII bytes (numbers,
@@ -917,6 +920,7 @@ pub const Heap = struct {
     free_shapes: ?*Shape = null,
     shape_slabs: std.ArrayList(*[64]Shape) = .empty,
     next_shape_id: u32 = 0,
+    next_dict_version: u32 = 0,
     /// `allocator()` refused an allocation because of the heap limit (see `failed`).
     refused: bool = false,
     /// When `bytes` passes this, a collection is requested for the next safepoint.
@@ -1983,6 +1987,13 @@ pub const Heap = struct {
         }
         if (sh.extra.len > 0) h.allocator().free(sh.extra);
         o.props = .{ .dict = dict };
+        h.bumpDictVersion(o);
+    }
+
+    inline fn bumpDictVersion(h: *Heap, o: *Object) void {
+        h.next_dict_version = (h.next_dict_version +% 1) & 0x7FFF_FFFF;
+        if (h.next_dict_version == 0) h.next_dict_version = 1;
+        o.dict_version = h.next_dict_version;
     }
 
     fn allocShape(h: *Heap) Error!*Shape {
@@ -2105,8 +2116,13 @@ pub const Heap = struct {
         try h.growPropCards(o);
         const gop = o.props.dict.getOrPut(h.allocator(), key) catch |e| return h.failed(e);
         const old: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
-        if (gop.found_existing) gop.value_ptr.value = value else gop.value_ptr.* = .{ .value = value };
-        if (!gop.found_existing) h.barrierObj(&o.obj, key.obj); // the key is a child too
+        if (gop.found_existing) {
+            gop.value_ptr.value = value;
+        } else {
+            gop.value_ptr.* = .{ .value = value };
+            h.bumpDictVersion(o);
+            h.barrierObj(&o.obj, key.obj); // the key is a child too
+        }
         h.barrier(&o.obj, old, value);
         h.propertyBarrier(o, gop.index, key, value);
     }
@@ -2159,6 +2175,7 @@ pub const Heap = struct {
         const old_val: ?Value = if (gop.found_existing) gop.value_ptr.value else null;
         const old_set: ?Value = if (gop.found_existing and gop.value_ptr.is_accessor) gop.value_ptr.setter else null;
         gop.value_ptr.* = p;
+        h.bumpDictVersion(o);
         if (!gop.found_existing) h.barrierObj(&o.obj, key.obj); // the key is a child too
         h.barrier(&o.obj, old_val, p.value);
         h.propertyBarrier(o, gop.index, key, p.value);
@@ -2194,6 +2211,7 @@ pub const Heap = struct {
         const index = o.props.dict.getIndex(key) orelse return;
         const old = o.props.dict.values()[index];
         o.props.dict.orderedRemoveAt(index);
+        h.bumpDictVersion(o);
         h.barrier(&o.obj, old.value, null);
         if (old.is_accessor) h.barrier(&o.obj, old.setter, null);
         if (!o.obj.remembered or mutation == .no_dirty_on_remove) return;

@@ -874,7 +874,20 @@ pub const Vm = struct {
             },
             .get_global => {
                 try cache.ensurePush(vm);
-                try cache.push(vm, try builtins.global(rt, try vm.name(cache.operand(0))));
+                const name_idx = cache.operand(0);
+                if (name_idx < p.name_atoms.len) {
+                    const atom = p.name_atoms[name_idx];
+                    if (fastGetGlobal(rt, p, pc, atom)) |v| {
+                        try cache.push(vm, v);
+                    } else {
+                        const gname = try vm.name(name_idx);
+                        const v = try builtins.global(rt, gname);
+                        populateGetGlobalIc(rt, p, pc, atom, gname);
+                        try cache.push(vm, v);
+                    }
+                } else {
+                    try cache.push(vm, try builtins.global(rt, try vm.name(name_idx)));
+                }
             },
             .get_global_or_undefined => {
                 try cache.ensurePush(vm);
@@ -2710,9 +2723,44 @@ fn fastArraySet(rt: *Runtime, base: Value, idx: Value, val: Value) bool {
     return true;
 }
 
-inline fn propIcSlot(rt: *Runtime, p: *const Proto, pc: u32) *rt_mod.PropIc {
-    const h = (@intFromPtr(p) >> 4) ^ pc;
-    return &rt.prop_ic[h & (rt.prop_ic.len - 1)];
+inline fn propIcBucket(rt: *Runtime, p: *const Proto, pc: u32) *[2]rt_mod.PropIc {
+    const h = (@intFromPtr(p) >> 4) ^ (@as(usize, pc) *% 2654435761);
+    return &rt.prop_ic[(h ^ (h >> 11)) & (rt.prop_ic.len - 1)];
+}
+
+inline fn insertPropIc(rt: *Runtime, p: *const Proto, pc: u32, entry: rt_mod.PropIc) void {
+    const b = propIcBucket(rt, p, pc);
+    if (b[0].atom_addr == entry.atom_addr and b[0].shape_id == entry.shape_id and b[0].kind == entry.kind) {
+        b[0] = entry;
+        return;
+    }
+    b[1] = b[0];
+    b[0] = entry;
+}
+
+inline fn fastGetGlobal(rt: *Runtime, p: *const Proto, pc: u32, atom: *heap.String) ?Value {
+    const r = builtins.realmIfInit(rt) orelse return null;
+    if (rt.host_globals.items.len != 0) return null;
+    const b = propIcBucket(rt, p, pc);
+    const ic = b[0];
+    if (ic.kind == 12 and ic.atom_addr == @intFromPtr(atom) and objVersion(r.global_object) == ic.shape_id) {
+        return builtins.resolveGlobalTargetByIndex(r, ic.slot);
+    }
+    return null;
+}
+
+noinline fn populateGetGlobalIc(rt: *Runtime, p: *const Proto, pc: u32, atom: *heap.String, name: []const u8) void {
+    const r = builtins.realmIfInit(rt) orelse return;
+    if (rt.host_globals.items.len != 0) return;
+    if (r.global_object.props.get(heap.PropKey.fromAtom(atom)) != null) return;
+    const idx = builtins.globalTargetIndex(name) orelse return;
+    insertPropIc(rt, p, pc, .{
+        .shape_id = objVersion(r.global_object),
+        .proto_shape_id = 0,
+        .atom_addr = @intFromPtr(atom),
+        .slot = idx,
+        .kind = 12,
+    });
 }
 
 inline fn isLengthAtom(atom: *const heap.String) bool {
@@ -2720,87 +2768,307 @@ inline fn isLengthAtom(atom: *const heap.String) bool {
     return u.len == 6 and u[0] == 'l' and u[1] == 'e' and u[2] == 'n' and u[3] == 'g' and u[4] == 't' and u[5] == 'h';
 }
 
-fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) ?Value {
+inline fn objVersion(o: *const heap.Object) u32 {
+    return if (o.props == .shaped) o.props.shapeId() else (o.dict_version | 0x8000_0000);
+}
+
+inline fn matchGetPropIc(o: *const heap.Object, atom_addr: usize, sid: u32, ic: rt_mod.PropIc) ?Value {
+    if (ic.atom_addr != atom_addr) return null;
+    if (ic.kind == 6) {
+        if (o.props != .dict or o.dict_version != ic.shape_id) return null;
+        const v = o.props.dict.values()[ic.slot].value;
+        heap.checkValue(v);
+        return v;
+    }
+    if (sid != ic.shape_id) return null;
+    switch (ic.kind) {
+        1 => {
+            const v = o.props.getShapedSlot(ic.slot);
+            heap.checkValue(v);
+            return v;
+        },
+        2 => {
+            if (o.proto) |proto| {
+                if (proto.kind == .ordinary) {
+                    proto.obj.checkLive();
+                    if (proto.props.shapeId() == ic.proto_shape_id) {
+                        const v = proto.props.getShapedSlot(ic.slot);
+                        heap.checkValue(v);
+                        return v;
+                    }
+                }
+            }
+        },
+        5 => {
+            if (o.proto) |proto| {
+                if (proto.kind == .ordinary and proto.props == .dict) {
+                    proto.obj.checkLive();
+                    if (proto.dict_version == ic.proto_shape_id) {
+                        const v = proto.props.dict.values()[ic.slot].value;
+                        heap.checkValue(v);
+                        return v;
+                    }
+                }
+            }
+        },
+        7, 8 => {
+            if (o.proto) |proto| {
+                if (proto.kind == .ordinary and objVersion(proto) == ic.proto_shape_id) {
+                    proto.obj.checkLive();
+                    if (proto.proto) |gp| {
+                        if (gp.kind == .ordinary) {
+                            gp.obj.checkLive();
+                            if (ic.kind == 7) {
+                                if (gp.props.shapeId() == ic.grandproto_shape_id) {
+                                    const v = gp.props.getShapedSlot(ic.slot);
+                                    heap.checkValue(v);
+                                    return v;
+                                }
+                            } else if (gp.props == .dict and gp.dict_version == ic.grandproto_shape_id) {
+                                const v = gp.props.dict.values()[ic.slot].value;
+                                heap.checkValue(v);
+                                return v;
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        9 => {
+            if (ic.proto_shape_id == 0) {
+                if (o.proto == null) return .undefined;
+            } else if (o.proto) |proto| {
+                if (proto.kind == .ordinary and objVersion(proto) == ic.proto_shape_id) {
+                    proto.obj.checkLive();
+                    if (ic.grandproto_shape_id == 0) {
+                        if (proto.proto == null) return .undefined;
+                    } else if (proto.proto) |gp| {
+                        if (gp.kind == .ordinary and objVersion(gp) == ic.grandproto_shape_id and gp.proto == null) {
+                            gp.obj.checkLive();
+                            return .undefined;
+                        }
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+inline fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) ?Value {
+    const atom_addr = @intFromPtr(atom);
     if (!base.isObject()) {
-        if (base.isString() and isLengthAtom(atom)) {
+        if (base.isString()) {
             const s = base.asString();
             s.obj.checkLive();
-            return Value.fromNumber(@floatFromInt(s.units.len));
+            if (isLengthAtom(atom)) return Value.fromNumber(@floatFromInt(s.units.len));
+            if (atom.atom.?.index != null) return null;
+            const r = builtins.realmIfInit(rt) orelse return null;
+            const sp = r.string_prototype;
+            const b = propIcBucket(rt, p, pc);
+            inline for (0..2) |i| {
+                const ic = b[i];
+                if (ic.atom_addr == atom_addr) {
+                    if (ic.kind == 10 and sp.props == .shaped and sp.props.shapeId() == ic.proto_shape_id) {
+                        const v = sp.props.getShapedSlot(ic.slot);
+                        heap.checkValue(v);
+                        return v;
+                    }
+                    if (ic.kind == 11 and sp.props == .dict and sp.dict_version == ic.proto_shape_id) {
+                        const v = sp.props.dict.values()[ic.slot].value;
+                        heap.checkValue(v);
+                        return v;
+                    }
+                }
+            }
         }
         return null;
     }
     const o = base.asObject();
     const is_array = o.kind == .array;
-    if (is_array and isLengthAtom(atom)) {
-        o.obj.checkLive();
-        return Value.fromNumber(@floatFromInt(o.kind.array.items.len));
-    }
-    if (!is_array and (o.kind != .ordinary or o.builtin != null)) return null;
-    o.obj.checkLive();
-    const ic = propIcSlot(rt, p, pc).*;
-    if (ic.atom_addr != @intFromPtr(atom)) return null;
-    const sid = o.props.shapeId();
-    if (sid != ic.shape_id) return null;
-    if (ic.kind == 1) {
-        if (is_array) return null;
-        const v = o.props.getShapedSlot(ic.slot);
-        heap.checkValue(v);
-        return v;
-    }
-    if (ic.kind == 2) {
-        if (is_array and (atom.atom.?.index != null or isLengthAtom(atom))) return null;
-        if (o.proto) |proto| {
-            if (proto.kind == .ordinary) {
-                proto.obj.checkLive();
-                if (proto.props.shapeId() == ic.proto_shape_id) {
-                    const v = proto.props.getShapedSlot(ic.slot);
-                    heap.checkValue(v);
-                    return v;
-                }
-            }
+    if (is_array) {
+        if (isLengthAtom(atom)) {
+            o.obj.checkLive();
+            return Value.fromNumber(@floatFromInt(o.kind.array.items.len));
         }
+        if (atom.atom.?.index != null) return null;
+    } else if (o.kind != .ordinary or o.builtin != null) {
+        return null;
     }
-    return null;
+    o.obj.checkLive();
+    const sid = objVersion(o);
+    const b = propIcBucket(rt, p, pc);
+    if (matchGetPropIc(o, atom_addr, sid, b[0])) |v| return v;
+    return matchGetPropIc(o, atom_addr, sid, b[1]);
 }
 
 noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) void {
-    if (!base.isObject()) return;
+    const key = heap.PropKey.fromAtom(atom);
+    if (!base.isObject()) {
+        if (base.isString() and !isLengthAtom(atom) and atom.atom.?.index == null) {
+            const r = builtins.realmIfInit(rt) orelse return;
+            const sp = r.string_prototype;
+            if (sp.props == .shaped) {
+                if (sp.props.shaped.shape) |sleaf| {
+                    if (sleaf.find(key)) |ss| {
+                        insertPropIc(rt, p, pc, .{
+                            .shape_id = 0,
+                            .proto_shape_id = sleaf.id,
+                            .atom_addr = @intFromPtr(atom),
+                            .slot = ss.slot,
+                            .kind = 10,
+                        });
+                    }
+                }
+            } else if (sp.dict_version != 0) {
+                if (sp.props.dict.getIndex(key)) |idx| {
+                    const prop = sp.props.dict.values()[idx];
+                    if (!prop.is_accessor and idx <= std.math.maxInt(u16)) {
+                        insertPropIc(rt, p, pc, .{
+                            .shape_id = 0,
+                            .proto_shape_id = sp.dict_version,
+                            .atom_addr = @intFromPtr(atom),
+                            .slot = @intCast(idx),
+                            .kind = 11,
+                        });
+                    }
+                }
+            }
+        }
+        return;
+    }
     const o = base.asObject();
     const is_array = o.kind == .array;
-    if (!is_array and (o.kind != .ordinary or o.builtin != null)) return;
-    if (o.props != .shaped) return;
-    const sid = o.props.shapeId();
-    const key = heap.PropKey.fromAtom(atom);
-    if (!is_array) {
+    if (is_array) {
+        if (atom.atom.?.index != null or isLengthAtom(atom)) return;
+    } else if (o.kind != .ordinary or o.builtin != null) {
+        return;
+    }
+    if (o.props == .shaped) {
         if (o.props.shaped.shape) |leaf| {
             if (leaf.find(key)) |s| {
-                propIcSlot(rt, p, pc).* = .{
-                    .shape_id = sid,
+                insertPropIc(rt, p, pc, .{
+                    .shape_id = o.props.shapeId(),
                     .proto_shape_id = 0,
                     .atom_addr = @intFromPtr(atom),
                     .slot = s.slot,
                     .kind = 1,
-                };
+                });
                 return;
             }
         }
-    } else if (atom.atom.?.index != null or isLengthAtom(atom)) {
-        return;
+    } else {
+        if (o.props.dict.getIndex(key)) |idx| {
+            const prop = o.props.dict.values()[idx];
+            if (!prop.is_accessor and idx <= std.math.maxInt(u16) and o.dict_version != 0) {
+                insertPropIc(rt, p, pc, .{
+                    .shape_id = o.dict_version,
+                    .proto_shape_id = 0,
+                    .atom_addr = @intFromPtr(atom),
+                    .slot = @intCast(idx),
+                    .kind = 6,
+                });
+            }
+            return;
+        }
     }
+    const sid = objVersion(o);
+    if (o.props == .dict and o.dict_version == 0) return;
     if (o.proto) |proto| {
-        if (proto.kind == .ordinary and proto.props == .shaped) {
+        if (proto.kind != .ordinary) return;
+        if (proto.props == .shaped) {
             if (proto.props.shaped.shape) |pleaf| {
                 if (pleaf.find(key)) |ps| {
-                    propIcSlot(rt, p, pc).* = .{
+                    insertPropIc(rt, p, pc, .{
                         .shape_id = sid,
                         .proto_shape_id = pleaf.id,
                         .atom_addr = @intFromPtr(atom),
                         .slot = ps.slot,
                         .kind = 2,
-                    };
+                    });
+                    return;
                 }
             }
+        } else {
+            if (proto.dict_version == 0) return;
+            if (proto.props.dict.getIndex(key)) |idx| {
+                const prop = proto.props.dict.values()[idx];
+                if (!prop.is_accessor and idx <= std.math.maxInt(u16)) {
+                    insertPropIc(rt, p, pc, .{
+                        .shape_id = sid,
+                        .proto_shape_id = proto.dict_version,
+                        .atom_addr = @intFromPtr(atom),
+                        .slot = @intCast(idx),
+                        .kind = 5,
+                    });
+                }
+                return;
+            }
         }
+        // 2-hop prototype lookup (e.g. SubClass instance -> Sub.prototype -> Base.prototype)
+        if (proto.proto) |gp| {
+            if (gp.kind != .ordinary) return;
+            const pver = objVersion(proto);
+            if (gp.props == .shaped) {
+                if (gp.props.shaped.shape) |gpleaf| {
+                    if (gpleaf.find(key)) |gps| {
+                        insertPropIc(rt, p, pc, .{
+                            .shape_id = sid,
+                            .proto_shape_id = pver,
+                            .grandproto_shape_id = gpleaf.id,
+                            .atom_addr = @intFromPtr(atom),
+                            .slot = gps.slot,
+                            .kind = 7,
+                        });
+                        return;
+                    }
+                }
+            } else if (gp.dict_version != 0) {
+                if (gp.props.dict.getIndex(key)) |idx| {
+                    const prop = gp.props.dict.values()[idx];
+                    if (!prop.is_accessor and idx <= std.math.maxInt(u16)) {
+                        insertPropIc(rt, p, pc, .{
+                            .shape_id = sid,
+                            .proto_shape_id = pver,
+                            .grandproto_shape_id = gp.dict_version,
+                            .atom_addr = @intFromPtr(atom),
+                            .slot = @intCast(idx),
+                            .kind = 8,
+                        });
+                    }
+                    return;
+                }
+            }
+            if (gp.proto == null and (gp.props == .shaped or gp.dict_version != 0)) {
+                insertPropIc(rt, p, pc, .{
+                    .shape_id = sid,
+                    .proto_shape_id = pver,
+                    .grandproto_shape_id = objVersion(gp),
+                    .atom_addr = @intFromPtr(atom),
+                    .slot = 0,
+                    .kind = 9,
+                });
+            }
+        } else {
+            insertPropIc(rt, p, pc, .{
+                .shape_id = sid,
+                .proto_shape_id = objVersion(proto),
+                .grandproto_shape_id = 0,
+                .atom_addr = @intFromPtr(atom),
+                .slot = 0,
+                .kind = 9,
+            });
+        }
+    } else {
+        insertPropIc(rt, p, pc, .{
+            .shape_id = sid,
+            .proto_shape_id = 0,
+            .grandproto_shape_id = 0,
+            .atom_addr = @intFromPtr(atom),
+            .slot = 0,
+            .kind = 9,
+        });
     }
 }
 
@@ -2809,7 +3077,7 @@ fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
     const o = base.asObject();
     if (o.kind != .ordinary or o.builtin != null) return false;
     o.obj.checkLive();
-    const ic = propIcSlot(rt, p, pc).*;
+    const ic = propIcBucket(rt, p, pc)[0];
     if (ic.atom_addr != @intFromPtr(atom)) return false;
     const sid = o.props.shapeId();
     if (sid != ic.shape_id) return false;
@@ -2853,14 +3121,14 @@ noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
     const s = leaf.find(key) orelse return;
     if (!s.attrs.writable) return;
     if (old_sid == leaf.id) {
-        propIcSlot(rt, p, pc).* = .{
+        insertPropIc(rt, p, pc, .{
             .shape_id = leaf.id,
             .proto_shape_id = 0,
             .grandproto_shape_id = 0,
             .atom_addr = @intFromPtr(atom),
             .slot = s.slot,
             .kind = 3,
-        };
+        });
         return;
     }
     // Property was just added via an inline default-attrs transition: cache the ADD transition
@@ -2877,14 +3145,14 @@ noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
                 p2_sid = pr2.props.shapeId();
             }
         }
-        propIcSlot(rt, p, pc).* = .{
+        insertPropIc(rt, p, pc, .{
             .shape_id = old_sid,
             .proto_shape_id = p1_sid,
             .grandproto_shape_id = p2_sid,
             .atom_addr = @intFromPtr(atom),
             .slot = leaf.slot,
             .kind = 4,
-        };
+        });
     }
 }
 

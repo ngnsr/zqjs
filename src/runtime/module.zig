@@ -419,7 +419,8 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                 }
                 if (imp.namespace_binding) |nb| {
                     const ri = m.res.bindings[nb.binding].repl_index.?;
-                    is_import[ri] = true;
+                    // Namespace imports own their own cell (populated in Step 2) so
+                    // `import * as ns from ...; export { ns };` shares the cell safely.
                     try m.import_links.append(gpa, .{ .repl_idx = ri, .dep = dep, .imported_name = null, .span = nb.span });
                 }
                 for (imp.named) |sp| {
@@ -489,7 +490,22 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
             },
             .named => |specs| for (specs) |sp| {
                 const ri = m.res.refs[sp.local.id].repl;
-                try m.local_exports.put(gpa, sp.exported, m.cells[ri]);
+                if (is_import[ri]) {
+                    for (m.import_links.items) |link| {
+                        if (link.repl_idx == ri) {
+                            if (link.imported_name) |imp_name| {
+                                try m.indirect_exports.put(gpa, sp.exported, .{
+                                    .dep = link.dep,
+                                    .imported_name = imp_name,
+                                    .span = sp.span,
+                                });
+                            }
+                            break;
+                        }
+                    }
+                } else {
+                    try m.local_exports.put(gpa, sp.exported, m.cells[ri]);
+                }
             },
             .reexport_named, .reexport_all => {},
         };
@@ -518,7 +534,7 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                 }
             } else {
                 const ns_obj = getNamespace(rt, link.dep) catch |e| return mapRuntimeToModErr(e);
-                m.cells[link.repl_idx] = rt.heap.newCell(Value.fromObject(ns_obj)) catch |e| return mapHeapErr(e, rt);
+                rt.heap.storeCell(m.cells[link.repl_idx], Value.fromObject(ns_obj));
             }
         }
 

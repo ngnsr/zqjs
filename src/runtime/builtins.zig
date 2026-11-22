@@ -541,6 +541,13 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.json, "stringify", &json.stringify_native);
     try initErrorProto(rt, r.error_prototype, r.error_namespace, "Error", &error_global);
     try method(rt, r.error_namespace, "isError", &error_is_error);
+    try method(rt, r.error_namespace, "captureStackTrace", &error_capture_stack_trace);
+    try rt.heap.defineProperty(r.error_namespace, try rt.heap.internAscii("stackTraceLimit"), .{
+        .value = Value.fromNumber(10),
+        .enumerable = false,
+        .writable = true,
+        .configurable = true,
+    });
     try method(rt, r.error_prototype, "toString", &error_to_string);
     try initErrorProto(rt, r.type_error_prototype, r.type_error_namespace, "TypeError", &type_error_global);
     try initErrorProto(rt, r.range_error_prototype, r.range_error_namespace, "RangeError", &range_error_global);
@@ -933,6 +940,19 @@ fn arrayAppendOrDefine(rt: *Runtime, out: Value, idx: usize, val: Value) Error!v
 }
 
 const error_is_error: Native = .{ .name = "isError", .length = 1, .call = errorIsError };
+const error_capture_stack_trace: Native = .{ .name = "captureStackTrace", .length = 2, .call = errorCaptureStackTrace };
+
+fn errorCaptureStackTrace(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const target = arg(args, 0);
+    if (!target.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Error.captureStackTrace target must be an object" }});
+    }
+    if (target.isObject()) {
+        const stack_val = Value.fromString(try rt.heap.ascii("Error"));
+        try object.define(rt, target.asObject(), try object.named(rt, "stack"), stack_val);
+    }
+    return .undefined;
+}
 
 fn errorIsError(_: *Runtime, _: Value, args: []const Value) Error!Value {
     const v = arg(args, 0);

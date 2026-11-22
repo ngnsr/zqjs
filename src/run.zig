@@ -197,6 +197,14 @@ pub fn runModule(gpa: Allocator, name: []const u8, source: []const u8, io: std.I
         error.SyntaxError, error.Unsupported => {
             if (mod_diag.source.len > 0) {
                 try mod_diag.diag.render(mod_diag.source, name, report);
+            } else if (e == error.Unsupported) {
+                if (rt.unsupported) |u| {
+                    try report.print("{s}: Unsupported({s})\n", .{ name, @tagName(u) });
+                } else {
+                    try report.print("{s}: {s}\n", .{ name, @errorName(e) });
+                }
+            } else if (mod_diag.diag.detail == .syntax_error) {
+                try report.print("{s}: SyntaxError: {s}\n", .{ name, mod_diag.diag.detail.syntax_error });
             } else {
                 try report.print("{s}: {s}\n", .{ name, @errorName(e) });
             }

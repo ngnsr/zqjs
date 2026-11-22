@@ -3573,6 +3573,10 @@ const Machine = struct {
         if (m.res.functions[f.id].param_scope) |ps| {
             if (m.res.scopes[ps].len > 0) _ = try m.pushScope(ps);
         }
+        if (m.res.functions[f.id].arguments_binding) |ab| {
+            const arg_obj = try builtins.newArgumentsObject(m.rt, m.values.items[args_base..]);
+            m.store(ab, Value.fromObject(arg_obj));
+        }
         const argc: u32 = @intCast(m.values.items.len - args_base);
         if (f.params.len > 0) {
             try m.pushTask(.{ .call_bind_param = .{ .func = f, .idx = 0, .args_base = @intCast(args_base), .argc = argc } });

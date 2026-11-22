@@ -210,6 +210,8 @@ pub const Op = enum(u8) {
     get_arg,
     /// Push a new array containing `args[i..argc]`.
     rest_array,
+    /// Push a new unmapped `arguments` object containing `args[0..argc]`.
+    make_arguments,
     /// [arr, val] → [arr]: append `val` to `arr`.
     array_push,
     /// [arr, iterable] → [arr]: append all elements of `iterable` to `arr`.
@@ -262,6 +264,8 @@ pub const Op = enum(u8) {
     ge,
     strict_eq,
     strict_ne,
+    loose_eq,
+    loose_ne,
     neg,
     /// ToNumber: unary `+`, and the first step of `++`/`--`.
     to_number,
@@ -441,7 +445,7 @@ pub const Op = enum(u8) {
             .set_elem => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
             .set_elem_pop => .{ .operands = &.{}, .pops = 3, .pushes = 0 },
             .in, .instanceof => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
-            .push_this => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
+            .push_this, .make_arguments => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
             .get_arg, .rest_array => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
             .array_push, .array_spread, .object_spread => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .call_spread, .new_call_spread => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
@@ -449,7 +453,7 @@ pub const Op = enum(u8) {
             .iter_rest, .require_obj => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .object_rest => .{ .operands = &.{.argc}, .pops = 1, .pushes = 1 },
             .call_method => .{ .operands = &.{.argc}, .pops = 2, .pushes = 1 },
-            .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
+            .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .loose_eq, .loose_ne => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .add_const, .sub_const, .mul_const, .mod_const => .{ .operands = &.{.@"const"}, .pops = 1, .pushes = 1 },
             .add_local, .sub_local, .mul_local, .mod_local => .{ .operands = &.{ .slot, .name }, .pops = 1, .pushes = 1 },
             .neg, .to_number, .to_numeric, .to_string, .not, .bit_not, .typeof, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },

@@ -46,6 +46,8 @@ pub const BinaryOp = enum {
     ge,
     strict_eq,
     strict_ne,
+    loose_eq,
+    loose_ne,
     /// `key in object` (M7).
     in,
     /// `lhs instanceof rhs` (M25).
@@ -76,6 +78,8 @@ pub const BinaryOp = enum {
             .ge => ">=",
             .strict_eq => "===",
             .strict_ne => "!==",
+            .loose_eq => "==",
+            .loose_ne => "!=",
             .in => "in",
             .instanceof => "instanceof",
             .logical_and => "&&",

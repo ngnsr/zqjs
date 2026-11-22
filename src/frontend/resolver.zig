@@ -121,6 +121,8 @@ pub const Resolution = struct {
         captures: []const Capture = &.{},
         /// Canonical hoisted `var` binding ids belonging to this function/script.
         var_bindings: []const u32 = &.{},
+        /// Implicit `arguments` object binding id, lazily allocated only when referenced.
+        arguments_binding: ?u32 = null,
     };
 
     pub const Capture = struct {
@@ -145,11 +147,13 @@ pub fn resolve(arena: Allocator, script: ast.Script, diag: *Diagnostic) Error!Re
 }
 
 pub fn resolveWithRepl(arena: Allocator, script: ast.Script, repl_lookup: ?ReplLookup, diag: *Diagnostic) Error!Resolution {
+    var bindings_list: std.ArrayList(Resolution.Binding) = .empty;
+    try bindings_list.resize(arena, script.binding_count);
     var r: Resolver = .{
         .arena = arena,
         .diag = diag,
         .refs = try arena.alloc(Resolution.Ref, script.ref_count),
-        .bindings = try arena.alloc(Resolution.Binding, script.binding_count),
+        .bindings = bindings_list,
         .functions = try arena.alloc(Resolution.Function, script.function_count),
         .repl_lookup = repl_lookup,
         .module_mode = script.source_kind == .module,
@@ -160,17 +164,24 @@ pub fn resolveWithRepl(arena: Allocator, script: ast.Script, repl_lookup: ?ReplL
     try r.block(script.statements, .script);
     r.finishFunction();
     // Propagate final slot/captured/repl_index from canonical bindings to any merged `var` aliases.
-    for (r.bindings) |*b| {
+    for (r.bindings.items) |*b| {
         if (b.alias_of) |canon_id| {
             var c = canon_id;
-            while (r.bindings[c].alias_of) |next| c = next;
-            b.* = r.bindings[c];
+            while (r.bindings.items[c].alias_of) |next| c = next;
+            b.* = r.bindings.items[c];
             b.alias_of = c;
+        }
+    }
+    // Fix up `parent_slot` for any capture targeting a lazily-slotted `arguments` binding.
+    for (r.functions) |*func| {
+        const caps = @constCast(func.captures);
+        for (caps) |*cap| {
+            if (cap.from == .parent_slot) cap.from = .{ .parent_slot = r.bindings.items[cap.binding].slot };
         }
     }
     return .{
         .refs = r.refs,
-        .bindings = r.bindings,
+        .bindings = r.bindings.items,
         .scopes = r.scopes.items,
         .functions = r.functions,
         .repl_bindings = r.repl_bindings.items,
@@ -189,6 +200,7 @@ const FnState = struct {
     max_slots: u32 = 0,
     captures: std.ArrayList(Resolution.Capture) = .empty,
     var_bindings: std.ArrayList(u32) = .empty,
+    arguments_binding: ?u32 = null,
 };
 
 const PrivateDecl = struct {
@@ -202,7 +214,7 @@ const Resolver = struct {
     arena: Allocator,
     diag: *Diagnostic,
     refs: []Resolution.Ref,
-    bindings: []Resolution.Binding,
+    bindings: std.ArrayList(Resolution.Binding),
     functions: []Resolution.Function,
     scopes: std.ArrayList(Resolution.Scope) = .empty,
     fns: std.ArrayList(FnState) = .empty,
@@ -240,7 +252,12 @@ const Resolver = struct {
     }
 
     fn finishFunction(r: *Resolver) void {
-        const f = r.fns.pop().?;
+        var f = r.fns.pop().?;
+        if (f.arguments_binding) |ab| {
+            r.bindings.items[ab].slot = f.max_slots;
+            f.max_slots += 1;
+            r.functions[f.id].arguments_binding = ab;
+        }
         r.functions[f.id].slot_count = f.max_slots;
         r.functions[f.id].captures = f.captures.items;
         r.functions[f.id].var_bindings = f.var_bindings.items;
@@ -329,16 +346,16 @@ const Resolver = struct {
         if (param_range) |pr| {
             for (r.live.items[pr.start..pr.end]) |l| {
                 if (!std.mem.eql(u8, l.name, d.name)) continue;
-                r.bindings[d.binding] = r.bindings[l.binding];
-                r.bindings[d.binding].alias_of = l.binding;
+                r.bindings.items[d.binding] = r.bindings.items[l.binding];
+                r.bindings.items[d.binding].alias_of = l.binding;
                 return;
             }
         }
         // Duplicate `var` in the same hoisting scope merges into the canonical binding.
         for (r.live.items[r.scope_start..]) |l| {
             if (!std.mem.eql(u8, l.name, d.name)) continue;
-            r.bindings[d.binding] = r.bindings[l.binding];
-            r.bindings[d.binding].alias_of = l.binding;
+            r.bindings.items[d.binding] = r.bindings.items[l.binding];
+            r.bindings.items[d.binding].alias_of = l.binding;
             return;
         }
         // Sloppy script-level `var undefined/NaN/Infinity` is valid in JS (no-op on non-writable global).
@@ -351,7 +368,7 @@ const Resolver = struct {
             if (r.module_mode) {
                 const repl_idx: u32 = @intCast(r.repl_bindings.items.len);
                 try r.repl_bindings.append(r.arena, .{ .name = d.name, .kind = .@"var", .is_decl = true });
-                r.bindings[d.binding] = .{ .kind = .@"var", .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .repl_index = repl_idx };
+                r.bindings.items[d.binding] = .{ .kind = .@"var", .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .repl_index = repl_idx };
                 scope.len += 1;
                 try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
                 try f.var_bindings.append(r.arena, d.binding);
@@ -365,7 +382,7 @@ const Resolver = struct {
                 }
                 const repl_idx: u32 = @intCast(r.repl_bindings.items.len);
                 try r.repl_bindings.append(r.arena, .{ .name = d.name, .kind = .@"var", .is_decl = true });
-                r.bindings[d.binding] = .{ .kind = .@"var", .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .repl_index = repl_idx };
+                r.bindings.items[d.binding] = .{ .kind = .@"var", .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .repl_index = repl_idx };
                 scope.len += 1;
                 try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
                 try f.var_bindings.append(r.arena, d.binding);
@@ -373,7 +390,7 @@ const Resolver = struct {
             }
         }
         const slot: u32 = @intCast(r.live.items.len - f.live_start);
-        r.bindings[d.binding] = .{ .kind = .@"var", .slot = slot, .scope = r.scope, .index = scope.len, .function = f.id };
+        r.bindings.items[d.binding] = .{ .kind = .@"var", .slot = slot, .scope = r.scope, .index = scope.len, .function = f.id };
         scope.len += 1;
         try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
         try f.var_bindings.append(r.arena, d.binding);
@@ -388,7 +405,7 @@ const Resolver = struct {
                 const f = r.current();
                 const param_scope = r.functions[f.id].param_scope;
                 for (r.live.items[f.live_start..]) |l| {
-                    const b = r.bindings[l.binding];
+                    const b = r.bindings.items[l.binding];
                     if (b.function != f.id) continue;
                     if (b.scope == f.var_scope) continue;
                     if (param_scope != null and b.scope == param_scope.?) continue;
@@ -472,7 +489,7 @@ const Resolver = struct {
         };
         if (kind == .script or kind == .body) {
             for (r.live.items[r.scope_start..]) |l| {
-                if (r.bindings[l.binding].repl_index == null) {
+                if (r.bindings.items[l.binding].repl_index == null) {
                     r.functions[r.current().id].body_scope = r.scope;
                     break;
                 }
@@ -520,12 +537,12 @@ const Resolver = struct {
         }
         for (r.live.items[r.scope_start..]) |l| {
             if (!std.mem.eql(u8, l.name, d.name)) continue;
-            const old = r.bindings[l.binding].kind;
+            const old = r.bindings.items[l.binding].kind;
             // Sloppy JS allows duplicate simple params (the later wins); non-simple params are SyntaxError.
             if (kind == .param and old == .param and !dup_is_syntax) return r.fail(.{ .unsupported = .duplicate_parameter }, d.span);
             if (kind == .function and old == .@"var" and !r.module_mode) {
-                r.bindings[d.binding] = r.bindings[l.binding];
-                r.bindings[d.binding].alias_of = l.binding;
+                r.bindings.items[d.binding] = r.bindings.items[l.binding];
+                r.bindings.items[d.binding].alias_of = l.binding;
                 return;
             }
             if (kind == .function and (old == .function or old == .param)) return r.fail(.{ .unsupported = .duplicate_function }, d.span);
@@ -550,7 +567,7 @@ const Resolver = struct {
                     else => unreachable,
                 };
                 try r.repl_bindings.append(r.arena, .{ .name = d.name, .kind = repl_kind, .is_decl = true });
-                r.bindings[d.binding] = .{ .kind = kind, .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .repl_index = repl_idx };
+                r.bindings.items[d.binding] = .{ .kind = kind, .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .repl_index = repl_idx };
                 scope.len += 1;
                 try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
                 return;
@@ -569,14 +586,14 @@ const Resolver = struct {
                     else => unreachable,
                 };
                 try r.repl_bindings.append(r.arena, .{ .name = d.name, .kind = repl_kind, .is_decl = true });
-                r.bindings[d.binding] = .{ .kind = kind, .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .repl_index = repl_idx };
+                r.bindings.items[d.binding] = .{ .kind = kind, .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .repl_index = repl_idx };
                 scope.len += 1;
                 try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
                 return;
             }
         }
         const slot: u32 = @intCast(r.live.items.len - f.live_start);
-        r.bindings[d.binding] = .{ .kind = kind, .slot = slot, .scope = r.scope, .index = scope.len, .function = f.id };
+        r.bindings.items[d.binding] = .{ .kind = kind, .slot = slot, .scope = r.scope, .index = scope.len, .function = f.id };
         scope.len += 1;
         try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
         f.max_slots = @max(f.max_slots, slot + 1);
@@ -723,7 +740,7 @@ const Resolver = struct {
     fn declareSyntheticDefault(r: *Resolver, binding_id: u32) Error!void {
         const repl_idx: u32 = @intCast(r.repl_bindings.items.len);
         try r.repl_bindings.append(r.arena, .{ .name = "*default*", .kind = .@"const", .is_decl = true });
-        r.bindings[binding_id] = .{ .kind = .@"const", .slot = 0, .scope = r.scope, .index = 0, .function = 0, .repl_index = repl_idx };
+        r.bindings.items[binding_id] = .{ .kind = .@"const", .slot = 0, .scope = r.scope, .index = 0, .function = 0, .repl_index = repl_idx };
     }
 
     fn resolveForEach(r: *Resolver, for_target: ast.ForOfTarget, rhs: *const ast.Expr, body: *const ast.Stmt) Error!void {
@@ -992,20 +1009,57 @@ const Resolver = struct {
                 return;
             },
         };
-        if (r.bindings[b].kind == .function_name) return r.fail(.{ .unsupported = .function_name_assignment }, ref.span);
+        if (r.bindings.items[b].kind == .function_name) return r.fail(.{ .unsupported = .function_name_assignment }, ref.span);
         r.refs[ref.id] = res;
     }
 
     fn lookup(r: *Resolver, name: []const u8) Error!Resolution.Ref {
+        // Find the nearest enclosing non-arrow function for implicit `arguments` resolution.
+        var arg_fn_idx: ?usize = null;
+        if (std.mem.eql(u8, name, "arguments")) {
+            var fi = r.fns.items.len;
+            while (fi > 1) {
+                fi -= 1;
+                if (!r.fns.items[fi].is_arrow) {
+                    arg_fn_idx = fi;
+                    break;
+                }
+            }
+        }
+        const arg_floor: usize = if (arg_fn_idx) |fi| r.fns.items[fi].live_start else 0;
+
         var i = r.live.items.len;
-        while (i > 0) {
+        while (i > arg_floor) {
             i -= 1;
             if (!std.mem.eql(u8, r.live.items[i].name, name)) continue;
             const b = r.live.items[i].binding;
-            if (r.bindings[b].repl_index) |repl_idx| return .{ .repl = repl_idx };
-            if (r.bindings[b].function == r.current().id) return .{ .local = b };
-            r.bindings[b].captured = true;
+            if (r.bindings.items[b].repl_index) |repl_idx| return .{ .repl = repl_idx };
+            if (r.bindings.items[b].function == r.current().id) return .{ .local = b };
+            r.bindings.items[b].captured = true;
             return .{ .capture = .{ .binding = b, .index = try r.captureIndex(r.fns.items.len - 1, b) } };
+        }
+        // No local binding shadowed `arguments` inside the enclosing non-arrow function:
+        // lazily materialize the implicit `arguments` binding on that function.
+        if (arg_fn_idx) |fi| {
+            const target_fn = &r.fns.items[fi];
+            const arg_b: u32 = target_fn.arguments_binding orelse blk: {
+                const ps = r.functions[target_fn.id].param_scope.?;
+                const scope = &r.scopes.items[ps];
+                const new_id: u32 = @intCast(r.bindings.items.len);
+                try r.bindings.append(r.arena, .{
+                    .kind = .let,
+                    .slot = 0, // assigned in finishFunction after max_slots settles
+                    .scope = ps,
+                    .index = scope.len,
+                    .function = target_fn.id,
+                });
+                scope.len += 1;
+                target_fn.arguments_binding = new_id;
+                break :blk new_id;
+            };
+            if (target_fn.id == r.current().id) return .{ .local = arg_b };
+            r.bindings.items[arg_b].captured = true;
+            return .{ .capture = .{ .binding = arg_b, .index = try r.captureIndex(r.fns.items.len - 1, arg_b) } };
         }
         if (r.repl_lookup) |rl| {
             if (rl.get(rl.ctx, name)) |rk| {
@@ -1027,8 +1081,8 @@ const Resolver = struct {
         for (f.captures.items, 0..) |c, i| if (c.binding == b) return @intCast(i);
         // `b` belongs to an enclosing function, so level > its function's level ≥ 0.
         const parent = r.fns.items[level - 1];
-        const capture: Resolution.Capture = if (r.bindings[b].function == parent.id)
-            .{ .binding = b, .from = .{ .parent_slot = r.bindings[b].slot } }
+        const capture: Resolution.Capture = if (r.bindings.items[b].function == parent.id)
+            .{ .binding = b, .from = .{ .parent_slot = r.bindings.items[b].slot } }
         else
             .{ .binding = b, .from = .{ .parent_capture = try r.captureIndex(level - 1, b) } };
         // `f` is still valid: the recursion appends to other functions' capture lists,

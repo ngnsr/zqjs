@@ -1,0 +1,15 @@
+0 10
+10,,1,10, 10,20,3,10,30
+[object Arguments]
+true
+a-b-c
+a|b|c
+a:b:c
+0,1,2
+3 true false true
+2/hello/world
+0 2 7
+3 x+y
+123
+456
+60

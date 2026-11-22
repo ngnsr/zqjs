@@ -77,6 +77,8 @@ fn infix(tag: Tag) ?Infix {
         .amp => .{ .op = .bit_and, .bp = 5 },
         .eq3 => .{ .op = .strict_eq, .bp = 6 },
         .neq3 => .{ .op = .strict_ne, .bp = 6 },
+        .eq2 => .{ .op = .loose_eq, .bp = 6 },
+        .neq2 => .{ .op = .loose_ne, .bp = 6 },
         .lt => .{ .op = .lt, .bp = 7 },
         .le => .{ .op = .le, .bp = 7 },
         .gt => .{ .op = .gt, .bp = 7 },
@@ -881,7 +883,6 @@ const Parser = struct {
                 else => false,
             };
             if (certain) return p.fail(.{ .syntax_error = "unexpected token after do-while" }, p.tok);
-            return p.fail(.{ .unsupported = .asi }, p.tok);
         }
         return .{ .span = .{ .start = start, .end = end.end }, .data = .{ .do_while = .{ .body = body, .cond = cond } } };
     }
@@ -938,7 +939,9 @@ const Parser = struct {
             try p.advance();
             return .{ .span = span(t, end), .data = .{ .@"return" = null } };
         }
-        if (p.tok.newline_before or p.tok.tag == .eof or p.tok.tag == .r_brace) return p.fail(.{ .unsupported = .asi }, p.tok);
+        if (p.tok.newline_before or p.tok.tag == .eof or p.tok.tag == .r_brace) {
+            return .{ .span = span(t, t), .data = .{ .@"return" = null } };
+        }
         const value = try p.expression();
         const end = p.tok;
         try p.endStatement();
@@ -1216,7 +1219,9 @@ const Parser = struct {
             if (is_lexical_decl) return p.fail(.{ .syntax_error = "let is disallowed as a lexically bound name" }, t);
             return p.fail(.{ .unsupported = .syntax }, t);
         }
-        if (std.mem.eql(u8, name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
+        if (std.mem.eql(u8, name, "arguments") and p.in_strict_mode) {
+            return p.fail(.{ .syntax_error = "Unexpected eval or arguments in strict mode" }, t);
+        }
         if (std.mem.eql(u8, name, "await")) {
             return switch (p.async_ctx) {
                 .none => p.fail(.{ .unsupported = .syntax }, t),
@@ -1355,7 +1360,9 @@ const Parser = struct {
                     if (is_lexical_decl) return p.fail(.{ .syntax_error = "let is disallowed as a lexically bound name" }, t);
                     return p.fail(.{ .unsupported = .syntax }, t);
                 }
-                if (std.mem.eql(u8, name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
+                if (std.mem.eql(u8, name, "arguments") and p.in_strict_mode) {
+                    return p.fail(.{ .syntax_error = "Unexpected eval or arguments in strict mode" }, t);
+                }
                 if (std.mem.eql(u8, name, "await")) {
                     return switch (p.async_ctx) {
                         .none => p.fail(.{ .unsupported = .syntax }, t),
@@ -1390,7 +1397,7 @@ const Parser = struct {
     fn endStatement(p: *Parser) Error!void {
         const t = p.tok;
         if (t.tag == .semicolon) return p.advance();
-        if (t.newline_before or t.tag == .eof or t.tag == .r_brace) return p.fail(.{ .unsupported = .asi }, t);
+        if (t.newline_before or t.tag == .eof or t.tag == .r_brace) return;
         return p.unexpectedAfterExpression(t);
     }
 
@@ -1867,7 +1874,6 @@ const Parser = struct {
         var saw_logical = false;
         var saw_nullish = false;
         while (true) {
-            if (p.tok.tag == .eq2 or p.tok.tag == .neq2) return p.fail(.{ .unsupported = .loose_equality }, p.tok);
             const info: Infix = if (!p.no_in and p.isText(p.tok, "in"))
                 .{ .op = .in, .bp = 7 }
             else if (p.isText(p.tok, "instanceof"))
@@ -2401,7 +2407,6 @@ const Parser = struct {
                     if (k != .name or t.tag != .identifier) return p.fail(.{ .syntax_error = "unexpected token in object literal" }, p.tok);
                     if (token.reserved_identifiers.has(k.name)) return p.fail(.{ .syntax_error = "reserved word as shorthand property" }, t);
                     if (std.mem.eql(u8, k.name, "let")) return p.fail(.{ .unsupported = .syntax }, t);
-                    if (std.mem.eql(u8, k.name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
                     if (std.mem.eql(u8, k.name, "await")) {
                         return switch (p.async_ctx) {
                             .none => p.fail(.{ .unsupported = .syntax }, t),
@@ -2421,7 +2426,6 @@ const Parser = struct {
                     if (k != .name or t.tag != .identifier) return p.fail(.{ .syntax_error = "unexpected '=' in object literal" }, p.tok);
                     if (token.reserved_identifiers.has(k.name)) return p.fail(.{ .syntax_error = "reserved word as shorthand property" }, t);
                     if (std.mem.eql(u8, k.name, "let")) return p.fail(.{ .unsupported = .syntax }, t);
-                    if (std.mem.eql(u8, k.name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
                     if (std.mem.eql(u8, k.name, "await")) {
                         return switch (p.async_ctx) {
                             .none => p.fail(.{ .unsupported = .syntax }, t),
@@ -2587,8 +2591,6 @@ const Parser = struct {
                 if (std.mem.eql(u8, name, "new")) {
                     return p.newExpr();
                 }
-                // Inside a function, `arguments` is the arguments object.
-                if (std.mem.eql(u8, name, "arguments")) return p.fail(.{ .unsupported = .arguments }, t);
                 if (std.mem.eql(u8, name, "await")) {
                     switch (p.async_ctx) {
                         .none => if (!p.in_async_paren) return p.fail(.{ .unsupported = .syntax }, t),
@@ -2779,7 +2781,9 @@ const Parser = struct {
         if (token.reserved_identifiers.has(r.name))
             return p.failAt(.{ .syntax_error = "reserved word cannot be a binding name" }, r.span.start, r.span.end);
         if (std.mem.eql(u8, r.name, "let")) return p.failAt(.{ .unsupported = .syntax }, r.span.start, r.span.end);
-        if (std.mem.eql(u8, r.name, "arguments")) return p.failAt(.{ .unsupported = .arguments }, r.span.start, r.span.end);
+        if (std.mem.eql(u8, r.name, "arguments") and p.in_strict_mode) {
+            return p.failAt(.{ .syntax_error = "Unexpected eval or arguments in strict mode" }, r.span.start, r.span.end);
+        }
         const d: ast.Declarator = .{ .name = r.name, .span = r.span, .binding = p.binding_count, .init = null };
         p.binding_count += 1;
         return d;

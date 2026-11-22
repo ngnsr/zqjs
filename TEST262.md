@@ -36,25 +36,25 @@ ZQJS includes a parallel [tc39/test262](https://github.com/tc39/test262) conform
 - **Harness:** Test262's `harness/sta.js`, `harness/assert.js`, and helper includes are loaded **unmodified** (with a minimal `$262` host stub: `global: {}`, `gc: () => {}`). Test files themselves are executed **unmodified**.
 - **Outcome classification:**
   - `pass`: test matched its expected outcome (including `negative` parse/runtime error types and `async` `$DONE` completion).
-  - `unsupported`: `zqjs` emitted `Unsupported(<feature>)` (intentional ZQJS restrictions such as `asi`, `loose_equality`, `arguments`, `sloppy_this`, or unimplemented built-ins).
+  - `unsupported`: `zqjs` emitted `Unsupported(<feature>)` (intentional ZQJS restrictions such as `sloppy_this`, `sparse_array`, `global_assignment`, or unimplemented built-ins).
   - `applicable`: `executed - unsupported - limit` — tests that ZQJS accepted and ran to completion/error.
   - `fail_assert` / `fail_runtime` / `fail_parse`: real spec or edge-case mismatches on applicable tests.
   - `internal`: exit code 70 (bytecode verifier rejection) or process crash.
 
 ---
 
-## Results (M60 — with `var` hoisting)
+## Results (M60 — `var`, `arguments`, ASI, `==`/`!=`)
 
 Measured with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
 
 | Suite | Collected | Skipped (meta) | Executed | Unsupported | Limit | Applicable | Pass | Fail | Pass / Executed | Pass / Applicable |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `built-ins` | 23,885 | 7,414 | 16,471 | 9,643 | 8 | 6,820 | **6,235** | 585 | 37.85% | **91.42%** |
-| `language` | 23,832 | 971 | 22,861 | 7,558 | 0 | 15,303 | **13,942** | 1,361 | 60.99% | **91.11%** |
-| **Combined** | **47,717** | **8,385** | **39,332** | **17,201** | **8** | **22,123** | **20,177** | **1,946** | **51.30%** | **91.20%** |
+| `built-ins` | 23,885 | 7,414 | 16,471 | 7,762 | 453 | 8,256 | **7,469** | 787 | 45.35% | **90.47%** |
+| `language` | 23,832 | 971 | 22,861 | 4,776 | 0 | 18,085 | **16,282** | 1,803 | **71.22%** | **90.03%** |
+| **Combined** | **47,717** | **8,385** | **39,332** | **12,538** | **453** | **26,341** | **23,751** | **2,590** | **60.39%** | **90.17%** |
 
 - **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,332 executed tests (~46 s total on Apple M4).
-- Adding spec-compliant `var` hoisting (plus dropping the `var → let` harness shim) unlocked **+15,762** applicable tests and **+14,406 passes** (`5,771 → 20,177`, 3.5× more official tests passing) with **0% VM benchmark regression**.
+- Adding `var` hoisting, unmapped `arguments`, ASI, and loose equality (`==`/`!=`) unlocked **+19,980** applicable tests and **+17,980 passes** (`5,771 → 23,751`, **4.1×** more official tests passing) with **0% VM benchmark regression**.
 
 ### Built-ins Breakdown (Applicable Tests)
 

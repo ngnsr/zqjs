@@ -86,6 +86,11 @@ const Shared = struct {
                 try c.initBinding(n.binding);
             };
             const fn_info = c.s.res.functions[func.id];
+            if (fn_info.arguments_binding) |ab| {
+                if (c.binding(ab).captured) try c.emit(.new_cell, &.{c.slotOf(ab)});
+                try c.emit(.make_arguments, &.{});
+                try c.initBinding(ab);
+            }
             if (fn_info.is_simple_params) {
                 // Parameters arrive as plain values; box the captured ones.
                 for (func.params) |p| {
@@ -2733,6 +2738,8 @@ fn binaryOp(op: ast.BinaryOp) Op {
         .ge => .ge,
         .strict_eq => .strict_eq,
         .strict_ne => .strict_ne,
+        .loose_eq => .loose_eq,
+        .loose_ne => .loose_ne,
         .in => .in,
         .instanceof => .instanceof,
         .logical_and, .logical_or, .nullish, .comma => unreachable, // control flow, handled by the caller

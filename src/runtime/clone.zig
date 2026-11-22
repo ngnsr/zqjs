@@ -72,7 +72,7 @@ pub fn throwDataCloneError(rt: *Runtime, msg: []const u8) Error {
     defer roots.unregister(rt);
 
     const err_obj = try rt.heap.newObject(r.error_prototype);
-    err_obj.is_error = true;
+    err_obj.ordinary_tag = .@"error";
     root_buf[0] = Value.fromObject(err_obj);
 
     const name_str = try rt.heap.internAscii("DataCloneError");
@@ -184,7 +184,7 @@ fn cloneObject(ctx: *CloneContext, src: *Object) Error!*Object {
     defer ctx.popRoots(saved);
 
     return switch (src.kind) {
-        .ordinary => if (src.is_error) try cloneError(ctx, src) else try cloneOrdinary(ctx, src),
+        .ordinary => if (src.ordinary_tag == .@"error") try cloneError(ctx, src) else try cloneOrdinary(ctx, src),
         .array => try cloneArray(ctx, src),
         .map => try cloneMap(ctx, src),
         .set => try cloneSet(ctx, src),
@@ -408,7 +408,7 @@ fn cloneError(ctx: *CloneContext, src: *Object) Error!*Object {
     }
 
     const dst = try rt.heap.newObject(proto);
-    dst.is_error = true;
+    dst.ordinary_tag = .@"error";
     try ctx.visited.put(rt.gpa, src, dst);
 
     const name_atom = try rt.heap.internAscii("name");

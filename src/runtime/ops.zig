@@ -340,6 +340,89 @@ pub fn strictEquals(a: Value, b: Value) bool {
     return false;
 }
 
+/// ES2025 §7.2.13 IsLooselyEqual ( x, y ).
+pub fn abstractEquals(rt: *Runtime, a_in: Value, b_in: Value) Error!bool {
+    var roots_buf = [_]Value{ a_in, b_in };
+    var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+    const may_call = a_in.isObjectLike() or b_in.isObjectLike();
+    if (may_call) try roots.register(rt);
+    defer if (may_call) roots.unregister(rt);
+
+    var x = a_in;
+    var y = b_in;
+    while (true) {
+        // 1. Same type → IsStrictlyEqual.
+        const x_obj = x.isObjectLike();
+        const y_obj = y.isObjectLike();
+        if (x_obj and y_obj) return x.bits == y.bits;
+        if ((x.isUndefined() and y.isUndefined()) or
+            (x.isNull() and y.isNull()) or
+            (x.isBool() and y.isBool()) or
+            (x.isNumber() and y.isNumber()) or
+            (x.isString() and y.isString()) or
+            (x.isSymbol() and y.isSymbol()) or
+            (x.isBigInt() and y.isBigInt()))
+        {
+            return strictEquals(x, y);
+        }
+        // 2-3. null == undefined.
+        if ((x.isNull() and y.isUndefined()) or (x.isUndefined() and y.isNull())) return true;
+        // 5-6. Number vs String.
+        if (x.isNumber() and y.isString()) {
+            y = Value.fromNumber(try toNumber(rt, y));
+            if (may_call) roots_buf[1] = y;
+            continue;
+        }
+        if (x.isString() and y.isNumber()) {
+            x = Value.fromNumber(try toNumber(rt, x));
+            if (may_call) roots_buf[0] = x;
+            continue;
+        }
+        // 7-8. BigInt vs String.
+        if (x.isBigInt() and y.isString()) {
+            const rhs = (try stringToBigIntOpt(rt, y.asString().units)) orelse return false;
+            return bigint.cmp(x.asBigInt(), rhs) == .eq;
+        }
+        if (x.isString() and y.isBigInt()) {
+            const lhs = (try stringToBigIntOpt(rt, x.asString().units)) orelse return false;
+            return bigint.cmp(lhs, y.asBigInt()) == .eq;
+        }
+        // 9-10. Boolean → Number.
+        if (x.isBool()) {
+            x = Value.fromNumber(if (x.asBool()) 1.0 else 0.0);
+            if (may_call) roots_buf[0] = x;
+            continue;
+        }
+        if (y.isBool()) {
+            y = Value.fromNumber(if (y.asBool()) 1.0 else 0.0);
+            if (may_call) roots_buf[1] = y;
+            continue;
+        }
+        // 11-12. Object vs (String | Number | BigInt | Symbol) → ToPrimitive(obj, default).
+        if ((x.isString() or x.isNumber() or x.isBigInt() or x.isSymbol()) and y_obj) {
+            y = try object.toPrimitive(rt, y, .default);
+            roots_buf[1] = y;
+            continue;
+        }
+        if (x_obj and (y.isString() or y.isNumber() or y.isBigInt() or y.isSymbol())) {
+            x = try object.toPrimitive(rt, x, .default);
+            roots_buf[0] = x;
+            continue;
+        }
+        // 13. BigInt vs Number.
+        if (x.isBigInt() and y.isNumber()) {
+            const ord = bigint.cmpNumber(x.asBigInt(), y.asNumber()) orelse return false;
+            return ord == .eq;
+        }
+        if (x.isNumber() and y.isBigInt()) {
+            const ord = bigint.cmpNumber(y.asBigInt(), x.asNumber()) orelse return false;
+            return ord == .eq;
+        }
+        // 14. Otherwise false.
+        return false;
+    }
+}
+
 /// All binary operators except `&&`/`||` (which short-circuit, so they are control
 /// flow in the evaluator). Both operands have already been evaluated, left first.
 pub fn binary(rt: *Runtime, op: ast.BinaryOp, a_in: Value, b_in: Value) Error!Value {
@@ -445,6 +528,8 @@ pub fn binary(rt: *Runtime, op: ast.BinaryOp, a_in: Value, b_in: Value) Error!Va
         .ge => Value.fromBool(if (try lessThan(rt, a, b)) |r| !r else false),
         .strict_eq => Value.fromBool(strictEquals(a, b)),
         .strict_ne => Value.fromBool(!strictEquals(a, b)),
+        .loose_eq => Value.fromBool(try abstractEquals(rt, a, b)),
+        .loose_ne => Value.fromBool(!try abstractEquals(rt, a, b)),
         .logical_and, .logical_or, .nullish, .comma => unreachable,
     };
 }

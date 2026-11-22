@@ -72,7 +72,7 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `duplicate_parameter` | restriction | `function f(a, a) {}` | legal in sloppy JS (the last one wins) |
 | `duplicate_function` | restriction | `function f() {} function f() {}`, `function f(a) { function a() {} }`, `function NaN() {}` | legal in sloppy JS (the later declaration wins, or a global is redefined) |
 | `function_name_assignment` | restriction | `let g = function n() { n = 1; };` | sloppy JS silently ignores the write |
-| `arguments` | not yet | `arguments`, `function f(arguments) {}` | the arguments object |
+| `arguments` | retired (M60) | *(implemented in M60)* | retained in `diag.Feature` enum for stability; unmapped `arguments` object is now supported |
 | `builtin` | not yet | `Intl`, `WeakRef`, `FinalizationRegistry`, `eval`, `Function(...)`, … | a global or built-in member node has that ZQJS doesn't implement yet (the diagnostic names it; DESIGN_DECISIONS D39) |
 | `sparse_array` | restriction (revisit) | `[1,,2]`, `delete a[0]`, `a[a.length + 1] = x`, `a.length = 10` | arrays have no holes |
 | `user_conversion` | retired (M40) | *(implemented in M40)* | retained in `diag.Feature` enum for stability; `Symbol.toPrimitive`, `toString`/`valueOf`, and `toJSON` are now supported (D70) |

@@ -1062,6 +1062,9 @@ pub const Vm = struct {
             .delete_prop,
             .delete_elem,
             .rest_array,
+            .make_arguments,
+            .loose_eq,
+            .loose_ne,
             .array_spread,
             .object_spread,
             .iter_rest,
@@ -1833,6 +1836,18 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = Value.fromBool(r);
             },
+            .loose_eq => {
+                cache.syncSp(vm);
+                const r = try ops.abstractEquals(rt, try cache.peek(vm, 1), try cache.peek(vm, 0));
+                try cache.drop(vm, 1);
+                (try cache.top(vm)).* = Value.fromBool(r);
+            },
+            .loose_ne => {
+                cache.syncSp(vm);
+                const r = !try ops.abstractEquals(rt, try cache.peek(vm, 1), try cache.peek(vm, 0));
+                try cache.drop(vm, 1);
+                (try cache.top(vm)).* = Value.fromBool(r);
+            },
             .rest_array => {
                 const start_idx = cache.operand(0);
                 const f = vm.frame();
@@ -1843,6 +1858,12 @@ pub const Vm = struct {
                     try rt.heap.appendElements(arr, vm.stack[args_start..][0..rest_len]);
                 }
                 try cache.push(vm, Value.fromObject(arr));
+            },
+            .make_arguments => {
+                cache.syncSp(vm);
+                const f = vm.frame();
+                const arg_obj = try builtins.newArgumentsObject(rt, vm.stack[f.args_start..][0..f.argc]);
+                try cache.push(vm, Value.fromObject(arg_obj));
             },
             .array_spread => {
                 const arr_v = try cache.peek(vm, 1);

@@ -1281,6 +1281,38 @@ fn unsupportedReceiver(rt: *Runtime, name: []const u8) Error {
 
 // ---------------------------------------------------------------- Object.prototype
 
+/// Allocates an ES unmapped `arguments` object (CreateUnmappedArgumentsObject).
+pub fn newArgumentsObject(rt: *Runtime, args: []const Value) Error!*heap_mod.Object {
+    const r = try realm(rt);
+    const obj = try rt.heap.newObject(r.object_prototype);
+    obj.ordinary_tag = .arguments;
+    var root_buf = [_]Value{Value.fromObject(obj)};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var idx_buf: [20]u8 = undefined;
+    for (args, 0..) |v, i| {
+        const s = std.fmt.bufPrint(&idx_buf, "{d}", .{i}) catch unreachable;
+        const k = try rt.heap.internUtf8(s);
+        try rt.heap.defineProperty(obj, k, .{
+            .value = v,
+            .writable = true,
+            .enumerable = true,
+            .configurable = true,
+        });
+    }
+    const len_key = try rt.heap.internUtf8("length");
+    try rt.heap.defineProperty(obj, len_key, .{
+        .value = Value.fromNumber(@floatFromInt(args.len)),
+        .writable = true,
+        .enumerable = false,
+        .configurable = true,
+    });
+    try symbolMethod(rt, obj, r.sym_iterator, &array_values);
+    return obj;
+}
+
 const object_to_string: Native = .{ .name = "toString", .call = objectToString };
 const object_value_of: Native = .{ .name = "valueOf", .call = objectValueOf };
 
@@ -1308,7 +1340,11 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
             .regexp => "RegExp",
             .date => "Date",
             .module_namespace => "Module",
-            .ordinary => if (o.is_error) "Error" else if (o.builtin == .number_prototype) "Number" else "Object",
+            .ordinary => switch (o.ordinary_tag) {
+                .arguments => "Arguments",
+                .@"error" => "Error",
+                .plain => if (o.builtin == .number_prototype) "Number" else "Object",
+            },
             else => "Object",
         },
     };
@@ -1519,12 +1555,12 @@ fn arrayKeys(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 }
 
 fn arrayValues(rt: *Runtime, this: Value, _: []const Value) Error!Value {
-    _ = try thisArray(rt, this, "values");
+    if (this.isUndefined() or this.isNull()) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
     return Value.fromObject(try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .array_values));
 }
 
 fn arrayEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
-    _ = try thisArray(rt, this, "entries");
+    if (this.isUndefined() or this.isNull()) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
     return Value.fromObject(try rt.heap.newIterator((try realm(rt)).iterator_prototype, this, .array_entries));
 }
 
@@ -6070,7 +6106,7 @@ fn makeAggregateError(rt: *Runtime, errors_arr_val: Value) Error!Value {
     defer roots.unregister(rt);
 
     const err_obj = try rt.heap.newObject(r.aggregate_error_prototype);
-    err_obj.is_error = true;
+    err_obj.ordinary_tag = .@"error";
     root_buf[1] = Value.fromObject(err_obj);
     const msg_str = try rt.heap.newString(&.{.{ .ascii = "All promises were rejected" }});
     root_buf[2] = Value.fromString(msg_str);
@@ -6106,7 +6142,7 @@ pub fn resolvePromiseValue(rt: *Runtime, p_obj: *Object, val: Value) Error!void 
         defer err_roots.unregister(rt);
 
         const err_obj = try rt.heap.newObject(r.type_error_prototype);
-        err_obj.is_error = true;
+        err_obj.ordinary_tag = .@"error";
         err_roots_buf[1] = Value.fromObject(err_obj);
         const msg_str = try rt.heap.newString(&.{.{ .ascii = "Chaining cycle detected for promise" }});
         err_roots_buf[2] = Value.fromString(msg_str);
@@ -6293,7 +6329,7 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
                         else => unreachable,
                     };
                 }
-            } else {
+            } else if (it.target.isObject() and it.target.asObject().kind == .array) {
                 const items = it.target.asObject().kind.array.items;
                 if (it.cursor < items.len) {
                     const i = it.cursor;
@@ -6303,6 +6339,26 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
                         .array_values => items[i],
                         .array_keys => idx_val,
                         .array_entries => try makePairArray(rt, idx_val, items[i]),
+                        else => unreachable,
+                    };
+                }
+            } else {
+                // Generic array-like iteration (e.g. `arguments` or `Array.prototype.values.call(obj)`).
+                var root_buf = [_]Value{ Value.fromObject(iter), it.target };
+                var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+                try roots.register(rt);
+                defer roots.unregister(rt);
+                const len_val = try object.get(rt, it.target, .{ .atom = try rt.heap.internUtf8("length") });
+                const len = try toLength(rt, len_val);
+                if (@as(f64, @floatFromInt(it.cursor)) < len) {
+                    const i = it.cursor;
+                    it.cursor += 1;
+                    const idx_val: Value = Value.fromNumber(@floatFromInt(i));
+                    if (it.kind == .array_keys) return idx_val;
+                    const elem = try object.get(rt, it.target, try object.key(rt, idx_val));
+                    return switch (it.kind) {
+                        .array_values => elem,
+                        .array_entries => try makePairArray(rt, idx_val, elem),
                         else => unreachable,
                     };
                 }
@@ -6843,7 +6899,7 @@ fn buildError(rt: *Runtime, proto: *Object, msg_arg: Value, opts_arg: Value) Err
     defer roots.unregister(rt);
 
     const err_obj = try rt.heap.newObject(proto);
-    err_obj.is_error = true;
+    err_obj.ordinary_tag = .@"error";
     root_buf[2] = Value.fromObject(err_obj);
 
     if (!msg_arg.isUndefined()) {
@@ -6876,7 +6932,7 @@ pub fn makeEngineError(rt: *Runtime, name: rt_mod.ErrorName, msg: *const heap_mo
     defer roots.unregister(rt);
 
     const err_obj = try rt.heap.newObject(proto);
-    err_obj.is_error = true;
+    err_obj.ordinary_tag = .@"error";
     root_buf[1] = Value.fromObject(err_obj);
     try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("message"), .{ .value = root_buf[0], .enumerable = false });
     return root_buf[1];

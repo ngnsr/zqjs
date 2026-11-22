@@ -48,7 +48,7 @@ const Diagnostic = @import("diag.zig").Diagnostic;
 
 pub const Error = error{ SyntaxError, Unsupported, OutOfMemory };
 
-pub const ReplKind = enum { let, @"const", function };
+pub const ReplKind = enum { let, @"const", @"var", function };
 
 pub const ReplLookup = struct {
     ctx: *const anyopaque,
@@ -83,6 +83,7 @@ pub const Resolution = struct {
     pub const BindingKind = enum {
         let,
         @"const",
+        @"var",
         param,
         /// A function declaration's name: initialised on scope entry, mutable.
         function,
@@ -101,6 +102,9 @@ pub const Resolution = struct {
         function: u32,
         captured: bool = false,
         repl_index: ?u32 = null,
+        /// Non-null when this declarator merges into an earlier canonical binding
+        /// (duplicate `var`, `var` matching a parameter, or `function` matching `var`).
+        alias_of: ?u32 = null,
     };
 
     pub const Scope = struct { len: u32 = 0 };
@@ -112,8 +116,11 @@ pub const Resolution = struct {
         /// name comes first; else 0). Parameters occupy consecutive slots.
         param_slot: u32 = 0,
         param_scope: ?u32 = null,
+        body_scope: ?u32 = null,
         is_simple_params: bool = true,
         captures: []const Capture = &.{},
+        /// Canonical hoisted `var` binding ids belonging to this function/script.
+        var_bindings: []const u32 = &.{},
     };
 
     pub const Capture = struct {
@@ -152,6 +159,15 @@ pub fn resolveWithRepl(arena: Allocator, script: ast.Script, repl_lookup: ?ReplL
     try r.fns.append(arena, .{ .id = 0, .live_start = 0 });
     try r.block(script.statements, .script);
     r.finishFunction();
+    // Propagate final slot/captured/repl_index from canonical bindings to any merged `var` aliases.
+    for (r.bindings) |*b| {
+        if (b.alias_of) |canon_id| {
+            var c = canon_id;
+            while (r.bindings[c].alias_of) |next| c = next;
+            b.* = r.bindings[c];
+            b.alias_of = c;
+        }
+    }
     return .{
         .refs = r.refs,
         .bindings = r.bindings,
@@ -161,7 +177,7 @@ pub fn resolveWithRepl(arena: Allocator, script: ast.Script, repl_lookup: ?ReplL
     };
 }
 
-const Live = struct { name: []const u8, binding: u32 };
+const Live = struct { name: []const u8, binding: u32, is_simple_catch: bool = false };
 
 /// A function being resolved (innermost last in `Resolver.fns`).
 const FnState = struct {
@@ -169,8 +185,10 @@ const FnState = struct {
     is_arrow: bool = false,
     /// Index in `live` where this function's bindings start (its slot 0).
     live_start: usize,
+    var_scope: u32 = 0,
     max_slots: u32 = 0,
     captures: std.ArrayList(Resolution.Capture) = .empty,
+    var_bindings: std.ArrayList(u32) = .empty,
 };
 
 const PrivateDecl = struct {
@@ -225,9 +243,172 @@ const Resolver = struct {
         const f = r.fns.pop().?;
         r.functions[f.id].slot_count = f.max_slots;
         r.functions[f.id].captures = f.captures.items;
+        r.functions[f.id].var_bindings = f.var_bindings.items;
     }
 
     const Range = struct { start: usize, end: usize };
+
+    /// Pre-pass hoisting all `var` declarations within a script/function body (stopping at
+    /// nested function/class-static-block boundaries).
+    fn hoistVars(r: *Resolver, stmts: []const ast.Stmt, script_scope: bool, param_range: ?Range) Error!void {
+        for (stmts) |s| try r.hoistVarStmt(s, script_scope, param_range);
+    }
+
+    fn hoistVarStmt(r: *Resolver, s: ast.Stmt, script_scope: bool, param_range: ?Range) Error!void {
+        switch (s.data) {
+            .declaration => |decl| if (decl.kind == .@"var") {
+                for (decl.declarators) |d| try r.hoistVarPattern(d.pattern, script_scope, param_range);
+            },
+            .export_decl => |exp| switch (exp) {
+                .declaration => |decl| if (decl.kind == .@"var") {
+                    for (decl.declarators) |d| {
+                        try r.hoistVarPattern(d.pattern, true, null);
+                        try r.exportPatternNames(d.pattern);
+                    }
+                },
+                else => {},
+            },
+            .block => |stmts| try r.hoistVars(stmts, script_scope, param_range),
+            .labeled => |l| try r.hoistVarStmt(l.body.*, script_scope, param_range),
+            .@"if" => |i| {
+                try r.hoistVarStmt(i.then.*, script_scope, param_range);
+                if (i.@"else") |e| try r.hoistVarStmt(e.*, script_scope, param_range);
+            },
+            .@"while" => |w| try r.hoistVarStmt(w.body.*, script_scope, param_range),
+            .do_while => |dw| try r.hoistVarStmt(dw.body.*, script_scope, param_range),
+            .@"for" => |f| {
+                if (f.init) |init| switch (init) {
+                    .declaration => |decl| if (decl.kind == .@"var") {
+                        for (decl.declarators) |d| try r.hoistVarPattern(d.pattern, script_scope, param_range);
+                    },
+                    .expression => {},
+                };
+                try r.hoistVarStmt(f.body.*, script_scope, param_range);
+            },
+            .for_of => |f| {
+                if (f.target == .declaration and f.target.declaration.kind == .@"var") {
+                    try r.hoistVarPattern(f.target.declaration.pattern, script_scope, param_range);
+                }
+                try r.hoistVarStmt(f.body.*, script_scope, param_range);
+            },
+            .for_in => |f| {
+                if (f.target == .declaration and f.target.declaration.kind == .@"var") {
+                    try r.hoistVarPattern(f.target.declaration.pattern, script_scope, param_range);
+                }
+                try r.hoistVarStmt(f.body.*, script_scope, param_range);
+            },
+            .@"switch" => |sw| {
+                for (sw.cases) |c| try r.hoistVars(c.body, script_scope, param_range);
+            },
+            .@"try" => |t| {
+                try r.hoistVars(t.body, script_scope, param_range);
+                if (t.catch_body) |cb| try r.hoistVars(cb, script_scope, param_range);
+                if (t.finally_body) |fb| try r.hoistVars(fb, script_scope, param_range);
+            },
+            else => {},
+        }
+    }
+
+    fn hoistVarPattern(r: *Resolver, pat: *const ast.Pattern, script_scope: bool, param_range: ?Range) Error!void {
+        switch (pat.data) {
+            .binding => |d| try r.hoistVar(d, script_scope, param_range),
+            .array => |arr| {
+                for (arr.elems) |maybe| if (maybe) |el| try r.hoistVarPattern(el.pattern, script_scope, param_range);
+                if (arr.rest) |rest| try r.hoistVarPattern(rest, script_scope, param_range);
+            },
+            .object => |obj| {
+                for (obj.props) |pr| try r.hoistVarPattern(pr.pattern, script_scope, param_range);
+                if (obj.rest) |rest| try r.hoistVarPattern(rest, script_scope, param_range);
+            },
+            .target => unreachable,
+        }
+    }
+
+    fn hoistVar(r: *Resolver, d: ast.Declarator, script_scope: bool, param_range: ?Range) Error!void {
+        // `function f(x) { var x; }` merges into the parameter binding.
+        if (param_range) |pr| {
+            for (r.live.items[pr.start..pr.end]) |l| {
+                if (!std.mem.eql(u8, l.name, d.name)) continue;
+                r.bindings[d.binding] = r.bindings[l.binding];
+                r.bindings[d.binding].alias_of = l.binding;
+                return;
+            }
+        }
+        // Duplicate `var` in the same hoisting scope merges into the canonical binding.
+        for (r.live.items[r.scope_start..]) |l| {
+            if (!std.mem.eql(u8, l.name, d.name)) continue;
+            r.bindings[d.binding] = r.bindings[l.binding];
+            r.bindings[d.binding].alias_of = l.binding;
+            return;
+        }
+        // Sloppy script-level `var undefined/NaN/Infinity` is valid in JS (no-op on non-writable global).
+        if (script_scope and !r.module_mode and isRestrictedGlobal(d.name)) {
+            return r.fail(.{ .unsupported = .syntax }, d.span);
+        }
+        const f = r.current();
+        const scope = &r.scopes.items[r.scope];
+        if (script_scope) {
+            if (r.module_mode) {
+                const repl_idx: u32 = @intCast(r.repl_bindings.items.len);
+                try r.repl_bindings.append(r.arena, .{ .name = d.name, .kind = .@"var", .is_decl = true });
+                r.bindings[d.binding] = .{ .kind = .@"var", .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .repl_index = repl_idx };
+                scope.len += 1;
+                try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
+                try f.var_bindings.append(r.arena, d.binding);
+                return;
+            }
+            if (r.repl_lookup) |rl| {
+                if (rl.get(rl.ctx, d.name)) |existing_kind| {
+                    if (existing_kind == .let or existing_kind == .@"const") {
+                        return r.fail(.{ .syntax_error = "identifier has already been declared" }, d.span);
+                    }
+                }
+                const repl_idx: u32 = @intCast(r.repl_bindings.items.len);
+                try r.repl_bindings.append(r.arena, .{ .name = d.name, .kind = .@"var", .is_decl = true });
+                r.bindings[d.binding] = .{ .kind = .@"var", .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .repl_index = repl_idx };
+                scope.len += 1;
+                try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
+                try f.var_bindings.append(r.arena, d.binding);
+                return;
+            }
+        }
+        const slot: u32 = @intCast(r.live.items.len - f.live_start);
+        r.bindings[d.binding] = .{ .kind = .@"var", .slot = slot, .scope = r.scope, .index = scope.len, .function = f.id };
+        scope.len += 1;
+        try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
+        try f.var_bindings.append(r.arena, d.binding);
+        f.max_slots = @max(f.max_slots, slot + 1);
+    }
+
+    /// Checks whether a `var` declaration collides with an intervening lexical binding
+    /// (`let`/`const`/`class`/destructuring `catch`) between its position and the hoisting scope.
+    fn checkVarConflicts(r: *Resolver, pat: *const ast.Pattern) Error!void {
+        switch (pat.data) {
+            .binding => |d| {
+                const f = r.current();
+                const param_scope = r.functions[f.id].param_scope;
+                for (r.live.items[f.live_start..]) |l| {
+                    const b = r.bindings[l.binding];
+                    if (b.function != f.id) continue;
+                    if (b.scope == f.var_scope) continue;
+                    if (param_scope != null and b.scope == param_scope.?) continue;
+                    if (!std.mem.eql(u8, l.name, d.name)) continue;
+                    // Annex B B.3.5: `catch (e) { var e; }` is valid in sloppy JS with dual bindings.
+                    if (l.is_simple_catch) return r.fail(.{ .unsupported = .syntax }, d.span);
+                    return r.fail(.{ .syntax_error = "identifier has already been declared" }, d.span);
+                }
+            },
+            .array => |arr| {
+                for (arr.elems) |maybe| if (maybe) |el| try r.checkVarConflicts(el.pattern);
+                if (arr.rest) |rest| try r.checkVarConflicts(rest);
+            },
+            .object => |obj| {
+                for (obj.props) |pr| try r.checkVarConflicts(pr.pattern);
+                if (obj.rest) |rest| try r.checkVarConflicts(rest);
+            },
+            .target => unreachable,
+        }
+    }
 
     /// The script body, a function body or a `{ … }` block: declare everything first,
     /// then resolve.
@@ -238,8 +419,14 @@ const Resolver = struct {
             if (r.param_scope_start) |ps| .{ .start = ps, .end = r.param_scope_end } else null
         else
             null;
+        if (kind == .script or kind == .body) {
+            r.current().var_scope = r.scope;
+            try r.hoistVars(stmts, kind == .script, param_range);
+        }
         for (stmts) |s| switch (s.data) {
-            .declaration => |decl| for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", kind == .script, true, param_range),
+            .declaration => |decl| if (decl.kind != .@"var") {
+                for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", kind == .script, true, param_range);
+            },
             .function => |f| try r.declare(f.name.?, .function, kind == .script, true, param_range),
             .class => |c| try r.declare(c.name.?, .let, kind == .script, true, param_range),
             .import_decl => |imp| {
@@ -248,7 +435,7 @@ const Resolver = struct {
                 for (imp.named) |sp| try r.declare(sp.local, .@"const", true, true, null);
             },
             .export_decl => |exp| switch (exp) {
-                .declaration => |decl| {
+                .declaration => |decl| if (decl.kind != .@"var") {
                     const bk: Resolution.BindingKind = if (decl.kind == .let) .let else .@"const";
                     for (decl.declarators) |d| {
                         try r.declarePattern(d.pattern, bk, true, true, null);
@@ -283,6 +470,14 @@ const Resolver = struct {
             },
             else => {},
         };
+        if (kind == .script or kind == .body) {
+            for (r.live.items[r.scope_start..]) |l| {
+                if (r.bindings[l.binding].repl_index == null) {
+                    r.functions[r.current().id].body_scope = r.scope;
+                    break;
+                }
+            }
+        }
         for (stmts) |s| try r.stmt(s);
     }
 
@@ -328,6 +523,11 @@ const Resolver = struct {
             const old = r.bindings[l.binding].kind;
             // Sloppy JS allows duplicate simple params (the later wins); non-simple params are SyntaxError.
             if (kind == .param and old == .param and !dup_is_syntax) return r.fail(.{ .unsupported = .duplicate_parameter }, d.span);
+            if (kind == .function and old == .@"var" and !r.module_mode) {
+                r.bindings[d.binding] = r.bindings[l.binding];
+                r.bindings[d.binding].alias_of = l.binding;
+                return;
+            }
             if (kind == .function and (old == .function or old == .param)) return r.fail(.{ .unsupported = .duplicate_function }, d.span);
             return r.fail(.{ .syntax_error = "identifier has already been declared" }, d.span);
         }
@@ -387,8 +587,10 @@ const Resolver = struct {
             .empty, .@"break", .@"continue" => {},
             .labeled => |l| try r.stmt(l.body.*),
             .expression => |e| try r.expr(e),
-            // Already declared by the enclosing block; only the initialisers and pattern exprs remain.
+            // Already declared by the enclosing block (or hoisted for `var`); only conflict checks,
+            // initialisers, and pattern exprs remain.
             .declaration => |decl| for (decl.declarators) |d| {
+                if (decl.kind == .@"var") try r.checkVarConflicts(d.pattern);
                 if (d.init) |init| try r.expr(init);
                 try r.resolvePatternExprs(d.pattern);
             },
@@ -401,14 +603,19 @@ const Resolver = struct {
                 if (t.catch_body) |cb| {
                     const saved = try r.enterScope();
                     defer r.exitScope(saved);
-                    if (t.catch_param) |cp| try r.declarePattern(cp, .let, false, true, null);
+                    if (t.catch_param) |cp| {
+                        try r.declarePattern(cp, .let, false, true, null);
+                        if (cp.data == .binding) r.live.items[r.live.items.len - 1].is_simple_catch = true;
+                        try r.resolvePatternExprs(cp);
+                    }
                     for (cb) |cs| switch (cs.data) {
-                        .declaration => |decl| for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", false, true, null),
+                        .declaration => |decl| if (decl.kind != .@"var") {
+                            for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", false, true, null);
+                        },
                         .function => |f| try r.declare(f.name.?, .function, false, true, null),
                         .class => |c| try r.declare(c.name.?, .let, false, true, null),
                         else => {},
                     };
-                    if (t.catch_param) |cp| try r.resolvePatternExprs(cp);
                     for (cb) |cs| try r.stmt(cs);
                 }
                 if (t.finally_body) |fb| try r.block(fb, .block);
@@ -434,7 +641,9 @@ const Resolver = struct {
                 // All case clauses share one lexical scope (TDZ across cases).
                 for (sw.cases) |c| {
                     for (c.body) |st| switch (st.data) {
-                        .declaration => |d| for (d.declarators) |decl| try r.declarePattern(decl.pattern, if (d.kind == .let) .let else .@"const", false, true, null),
+                        .declaration => |d| if (d.kind != .@"var") {
+                            for (d.declarators) |decl| try r.declarePattern(decl.pattern, if (d.kind == .let) .let else .@"const", false, true, null);
+                        },
                         else => {},
                     };
                 }
@@ -450,7 +659,11 @@ const Resolver = struct {
                 defer r.exitScope(saved);
                 if (f.init) |init| switch (init) {
                     .declaration => |decl| {
-                        for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", false, true, null);
+                        if (decl.kind == .@"var") {
+                            for (decl.declarators) |d| try r.checkVarConflicts(d.pattern);
+                        } else {
+                            for (decl.declarators) |d| try r.declarePattern(d.pattern, if (decl.kind == .let) .let else .@"const", false, true, null);
+                        }
                         for (decl.declarators) |d| {
                             if (d.init) |e| try r.expr(e);
                             try r.resolvePatternExprs(d.pattern);
@@ -518,7 +731,11 @@ const Resolver = struct {
         defer r.exitScope(saved);
         switch (for_target) {
             .declaration => |d| {
-                try r.declarePattern(d.pattern, if (d.kind == .let) .let else .@"const", false, true, null);
+                if (d.kind == .@"var") {
+                    try r.checkVarConflicts(d.pattern);
+                } else {
+                    try r.declarePattern(d.pattern, if (d.kind == .let) .let else .@"const", false, true, null);
+                }
                 try r.expr(rhs);
                 try r.resolvePatternExprs(d.pattern);
             },

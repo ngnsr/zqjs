@@ -414,7 +414,16 @@ pub const Session = struct {
     ) !void {
         for (bindings, 0..) |rb, i| {
             if (rb.is_decl) {
-                const cell = try s.rt.heap.newCell(null);
+                if (rb.kind == .@"var") {
+                    if (s.repl_env.getPtr(rb.name)) |existing| {
+                        if (existing.kind == .@"var" or existing.kind == .function) {
+                            cells[i] = existing.cell;
+                            continue;
+                        }
+                    }
+                }
+                const init_val: ?Value = if (rb.kind == .@"var") .undefined else null;
+                const cell = try s.rt.heap.newCell(init_val);
                 cells[i] = cell;
                 if (s.repl_env.getPtr(rb.name)) |existing| {
                     try undo.append(s.gpa, .{

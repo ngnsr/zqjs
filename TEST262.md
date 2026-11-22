@@ -33,28 +33,28 @@ ZQJS includes a parallel [tc39/test262](https://github.com/tc39/test262) conform
 
 ## How the Runner Works
 
-- **Harness shim:** Test262's `harness/sta.js`, `harness/assert.js`, and helper includes use `var`. Because ZQJS intentionally rejects `var` as `Unsupported(syntax)`, the runner rewrites `\bvar\b` → `let` in `harness/*.js` only and provides a minimal `$262` host stub (`global: {}`, `gc: () => {}`). Test files themselves are executed **unmodified**.
+- **Harness:** Test262's `harness/sta.js`, `harness/assert.js`, and helper includes are loaded **unmodified** (with a minimal `$262` host stub: `global: {}`, `gc: () => {}`). Test files themselves are executed **unmodified**.
 - **Outcome classification:**
   - `pass`: test matched its expected outcome (including `negative` parse/runtime error types and `async` `$DONE` completion).
-  - `unsupported`: `zqjs` emitted `Unsupported(<feature>)` (intentional ZQJS restrictions such as `var`, `asi`, `loose_equality`, `arguments`, `sloppy_this`, or unimplemented built-ins).
+  - `unsupported`: `zqjs` emitted `Unsupported(<feature>)` (intentional ZQJS restrictions such as `asi`, `loose_equality`, `arguments`, `sloppy_this`, or unimplemented built-ins).
   - `applicable`: `executed - unsupported - limit` — tests that ZQJS accepted and ran to completion/error.
   - `fail_assert` / `fail_runtime` / `fail_parse`: real spec or edge-case mismatches on applicable tests.
   - `internal`: exit code 70 (bytecode verifier rejection) or process crash.
 
 ---
 
-## Results (M59, D89)
+## Results (M60 — with `var` hoisting)
 
-Measured with `zig build -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
+Measured with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
 
 | Suite | Collected | Skipped (meta) | Executed | Unsupported | Limit | Applicable | Pass | Fail | Pass / Executed | Pass / Applicable |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `built-ins` | 23,885 | 7,414 | 16,471 | 14,326 | 1 | 2,144 | 2,087 | 57 | 12.67% | **97.34%** |
-| `language` | 23,832 | 971 | 22,861 | 18,644 | 0 | 4,217 | 3,684 | 533 | 16.11% | **87.36%** |
-| **Combined** | **47,717** | **8,385** | **39,332** | **32,970** | **1** | **6,361** | **5,771** | **590** | **14.67%** | **90.72%** |
+| `built-ins` | 23,885 | 7,414 | 16,471 | 9,643 | 8 | 6,820 | **6,235** | 585 | 37.85% | **91.42%** |
+| `language` | 23,832 | 971 | 22,861 | 7,558 | 0 | 15,303 | **13,942** | 1,361 | 60.99% | **91.11%** |
+| **Combined** | **47,717** | **8,385** | **39,332** | **17,201** | **8** | **22,123** | **20,177** | **1,946** | **51.30%** | **91.20%** |
 
-- **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,332 executed tests (~45 s total on Apple M4).
-- Compared to the M49 checkpoint (`5,602` passes), M50 (`Date`) + M51 (`structuredClone`) unlocked +178 applicable tests and **+169 passes**, with **0 regressions** across the M52–M59 VM performance rewrites (NaN-boxing, Shapes, ICs, superinstructions, back-edge safepoints).
+- **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,332 executed tests (~46 s total on Apple M4).
+- Adding spec-compliant `var` hoisting (plus dropping the `var → let` harness shim) unlocked **+15,762** applicable tests and **+14,406 passes** (`5,771 → 20,177`, 3.5× more official tests passing) with **0% VM benchmark regression**.
 
 ### Built-ins Breakdown (Applicable Tests)
 

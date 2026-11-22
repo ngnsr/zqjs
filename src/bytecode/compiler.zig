@@ -116,6 +116,21 @@ const Shared = struct {
             // Parameters bind on the call; the generator object is returned here (D67).
             if (func.is_generator) try c.emit(.generator_start, &.{});
         }
+        // Hoisted `var` bindings start as `undefined` (fresh cell if captured) before any statement runs.
+        for (c.s.res.functions[c.function].var_bindings) |vb| {
+            const b = c.binding(vb);
+            if (b.repl_index != null) continue;
+            const sl = c.slotOf(vb);
+            if (b.captured) {
+                try c.emit(.new_cell, &.{sl});
+                try c.emit(.push_undefined, &.{});
+                try c.emit(.init_cell, &.{sl});
+            } else {
+                try c.emit(.push_undefined, &.{});
+                try c.emit(.init_local, &.{sl});
+                c.markSlotInit(sl);
+            }
+        }
         const completes = try c.statementsImpl(body, .{ .start = 0, .end = 0 }, kind == .script and s.options.repl);
         if (completes) switch (kind) {
             .script => if (s.options.top_level_await) {
@@ -497,7 +512,7 @@ const Compiler = struct {
             if (!has_hoisted) {
                 var pending_slots: u64 = 0;
                 for (stmts) |s| switch (s.data) {
-                    .declaration => |decl| for (decl.declarators) |d| {
+                    .declaration => |decl| if (decl.kind != .@"var") for (decl.declarators) |d| {
                         if (d.pattern.data == .binding) {
                             const b = d.pattern.data.binding.binding;
                             if (c.binding(b).repl_index == null and !c.binding(b).captured) {
@@ -511,6 +526,7 @@ const Compiler = struct {
                 for (stmts) |s| {
                     if (s.data != .declaration) break;
                     const decl = s.data.declaration;
+                    if (decl.kind == .@"var") break;
                     var all_safe = true;
                     for (decl.declarators) |d| {
                         if (d.pattern.data != .binding or d.init == null) {
@@ -538,12 +554,12 @@ const Compiler = struct {
         }
 
         for (stmts, 0..) |s, si| switch (s.data) {
-            .declaration => |decl| if (si >= skip_clear_prefix) {
+            .declaration => |decl| if (decl.kind != .@"var" and si >= skip_clear_prefix) {
                 for (decl.declarators) |d| try c.enterPatternBindings(d.pattern);
             },
             .function => |f| {
                 const b = c.binding(f.name.?.binding);
-                if (b.repl_index == null and b.captured) try c.emit(.new_cell, &.{c.slotOf(f.name.?.binding)});
+                if (b.repl_index == null and b.alias_of == null and b.captured) try c.emit(.new_cell, &.{c.slotOf(f.name.?.binding)});
             },
             .class => |cls| try c.enterBinding(cls.name.?.binding),
             else => {},
@@ -654,6 +670,8 @@ const Compiler = struct {
 
     fn declare(c: *Compiler, decl: ast.Declaration) Error!void {
         for (decl.declarators) |d| {
+            // Hoisted `var x;` without an initializer is a no-op (must not clobber an existing value).
+            if (decl.kind == .@"var" and d.init == null) continue;
             if (d.init) |init| try c.expr(init) else try c.emit(.push_undefined, &.{});
             try c.bindPattern(d.pattern, .init);
         }
@@ -758,7 +776,9 @@ const Compiler = struct {
                 var copies: []const ast.DeclItem = &.{};
                 if (f.init) |init| switch (init) {
                     .declaration => |decl| {
-                        for (decl.declarators) |d| try c.enterPatternBindings(d.pattern);
+                        if (decl.kind != .@"var") {
+                            for (decl.declarators) |d| try c.enterPatternBindings(d.pattern);
+                        }
                         try c.declare(decl);
                         if (decl.kind == .let) copies = decl.declarators;
                     },
@@ -792,7 +812,7 @@ const Compiler = struct {
 
                 var single_copy: [1]ast.DeclItem = undefined;
                 var copies: []const ast.DeclItem = &.{};
-                if (f.target == .declaration) {
+                if (f.target == .declaration and f.target.declaration.kind != .@"var") {
                     const pat = f.target.declaration.pattern;
                     try c.enterPatternBindings(pat);
                     single_copy[0] = .{ .pattern = pat, .init = null, .span = pat.span };
@@ -869,7 +889,7 @@ const Compiler = struct {
 
                 var single_copy: [1]ast.DeclItem = undefined;
                 var copies: []const ast.DeclItem = &.{};
-                if (f.target == .declaration) {
+                if (f.target == .declaration and f.target.declaration.kind != .@"var") {
                     const pat = f.target.declaration.pattern;
                     try c.enterPatternBindings(pat);
                     single_copy[0] = .{ .pattern = pat, .init = null, .span = pat.span };
@@ -1331,7 +1351,7 @@ const Compiler = struct {
         try c.expr(sw.discriminant);
         for (sw.cases) |cs| {
             for (cs.body) |s| switch (s.data) {
-                .declaration => |d| for (d.declarators) |decl| try c.enterPatternBindings(decl.pattern),
+                .declaration => |d| if (d.kind != .@"var") for (d.declarators) |decl| try c.enterPatternBindings(decl.pattern),
                 else => {},
             };
         }

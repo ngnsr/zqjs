@@ -83,7 +83,7 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `regex_annex_b` | restriction | `/{/`, `/(?=a)*/`, `/\8/` | Annex B web-reality RegExp syntax |
 | `regex_unicode_escape_braced` | restriction | `/\u{41}/` | `\u{...}` RegExp escapes without `u`/`v` mode (Annex B identity escape in JS) |
 | `regex_unicode_property` | restriction | `/\p{ASCII}/` | `\p{...}` and `\P{...}` RegExp unicode property escapes without `u`/`v` mode (Annex B identity escape in JS) |
-| `syntax` | not yet | `var`, `with`, `let` used as a variable name, `eval`, … | any JS token or construct not yet in the grammar below |
+| `syntax` | not yet | `with`, `let` used as a variable name, `eval`, … | any JS token or construct not yet in the grammar below |
 
 ## 3. Lexical grammar (M1)
 

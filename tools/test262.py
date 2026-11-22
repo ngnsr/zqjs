@@ -160,13 +160,6 @@ def parse_frontmatter(source: str) -> dict[str, Any]:
     return meta
 
 
-def shim_harness(text: str) -> str:
-    """Adapt Test262 harness JS for ZQJS (e.g. `var` -> `let`)."""
-    # Replace `var ` keyword with `let ` in harness files only, so ZQJS can load
-    # the test262 assertion library without failing on `var` before the test runs.
-    return re.sub(r"\bvar\b", "let", text)
-
-
 class HarnessCache:
     def __init__(self, harness_dir: Path) -> None:
         self.harness_dir = harness_dir
@@ -176,7 +169,7 @@ class HarnessCache:
         if name not in self._cache:
             p = self.harness_dir / name
             if p.exists():
-                self._cache[name] = shim_harness(p.read_text(encoding="utf-8", errors="replace"))
+                self._cache[name] = p.read_text(encoding="utf-8", errors="replace")
             else:
                 self._cache[name] = ""
         return self._cache[name]
@@ -465,7 +458,7 @@ def main() -> int:
     # Preload all harness/*.js files (small, < 500 KB total)
     harness_cache: dict[str, str] = {}
     for p in harness_dir.glob("*.js"):
-        harness_cache[p.name] = shim_harness(p.read_text(encoding="utf-8", errors="replace"))
+        harness_cache[p.name] = p.read_text(encoding="utf-8", errors="replace")
 
     tests = collect_tests(test_root, args.suite)
     print(f"Collected {len(tests)} tests (suite={args.suite or 'all'}, mode={args.mode}, engine={args.engine}, jobs={args.jobs})")

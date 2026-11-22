@@ -89,7 +89,7 @@ fn runModuleImpl(rt: *Runtime, script: ast.Script, res: *const Resolution, modul
     rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
     defer rt.closure_caller = prev_caller;
 
-    try m.pushBlock(script.statements);
+    try m.pushFnBody(0, script.statements);
     _ = try m.runLoop(0);
     if (drain) try rt.drainMicrotasks();
 }
@@ -121,7 +121,7 @@ pub fn runRepl(rt: *Runtime, script: ast.Script, res: *const Resolution, repl_ce
     rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
     defer rt.closure_caller = prev_caller;
 
-    try m.pushBlock(script.statements);
+    try m.pushFnBody(0, script.statements);
     _ = try m.runLoop(0);
     try rt.drainMicrotasks();
 }
@@ -169,7 +169,7 @@ fn runTopLevelAsyncImpl(rt: *Runtime, script: ast.Script, res: *const Resolution
                 }
             }
             try m_ptr.pushVal(.undefined);
-            try m_ptr.pushBlock(ctx.script.statements);
+            try m_ptr.pushFnBody(0, ctx.script.statements);
             co.engine = m_ptr;
             co.state = .running;
             return Machine.runCoroMachine(m_ptr, 0, 0, .start);
@@ -212,7 +212,7 @@ fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUs
     rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
     defer rt.closure_caller = prev_caller;
 
-    try m.pushBlock(script.statements);
+    try m.pushFnBody(0, script.statements);
     _ = try m.runLoop(0);
     try rt.drainMicrotasks();
 }
@@ -263,7 +263,7 @@ const Task = union(enum) {
     stmt_list: struct { stmts: []const ast.Stmt, idx: usize },
     body_hoist: []const ast.Stmt,
     block: []const ast.Stmt,
-    decl_next: struct { decls: []const ast.DeclItem, idx: usize },
+    decl_next: struct { decls: []const ast.DeclItem, idx: usize, is_var: bool = false },
     return_finish,
     if_branch: struct { then: *const ast.Stmt, @"else": ?*const ast.Stmt },
     while_iter: WhileTask,
@@ -618,7 +618,7 @@ const Machine = struct {
 
     fn scopeOf(m: *const Machine, stmts: []const ast.Stmt) ?u32 {
         for (stmts) |s| switch (s.data) {
-            .declaration => |decl| for (decl.declarators) |d| {
+            .declaration => |decl| if (decl.kind != .@"var") for (decl.declarators) |d| {
                 if (m.patternScope(d.pattern)) |sc| return sc;
             },
             .function => |f| if (m.res.bindings[f.name.?.binding].repl_index == null) return m.res.bindings[f.name.?.binding].scope,
@@ -626,6 +626,16 @@ const Machine = struct {
             else => {},
         };
         return null;
+    }
+
+    fn pushFnBody(m: *Machine, fn_id: u32, stmts: []const ast.Stmt) Error!void {
+        const info = m.res.functions[fn_id];
+        const sc = info.body_scope orelse m.scopeOf(stmts);
+        _ = try m.pushScope(sc);
+        for (info.var_bindings) |vb| {
+            if (m.res.bindings[vb].repl_index == null) m.store(vb, .undefined);
+        }
+        try m.pushBody(stmts);
     }
 
     fn copyScope(m: *Machine) Error!void {
@@ -1226,8 +1236,9 @@ const Machine = struct {
             .decl_next => |dn| {
                 const d = dn.decls[dn.idx];
                 if (dn.idx + 1 < dn.decls.len) {
-                    try m.pushTask(.{ .decl_next = .{ .decls = dn.decls, .idx = dn.idx + 1 } });
+                    try m.pushTask(.{ .decl_next = .{ .decls = dn.decls, .idx = dn.idx + 1, .is_var = dn.is_var } });
                 }
+                if (dn.is_var and d.init == null) return null;
                 try m.pushTask(.{ .bind_pattern = .{ .pat = d.pattern, .mode = .init } });
                 if (d.init) |init| {
                     try m.pushTask(.{ .eval = init });
@@ -2283,8 +2294,7 @@ const Machine = struct {
             .call_enter_body => |cb| {
                 // Pop the call's args now that all parameters are bound.
                 m.values.shrinkRetainingCapacity(cb.args_base);
-                _ = try m.pushScope(m.scopeOf(cb.func.body));
-                try m.pushBody(cb.func.body);
+                try m.pushFnBody(cb.func.id, cb.func.body);
                 // Parameters bind on the call; the generator object is returned here (D67).
                 if (cb.func.is_generator) try m.pushTask(.generator_start);
             },
@@ -2903,7 +2913,7 @@ const Machine = struct {
                     m.depth -= 1;
                 } else {
                     try m.pushTask(.depth_pop);
-                    try m.pushTask(.{ .decl_next = .{ .decls = decl.declarators, .idx = 0 } });
+                    try m.pushTask(.{ .decl_next = .{ .decls = decl.declarators, .idx = 0, .is_var = decl.kind == .@"var" } });
                 }
             },
             .class => |cls| {
@@ -2974,19 +2984,21 @@ const Machine = struct {
                 if (f.init) |init| switch (init) {
                     .declaration => |decl| {
                         var head_scope: ?u32 = null;
-                        for (decl.declarators) |d| {
-                            if (m.patternScope(d.pattern)) |sc| {
-                                head_scope = sc;
-                                break;
+                        if (decl.kind != .@"var") {
+                            for (decl.declarators) |d| {
+                                if (m.patternScope(d.pattern)) |sc| {
+                                    head_scope = sc;
+                                    break;
+                                }
                             }
-                        }
-                        if (try m.pushScope(head_scope)) {
-                            try m.pushTask(.{ .scope_exit = saved });
+                            if (try m.pushScope(head_scope)) {
+                                try m.pushTask(.{ .scope_exit = saved });
+                            }
                         }
                         per_iter = decl.kind == .let and head_scope != null;
                         try m.pushTask(.{ .for_after_init = .{ .stmt = s, .per_iter = per_iter, .values_base = values_base } });
                         if (decl.declarators.len > 0) {
-                            try m.pushTask(.{ .decl_next = .{ .decls = decl.declarators, .idx = 0 } });
+                            try m.pushTask(.{ .decl_next = .{ .decls = decl.declarators, .idx = 0, .is_var = decl.kind == .@"var" } });
                         }
                     },
                     .expression => |e| {
@@ -3003,7 +3015,7 @@ const Machine = struct {
                 try m.pushTask(.depth_pop);
                 const saved = m.env;
                 var has_scope = false;
-                if (f.target == .declaration) {
+                if (f.target == .declaration and f.target.declaration.kind != .@"var") {
                     const sc = m.patternScope(f.target.declaration.pattern);
                     has_scope = sc != null;
                     if (try m.pushScope(sc)) {
@@ -3018,7 +3030,7 @@ const Machine = struct {
                 try m.pushTask(.depth_pop);
                 const saved = m.env;
                 var has_scope = false;
-                if (f.target == .declaration) {
+                if (f.target == .declaration and f.target.declaration.kind != .@"var") {
                     const sc = m.patternScope(f.target.declaration.pattern);
                     has_scope = sc != null;
                     if (try m.pushScope(sc)) {
@@ -3032,7 +3044,7 @@ const Machine = struct {
             .export_decl => |exp| switch (exp) {
                 .declaration => |decl| {
                     m.depth -= 1;
-                    if (decl.declarators.len > 0) try m.pushTask(.{ .decl_next = .{ .decls = decl.declarators, .idx = 0 } });
+                    if (decl.declarators.len > 0) try m.pushTask(.{ .decl_next = .{ .decls = decl.declarators, .idx = 0, .is_var = decl.kind == .@"var" } });
                 },
                 .class => |cls| {
                     try m.pushTask(.depth_pop);

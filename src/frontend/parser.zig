@@ -231,6 +231,7 @@ const Parser = struct {
         }
         if (p.tok.tag == .kw_const) return p.declarationStatement(.@"const");
         if (p.isText(p.tok, "let") and try p.letStartsDeclaration()) return p.declarationStatement(.let);
+        if (p.isText(p.tok, "var")) return p.declarationStatement(.@"var");
         return p.statement();
     }
 
@@ -270,6 +271,7 @@ const Parser = struct {
             if (!next.newline_before and p.isText(next, "function"))
                 return p.fail(.{ .syntax_error = "async function declarations cannot appear in a single-statement context" }, t);
         }
+        if (p.isText(t, "var")) return p.declarationStatement(.@"var");
         if (p.isText(t, "return")) return p.returnStatement();
         if (p.isText(t, "throw")) return p.throwStatement();
         if (p.isText(t, "try")) return p.tryStatement();
@@ -631,6 +633,12 @@ const Parser = struct {
             try p.endStatement();
             return .{ .span = .{ .start = start, .end = end.end }, .data = .{ .export_decl = .{ .declaration = decl } } };
         }
+        if (p.isText(p.tok, "var")) {
+            const decl = try p.declaration(.@"var", false);
+            const end = p.tok;
+            try p.endStatement();
+            return .{ .span = .{ .start = start, .end = end.end }, .data = .{ .export_decl = .{ .declaration = decl } } };
+        }
         if (p.isText(p.tok, "function")) {
             const f = try p.function(.declaration, false, p.tok.start);
             return .{ .span = .{ .start = start, .end = f.span.end }, .data = .{ .export_decl = .{ .function = f } } };
@@ -758,6 +766,8 @@ const Parser = struct {
             init = .{ .declaration = try p.declaration(.@"const", true) };
         } else if (p.isText(p.tok, "let") and try p.letStartsDeclaration()) {
             init = .{ .declaration = try p.declaration(.let, true) };
+        } else if (p.isText(p.tok, "var")) {
+            init = .{ .declaration = try p.declaration(.@"var", true) };
         } else if (p.tok.tag != .semicolon) {
             init = .{ .expression = try p.expression() };
         }
@@ -795,8 +805,12 @@ const Parser = struct {
     fn extractForEachTarget(p: *Parser, init: ?ast.ForInit, comptime kind: []const u8) Error!ast.ForOfTarget {
         return switch (init orelse return p.fail(.{ .syntax_error = "missing left-hand side in " ++ kind }, p.tok)) {
             .declaration => |decl| blk: {
-                if (decl.declarators.len != 1 or decl.declarators[0].init != null)
+                if (decl.declarators.len != 1 or decl.declarators[0].init != null) {
+                    // Sloppy JS Annex B allows `for (var x = init in obj)`.
+                    if (decl.declarators.len == 1 and decl.declarators[0].init != null and decl.kind == .@"var" and std.mem.eql(u8, kind, "for-in"))
+                        return p.fail(.{ .unsupported = .syntax }, p.tok);
                     return p.fail(.{ .syntax_error = kind ++ " loop variable declaration may not have an initializer" }, p.tok);
+                }
                 break :blk .{ .declaration = .{ .kind = decl.kind, .pattern = decl.declarators[0].pattern } };
             },
             .expression => |e| blk: {

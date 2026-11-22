@@ -194,6 +194,11 @@ pub fn runEntry(
         var roots: ValueRoots = .{ .values = &held };
         try roots.register(rt);
         defer roots.unregister(rt);
+        const prev_caller = rt.closure_caller;
+        if (engine == .vm and rt.closure_caller == null) {
+            rt.closure_caller = .{ .ctx = rt, .call = Vm.callStandalone, .construct = Vm.constructStandalone };
+        }
+        defer rt.closure_caller = prev_caller;
         try rt.drainMicrotasks();
         switch (ep.kind.promise.state) {
             .fulfilled => {},
@@ -451,10 +456,11 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
             else => {},
         };
 
-        // Allocate fresh TDZ cells for all non-import top-level bindings.
-        for (m.res.repl_bindings, 0..) |_, i| {
+        // Allocate fresh cells for all non-import top-level bindings (`var` starts as undefined; let/const start in TDZ).
+        for (m.res.repl_bindings, 0..) |rb, i| {
             if (!is_import[i]) {
-                cells[i] = rt.heap.newCell(null) catch |e| return mapHeapErr(e, rt);
+                const init_val: ?Value = if (rb.kind == .@"var") .undefined else null;
+                cells[i] = rt.heap.newCell(init_val) catch |e| return mapHeapErr(e, rt);
             }
         }
 

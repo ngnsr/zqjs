@@ -375,7 +375,7 @@ pub const Function = struct {
     body: []const Stmt,
 };
 
-pub const DeclKind = enum { let, @"const" };
+pub const DeclKind = enum { let, @"const", @"var" };
 
 pub const Declarator = struct {
     name: []const u8,

@@ -1523,6 +1523,11 @@ const Compiler = struct {
                 try c.emit(.pop, &.{});
             },
             .unary => |u| {
+                if (u.op == .void) {
+                    try c.exprDiscard(u.operand);
+                    try c.emit(.push_undefined, &.{});
+                    return;
+                }
                 if (u.op == .typeof and u.operand.data == .identifier) {
                     const ref = u.operand.data.identifier;
                     if (c.s.res.refs[ref.id] == .global) {
@@ -1538,6 +1543,7 @@ const Compiler = struct {
                     .not => .not,
                     .bit_not => .bit_not,
                     .typeof => .typeof,
+                    .void => unreachable,
                 }, &.{});
             },
             .binary => |b| switch (b.op) {

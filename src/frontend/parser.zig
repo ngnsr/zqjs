@@ -1965,6 +1965,13 @@ const Parser = struct {
                 if (p.tok.tag == .star_star)
                     return p.fail(.{ .syntax_error = "unary operator before '**' needs parentheses" }, t);
                 return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .unary = .{ .op = .typeof, .operand = operand } }, operand.depth);
+            } else if (p.isText(t, "void")) {
+                try p.advance();
+                const operand = try p.binary(unary_bp);
+                try p.rejectCoverExpr(operand);
+                if (p.tok.tag == .star_star)
+                    return p.fail(.{ .syntax_error = "unary operator before '**' needs parentheses" }, t);
+                return p.node(.{ .start = t.start, .end = operand.span.end }, .{ .unary = .{ .op = .void, .operand = operand } }, operand.depth);
             } else if (p.isText(t, "await")) {
                 switch (p.async_ctx) {
                     .none => {

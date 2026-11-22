@@ -282,6 +282,7 @@ pub const Native = struct {
         array,
         string,
         number,
+        boolean,
         bigint,
         function,
         map,

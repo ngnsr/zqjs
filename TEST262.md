@@ -49,12 +49,12 @@ Measured with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=non
 
 | Suite | Collected | Skipped (meta) | Executed | Unsupported | Limit | Applicable | Pass | Fail | Pass / Executed | Pass / Applicable |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `built-ins` | 23,885 | 7,414 | 16,471 | 7,762 | 453 | 8,256 | **7,469** | 787 | 45.35% | **90.47%** |
-| `language` | 23,832 | 971 | 22,861 | 4,776 | 0 | 18,085 | **16,282** | 1,803 | **71.22%** | **90.03%** |
-| **Combined** | **47,717** | **8,385** | **39,332** | **12,538** | **453** | **26,341** | **23,751** | **2,590** | **60.39%** | **90.17%** |
+| `built-ins` | 23,885 | 7,414 | 16,471 | 7,398 | 452 | 8,621 | **7,732** | 889 | 46.94% | **89.69%** |
+| `language` | 23,832 | 971 | 22,861 | 4,471 | 0 | 18,390 | **16,488** | 1,902 | **72.12%** | **89.66%** |
+| **Combined** | **47,717** | **8,385** | **39,332** | **11,869** | **452** | **27,011** | **24,220** | **2,791** | **61.58%** | **89.67%** |
 
 - **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,332 executed tests (~46 s total on Apple M4).
-- Adding `var` hoisting, unmapped `arguments`, ASI, and loose equality (`==`/`!=`) unlocked **+19,980** applicable tests and **+17,980 passes** (`5,771 → 23,751`, **4.1×** more official tests passing) with **0% VM benchmark regression**.
+- Adding `var` hoisting, unmapped `arguments`, ASI, loose equality (`==`/`!=`), `Boolean`, `Object(...)`/`new Object(...)`, `Array(...)`/`new Array(...)`, `void`, and `globalThis` unlocked **+20,650** applicable tests and **+18,449 passes** (`5,771 → 24,220`, **4.2×** more official tests passing) with **0% VM benchmark regression**.
 
 ### Built-ins Breakdown (Applicable Tests)
 

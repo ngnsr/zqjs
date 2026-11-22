@@ -80,6 +80,7 @@ pub const Realm = struct {
     array_namespace: *Object,
     string_namespace: *Object,
     number_namespace: *Object,
+    boolean_namespace: *Object,
     map_namespace: *Object,
     set_namespace: *Object,
     weak_map_namespace: *Object,
@@ -109,10 +110,11 @@ pub const Realm = struct {
     sym_has_instance: *heap_mod.Symbol,
     math: *Object,
     json: *Object,
+    global_object: *Object,
     views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [57]*Object {
+    pub fn objects(r: *const Realm) [59]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -150,6 +152,7 @@ pub const Realm = struct {
             r.array_namespace,
             r.string_namespace,
             r.number_namespace,
+            r.boolean_namespace,
             r.map_namespace,
             r.set_namespace,
             r.weak_map_namespace,
@@ -171,6 +174,7 @@ pub const Realm = struct {
             r.bigint_namespace,
             r.math,
             r.json,
+            r.global_object,
         };
     }
 };
@@ -262,6 +266,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .array_namespace = try builtin(h, null, .array_constructor),
         .string_namespace = try builtin(h, null, .string_constructor),
         .number_namespace = try builtin(h, null, .number_constructor),
+        .boolean_namespace = try h.newObject(null),
         .map_namespace = try builtin(h, null, .map_constructor),
         .set_namespace = try builtin(h, null, .set_constructor),
         .weak_map_namespace = try builtin(h, null, .weak_map_constructor),
@@ -290,6 +295,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .sym_has_instance = try h.newSymbol(try h.ascii("Symbol.hasInstance"), false),
         .math = try builtin(h, object_prototype, .math),
         .json = try builtin(h, object_prototype, .json),
+        .global_object = try builtin(h, object_prototype, .global),
     };
     try method(rt, r.object_prototype, "toString", &object_to_string);
     try method(rt, r.object_prototype, "valueOf", &object_value_of);
@@ -552,12 +558,25 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try constant(rt, r.function_prototype, "constructor", Value.fromNative(&function_global));
     try constant(rt, r.object_namespace, "prototype", Value.fromObject(r.object_prototype));
     try constant(rt, r.array_namespace, "prototype", Value.fromObject(r.array_prototype));
+    try constant(rt, r.array_prototype, "constructor", Value.fromNative(&array_global));
     try constant(rt, r.string_namespace, "prototype", Value.fromObject(r.string_prototype));
+    try constant(rt, r.string_prototype, "constructor", Value.fromNative(&string_global));
+    try method(rt, r.string_prototype, "toString", &string_to_string);
+    try method(rt, r.string_prototype, "valueOf", &string_value_of);
     try constant(rt, r.number_namespace, "prototype", Value.fromObject(r.number_prototype));
     try constant(rt, r.number_prototype, "constructor", Value.fromNative(&number_global));
     try method(rt, r.number_prototype, "toString", &number_to_string);
     try method(rt, r.number_prototype, "toLocaleString", &number_to_locale_string);
     try method(rt, r.number_prototype, "valueOf", &number_value_of);
+    try rt.heap.defineProperty(r.boolean_namespace, try rt.heap.internAscii("prototype"), .{
+        .value = Value.fromObject(r.boolean_prototype),
+        .enumerable = false,
+        .writable = false,
+        .configurable = false,
+    });
+    try constant(rt, r.boolean_prototype, "constructor", Value.fromNative(&boolean_global));
+    try method(rt, r.boolean_prototype, "toString", &boolean_to_string);
+    try method(rt, r.boolean_prototype, "valueOf", &boolean_value_of);
     try constant(rt, r.map_namespace, "prototype", Value.fromObject(r.map_prototype));
     try constant(rt, r.set_namespace, "prototype", Value.fromObject(r.set_prototype));
     try constant(rt, r.weak_map_namespace, "prototype", Value.fromObject(r.weak_map_prototype));
@@ -692,6 +711,7 @@ pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
         .array => r.array_namespace,
         .string => r.string_namespace,
         .number => r.number_namespace,
+        .boolean => r.boolean_namespace,
         .function => r.function_namespace,
         .map => r.map_namespace,
         .set => r.set_namespace,
@@ -755,6 +775,7 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
         .array => r.array_prototype,
         .string => r.string_prototype,
         .number => r.number_prototype,
+        .boolean => r.boolean_prototype,
         .function => r.function_prototype,
         .map => r.map_prototype,
         .set => r.set_prototype,
@@ -794,10 +815,11 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
 // ---------------------------------------------------------------- globals
 
 pub const print: Native = .{ .name = "print", .call = printImpl };
-pub const object_global: Native = .{ .name = "Object", .length = 1, .call = notCallable, .namespace = .object };
-pub const array_global: Native = .{ .name = "Array", .length = 1, .call = notCallable, .namespace = .array };
+pub const object_global: Native = .{ .name = "Object", .length = 1, .call = objectCall, .construct = objectConstruct, .namespace = .object };
+pub const array_global: Native = .{ .name = "Array", .length = 1, .call = arrayCall, .construct = arrayConstruct, .namespace = .array };
 pub const string_global: Native = .{ .name = "String", .length = 1, .call = stringCall, .namespace = .string };
 pub const number_global: Native = .{ .name = "Number", .length = 1, .call = numberCall, .namespace = .number };
+pub const boolean_global: Native = .{ .name = "Boolean", .length = 1, .call = booleanCall, .namespace = .boolean };
 pub const function_global: Native = .{ .name = "Function", .length = 1, .call = notCallable, .namespace = .function };
 pub const parse_int_global: Native = .{ .name = "parseInt", .length = 2, .call = parseIntImpl };
 pub const parse_float_global: Native = .{ .name = "parseFloat", .call = parseFloatImpl };
@@ -849,6 +871,7 @@ const GlobalTarget = union(enum) {
     math,
     json,
     reflect,
+    global_this,
     native: *const Native,
 };
 
@@ -856,11 +879,13 @@ const builtin_globals = std.StaticStringMap(GlobalTarget).initComptime([_]struct
     .{ "undefined", .undefined },
     .{ "NaN", .nan },
     .{ "Infinity", .inf },
+    .{ "globalThis", .global_this },
     .{ "print", .{ .native = &print } },
     .{ "Object", .{ .native = &object_global } },
     .{ "Array", .{ .native = &array_global } },
     .{ "String", .{ .native = &string_global } },
     .{ "Number", .{ .native = &number_global } },
+    .{ "Boolean", .{ .native = &boolean_global } },
     .{ "Function", .{ .native = &function_global } },
     .{ "parseInt", .{ .native = &parse_int_global } },
     .{ "parseFloat", .{ .native = &parse_float_global } },
@@ -907,23 +932,56 @@ const builtin_globals = std.StaticStringMap(GlobalTarget).initComptime([_]struct
     .{ "structuredClone", .{ .native = &structured_clone_global } },
 });
 
+fn resolveGlobalTarget(rt: *Runtime, target: GlobalTarget) Error!Value {
+    return switch (target) {
+        .undefined => .undefined,
+        .nan => Value.fromNumber(std.math.nan(f64)),
+        .inf => Value.fromNumber(std.math.inf(f64)),
+        .math => Value.fromObject((try realm(rt)).math),
+        .json => Value.fromObject((try realm(rt)).json),
+        .reflect => Value.fromObject((try realm(rt)).reflect),
+        .global_this => Value.fromObject((try realm(rt)).global_object),
+        .native => |n| Value.fromNative(n),
+    };
+}
+
 fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (builtin_globals.get(name)) |target| {
-        return switch (target) {
-            .undefined => .undefined,
-            .nan => Value.fromNumber(std.math.nan(f64)),
-            .inf => Value.fromNumber(std.math.inf(f64)),
-            .math => Value.fromObject((try realm(rt)).math),
-            .json => Value.fromObject((try realm(rt)).json),
-            .reflect => Value.fromObject((try realm(rt)).reflect),
-            .native => |n| Value.fromNative(n),
-        };
+        return try resolveGlobalTarget(rt, target);
     }
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return Value.fromNative(n);
     if (names.has(.global, name)) {
         rt.unsupported_name = try rt.heap.internAscii(name);
         return rt.fail(.builtin);
     }
+    return null;
+}
+
+pub fn globalOwnProp(rt: *Runtime, atom: *const heap_mod.String) Error!?heap_mod.Property {
+    if (atom.units.len > 64) return null;
+    var buf: [64]u8 = undefined;
+    for (atom.units, 0..) |u, i| {
+        if (u > 0x7f) return null;
+        buf[i] = @intCast(u);
+    }
+    const name = buf[0..atom.units.len];
+    if (builtin_globals.get(name)) |target| {
+        const is_const = target == .undefined or target == .nan or target == .inf;
+        return .{
+            .value = try resolveGlobalTarget(rt, target),
+            .enumerable = false,
+            .writable = !is_const,
+            .configurable = !is_const,
+        };
+    }
+    for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) {
+        return .{
+            .value = Value.fromNative(n),
+            .enumerable = false,
+            .writable = true,
+            .configurable = true,
+        };
+    };
     return null;
 }
 
@@ -1343,7 +1401,7 @@ fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
             .ordinary => switch (o.ordinary_tag) {
                 .arguments => "Arguments",
                 .@"error" => "Error",
-                .plain => if (o.builtin == .number_prototype) "Number" else "Object",
+                .plain => if (o.builtin == .number_prototype) "Number" else if (o.builtin == .boolean_prototype) "Boolean" else if (o.builtin == .string_prototype) "String" else "Object",
             },
             else => "Object",
         },
@@ -2936,8 +2994,13 @@ fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap_mod
                 .proxy => return proxyGetOwnPropertyDescriptor(rt, o, k),
                 .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .date => {},
             }
-            if (o.props.count() == 0) return null;
-            return o.props.get(try object.propKey(rt, k));
+            if (o.props.count() > 0) {
+                if (o.props.get(try object.propKey(rt, k))) |p| return p;
+            }
+            if (o.builtin == .global and k == .atom) {
+                return globalOwnProp(rt, k.atom);
+            }
+            return null;
         },
         .closure => |c| {
             if (object.isNamed(k, "length")) return .{
@@ -4132,6 +4195,87 @@ fn stringCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     if (args.len == 0) return Value.fromString(try rt.heap.newString(&.{}));
     if (args[0].isSymbol()) return Value.fromString(try symbolDescriptiveString(rt, args[0].asSymbol()));
     return Value.fromString(try toStringObj(rt, args[0]));
+}
+
+const string_to_string: Native = .{ .name = "toString", .length = 0, .call = stringToString };
+const string_value_of: Native = .{ .name = "valueOf", .length = 0, .call = stringValueOf };
+
+fn thisStringExact(rt: *Runtime, this: Value) Error!*const heap_mod.String {
+    if (this.isString()) return this.asString();
+    if (this.isObject() and this.asObject().builtin == .string_prototype) return rt.heap.newString(&.{});
+    return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype method requires a String receiver" }});
+}
+
+fn stringToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return Value.fromString(try thisStringExact(rt, this));
+}
+
+fn stringValueOf(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return Value.fromString(try thisStringExact(rt, this));
+}
+
+fn objectCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return objectConstruct(rt, args);
+}
+
+fn objectConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const v = arg(args, 0);
+    if (v.isUndefined() or v.isNull()) {
+        return Value.fromObject(try rt.heap.newObject((try realm(rt)).object_prototype));
+    }
+    if (v.isObjectLike()) return v;
+    return rt.fail(.builtin);
+}
+
+fn arrayCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    return arrayConstruct(rt, args);
+}
+
+fn arrayConstruct(rt: *Runtime, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    if (args.len == 0) {
+        return Value.fromObject(try rt.heap.newArray(r.array_prototype));
+    }
+    if (args.len == 1) {
+        const first = args[0];
+        if (first.isNumber()) {
+            const n = first.asNumber();
+            const int_len = ops.toUint32(n);
+            if (@as(f64, @floatFromInt(int_len)) != n) {
+                return rt.throw(.RangeError, &.{.{ .ascii = "Invalid array length" }});
+            }
+            if (int_len > 0) return rt.fail(.sparse_array);
+            return Value.fromObject(try rt.heap.newArray(r.array_prototype));
+        }
+        const out = try rt.heap.newArray(r.array_prototype);
+        try rt.heap.appendElement(out, first);
+        return Value.fromObject(out);
+    }
+    const out = try rt.heap.newArray(r.array_prototype);
+    try rt.heap.appendElements(out, args);
+    return Value.fromObject(out);
+}
+
+const boolean_to_string: Native = .{ .name = "toString", .length = 0, .call = booleanToString };
+const boolean_value_of: Native = .{ .name = "valueOf", .length = 0, .call = booleanValueOf };
+
+fn booleanCall(_: *Runtime, _: Value, args: []const Value) Error!Value {
+    return Value.fromBool(ops.toBoolean(arg(args, 0)));
+}
+
+fn thisBoolean(rt: *Runtime, this: Value) Error!bool {
+    if (this.isBool()) return this.asBool();
+    if (this.isObject() and this.asObject().builtin == .boolean_prototype) return false;
+    return rt.throw(.TypeError, &.{.{ .ascii = "Boolean.prototype method requires a Boolean receiver" }});
+}
+
+fn booleanToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const b = try thisBoolean(rt, this);
+    return Value.fromString(try rt.heap.ascii(if (b) "true" else "false"));
+}
+
+fn booleanValueOf(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    return Value.fromBool(try thisBoolean(rt, this));
 }
 
 // ---------------------------------------------------------------- Symbol (M36, D66)
@@ -10020,6 +10164,16 @@ fn constructWithNewTarget(rt: *Runtime, target_in: Value, args: []const Value, n
         return callProxyConstruct(rt, target.asObject(), effective_args, new_target);
     }
     if (target.isNative()) {
+        if (!sameValue(new_target, target)) {
+            const p = try object.get(rt, new_target, try object.named(rt, "prototype"));
+            const po: ?*Object = if (p.isObject()) p.asObject() else null;
+            if (target.asNative() == &object_global) {
+                return Value.fromObject(try rt.heap.newObject(po orelse (try realm(rt)).object_prototype));
+            }
+            const res = try construct(rt, target, effective_args);
+            if (po) |proto_obj| if (res.isObject()) rt.heap.storeObjectProto(res.asObject(), proto_obj);
+            return res;
+        }
         return construct(rt, target, effective_args);
     }
     return rt.constructClosure(target.asClosure(), effective_args, new_target);

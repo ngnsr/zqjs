@@ -1358,6 +1358,7 @@ const Machine = struct {
                         break :blk if (nv.isBigInt()) Value.fromBigInt(try bigint.bitNot(rt, nv.asBigInt())) else Value.fromNumber(ops.bitNot(nv.asNumber()));
                     },
                     .typeof => try ops.typeOf(rt, v),
+                    .void => .undefined,
                 };
                 m.depth -= 1;
                 try m.pushVal(res_v);
@@ -2251,8 +2252,13 @@ const Machine = struct {
                     return;
                 }
                 if (target.isNative()) {
-                    const res_v = try builtins.construct(rt, target, m.values.items[args_base..]);
-                    if (res_v.isObject()) rt.heap.storeObjectProto(res_v.asObject(), inst.proto);
+                    const res_v = if (target.asNative() == &builtins.object_global)
+                        Value.fromObject(inst)
+                    else blk: {
+                        const r = try builtins.construct(rt, target, m.values.items[args_base..]);
+                        if (r.isObject()) rt.heap.storeObjectProto(r.asObject(), inst.proto);
+                        break :blk r;
+                    };
                     m.values.shrinkRetainingCapacity(args_base);
                     m.this = res_v;
                     try builtins.runInstanceInits(rt, @constCast(cur_closure), res_v);

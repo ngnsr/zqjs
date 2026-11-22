@@ -330,7 +330,7 @@ test "built-ins: known to node but not implemented is Unsupported, naming the me
     try expectUnsupported("({}).toLocaleString;", "", "('toLocaleString')");
     try expectUnsupported("({}).constructor;", "", "('constructor')");
     try expectUnsupported("console;", "", "('console')");
-    try expectUnsupported("Object({});", "", "Unsupported(builtin)");
+    try expectUnsupported("Object(1);", "", "Unsupported(builtin)");
     // Names node doesn't have are plain misses (undefined / ReferenceError), not Unsupported.
     for (support.engines) |engine| {
         var r = try support.run(testing.allocator, "print([].nope, ({}).nope, 'x'.nope, Object.nope); nope;", .{}, engine, .normal);
@@ -389,8 +389,8 @@ test "M11.3b: Array/String unimplemented methods, non-matching receivers, and no
 test "M14.2: Map unsupported methods, non-Map receivers, and non-Map new() targets" {
     try expectUnsupported("new Map().constructor;", "", "('constructor')");
     try expectUnsupported("let o = { get: new Map().get }; o.get('x');", "", "Unsupported(builtin)");
-    try expectUnsupported("new Object();", "", "Unsupported(builtin)");
-    try expectUnsupported("new Array();", "", "Unsupported(builtin)");
+    try expectUnsupported("new Number();", "", "Unsupported(builtin)");
+    try expectUnsupported("new String();", "", "Unsupported(builtin)");
 }
 
 test "M14.3: Set unsupported methods, non-Set receivers, and non-array iterables" {

@@ -192,7 +192,7 @@ pub fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error
             if (isNamed(k, "length")) return Value.fromNumber(@floatFromInt(n.length));
             if (try builtins.namespaceObject(rt, n)) |ns| {
                 if (try ownProp(rt, ns, k)) |p| return resolvePropValue(rt, receiver, p);
-                if (nodeHas(ns.builtin.?, k)) return unsupportedBuiltin(rt, k);
+                if (ns.builtin) |b| if (nodeHas(b, k)) return unsupportedBuiltin(rt, k);
             }
             return getWithReceiver(rt, try builtins.nativeProto(rt, n), receiver, k);
         },
@@ -323,8 +323,13 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
         },
         .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
-    if (o.props.count() == 0) return null; // don't intern index keys just to miss
-    return o.props.get(try propKey(rt, k));
+    if (o.props.count() > 0) {
+        if (o.props.get(try propKey(rt, k))) |p| return p;
+    }
+    if (o.builtin == .global and k == .atom) {
+        return builtins.globalOwnProp(rt, k.atom);
+    }
+    return null;
 }
 
 fn isRegExpGetter(k: Key) bool {
@@ -875,7 +880,7 @@ pub fn has(rt: *Runtime, k: Key, base: Value) Error!bool {
             if (isNamed(k, "name") or isNamed(k, "length")) return true;
             if (try builtins.namespaceObject(rt, n)) |ns| {
                 if (try ownProp(rt, ns, k) != null) return true;
-                if (nodeHas(ns.builtin.?, k)) return true;
+                if (ns.builtin) |b| if (nodeHas(b, k)) return true;
             }
             return has(rt, k, try builtins.nativeProto(rt, n));
         },

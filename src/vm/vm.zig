@@ -2238,8 +2238,13 @@ pub const Vm = struct {
             return false;
         }
         if (target.isNative()) {
-            const res = try builtins.construct(rt, target, effective_args);
-            if (res.isObject()) rt.heap.storeObjectProto(res.asObject(), inst.proto);
+            const res = if (target.asNative() == &builtins.object_global)
+                Value.fromObject(inst)
+            else blk: {
+                const r = try builtins.construct(rt, target, effective_args);
+                if (r.isObject()) rt.heap.storeObjectProto(r.asObject(), inst.proto);
+                break :blk r;
+            };
             vm.frames.items[vm.frames.items.len - 1].this = res;
             vm.stack[base] = res;
             vm.sp = base + 1;

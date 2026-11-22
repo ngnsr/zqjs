@@ -706,3 +706,7 @@
 ["unsupported:syntax", "for (var x = 1 in {}) {}"]
 ["syntax", "for (var x = 1 of []) {}"]
 ["syntax", "class C { m() { let arguments = 1; } }"]
+["ok", "void 0;", "(void 0)"]
+["ok", "void (1 + 2);", "(void (+ 1 2))"]
+["syntax", "void 2 ** 2;"]
+["syntax", "void ({ a = 1 });"]

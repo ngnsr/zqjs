@@ -15,6 +15,7 @@ pub const UnaryOp = enum {
     not,
     bit_not,
     typeof,
+    void,
 
     pub fn symbol(op: UnaryOp) []const u8 {
         return switch (op) {
@@ -23,6 +24,7 @@ pub const UnaryOp = enum {
             .not => "!",
             .bit_not => "~",
             .typeof => "typeof",
+            .void => "void",
         };
     }
 };

@@ -7,3 +7,12 @@ undefined 0
 1,2 e 0,1,extra
 1,2,
 true false 2
+false false false false false false true true true
+true false true false false false true
+hi hi  true
+object object object true true true
+0 0 1 only 10,20,30 true
+RangeError
+RangeError
+undefined undefined 7
+true true true 42 true

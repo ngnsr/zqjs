@@ -1073,11 +1073,14 @@ const Parser = struct {
 
         const outer_async_ctx = p.async_ctx;
         const outer_yield_ctx = p.yield_ctx;
+        const outer_static_block = p.in_static_block;
         p.async_ctx = if (is_async) .params else .none;
         p.yield_ctx = if (is_generator) .params else .none;
+        p.in_static_block = false;
         defer {
             p.async_ctx = outer_async_ctx;
             p.yield_ctx = outer_yield_ctx;
+            p.in_static_block = outer_static_block;
         }
 
         const params = try p.parseParams();
@@ -1104,13 +1107,10 @@ const Parser = struct {
             p.in_class_method = outer_method;
             p.function_depth -= 1;
         }
-        const outer_static_block = p.in_static_block;
         const outer_disallow_return = p.disallow_return;
         const outer_strict = p.in_strict_mode;
-        p.in_static_block = false;
         p.disallow_return = false;
         defer {
-            p.in_static_block = outer_static_block;
             p.disallow_return = outer_disallow_return;
             p.in_strict_mode = outer_strict;
         }
@@ -1644,7 +1644,7 @@ const Parser = struct {
         const target = try p.assignTarget(lhs, "invalid assignment target");
         try p.advance();
         const value = try p.assignment();
-        if (op == .plain and target == .ref) inferExprName(value, target.ref.name);
+        if ((op == .plain or op == .logical_and or op == .logical_or or op == .nullish) and target == .ref) inferExprName(value, target.ref.name);
         p.last_was_paren = false;
         return p.node(
             .{ .start = lhs.span.start, .end = value.span.end },

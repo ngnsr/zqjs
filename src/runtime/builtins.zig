@@ -609,6 +609,9 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.date_prototype, "toString", &date_to_string);
     try method(rt, r.date_prototype, "toDateString", &date_to_date_string);
     try method(rt, r.date_prototype, "toTimeString", &date_to_time_string);
+    try method(rt, r.date_prototype, "toLocaleString", &date_to_locale_string);
+    try method(rt, r.date_prototype, "toLocaleDateString", &date_to_locale_date_string);
+    try method(rt, r.date_prototype, "toLocaleTimeString", &date_to_locale_time_string);
     try method(rt, r.date_prototype, "toJSON", &date_to_json);
     try rt.heap.definePropKey(r.date_prototype, heap_mod.PropKey.fromSymbol(r.sym_to_primitive), .{
         .value = Value.fromNative(&date_to_primitive),
@@ -1375,7 +1378,8 @@ pub fn closureLength(c: *const heap_mod.Closure) u16 {
         .vm => |v| @as(*const bytecode.Proto, @ptrCast(@alignCast(v.proto))).length,
         .tree => |t| @as(*const ast.Function, @ptrCast(@alignCast(t.func))).length,
         .bound => |b| b.length,
-        .promise_cap, .native_closure => 0,
+        .promise_cap => 1,
+        .native_closure => 0,
     };
 }
 
@@ -7380,27 +7384,36 @@ fn promiseCatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn promiseFinally(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const p_obj = try thisPromise(rt, this, "finally");
-    const raw_f = arg(args, 0);
-    if (!raw_f.isNative() and !raw_f.isClosure()) {
-        return promiseThen(rt, this, &.{ raw_f, raw_f });
+    if (!this.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Promise.prototype.finally called on non-object" }});
     }
-
-    var root_buf = [_]Value{ Value.fromObject(p_obj), raw_f, .undefined, .undefined, .undefined };
+    const raw_f = arg(args, 0);
+    var root_buf = [_]Value{ this, raw_f, .undefined, .undefined, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const env = try rt.heap.newArray(null);
-    root_buf[2] = Value.fromObject(env);
-    try rt.heap.appendElements(env, &.{raw_f});
+    const ctor = try speciesConstructor(rt, this, Value.fromNative(&promise_global));
+    root_buf[2] = ctor;
 
-    const then_fn = try rt.heap.newNativeClosure(&finallyThenCb, env);
-    root_buf[3] = Value.fromClosure(then_fn);
-    const catch_fn = try rt.heap.newNativeClosure(&finallyCatchCb, env);
-    root_buf[4] = Value.fromClosure(catch_fn);
-
-    return promiseThen(rt, Value.fromObject(p_obj), &.{ root_buf[3], root_buf[4] });
+    var then_arg: Value = raw_f;
+    var catch_arg: Value = raw_f;
+    if (raw_f.isFunction()) {
+        const env = try rt.heap.newArray(null);
+        root_buf[3] = Value.fromObject(env);
+        try rt.heap.appendElements(env, &.{ raw_f, ctor });
+        const then_fn = try rt.heap.newNativeClosure(&finallyThenCb, env);
+        root_buf[4] = Value.fromClosure(then_fn);
+        const catch_fn = try rt.heap.newNativeClosure(&finallyCatchCb, env);
+        root_buf[5] = Value.fromClosure(catch_fn);
+        then_arg = root_buf[4];
+        catch_arg = root_buf[5];
+    }
+    const then_method = try object.get(rt, this, try object.named(rt, "then"));
+    if (!then_method.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Promise.prototype.finally: then is not a function" }});
+    }
+    return rt.callCallable(then_method, this, &.{ then_arg, catch_arg });
 }
 
 fn finallyThenCb(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
@@ -7418,9 +7431,10 @@ fn finallyRunCb(rt: *Runtime, env: *Object, val: Value, is_catch: bool) Error!Va
     defer roots.unregister(rt);
 
     const on_finally = env.kind.array.items[0];
+    const ctor = env.kind.array.items[1];
     const res = try rt.callCallable(on_finally, .undefined, &.{});
     root_buf[2] = res;
-    const p_val = try resolveToPromise(rt, res);
+    const p_val = try promiseResolveWithCtor(rt, ctor, res);
     root_buf[3] = p_val;
 
     const env2 = try rt.heap.newArray(null);
@@ -7430,7 +7444,11 @@ fn finallyRunCb(rt: *Runtime, env: *Object, val: Value, is_catch: bool) Error!Va
     const cb_ptr: *const anyopaque = if (is_catch) &finallyThrower else &finallyValueThunk;
     const cb = try rt.heap.newNativeClosure(cb_ptr, env2);
     root_buf[5] = Value.fromClosure(cb);
-    return promiseThen(rt, p_val, &.{root_buf[5]});
+    const then_method = try object.get(rt, p_val, try object.named(rt, "then"));
+    if (!then_method.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "then is not a function" }});
+    }
+    return rt.callCallable(then_method, p_val, &.{root_buf[5]});
 }
 
 fn finallyValueThunk(_: *Runtime, env: *Object, _: []const Value) Error!Value {
@@ -7484,65 +7502,152 @@ pub fn resolveToPromise(rt: *Runtime, x: Value) Error!Value {
     return Value.fromObject(p);
 }
 
-fn promiseResolveStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
-    return resolveToPromise(rt, arg(args, 0));
+const PromiseCapRecord = struct {
+    promise: Value,
+    resolve: Value,
+    reject: Value,
+};
+
+fn getCapabilitiesExecutor(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
+    if (!env.kind.array.items[0].isUndefined() or !env.kind.array.items[1].isUndefined()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Promise capability executor already called" }});
+    }
+    rt.heap.storeElement(env, 0, arg(args, 0));
+    rt.heap.storeElement(env, 1, arg(args, 1));
+    return .undefined;
 }
 
-fn promiseRejectStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
-    const reason = arg(args, 0);
-    const r = try realm(rt);
-    const p = try rt.heap.newPromise(r.promise_prototype);
-    try settlePromiseFromJob(rt, p, true, reason);
-    return Value.fromObject(p);
-}
-
-fn promiseWithResolversStatic(rt: *Runtime, _: Value, _: []const Value) Error!Value {
-    const r = try realm(rt);
-    const p = try rt.heap.newPromise(r.promise_prototype);
-    const out = try rt.heap.newObject(r.object_prototype);
-    var root_buf = [_]Value{ Value.fromObject(p), Value.fromObject(out), .undefined, .undefined };
+fn newPromiseCapabilityRecord(rt: *Runtime, ctor: Value) Error!PromiseCapRecord {
+    if (!ctor.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Promise constructor is not an object" }});
+    }
+    if (ctor.isNative() and ctor.asNative() == &promise_global) {
+        const r = try realm(rt);
+        const p = try rt.heap.newPromise(r.promise_prototype);
+        var root_buf = [_]Value{ Value.fromObject(p), .undefined, .undefined };
+        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+        try roots.register(rt);
+        defer roots.unregister(rt);
+        const res_fn = try rt.heap.newPromiseCapability(p, false);
+        root_buf[1] = Value.fromClosure(res_fn);
+        const rej_fn = try rt.heap.newPromiseCapability(p, true);
+        root_buf[2] = Value.fromClosure(rej_fn);
+        return .{ .promise = root_buf[0], .resolve = root_buf[1], .reject = root_buf[2] };
+    }
+    var root_buf = [_]Value{ ctor, .undefined, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const resolve_fn = try rt.heap.newPromiseCapability(p, false);
-    root_buf[2] = Value.fromClosure(resolve_fn);
-    const reject_fn = try rt.heap.newPromiseCapability(p, true);
-    root_buf[3] = Value.fromClosure(reject_fn);
+    const env = try rt.heap.newArray(null);
+    root_buf[1] = Value.fromObject(env);
+    try rt.heap.appendElements(env, &.{ .undefined, .undefined });
 
-    try object.define(rt, out, try object.named(rt, "promise"), Value.fromObject(p));
-    try object.define(rt, out, try object.named(rt, "resolve"), Value.fromClosure(resolve_fn));
-    try object.define(rt, out, try object.named(rt, "reject"), Value.fromClosure(reject_fn));
+    const exec = try rt.heap.newNativeClosure(&getCapabilitiesExecutor, env);
+    root_buf[2] = Value.fromClosure(exec);
+
+    const promise_val = try construct(rt, ctor, &.{root_buf[2]});
+    root_buf[3] = promise_val;
+    const res_fn = env.kind.array.items[0];
+    const rej_fn = env.kind.array.items[1];
+    if (!res_fn.isFunction() or !rej_fn.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Promise resolve or reject function is not callable" }});
+    }
+    return .{ .promise = promise_val, .resolve = res_fn, .reject = rej_fn };
+}
+
+fn promiseResolveWithCtor(rt: *Runtime, ctor: Value, x: Value) Error!Value {
+    if (!ctor.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Promise.resolve called on non-object" }});
+    }
+    var root_buf = [_]Value{ ctor, x, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    if (x.isObject() and x.asObject().kind == .promise) {
+        const x_ctor = try object.get(rt, x, try object.named(rt, "constructor"));
+        if (ops.strictEquals(x_ctor, ctor)) return x;
+    }
+    const cap = try newPromiseCapabilityRecord(rt, ctor);
+    root_buf[2] = cap.promise;
+    root_buf[3] = cap.resolve;
+    _ = try rt.callCallable(cap.resolve, .undefined, &.{x});
+    return cap.promise;
+}
+
+fn promiseResolveStatic(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return promiseResolveWithCtor(rt, this, arg(args, 0));
+}
+
+fn promiseRejectStatic(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const reason = arg(args, 0);
+    var root_buf = [_]Value{ this, reason, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const cap = try newPromiseCapabilityRecord(rt, this);
+    root_buf[2] = cap.promise;
+    root_buf[3] = cap.reject;
+    _ = try rt.callCallable(cap.reject, .undefined, &.{reason});
+    return cap.promise;
+}
+
+fn promiseWithResolversStatic(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const r = try realm(rt);
+    var root_buf = [_]Value{ this, .undefined, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const cap = try newPromiseCapabilityRecord(rt, this);
+    root_buf[1] = cap.promise;
+    root_buf[2] = cap.resolve;
+    root_buf[3] = cap.reject;
+
+    const out = try rt.heap.newObject(r.object_prototype);
+    root_buf[4] = Value.fromObject(out);
+    try object.define(rt, out, try object.named(rt, "promise"), cap.promise);
+    try object.define(rt, out, try object.named(rt, "resolve"), cap.resolve);
+    try object.define(rt, out, try object.named(rt, "reject"), cap.reject);
     return Value.fromObject(out);
 }
 
-fn promiseTryStatic(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+fn promiseTryStatic(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Promise.try called on non-object" }});
+    }
     const cb = arg(args, 0);
-    const r = try realm(rt);
-    const p = try rt.heap.newPromise(r.promise_prototype);
-    var root_buf = [_]Value{ Value.fromObject(p), cb, .undefined };
+    var root_buf = [_]Value{ this, cb, .undefined, .undefined, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    if (!cb.isFunction()) {
-        const err_val = try makeEngineError(rt, .TypeError, try rt.heap.ascii("Promise.try requires a callable argument"));
-        root_buf[2] = err_val;
-        try settlePromiseFromJob(rt, p, true, err_val);
-        return Value.fromObject(p);
-    }
+    const cap = try newPromiseCapabilityRecord(rt, this);
+    root_buf[2] = cap.promise;
+    root_buf[3] = cap.resolve;
+    root_buf[4] = cap.reject;
 
     const call_args = if (args.len > 1) args[1..] else &[_]Value{};
-    const res = rt.callCallable(cb, .undefined, call_args) catch |e| {
-        if (e != error.Thrown) return e;
-        const err_val = try rt.catchValue();
-        root_buf[2] = err_val;
-        try settlePromiseFromJob(rt, p, true, err_val);
-        return Value.fromObject(p);
+    const res = blk: {
+        if (!cb.isFunction()) {
+            const err_val = try makeEngineError(rt, .TypeError, try rt.heap.ascii("Promise.try requires a callable argument"));
+            root_buf[5] = err_val;
+            _ = try rt.callCallable(cap.reject, .undefined, &.{err_val});
+            return cap.promise;
+        }
+        break :blk rt.callCallable(cb, .undefined, call_args) catch |e| {
+            if (e != error.Thrown) return e;
+            const err_val = try rt.catchValue();
+            root_buf[5] = err_val;
+            _ = try rt.callCallable(cap.reject, .undefined, &.{err_val});
+            return cap.promise;
+        };
     };
-    root_buf[2] = res;
-    try resolvePromiseValue(rt, p, res);
-    return Value.fromObject(p);
+    root_buf[5] = res;
+    _ = try rt.callCallable(cap.resolve, .undefined, &.{res});
+    return cap.promise;
 }
 
 const CombinatorKind = enum { all, all_settled, race, any };
@@ -13477,6 +13582,9 @@ const date_to_utc_string: Native = .{ .name = "toUTCString", .length = 0, .call 
 const date_to_string: Native = .{ .name = "toString", .length = 0, .call = dateToString };
 const date_to_date_string: Native = .{ .name = "toDateString", .length = 0, .call = dateToDateString };
 const date_to_time_string: Native = .{ .name = "toTimeString", .length = 0, .call = dateToTimeString };
+const date_to_locale_string: Native = .{ .name = "toLocaleString", .length = 0, .call = dateToString };
+const date_to_locale_date_string: Native = .{ .name = "toLocaleDateString", .length = 0, .call = dateToDateString };
+const date_to_locale_time_string: Native = .{ .name = "toLocaleTimeString", .length = 0, .call = dateToTimeString };
 const date_to_json: Native = .{ .name = "toJSON", .length = 1, .call = dateToJson };
 const date_to_primitive: Native = .{ .name = "[Symbol.toPrimitive]", .length = 1, .call = dateToPrimitive };
 
@@ -13643,13 +13751,13 @@ fn dateGetMilliseconds(rt: *Runtime, this: Value, _: []const Value) Error!Value 
 
 fn dateSetTimeFields(rt: *Runtime, this: Value, args: []const Value, is_utc: bool, start_idx: usize) Error!Value {
     const o = try requireDate(rt, this);
+    const t_raw = o.kind.date;
     const max_count = 4 - start_idx;
     var vals: [4]f64 = .{ 0, 0, 0, 0 };
     const n_args = @min(args.len, max_count);
     for (0..@max(n_args, 1)) |i| {
         vals[start_idx + i] = try ops.toNumber(rt, arg(args, i));
     }
-    const t_raw = o.kind.date;
     if (!std.math.isFinite(t_raw)) return Value.fromNumber(std.math.nan(f64));
     const t = if (is_utc) t_raw else date.localTime(t_raw);
     const d = date.decompose(t) orelse return Value.fromNumber(std.math.nan(f64));
@@ -13672,13 +13780,13 @@ fn dateSetTimeFields(rt: *Runtime, this: Value, args: []const Value, is_utc: boo
 
 fn dateSetDateFields(rt: *Runtime, this: Value, args: []const Value, is_utc: bool, start_idx: usize) Error!Value {
     const o = try requireDate(rt, this);
+    const t_raw = o.kind.date;
     const max_count = 3 - start_idx;
     var vals: [3]f64 = .{ 0, 0, 0 };
     const n_args = @min(args.len, max_count);
     for (0..@max(n_args, 1)) |i| {
         vals[start_idx + i] = try ops.toNumber(rt, arg(args, i));
     }
-    const t_raw = o.kind.date;
     const t = if (!std.math.isFinite(t_raw)) blk: {
         // Only setFullYear / setUTCFullYear (start_idx == 0) treats NaN as +0.0 per ES spec.
         if (start_idx != 0) return Value.fromNumber(std.math.nan(f64));
@@ -13789,8 +13897,8 @@ fn dateToJson(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const tv = try ops.toNumber(rt, this);
-    if (!std.math.isFinite(tv)) return .null;
+    const tv = try object.toPrimitive(rt, this, .number);
+    if (tv.isNumber() and !std.math.isFinite(tv.asNumber())) return .null;
     const iso = try object.get(rt, this, try object.named(rt, "toISOString"));
     if (!iso.isFunction()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "toISOString is not a function" }});

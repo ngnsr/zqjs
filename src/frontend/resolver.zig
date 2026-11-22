@@ -661,6 +661,8 @@ const Resolver = struct {
                         .declaration => |d| if (d.kind != .@"var") {
                             for (d.declarators) |decl| try r.declarePattern(decl.pattern, if (d.kind == .let) .let else .@"const", false, true, null);
                         },
+                        .function => |f| try r.declare(f.name.?, .function, false, true, null),
+                        .class => |cl| try r.declare(cl.name.?, .let, false, true, null),
                         else => {},
                     };
                 }

@@ -325,7 +325,7 @@ test "built-ins: known to node but not implemented is Unsupported, naming the me
     try expectUnsupported("print([1].length); [1].toLocaleString;", "1\n", "Unsupported(builtin)");
     try expectUnsupported("[1].toLocaleString;", "", "('toLocaleString')");
     try expectUnsupported("'abc'.normalize;", "", "('normalize')");
-    try expectUnsupported("(1).toFixed;", "", "('toFixed')");
+    try expectUnsupported("'abc'.localeCompare;", "", "('localeCompare')");
     try expectUnsupported("Object.prototype.__defineGetter__;", "", "('__defineGetter__')");
     try expectUnsupported("({}).toLocaleString;", "", "('toLocaleString')");
     try expectUnsupported("({}).__lookupGetter__;", "", "('__lookupGetter__')");

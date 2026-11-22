@@ -408,6 +408,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try method(rt, r.map_namespace, "groupBy", &map_group_by);
     try method(rt, r.array_namespace, "isArray", &array_is_array);
     try method(rt, r.array_namespace, "from", &array_from);
+    try method(rt, r.array_namespace, "fromAsync", &array_from_async);
     try method(rt, r.array_namespace, "of", &array_of);
     try method(rt, r.number_namespace, "isInteger", &number_is_integer);
     try method(rt, r.number_namespace, "isFinite", &number_is_finite);
@@ -593,6 +594,9 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try immutableConstant(rt, r.number_namespace, "prototype", Value.fromObject(r.number_prototype));
     try constant(rt, r.number_prototype, "constructor", Value.fromNative(&number_global));
     try method(rt, r.number_prototype, "toString", &number_to_string);
+    try method(rt, r.number_prototype, "toFixed", &number_to_fixed);
+    try method(rt, r.number_prototype, "toExponential", &number_to_exponential);
+    try method(rt, r.number_prototype, "toPrecision", &number_to_precision);
     try method(rt, r.number_prototype, "toLocaleString", &number_to_locale_string);
     try method(rt, r.number_prototype, "valueOf", &number_value_of);
     try immutableConstant(rt, r.boolean_namespace, "prototype", Value.fromObject(r.boolean_prototype));
@@ -3517,6 +3521,7 @@ const object_proto_is_prototype_of: Native = .{ .name = "isPrototypeOf", .length
 const object_proto_property_is_enumerable: Native = .{ .name = "propertyIsEnumerable", .length = 1, .call = objectProtoPropertyIsEnumerable };
 const array_is_array: Native = .{ .name = "isArray", .length = 1, .call = arrayIsArray };
 const array_from: Native = .{ .name = "from", .length = 1, .call = arrayFrom };
+const array_from_async: Native = .{ .name = "fromAsync", .length = 1, .call = arrayFromAsync };
 const array_of: Native = .{ .name = "of", .call = arrayOf };
 const number_is_integer: Native = .{ .name = "isInteger", .length = 1, .call = numberIsInteger };
 const number_is_finite: Native = .{ .name = "isFinite", .length = 1, .call = numberIsFinite };
@@ -4968,6 +4973,300 @@ fn arrayFrom(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     return Value.fromObject(out);
 }
 
+fn arrayFromAsync(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const r = try realm(rt);
+    const res_p = try rt.heap.newPromise(r.promise_prototype);
+    var root_buf = [_]Value{ this, Value.fromObject(res_p) };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    arrayFromAsyncStart(rt, this, args, res_p) catch |e| {
+        if (e == error.Thrown) {
+            const reason = try rt.catchValue();
+            try settlePromiseFromJob(rt, res_p, true, reason);
+            return Value.fromObject(res_p);
+        }
+        return e;
+    };
+    return Value.fromObject(res_p);
+}
+
+fn arrayFromAsyncStart(rt: *Runtime, _: Value, args: []const Value, res_p: *Object) Error!void {
+    const items = arg(args, 0);
+    const mapfn = arg(args, 1);
+    const this_arg = arg(args, 2);
+    if (!mapfn.isUndefined() and !mapfn.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Array.fromAsync: mapfn is not callable" }});
+    }
+    if (items.isUndefined() or items.isNull()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+
+    const r = try realm(rt);
+    const env = try rt.heap.newArray(null);
+    const out = try rt.heap.newArray(r.array_prototype);
+    var root_buf = [_]Value{ items, mapfn, this_arg, Value.fromObject(res_p), Value.fromObject(env), Value.fromObject(out), .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var iter_val: Value = .undefined;
+    var next_method: Value = .undefined;
+    var is_async_iter = false;
+    var limit_val: Value = .undefined;
+
+    if (try object.getMethod(rt, items, .{ .symbol = r.sym_async_iterator })) |async_fn| {
+        const iter = try getIteratorWithMethod(rt, items, async_fn);
+        iter_val = Value.fromObject(iter);
+        root_buf[6] = iter_val;
+        next_method = try object.get(rt, iter_val, try object.named(rt, "next"));
+        root_buf[7] = next_method;
+        is_async_iter = true;
+    } else if (try object.getMethod(rt, items, .{ .symbol = r.sym_iterator })) |sync_fn| {
+        const iter = try getIteratorWithMethod(rt, items, sync_fn);
+        iter_val = Value.fromObject(iter);
+        root_buf[6] = iter_val;
+        next_method = try object.get(rt, iter_val, try object.named(rt, "next"));
+        root_buf[7] = next_method;
+        is_async_iter = false;
+    } else {
+        iter_val = items;
+        const len_f = try toLength(rt, try object.get(rt, items, try object.named(rt, "length")));
+        limit_val = Value.fromNumber(len_f);
+    }
+
+    // env layout: [0]=res_p, [1]=out, [2]=mapfn, [3]=this_arg, [4]=source/iter, [5]=next_method, [6]=index, [7]=limit, [8]=is_async_iter
+    try rt.heap.appendElements(env, &.{
+        Value.fromObject(res_p),
+        Value.fromObject(out),
+        mapfn,
+        this_arg,
+        iter_val,
+        next_method,
+        Value.fromNumber(0),
+        limit_val,
+        Value.fromBool(is_async_iter),
+    });
+    try arrayFromAsyncStep(rt, env);
+}
+
+fn arrayFromAsyncCloseOnErr(rt: *Runtime, env: *Object, reason: Value) Error!void {
+    const res_p = env.kind.array.items[0].asObject();
+    const next_method = env.kind.array.items[5];
+    if (!next_method.isUndefined()) {
+        const iter = env.kind.array.items[4];
+        if (iter.isObject()) {
+            const is_async = env.kind.array.items[8].asBool();
+            if (!is_async) {
+                iteratorClose(rt, iter.asObject(), true) catch {};
+            } else {
+                const ret_m = object.getMethod(rt, iter, try object.named(rt, "return")) catch null;
+                if (ret_m) |rm| {
+                    _ = rt.callCallable(rm, iter, &.{}) catch {};
+                }
+            }
+        }
+    }
+    try settlePromiseFromJob(rt, res_p, true, reason);
+}
+
+fn arrayFromAsyncStep(rt: *Runtime, env: *Object) Error!void {
+    var root_buf = [_]Value{ Value.fromObject(env), .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const res_p = env.kind.array.items[0].asObject();
+    const out = env.kind.array.items[1];
+    const source = env.kind.array.items[4];
+    const next_method = env.kind.array.items[5];
+    const is_async = env.kind.array.items[8].asBool();
+
+    if (!next_method.isUndefined()) {
+        const next_res = rt.callCallable(next_method, source, &.{}) catch |e| {
+            if (e == error.Thrown) {
+                try settlePromiseFromJob(rt, res_p, true, try rt.catchValue());
+                return;
+            }
+            return e;
+        };
+        root_buf[1] = next_res;
+        if (is_async) {
+            const p = resolveToPromise(rt, next_res) catch |e| {
+                if (e == error.Thrown) {
+                    try settlePromiseFromJob(rt, res_p, true, try rt.catchValue());
+                    return;
+                }
+                return e;
+            };
+            root_buf[1] = p;
+            const on_ful = try rt.heap.newNativeClosure(&arrayFromAsyncIterNextCb, env);
+            root_buf[2] = Value.fromClosure(on_ful);
+            const on_rej = try rt.heap.newNativeClosure(&arrayFromAsyncRejectCb, env);
+            root_buf[3] = Value.fromClosure(on_rej);
+            _ = try promiseThen(rt, p, &.{ root_buf[2], root_buf[3] });
+            return;
+        }
+        try arrayFromAsyncProcessIterResult(rt, env, next_res, false);
+        return;
+    }
+
+    const k_f = env.kind.array.items[6].asNumber();
+    const lim_f = env.kind.array.items[7].asNumber();
+    if (k_f >= lim_f) {
+        try settlePromiseFromJob(rt, res_p, false, out);
+        return;
+    }
+    const key: object.Key = if (k_f <= @as(f64, @floatFromInt(std.math.maxInt(u32))))
+        .{ .index = @intFromFloat(k_f) }
+    else
+        try object.key(rt, Value.fromNumber(k_f));
+    const elem = object.get(rt, source, key) catch |e| {
+        if (e == error.Thrown) {
+            try settlePromiseFromJob(rt, res_p, true, try rt.catchValue());
+            return;
+        }
+        return e;
+    };
+    root_buf[1] = elem;
+    const p = resolveToPromise(rt, elem) catch |e| {
+        if (e == error.Thrown) {
+            try settlePromiseFromJob(rt, res_p, true, try rt.catchValue());
+            return;
+        }
+        return e;
+    };
+    root_buf[1] = p;
+    const on_ful = try rt.heap.newNativeClosure(&arrayFromAsyncMapAndStoreCb, env);
+    root_buf[2] = Value.fromClosure(on_ful);
+    const on_rej = try rt.heap.newNativeClosure(&arrayFromAsyncRejectCb, env);
+    root_buf[3] = Value.fromClosure(on_rej);
+    _ = try promiseThen(rt, p, &.{ root_buf[2], root_buf[3] });
+}
+
+fn arrayFromAsyncProcessIterResult(rt: *Runtime, env: *Object, next_res: Value, is_async: bool) Error!void {
+    var root_buf = [_]Value{ Value.fromObject(env), next_res, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const res_p = env.kind.array.items[0].asObject();
+    const out = env.kind.array.items[1];
+    if (!next_res.isObject()) {
+        const err_v = try makeEngineError(rt, .TypeError, try rt.heap.ascii("Iterator result is not an object"));
+        try settlePromiseFromJob(rt, res_p, true, err_v);
+        return;
+    }
+    const done_v = object.get(rt, next_res, try object.named(rt, "done")) catch |e| {
+        if (e == error.Thrown) {
+            try settlePromiseFromJob(rt, res_p, true, try rt.catchValue());
+            return;
+        }
+        return e;
+    };
+    if (ops.toBoolean(done_v)) {
+        try settlePromiseFromJob(rt, res_p, false, out);
+        return;
+    }
+    const val = object.get(rt, next_res, try object.named(rt, "value")) catch |e| {
+        if (e == error.Thrown) {
+            try settlePromiseFromJob(rt, res_p, true, try rt.catchValue());
+            return;
+        }
+        return e;
+    };
+    root_buf[1] = val;
+    if (is_async) {
+        try arrayFromAsyncApplyMapOrStore(rt, env, val);
+        return;
+    }
+    // Sync iterator: await the yielded value before mapping/storing.
+    const p = resolveToPromise(rt, val) catch |e| {
+        if (e == error.Thrown) {
+            try arrayFromAsyncCloseOnErr(rt, env, try rt.catchValue());
+            return;
+        }
+        return e;
+    };
+    root_buf[1] = p;
+    const on_ful = try rt.heap.newNativeClosure(&arrayFromAsyncMapAndStoreCb, env);
+    root_buf[2] = Value.fromClosure(on_ful);
+    const on_rej = try rt.heap.newNativeClosure(&arrayFromAsyncCloseRejectCb, env);
+    root_buf[3] = Value.fromClosure(on_rej);
+    _ = try promiseThen(rt, p, &.{ root_buf[2], root_buf[3] });
+}
+
+fn arrayFromAsyncIterNextCb(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
+    try arrayFromAsyncProcessIterResult(rt, env, arg(args, 0), true);
+    return .undefined;
+}
+
+fn arrayFromAsyncRejectCb(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
+    const res_p = env.kind.array.items[0].asObject();
+    try settlePromiseFromJob(rt, res_p, true, arg(args, 0));
+    return .undefined;
+}
+
+fn arrayFromAsyncCloseRejectCb(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
+    try arrayFromAsyncCloseOnErr(rt, env, arg(args, 0));
+    return .undefined;
+}
+
+fn arrayFromAsyncApplyMapOrStore(rt: *Runtime, env: *Object, val: Value) Error!void {
+    var root_buf = [_]Value{ Value.fromObject(env), val, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const mapfn = env.kind.array.items[2];
+    const this_arg = env.kind.array.items[3];
+    const k_val = env.kind.array.items[6];
+    if (!mapfn.isUndefined()) {
+        const mapped = rt.callCallable(mapfn, this_arg, &.{ val, k_val }) catch |e| {
+            if (e == error.Thrown) {
+                try arrayFromAsyncCloseOnErr(rt, env, try rt.catchValue());
+                return;
+            }
+            return e;
+        };
+        root_buf[1] = mapped;
+        const p = resolveToPromise(rt, mapped) catch |e| {
+            if (e == error.Thrown) {
+                try arrayFromAsyncCloseOnErr(rt, env, try rt.catchValue());
+                return;
+            }
+            return e;
+        };
+        root_buf[1] = p;
+        const on_ful = try rt.heap.newNativeClosure(&arrayFromAsyncStoreCb, env);
+        root_buf[2] = Value.fromClosure(on_ful);
+        const on_rej = try rt.heap.newNativeClosure(&arrayFromAsyncCloseRejectCb, env);
+        root_buf[3] = Value.fromClosure(on_rej);
+        _ = try promiseThen(rt, p, &.{ root_buf[2], root_buf[3] });
+        return;
+    }
+    try arrayFromAsyncStoreAndAdvance(rt, env, val);
+}
+
+fn arrayFromAsyncMapAndStoreCb(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
+    try arrayFromAsyncApplyMapOrStore(rt, env, arg(args, 0));
+    return .undefined;
+}
+
+fn arrayFromAsyncStoreCb(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
+    try arrayFromAsyncStoreAndAdvance(rt, env, arg(args, 0));
+    return .undefined;
+}
+
+fn arrayFromAsyncStoreAndAdvance(rt: *Runtime, env: *Object, val: Value) Error!void {
+    const out = env.kind.array.items[1].asObject();
+    try rt.heap.appendElement(out, val);
+    const next_k = env.kind.array.items[6].asNumber() + 1.0;
+    rt.heap.storeElement(env, 6, Value.fromNumber(next_k));
+    try arrayFromAsyncStep(rt, env);
+}
+
 fn stringCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     if (args.len == 0) return Value.fromString(try rt.heap.newString(&.{}));
     if (args[0].isSymbol()) return Value.fromString(try symbolDescriptiveString(rt, args[0].asSymbol()));
@@ -5237,6 +5536,9 @@ const bigint_to_string: Native = .{ .name = "toString", .length = 0, .call = big
 const bigint_value_of: Native = .{ .name = "valueOf", .length = 0, .call = bigintValueOf };
 
 const number_to_string: Native = .{ .name = "toString", .length = 0, .call = numberToString };
+const number_to_fixed: Native = .{ .name = "toFixed", .length = 1, .call = numberToFixed };
+const number_to_exponential: Native = .{ .name = "toExponential", .length = 1, .call = numberToExponential };
+const number_to_precision: Native = .{ .name = "toPrecision", .length = 1, .call = numberToPrecision };
 const number_to_locale_string: Native = .{ .name = "toLocaleString", .length = 0, .call = numberToLocaleString };
 const number_value_of: Native = .{ .name = "valueOf", .length = 0, .call = numberValueOf };
 
@@ -5292,6 +5594,140 @@ fn numberToString(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 fn numberToLocaleString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     const n = try thisNumber(rt, this);
     return Value.fromString(try toStringObj(rt, Value.fromNumber(n)));
+}
+
+fn formatJsExp(out: []u8, raw: []const u8) []const u8 {
+    // Normalize Zig scientific output `...eN` -> `...e+N` (JS always emits an explicit sign).
+    const e_pos = std.mem.indexOfScalar(u8, raw, 'e') orelse {
+        @memcpy(out[0..raw.len], raw);
+        return out[0..raw.len];
+    };
+    @memcpy(out[0 .. e_pos + 1], raw[0 .. e_pos + 1]);
+    const pos: usize = e_pos + 1;
+    if (pos < raw.len and raw[pos] != '+' and raw[pos] != '-') {
+        out[pos] = '+';
+        @memcpy(out[pos + 1 .. pos + 1 + (raw.len - pos)], raw[pos..]);
+        return out[0 .. raw.len + 1];
+    }
+    @memcpy(out[pos..raw.len], raw[pos..]);
+    return out[0..raw.len];
+}
+
+fn numberToFixed(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const x_raw = try thisNumber(rt, this);
+    const f_f = try toIntegerOrInfinity(rt, arg(args, 0));
+    if (!std.math.isFinite(f_f) or f_f < 0.0 or f_f > 100.0) {
+        return rt.throw(.RangeError, &.{.{ .ascii = "toFixed() digits argument must be between 0 and 100" }});
+    }
+    if (!std.math.isFinite(x_raw) or @abs(x_raw) >= 1e21) {
+        return Value.fromString(try toStringObj(rt, Value.fromNumber(x_raw)));
+    }
+    const x = if (x_raw == 0.0) 0.0 else x_raw;
+    const f: usize = @intFromFloat(f_f);
+    var buf: [512]u8 = undefined;
+    const rendered = std.fmt.float.render(&buf, x, .{ .mode = .decimal, .precision = f }) catch unreachable;
+    return Value.fromString(try rt.heap.ascii(rendered));
+}
+
+fn numberToExponential(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const x_raw = try thisNumber(rt, this);
+    const f_arg = arg(args, 0);
+    const f_f = try toIntegerOrInfinity(rt, f_arg);
+    if (!std.math.isFinite(x_raw)) {
+        return Value.fromString(try toStringObj(rt, Value.fromNumber(x_raw)));
+    }
+    if (!f_arg.isUndefined() and (f_f < 0.0 or f_f > 100.0)) {
+        return rt.throw(.RangeError, &.{.{ .ascii = "toExponential() argument must be between 0 and 100" }});
+    }
+    const x = if (x_raw == 0.0) 0.0 else x_raw;
+    const prec: ?usize = if (f_arg.isUndefined()) null else @intFromFloat(f_f);
+    var raw_buf: [512]u8 = undefined;
+    const raw = std.fmt.float.render(&raw_buf, x, .{ .mode = .scientific, .precision = prec }) catch unreachable;
+    var out_buf: [512]u8 = undefined;
+    return Value.fromString(try rt.heap.ascii(formatJsExp(&out_buf, raw)));
+}
+
+fn numberToPrecision(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const x_raw = try thisNumber(rt, this);
+    const p_arg = arg(args, 0);
+    if (p_arg.isUndefined()) {
+        return Value.fromString(try toStringObj(rt, Value.fromNumber(x_raw)));
+    }
+    const p_f = try toIntegerOrInfinity(rt, p_arg);
+    if (!std.math.isFinite(x_raw)) {
+        return Value.fromString(try toStringObj(rt, Value.fromNumber(x_raw)));
+    }
+    if (p_f < 1.0 or p_f > 100.0) {
+        return rt.throw(.RangeError, &.{.{ .ascii = "toPrecision() argument must be between 1 and 100" }});
+    }
+    const p: usize = @intFromFloat(p_f);
+    const neg = x_raw < 0.0;
+    const ax = if (x_raw == 0.0) 0.0 else @abs(x_raw);
+
+    var raw_buf: [512]u8 = undefined;
+    const raw = std.fmt.float.render(&raw_buf, ax, .{ .mode = .scientific, .precision = p - 1 }) catch unreachable;
+    const e_pos = std.mem.indexOfScalar(u8, raw, 'e') orelse unreachable;
+    const exp = std.fmt.parseInt(i32, raw[e_pos + 1 ..], 10) catch unreachable;
+
+    // Extract the p significant digits (skipping any '.').
+    var digits: [128]u8 = undefined;
+    var dlen: usize = 0;
+    for (raw[0..e_pos]) |ch| {
+        if (ch != '.') {
+            digits[dlen] = ch;
+            dlen += 1;
+        }
+    }
+    while (dlen < p) : (dlen += 1) digits[dlen] = '0';
+
+    var out: [512]u8 = undefined;
+    var oi: usize = 0;
+    if (neg) {
+        out[oi] = '-';
+        oi += 1;
+    }
+    if (exp < -6 or exp >= @as(i32, @intCast(p))) {
+        out[oi] = digits[0];
+        oi += 1;
+        if (p > 1) {
+            out[oi] = '.';
+            oi += 1;
+            @memcpy(out[oi..][0 .. p - 1], digits[1..p]);
+            oi += p - 1;
+        }
+        out[oi] = 'e';
+        oi += 1;
+        if (exp >= 0) {
+            out[oi] = '+';
+            oi += 1;
+            const es = std.fmt.bufPrint(out[oi..], "{d}", .{exp}) catch unreachable;
+            oi += es.len;
+        } else {
+            const es = std.fmt.bufPrint(out[oi..], "{d}", .{exp}) catch unreachable;
+            oi += es.len;
+        }
+    } else if (exp == @as(i32, @intCast(p)) - 1) {
+        @memcpy(out[oi..][0..p], digits[0..p]);
+        oi += p;
+    } else if (exp >= 0) {
+        const int_digits: usize = @intCast(exp + 1);
+        @memcpy(out[oi..][0..int_digits], digits[0..int_digits]);
+        oi += int_digits;
+        out[oi] = '.';
+        oi += 1;
+        @memcpy(out[oi..][0 .. p - int_digits], digits[int_digits..p]);
+        oi += p - int_digits;
+    } else {
+        out[oi] = '0';
+        out[oi + 1] = '.';
+        oi += 2;
+        const zeros: usize = @intCast(-exp - 1);
+        @memset(out[oi..][0..zeros], '0');
+        oi += zeros;
+        @memcpy(out[oi..][0..p], digits[0..p]);
+        oi += p;
+    }
+    return Value.fromString(try rt.heap.ascii(out[0..oi]));
 }
 
 fn numberIsNaN(_: *Runtime, _: Value, args: []const Value) Error!Value {

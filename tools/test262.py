@@ -254,6 +254,7 @@ def run_single_test(args: tuple[Any, ...]) -> dict[str, Any]:
         parts.append(harness_bundle_cache["assert.js"])
         if is_async:
             parts.append(harness_bundle_cache["doneprintHandle.js"])
+            parts.append("globalThis.$DONE = $DONE;\n")
         for inc in includes:
             if inc in ("sta.js", "assert.js", "doneprintHandle.js"):
                 continue

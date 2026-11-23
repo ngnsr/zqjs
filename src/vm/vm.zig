@@ -2926,7 +2926,7 @@ inline fn matchGetPropIc(o: *const heap.Object, atom_addr: usize, sid: u32, ic: 
     return null;
 }
 
-inline fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) ?Value {
+fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) ?Value {
     const atom_addr = @intFromPtr(atom);
     if (!base.isObject()) {
         if (base.isString()) {
@@ -3142,7 +3142,7 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
     }
 }
 
-inline fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String, val: Value) bool {
+fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String, val: Value) bool {
     if (!base.isObject()) return false;
     const o = base.asObject();
     if (o.kind != .ordinary or o.builtin != null) return false;

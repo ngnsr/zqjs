@@ -4,6 +4,7 @@
 //! (Howard Hinnant's civil-date algorithm) over the full ECMAScript ±8.64e15 ms range.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const ms_per_second: f64 = 1_000.0;
 pub const ms_per_minute: f64 = 60_000.0;
@@ -46,15 +47,23 @@ const Tm = extern struct {
     tm_zone: ?[*:0]const u8,
 };
 
-extern "c" fn localtime_r(noalias timer: *const std.c.time_t, noalias result: *Tm) ?*Tm;
-
 /// Current system UTC epoch time in milliseconds.
 pub fn systemNowMs() f64 {
-    var tv: std.c.timeval = undefined;
-    _ = std.c.gettimeofday(&tv, null);
-    const sec_ms = @as(f64, @floatFromInt(tv.sec)) * ms_per_second;
-    const usec_ms = @as(f64, @floatFromInt(@divTrunc(tv.usec, 1000)));
-    return timeClip(sec_ms + usec_ms);
+    if (comptime builtin.link_libc) {
+        var tv: std.c.timeval = undefined;
+        _ = std.c.gettimeofday(&tv, null);
+        const sec_ms = @as(f64, @floatFromInt(tv.sec)) * ms_per_second;
+        const usec_ms = @as(f64, @floatFromInt(@divTrunc(tv.usec, 1000)));
+        return timeClip(sec_ms + usec_ms);
+    } else if (comptime builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+        const sec_ms = @as(f64, @floatFromInt(ts.sec)) * ms_per_second;
+        const nsec_ms = @as(f64, @floatFromInt(@divTrunc(ts.nsec, 1_000_000)));
+        return timeClip(sec_ms + nsec_ms);
+    } else {
+        return 0.0;
+    }
 }
 
 /// ES `TimeClip(time)`: truncates toward zero, normalizes `-0` to `+0`, and returns `NaN`
@@ -163,15 +172,22 @@ pub fn makeDate(day: f64, time: f64) f64 {
 }
 
 /// Queries POSIX `localtime_r` for the local timezone offset (seconds east of UTC) and
-/// zone abbreviation at UTC timestamp `t_utc` (in ms).
+/// zone abbreviation at UTC timestamp `t_utc` (in ms). Falls back to UTC when built
+/// without libc (preserving libc-free Linux builds per D45).
 pub fn localZoneAt(t_utc: f64) LocalZone {
     if (!std.math.isFinite(t_utc)) return .{ .offset_sec = 0 };
+    if (comptime !(builtin.link_libc and builtin.os.tag != .windows)) {
+        return .{ .offset_sec = 0 };
+    }
+    const c = struct {
+        extern "c" fn localtime_r(noalias timer: *const std.c.time_t, noalias result: *Tm) ?*Tm;
+    };
     const sec_f = @divFloor(t_utc, ms_per_second);
     if (@abs(sec_f) <= 9.0e12) {
         const sec_i64: i64 = @intFromFloat(sec_f);
         if (std.math.cast(std.c.time_t, sec_i64)) |sec_c| {
             var tm: Tm = undefined;
-            if (localtime_r(&sec_c, &tm) != null) {
+            if (c.localtime_r(&sec_c, &tm) != null) {
                 return extractZone(&tm);
             }
         }
@@ -181,7 +197,7 @@ pub fn localZoneAt(t_utc: f64) LocalZone {
     const equiv_sec = equivalentPosixSec(t_utc);
     if (std.math.cast(std.c.time_t, equiv_sec)) |sec_c| {
         var tm: Tm = undefined;
-        if (localtime_r(&sec_c, &tm) != null) {
+        if (c.localtime_r(&sec_c, &tm) != null) {
             return extractZone(&tm);
         }
     }

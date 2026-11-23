@@ -104,7 +104,8 @@ pub const LineEditor = struct {
     }
 
     pub fn isTty() bool {
-        return std.c.isatty(posix.STDIN_FILENO) != 0;
+        var term: posix.termios = undefined;
+        return posix.errno(posix.system.tcgetattr(posix.STDIN_FILENO, &term)) == .SUCCESS;
     }
 
     /// Reads one line from stdin (raw mode if TTY, plain line-by-line if piped).

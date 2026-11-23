@@ -182,6 +182,12 @@ pub const Op = enum(u8) {
     define_elem,
     /// [base] → [base.name].
     get_prop,
+    /// [] → [this.name] (fused `push_this` + `get_prop`).
+    get_this_prop,
+    /// [] → [this, this.name] (fused `push_this` + `dup` + `get_prop` for `this.m(...)`).
+    get_this_method,
+    /// [] → [locals[s].name] (fused `get_local` + `get_prop`, slot guaranteed initialized).
+    get_local_prop,
     /// [base, key] → [base[key]].
     get_elem,
     /// [] → [locals[s0][locals[s1]]] (M54 superinstruction; both slots guaranteed initialized).
@@ -441,6 +447,9 @@ pub const Op = enum(u8) {
             .define_prop => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
             .define_elem => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
             .get_prop, .delete_prop => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
+            .get_this_prop => .{ .operands = &.{.name}, .pops = 0, .pushes = 1 },
+            .get_this_method => .{ .operands = &.{.name}, .pops = 0, .pushes = 2 },
+            .get_local_prop => .{ .operands = &.{ .slot, .name }, .pops = 0, .pushes = 1 },
             .get_elem, .delete_elem => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .get_elem_local => .{ .operands = &.{ .slot, .slot }, .pops = 0, .pushes = 1 },
             .set_prop => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },

@@ -2310,6 +2310,25 @@ const Compiler = struct {
 
     /// `o.name` / `o[k]`, read or deleted.
     fn member(c: *Compiler, m: ast.Member, comptime what: enum { get, delete }) Error!void {
+        if (what == .get and !m.is_private and m.key == .name) {
+            if (m.object.data == .this) {
+                try c.emit(.get_this_prop, &.{try c.name(m.key.name)});
+                return;
+            }
+            if (m.object.data == .identifier) {
+                const oref = m.object.data.identifier;
+                if (c.s.res.refs[oref.id] == .local) {
+                    const ob = c.s.res.refs[oref.id].local;
+                    if (!c.binding(ob).captured) {
+                        const os = c.slotOf(ob);
+                        if (c.isSlotInit(os)) {
+                            try c.emit(.get_local_prop, &.{ os, try c.name(m.key.name) });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         if (what == .get and !m.is_private and m.key == .computed and m.object.data == .identifier and m.key.computed.data == .identifier) {
             const oref = m.object.data.identifier;
             const kref = m.key.computed.data.identifier;
@@ -2516,6 +2535,10 @@ const Compiler = struct {
         const method = callee.data == .member;
         if (method) {
             const m = callee.data.member;
+            if (!m.is_private and m.key == .name and m.object.data == .this) {
+                try c.emit(.get_this_method, &.{try c.name(m.key.name)});
+                return true;
+            }
             try c.expr(m.object);
             try c.emit(.dup, &.{});
             switch (m.key) {

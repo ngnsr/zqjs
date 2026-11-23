@@ -813,6 +813,7 @@ pub const Vm = struct {
     /// When `inline_safepoints` is true (non-stress `runLoop`), `collect_requested` is
     /// checked at loop back-edges, calls, and allocations instead of every instruction.
     fn execute(vm: *Vm, cache: *FrameCache, comptime inline_safepoints: bool) Error!State {
+        @setEvalBranchQuota(4000);
         const p = cache.p;
         const code = cache.code;
         const pc = cache.pc;
@@ -1166,6 +1167,63 @@ pub const Vm = struct {
                     break :blk try object.get(rt, base, try vm.nameKey(name_idx));
                 };
                 (try cache.top(vm)).* = r;
+            },
+            .get_this_prop => {
+                const base = try vm.requireThis();
+                const name_idx = cache.operand(0);
+                try cache.ensurePush(vm);
+                const r: Value = if (name_idx < p.name_atoms.len)
+                    fastGetProp(rt, p, pc, base, p.name_atoms[name_idx]) orelse blk: {
+                        cache.syncSp(vm);
+                        const atom = p.name_atoms[name_idx];
+                        const val = try object.get(rt, base, object.namedAtom(atom));
+                        populateGetPropIc(rt, p, pc, base, atom);
+                        break :blk val;
+                    }
+                else blk: {
+                    cache.syncSp(vm);
+                    break :blk try object.get(rt, base, try vm.nameKey(name_idx));
+                };
+                try cache.push(vm, r);
+            },
+            .get_this_method => {
+                const base = try vm.requireThis();
+                const name_idx = cache.operand(0);
+                try cache.ensurePush(vm);
+                try cache.push(vm, base);
+                try cache.ensurePush(vm);
+                const r: Value = if (name_idx < p.name_atoms.len)
+                    fastGetProp(rt, p, pc, base, p.name_atoms[name_idx]) orelse blk: {
+                        cache.syncSp(vm);
+                        const atom = p.name_atoms[name_idx];
+                        const val = try object.get(rt, base, object.namedAtom(atom));
+                        populateGetPropIc(rt, p, pc, base, atom);
+                        break :blk val;
+                    }
+                else blk: {
+                    cache.syncSp(vm);
+                    break :blk try object.get(rt, base, try vm.nameKey(name_idx));
+                };
+                try cache.push(vm, r);
+            },
+            .get_local_prop => {
+                const base_slot = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.bug("uninit base in get_local_prop");
+                const base = base_slot.asValue();
+                const name_idx = cache.operand(1);
+                try cache.ensurePush(vm);
+                const r: Value = if (name_idx < p.name_atoms.len)
+                    fastGetProp(rt, p, pc, base, p.name_atoms[name_idx]) orelse blk: {
+                        cache.syncSp(vm);
+                        const atom = p.name_atoms[name_idx];
+                        const val = try object.get(rt, base, object.namedAtom(atom));
+                        populateGetPropIc(rt, p, pc, base, atom);
+                        break :blk val;
+                    }
+                else blk: {
+                    cache.syncSp(vm);
+                    break :blk try object.get(rt, base, try vm.nameKey(name_idx));
+                };
+                try cache.push(vm, r);
             },
             .get_elem => {
                 const idx = try cache.peek(vm, 0);
@@ -2251,9 +2309,14 @@ pub const Vm = struct {
         return vm.currentBrandOrNull() orelse vm.rt.throw(.TypeError, &.{.{ .ascii = "Cannot access private member outside its class" }});
     }
 
-    fn requireThis(vm: *Vm) Error!Value {
+    inline fn requireThis(vm: *Vm) Error!Value {
         const f = vm.frame();
         if (f.this) |t| return t;
+        return vm.requireThisSlow();
+    }
+
+    noinline fn requireThisSlow(vm: *Vm) Error!Value {
+        const f = vm.frame();
         if (f.proto.has_super_ctor) {
             return vm.rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
         }
@@ -2357,7 +2420,14 @@ pub const Vm = struct {
     /// Out-of-line with <= 8 register args (no FrameCache pointer) so `runLoop` keeps `cache` in registers.
     noinline fn enterCall(vm: *Vm, c: *const Closure, callee: *const Proto, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value) Error!void {
         c.obj.checkLive();
-        const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else try builtins.coerceThis(vm.rt, this, callee.is_strict);
+        const effective_this: ?Value = if (callee.is_arrow)
+            (if (c.meta) |m| m.lexical_this else null)
+        else if (callee.is_strict)
+            (this orelse .undefined)
+        else if (this != null and this.?.isObject())
+            this
+        else
+            try builtins.coerceThis(vm.rt, this, false);
         const limits = vm.rt.limits;
         if (vm.chain) |cx| {
             if (cx.call_depth >= limits.max_call_depth) return vm.rt.limit(.call_depth);
@@ -3072,7 +3142,7 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
     }
 }
 
-fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String, val: Value) bool {
+inline fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String, val: Value) bool {
     if (!base.isObject()) return false;
     const o = base.asObject();
     if (o.kind != .ordinary or o.builtin != null) return false;

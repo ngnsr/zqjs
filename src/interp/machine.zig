@@ -3326,7 +3326,8 @@ const Machine = struct {
                 try m.pushTask(.{ .assign_pattern_keep = ap.pattern });
                 try m.pushTask(.{ .eval = ap.value });
             },
-            .spread, .hole => unreachable,
+            .hole => try m.pushVal(.hole),
+            .spread => unreachable,
             .update => |u| switch (u.target) {
                 .ref => |ref| {
                     const s = try stepNumeric(rt, try m.read(ref), u.op == .inc);

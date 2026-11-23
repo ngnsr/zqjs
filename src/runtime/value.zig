@@ -35,6 +35,8 @@ pub const Value = packed struct(u64) {
     const TRUE_BITS: u64 = TAG_IMM | 3;
     /// Internal sentinel for uninitialized/TDZ slots (never a JS Value).
     pub const UNINIT_BITS: u64 = TAG_IMM | 4;
+    /// Internal sentinel for sparse array holes (never exposed to JS).
+    pub const HOLE_BITS: u64 = TAG_IMM | 5;
 
     pub const @"undefined": Value = .{ .bits = UNDEFINED_BITS };
     pub const @"null": Value = .{ .bits = NULL_BITS };
@@ -42,6 +44,7 @@ pub const Value = packed struct(u64) {
     pub const null_val: Value = @"null";
     pub const false_val: Value = .{ .bits = FALSE_BITS };
     pub const true_val: Value = .{ .bits = TRUE_BITS };
+    pub const hole: Value = .{ .bits = HOLE_BITS };
 
     pub const Tag = enum(u8) {
         undefined,
@@ -117,6 +120,14 @@ pub const Value = packed struct(u64) {
     // ---- fast predicates
     pub inline fn isUndefined(v: Value) bool {
         return v.bits == UNDEFINED_BITS;
+    }
+
+    pub inline fn isHole(v: Value) bool {
+        return v.bits == HOLE_BITS;
+    }
+
+    pub inline fn unwrapHole(v: Value) Value {
+        return if (v.bits == HOLE_BITS) .undefined else v;
     }
 
     pub inline fn isNull(v: Value) bool {

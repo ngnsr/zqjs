@@ -388,6 +388,7 @@ fn jsonStringify(rt: *Runtime, _: Value, args: []const Value) Error!Value {
             replacer_fn = args[1];
         } else if (args[1].isObject() and args[1].asObject().kind == .array) {
             for (args[1].asObject().kind.array.items) |item| {
+                if (item.isHole()) continue;
                 const cand: *const heap_mod.String = switch (item.unpack()) {
                     .string => |s| s,
                     .number => |n| blk: {
@@ -638,7 +639,8 @@ const Stringifier = struct {
         for (0..len) |i| {
             if (i > 0) try s.writeUnit(',');
             if (s.gap.len > 0) try s.writeIndent(step_indent);
-            const elem: Value = if (i < arr.kind.array.items.len) arr.kind.array.items[i] else .undefined;
+            const raw: Value = if (i < arr.kind.array.items.len) arr.kind.array.items[i] else .undefined;
+            const elem: Value = if (raw.isHole()) try object.get(s.rt, Value.fromObject(arr), .{ .index = @intCast(i) }) else raw;
             var buf: [20]u8 = undefined;
             const idx_str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
             const key_val: Value = Value.fromString(try s.rt.heap.ascii(idx_str));

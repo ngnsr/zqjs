@@ -2258,6 +2258,19 @@ pub const Heap = struct {
         setCard(words, index);
     }
 
+    pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
+
+    /// Grows an array's element storage to `new_len` (>= current length), filling new
+    /// positions with `Value.hole`.
+    pub fn growElementsWithHoles(h: *Heap, arr: *Object, new_len: usize) Error!void {
+        const elements = elementsOf(arr);
+        if (new_len <= elements.items.len) return;
+        try h.growElements(arr, new_len);
+        const old_len = elements.items.len;
+        elements.items.len = new_len;
+        @memset(elements.items[old_len..new_len], .hole);
+    }
+
     pub fn appendElement(h: *Heap, arr: *Object, value: Value) Error!void {
         const elements = elementsOf(arr);
         try h.growElements(arr, elements.items.len + 1);

@@ -74,7 +74,7 @@ Each `Unsupported` diagnostic names one of these stable ids.
 | `function_name_assignment` | restriction | `let g = function n() { n = 1; };` | sloppy JS silently ignores the write |
 | `arguments` | retired (M60) | *(implemented in M60)* | retained in `diag.Feature` enum for stability; unmapped `arguments` object is now supported |
 | `builtin` | not yet | `Intl`, `WeakRef`, `FinalizationRegistry`, `eval`, `Function(...)`, … | a global or built-in member node has that ZQJS doesn't implement yet (the diagnostic names it; DESIGN_DECISIONS D39) |
-| `sparse_array` | restriction (revisit) | `[1,,2]`, `delete a[0]`, `a[a.length + 1] = x`, `a.length = 10` | arrays have no holes |
+| `sparse_array` | restriction (huge gaps) | `a[2000000] = x`, `a.length = 2000000` | bounded sparse arrays with holes (`[1,,2]`, `delete a[0]`, `Array(n)`, gaps `< 2^20`) are supported; huge sparse gaps (`>= 2^20`) still report `Unsupported(sparse_array)` |
 | `user_conversion` | retired (M40) | *(implemented in M40)* | retained in `diag.Feature` enum for stability; `Symbol.toPrimitive`, `toString`/`valueOf`, and `toJSON` are now supported (D70) |
 | `sloppy_this` | restriction | `this` at script level, `const f = o.m; f()` where `m` reads `this` | sloppy JS uses the global object (or boxes a primitive receiver) |
 | `arrow_this` | retired (M31) | *(implemented in M31)* | retained in `diag.Feature` enum for stability; lexical `this` in arrows is now supported (D62) |

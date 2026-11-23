@@ -279,7 +279,7 @@ fn getFrom(rt: *Runtime, start: *Object, receiver: Value, k: Key) Error!Value {
 pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
     switch (o.kind) {
         .array => |elements| switch (k) {
-            .index => |i| return if (i < elements.items.len) .{
+            .index => |i| return if (i < elements.items.len and !elements.items[i].isHole()) .{
                 .value = elements.items[i],
                 .writable = o.array_elements_writable,
                 .configurable = o.array_elements_configurable,
@@ -623,16 +623,22 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!b
                 .array => |elements| switch (k) {
                     .index => |i| {
                         if (i < elements.items.len) {
-                            if (!o.array_elements_writable) {
+                            if (elements.items[i].isHole()) {
+                                if (!o.extensible) {
+                                    if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot add property, object is not extensible" }});
+                                    return false;
+                                }
+                            } else if (!o.array_elements_writable) {
                                 if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
                                 return false;
                             }
                             rt.heap.storeElement(o, i, v);
-                        } else if (i == elements.items.len) {
+                        } else if (i < heap_mod.Heap.MAX_DENSE_ARRAY_LEN) {
                             if (!o.extensible or !o.array_length_writable) {
                                 if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot add property, object is not extensible" }});
                                 return false;
                             }
+                            if (i > elements.items.len) try rt.heap.growElementsWithHoles(o, i);
                             try rt.heap.appendElement(o, v);
                         } else return rt.fail(.sparse_array);
                         return true;
@@ -825,7 +831,11 @@ fn setLength(rt: *Runtime, arr: *Object, v: Value, strict: bool) Error!bool {
         if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property 'length'" }});
         return false;
     }
-    if (len > cur_len) return rt.fail(.sparse_array);
+    if (len > cur_len) {
+        if (len > heap_mod.Heap.MAX_DENSE_ARRAY_LEN) return rt.fail(.sparse_array);
+        try rt.heap.growElementsWithHoles(arr, len);
+        return true;
+    }
     if (!arr.array_elements_configurable and len < cur_len) {
         if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property of non-configurable array" }});
         return false;
@@ -897,8 +907,10 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
             // Deleting an element leaves a hole; deleting past the end does nothing.
             .index => |i| {
                 if (i < elements.items.len) {
+                    if (elements.items[i].isHole()) return true;
                     if (!o.array_elements_configurable) return false;
-                    return rt.fail(.sparse_array);
+                    rt.heap.storeElement(o, i, .hole);
+                    return true;
                 }
                 return true;
             },
@@ -1190,7 +1202,7 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
     var out: std.ArrayList(Key) = .empty;
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
-        .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
+        .array => |elements| for (elements.items, 0..) |v, i| if (!v.isHole()) try out.append(rt.gpa, .{ .index = @intCast(i) }),
         .typed_array => |ta| if (!ta.buffer.kind.array_buffer.detached) {
             for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
@@ -1211,7 +1223,7 @@ pub fn ownPropertyNames(rt: *Runtime, o: *Object) Error![]Key {
     var out: std.ArrayList(Key) = .empty;
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
-        .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
+        .array => |elements| for (elements.items, 0..) |v, i| if (!v.isHole()) try out.append(rt.gpa, .{ .index = @intCast(i) }),
         .typed_array => |ta| if (!ta.buffer.kind.array_buffer.detached) {
             for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
@@ -1238,7 +1250,7 @@ pub fn ownAllKeys(rt: *Runtime, o: *Object) Error![]Key {
     var out: std.ArrayList(Key) = .empty;
     errdefer out.deinit(rt.gpa);
     switch (o.kind) {
-        .array => |elements| for (0..elements.items.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) }),
+        .array => |elements| for (elements.items, 0..) |v, i| if (!v.isHole()) try out.append(rt.gpa, .{ .index = @intCast(i) }),
         .typed_array => |ta| if (!ta.buffer.kind.array_buffer.detached) {
             for (0..ta.length) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
@@ -1355,7 +1367,8 @@ pub fn join(rt: *Runtime, arr: *Object, sep_in: []const u16) Error!*String {
     const len = arr.kind.array.items.len;
     for (0..len) |i| {
         if (i > 0) try append(rt, &out, sep);
-        const e: Value = if (i < arr.kind.array.items.len) arr.kind.array.items[i] else .undefined;
+        const raw: Value = if (i < arr.kind.array.items.len) arr.kind.array.items[i] else .undefined;
+        const e: Value = if (raw.isHole()) try get(rt, Value.fromObject(arr), .{ .index = @intCast(i) }) else raw;
         switch (e) {
             .undefined, .null => {},
             else => {

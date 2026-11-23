@@ -43,18 +43,18 @@ ZQJS includes a parallel [tc39/test262](https://github.com/tc39/test262) conform
 
 ---
 
-## Results (M63 — Unicode Identifiers, Sloppy `this` & Global Writes, Strict Mode, ES2025 Iterator Helpers, `Symbol.species`, `RegExp.escape`, `Error.isError`, Thenables, `Array.fromAsync`, `Number` Formatting)
+## Results (M64 — Bounded Sparse Arrays (`Value.hole`), `debugger;`, Unicode Identifiers, Sloppy `this` & Global Writes, Strict Mode, ES2025 Iterator Helpers & `Set` Methods, `Symbol.species`, `RegExp.escape`, `Error.isError`, Thenables, `Array.fromAsync`, `Number` Formatting)
 
 Measured with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
 
 | Suite | Collected | Skipped (meta) | Executed | Unsupported | Limit | Applicable | Pass | Fail | Pass / Executed | Pass / Applicable |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `built-ins` | 23,885 | 6,981 | 16,904 | 1,927 | 469 | 14,508 | **13,983** | 525 | **82.72%** | **96.38%** |
-| `language` | 23,832 | 968 | 22,864 | 2,291 | 1 | 20,572 | **20,115** | 457 | **87.98%** | **97.78%** |
-| **Combined** | **47,717** | **7,949** | **39,768** | **4,218** | **470** | **35,080** | **34,098** | **982** | **85.74%** | **97.20%** |
+| `built-ins` | 23,885 | 6,981 | 16,904 | 1,580 | 480 | 14,844 | **14,281** | 563 | **84.48%** | **96.21%** |
+| `language` | 23,832 | 968 | 22,864 | 2,140 | 1 | 20,723 | **20,314** | 409 | **88.85%** | **98.03%** |
+| **Combined** | **47,717** | **7,949** | **39,768** | **3,720** | **481** | **35,567** | **34,595** | **972** | **86.99%** | **97.27%** |
 
 - **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,768 executed tests.
-- Building on M60 (`29,434` PASS), adding `"use strict"` directive prologue & strict property writes/`delete`, sloppy-mode `this` coercion & global writes (`globalThis`), Unicode `ID_Start`/`ID_Continue` identifiers & whitespace, `$262.detachArrayBuffer` + detached `ArrayBuffer` guards, `Symbol.{species, match, replace, search, split, matchAll, isConcatSpreadable}`, `Symbol.prototype[Symbol.toPrimitive]`, `TypedArraySpeciesCreate`/`ArraySpeciesCreate`/`ArrayBuffer.prototype.slice` species, TypedArray exotic `[[DefineOwnProperty]]`/`[[Set]]` internals, `RegExp.escape` / `RegExp.prototype` accessor getters & generic `toString`/`[Symbol.{match, search, replace, split, matchAll}]`, `Error.isError`, `String.raw` / `String.prototype.{concat, toLocaleLowerCase, toLocaleUpperCase}`, ES2025 `String.prototype.{match, matchAll, replace, search, split}` object checks & invocation, generic `String.prototype` & `Array.prototype` receivers, `TypedArray.prototype.toLocaleString`, `super` in object literal methods/accessors, `Number.prototype.{toFixed, toExponential, toPrecision}`, `Array.from`/`Array.fromAsync` custom `this` constructors, ES2025 `Iterator` helpers, ES2025 `Set` methods, `Date.prototype.set*`/generic `toJSON`/`toLocale*`, full `NewPromiseCapability`/thenable assimilation/`Promise.try`/`Promise.withResolvers`/generic `Promise.prototype.finally`, `Map.prototype.size`/`Set.prototype.size` accessors, built-in `.length` descriptors, `getAsyncIterator` abrupt completion propagation, `RequireObjectCoercible` before `ToPropertyKey`, logical assignment `NamedEvaluation`, `switch` lexical class/function redeclaration checks, classic-script dynamic `import()` filesystem resolution, and class element parser/UTF-16 field key conformance unlocked **+4,664** more passes (`29,434 → 34,098`, **97.20%** Pass / Applicable, **87.98%** `language` and **82.72%** `built-ins` Pass / Executed).
+- Building on M63 (`34,098` PASS), adding bounded sparse arrays with `Value.hole` (`[1,,2]`, `delete a[i]`, `Array(n)`, `a.length = n`, `a[k] = v` up to `2^20` elements across `Array.prototype.*`, `JSON`, `object.zig`, VM, and tree-walker) and `debugger;` no-op statement unlocked **+497** more passes (`34,098 → 34,595`, **97.27%** Pass / Applicable, **88.85%** `language` and **84.48%** `built-ins` Pass / Executed).
 
 ### Built-ins Breakdown (Applicable Tests)
 

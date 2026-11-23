@@ -292,6 +292,12 @@ const Parser = struct {
         if (p.isText(t, "try")) return p.tryStatement();
         if (p.isText(t, "do")) return p.doWhileStatement();
         if (p.isText(t, "switch")) return p.switchStatement();
+        if (p.isText(t, "debugger")) {
+            try p.advance();
+            const end = p.tok;
+            try p.endStatement();
+            return .{ .span = .{ .start = t.start, .end = end.end }, .data = .empty };
+        }
         if (p.isText(t, "class")) return p.fail(.{ .syntax_error = "class declaration cannot appear in a single-statement context" }, t);
         if (p.isText(t, "import")) {
             const next = try p.peek();
@@ -2810,7 +2816,6 @@ const Parser = struct {
 
     fn rejectCoverExpr(p: *Parser, e: *const ast.Expr) Error!void {
         if (e.has_cover_init) return p.failAt(.{ .syntax_error = "invalid shorthand property initializer" }, p.cover_init_span.start, p.cover_init_span.end);
-        if (e.has_hole) return p.failAt(.{ .unsupported = .sparse_array }, p.hole_span.start, p.hole_span.end);
     }
 
     fn exprToAssignPattern(p: *Parser, e: *const ast.Expr) Error!*const ast.Pattern {

@@ -928,9 +928,22 @@ fn arraySpeciesCreate(rt: *Runtime, original: Value, len: usize) Error!Value {
 }
 
 fn arrayAppendOrDefine(rt: *Runtime, out: Value, idx: usize, val: Value) Error!void {
-    if (out.isObject() and out.asObject().kind == .array and idx == out.asObject().kind.array.items.len) {
-        try rt.heap.appendElement(out.asObject(), val);
-        return;
+    if (out.isObject() and out.asObject().kind == .array and out.asObject().extensible and out.asObject().array_length_writable) {
+        const arr = out.asObject();
+        const cur = arr.kind.array.items.len;
+        if (idx < cur) {
+            rt.heap.storeElement(arr, idx, val);
+            return;
+        }
+        if (idx == cur) {
+            try rt.heap.appendElement(arr, val);
+            return;
+        }
+        if (idx < heap_mod.Heap.MAX_DENSE_ARRAY_LEN) {
+            try rt.heap.growElementsWithHoles(arr, idx);
+            try rt.heap.appendElement(arr, val);
+            return;
+        }
     }
     if (out.isObject()) {
         try object.define(rt, out.asObject(), .{ .index = @intCast(idx) }, val);
@@ -1870,7 +1883,8 @@ fn arrayPush(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 fn arrayPop(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     const a = try thisArray(rt, this, "pop");
     try checkArrayMutate(rt, a, .{ .shrink = a.kind.array.items.len > 0, .write_length = true });
-    return rt.heap.popElement(a) orelse .undefined;
+    const popped = rt.heap.popElement(a) orelse return .undefined;
+    return popped.unwrapHole();
 }
 
 fn toObjectReceiver(rt: *Runtime, this: Value) Error!Value {
@@ -1928,7 +1942,10 @@ fn arraySlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const end = if (arg(args, 1).isUndefined()) len else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 1)), len);
     var k: usize = start;
     while (k < end) : (k += 1) {
-        if (!try object.has(rt, .{ .index = @intCast(k) }, o_val)) return rt.fail(.sparse_array);
+        if (!try object.has(rt, .{ .index = @intCast(k) }, o_val)) {
+            try rt.heap.appendElement(out, .hole);
+            continue;
+        }
         root_buf[2] = try object.get(rt, o_val, .{ .index = @intCast(k) });
         try rt.heap.appendElement(out, root_buf[2]);
         root_buf[2] = .undefined;
@@ -1944,6 +1961,7 @@ fn arrayIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const from_n = if (args.len >= 2) try toIntegerOrInfinity(rt, args[1]) else 0;
         const start = resolveSearchStart(from_n, items.len) orelse return Value.fromNumber(-1);
         for (items[start..], start..) |item, i| {
+            if (item.isHole()) continue;
             if (ops.strictEquals(item, needle)) return Value.fromNumber(@floatFromInt(i));
         }
         return Value.fromNumber(-1);
@@ -1975,8 +1993,9 @@ fn arrayIncludes(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const needle = arg(args, 0);
         const from_n = if (args.len >= 2) try toIntegerOrInfinity(rt, args[1]) else 0;
         const start = resolveSearchStart(from_n, items.len) orelse return Value.fromBool(false);
-        for (items[start..]) |item| {
-            if (sameValueZero(item, needle)) return Value.fromBool(true);
+        for (items[start..], start..) |item, i| {
+            const v = if (item.isHole()) try object.get(rt, this, .{ .index = @intCast(i) }) else item;
+            if (sameValueZero(v, needle)) return Value.fromBool(true);
         }
         return Value.fromBool(false);
     }
@@ -2085,8 +2104,14 @@ fn arrayForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const cb = try requireCallable(rt, root_buf[1]);
         for (0..len) |i| {
             if (i >= a.kind.array.items.len) continue;
-            const elem = a.kind.array.items[i];
-            _ = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
+            const raw = a.kind.array.items[i];
+            if (raw.isHole()) {
+                if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) continue;
+                const elem = try object.get(rt, o_val, .{ .index = @intCast(i) });
+                _ = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
+                continue;
+            }
+            _ = try rt.callCallable(cb, this_arg, &.{ raw, Value.fromNumber(@floatFromInt(i)), o_val });
         }
         return .undefined;
     }
@@ -2117,8 +2142,16 @@ fn arrayMap(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const out_val = try arraySpeciesCreate(rt, o_val, len);
         root_buf[3] = out_val;
         for (0..len) |i| {
-            if (i >= a.kind.array.items.len) return rt.fail(.sparse_array);
-            const elem = a.kind.array.items[i];
+            const raw = if (i < a.kind.array.items.len) a.kind.array.items[i] else Value.hole;
+            const elem = if (raw.isHole()) blk: {
+                if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) {
+                    if (out_val.isObject() and out_val.asObject().kind == .array and out_val.asObject().kind.array.items.len <= i) {
+                        try rt.heap.growElementsWithHoles(out_val.asObject(), i + 1);
+                    }
+                    continue;
+                }
+                break :blk try object.get(rt, o_val, .{ .index = @intCast(i) });
+            } else raw;
             root_buf[4] = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
             try arrayAppendOrDefine(rt, out_val, i, root_buf[4]);
             root_buf[4] = .undefined;
@@ -2131,7 +2164,12 @@ fn arrayMap(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const out_val = try arraySpeciesCreate(rt, o_val, len);
     root_buf[3] = out_val;
     for (0..len) |i| {
-        if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) return rt.fail(.sparse_array);
+        if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) {
+            if (out_val.isObject() and out_val.asObject().kind == .array and out_val.asObject().kind.array.items.len <= i) {
+                try rt.heap.growElementsWithHoles(out_val.asObject(), i + 1);
+            }
+            continue;
+        }
         const elem = try object.get(rt, o_val, .{ .index = @intCast(i) });
         root_buf[4] = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
         try arrayAppendOrDefine(rt, out_val, i, root_buf[4]);
@@ -2157,7 +2195,11 @@ fn arrayFilter(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         var to: usize = 0;
         for (0..len) |i| {
             if (i >= a.kind.array.items.len) continue;
-            const elem = a.kind.array.items[i];
+            const raw = a.kind.array.items[i];
+            const elem = if (raw.isHole()) blk: {
+                if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) continue;
+                break :blk try object.get(rt, o_val, .{ .index = @intCast(i) });
+            } else raw;
             root_buf[4] = elem;
             const keep = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
             if (ops.toBoolean(keep)) {
@@ -2203,13 +2245,28 @@ fn arrayReduce(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const len = elems.len;
         var start: usize = 0;
         if (args.len < 2) {
-            if (len == 0) return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty array with no initial value" }});
-            root_buf[2] = elems[0];
-            start = 1;
+            var found = false;
+            while (start < len) : (start += 1) {
+                const raw = if (start < a.kind.array.items.len) a.kind.array.items[start] else Value.hole;
+                if (raw.isHole()) {
+                    if (!try object.has(rt, .{ .index = @intCast(start) }, o_val)) continue;
+                    root_buf[2] = try object.get(rt, o_val, .{ .index = @intCast(start) });
+                } else {
+                    root_buf[2] = raw;
+                }
+                start += 1;
+                found = true;
+                break;
+            }
+            if (!found) return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty array with no initial value" }});
         }
         for (start..len) |i| {
             if (i >= a.kind.array.items.len) continue;
-            const elem = a.kind.array.items[i];
+            const raw = a.kind.array.items[i];
+            const elem = if (raw.isHole()) blk: {
+                if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) continue;
+                break :blk try object.get(rt, o_val, .{ .index = @intCast(i) });
+            } else raw;
             root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, Value.fromNumber(@floatFromInt(i)), o_val });
         }
         return root_buf[2];
@@ -2256,7 +2313,8 @@ fn arrayFindImpl(rt: *Runtime, this: Value, args: []const Value, _: []const u8, 
         const cb = try requireCallable(rt, root_buf[1]);
         for (0..len) |step| {
             const i = if (reverse) len - 1 - step else step;
-            const elem = if (i < a.kind.array.items.len) a.kind.array.items[i] else Value.undefined;
+            const raw = if (i < a.kind.array.items.len) a.kind.array.items[i] else Value.hole;
+            const elem = if (raw.isHole()) try object.get(rt, o_val, .{ .index = @intCast(i) }) else raw;
             root_buf[3] = elem;
             const res = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
             if (ops.toBoolean(res)) {
@@ -2321,7 +2379,11 @@ fn arraySomeEveryImpl(rt: *Runtime, this: Value, args: []const Value, _: []const
         const cb = try requireCallable(rt, root_buf[1]);
         for (0..len) |i| {
             if (i >= a.kind.array.items.len) continue;
-            const elem = a.kind.array.items[i];
+            const raw = a.kind.array.items[i];
+            const elem = if (raw.isHole()) blk: {
+                if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) continue;
+                break :blk try object.get(rt, o_val, .{ .index = @intCast(i) });
+            } else raw;
             const res = try rt.callCallable(cb, this_arg, &.{ elem, Value.fromNumber(@floatFromInt(i)), o_val });
             const b = ops.toBoolean(res);
             if (is_every and !b) return Value.fromBool(false);
@@ -2379,7 +2441,13 @@ fn concatAppendItem(rt: *Runtime, out: Value, n: *usize, item: Value, elem_root:
             const len_f = try toLength(rt, try object.get(rt, item, try object.named(rt, "length")));
             const len: usize = @intFromFloat(len_f);
             for (0..len) |i| {
-                if (!try object.has(rt, .{ .index = @intCast(i) }, item)) return rt.fail(.sparse_array);
+                if (!try object.has(rt, .{ .index = @intCast(i) }, item)) {
+                    if (out.isObject() and out.asObject().kind == .array) {
+                        try rt.heap.growElementsWithHoles(out.asObject(), n.* + 1);
+                    }
+                    n.* += 1;
+                    continue;
+                }
                 elem_root.* = try object.get(rt, item, .{ .index = @intCast(i) });
                 try arrayAppendOrDefine(rt, out, n.*, elem_root.*);
                 n.* += 1;
@@ -2467,7 +2535,8 @@ fn arrayAt(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const rel = try toIntegerOrInfinity(rt, arg(args, 0));
         const k = if (rel >= 0) rel else @as(f64, @floatFromInt(len)) + rel;
         if (k < 0 or k >= @as(f64, @floatFromInt(len))) return .undefined;
-        return a.kind.array.items[@intFromFloat(k)];
+        const raw = a.kind.array.items[@intFromFloat(k)];
+        return if (raw.isHole()) try object.get(rt, this, .{ .index = @intFromFloat(k) }) else raw;
     }
     var root_buf = [_]Value{o_val};
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
@@ -2491,7 +2560,7 @@ fn arrayLastIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value 
         if (k_f < 0) return Value.fromNumber(-1);
         var k: usize = @intFromFloat(k_f);
         while (true) : (k -= 1) {
-            if (ops.strictEquals(items[k], needle)) return Value.fromNumber(@floatFromInt(k));
+            if (!items[k].isHole() and ops.strictEquals(items[k], needle)) return Value.fromNumber(@floatFromInt(k));
             if (k == 0) break;
         }
         return Value.fromNumber(-1);
@@ -2527,7 +2596,13 @@ fn arrayFill(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const start = if (arg(args, 1).isUndefined()) 0 else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 1)), len);
         const end = if (arg(args, 2).isUndefined()) len else resolveRelativeIndex(try toIntegerOrInfinity(rt, arg(args, 2)), len);
         if (start < end) try checkArrayMutate(rt, a, .{ .write_elements = true });
-        for (start..end) |i| rt.heap.storeElement(a, i, val);
+        for (start..end) |i| {
+            if (i < a.kind.array.items.len) {
+                rt.heap.storeElement(a, i, val);
+            } else {
+                try object.setStrict(rt, o_val, .{ .index = @intCast(i) }, val);
+            }
+        }
         return o_val;
     }
     var root_buf = [_]Value{ o_val, val };
@@ -2552,7 +2627,7 @@ fn arrayShift(rt: *Runtime, this: Value, _: []const Value) Error!Value {
             return .undefined;
         }
         try checkArrayMutate(rt, a, .{ .shrink = true, .write_elements = items.len > 1, .write_length = true });
-        const first = items[0];
+        const first = if (items[0].isHole()) try object.get(rt, o_val, .{ .index = 0 }) else items[0];
         for (1..items.len) |i| rt.heap.storeElement(a, i - 1, items[i]);
         rt.heap.shrinkElements(a, items.len - 1);
         return first;
@@ -2716,8 +2791,14 @@ fn arraySort(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
 
+    var undef_count: usize = 0;
     for (a.kind.array.items) |v| {
-        if (!v.isUndefined()) try rt.heap.appendElement(snap, v);
+        if (v.isHole()) continue;
+        if (v.isUndefined()) {
+            undef_count += 1;
+        } else {
+            try rt.heap.appendElement(snap, v);
+        }
     }
     const defined_count = snap.kind.array.items.len;
     if (defined_count > 1) {
@@ -2729,12 +2810,12 @@ fn arraySort(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const cur_len = a.kind.array.items.len;
     const write_len = @min(len, cur_len);
     for (0..write_len) |i| {
-        const v = if (i < defined_count) snap.kind.array.items[i] else Value.undefined;
+        const v: Value = if (i < defined_count) snap.kind.array.items[i] else if (i < defined_count + undef_count) .undefined else .hole;
         rt.heap.storeElement(a, i, v);
     }
     if (cur_len < len) {
         for (cur_len..len) |i| {
-            const v = if (i < defined_count) snap.kind.array.items[i] else Value.undefined;
+            const v: Value = if (i < defined_count) snap.kind.array.items[i] else if (i < defined_count + undef_count) .undefined else .hole;
             try rt.heap.appendElement(a, v);
         }
     }
@@ -2797,14 +2878,29 @@ fn arrayReduceRight(rt: *Runtime, this: Value, args: []const Value) Error!Value 
         const len = elems.len;
         var idx: usize = len;
         if (args.len < 2) {
-            if (len == 0) return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty array with no initial value" }});
-            idx = len - 1;
-            root_buf[2] = elems[idx];
+            var found = false;
+            while (idx > 0) {
+                idx -= 1;
+                const raw = if (idx < a.kind.array.items.len) a.kind.array.items[idx] else Value.hole;
+                if (raw.isHole()) {
+                    if (!try object.has(rt, .{ .index = @intCast(idx) }, o_val)) continue;
+                    root_buf[2] = try object.get(rt, o_val, .{ .index = @intCast(idx) });
+                } else {
+                    root_buf[2] = raw;
+                }
+                found = true;
+                break;
+            }
+            if (!found) return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty array with no initial value" }});
         }
         while (idx > 0) {
             idx -= 1;
             if (idx >= a.kind.array.items.len) continue;
-            const elem = a.kind.array.items[idx];
+            const raw = a.kind.array.items[idx];
+            const elem = if (raw.isHole()) blk: {
+                if (!try object.has(rt, .{ .index = @intCast(idx) }, o_val)) continue;
+                break :blk try object.get(rt, o_val, .{ .index = @intCast(idx) });
+            } else raw;
             root_buf[2] = try rt.callCallable(cb, .undefined, &.{ root_buf[2], elem, Value.fromNumber(@floatFromInt(idx)), o_val });
         }
         return root_buf[2];
@@ -2956,7 +3052,9 @@ fn arrayToReversed(rt: *Runtime, this: Value, _: []const Value) Error!Value {
         var i: usize = a.kind.array.items.len;
         while (i > 0) {
             i -= 1;
-            try rt.heap.appendElement(out, a.kind.array.items[i]);
+            const raw = a.kind.array.items[i];
+            const elem = if (raw.isHole()) try object.get(rt, o_val, .{ .index = @intCast(i) }) else raw;
+            try rt.heap.appendElement(out, elem);
         }
         return Value.fromObject(out);
     }
@@ -4379,13 +4477,14 @@ fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Parsed
             if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot add property to array with non-writable length" }});
             return false;
         }
-        if (k.index > cur_len) return rt.fail(.sparse_array);
+        if (k.index >= heap_mod.Heap.MAX_DENSE_ARRAY_LEN) return rt.fail(.sparse_array);
         if (next.is_accessor or !next.enumerable or next.writable != arr.array_elements_writable or next.configurable != arr.array_elements_configurable) {
             return unsupportedReceiver(rt, "defineProperty");
         }
         if (k.index < cur_len) {
-            if (d.has_val) rt.heap.storeElement(arr, k.index, next.value);
+            if (d.has_val) rt.heap.storeElement(arr, k.index, next.value) else if (arr.kind.array.items[k.index].isHole()) rt.heap.storeElement(arr, k.index, .undefined);
         } else {
+            if (k.index > cur_len) try rt.heap.growElementsWithHoles(arr, k.index);
             try rt.heap.appendElement(arr, next.value);
         }
         return true;
@@ -5707,8 +5806,10 @@ fn arrayConstruct(rt: *Runtime, args: []const Value) Error!Value {
             if (@as(f64, @floatFromInt(int_len)) != n) {
                 return rt.throw(.RangeError, &.{.{ .ascii = "Invalid array length" }});
             }
-            if (int_len > 0) return rt.fail(.sparse_array);
-            return Value.fromObject(try rt.heap.newArray(r.array_prototype));
+            if (int_len > heap_mod.Heap.MAX_DENSE_ARRAY_LEN) return rt.fail(.sparse_array);
+            const out = try rt.heap.newArray(r.array_prototype);
+            if (int_len > 0) try rt.heap.growElementsWithHoles(out, int_len);
+            return Value.fromObject(out);
         }
         const out = try rt.heap.newArray(r.array_prototype);
         try rt.heap.appendElement(out, first);
@@ -8955,10 +9056,11 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
                     const i = it.cursor;
                     it.cursor += 1;
                     const idx_val: Value = Value.fromNumber(@floatFromInt(i));
+                    const elem = if (items[i].isHole()) try object.get(rt, it.target, .{ .index = @intCast(i) }) else items[i];
                     return switch (it.kind) {
-                        .array_values => items[i],
+                        .array_values => elem,
                         .array_keys => idx_val,
-                        .array_entries => try makePairArray(rt, idx_val, items[i]),
+                        .array_entries => try makePairArray(rt, idx_val, elem),
                         else => unreachable,
                     };
                 }

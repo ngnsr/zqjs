@@ -532,7 +532,7 @@ const Dumper = struct {
                 try d.expr(inner);
                 try w.writeByte(')');
             },
-            .hole => unreachable,
+            .hole => try w.writeAll("(hole)"),
             .assign => |a| {
                 switch (a.op) {
                     .plain => try w.writeAll("(= "),

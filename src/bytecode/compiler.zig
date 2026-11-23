@@ -1624,7 +1624,8 @@ const Compiler = struct {
                 try c.emit(.dup, &.{});
                 try c.bindPattern(ap.pattern, .assign);
             },
-            .spread, .hole => unreachable,
+            .hole => try c.emit(.push_hole, &.{}),
+            .spread => unreachable,
             .assign => |a| switch (a.target) {
                 .ref => |ref| switch (a.op) {
                     .plain => {

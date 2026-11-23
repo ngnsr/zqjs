@@ -39,6 +39,7 @@ pub const Operand = enum { slot, @"const", name, target, argc, function, capture
 pub const Op = enum(u8) {
     // ---- constants: push one value
     push_undefined,
+    push_hole,
     push_null,
     push_true,
     push_false,
@@ -389,7 +390,7 @@ pub const Op = enum(u8) {
 
     fn infoOf(op: Op) Info {
         return switch (op) {
-            .push_undefined, .push_null, .push_true, .push_false => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
+            .push_undefined, .push_hole, .push_null, .push_true, .push_false => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
             .push_const => .{ .operands = &.{.@"const"}, .pops = 0, .pushes = 1 },
             .get_local => .{ .operands = &.{ .slot, .name }, .pops = 0, .pushes = 1 },
             .set_local, .assign_const => .{ .operands = &.{ .slot, .name }, .pops = 1, .pushes = 1 },

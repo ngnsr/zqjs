@@ -323,10 +323,14 @@ test "this: decided by the call; sloppy unbound calls bind globalThis, primitive
     try expectUnsupported("let o = { f() { return this; } }; let p = 'str'; p.f = o.f;", "", "Unsupported(primitive_write)");
 }
 
-test "holes are Unsupported: arrays stay dense" {
-    try expectUnsupported("let a = [10, 20, 30]; print(delete a[3]); delete a[1];", "true\n", "Unsupported(sparse_array)");
-    try expectUnsupported("let a = [1]; a[1] = 2; print(a); a[5] = 6;", "1,2\n", "Unsupported(sparse_array)");
-    try expectUnsupported("let a = [1, 2]; a.length = 1; print(a); a.length = 3;", "1\n", "Unsupported(sparse_array)");
+test "sparse arrays with holes work on both engines; huge gaps remain Unsupported" {
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, "let a = [10, 20, 30]; print(delete a[3], delete a[1], 1 in a, a[1], a.length); let b = [1]; b[3] = 4; print(b.length, 1 in b, b.join('-')); let c = [1, 2]; c.length = 4; print(c.length, 2 in c);", .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("true true false undefined 3\n4 false 1---4\n4 false\n", r.out);
+    }
+    try expectUnsupported("let a = [1]; a[2000000] = 6;", "", "Unsupported(sparse_array)");
+    try expectUnsupported("let a = [1, 2]; a.length = 2000000;", "", "Unsupported(sparse_array)");
 }
 
 test "built-ins: known to node but not implemented is Unsupported, naming the member" {
@@ -385,14 +389,17 @@ test "object limits: heap, string length of a join, conversion depth" {
 
 test "M11.3b: Array/String unimplemented methods, non-matching receivers, and non-ASCII case report Unsupported" {
     try expectUnsupported("[1].toLocaleString;", "", "('toLocaleString')");
-    try expectUnsupported("let o = { length: 1, slice: [].slice }; o.slice();", "", "Unsupported(sparse_array)");
     try expectUnsupported("let o = { length: 1, push: [].push }; o.push(1);", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { length: 1, pop: [].pop }; o.pop();", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { charAt: ''.charAt }; o.charAt(0);", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { slice: ''.slice }; o.slice(0);", "", "Unsupported(builtin)");
     try expectUnsupported("'\\u00e9'.toLowerCase();", "", "('toLowerCase')");
     try expectUnsupported("'\\u00e9'.toUpperCase();", "", "('toUpperCase')");
-    try expectUnsupported("[1, , 3].slice();", "", "Unsupported(sparse_array)");
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, "let s = [1, , 3].slice(); print(s.length, 1 in s, s[0], s[2]);", .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("3 false 1 3\n", r.out);
+    }
 }
 
 test "M14.2: Map unsupported methods, non-Map receivers, and non-Map new() targets" {
@@ -579,12 +586,14 @@ test "M16.1: ClosureCaller, callCallable, ValueRoots, exception propagation, dep
     try std.testing.checkAllAllocationFailures(testing.allocator, OomCtx.runOnce, .{});
 }
 
-test "M16.2: Array/Map/Set callback receivers, map shrink deviation, limits, and OOM" {
-    // Intentional dense-array deviation: shrinking the array during map() reports Unsupported(sparse_array)
-    try expectUnsupported("[1, 2, 3].map(function (v, i, a) { if (i === 0) a.pop(); return v; });", "", "Unsupported(sparse_array)");
+test "M16.2: Array/Map/Set callback receivers, map shrink with holes, limits, and OOM" {
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, "let m = [1, 2, 3].map(function (v, i, a) { if (i === 0) a.pop(); return v; }); print(m.length, 2 in m, m[0], m[1]);", .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("3 false 1 2\n", r.out);
+    }
 
     // Non-matching receivers
-    try expectUnsupported("let o = { length: 1, map: [].map }; o.map(function () {});", "", "Unsupported(sparse_array)");
     try expectUnsupported("let o = { forEach: new Map().forEach }; o.forEach(function () {});", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { forEach: new Set().forEach }; o.forEach(function () {});", "", "Unsupported(builtin)");
 

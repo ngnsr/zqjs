@@ -546,9 +546,10 @@ static void test_m12_3_abi_version_options_and_handles(void) {
     assert(fail.kind == ZQJS_FAILURE_THROWN);
     assert(zqjs_handle_release(rt_def, missing) == ZQJS_OK);
 
-    /* Array dense index operations */
+    /* Array dense + bounded sparse index operations; huge sparse gap stays Unsupported */
     assert(zqjs_handle_set_index(rt_def, arr, 0, num, &fail) == ZQJS_OK);
-    assert(zqjs_handle_set_index(rt_def, arr, 3, num, &fail) == ZQJS_ERR_UNSUPPORTED);
+    assert(zqjs_handle_set_index(rt_def, arr, 3, num, &fail) == ZQJS_OK);
+    assert(zqjs_handle_set_index(rt_def, arr, 2000000, num, &fail) == ZQJS_ERR_UNSUPPORTED);
     assert(fail.kind == ZQJS_FAILURE_UNSUPPORTED);
 
     zqjs_handle got_0 = ZQJS_HANDLE_NULL;

@@ -828,6 +828,7 @@ pub const Vm = struct {
 
         switch (op) {
             .push_undefined => try cache.push(vm, .undefined),
+            .push_hole => try cache.push(vm, .hole),
             .push_null => try cache.push(vm, .null),
             .push_true => try cache.push(vm, Value.fromBool(true)),
             .push_false => try cache.push(vm, Value.fromBool(false)),
@@ -2777,6 +2778,7 @@ fn fastArrayGet(base: Value, idx: Value) ?Value {
     if (!(n >= 0 and n < @as(f64, @floatFromInt(elems.len)) and @floor(n) == n)) return null;
     o.obj.checkLive();
     const r = elems[@intFromFloat(n)];
+    if (r.isHole()) return null;
     heap.checkValue(r);
     return r;
 }
@@ -2788,8 +2790,10 @@ fn fastArraySet(rt: *Runtime, base: Value, idx: Value, val: Value) bool {
     const n = idx.asNumber();
     const elems = o.kind.array.items;
     if (!(n >= 0 and n < @as(f64, @floatFromInt(elems.len)) and @floor(n) == n)) return false;
+    const i: usize = @intFromFloat(n);
+    if (elems[i].isHole() and !o.extensible) return false;
     o.obj.checkLive();
-    rt.heap.storeElement(o, @intFromFloat(n), val);
+    rt.heap.storeElement(o, i, val);
     return true;
 }
 

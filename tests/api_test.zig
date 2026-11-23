@@ -2585,8 +2585,13 @@ test "M12.2: newObject, newArray, getGlobal, getProperty/setProperty, getIndex/s
     defer oob.release();
     try testing.expectEqual(zqjs.HandleKind.undefined, oob.kind());
 
+    // Bounded sparse write succeeds (creating holes); huge sparse gap stays Unsupported.
+    try rt.setIndex(arr, 5, v0, null);
+    const hole_h = try rt.getIndex(arr, 2, null);
+    defer hole_h.release();
+    try testing.expectEqual(zqjs.HandleKind.undefined, hole_h.kind());
     var sparse_fail: zqjs.Failure = .{};
-    try testing.expectError(error.Unsupported, rt.setIndex(arr, 5, v0, &sparse_fail));
+    try testing.expectError(error.Unsupported, rt.setIndex(arr, 2_000_000, v0, &sparse_fail));
     try testing.expectEqual(zqjs.Failure.Kind.unsupported, sparse_fail.kind);
 
     // maxInt(u32) is treated as an ordinary property atom, not an array index.

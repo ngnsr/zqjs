@@ -850,7 +850,7 @@ const Resolver = struct {
                 try r.resolvePatternExprs(ap.pattern);
             },
             .spread => |inner| try r.expr(inner),
-            .hole => unreachable,
+            .hole => {},
             .update => |u| try r.assignTarget(u.target),
             .member, .delete => |m| try r.member(m),
             .optional_chain, .delete_optional => |oc| try r.optionalChain(oc),

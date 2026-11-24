@@ -1376,8 +1376,12 @@ test "gc roots: stacks, frames, closures and cells survive collections between s
 
     try testing.expectEqual(zqjs.Status.finished, s1);
     try testing.expectEqual(zqjs.Status.finished, s2);
-    try testing.expect(std.mem.indexOf(u8, out.buffered(), "11\n12\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out.buffered(), "24\n") != null);
+    const printed = out.buffered();
+    const idx_11 = std.mem.indexOf(u8, printed, "11\n") orelse return error.TestUnexpectedResult;
+    const idx_12 = std.mem.indexOf(u8, printed, "12\n") orelse return error.TestUnexpectedResult;
+    try testing.expect(idx_11 < idx_12);
+    try testing.expect(std.mem.indexOf(u8, printed, "24\n") != null);
+    try testing.expectEqual("11\n12\n24\n".len, printed.len);
 }
 
 test "step accounting: 0, 1, slice equal to cap, completion at cap, unfinished at cap" {

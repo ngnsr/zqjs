@@ -1059,8 +1059,11 @@ const Parser = struct {
             p.async_ctx = outer_async_ctx;
             p.yield_ctx = outer_yield_ctx;
         }
-        if (is_async and kind == .expression) p.async_ctx = .params;
-        if (is_generator and kind == .expression) p.yield_ctx = .params;
+        // A FunctionExpression is not in the enclosing generator/async body unless it itself has * / async.
+        if (kind == .expression) {
+            p.async_ctx = if (is_async) .params else .none;
+            p.yield_ctx = if (is_generator) .params else .none;
+        }
 
         var name: ?ast.Declarator = null;
         if (p.tok.tag != .l_paren) {

@@ -1248,7 +1248,8 @@ overflowed the same way before this entry.
   ~1 100. Deep recursion *through callbacks* is rare in real code; Node allows ~11k but does
   not nest native frames per crossing like model B does.
 - Test: `tests/interpreter_test.zig` "native→JS recursion stops cleanly even when the host
-  thread has a tiny stack": 256 KiB thread, budget 128 KiB, `map` and plain `async`
+  thread has a tiny stack": 256 KiB thread (512 KiB in Debug, where Linux x86_64 stack frames
+  need more headroom than macOS arm64), budget 128 KiB, `map` and plain `async`
   recursion, both engines expect `LimitExceeded(native_stack)`. Before this entry it crashed the `interpreter_test` binary.
 - C API: `ZQJS_LIMIT_NATIVE_STACK` (12) reports the fault, and `zqjs_limits` gets no field:
   it is embedded in the versioned `zqjs_options` before trailing fields, so a new field would

@@ -3,6 +3,7 @@
 //! agree on any input). Observable JS behaviour is tested against node in tests/diff.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const zqjs = @import("zqjs_internal");
@@ -243,10 +244,12 @@ test "deep recursion stops cleanly even when the host thread has a tiny stack" {
             };
         }
     };
+    // Debug stack frames on Linux x86_64 are larger than on macOS arm64; keep 256 KiB for optimized builds.
+    const stack_size: usize = if (builtin.mode == .debug) 512 * 1024 else 256 * 1024;
     for (support.engines) |engine| {
         var result: ?support.Outcome = null;
         var err: ?anyerror = null;
-        const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Host.work, .{ &result, engine, &err });
+        const t = try std.Thread.spawn(.{ .stack_size = stack_size }, Host.work, .{ &result, engine, &err });
         t.join();
         if (err) |e| return e;
         var r = result.?;
@@ -276,10 +279,11 @@ test "native→JS recursion stops cleanly even when the host thread has a tiny s
         "function f(n) { return [n].map(x => f(x + 1)); } f(0);",
         "async function f(n) { return f(n + 1); } f(0);",
     };
+    const stack_size: usize = if (builtin.mode == .debug) 512 * 1024 else 256 * 1024;
     for (support.engines) |engine| for (sources) |src| {
         var result: ?support.Outcome = null;
         var err: ?anyerror = null;
-        const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Host.work, .{ &result, src, engine, &err });
+        const t = try std.Thread.spawn(.{ .stack_size = stack_size }, Host.work, .{ &result, src, engine, &err });
         t.join();
         if (err) |e| return e;
         var r = result.?;

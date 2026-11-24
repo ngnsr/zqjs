@@ -37,6 +37,8 @@ pub const Value = packed struct(u64) {
     pub const UNINIT_BITS: u64 = TAG_IMM | 4;
     /// Internal sentinel for sparse array holes (never exposed to JS).
     pub const HOLE_BITS: u64 = TAG_IMM | 5;
+    /// Internal sentinel for missing `this` in `Vm.Frame` (never a JS Value).
+    pub const NO_THIS_BITS: u64 = TAG_IMM | 6;
 
     pub const @"undefined": Value = .{ .bits = UNDEFINED_BITS };
     pub const @"null": Value = .{ .bits = NULL_BITS };

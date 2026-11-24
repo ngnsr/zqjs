@@ -97,10 +97,39 @@ comptime {
     std.debug.assert(@sizeOf(Slot) == 8);
 }
 
+/// 8-byte optional `Value` packed with `Value.NO_THIS_BITS` so `Frame` stays 64 bytes
+/// and `enterCall` passes/stores `this` in a single register without 16-byte stack spills.
+pub const OptValue = packed struct(u64) {
+    bits: u64,
+
+    pub const none: OptValue = .{ .bits = Value.NO_THIS_BITS };
+
+    pub inline fn some(v: Value) OptValue {
+        std.debug.assert(v.bits != Value.NO_THIS_BITS);
+        return .{ .bits = v.bits };
+    }
+
+    pub inline fn from(mv: ?Value) OptValue {
+        return if (mv) |v| some(v) else none;
+    }
+
+    pub inline fn asOpt(self: OptValue) ?Value {
+        return if (self.bits == Value.NO_THIS_BITS) null else .{ .bits = self.bits };
+    }
+
+    pub inline fn isNone(self: OptValue) bool {
+        return self.bits == Value.NO_THIS_BITS;
+    }
+};
+
 pub const Frame = struct {
     proto: *const Proto,
     /// The running closure (null for the script).
     closure: ?*const Closure,
+    /// `this`: the method call's receiver, or `.none` for a call without one (D41).
+    this_opt: OptValue,
+    /// Pre-allocated instance for `new` / `super(...)` (traced by GC).
+    construct_instance: ?*heap.Object = null,
     /// Where the caller continues (unused for the script).
     return_pc: u32,
     /// First of this frame's `slot_count` locals.
@@ -110,8 +139,6 @@ pub const Frame = struct {
     /// Where the result goes in the caller's operands (the callee's slot, or the receiver's
     /// for a method call): `return` cuts the stack back to it.
     result_index: u32,
-    /// `this`: the method call's receiver, or null for a call without one (D41).
-    this: ?Value,
     /// The end of the operand region reserved by this frame *or any frame below it*: a
     /// callee's region can end below its caller's, and the stack must keep both.
     stack_end: u32,
@@ -122,9 +149,15 @@ pub const Frame = struct {
     is_construct: bool = false,
     /// True when entered via `super(...)` from a derived class constructor.
     is_super_call: bool = false,
-    /// Pre-allocated instance for `new` / `super(...)` (traced by GC).
-    construct_instance: ?*heap.Object = null,
+
+    pub inline fn thisVal(f: Frame) ?Value {
+        return f.this_opt.asOpt();
+    }
 };
+
+comptime {
+    std.debug.assert(@sizeOf(Frame) == 64);
+}
 
 pub const Vm = struct {
     pub const State = enum { running, halted, awaiting };
@@ -162,17 +195,39 @@ pub const Vm = struct {
     /// which keeps its own per-VM check. Torn down in `deinit` (subtracting the frames
     /// still live), so a VM faulting mid-recursion unwinds its charge exactly.
     chain: ?*rt_mod.ExecContext = null,
+    /// Number of chain depth slots owned by callers below this VM while running.
+    base_chain_depth: u32 = 0,
+    /// Maximum `frames.items.len` allowed for this VM (`max_call_depth -| base_chain_depth`).
+    frame_limit: u32 = 0,
+
+    inline fn enterDepthScope(vm: *Vm) void {
+        if (vm.chain) |cx| {
+            const cur_frames: u32 = @intCast(vm.frames.items.len);
+            const base = cx.call_depth -| cur_frames;
+            vm.base_chain_depth = base;
+            vm.frame_limit = vm.rt.limits.max_call_depth -| base;
+        } else {
+            vm.base_chain_depth = 0;
+            vm.frame_limit = vm.rt.limits.max_call_depth;
+        }
+    }
+
+    inline fn syncChainDepth(vm: *const Vm) void {
+        if (vm.chain) |cx| {
+            cx.call_depth = vm.base_chain_depth + @as(u32, @intCast(vm.frames.items.len));
+        }
+    }
 
     /// `script` must have passed `verify` and must outlive the VM (and every use of its
     /// closures). Allocates with `rt.gpa`; on failure nothing is left allocated.
     pub fn init(rt: *Runtime, script: *const Proto) Error!Vm {
         if (@as(u64, script.slot_count) + script.max_stack > rt.limits.max_stack_slots) return rt.limit(.stack_slots);
-        var vm: Vm = .{ .rt = rt };
+        var vm: Vm = .{ .rt = rt, .frame_limit = rt.limits.max_call_depth };
         errdefer vm.deinit();
         try vm.reserve(script);
         try vm.frames.ensureTotalCapacity(rt.gpa, 1);
         vm.initLocals(script, &.{});
-        vm.frames.appendAssumeCapacity(.{ .proto = script, .closure = null, .return_pc = 0, .locals_base = 0, .stack_base = 0, .result_index = 0, .this = if (script.is_module) .undefined else null, .stack_end = script.max_stack, .args_start = 0, .argc = 0 });
+        vm.frames.appendAssumeCapacity(.{ .proto = script, .closure = null, .return_pc = 0, .locals_base = 0, .stack_base = 0, .result_index = 0, .this_opt = if (script.is_module) OptValue.some(.undefined) else .none, .stack_end = script.max_stack, .args_start = 0, .argc = 0 });
         vm.locals_len = script.slot_count;
         vm.reserved = script.slot_count + script.max_stack;
         return vm;
@@ -214,7 +269,7 @@ pub const Vm = struct {
         const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else if (is_construct) this else try builtins.coerceThis(rt, this, callee.is_strict);
         const argc: u32 = @intCast(args.len);
         if (@as(u64, argc) + callee.slot_count + callee.max_stack > rt.limits.max_stack_slots) return rt.limit(.stack_slots);
-        var vm: Vm = .{ .rt = rt, .nested = true };
+        var vm: Vm = .{ .rt = rt, .nested = true, .frame_limit = rt.limits.max_call_depth };
         errdefer vm.deinit();
         try vm.reserveWithExtra(callee, argc);
         try vm.frames.ensureTotalCapacity(rt.gpa, 1);
@@ -228,7 +283,7 @@ pub const Vm = struct {
             .locals_base = 0,
             .stack_base = argc,
             .result_index = 0,
-            .this = effective_this,
+            .this_opt = OptValue.from(effective_this),
             .stack_end = argc + callee.max_stack,
             .args_start = 0,
             .argc = argc,
@@ -243,11 +298,13 @@ pub const Vm = struct {
     /// Invokes a VM closure from inside a built-in native via Model B nested VM execution (M16.1).
     fn callFromBuiltin(ctx: *anyopaque, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
         const vm: *Vm = @ptrCast(@alignCast(ctx));
+        vm.syncChainDepth();
         return callNested(vm.rt, vm, c, this, args, false, null);
     }
 
     fn constructFromBuiltin(ctx: *anyopaque, c: *const Closure, args: []const Value, new_target: Value) Error!Value {
         const vm: *Vm = @ptrCast(@alignCast(ctx));
+        vm.syncChainDepth();
         return constructNested(vm.rt, vm, c, args, new_target);
     }
 
@@ -350,6 +407,7 @@ pub const Vm = struct {
 
     noinline fn startAsyncFromVm(vm: *Vm, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
         @branchHint(.cold);
+        vm.syncChainDepth();
         return startAsync(vm.rt, vm, c, this, args);
     }
 
@@ -548,15 +606,16 @@ pub const Vm = struct {
         return vm.runLoop(true, steps);
     }
 
-    /// Loop-local cache of the active frame's `proto`, `code`, `pc`, and frame-constant
+    /// Loop-local cache of the active frame's `proto`, `code_ptr`, `pc`, and frame-constant
     /// stack/local bounds (`locals_base` is stored as an index into `vm.locals`, never
-    /// as a slice/pointer, so stack/local growth in `enter()` cannot dangle).
+    /// as a slice/pointer, so stack/local growth in `enter()` cannot dangle). Keeping
+    /// `code_len` out of `FrameCache` (read from `p.code.len`) keeps `sp` in a register.
     /// Invariants: `vm.sp` and `vm.pc` are synced via `syncSp` before any helper,
     /// error, host call, GC, or loop exit that can observe them; any opcode that pushes
     /// or pops a frame updates `cache` directly or via `FrameCache.fromVm`.
     const FrameCache = struct {
         p: *const Proto,
-        code: []const u8,
+        code_ptr: [*]const u8,
         pc: u32,
         sp: u32,
         stack_base: u32,
@@ -569,7 +628,7 @@ pub const Vm = struct {
             const limit = @min(@as(usize, f.stack_base) + p.max_stack, vm.stack.len);
             return .{
                 .p = p,
-                .code = p.code,
+                .code_ptr = p.code.ptr,
                 .pc = pc,
                 .sp = vm.sp,
                 .stack_base = f.stack_base,
@@ -584,12 +643,13 @@ pub const Vm = struct {
         }
 
         inline fn operand(self: FrameCache, i: usize) u32 {
-            return bc.readU32(self.code, self.pc + 1 + 4 * i); // instruction bounds checked in execute
+            // Instruction length and bounds already verified at top of `execute`.
+            return std.mem.readInt(u32, self.code_ptr[self.pc + 1 + 4 * i ..][0..4], .little);
         }
 
         inline fn target(self: FrameCache, vm: *const Vm) Error!u32 {
             const t = self.operand(0);
-            if (t >= self.code.len) return vm.bug("jump target outside the code");
+            if (t >= self.p.code.len) return vm.bug("jump target outside the code");
             return t;
         }
 
@@ -658,14 +718,17 @@ pub const Vm = struct {
         const prev_caller = rt.closure_caller;
         rt.closure_caller = .{ .ctx = vm, .call = callFromBuiltin, .construct = constructFromBuiltin };
         defer rt.closure_caller = prev_caller;
+        vm.enterDepthScope();
+        defer vm.syncChainDepth();
         var cache = FrameCache.fromVm(vm, vm.pc);
+        var state: State = .running;
         var n: u64 = 0;
         while (!bounded or n < steps) {
             if (stress) {
                 cache.syncSp(vm);
                 rt.collect();
             }
-            const state = @call(.always_inline, execute, .{ vm, &cache, !stress }) catch |e| {
+            @call(.always_inline, execute, .{ vm, rt, &cache, &state, !stress }) catch |e| {
                 cache.syncSp(vm);
                 if (e == error.Thrown) {
                     if (vm.unwind(cache.pc)) |_| {
@@ -684,6 +747,7 @@ pub const Vm = struct {
                 cache.syncSp(vm);
                 if (state == .halted) {
                     if (!vm.nested) {
+                        vm.syncChainDepth();
                         rt.drainMicrotasks() catch |e| {
                             vm.fault = e;
                             return e;
@@ -740,7 +804,7 @@ pub const Vm = struct {
         }
         for (vm.frames.items) |f| {
             if (f.closure) |c| visit(ctx, @constCast(&c.obj));
-            if (f.this) |t| heap.visitValue(t, ctx, visit);
+            if (f.thisVal()) |t| heap.visitValue(t, ctx, visit);
             if (f.construct_instance) |ci| visit(ctx, &ci.obj);
         }
         heap.visitValue(vm.awaited, ctx, visit);
@@ -791,8 +855,11 @@ pub const Vm = struct {
             if (!vm.nested) vm.rt.engine_roots = .{ .ctx = vm, .mark = markRoots };
             vm.rt.collect();
         }
+        vm.enterDepthScope();
+        defer vm.syncChainDepth();
         var cache = FrameCache.fromVm(vm, vm.pc);
-        const state = vm.execute(&cache, false) catch |e| {
+        var state: State = .running;
+        vm.execute(vm.rt, &cache, &state, false) catch |e| {
             cache.syncSp(vm);
             if (e == error.Thrown) {
                 if (vm.unwind(cache.pc)) |_| {
@@ -813,17 +880,17 @@ pub const Vm = struct {
     /// its changes and then sets `pc` (see the contract above).
     /// When `inline_safepoints` is true (non-stress `runLoop`), `collect_requested` is
     /// checked at loop back-edges, calls, and allocations instead of every instruction.
-    fn execute(vm: *Vm, cache: *FrameCache, comptime inline_safepoints: bool) Error!State {
+    fn execute(vm: *Vm, rt: *Runtime, cache: *FrameCache, state_out: *State, comptime inline_safepoints: bool) Error!void {
         @setEvalBranchQuota(4000);
-        const rt = vm.rt;
         const p = cache.p;
-        const code = cache.code;
+        const code_ptr = cache.code_ptr;
+        const code_len = p.code.len;
         const pc = cache.pc;
-        if (pc >= code.len) return vm.bug("pc outside the code");
-        const byte = code[pc];
+        if (pc >= code_len) return vm.bug("pc outside the code");
+        const byte = code_ptr[pc];
         if (byte >= Op.count) return vm.bug("invalid opcode");
         const op: Op = @fromBackingInt(@intCast(byte));
-        if (op.size() > code.len - pc) return vm.bug("instruction runs past the end of the code");
+        if (op.size() > code_len - pc) return vm.bug("instruction runs past the end of the code");
         try rt.step();
         var next: u32 = pc + op.size();
 
@@ -996,7 +1063,7 @@ pub const Vm = struct {
                     .parent_capture => try vm.capture(desc.index),
                 };
                 if (child.is_arrow) {
-                    if (vm.frame().this) |t| try rt.heap.storeClosureLexicalThis(c, t);
+                    if (vm.frame().thisVal()) |t| try rt.heap.storeClosureLexicalThis(c, t);
                     if (vm.frame().closure) |parent_c| {
                         if (parent_c.meta) |pm| {
                             if (pm.home_object) |ho| try rt.heap.storeClosureHomeObject(c, ho);
@@ -1116,10 +1183,11 @@ pub const Vm = struct {
                 if (try vm.executeCold(op, pc, next)) {
                     if (vm.yielding) {
                         cache.sp = vm.sp;
-                        return .awaiting; // a generator suspends like `await` (D67)
+                        state_out.* = .awaiting; // a generator suspends like `await` (D67)
+                        return;
                     }
                     cache.* = FrameCache.fromVm(vm, 0);
-                    return .running;
+                    return;
                 }
                 cache.sp = vm.sp;
             },
@@ -1566,7 +1634,7 @@ pub const Vm = struct {
                 const callee = vm.stack[base];
                 if (try vm.callConstruct(base, callee, args, vm.stack[args..cache.sp], false, next)) {
                     cache.* = FrameCache.fromVm(vm, 0);
-                    return .running;
+                    return;
                 }
                 cache.sp = base + 1;
             },
@@ -1579,85 +1647,63 @@ pub const Vm = struct {
                 // Stack: [callee, args…] or [receiver, callee, args…], arguments in source
                 // order. The result replaces the whole group, from `base`.
                 const argc = cache.operand(0);
-                const group = argc + @as(u32, if (op == .call_method) 2 else 1);
+                const is_method = op == .call_method;
+                const group = argc + @as(u32, if (is_method) 2 else 1);
                 if (group > cache.sp - cache.stack_base) return vm.bug("stack underflow");
                 const base = cache.sp - group;
                 const args = cache.sp - argc;
-                const receiver: ?Value = if (op == .call_method) vm.stack[base] else null;
-                switch (vm.stack[args - 1].unpack()) {
+                const callee_v = vm.stack[args - 1];
+                if (callee_v.isClosure()) {
+                    const c = callee_v.asClosure();
+                    if (c.impl == .vm) {
+                        const callee_proto: *const Proto = @ptrCast(@alignCast(c.impl.vm.proto));
+                        if (!callee_proto.is_async and !callee_proto.is_class_constructor) {
+                            const locals_base = vm.locals_len;
+                            vm.sp = cache.sp;
+                            try vm.enterCall(c, callee_proto, base, argc, next, is_method);
+                            cache.* = .{
+                                .p = callee_proto,
+                                .code_ptr = callee_proto.code.ptr,
+                                .pc = 0,
+                                .sp = cache.sp,
+                                .stack_base = cache.sp,
+                                .stack_limit = cache.sp + callee_proto.max_stack,
+                                .locals_base = locals_base,
+                            };
+                            return; // pc is the callee's 0
+                        }
+                    }
+                    cache.syncSp(vm);
+                    if (try vm.callClosureSlow(c, is_method, base, args, next)) {
+                        cache.* = FrameCache.fromVm(vm, 0);
+                        return;
+                    }
+                    cache.sp = base + 1;
+                } else if (callee_v.isNative()) {
+                    const n = callee_v.asNative();
                     // A built-in native *borrows* the argument slice: valid only during the call; it
                     // cannot call back into JS, so the stack cannot move under it. A host native
                     // (D53) receives temporary handles owned by its native-call record. If either
                     // fails, nothing has been popped: the stack is still a valid pre-call state (D35).
-                    .native => |n| {
-                        cache.syncSp(vm);
-                        const this_obj: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
-                        const result = (if (n.host) |h|
-                            h.call(rt, h.ctx, this_obj, vm.stack[args..cache.sp])
-                        else
-                            n.call(rt, receiver orelse .undefined, vm.stack[args..cache.sp])) catch |e| {
-                            if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
-                                return rt.limit(.steps);
-                            return e;
-                        };
-                        if (rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
+                    cache.syncSp(vm);
+                    const receiver: ?Value = if (is_method) vm.stack[base] else null;
+                    const this_obj: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
+                    const result = (if (n.host) |h| blk: {
+                        vm.syncChainDepth();
+                        break :blk h.call(rt, h.ctx, this_obj, vm.stack[args..cache.sp]);
+                    } else n.call(rt, receiver orelse .undefined, vm.stack[args..cache.sp])) catch |e| {
+                        if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
                             return rt.limit(.steps);
-                        vm.stack[base] = result;
-                        cache.sp = base + 1;
-                    },
-                    .closure => |c| switch (c.impl) {
-                        .promise_cap => |cap| {
-                            cache.syncSp(vm);
-                            vm.stack[base] = try @import("../runtime/builtins.zig").callPromiseCapability(rt, cap.promise, cap.is_reject, vm.stack[args..cache.sp]);
-                            cache.sp = base + 1;
-                        },
-                        .native_closure => |nc| {
-                            cache.syncSp(vm);
-                            const f: *const fn (*Runtime, *heap.Object, []const Value) Error!Value = @ptrCast(@alignCast(nc.func));
-                            vm.stack[base] = try f(rt, nc.env, vm.stack[args..cache.sp]);
-                            cache.sp = base + 1;
-                        },
-                        .bound => |b| {
-                            cache.syncSp(vm);
-                            if (try vm.callBound(b, base, vm.stack[args..cache.sp], next)) {
-                                cache.* = FrameCache.fromVm(vm, 0);
-                                return .running;
-                            }
-                            cache.sp = base + 1;
-                        },
-                        .vm => |v_impl| {
-                            cache.syncSp(vm);
-                            const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
-                            if (callee_proto.is_async) {
-                                @branchHint(.unlikely);
-                                vm.stack[base] = try vm.startAsyncFromVm(c, receiver, vm.stack[args..cache.sp]);
-                                cache.sp = base + 1;
-                            } else if (callee_proto.is_class_constructor) {
-                                @branchHint(.unlikely);
-                                return rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
-                            } else {
-                                const locals_base = try vm.enterCall(c, callee_proto, base, argc, next);
-                                cache.* = .{
-                                    .p = callee_proto,
-                                    .code = callee_proto.code,
-                                    .pc = 0,
-                                    .sp = cache.sp,
-                                    .stack_base = cache.sp,
-                                    .stack_limit = cache.sp + callee_proto.max_stack,
-                                    .locals_base = locals_base,
-                                };
-                                return .running; // pc is the callee's 0
-                            }
-                        },
-                        .tree => return vm.bug("a non-VM closure in the VM"),
-                    },
-                    .object => |o| {
-                        if (o.kind != .proxy or !o.kind.proxy.is_callable) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
-                        cache.syncSp(vm);
-                        vm.stack[base] = try builtins.callProxy(rt, o, receiver orelse .undefined, vm.stack[args..cache.sp]);
-                        cache.sp = base + 1;
-                    },
-                    else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
+                        return e;
+                    };
+                    if (rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
+                        return rt.limit(.steps);
+                    vm.stack[base] = result;
+                    cache.sp = base + 1;
+                } else {
+                    cache.syncSp(vm);
+                    try vm.callOtherSlow(callee_v, is_method, base, args);
+                    cache.sp = base + 1;
                 }
             },
             .@"return" => {
@@ -1668,9 +1714,10 @@ pub const Vm = struct {
                         const ret_v = try cache.peek(vm, 0);
                         const f = vm.frame();
                         cache.syncSp(vm);
-                        vm.nested_result = if (f.is_construct and !ret_v.isObjectLike()) f.this.? else ret_v;
+                        vm.nested_result = if (f.is_construct and !ret_v.isObjectLike()) f.thisVal().? else ret_v;
                         vm.halted = true;
-                        return .halted;
+                        state_out.* = .halted;
+                        return;
                     }
                     return vm.bug("return in the script");
                 }
@@ -1680,24 +1727,24 @@ pub const Vm = struct {
                     const return_pc = cur_f.return_pc;
                     const result_index = cur_f.result_index;
                     vm.frames.items.len -= 1;
-                    if (vm.chain) |cx| cx.call_depth -= 1; // the frame died (D51 #2)
                     vm.locals_len = cache.locals_base;
                     vm.reserved -= cache.p.slot_count + cache.p.max_stack;
                     vm.stack[result_index] = ret_v; // replaces the callee (and receiver); arguments and callee operands are gone
                     vm.sp = result_index + 1;
                     cache.* = FrameCache.fromVm(vm, return_pc);
-                    return .running;
+                    return;
                 }
                 cache.syncSp(vm);
                 try vm.returnConstruct(ret_v);
                 cache.* = FrameCache.fromVm(vm, vm.pc);
-                return .running;
+                return;
             },
             .halt => {
                 if (vm.frames.items.len != 1) return vm.bug("halt in a function");
                 if (cache.sp != 0) return vm.bug("stack not empty at halt");
                 vm.halted = true;
-                return .halted; // pc stays on `halt`
+                state_out.* = .halted;
+                return; // pc stays on `halt`
             },
             .await => {
                 const v = try cache.peek(vm, 0);
@@ -1705,16 +1752,16 @@ pub const Vm = struct {
                 cache.syncSp(vm);
                 vm.pc = pc;
                 vm.awaited = v;
-                return .awaiting;
+                state_out.* = .awaiting;
+                return;
             },
             .throw => {
                 const v = try cache.peek(vm, 0);
                 return rt.throwValue(v);
             },
         }
-        if (!inline_safepoints and next >= code.len) return vm.bug("pc outside the code");
+        if (!inline_safepoints and next >= code_len) return vm.bug("pc outside the code");
         cache.pc = next;
-        return .running;
     }
 
     // ---- cold opcodes & calls (outlined to keep `Vm.run` small and `FrameCache` in registers)
@@ -2094,10 +2141,10 @@ pub const Vm = struct {
                 switch (callee.unpack()) {
                     .native => |n| {
                         const this_obj: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
-                        const result = (if (n.host) |h|
-                            h.call(rt, h.ctx, this_obj, args_slice)
-                        else
-                            n.call(rt, receiver orelse .undefined, args_slice)) catch |e| {
+                        const result = (if (n.host) |h| blk: {
+                            vm.syncChainDepth();
+                            break :blk h.call(rt, h.ctx, this_obj, args_slice);
+                        } else n.call(rt, receiver orelse .undefined, args_slice)) catch |e| {
                             if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
                                 return rt.limit(.steps);
                             return e;
@@ -2234,6 +2281,50 @@ pub const Vm = struct {
     }
 
     // Keep FrameCache out of non-inlined helpers so LLVM keeps `cache` in registers (e2b1fd2).
+    noinline fn callClosureSlow(vm: *Vm, c: *const Closure, is_method: bool, base: u32, args: u32, next: u32) Error!bool {
+        @branchHint(.cold);
+        const rt = vm.rt;
+        const receiver: ?Value = if (is_method) vm.stack[base] else null;
+        switch (c.impl) {
+            .promise_cap => |cap| {
+                vm.stack[base] = try builtins.callPromiseCapability(rt, cap.promise, cap.is_reject, vm.stack[args..vm.sp]);
+                return false;
+            },
+            .native_closure => |nc| {
+                const f: *const fn (*Runtime, *heap.Object, []const Value) Error!Value = @ptrCast(@alignCast(nc.func));
+                vm.stack[base] = try f(rt, nc.env, vm.stack[args..vm.sp]);
+                return false;
+            },
+            .bound => |b| return vm.callBound(b, base, vm.stack[args..vm.sp], next),
+            .vm => |v_impl| {
+                const callee_proto: *const Proto = @ptrCast(@alignCast(v_impl.proto));
+                if (callee_proto.is_async) {
+                    vm.stack[base] = try vm.startAsyncFromVm(c, receiver, vm.stack[args..vm.sp]);
+                    return false;
+                }
+                if (callee_proto.is_class_constructor) {
+                    return rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
+                }
+                unreachable;
+            },
+            .tree => return vm.bug("a non-VM closure in the VM"),
+        }
+    }
+
+    noinline fn callOtherSlow(vm: *Vm, callee_v: Value, is_method: bool, base: u32, args: u32) Error!void {
+        @branchHint(.cold);
+        const rt = vm.rt;
+        if (callee_v.isObject()) {
+            const o = callee_v.asObject();
+            if (o.kind == .proxy and o.kind.proxy.is_callable) {
+                const receiver: Value = if (is_method) vm.stack[base] else .undefined;
+                vm.stack[base] = try builtins.callProxy(rt, o, receiver, vm.stack[args..vm.sp]);
+                return;
+            }
+        }
+        return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
+    }
+
     noinline fn callBound(vm: *Vm, b: *const heap.BoundClosure, base: u32, call_args: []const Value, next: u32) Error!bool {
         const rt = vm.rt;
         const combined = try rt.gpa.alloc(Value, b.bound_args.len + call_args.len);
@@ -2244,10 +2335,10 @@ pub const Vm = struct {
         switch (b.target.unpack()) {
             .native => |n| {
                 const this_obj: ?Value = if (b.bound_this.isObjectLike()) b.bound_this else null;
-                const result = (if (n.host) |h|
-                    h.call(rt, h.ctx, this_obj, combined)
-                else
-                    n.call(rt, b.bound_this, combined)) catch |e| {
+                const result = (if (n.host) |h| blk: {
+                    vm.syncChainDepth();
+                    break :blk h.call(rt, h.ctx, this_obj, combined);
+                } else n.call(rt, b.bound_this, combined)) catch |e| {
                     if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
                         return rt.limit(.steps);
                     return e;
@@ -2349,7 +2440,7 @@ pub const Vm = struct {
 
     inline fn requireThis(vm: *Vm) Error!Value {
         const f = vm.frame();
-        if (f.this) |t| return t;
+        if (f.thisVal()) |t| return t;
         return vm.requireThisSlow();
     }
 
@@ -2364,7 +2455,7 @@ pub const Vm = struct {
     noinline fn callSuper(vm: *Vm, base: u32, args_slice: []const Value, is_spread: bool, next: u32) Error!bool {
         const rt = vm.rt;
         const f = vm.frame();
-        if (f.this != null) {
+        if (!f.this_opt.isNone()) {
             return rt.throw(.ReferenceError, &.{.{ .ascii = "Super constructor may only be called once" }});
         }
         const cur_closure = f.closure orelse return vm.bug("super() without closure");
@@ -2388,7 +2479,7 @@ pub const Vm = struct {
         const inst = f.construct_instance orelse return vm.bug("super() without construct_instance");
         if (target.isObject()) {
             const res = try builtins.callProxyConstruct(rt, target.asObject(), effective_args, Value.fromClosure(cur_closure));
-            vm.frames.items[vm.frames.items.len - 1].this = res;
+            vm.frames.items[vm.frames.items.len - 1].this_opt = OptValue.some(res);
             vm.stack[base] = res;
             vm.sp = base + 1;
             try builtins.runInstanceInits(rt, @constCast(cur_closure), res);
@@ -2402,7 +2493,7 @@ pub const Vm = struct {
                 if (r.isObject()) rt.heap.storeObjectProto(r.asObject(), inst.proto);
                 break :blk r;
             };
-            vm.frames.items[vm.frames.items.len - 1].this = res;
+            vm.frames.items[vm.frames.items.len - 1].this_opt = OptValue.some(res);
             vm.stack[base] = res;
             vm.sp = base + 1;
             try builtins.runInstanceInits(rt, @constCast(cur_closure), res);
@@ -2430,7 +2521,7 @@ pub const Vm = struct {
         const v: Value = if (cur_f.proto.has_super_ctor) blk: {
             if (ret_v.isObjectLike()) break :blk ret_v;
             if (ret_v.isUndefined()) {
-                break :blk cur_f.this orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
+                break :blk cur_f.thisVal() orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
             }
             return rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
         } else if (!ret_v.isObjectLike())
@@ -2439,9 +2530,8 @@ pub const Vm = struct {
             ret_v;
         const f = vm.frames.pop().?;
         if (f.is_super_call) {
-            vm.frames.items[vm.frames.items.len - 1].this = v;
+            vm.frames.items[vm.frames.items.len - 1].this_opt = OptValue.some(v);
         }
-        if (vm.chain) |cx| cx.call_depth -= 1;
         vm.locals_len = f.locals_base;
         vm.reserved -= f.proto.slot_count + f.proto.max_stack;
         vm.stack[f.result_index] = v;
@@ -2454,28 +2544,30 @@ pub const Vm = struct {
         }
     }
 
+    noinline fn coerceThisSlow(vm: *Vm, t: Value) Error!Value {
+        @branchHint(.cold);
+        return (try builtins.coerceThis(vm.rt, t, false)).?;
+    }
+
     /// Fast-path frame entry for normal (non-construct, non-async) JS→JS calls (D86).
-    /// Out-of-line with 6 register args (no FrameCache pointer) so `runLoop` keeps `cache` in registers.
-    /// Returns the new frame's `locals_base` so `.call` can update `cache` directly without reloading the frame.
-    noinline fn enterCall(vm: *Vm, c: *const Closure, callee: *const Proto, base: u32, argc: u32, return_pc: u32) Error!u32 {
+    /// Out-of-line with register args (no FrameCache pointer, no sret) so `runLoop` keeps `cache` in registers.
+    noinline fn enterCall(vm: *Vm, c: *const Closure, callee: *const Proto, base: u32, argc: u32, return_pc: u32, is_method: bool) Error!void {
         c.obj.checkLive();
         const args = vm.sp - argc;
-        const this: ?Value = if (base + 1 < args) vm.stack[base] else null;
-        const effective_this: ?Value = if (callee.is_arrow)
-            (if (c.meta) |m| m.lexical_this else null)
-        else if (callee.is_strict)
-            (this orelse .undefined)
-        else if (this) |t|
-            (if (t.isObject()) t else if (t.isUndefined() or t.isNull()) null else try builtins.coerceThis(vm.rt, t, false))
-        else
-            null;
-        const limits = vm.rt.limits;
-        if (vm.chain) |cx| {
-            if (cx.call_depth >= limits.max_call_depth) return vm.rt.limit(.call_depth);
-        } else if (vm.frames.items.len >= limits.max_call_depth) return vm.rt.limit(.call_depth);
+        const effective_this: OptValue = if (callee.is_arrow)
+            (if (c.meta) |m| OptValue.from(m.lexical_this) else .none)
+        else if (!is_method)
+            (if (callee.is_strict) OptValue.some(.undefined) else .none)
+        else blk: {
+            const t = vm.stack[base];
+            if (callee.is_strict or t.isObjectLike()) break :blk OptValue.some(t);
+            if (t.isNullish()) break :blk .none;
+            break :blk OptValue.some(try vm.coerceThisSlow(t));
+        };
+        if (vm.frames.items.len >= vm.frame_limit) return vm.rt.limit(.call_depth);
         const slot_count = callee.slot_count;
         const max_stack = callee.max_stack;
-        if (vm.reserved + slot_count + max_stack > limits.max_stack_slots) return vm.rt.limit(.stack_slots);
+        if (vm.reserved + slot_count + max_stack > vm.rt.limits.max_stack_slots) return vm.rt.limit(.stack_slots);
         if (vm.frames.items.len == vm.frames.capacity) try vm.growFrames();
         const locals_base = vm.locals_len;
         const need_locals = @as(usize, locals_base) + slot_count;
@@ -2483,7 +2575,16 @@ pub const Vm = struct {
         if (build_options.stack_stress or need_locals > vm.locals.len or @as(usize, stack_end) > vm.stack.len) {
             try vm.reserve(callee);
         }
-        vm.initLocals(callee, vm.stack[args..][0..argc]);
+        const dst = vm.locals[locals_base..][0..slot_count];
+        const pc_n = callee.param_count;
+        if (callee.param_slot == 0 and argc >= pc_n) {
+            for (dst[0..pc_n], vm.stack[args..][0..pc_n]) |*s, arg| s.* = Slot.fromValue(arg);
+            if (pc_n < slot_count) {
+                for (dst[pc_n..]) |*s| s.* = .uninit;
+            }
+        } else {
+            vm.initLocalsSlow(locals_base, callee, vm.stack[args..][0..argc]);
+        }
         vm.frames.appendAssumeCapacity(.{
             .proto = callee,
             .closure = c,
@@ -2491,7 +2592,7 @@ pub const Vm = struct {
             .locals_base = locals_base,
             .stack_base = vm.sp,
             .result_index = base,
-            .this = effective_this,
+            .this_opt = effective_this,
             .stack_end = stack_end,
             .args_start = args,
             .argc = argc,
@@ -2501,8 +2602,6 @@ pub const Vm = struct {
         });
         vm.locals_len = locals_base + slot_count;
         vm.reserved += slot_count + max_stack;
-        if (vm.chain) |cx| cx.call_depth += 1;
-        return locals_base;
     }
 
     /// Enters closure `c`: its `argc` arguments start at `stack[args]`, and the result will
@@ -2523,9 +2622,7 @@ pub const Vm = struct {
         // 1. limits — a chained VM checks the chain's shared depth (D51 #2: every VM's
         // frames plus every native record, one `max_call_depth` across the chain); a
         // chain-less VM (the CLI) checks its own frames.
-        if (vm.chain) |cx| {
-            if (cx.call_depth >= limits.max_call_depth) return vm.rt.limit(.call_depth);
-        } else if (vm.frames.items.len >= limits.max_call_depth) return vm.rt.limit(.call_depth);
+        if (vm.frames.items.len >= vm.frame_limit) return vm.rt.limit(.call_depth);
         if (vm.reserved + callee.slot_count + callee.max_stack > limits.max_stack_slots) return vm.rt.limit(.stack_slots);
         // 2. capacity (may move the stacks: fine, everything is an index)
         if (vm.frames.items.len == vm.frames.capacity) try vm.growFrames();
@@ -2544,7 +2641,7 @@ pub const Vm = struct {
             .locals_base = vm.locals_len,
             .stack_base = vm.sp,
             .result_index = base,
-            .this = effective_this,
+            .this_opt = OptValue.from(effective_this),
             .stack_end = stack_end,
             .args_start = args,
             .argc = argc,
@@ -2555,7 +2652,6 @@ pub const Vm = struct {
         vm.locals_len += callee.slot_count;
         vm.reserved += callee.slot_count + callee.max_stack;
         vm.pc = 0;
-        if (vm.chain) |cx| cx.call_depth += 1; // the frame is live now (D51 #2)
         if (is_construct and !callee.has_super_ctor) {
             try builtins.runInstanceInits(vm.rt, @constCast(c), Value.fromObject(construct_instance.?));
         }
@@ -2573,9 +2669,7 @@ pub const Vm = struct {
         }
         const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else if (is_construct) this else try builtins.coerceThis(vm.rt, this, callee.is_strict);
         const limits = vm.rt.limits;
-        if (vm.chain) |cx| {
-            if (cx.call_depth >= limits.max_call_depth) return vm.rt.limit(.call_depth);
-        } else if (vm.frames.items.len >= limits.max_call_depth) return vm.rt.limit(.call_depth);
+        if (vm.frames.items.len >= vm.frame_limit) return vm.rt.limit(.call_depth);
         const argc: u32 = @intCast(args_slice.len);
         if (vm.reserved + callee.slot_count + callee.max_stack > limits.max_stack_slots) return vm.rt.limit(.stack_slots);
         if (vm.frames.items.len == vm.frames.capacity) try vm.growFrames();
@@ -2595,7 +2689,7 @@ pub const Vm = struct {
             .locals_base = vm.locals_len,
             .stack_base = vm.sp,
             .result_index = base,
-            .this = effective_this,
+            .this_opt = OptValue.from(effective_this),
             .stack_end = vm.stackEnd(callee),
             .args_start = args_start,
             .argc = argc,
@@ -2606,7 +2700,6 @@ pub const Vm = struct {
         vm.locals_len += callee.slot_count;
         vm.reserved += callee.slot_count + callee.max_stack;
         vm.pc = 0;
-        if (vm.chain) |cx| cx.call_depth += 1;
         if (is_construct and !callee.has_super_ctor) {
             try builtins.runInstanceInits(vm.rt, @constCast(c), Value.fromObject(construct_instance.?));
         }
@@ -2671,6 +2764,14 @@ pub const Vm = struct {
             if (pc < p.slot_count) @memset(dst[pc..], .uninit);
             return;
         }
+        vm.initLocalsSlow(vm.locals_len, p, args);
+    }
+
+    noinline fn initLocalsSlow(vm: *Vm, locals_base: u32, p: *const Proto, args: []const Value) void {
+        @branchHint(.cold);
+        const dst = vm.locals[locals_base..][0..p.slot_count];
+        const ps = p.param_slot;
+        const pc = p.param_count;
         const pe = ps + pc;
         const copy_n = @min(pc, args.len);
         if (ps > 0) @memset(dst[0..ps], .uninit);
@@ -2690,7 +2791,7 @@ pub const Vm = struct {
         return c;
     }
 
-    fn capture(vm: *const Vm, i: u32) Error!*Cell {
+    inline fn capture(vm: *const Vm, i: u32) Error!*Cell {
         const c = vm.frame().closure orelse return vm.bug("capture access in the script");
         const caps = c.impl.vm.captures;
         if (i >= caps.len) return vm.bug("capture index out of range");
@@ -2744,7 +2845,6 @@ pub const Vm = struct {
         };
         while (vm.frames.items.len - 1 > target_frame) {
             const popped = vm.frames.pop().?;
-            if (vm.chain) |cx| cx.call_depth -= 1;
             vm.locals_len = popped.locals_base;
             vm.reserved -= popped.proto.slot_count + popped.proto.max_stack;
         }

@@ -238,9 +238,6 @@ pub const Runtime = struct {
     host_message_truncated: bool = false,
     /// The built-in objects, created on first use (builtins.zig).
     realm: ?@import("builtins.zig").Realm = null,
-    /// Direct-mapped monomorphic property inline cache (M52/M58, D82/D88): stores shape ids,
-    /// atom address (never dereferenced), slot index, and hit kind (zero GC pointers).
-    prop_ic: [1024][2]PropIc = @splat(@splat(.{})),
     /// Arrays being converted to strings right now (cycle detection, object.join).
     joining: std.ArrayList(*heap_mod.Object) = .empty,
     /// The running engine's roots (its stacks and frames), marked by `collect` (D8).
@@ -284,6 +281,9 @@ pub const Runtime = struct {
     /// Step budget counter and limit kept adjacent (same cache line, away from heap buffer page offsets).
     steps: u64 = 0,
     max_steps: u64,
+    /// Direct-mapped monomorphic property inline cache (M52/M58, D82/D88): placed at the end
+    /// so `heap`, `steps`, and `max_steps` stay within small immediate offsets of `*Runtime`.
+    prop_ic: [1024][2]PropIc = @splat(@splat(.{})),
 
     pub const default_random_seed: u64 = 0x9e3779b97f4a7c15;
 

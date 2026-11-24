@@ -12,23 +12,23 @@ At the M10 checkpoint (`05c0c7a`, see `ROADMAP.md` and `bench/suite/baseline-qjs
 - **Objects, fib, loops, arrays, calls:** `1.66×–2.33×` QuickJS
 - **C-ABI throughput:** `~6.59M calls/s` (`js_to_c_native`), `~4.87M trips/s` (`host_js_c_js_roundtrip`), `18.0 µs` p50 per frame on `frame_loop_3600`
 
-### M52–M65 Checkpoints (D82–D89 + Post-M59 VM/Shape Opts — Geomean `0.74×` QuickJS!)
+### M52–M66 Checkpoints (D82–D89 + Post-M59 VM/Shape Opts — Geomean `0.74×` QuickJS!)
 
-After M52–M59 (D82–D89), ZQJS reached QuickJS parity (`0.96×` geometric mean, game-loop GC peak RAM down **40–65%**, C-ABI `frame_loop_3600` p50 `18.0 µs → 11.0 µs`). Subsequent VM call/return, property-IC, fused arithmetic, and shape-transition optimizations through `d3e40d6` (measured via `python3 tools/bench_compare.py`, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`) brought the **geometric mean across all 11 CLI benchmarks down to `0.74×` QuickJS** (`0.39×–1.03×`, beating QuickJS on **10 of 11** workloads, with C-ABI `frame_loop_3600` p50 `12.0 µs` on battery power):
+After M52–M59 (D82–D89), ZQJS reached QuickJS parity (`0.96×` geometric mean, game-loop GC peak RAM down **40–65%**, C-ABI `frame_loop_3600` p50 `18.0 µs → 11.0 µs`). Subsequent VM call/return, property-IC, fused arithmetic, and shape-transition optimizations through `499860e` (measured on AC power via `python3 tools/bench_compare.py`, Apple M4, Zig `0.17.1` `ReleaseFast`, QuickJS `2026-06-04`) brought the **geometric mean across all 11 CLI benchmarks down to `0.74×` QuickJS** (`0.39×–1.01×`, beating QuickJS on **10 of 11** workloads, with C-ABI `js_to_c_native` `7.63M calls/s` and `frame_loop_3600` p50 `12.0 µs`):
 
-| Benchmark | Pre-M52 (`zqjs/qjs`) | M59 (`zqjs/qjs`) | **Post-`d3e40d6` (`zqjs/qjs`)** | ZQJS CLI med |
+| Benchmark | Pre-M52 (`zqjs/qjs`) | M59 (`zqjs/qjs`) | **M66 (`zqjs/qjs`)** | ZQJS CLI med |
 |---|---:|---:|---:|---:|
-| `closures.js` | `0.77×` (95.2 ms) | `0.50×` (60.7 ms) | **`0.39×`** | **49.33 ms** (2.6× faster than QJS, -48%) |
-| `branch_dense.js` | `1.91×` (200.8 ms) | `0.70×` (73.8 ms) | **`0.59×`** | **61.63 ms** (41% faster than QJS, -69%) |
-| `int_loop.js` | `2.07×` (141.9 ms) | `0.89×` (60.1 ms) | **`0.62×`** | **42.34 ms** (38% faster than QJS, -70%) |
-| `scopes.js` | `2.38×` (84.1 ms) | `1.04×` (36.4 ms) | **`0.68×`** | **23.51 ms** (32% faster than QJS, -72%) |
-| `float_math.js` | `2.14×` (286.7 ms) | `1.05×` (139.5 ms) | **`0.70×`** | **94.76 ms** (30% faster than QJS, -67%) |
-| `fib.js` | `1.90×` (64.3 ms) | `1.13×` (36.9 ms) | **`0.77×`** | **25.70 ms** (23% faster than QJS, -60%) |
-| `arrays.js` | `2.42×` (400.0 ms) | `0.94×` (155.6 ms) | **`0.87×`** | **143.55 ms** (13% faster than QJS, -64%) |
-| `global_reads.js` | `2.61×` (64.4 ms) | `1.19×` (28.7 ms) | **`0.87×`** | **21.78 ms** (13% faster than QJS, -66%) |
-| `call_chain.js` | `2.37×` (122.0 ms) | `1.27×` (64.5 ms) | **`0.96×`** | **49.38 ms** (4% faster than QJS, -60%) |
-| `objects.js` | `2.37×` (75.4 ms) | `1.19×` (38.0 ms) | **`0.97×`** | **31.55 ms** (3% faster than QJS, -58%) |
-| `strings.js` | `2.31×` (26.3 ms) | `1.02×` (12.4 ms) | **`1.03×`** | **11.93 ms** (-55%) |
+| `closures.js` | `0.77×` (95.2 ms) | `0.50×` (60.7 ms) | **`0.39×`** | **48.90 ms** (2.5× faster than QJS, -49%) |
+| `branch_dense.js` | `1.91×` (200.8 ms) | `0.70×` (73.8 ms) | **`0.58×`** | **61.03 ms** (42% faster than QJS, -70%) |
+| `int_loop.js` | `2.07×` (141.9 ms) | `0.89×` (60.1 ms) | **`0.62×`** | **42.55 ms** (38% faster than QJS, -70%) |
+| `scopes.js` | `2.38×` (84.1 ms) | `1.04×` (36.4 ms) | **`0.69×`** | **24.42 ms** (31% faster than QJS, -71%) |
+| `float_math.js` | `2.14×` (286.7 ms) | `1.05×` (139.5 ms) | **`0.70×`** | **93.61 ms** (30% faster than QJS, -67%) |
+| `fib.js` | `1.90×` (64.3 ms) | `1.13×` (36.9 ms) | **`0.78×`** | **25.73 ms** (22% faster than QJS, -60%) |
+| `global_reads.js` | `2.61×` (64.4 ms) | `1.19×` (28.7 ms) | **`0.88×`** | **21.42 ms** (12% faster than QJS, -67%) |
+| `arrays.js` | `2.42×` (400.0 ms) | `0.94×` (155.6 ms) | **`0.90×`** | **148.61 ms** (10% faster than QJS, -63%) |
+| `call_chain.js` | `2.37×` (122.0 ms) | `1.27×` (64.5 ms) | **`0.93×`** | **47.20 ms** (7% faster than QJS, -61%) |
+| `objects.js` | `2.37×` (75.4 ms) | `1.19×` (38.0 ms) | **`0.97×`** | **30.88 ms** (3% faster than QJS, -59%) |
+| `strings.js` | `2.31×` (26.3 ms) | `1.02×` (12.4 ms) | **`1.01×`** | **12.21 ms** (-54%) |
 | **Geomean (11 CLI)** | `2.03×` | `0.96×` | **`0.74×`** | **10/11 faster than QJS** |
 
 *Note:* Labeled-switch threaded dispatch with `noinline` cold handlers and expanding `FrameCache` with `stack`/`locals` pointers both regressed due to register spilling and I-cache bloat, and were reverted per §5.

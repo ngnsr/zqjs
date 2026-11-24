@@ -30,17 +30,17 @@ CLI-to-CLI end-to-end medians (startup + parse + compile + execute, 11 alternati
 
 | Benchmark | ZQJS med | QuickJS med | Ratio (`zqjs/qjs`) |
 |---|---:|---:|---:|
-| `closures.js` | **49.3 ms** | 126.8 ms | **`0.39×`** (2.6× faster) |
-| `branch_dense.js` | **61.6 ms** | 104.3 ms | **`0.59×`** (41% faster) |
-| `int_loop.js` | **42.3 ms** | 67.8 ms | **`0.62×`** (38% faster) |
-| `scopes.js` | **23.5 ms** | 34.6 ms | **`0.68×`** (32% faster) |
-| `float_math.js` | **94.8 ms** | 134.9 ms | **`0.70×`** (30% faster) |
-| `fib.js` | **25.7 ms** | 33.3 ms | **`0.77×`** (23% faster) |
-| `arrays.js` | **143.6 ms** | 165.9 ms | **`0.87×`** (13% faster) |
-| `global_reads.js` | **21.8 ms** | 25.2 ms | **`0.87×`** (13% faster) |
-| `call_chain.js` | **49.4 ms** | 51.6 ms | **`0.96×`** (4% faster) |
-| `objects.js` | **31.6 ms** | 32.5 ms | **`0.97×`** (3% faster) |
-| `strings.js` | 11.9 ms | **11.5 ms** | `1.03×` |
+| `closures.js` | **48.9 ms** | 123.9 ms | **`0.39×`** (2.5× faster) |
+| `branch_dense.js` | **61.0 ms** | 104.8 ms | **`0.58×`** (42% faster) |
+| `int_loop.js` | **42.6 ms** | 69.1 ms | **`0.62×`** (38% faster) |
+| `scopes.js` | **24.4 ms** | 35.3 ms | **`0.69×`** (31% faster) |
+| `float_math.js` | **93.6 ms** | 133.4 ms | **`0.70×`** (30% faster) |
+| `fib.js` | **25.7 ms** | 33.2 ms | **`0.78×`** (22% faster) |
+| `global_reads.js` | **21.4 ms** | 24.5 ms | **`0.88×`** (12% faster) |
+| `arrays.js` | **148.6 ms** | 165.9 ms | **`0.90×`** (10% faster) |
+| `call_chain.js` | **47.2 ms** | 50.8 ms | **`0.93×`** (7% faster) |
+| `objects.js` | **30.9 ms** | 31.7 ms | **`0.97×`** (3% faster) |
+| `strings.js` | 12.2 ms | **12.1 ms** | `1.01×` |
 | **Geometric mean** | — | — | **`0.74×`** |
 
 **C-ABI embedding throughput (`zig build bench-c`):**

@@ -2586,8 +2586,10 @@ const Parser = struct {
                     const eq_tok = p.tok;
                     try p.advance();
                     const def = try p.nestedAssignment();
-                    if (!has_cover_init) p.cover_init_span = span(eq_tok, eq_tok);
-                    has_cover_init = true;
+                    if (!p.allow_cover_init) {
+                        if (!has_cover_init) p.cover_init_span = span(eq_tok, eq_tok);
+                        has_cover_init = true;
+                    }
                     const id = p.ref_count;
                     p.ref_count += 1;
                     const ref: ast.Ref = .{ .name = k.name, .span = span(t, t), .id = id };
@@ -3618,11 +3620,14 @@ const Parser = struct {
 
             const outer_async_ctx = p.async_ctx;
             const outer_yield_ctx = p.yield_ctx;
+            const outer_param_class_method = p.in_class_method;
             p.async_ctx = if (is_async) .params else .none;
             p.yield_ctx = if (is_generator) .params else .none;
+            p.in_class_method = true;
             defer {
                 p.async_ctx = outer_async_ctx;
                 p.yield_ctx = outer_yield_ctx;
+                p.in_class_method = outer_param_class_method;
             }
             const params = try p.parseParams();
             if (method_kind != .method) {

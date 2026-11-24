@@ -714,3 +714,5 @@
 ["ok", "async function fn() { for await ([{ x = yield }] of [[{}]]) {} }"]
 ["ok", "const o = { m() { return super.a; }, get g() { return super[0]; }, set s(v) { super.a = v; } };"]
 ["syntax", "const o = { m() { return super(); } };"]
+["ok", "class A { m() { return 1; } } class B extends A { async m(x = super.m()) { return x; } }"]
+["ok", "for (var { cover = (function() {}) } of [{}]) {}"]

@@ -323,13 +323,15 @@ pub fn dataViewConstruct(rt: *Runtime, args: []const Value) Error!Value {
     const ab = buf_val.asObject().kind.array_buffer;
     if (ab.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot construct DataView on a detached ArrayBuffer" }});
     if (offset > ab.data.len) return rt.throw(.RangeError, &.{.{ .ascii = "Start offset is outside the bounds of the buffer" }});
-    const view_byte_len: usize = if (common.arg(args, 2).isUndefined())
-        ab.data.len - offset
-    else blk: {
+    const view_byte_len: usize = if (common.arg(args, 2).isUndefined()) blk: {
+        if (buf_val.asObject().kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot construct DataView on a detached ArrayBuffer" }});
+        break :blk buf_val.asObject().kind.array_buffer.data.len - offset;
+    } else blk: {
         const l = try toIndex(rt, common.arg(args, 2));
-        if (ab.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot construct DataView on a detached ArrayBuffer" }});
+        if (buf_val.asObject().kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot construct DataView on a detached ArrayBuffer" }});
+        const cur_len = buf_val.asObject().kind.array_buffer.data.len;
         const end = std.math.add(usize, offset, l) catch return rt.throw(.RangeError, &.{.{ .ascii = "Invalid DataView length" }});
-        if (end > ab.data.len) return rt.throw(.RangeError, &.{.{ .ascii = "Invalid DataView length" }});
+        if (end > cur_len) return rt.throw(.RangeError, &.{.{ .ascii = "Invalid DataView length" }});
         break :blk l;
     };
     const vr = try viewsRealm(rt);
@@ -708,27 +710,27 @@ fn typedArrayConstructKind(rt: *Runtime, kind: heap_mod.TypedArrayKind, args: []
             defer roots.unregister(rt);
             const bpe = kind.bytesPerElement();
             const offset = try toIndex(rt, common.arg(args, 1));
+            if (arg0.asObject().kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
             if (offset % bpe != 0) {
                 return rt.throw(.RangeError, &.{.{ .ascii = "Start offset of TypedArray should be a multiple of element size" }});
             }
-            const ab = arg0.asObject().kind.array_buffer;
-            if (ab.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
             const new_len: usize = if (common.arg(args, 2).isUndefined()) blk: {
-                if (ab.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
-                const buf_len = ab.data.len;
+                if (arg0.asObject().kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
+                const buf_len = arg0.asObject().kind.array_buffer.data.len;
                 if (buf_len % bpe != 0 or offset > buf_len) {
                     return rt.throw(.RangeError, &.{.{ .ascii = "Byte length of TypedArray should be a multiple of element size" }});
                 }
                 break :blk (buf_len - offset) / bpe;
             } else blk: {
                 const l = try toIndex(rt, common.arg(args, 2));
-                if (ab.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
-                const buf_len = ab.data.len;
+                if (arg0.asObject().kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
+                const buf_len = arg0.asObject().kind.array_buffer.data.len;
                 const needed = std.math.mul(usize, l, bpe) catch return rt.throw(.RangeError, &.{.{ .ascii = "Invalid typed array length" }});
                 const end = std.math.add(usize, offset, needed) catch return rt.throw(.RangeError, &.{.{ .ascii = "Invalid typed array length" }});
                 if (end > buf_len) return rt.throw(.RangeError, &.{.{ .ascii = "Invalid typed array length" }});
                 break :blk l;
             };
+            if (arg0.asObject().kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
             return Value.fromObject(try rt.heap.newTypedArray(proto, arg0.asObject(), kind, offset, new_len));
         },
         else => {
@@ -737,8 +739,12 @@ fn typedArrayConstructKind(rt: *Runtime, kind: heap_mod.TypedArrayKind, args: []
             try roots.register(rt);
             defer roots.unregister(rt);
 
-            if (try object.getMethod(rt, arg0, .{ .symbol = r.sym_iterator })) |iter_fn| {
-                const arr = try collectIterableToArray(rt, arg0, iter_fn);
+            const iter_prop = try object.get(rt, arg0, .{ .symbol = r.sym_iterator });
+            if (!iter_prop.isUndefined() and !iter_prop.isNull()) {
+                if (!iter_prop.isFunction()) {
+                    return rt.throw(.TypeError, &.{.{ .ascii = "Iterator is not a function" }});
+                }
+                const arr = try collectIterableToArray(rt, arg0, iter_prop);
                 root_buf[1] = Value.fromObject(arr);
                 const len = arr.kind.array.items.len;
                 const dst = try allocateTypedArray(rt, kind, len);
@@ -840,10 +846,19 @@ fn taFrom(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn taOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const kind = constructorTypedArrayKind(this) orelse {
-        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray.of requires a TypedArray constructor" }});
+    if (!function_error.isConstructor(this)) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray.of requires a constructor" }});
+    }
+    const dst = if (constructorTypedArrayKind(this)) |kind| blk: {
+        break :blk try allocateTypedArray(rt, kind, args.len);
+    } else blk: {
+        const res = try proxy_reflect.constructWithNewTarget(rt, this, &.{Value.fromNumber(@floatFromInt(args.len))}, this);
+        const obj = try requireLiveTypedArray(rt, res);
+        if (obj.kind.typed_array.length < args.len) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Derived TypedArray constructor created an array that was too small" }});
+        }
+        break :blk obj;
     };
-    const dst = try allocateTypedArray(rt, kind, args.len);
     var root_buf = [_]Value{Value.fromObject(dst)};
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);

@@ -1609,8 +1609,16 @@ pub const Vm = struct {
                                 @branchHint(.unlikely);
                                 return rt.throw(.TypeError, &.{.{ .ascii = "Class constructor cannot be invoked without 'new'" }});
                             } else {
-                                try vm.enterCall(c, callee_proto, base, args, argc, next, receiver);
-                                cache.* = FrameCache.fromVm(vm, 0);
+                                const locals_base = try vm.enterCall(c, callee_proto, base, argc, next);
+                                cache.* = .{
+                                    .p = callee_proto,
+                                    .code = callee_proto.code,
+                                    .pc = 0,
+                                    .sp = cache.sp,
+                                    .stack_base = cache.sp,
+                                    .stack_limit = cache.sp + callee_proto.max_stack,
+                                    .locals_base = locals_base,
+                                };
                                 return .running; // pc is the callee's 0
                             }
                         },
@@ -1642,13 +1650,15 @@ pub const Vm = struct {
                 const ret_v = try cache.peek(vm, 0);
                 const cur_f = vm.frame();
                 if (!cur_f.is_construct) {
-                    const f = vm.frames.pop().?;
+                    const return_pc = cur_f.return_pc;
+                    const result_index = cur_f.result_index;
+                    vm.frames.items.len -= 1;
                     if (vm.chain) |cx| cx.call_depth -= 1; // the frame died (D51 #2)
-                    vm.locals_len = f.locals_base;
-                    vm.reserved -= f.proto.slot_count + f.proto.max_stack;
-                    vm.stack[f.result_index] = ret_v; // replaces the callee (and receiver); arguments and callee operands are gone
-                    vm.sp = f.result_index + 1;
-                    cache.* = FrameCache.fromVm(vm, f.return_pc);
+                    vm.locals_len = cache.locals_base;
+                    vm.reserved -= cache.p.slot_count + cache.p.max_stack;
+                    vm.stack[result_index] = ret_v; // replaces the callee (and receiver); arguments and callee operands are gone
+                    vm.sp = result_index + 1;
+                    cache.* = FrameCache.fromVm(vm, return_pc);
                     return .running;
                 }
                 cache.syncSp(vm);
@@ -2418,17 +2428,20 @@ pub const Vm = struct {
     }
 
     /// Fast-path frame entry for normal (non-construct, non-async) JS→JS calls (D86).
-    /// Out-of-line with <= 8 register args (no FrameCache pointer) so `runLoop` keeps `cache` in registers.
-    noinline fn enterCall(vm: *Vm, c: *const Closure, callee: *const Proto, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value) Error!void {
+    /// Out-of-line with 6 register args (no FrameCache pointer) so `runLoop` keeps `cache` in registers.
+    /// Returns the new frame's `locals_base` so `.call` can update `cache` directly without reloading the frame.
+    noinline fn enterCall(vm: *Vm, c: *const Closure, callee: *const Proto, base: u32, argc: u32, return_pc: u32) Error!u32 {
         c.obj.checkLive();
+        const args = vm.sp - argc;
+        const this: ?Value = if (base + 1 < args) vm.stack[base] else null;
         const effective_this: ?Value = if (callee.is_arrow)
             (if (c.meta) |m| m.lexical_this else null)
         else if (callee.is_strict)
             (this orelse .undefined)
-        else if (this != null and this.?.isObject())
-            this
+        else if (this) |t|
+            (if (t.isObject()) t else if (t.isUndefined() or t.isNull()) null else try builtins.coerceThis(vm.rt, t, false))
         else
-            try builtins.coerceThis(vm.rt, this, false);
+            null;
         const limits = vm.rt.limits;
         if (vm.chain) |cx| {
             if (cx.call_depth >= limits.max_call_depth) return vm.rt.limit(.call_depth);
@@ -2462,6 +2475,7 @@ pub const Vm = struct {
         vm.locals_len = locals_base + slot_count;
         vm.reserved += slot_count + max_stack;
         if (vm.chain) |cx| cx.call_depth += 1;
+        return locals_base;
     }
 
     /// Enters closure `c`: its `argc` arguments start at `stack[args]`, and the result will
@@ -2624,11 +2638,17 @@ pub const Vm = struct {
         std.debug.assert(@as(u64, p.param_slot) + p.param_count <= p.slot_count);
         const dst = vm.locals[vm.locals_len..][0..p.slot_count];
         const ps = p.param_slot;
-        const pe = ps + p.param_count;
-        const copy_n = @min(p.param_count, args.len);
+        const pc = p.param_count;
+        if (ps == 0 and args.len >= pc) {
+            for (dst[0..pc], args[0..pc]) |*s, arg| s.* = Slot.fromValue(arg);
+            if (pc < p.slot_count) @memset(dst[pc..], .uninit);
+            return;
+        }
+        const pe = ps + pc;
+        const copy_n = @min(pc, args.len);
         if (ps > 0) @memset(dst[0..ps], .uninit);
         for (dst[ps..][0..copy_n], args[0..copy_n]) |*s, arg| s.* = Slot.fromValue(arg);
-        if (copy_n < p.param_count) @memset(dst[ps + copy_n .. pe], Slot.fromValue(.undefined));
+        if (copy_n < pc) @memset(dst[ps + copy_n .. pe], Slot.fromValue(.undefined));
         if (pe < p.slot_count) @memset(dst[pe..], .uninit);
     }
 

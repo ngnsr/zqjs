@@ -711,3 +711,6 @@
 ["syntax", "void 2 ** 2;"]
 ["syntax", "void ({ a = 1 });"]
 ["ok", "function* g() { (function yield() {}) }"]
+["ok", "async function fn() { for await ([{ x = yield }] of [[{}]]) {} }"]
+["ok", "const o = { m() { return super.a; }, get g() { return super[0]; }, set s(v) { super.a = v; } };"]
+["syntax", "const o = { m() { return super(); } };"]

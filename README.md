@@ -6,10 +6,10 @@ Designed for host-controlled scripting (games, plugins, tools, sandboxed automat
 
 ## Highlights
 
-- **Faster than QuickJS on average (`0.96×` geomean):** Pure bytecode interpreter (no JIT / no RWX) with 8-byte NaN-boxed values, Shapes (hidden classes), inline caches, and fused superinstructions.
+- **Faster than QuickJS (`0.74×` geomean, 10 of 11 benchmarks faster):** Pure bytecode interpreter (no JIT / no RWX) with 8-byte NaN-boxed values, 64-byte frames, Shapes (hidden classes), inline caches, and fused superinstructions.
 - **Zero dependencies & compact footprint:** Pure Zig (`0.17.1`), `2.2 MB` stripped `ReleaseFast` CLI (`1.5 MB` `ReleaseSmall`). Embedders (`@import("zqjs")` / `libzqjs.a`) link only the engine.
 - **Modern JavaScript (ES2025 core):** Classes & private fields, closures, generators, `async`/`await`, ES Modules, `BigInt`, `Symbol`, `Proxy`/`Reflect`, `Map`/`Set`/`WeakMap`/`WeakSet`, `ArrayBuffer`/`TypedArray`/`DataView`, `RegExp`, `Date`, `Promise`, `JSON`, and `structuredClone` ([LANGUAGE.md](LANGUAGE.md)).
-- **Explicit Compatibility Contract & Test262 Verified:** Unsupported features report `Unsupported(<feature>)` cleanly instead of silently misbehaving. Verified against **39,768 Test262 tests** (**`34,595` PASS** — `88.85%` of all `language` tests, `84.48%` of `built-ins`, `97.27%` of applicable tests, **0 crashes / 0 internal errors / 0 timeouts** — [TEST262.md](TEST262.md)).
+- **Explicit Compatibility Contract & Test262 Verified:** Unsupported features report `Unsupported(<feature>)` cleanly instead of silently misbehaving. Verified against **39,768 Test262 tests** (**`34,997` PASS** — `89.29%` of all `language` tests, `86.26%` of `built-ins`, **`97.98%`** of applicable tests, **0 crashes / 0 internal errors / 0 timeouts** — [TEST262.md](TEST262.md)).
 - **Generational GC & Hard Sandboxing:** Non-moving generational GC (~0.06 ms p95 minor pauses at 100k–1M live objects), cooperative step slicing, and hard caps on heap, call depth, stack, strings, and `BigInt` ([GC_DESIGN.md](GC_DESIGN.md)).
 - **Embeddable & Interactive:** Opaque Zig API, C11 ABI (`include/zqjs.h`), differential tree-walker oracle (`--engine=treewalk`), and an interactive REPL with syntax highlighting, `Tab` completion, and `Ctrl-R` history.
 
@@ -30,18 +30,18 @@ CLI-to-CLI end-to-end medians (startup + parse + compile + execute, 11 alternati
 
 | Benchmark | ZQJS med | QuickJS med | Ratio (`zqjs/qjs`) |
 |---|---:|---:|---:|
-| `closures.js` | **62.0 ms** | 123.7 ms | **`0.50×`** (2× faster) |
-| `branch_dense.js` | **71.8 ms** | 103.0 ms | **`0.70×`** (30% faster) |
-| `int_loop.js` | **60.3 ms** | 68.4 ms | **`0.88×`** (12% faster) |
-| `arrays.js` | **155.8 ms** | 165.5 ms | **`0.94×`** (6% faster) |
-| `strings.js` | **11.8 ms** | 12.1 ms | **`0.98×`** (2% faster) |
-| `scopes.js` | 36.3 ms | **35.4 ms** | `1.03×` |
-| `float_math.js` | 140.5 ms | **134.2 ms** | `1.05×` |
-| `fib.js` | 37.4 ms | **33.1 ms** | `1.13×` |
-| `objects.js` | 39.3 ms | **33.0 ms** | `1.19×` |
-| `global_reads.js` | 29.2 ms | **24.4 ms** | `1.20×` |
-| `call_chain.js` | 65.6 ms | **50.6 ms** | `1.30×` |
-| **Geometric mean** | — | — | **`0.96×`** |
+| `closures.js` | **49.3 ms** | 126.8 ms | **`0.39×`** (2.6× faster) |
+| `branch_dense.js` | **61.6 ms** | 104.3 ms | **`0.59×`** (41% faster) |
+| `int_loop.js` | **42.3 ms** | 67.8 ms | **`0.62×`** (38% faster) |
+| `scopes.js` | **23.5 ms** | 34.6 ms | **`0.68×`** (32% faster) |
+| `float_math.js` | **94.8 ms** | 134.9 ms | **`0.70×`** (30% faster) |
+| `fib.js` | **25.7 ms** | 33.3 ms | **`0.77×`** (23% faster) |
+| `arrays.js` | **143.6 ms** | 165.9 ms | **`0.87×`** (13% faster) |
+| `global_reads.js` | **21.8 ms** | 25.2 ms | **`0.87×`** (13% faster) |
+| `call_chain.js` | **49.4 ms** | 51.6 ms | **`0.96×`** (4% faster) |
+| `objects.js` | **31.6 ms** | 32.5 ms | **`0.97×`** (3% faster) |
+| `strings.js` | 11.9 ms | **11.5 ms** | `1.03×` |
+| **Geometric mean** | — | — | **`0.74×`** |
 
 **C-ABI embedding throughput (`zig build bench-c`):**
 - `js_to_c_native`: **7.3M–8.3M calls/s** (~120–137 ns/call)
@@ -78,7 +78,7 @@ See [LANGUAGE.md](LANGUAGE.md) for the complete specification and [TEST262.md](T
 
 ```sh
 # Build
-zig build                                        # Debug CLI + libzqjs.a + include/zqjs.h
+zig build                                        # ReleaseSafe (default) CLI + libzqjs.a + include/zqjs.h
 zig build cli -Doptimize=ReleaseFast -Dstrip=true # 2.2 MB stripped fast CLI
 zig build cli -Doptimize=ReleaseSmall            # 1.5 MB auto-stripped compact CLI
 
@@ -93,8 +93,8 @@ zig-out/bin/zqjs --trace -e "print(1 + 2);"      # instruction + operand stack t
 zig-out/bin/zqjs --engine=treewalk program.js    # run on the reference interpreter
 
 # Test & verify
-zig build test -Doptimize=ReleaseSafe --summary all
-zig build test -Dgc-stress -Dstack-stress -Doptimize=ReleaseSafe --summary all
+zig build test --summary all                     # defaults to ReleaseSafe
+zig build test -Dgc-stress -Dstack-stress --summary all
 zig build gc-mutants                             # deliberately broken GC builds must be caught
 zig build check-goldens                          # verify syntax/diff goldens against Node 22
 zig build test --fuzz=100K -Dtest-filter="fuzz: frontend"
@@ -171,8 +171,8 @@ zig build raylib-demo    # interactive GUI window (requires Raylib)
 
 - [EMBEDDING.md](EMBEDDING.md) — Zig & C11 embedding API (lifecycle, handles, step slices, modules, errors)
 - [LANGUAGE.md](LANGUAGE.md) — supported JavaScript subset and Node compatibility contract
-- [TEST262.md](TEST262.md) — ECMAScript Test262 conformance runner and M59 results (39,332 tests)
-- [PERF_PLAN.md](PERF_PLAN.md) — performance architecture, M52–M59 progression, and why JIT is deferred
+- [TEST262.md](TEST262.md) — ECMAScript Test262 conformance runner and results (39,768 executed tests, `34,997` PASS)
+- [PERF_PLAN.md](PERF_PLAN.md) — performance architecture, M52–M65 progression (`0.74×` QuickJS geomean), and why JIT is deferred
 - [ARCHITECTURE.md](ARCHITECTURE.md) — module layout and ownership
 - [GC_DESIGN.md](GC_DESIGN.md) — generational collector, card tables, ephemerons, and verification
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — architectural decision log (D1–D89)

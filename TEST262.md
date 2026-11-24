@@ -43,18 +43,18 @@ ZQJS includes a parallel [tc39/test262](https://github.com/tc39/test262) conform
 
 ---
 
-## Results (M64 — Bounded Sparse Arrays (`Value.hole`), `debugger;`, Unicode Identifiers, Sloppy `this` & Global Writes, Strict Mode, ES2025 Iterator Helpers & `Set` Methods, `Symbol.species`, `RegExp.escape`, `Error.isError`, Thenables, `Array.fromAsync`, `Number` Formatting)
+## Results (M66 — Built-ins Wave 1: Array/Function/`%ThrowTypeError%`/Object/Proxy/RegExp/String + Frontend `CoverInitializedName` & `super` Property Access)
 
-Measured with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
+Measured at `32f497f` with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
 
 | Suite | Collected | Skipped (meta) | Executed | Unsupported | Limit | Applicable | Pass | Fail | Pass / Executed | Pass / Applicable |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `built-ins` | 23,885 | 6,981 | 16,904 | 1,580 | 480 | 14,844 | **14,281** | 563 | **84.48%** | **96.21%** |
-| `language` | 23,832 | 968 | 22,864 | 2,140 | 1 | 20,723 | **20,314** | 409 | **88.85%** | **98.03%** |
-| **Combined** | **47,717** | **7,949** | **39,768** | **3,720** | **481** | **35,567** | **34,595** | **972** | **86.99%** | **97.27%** |
+| `built-ins` | 23,885 | 6,981 | 16,904 | 1,453 | 466 | 14,985 | **14,582** | 403 | **86.26%** | **97.31%** |
+| `language` | 23,832 | 968 | 22,864 | 2,131 | 1 | 20,732 | **20,415** | 317 | **89.29%** | **98.47%** |
+| **Combined** | **47,717** | **7,949** | **39,768** | **3,584** | **467** | **35,717** | **34,997** | **720** | **88.00%** | **97.98%** |
 
 - **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,768 executed tests.
-- Building on M63 (`34,098` PASS), adding bounded sparse arrays with `Value.hole` (`[1,,2]`, `delete a[i]`, `Array(n)`, `a.length = n`, `a[k] = v` up to `2^20` elements across `Array.prototype.*`, `JSON`, `object.zig`, VM, and tree-walker) and `debugger;` no-op statement unlocked **+497** more passes (`34,098 → 34,595`, **97.27%** Pass / Applicable, **88.85%** `language` and **84.48%** `built-ins` Pass / Executed).
+- Building on M64 (`34,595` PASS, `972` FAIL), splitting `src/runtime/builtins.zig` into 12 submodules, fixing Array/Function/`%ThrowTypeError%`/Object/Proxy/RegExp/String spec semantics, and fixing parser `CoverInitializedName` in `for-in`/`for-of`/`for-await-of` + `super` property access in object methods & class method params unlocked **+402** net passes (`34,595 → 34,997`, **97.98%** Pass / Applicable, **88.00%** Pass / Executed, failures reduced `972 → 720`).
 
 ### Built-ins Breakdown (Applicable Tests)
 

@@ -71,12 +71,6 @@ pub fn proxyConstruct(rt: *Runtime, args: []const Value) Error!Value {
     if (!target.isObjectLike() or !handler.isObjectLike()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Cannot create proxy with a non-object as target or handler" }});
     }
-    if (target.isObject() and target.asObject().kind == .proxy and target.asObject().kind.proxy.target == null) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot create proxy with a revoked proxy as target" }});
-    }
-    if (handler.isObject() and handler.asObject().kind == .proxy and handler.asObject().kind.proxy.target == null) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot create proxy with a revoked proxy as handler" }});
-    }
     const is_callable = target.isFunction();
     const is_constructable = function_error.isConstructor(target);
     const px = try rt.heap.newProxy(null, target, handler, is_callable, is_constructable);
@@ -461,17 +455,26 @@ pub fn ownKeysAllValue(rt: *Runtime, target: Value) Error![]object.Key {
             var idx_end: usize = 0;
             while (idx_end < prop_names.len and prop_names[idx_end] == .index) : (idx_end += 1) {}
             try out.appendSlice(rt.gpa, prop_names[0..idx_end]);
-            if (o.kind == .array) {
+            const is_str_wrap = o.kind == .primitive_wrapper and o.kind.primitive_wrapper.isString();
+            if (o.kind == .array or is_str_wrap) {
                 try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("length") });
             } else if (o.kind == .regexp) {
                 try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("lastIndex") });
             }
-            try out.appendSlice(rt.gpa, prop_names[idx_end..]);
+            for (prop_names[idx_end..]) |k| {
+                if (is_str_wrap and object.isNamed(k, "length")) continue;
+                try out.append(rt.gpa, k);
+            }
             const syms = try object.ownSymbolKeys(rt, o, true);
             defer rt.gpa.free(syms);
             for (syms) |s| try out.append(rt.gpa, .{ .symbol = s });
         },
         .closure => |c| {
+            const prop_names = try object.ownPropertyNamesClosure(rt, c);
+            defer rt.gpa.free(prop_names);
+            var idx_end: usize = 0;
+            while (idx_end < prop_names.len and prop_names[idx_end] == .index) : (idx_end += 1) {}
+            try out.appendSlice(rt.gpa, prop_names[0..idx_end]);
             if (!(c.meta != null and c.meta.?.length_deleted)) {
                 try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("length") });
             }
@@ -481,9 +484,7 @@ pub fn ownKeysAllValue(rt: *Runtime, target: Value) Error![]object.Key {
             if (function_error.hasAutoPrototype(c)) {
                 try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("prototype") });
             }
-            const prop_names = try object.ownPropertyNamesClosure(rt, c);
-            defer rt.gpa.free(prop_names);
-            for (prop_names) |k| {
+            for (prop_names[idx_end..]) |k| {
                 if ((object.isNamed(k, "length") and !(c.meta != null and c.meta.?.length_deleted)) or
                     (object.isNamed(k, "name") and !(c.meta != null and c.meta.?.name_deleted))) continue;
                 try out.append(rt.gpa, k);
@@ -498,6 +499,18 @@ pub fn ownKeysAllValue(rt: *Runtime, target: Value) Error![]object.Key {
             }
             if (!rt.isNativePropDeleted(n, false)) {
                 try out.append(rt.gpa, .{ .atom = try rt.heap.internAscii("name") });
+            }
+            if (try builtins.namespaceObject(rt, n)) |ns| {
+                const prop_names = try object.ownPropertyNames(rt, ns);
+                defer rt.gpa.free(prop_names);
+                for (prop_names) |k| {
+                    if ((object.isNamed(k, "length") and !rt.isNativePropDeleted(n, true)) or
+                        (object.isNamed(k, "name") and !rt.isNativePropDeleted(n, false))) continue;
+                    try out.append(rt.gpa, k);
+                }
+                const syms = try object.ownSymbolKeys(rt, ns, true);
+                defer rt.gpa.free(syms);
+                for (syms) |s| try out.append(rt.gpa, .{ .symbol = s });
             }
         },
         else => {},
@@ -858,7 +871,15 @@ fn createListFromArrayLike(rt: *Runtime, list_val: Value) Error![]Value {
         return rt.throw(.TypeError, &.{.{ .ascii = "CreateListFromArrayLike called on non-object" }});
     }
     if (list_val.isObject() and list_val.asObject().kind == .array) {
-        return rt.gpa.dupe(Value, list_val.asObject().kind.array.items);
+        const items = list_val.asObject().kind.array.items;
+        var has_hole = false;
+        for (items) |v| {
+            if (v.isHole()) {
+                has_hole = true;
+                break;
+            }
+        }
+        if (!has_hole) return rt.gpa.dupe(Value, items);
     }
     var list_root = [_]Value{list_val};
     var lr: rt_mod.ValueRoots = .{ .values = &list_root };
@@ -876,7 +897,7 @@ fn createListFromArrayLike(rt: *Runtime, list_val: Value) Error![]Value {
     defer out_roots.unregister(rt);
 
     for (0..len) |i| {
-        out[i] = try object.get(rt, list_val, .{ .index = @intCast(i) });
+        out[i] = try object.get(rt, list_val, try common.indexKey(rt, i));
     }
     return out;
 }

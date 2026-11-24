@@ -301,7 +301,7 @@ fn stringIncludes(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
     const search_arg = common.arg(args, 0);
-    if (search_arg.isObject() and search_arg.asObject().kind == .regexp) {
+    if (try regexp.isRegExp(rt, search_arg)) {
         return rt.throw(.TypeError, &.{.{ .ascii = "First argument to String.prototype.includes must not be a regular expression" }});
     }
     const search_obj = try common.toStringObj(rt, search_arg);
@@ -427,7 +427,7 @@ fn stringStartsWith(rt: *Runtime, this: Value, args: []const Value) Error!Value 
     try roots.register(rt);
     defer roots.unregister(rt);
     const search_arg = common.arg(args, 0);
-    if (search_arg.isObject() and search_arg.asObject().kind == .regexp) {
+    if (try regexp.isRegExp(rt, search_arg)) {
         return rt.throw(.TypeError, &.{.{ .ascii = "First argument to String.prototype.startsWith must not be a regular expression" }});
     }
     const search_obj = try common.toStringObj(rt, search_arg);
@@ -446,7 +446,7 @@ fn stringEndsWith(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
     const search_arg = common.arg(args, 0);
-    if (search_arg.isObject() and search_arg.asObject().kind == .regexp) {
+    if (try regexp.isRegExp(rt, search_arg)) {
         return rt.throw(.TypeError, &.{.{ .ascii = "First argument to String.prototype.endsWith must not be a regular expression" }});
     }
     const search_obj = try common.toStringObj(rt, search_arg);
@@ -662,7 +662,7 @@ fn stringReplaceImpl(rt: *Runtime, this: Value, args: []const Value, _: []const 
     }
     const search_arg = common.arg(args, 0);
     if (search_arg.isObjectLike()) {
-        if (is_all and search_arg.isObject() and search_arg.asObject().kind == .regexp) {
+        if (is_all and try regexp.isRegExp(rt, search_arg)) {
             const flags_val = try object.get(rt, search_arg, try object.named(rt, "flags"));
             if (flags_val.isUndefined() or flags_val.isNull()) {
                 return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype.replaceAll called with a non-global RegExp argument" }});
@@ -825,7 +825,7 @@ fn stringMatchAll(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const rx_arg = common.arg(args, 0);
     const r = try builtins.realm(rt);
     if (rx_arg.isObjectLike()) {
-        if (rx_arg.isObject() and rx_arg.asObject().kind == .regexp) {
+        if (try regexp.isRegExp(rt, rx_arg)) {
             const flags_val = try object.get(rt, rx_arg, try object.named(rt, "flags"));
             if (flags_val.isUndefined() or flags_val.isNull()) {
                 return rt.throw(.TypeError, &.{.{ .ascii = "String.prototype.matchAll called with a non-global RegExp argument" }});

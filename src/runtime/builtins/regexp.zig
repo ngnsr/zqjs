@@ -55,9 +55,9 @@ pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
     try object.defineAccessor(rt, Value.fromObject(r.regexp_namespace), .{ .symbol = r.sym_species }, Value.fromNative(&common.species_getter), false, false);
 }
 
-const regexp_exec: Native = .{ .name = "exec", .call = regexpExec };
+const regexp_exec: Native = .{ .name = "exec", .length = 1, .call = regexpExec };
 
-const regexp_test: Native = .{ .name = "test", .call = regexpTest };
+const regexp_test: Native = .{ .name = "test", .length = 1, .call = regexpTest };
 
 const regexp_to_string: Native = .{ .name = "toString", .call = regexpToString };
 
@@ -127,39 +127,70 @@ pub fn newRegExpFromLiteral(rt: *Runtime, pattern_units: []const u16, flags_asci
     return createRegExp(rt, pattern_units, flags_u16[0..flags_ascii.len]);
 }
 
+pub fn isRegExp(rt: *Runtime, v: Value) Error!bool {
+    if (!v.isObjectLike()) return false;
+    var root_buf = [_]Value{v};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const r = try builtins.realm(rt);
+    const matcher = try object.get(rt, v, .{ .symbol = r.sym_match });
+    if (!matcher.isUndefined()) return ops.toBoolean(matcher);
+    return v.isObject() and v.asObject().kind == .regexp;
+}
+
 pub fn regexpBuild(rt: *Runtime, args: []const Value, is_new: bool) Error!Value {
     const p_arg = common.arg(args, 0);
     const f_arg = common.arg(args, 1);
-
-    if (p_arg.isObject() and p_arg.asObject().kind == .regexp) {
-        if (f_arg.isUndefined()) {
-            if (!is_new) return p_arg;
-            const re = p_arg.asObject().kind.regexp;
-            const r = try builtins.realm(rt);
-            var root_buf = [_]Value{p_arg};
-            var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
-            try roots.register(rt);
-            defer roots.unregister(rt);
-
-            var cloned_prog = re.program.clone(rt.heap.allocator()) catch |e| return rt.heap.failed(e);
-            errdefer cloned_prog.deinit(rt.heap.allocator());
-            const obj = try rt.heap.newRegExp(r.regexp_prototype, cloned_prog, re.source, re.flags, re.global);
-            return Value.fromObject(obj);
-        }
-        var root_buf = [_]Value{ p_arg, f_arg, .undefined };
-        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
-        try roots.register(rt);
-        defer roots.unregister(rt);
-
-        const flags_str = try common.toStringObj(rt, f_arg);
-        root_buf[2] = Value.fromString(flags_str);
-        return createRegExp(rt, p_arg.asObject().kind.regexp.source.units, flags_str.units);
-    }
 
     var root_buf = [_]Value{ p_arg, f_arg, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
+
+    const pattern_is_rx = try isRegExp(rt, p_arg);
+    if (!is_new and pattern_is_rx and f_arg.isUndefined()) {
+        const ctor = try object.get(rt, p_arg, try object.named(rt, "constructor"));
+        if (ctor.isNative() and ctor.asNative() == &builtins.regexp_global) {
+            return p_arg;
+        }
+    }
+
+    if (p_arg.isObject() and p_arg.asObject().kind == .regexp) {
+        const re = p_arg.asObject().kind.regexp;
+        if (f_arg.isUndefined()) {
+            const r = try builtins.realm(rt);
+            var cloned_prog = re.program.clone(rt.heap.allocator()) catch |e| return rt.heap.failed(e);
+            errdefer cloned_prog.deinit(rt.heap.allocator());
+            const obj = try rt.heap.newRegExp(r.regexp_prototype, cloned_prog, re.source, re.flags, re.global);
+            return Value.fromObject(obj);
+        }
+        const flags_str = try common.toStringObj(rt, f_arg);
+        root_buf[2] = Value.fromString(flags_str);
+        return createRegExp(rt, re.source.units, flags_str.units);
+    }
+
+    if (pattern_is_rx) {
+        const pv = try object.get(rt, p_arg, try object.named(rt, "source"));
+        root_buf[2] = pv;
+        const fv = if (f_arg.isUndefined())
+            try object.get(rt, p_arg, try object.named(rt, "flags"))
+        else
+            f_arg;
+        root_buf[3] = fv;
+        const pat_units: []const u16 = if (pv.isUndefined()) &.{} else blk: {
+            const ps = try common.toStringObj(rt, pv);
+            root_buf[2] = Value.fromString(ps);
+            break :blk ps.units;
+        };
+        const flag_units: []const u16 = if (fv.isUndefined()) &.{} else blk: {
+            const fs = try common.toStringObj(rt, fv);
+            root_buf[3] = Value.fromString(fs);
+            break :blk fs.units;
+        };
+        return createRegExp(rt, pat_units, flag_units);
+    }
 
     const pat_units: []const u16 = if (p_arg.isUndefined()) &.{} else blk: {
         const ps = try common.toStringObj(rt, p_arg);
@@ -217,6 +248,11 @@ pub fn regexpExecInto(
     s: *const heap_mod.String,
     captures: []?regex.Range,
 ) Error!bool {
+    var root_buf = [_]Value{ Value.fromObject(rx_obj), Value.fromString(s) };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     var last_idx = try common.toLength(rt, rx_obj.kind.regexp.last_index);
     const re = rx_obj.kind.regexp;
     const global_or_sticky = re.global or re.program.flags.sticky;
@@ -224,17 +260,17 @@ pub fn regexpExecInto(
         last_idx = 0;
     }
     if (last_idx > @as(f64, @floatFromInt(s.units.len))) {
-        if (global_or_sticky) rt.heap.storeRegExpLastIndex(rx_obj, Value.fromNumber(0));
+        if (global_or_sticky) try object.setStrict(rt, Value.fromObject(rx_obj), try object.named(rt, "lastIndex"), Value.fromNumber(0));
         return false;
     }
     const start: u32 = @intFromFloat(last_idx);
     const matched = try runRegExpMatcher(rt, &re.program, s.units, start, captures);
     if (!matched) {
-        if (global_or_sticky) rt.heap.storeRegExpLastIndex(rx_obj, Value.fromNumber(0));
+        if (global_or_sticky) try object.setStrict(rt, Value.fromObject(rx_obj), try object.named(rt, "lastIndex"), Value.fromNumber(0));
         return false;
     }
     if (global_or_sticky) {
-        rt.heap.storeRegExpLastIndex(rx_obj, Value.fromNumber(@floatFromInt(captures[0].?.end)));
+        try object.setStrict(rt, Value.fromObject(rx_obj), try object.named(rt, "lastIndex"), Value.fromNumber(@floatFromInt(captures[0].?.end)));
     }
     return true;
 }
@@ -656,9 +692,6 @@ fn regexpSymMatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     root_buf[2] = s_val;
 
     const flags_val = try object.get(rt, this, try object.named(rt, "flags"));
-    if (flags_val.isUndefined() or flags_val.isNull()) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype[Symbol.match] flags is null or undefined" }});
-    }
     const flags_s = try common.toStringObj(rt, flags_val);
     root_buf[3] = Value.fromString(flags_s);
     const is_global = std.mem.indexOfScalar(u16, flags_s.units, 'g') != null;
@@ -796,9 +829,6 @@ fn regexpSymReplace(rt: *Runtime, this: Value, args: []const Value) Error!Value 
     } else null;
 
     const flags_val = try object.get(rt, this, try object.named(rt, "flags"));
-    if (flags_val.isUndefined() or flags_val.isNull()) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype[Symbol.replace] flags is null or undefined" }});
-    }
     const flags_s = try common.toStringObj(rt, flags_val);
     root_buf[5] = Value.fromString(flags_s);
     const is_global = std.mem.indexOfScalar(u16, flags_s.units, 'g') != null;

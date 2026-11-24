@@ -393,8 +393,7 @@ test "object limits: heap, string length of a join, conversion depth" {
 
 test "M11.3b: Array/String unimplemented methods, non-matching receivers, and non-ASCII case report Unsupported" {
     try expectUnsupported("[1].toLocaleString;", "", "('toLocaleString')");
-    try expectUnsupported("let o = { length: 1, push: [].push }; o.push(1);", "", "Unsupported(builtin)");
-    try expectUnsupported("let o = { length: 1, pop: [].pop }; o.pop();", "", "Unsupported(builtin)");
+    try expectUnsupported("let o = { length: 1, splice: [].splice }; o.splice(0, 1);", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { charAt: ''.charAt }; o.charAt(0);", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { slice: ''.slice }; o.slice(0);", "", "Unsupported(builtin)");
     try expectUnsupported("'\\u00e9'.toLowerCase();", "", "('toLowerCase')");
@@ -403,6 +402,10 @@ test "M11.3b: Array/String unimplemented methods, non-matching receivers, and no
         var r = try support.run(testing.allocator, "let s = [1, , 3].slice(); print(s.length, 1 in s, s[0], s[2]);", .{}, engine, .normal);
         defer r.deinit(testing.allocator);
         try testing.expectEqualStrings("3 false 1 3\n", r.out);
+
+        var r_gp = try support.run(testing.allocator, "let o = { length: 1, push: [].push, pop: [].pop }; print(o.push(7), o[1], o.pop(), o.length);", .{}, engine, .normal);
+        defer r_gp.deinit(testing.allocator);
+        try testing.expectEqualStrings("2 7 7 1\n", r_gp.out);
     }
 }
 

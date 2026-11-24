@@ -91,9 +91,11 @@ pub fn speciesConstructor(rt: *Runtime, o_val: Value, default_ctor: Value) Error
     return s;
 }
 
+const array = @import("array.zig");
+
 pub fn arraySpeciesCreate(rt: *Runtime, original: Value, len: usize) Error!Value {
     const r = try builtins.realm(rt);
-    if (!original.isObject() or original.asObject().kind != .array) {
+    if (!try array.isArray(rt, original)) {
         return Value.fromObject(try rt.heap.newArray(r.array_prototype));
     }
     var root_buf = [_]Value{ original, .undefined };
@@ -119,29 +121,48 @@ pub fn arraySpeciesCreate(rt: *Runtime, original: Value, len: usize) Error!Value
     return constructValue(rt, s, &.{Value.fromNumber(@floatFromInt(len))});
 }
 
+pub fn indexKey(rt: *Runtime, idx: usize) Error!object.Key {
+    if (idx < std.math.maxInt(u32)) return .{ .index = @intCast(idx) };
+    var buf: [20]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{idx}) catch unreachable;
+    return object.namedAtom(try rt.heap.internAscii(s));
+}
+
 pub fn arrayAppendOrDefine(rt: *Runtime, out: Value, idx: usize, val: Value) Error!void {
-    if (out.isObject() and out.asObject().kind == .array and out.asObject().extensible and out.asObject().array_length_writable) {
+    if (out.isObject() and out.asObject().kind == .array and out.asObject().array_elements_writable and out.asObject().array_elements_configurable) {
         const arr = out.asObject();
         const cur = arr.kind.array.items.len;
-        if (idx < cur) {
+        if (idx < cur and (arr.extensible or !arr.kind.array.items[idx].isHole())) {
             rt.heap.storeElement(arr, idx, val);
             return;
         }
-        if (idx == cur) {
-            try rt.heap.appendElement(arr, val);
-            return;
-        }
-        if (idx < heap_mod.Heap.MAX_DENSE_ARRAY_LEN) {
-            try rt.heap.growElementsWithHoles(arr, idx);
-            try rt.heap.appendElement(arr, val);
-            return;
+        if (arr.extensible and arr.array_length_writable) {
+            if (idx == cur) {
+                try rt.heap.appendElement(arr, val);
+                return;
+            }
+            if (idx < heap_mod.Heap.MAX_DENSE_ARRAY_LEN) {
+                try rt.heap.growElementsWithHoles(arr, idx);
+                try rt.heap.appendElement(arr, val);
+                return;
+            }
         }
     }
-    if (out.isObject()) {
-        try object.define(rt, out.asObject(), .{ .index = @intCast(idx) }, val);
-        return;
-    }
-    try object.setStrict(rt, out, .{ .index = @intCast(idx) }, val);
+    var root_buf = [_]Value{ out, val };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const k = try indexKey(rt, idx);
+    _ = try obj_builtins.defineOwnPropertyParsed(rt, out, k, .{
+        .has_val = true,
+        .val = val,
+        .has_writ = true,
+        .writ_val = true,
+        .has_enum = true,
+        .enum_val = true,
+        .has_conf = true,
+        .conf_val = true,
+    }, true);
 }
 
 pub fn notCallable(rt: *Runtime, this: Value, args: []const Value) Error!Value {

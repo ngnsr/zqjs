@@ -42,6 +42,12 @@ pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
         .writable = false,
         .configurable = true,
     });
+    try rt.heap.defineProperty(r.function_prototype, try rt.heap.internAscii("name"), .{
+        .value = Value.fromString(try rt.heap.ascii("")),
+        .enumerable = false,
+        .writable = false,
+        .configurable = true,
+    });
     try common.method(rt, r.function_prototype, "call", &function_call);
     try common.method(rt, r.function_prototype, "apply", &function_apply);
     try common.method(rt, r.function_prototype, "bind", &function_bind);
@@ -51,6 +57,45 @@ pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
         .writable = false,
         .configurable = false,
     });
+    const tte = try createThrowTypeError(rt, r);
+    const tte_val = Value.fromClosure(tte);
+    try rt.heap.defineProperty(r.function_prototype, try rt.heap.internAscii("caller"), .{
+        .is_accessor = true,
+        .value = tte_val,
+        .setter = tte_val,
+        .enumerable = false,
+        .configurable = true,
+        .writable = false,
+    });
+    try rt.heap.defineProperty(r.function_prototype, try rt.heap.internAscii("arguments"), .{
+        .is_accessor = true,
+        .value = tte_val,
+        .setter = tte_val,
+        .enumerable = false,
+        .configurable = true,
+        .writable = false,
+    });
+}
+
+fn throwTypeErrorFn(rt: *Runtime, _: *Object, _: []const Value) Error!Value {
+    return rt.throw(.TypeError, &.{.{ .ascii = "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them" }});
+}
+
+pub fn createThrowTypeError(rt: *Runtime, r: *const builtins.Realm) Error!*heap_mod.Closure {
+    var root_buf = [_]Value{.undefined};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const env = try rt.heap.newObject(null);
+    root_buf[0] = Value.fromObject(env);
+    const tte = try rt.heap.newNativeClosure(@ptrCast(&throwTypeErrorFn), env);
+    root_buf[0] = Value.fromClosure(tte);
+    const m = try rt.heap.ensureClosureMeta(tte);
+    m.extensible = false;
+    m.name_configurable = false;
+    m.length_configurable = false;
+    try rt.heap.storeClosureProto(tte, Value.fromObject(r.function_prototype));
+    return tte;
 }
 
 pub fn hasAutoPrototype(c: *const heap_mod.Closure) bool {
@@ -272,25 +317,40 @@ fn functionApply(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     if (!arg_array.isObjectLike()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "CreateListFromArrayLike called on non-object" }});
     }
+    var root_buf = [_]Value{ this, this_arg, arg_array };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     if (arg_array.isObject() and arg_array.asObject().kind == .array) {
         const items = arg_array.asObject().kind.array.items;
-        const copy = try rt.gpa.dupe(Value, items);
-        defer rt.gpa.free(copy);
-        var root_buf = [_]Value{ this, this_arg };
-        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
-        try roots.register(rt);
-        defer roots.unregister(rt);
-        // Keep copied args rooted? They are in `copy` on Zig heap, wait: if GC runs inside callCallable,
-        // `rt.callCallable` copies them to VM stack or Machine values immediately before any safepoint.
-        return rt.callCallable(this, this_arg, copy);
+        var has_hole = false;
+        for (items) |v| {
+            if (v.isHole()) {
+                has_hole = true;
+                break;
+            }
+        }
+        if (!has_hole) {
+            const copy = try rt.gpa.dupe(Value, items);
+            defer rt.gpa.free(copy);
+            var copy_roots: rt_mod.ValueRoots = .{ .values = copy };
+            try copy_roots.register(rt);
+            defer copy_roots.unregister(rt);
+            return rt.callCallable(this, this_arg, copy);
+        }
     }
     const len_val = try object.get(rt, arg_array, try object.named(rt, "length"));
     const len_n = try common.toIntegerOrInfinity(rt, len_val);
     const len: usize = if (len_n <= 0) 0 else @intFromFloat(@min(len_n, @as(f64, @floatFromInt(rt.limits.max_stack_slots))));
     const list = try rt.gpa.alloc(Value, len);
     defer rt.gpa.free(list);
+    @memset(list, .undefined);
+    var list_roots: rt_mod.ValueRoots = .{ .values = list };
+    try list_roots.register(rt);
+    defer list_roots.unregister(rt);
     for (0..len) |i| {
-        list[i] = try object.get(rt, arg_array, .{ .index = @intCast(i) });
+        list[i] = try object.get(rt, arg_array, try common.indexKey(rt, i));
     }
     return rt.callCallable(this, this_arg, list);
 }
@@ -300,57 +360,67 @@ fn functionBind(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const this_arg = common.arg(args, 0);
     const new_bound_args = if (args.len > 1) args[1..] else &[_]Value{};
 
+    var root_buf = [_]Value{ this, this_arg, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     var target: Value = this;
     var effective_this: Value = this_arg;
     var prev_args: []const Value = &.{};
-    var target_len: u16 = 0;
-    var target_name: []const u8 = "";
-    var target_name_str: ?*const heap_mod.String = null;
-
     if (this.isClosure() and this.asClosure().impl == .bound) {
         const prev = this.asClosure().impl.bound;
         target = prev.target;
         effective_this = prev.bound_this;
         prev_args = prev.bound_args;
-        target_len = prev.length;
-        target_name_str = prev.name;
-    } else switch (this.unpack()) {
-        .native => |n| {
-            target_len = n.length;
-            target_name = n.name;
-        },
-        .closure => |c| {
-            target_len = closureLength(c);
-            target_name_str = try closureName(rt, c);
-        },
-        .object => {
-            if (try object.hasOwn(rt, this, try object.named(rt, "length"))) {
-                const lv = try object.get(rt, this, try object.named(rt, "length"));
-                if (lv.isNumber()) {
-                    const n = @trunc(lv.asNumber());
-                    if (n > 0 and !std.math.isNan(n)) {
-                        target_len = @intFromFloat(@min(n, 65535.0));
-                    }
-                }
-            }
-            const nv = try object.get(rt, this, try object.named(rt, "name"));
-            if (nv.isString()) target_name_str = nv.asString();
-        },
-        else => unreachable,
     }
+
+    var bound_len_f: f64 = 0;
+    const len_k = try object.named(rt, "length");
+    if (try object.hasOwn(rt, this, len_k)) {
+        const target_len = try object.get(rt, this, len_k);
+        if (target_len.isNumber()) {
+            const tl = target_len.asNumber();
+            if (tl == std.math.inf(f64)) {
+                bound_len_f = std.math.inf(f64);
+            } else if (tl != -std.math.inf(f64)) {
+                const as_int = try common.toIntegerOrInfinity(rt, target_len);
+                const arg_count: f64 = @floatFromInt(new_bound_args.len);
+                bound_len_f = @max(as_int - arg_count, 0.0);
+            }
+        }
+    }
+
+    const name_k = try object.named(rt, "name");
+    const target_name_val = try object.get(rt, this, name_k);
+    root_buf[2] = target_name_val;
+    const name_str = if (target_name_val.isString())
+        try rt.heap.newString(&.{ .{ .ascii = "bound " }, .{ .utf16 = target_name_val.asString().units } })
+    else
+        try rt.heap.ascii("bound ");
+    root_buf[2] = Value.fromString(name_str);
 
     const combined = try rt.gpa.alloc(Value, prev_args.len + new_bound_args.len);
     defer rt.gpa.free(combined);
     @memcpy(combined[0..prev_args.len], prev_args);
     @memcpy(combined[prev_args.len..], new_bound_args);
 
-    const bound_len: u16 = target_len -| @as(u16, @intCast(@min(target_len, new_bound_args.len)));
-    const name_str = if (target_name_str) |s|
-        try rt.heap.newString(&.{ .{ .ascii = "bound " }, .{ .utf16 = s.units } })
-    else
-        try rt.heap.newString(&.{ .{ .ascii = "bound " }, .{ .ascii = target_name } });
-
-    const bound_c = try rt.heap.newBoundClosure(target, effective_this, combined, name_str, bound_len);
+    const small_len: u16 = if (bound_len_f <= 65535.0) @intFromFloat(bound_len_f) else 0;
+    const bound_c = try rt.heap.newBoundClosure(target, effective_this, combined, name_str, small_len);
+    root_buf[3] = Value.fromClosure(bound_c);
+    if (bound_len_f > 65535.0) {
+        try rt.heap.defineClosurePropKey(bound_c, try object.propKey(rt, len_k), .{
+            .value = Value.fromNumber(bound_len_f),
+            .writable = false,
+            .enumerable = false,
+            .configurable = true,
+        });
+    }
+    const proto_val = try object.getPrototypeOfValue(rt, this);
+    const r = try builtins.realm(rt);
+    if (!(proto_val.isObject() and proto_val.asObject() == r.function_prototype)) {
+        try rt.heap.storeClosureProto(bound_c, proto_val);
+    }
     return Value.fromClosure(bound_c);
 }
 

@@ -77,6 +77,25 @@ pub fn newArgumentsObject(rt: *Runtime, args: []const Value) Error!*heap_mod.Obj
         .enumerable = false,
         .configurable = true,
     });
+    const callee_k = try rt.heap.internUtf8("callee");
+    const tte_val: Value = blk: {
+        if (r.function_prototype.props.get(heap_mod.PropKey.fromAtom(try rt.heap.internUtf8("caller")))) |p| {
+            if (p.is_accessor and p.value.isClosure()) break :blk p.value;
+        }
+        break :blk Value.fromClosure(try function_error.createThrowTypeError(rt, r));
+    };
+    var tte_root = [_]Value{tte_val};
+    var tte_roots: rt_mod.ValueRoots = .{ .values = &tte_root };
+    try tte_roots.register(rt);
+    defer tte_roots.unregister(rt);
+    try rt.heap.defineProperty(obj, callee_k, .{
+        .is_accessor = true,
+        .value = tte_root[0],
+        .setter = tte_root[0],
+        .enumerable = false,
+        .configurable = false,
+        .writable = false,
+    });
     try common.symbolMethod(rt, obj, r.sym_iterator, &array_builtins.array_values);
     return obj;
 }
@@ -88,6 +107,12 @@ const object_value_of: Native = .{ .name = "valueOf", .call = objectValueOf };
 pub fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     if (this.isUndefined()) return Value.fromString(try rt.heap.ascii("[object Undefined]"));
     if (this.isNull()) return Value.fromString(try rt.heap.ascii("[object Null]"));
+    var roots_buf = [_]Value{this};
+    var roots = rt_mod.ValueRoots{ .values = &roots_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const is_proxy_arr = if (this.isObject() and this.asObject().kind == .proxy) try array_builtins.isArray(rt, this) else false;
     const builtin_tag: []const u8 = switch (this.unpack()) {
         .undefined, .null => unreachable,
         .boolean => "Boolean",
@@ -98,6 +123,7 @@ pub fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
         .native, .closure => "Function",
         .object => |o| switch (o.kind) {
             .array => "Array",
+            .proxy => if (is_proxy_arr) "Array" else if (o.kind.proxy.is_callable) "Function" else "Object",
             .iterator => |it| switch (it.kind) {
                 .map_entries, .map_keys, .map_values => "Map Iterator",
                 .set_values, .set_entries => "Set Iterator",
@@ -114,7 +140,7 @@ pub fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
             .ordinary => switch (o.ordinary_tag) {
                 .arguments => "Arguments",
                 .@"error" => "Error",
-                .plain => if (o.builtin == .number_prototype) "Number" else if (o.builtin == .boolean_prototype) "Boolean" else if (o.builtin == .string_prototype) "String" else "Object",
+                .plain => if (o.builtin == .number_prototype) "Number" else if (o.builtin == .boolean_prototype) "Boolean" else if (o.builtin == .string_prototype) "String" else if (o.builtin == .function_prototype) "Function" else "Object",
             },
             .primitive_wrapper => |pv| switch (pv.unpack()) {
                 .boolean => "Boolean",
@@ -126,11 +152,6 @@ pub fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
         },
     };
     const r = try builtins.realm(rt);
-    var roots_buf = [_]Value{this};
-    var roots = rt_mod.ValueRoots{ .values = &roots_buf };
-    try roots.register(rt);
-    defer roots.unregister(rt);
-
     const tag_val = try object.get(rt, this, .{ .symbol = r.sym_to_string_tag });
     if (tag_val.isString()) {
         roots_buf[0] = tag_val;
@@ -203,18 +224,29 @@ const object_proto_property_is_enumerable: Native = .{ .name = "propertyIsEnumer
 fn objectKeys(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const r = try builtins.realm(rt);
     const out = try rt.heap.newArray(r.array_prototype);
-    var root_buf = [_]Value{Value.fromObject(out)};
+    const target = common.arg(args, 0);
+    var root_buf = [_]Value{ target, Value.fromObject(out) };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    switch (common.arg(args, 0).unpack()) {
+    switch (target.unpack()) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .boolean, .number, .bigint, .symbol, .native => {},
-        .closure => |c| {
-            const keys = try object.ownKeysClosure(rt, c);
+        .boolean, .number, .bigint, .symbol => {},
+        .closure, .native => {
+            const keys = try proxy_reflect.ownKeysAllValue(rt, target);
             defer rt.gpa.free(keys);
-            for (keys) |k| try pushKey(rt, out, k);
+            const key_vals = try rt.gpa.alloc(Value, keys.len);
+            defer rt.gpa.free(key_vals);
+            for (keys, key_vals) |k, *dst| dst.* = common.keyToRootValue(k);
+            var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+            try key_roots.register(rt);
+            defer key_roots.unregister(rt);
+            for (keys) |k| {
+                if (k == .symbol) continue;
+                const desc = (try getOwnPropertyRaw(rt, target, k)) orelse continue;
+                if (desc.enumerable) try pushKey(rt, out, k);
+            }
         },
         .string => |s| for (0..s.units.len) |i| try pushKey(rt, out, .{ .index = @intCast(i) }),
         .object => |o| {
@@ -259,6 +291,7 @@ fn objectGetOwnPropertySymbols(rt: *Runtime, _: Value, args: []const Value) Erro
     const syms: []*heap_mod.Symbol = switch (v.unpack()) {
         .object => |o| try object.ownSymbolKeys(rt, o, true),
         .closure => |c| try object.ownSymbolKeysClosure(rt, c, true),
+        .native => |n| if (try builtins.namespaceObject(rt, n)) |ns| try object.ownSymbolKeys(rt, ns, true) else &.{},
         else => &.{},
     };
     defer rt.gpa.free(syms);
@@ -327,7 +360,7 @@ pub fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap
         .object => |o| {
             switch (o.kind) {
                 .array => |elements| switch (k) {
-                    .index => |i| return if (i < elements.items.len) .{
+                    .index => |i| return if (i < elements.items.len and !elements.items[i].isHole()) .{
                         .value = elements.items[i],
                         .writable = o.array_elements_writable,
                         .configurable = o.array_elements_configurable,
@@ -471,6 +504,28 @@ fn objectGetOwnPropertyDescriptors(rt: *Runtime, _: Value, args: []const Value) 
     try roots.register(rt);
     defer roots.unregister(rt);
 
+    if (target.isString()) {
+        const s = target.asString();
+        for (0..s.units.len) |i| {
+            const k = try common.indexKey(rt, i);
+            if (try getOwnPropertyRaw(rt, target, k)) |p| {
+                const desc = try descriptorToObject(rt, p);
+                root_buf[2] = desc;
+                const pk = try object.propKey(rt, k);
+                try rt.heap.definePropKey(out, pk, .{ .value = desc });
+                root_buf[2] = .undefined;
+            }
+        }
+        const len_k = try object.named(rt, "length");
+        if (try getOwnPropertyRaw(rt, target, len_k)) |p| {
+            const desc = try descriptorToObject(rt, p);
+            root_buf[2] = desc;
+            const pk = try object.propKey(rt, len_k);
+            try rt.heap.definePropKey(out, pk, .{ .value = desc });
+            root_buf[2] = .undefined;
+        }
+        return Value.fromObject(out);
+    }
     if (target.isObjectLike()) {
         const keys = try proxy_reflect.ownKeysAllValue(rt, target);
         defer rt.gpa.free(keys);
@@ -667,11 +722,16 @@ pub fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Pa
         }
     }
 
-    if (target.isObject() and target.asObject().kind == .array and k == .atom and object.isNamed(k, "length") and d.has_val) {
-        const n = try ops.toNumber(rt, d.val);
-        if (!(n >= 0 and n <= @as(f64, std.math.maxInt(u32)) and @floor(n) == n)) {
+    var desc = d;
+    if (target.isObject() and target.asObject().kind == .array and k == .atom and object.isNamed(k, "length") and desc.has_val) {
+        // ES ArraySetLength: coerce [[Value]] twice before validating against existing length descriptor.
+        const new_len = ops.toUint32(try ops.toNumber(rt, desc.val));
+        const number_len = try ops.toNumber(rt, desc.val);
+        if (@as(f64, @floatFromInt(new_len)) != number_len) {
             return rt.throw(.RangeError, &.{.{ .ascii = "Invalid array length" }});
         }
+        desc.val = Value.fromNumber(@floatFromInt(new_len));
+        root_buf[1] = desc.val;
     }
 
     const current = try getOwnPropertyRaw(rt, target, k);
@@ -688,21 +748,21 @@ pub fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Pa
             if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot define property, object is not extensible" }});
             return false;
         }
-        next = d.toCompleteProperty();
+        next = desc.toCompleteProperty();
     } else {
         const cur = current.?;
-        if (!isCompatiblePropertyDescriptor(d, cur)) {
+        if (!isCompatiblePropertyDescriptor(desc, cur)) {
             if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property" }});
             return false;
         }
-        if (!d.isData() and !d.isAccessor()) {
+        if (!desc.isData() and !desc.isAccessor()) {
             next = cur;
-        } else if (cur.is_accessor != d.isAccessor()) {
-            if (d.isAccessor()) {
+        } else if (cur.is_accessor != desc.isAccessor()) {
+            if (desc.isAccessor()) {
                 next = .{
                     .is_accessor = true,
-                    .value = if (d.has_get) d.get_val else .undefined,
-                    .setter = if (d.has_set) d.set_val else .undefined,
+                    .value = if (desc.has_get) desc.get_val else .undefined,
+                    .setter = if (desc.has_set) desc.set_val else .undefined,
                     .enumerable = cur.enumerable,
                     .configurable = cur.configurable,
                     .writable = false,
@@ -710,8 +770,8 @@ pub fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Pa
             } else {
                 next = .{
                     .is_accessor = false,
-                    .value = if (d.has_val) d.val else .undefined,
-                    .writable = if (d.has_writ) d.writ_val else false,
+                    .value = if (desc.has_val) desc.val else .undefined,
+                    .writable = if (desc.has_writ) desc.writ_val else false,
                     .enumerable = cur.enumerable,
                     .configurable = cur.configurable,
                 };
@@ -719,23 +779,23 @@ pub fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Pa
         } else if (!cur.is_accessor) {
             next = .{
                 .is_accessor = false,
-                .value = if (d.has_val) d.val else cur.value,
-                .writable = if (d.has_writ) d.writ_val else cur.writable,
-                .enumerable = if (d.has_enum) d.enum_val else cur.enumerable,
-                .configurable = if (d.has_conf) d.conf_val else cur.configurable,
+                .value = if (desc.has_val) desc.val else cur.value,
+                .writable = if (desc.has_writ) desc.writ_val else cur.writable,
+                .enumerable = if (desc.has_enum) desc.enum_val else cur.enumerable,
+                .configurable = if (desc.has_conf) desc.conf_val else cur.configurable,
             };
         } else {
             next = .{
                 .is_accessor = true,
-                .value = if (d.has_get) d.get_val else cur.value,
-                .setter = if (d.has_set) d.set_val else cur.setter,
-                .enumerable = if (d.has_enum) d.enum_val else cur.enumerable,
-                .configurable = if (d.has_conf) d.conf_val else cur.configurable,
+                .value = if (desc.has_get) desc.get_val else cur.value,
+                .setter = if (desc.has_set) desc.set_val else cur.setter,
+                .enumerable = if (desc.has_enum) desc.enum_val else cur.enumerable,
+                .configurable = if (desc.has_conf) desc.conf_val else cur.configurable,
                 .writable = false,
             };
         }
-        if (d.has_enum) next.enumerable = d.enum_val;
-        if (d.has_conf) next.configurable = d.conf_val;
+        if (desc.has_enum) next.enumerable = desc.enum_val;
+        if (desc.has_conf) next.configurable = desc.conf_val;
     }
 
     if (target.isObject() and target.asObject().kind == .array and k == .index) {
@@ -750,7 +810,7 @@ pub fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Pa
             return common.unsupportedReceiver(rt, "defineProperty");
         }
         if (k.index < cur_len) {
-            if (d.has_val) rt.heap.storeElement(arr, k.index, next.value) else if (arr.kind.array.items[k.index].isHole()) rt.heap.storeElement(arr, k.index, .undefined);
+            if (desc.has_val) rt.heap.storeElement(arr, k.index, next.value) else if (arr.kind.array.items[k.index].isHole()) rt.heap.storeElement(arr, k.index, .undefined);
         } else {
             if (k.index > cur_len) try rt.heap.growElementsWithHoles(arr, k.index);
             try rt.heap.appendElement(arr, next.value);
@@ -759,10 +819,29 @@ pub fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Pa
     }
 
     if (target.isObject() and target.asObject().kind == .array and k == .atom and object.isNamed(k, "length")) {
-        if (d.has_val) {
-            if (!try object.setWithReceiver(rt, target, k, next.value, target, throw_on_reject)) return false;
+        const arr = target.asObject();
+        const cur_len = arr.kind.array.items.len;
+        if (desc.has_val) {
+            const new_len: usize = @intFromFloat(next.value.asNumber());
+            if (new_len > cur_len) {
+                if (new_len > heap_mod.Heap.MAX_DENSE_ARRAY_LEN) return rt.fail(.sparse_array);
+                try rt.heap.growElementsWithHoles(arr, new_len);
+            } else if (new_len < cur_len) {
+                if (!arr.array_elements_configurable) {
+                    var keep = cur_len;
+                    while (keep > new_len and arr.kind.array.items[keep - 1].isHole()) : (keep -= 1) {}
+                    rt.heap.shrinkElements(arr, keep);
+                    if (keep > new_len) {
+                        if (desc.has_writ and !next.writable) arr.array_length_writable = false;
+                        if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property of non-configurable array" }});
+                        return false;
+                    }
+                } else {
+                    rt.heap.shrinkElements(arr, new_len);
+                }
+            }
         }
-        if (d.has_writ and !next.writable) target.asObject().array_length_writable = false;
+        if (desc.has_writ and !next.writable) arr.array_length_writable = false;
         return true;
     }
     if (target.isObject() and target.asObject().kind == .regexp and object.isNamed(k, "lastIndex")) {
@@ -909,38 +988,20 @@ fn ownKeyValue(rt: *Runtime, o: *Object, k: object.Key) Error!Value {
 fn objectValuesEntriesImpl(rt: *Runtime, args: []const Value, comptime is_entries: bool) Error!Value {
     const r = try builtins.realm(rt);
     const out = try rt.heap.newArray(r.array_prototype);
-    var root_buf = [_]Value{ common.arg(args, 0), Value.fromObject(out), .undefined, .undefined };
+    const target = common.arg(args, 0);
+    var root_buf = [_]Value{ target, Value.fromObject(out), .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    switch (common.arg(args, 0).unpack()) {
+    switch (target.unpack()) {
         .undefined, .null => return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }}),
-        .boolean, .number, .bigint, .symbol, .native => {},
-        .closure => |c| {
-            const keys = try object.ownKeysClosure(rt, c);
-            defer rt.gpa.free(keys);
-            for (keys) |k| {
-                const val = try object.get(rt, common.arg(args, 0), k);
-                if (is_entries) {
-                    const key_s = try common.keyToString(rt, k);
-                    root_buf[2] = Value.fromString(key_s);
-                    root_buf[3] = val;
-                    const pair = try iterator.makePairArray(rt, root_buf[2], val);
-                    root_buf[2] = pair;
-                    try rt.heap.appendElement(out, pair);
-                    root_buf[2] = .undefined;
-                    root_buf[3] = .undefined;
-                } else {
-                    try rt.heap.appendElement(out, val);
-                }
-            }
-        },
+        .boolean, .number, .bigint, .symbol => {},
         .string => |s| for (0..s.units.len) |i| {
             const ch = try rt.heap.newString(&.{.{ .utf16 = s.units[i .. i + 1] }});
             root_buf[2] = Value.fromString(ch);
             if (is_entries) {
-                const key_s = try common.keyToString(rt, .{ .index = @intCast(i) });
+                const key_s = try common.keyToString(rt, try common.indexKey(rt, i));
                 root_buf[3] = Value.fromString(key_s);
                 const pair = try iterator.makePairArray(rt, root_buf[3], root_buf[2]);
                 root_buf[2] = pair;
@@ -951,16 +1012,29 @@ fn objectValuesEntriesImpl(rt: *Runtime, args: []const Value, comptime is_entrie
             root_buf[2] = .undefined;
             root_buf[3] = .undefined;
         },
-        .object => |o| {
-            const keys = try object.ownKeys(rt, o);
+        .object, .closure, .native => {
+            const keys = try proxy_reflect.ownKeysAllValue(rt, target);
             defer rt.gpa.free(keys);
+            const key_vals = try rt.gpa.alloc(Value, keys.len);
+            defer rt.gpa.free(key_vals);
+            for (keys, key_vals) |k, *dst| dst.* = common.keyToRootValue(k);
+            var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+            try key_roots.register(rt);
+            defer key_roots.unregister(rt);
+
             for (keys) |k| {
-                const val = try ownKeyValue(rt, o, k);
+                if (k == .symbol) continue;
+                const desc = (try getOwnPropertyRaw(rt, target, k)) orelse continue;
+                if (!desc.enumerable) continue;
+                const val = if (target.isObject() and target.asObject().kind == .array and k == .index and k.index < target.asObject().kind.array.items.len and !target.asObject().kind.array.items[k.index].isHole())
+                    target.asObject().kind.array.items[k.index]
+                else
+                    try object.get(rt, target, k);
                 if (is_entries) {
+                    root_buf[3] = val;
                     const key_s = try common.keyToString(rt, k);
                     root_buf[2] = Value.fromString(key_s);
-                    root_buf[3] = val;
-                    const pair = try iterator.makePairArray(rt, root_buf[2], val);
+                    const pair = try iterator.makePairArray(rt, root_buf[2], root_buf[3]);
                     root_buf[2] = pair;
                     try rt.heap.appendElement(out, pair);
                     root_buf[2] = .undefined;
@@ -1050,6 +1124,10 @@ pub fn setPrototypeOfValue(rt: *Runtime, target: Value, proto: Value) Error!bool
         .native, .closure => return rt.fail(.function_properties),
         else => return rt.throw(.TypeError, &.{.{ .ascii = "Object prototype may only be an Object or null" }}),
     }
+    const r = try builtins.realm(rt);
+    if (target.isObject() and target.asObject() == r.object_prototype) {
+        return proto.isNull();
+    }
     switch (target.unpack()) {
         .object => |o| if (o.kind == .proxy) return proxy_reflect.proxySetPrototypeOf(rt, o, proto),
         .closure => {},
@@ -1069,6 +1147,7 @@ pub fn setPrototypeOfValue(rt: *Runtime, target: Value, proto: Value) Error!bool
     var p = proto;
     while (!p.isNull()) {
         if (common.sameValue(p, target)) return false;
+        if (p.isObject() and p.asObject().kind == .proxy) break;
         p = try object.getPrototypeOfValue(rt, p);
     }
 
@@ -1138,7 +1217,7 @@ fn setIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!Value {
                 try roots.register(rt);
                 defer roots.unregister(rt);
 
-                const keys = try object.ownAllKeys(rt, o);
+                const keys = try proxy_reflect.ownKeysAllValue(rt, target);
                 defer rt.gpa.free(keys);
                 const key_vals = try rt.gpa.alloc(Value, keys.len);
                 defer rt.gpa.free(key_vals);
@@ -1202,9 +1281,33 @@ fn setIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!Value {
     return target;
 }
 
-fn testIntegrityLevel(_: *Runtime, target: Value, freeze: bool) Error!bool {
+fn testIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!bool {
     return switch (target.unpack()) {
         .object => |o| {
+            if (o.kind == .proxy) {
+                if (try isExtensibleValue(rt, target)) return false;
+                var root_buf = [_]Value{target};
+                var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+                try roots.register(rt);
+                defer roots.unregister(rt);
+
+                const keys = try proxy_reflect.ownKeysAllValue(rt, target);
+                defer rt.gpa.free(keys);
+                const key_vals = try rt.gpa.alloc(Value, keys.len);
+                defer rt.gpa.free(key_vals);
+                for (keys, key_vals) |k, *dst| dst.* = common.keyToRootValue(k);
+                var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+                try key_roots.register(rt);
+                defer key_roots.unregister(rt);
+
+                for (keys) |k| {
+                    if (try getOwnPropertyRaw(rt, target, k)) |d| {
+                        if (d.configurable) return false;
+                        if (freeze and !d.is_accessor and d.writable) return false;
+                    }
+                }
+                return true;
+            }
             if (o.extensible) return false;
             var pit = o.props.iterator();
             while (pit.next()) |entry| {
@@ -1285,19 +1388,50 @@ fn objectGetOwnPropertyNames(rt: *Runtime, _: Value, args: []const Value) Error!
 
     switch (target.unpack()) {
         .object => |o| {
-            const keys = try object.ownPropertyNames(rt, o);
-            defer rt.gpa.free(keys);
-            for (keys) |k| {
-                const s = try common.keyToString(rt, k);
-                try rt.heap.appendElement(out, Value.fromString(s));
-            }
-            if (o.kind == .array) {
-                try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("length")));
-            } else if (o.kind == .regexp) {
-                try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("lastIndex")));
+            if (o.kind == .proxy) {
+                const keys = try object.ownPropertyNames(rt, o);
+                defer rt.gpa.free(keys);
+                const key_vals = try rt.gpa.alloc(Value, keys.len);
+                defer rt.gpa.free(key_vals);
+                for (keys, key_vals) |k, *dst| dst.* = common.keyToRootValue(k);
+                var key_roots: rt_mod.ValueRoots = .{ .values = key_vals };
+                try key_roots.register(rt);
+                defer key_roots.unregister(rt);
+                for (keys) |k| {
+                    const s = try common.keyToString(rt, k);
+                    try rt.heap.appendElement(out, Value.fromString(s));
+                }
+            } else {
+                const keys = try object.ownPropertyNames(rt, o);
+                defer rt.gpa.free(keys);
+                var idx_end: usize = 0;
+                while (idx_end < keys.len and keys[idx_end] == .index) : (idx_end += 1) {}
+                for (keys[0..idx_end]) |k| {
+                    const s = try common.keyToString(rt, k);
+                    try rt.heap.appendElement(out, Value.fromString(s));
+                }
+                const is_str_wrap = o.kind == .primitive_wrapper and o.kind.primitive_wrapper.isString();
+                if (o.kind == .array or is_str_wrap) {
+                    try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("length")));
+                } else if (o.kind == .regexp) {
+                    try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("lastIndex")));
+                }
+                for (keys[idx_end..]) |k| {
+                    if (is_str_wrap and object.isNamed(k, "length")) continue;
+                    const s = try common.keyToString(rt, k);
+                    try rt.heap.appendElement(out, Value.fromString(s));
+                }
             }
         },
         .closure => |c| {
+            const keys = try object.ownPropertyNamesClosure(rt, c);
+            defer rt.gpa.free(keys);
+            var idx_end: usize = 0;
+            while (idx_end < keys.len and keys[idx_end] == .index) : (idx_end += 1) {}
+            for (keys[0..idx_end]) |k| {
+                const s = try common.keyToString(rt, k);
+                try rt.heap.appendElement(out, Value.fromString(s));
+            }
             if (!(c.meta != null and c.meta.?.length_deleted)) {
                 try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("length")));
             }
@@ -1307,9 +1441,7 @@ fn objectGetOwnPropertyNames(rt: *Runtime, _: Value, args: []const Value) Error!
             if (function_error.hasAutoPrototype(c)) {
                 try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("prototype")));
             }
-            const keys = try object.ownPropertyNamesClosure(rt, c);
-            defer rt.gpa.free(keys);
-            for (keys) |k| {
+            for (keys[idx_end..]) |k| {
                 if ((object.isNamed(k, "length") and !(c.meta != null and c.meta.?.length_deleted)) or
                     (object.isNamed(k, "name") and !(c.meta != null and c.meta.?.name_deleted))) continue;
                 const s = try common.keyToString(rt, k);
@@ -1323,10 +1455,20 @@ fn objectGetOwnPropertyNames(rt: *Runtime, _: Value, args: []const Value) Error!
             if (!rt.isNativePropDeleted(n, false)) {
                 try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("name")));
             }
+            if (try builtins.namespaceObject(rt, n)) |ns| {
+                const keys = try object.ownPropertyNames(rt, ns);
+                defer rt.gpa.free(keys);
+                for (keys) |k| {
+                    if ((object.isNamed(k, "length") and !rt.isNativePropDeleted(n, true)) or
+                        (object.isNamed(k, "name") and !rt.isNativePropDeleted(n, false))) continue;
+                    const s = try common.keyToString(rt, k);
+                    try rt.heap.appendElement(out, Value.fromString(s));
+                }
+            }
         },
         .string => |s| {
             for (0..s.units.len) |i| {
-                try rt.heap.appendElement(out, Value.fromString(try common.keyToString(rt, .{ .index = @intCast(i) })));
+                try rt.heap.appendElement(out, Value.fromString(try common.keyToString(rt, try common.indexKey(rt, i))));
             }
             try rt.heap.appendElement(out, Value.fromString(try rt.heap.ascii("length")));
         },

@@ -1,0 +1,65 @@
+fnProto.name: "" toString: [object Function]
+fnProto.hasName: true hasLength: true
+tte callee identity: true true true true false true false
+tte frozen: true false length,name
+tte call: TypeError
+tte call: TypeError
+tte call: TypeError
+tte call: TypeError
+tte call: TypeError
+bind huge len: 999999 17
+bind inf len: Infinity
+bind neg len: 0
+bind nan len: 0
+bind name: bound customBase bound bound customBase
+bind proto: true protoTag
+apply sparse: [1,99,3]
+proxy toString arr: [object Array]
+revoked toString: TypeError
+wrapped revoked created: object object
+proxy toString fn: [object Function]
+setProto proxy cycle: 0 true
+setProto Object.prototype null: true
+setProto Object.prototype {}: TypeError
+proxy integrity: true true
+proxy freeze: true
+strDescs: a b 2 false
+arr names: 0,1,length,z,a
+str names: 0,1,length,b
+fn names: 0,2,length,name,prototype
+entries getter mut: [["a",1],["c",99]]
+values getter mut: [1,42]
+species non-ext: TypeError
+species non-ext: TypeError
+species non-ext: TypeError
+species non-ext: TypeError
+slice start>end: []
+generic flat: ["a","b","c"]
+generic flatMap: ["a","!",["b","c"],"!"]
+concat proxy: ["start","x","y"]
+indexOf shrink: 2
+lastIndexOf shrink: 2
+copyWithin same idx gets: 1
+sparse pop: 222 2
+sparse reverse: true 3 false true 1
+toSorted hole: [1,2,null]
+toSpliced hole: [1,9,null,3]
+with hole: [7,null,3]
+big push: 4294967296 a b
+big pop: b 4294967295 false
+len coerce count: 2 1
+shrink non-conf: TypeError 1
+rx lengths: 1 1
+new RegExp(rxLike): a+ i true
+RegExp(rxLike) short: true
+non-writable lastIndex: TypeError
+non-writable lastIndex: TypeError
+Sym.match null flags: null
+isRegExp throw: TypeError
+isRegExp throw: TypeError
+isRegExp throw: TypeError
+isRegExp throw: TypeError
+isRegExp throw: TypeError
+re with match=false: true true
+fromAsync close on err: RangeError 1
+fromAsync iter: [10,20,30]

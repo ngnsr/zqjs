@@ -177,6 +177,8 @@ const Parser = struct {
     async_paren_await_span: ?ast.Span = null,
     in_derived_ctor: enum { none, direct, arrow } = .none,
     in_class_method: bool = false,
+    in_obj_method: bool = false,
+    allow_cover_init: bool = false,
     class_count: u32 = 0,
     has_top_level_await: bool = false,
     source_kind: ast.SourceKind = .script,
@@ -795,17 +797,28 @@ const Parser = struct {
         var init: ?ast.ForInit = null;
         p.no_in = true;
         p.for_await_head = is_await;
+        const outer_cover = p.allow_cover_init;
+        p.allow_cover_init = true;
+        defer {
+            p.no_in = false;
+            p.for_await_head = false;
+            p.allow_cover_init = outer_cover;
+        }
         if (p.tok.tag == .kw_const) {
+            p.allow_cover_init = outer_cover;
             init = .{ .declaration = try p.declaration(.@"const", true) };
         } else if (p.isText(p.tok, "let") and try p.letStartsDeclaration()) {
+            p.allow_cover_init = outer_cover;
             init = .{ .declaration = try p.declaration(.let, true) };
         } else if (p.isText(p.tok, "var")) {
+            p.allow_cover_init = outer_cover;
             init = .{ .declaration = try p.declaration(.@"var", true) };
         } else if (p.tok.tag != .semicolon) {
             init = .{ .expression = try p.expression() };
         }
         p.no_in = false;
         p.for_await_head = false;
+        p.allow_cover_init = outer_cover;
         if (p.isText(p.tok, "in")) {
             if (is_await) return p.fail(.{ .syntax_error = "for await requires 'of'" }, p.tok);
             const target = try p.extractForEachTarget(init, "for-in");
@@ -1100,11 +1113,13 @@ const Parser = struct {
         const outer_labels = p.labels;
         const outer_derived = p.in_derived_ctor;
         const outer_method = p.in_class_method;
+        const outer_obj_method = p.in_obj_method;
         p.loop_depth = 0;
         p.switch_depth = 0;
         p.labels = .empty;
         p.in_derived_ctor = .none;
         p.in_class_method = false;
+        p.in_obj_method = outer_obj_method;
         p.function_depth += 1;
         p.async_ctx = if (is_async) .body else .none;
         p.yield_ctx = if (is_generator) .body else .none;
@@ -1114,6 +1129,7 @@ const Parser = struct {
             p.labels = outer_labels;
             p.in_derived_ctor = outer_derived;
             p.in_class_method = outer_method;
+            p.in_obj_method = outer_obj_method;
             p.function_depth -= 1;
         }
         const outer_disallow_return = p.disallow_return;
@@ -1532,7 +1548,7 @@ const Parser = struct {
 
     fn assignment(p: *Parser) Error!*const ast.Expr {
         const e = try p.expressionRaw();
-        try p.rejectCoverExpr(e);
+        if (!p.allow_cover_init) try p.rejectCoverExpr(e);
         return e;
     }
 
@@ -2515,9 +2531,9 @@ const Parser = struct {
                     depth = @max(depth, value.depth);
                 },
                 .l_paren => {
-                    const outer_method = p.in_class_method;
-                    p.in_class_method = true;
-                    defer p.in_class_method = outer_method;
+                    const outer_obj_method = p.in_obj_method;
+                    p.in_obj_method = true;
+                    defer p.in_obj_method = outer_obj_method;
                     const f = try p.functionRest(t.start, .expression, null, is_async_method, is_generator_method);
                     if (prop_kind != .init) {
                         try p.validateAccessorParams(prop_kind == .getter, f.params, t);
@@ -2564,11 +2580,16 @@ const Parser = struct {
                     if (std.mem.eql(u8, k.name, "yield") and p.yield_ctx != .none) {
                         return p.fail(.{ .syntax_error = "'yield' is not a valid identifier name in a generator" }, t);
                     }
+                    if (p.in_strict_mode and (std.mem.eql(u8, k.name, "arguments") or std.mem.eql(u8, k.name, "eval"))) {
+                        return p.fail(.{ .syntax_error = "Invalid strict mode assignment target" }, t);
+                    }
                     const eq_tok = p.tok;
                     try p.advance();
                     const def = try p.nestedAssignment();
-                    if (!has_cover_init) p.cover_init_span = span(eq_tok, eq_tok);
-                    has_cover_init = true;
+                    if (!p.allow_cover_init) {
+                        if (!has_cover_init) p.cover_init_span = span(eq_tok, eq_tok);
+                        has_cover_init = true;
+                    }
                     const id = p.ref_count;
                     p.ref_count += 1;
                     const ref: ast.Ref = .{ .name = k.name, .span = span(t, t), .id = id };
@@ -2690,7 +2711,7 @@ const Parser = struct {
                         const parsed = try p.parseCallArgs(0);
                         return p.node(.{ .start = t.start, .end = parsed.end }, .{ .super_call = parsed.args }, parsed.depth);
                     }
-                    if (!p.in_class_method) return p.fail(.{ .syntax_error = "'super' keyword unexpected here" }, t);
+                    if (!p.in_class_method and !p.in_obj_method) return p.fail(.{ .syntax_error = "'super' keyword unexpected here" }, t);
                     if (p.tok.tag == .dot) {
                         try p.advance();
                         if (p.tok.tag == .private_ident) return p.fail(.{ .syntax_error = "Private fields cannot be accessed on super" }, p.tok);
@@ -3599,11 +3620,14 @@ const Parser = struct {
 
             const outer_async_ctx = p.async_ctx;
             const outer_yield_ctx = p.yield_ctx;
+            const outer_param_class_method = p.in_class_method;
             p.async_ctx = if (is_async) .params else .none;
             p.yield_ctx = if (is_generator) .params else .none;
+            p.in_class_method = true;
             defer {
                 p.async_ctx = outer_async_ctx;
                 p.yield_ctx = outer_yield_ctx;
+                p.in_class_method = outer_param_class_method;
             }
             const params = try p.parseParams();
             if (method_kind != .method) {

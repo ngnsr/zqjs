@@ -184,6 +184,25 @@ pub fn getMethod(rt: *Runtime, v: Value, k: Key) Error!?Value {
 }
 
 pub fn getWithReceiver(rt: *Runtime, base: Value, receiver: Value, k: Key) Error!Value {
+    if (base.isObject() and k == .atom and base.asObject().kind == .ordinary) {
+        const o = base.asObject();
+        o.obj.checkLive();
+        if (o.props == .shaped) {
+            const pk = heap_mod.PropKey.fromAtom(k.atom);
+            if (o.props.shaped.shape) |leaf| {
+                if (leaf.find(pk)) |s| return o.props.getShapedSlot(s.slot);
+            }
+            if (o.builtin == null) {
+                if (o.proto) |proto| {
+                    if (proto.kind == .ordinary and proto.builtin == null and proto.props == .shaped) {
+                        if (proto.props.shaped.shape) |pleaf| {
+                            if (pleaf.find(pk)) |ps| return proto.props.getShapedSlot(ps.slot);
+                        }
+                    }
+                }
+            }
+        }
+    }
     heap_mod.checkValue(base);
     switch (base.unpack()) {
         .undefined, .null => {

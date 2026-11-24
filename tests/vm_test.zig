@@ -117,13 +117,21 @@ test "operator errors leave both operands on the stack" {
     try testing.expectEqual(Op.add, s.opAt(vm.pc));
     try testing.expectEqual(@as(usize, 2), vm.operands().len);
 
-    const s2 = try Setup.create("let s = 'ab'; s + s;", .{ .max_string_length = 3 });
+    const s2 = try Setup.create("let s = 'ab'; (s + '') + s;", .{ .max_string_length = 3 });
     defer s2.destroy();
     var vm2 = try zqjs.Vm.init(&s2.rt, &s2.proto);
     defer vm2.deinit();
     try testing.expectEqual(error.LimitExceeded, runToFault(&vm2));
     try testing.expectEqual(Op.add_local, s2.opAt(vm2.pc));
     try testing.expectEqual(@as(usize, 1), vm2.operands().len);
+
+    const s3 = try Setup.create("let s = 'ab'; s + s;", .{ .max_string_length = 3 });
+    defer s3.destroy();
+    var vm3 = try zqjs.Vm.init(&s3.rt, &s3.proto);
+    defer vm3.deinit();
+    try testing.expectEqual(error.LimitExceeded, runToFault(&vm3));
+    try testing.expectEqual(Op.add_local_local, s3.opAt(vm3.pc));
+    try testing.expectEqual(@as(usize, 0), vm3.operands().len);
 }
 
 test "the budget is charged before an instruction runs" {
@@ -175,12 +183,11 @@ test "--trace prints each instruction and the operand stack before it runs" {
         \\      5  push_const     k0            ; 1                |
         \\     10  init_local     s0                               | 1
         \\     15  get_global     n0            ; print            |
-        \\     20  get_local      s0 n1         ; x                | <native print>
-        \\     29  add_const      k1            ; 2                | <native print>, 1
-        \\     34  push_const     k2            ; "a"              | <native print>, 3
-        \\     39  call           2                                | <native print>, 3, "a"
-        \\     44  pop                                             | undefined
-        \\     45  halt                                            |
+        \\     20  add_local_const s0 k1        ; 2                | <native print>
+        \\     29  push_const     k2            ; "a"              | <native print>, 3
+        \\     34  call           2                                | <native print>, 3, "a"
+        \\     39  pop                                             | undefined
+        \\     40  halt                                            |
         \\
     , trace.written());
 }
@@ -1769,6 +1776,60 @@ test "M59: fast i32 formatNumber, string+number concat, and str/arr .length fast
     try rt.run(prog, null);
     try testing.expectEqualStrings(
         "0,0,1,-1,42,-999,2147483647,-2147483648,2147483648,-2147483649,1.5,NaN,Infinity,-Infinity\nx123:-45 8 7y 2 14\n",
+        out.buffered(),
+    );
+}
+
+test "local-const / local-local arithmetic superinstructions, TDZ in switch/if/try, and globalThis IC invalidation" {
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\// 1. *_local_const and *_local_local on numbers, -0, NaN, large ints, strings, BigInt, and objects
+        \\let a = 10, b = 3, neg0 = -0, big = 5000000000, div = 7, s = 'hi', bi = 4n;
+        \\let obj = { valueOf() { return 6; } };
+        \\print(a + 2, a - 2, a * 2, a % 4, a + b, a - b, a * b, a % b);
+        \\print(Object.is(neg0 % 7, -0), Object.is(neg0 % div, -0), 5.5 % 2, 5.5 % b, big % 7, big % div, NaN % 7);
+        \\print(s + 1, s + b, bi + 2n, obj + 1, obj + b);
+        \\
+        \\// 2. TDZ must throw ReferenceError in switch cases and conditional blocks (never mis-marked as init_slots)
+        \\let swTdz = false;
+        \\switch (2) {
+        \\  case 1: { } const swv = 5; break;
+        \\  case 2: try { swv + 1; } catch (e) { swTdz = e instanceof ReferenceError; } break;
+        \\}
+        \\let swTdz2 = false;
+        \\switch (2) {
+        \\  case 1: const swu = 5; break;
+        \\  case 2: try { swu + 1; } catch (e) { swTdz2 = e instanceof ReferenceError; } break;
+        \\}
+        \\print(swTdz, swTdz2);
+        \\
+        \\// 3. globalThis IC: shaped -> update -> delete -> accessor -> dict -> builtin shadow/restore
+        \\globalThis.gx = 10;
+        \\let sum = 0;
+        \\for (let i = 0; i < 4; i++) sum += gx;
+        \\globalThis.gx = 20;
+        \\for (let i = 0; i < 3; i++) sum += gx;
+        \\delete globalThis.gx;
+        \\let delThrows = false;
+        \\try { gx; } catch (e) { delThrows = e instanceof ReferenceError; }
+        \\let accHits = 0;
+        \\Object.defineProperty(globalThis, 'gx', { get() { accHits++; return 7; }, configurable: true });
+        \\for (let i = 0; i < 3; i++) sum += gx;
+        \\globalThis.Math = { abs(x) { return x + 100; } };
+        \\let m1 = Math.abs(5);
+        \\delete globalThis.Math;
+        \\let m2 = Math.abs(-5);
+        \\print(sum, delThrows, accHits, m1, m2);
+    ;
+    const prog = try rt.compile("global_ic_and_local_arith.js", src, null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+    try testing.expectEqualStrings(
+        "12 8 20 2 13 7 30 1\ntrue true 1.5 2.5 2 2 NaN\nhi1 hi3 6 7 9\ntrue true\n121 true 3 105 5\n",
         out.buffered(),
     );
 }

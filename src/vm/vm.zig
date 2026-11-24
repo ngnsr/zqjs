@@ -600,6 +600,7 @@ pub const Vm = struct {
 
         inline fn valueSlot(self: FrameCache, vm: *Vm, i: u32) Error!?*Slot {
             const s = try self.slot(vm, i);
+            if (s.bits < Value.TAG_BASE) return s;
             if (s.isUninit()) return null;
             if (s.isCell()) return vm.bug("value access to a cell slot");
             return s;
@@ -814,6 +815,7 @@ pub const Vm = struct {
     /// checked at loop back-edges, calls, and allocations instead of every instruction.
     fn execute(vm: *Vm, cache: *FrameCache, comptime inline_safepoints: bool) Error!State {
         @setEvalBranchQuota(4000);
+        const rt = vm.rt;
         const p = cache.p;
         const code = cache.code;
         const pc = cache.pc;
@@ -822,8 +824,7 @@ pub const Vm = struct {
         if (byte >= Op.count) return vm.bug("invalid opcode");
         const op: Op = @fromBackingInt(@intCast(byte));
         if (op.size() > code.len - pc) return vm.bug("instruction runs past the end of the code");
-        try vm.rt.step();
-        const rt = vm.rt;
+        try rt.step();
         var next: u32 = pc + op.size();
 
         switch (op) {
@@ -882,17 +883,20 @@ pub const Vm = struct {
                     if (fastGetGlobal(rt, p, pc, atom)) |v| {
                         try cache.push(vm, v);
                     } else {
+                        cache.syncSp(vm);
                         const gname = try vm.name(name_idx);
                         const v = try builtins.global(rt, gname);
                         populateGetGlobalIc(rt, p, pc, atom, gname);
                         try cache.push(vm, v);
                     }
                 } else {
+                    cache.syncSp(vm);
                     try cache.push(vm, try builtins.global(rt, try vm.name(name_idx)));
                 }
             },
             .get_global_or_undefined => {
                 try cache.ensurePush(vm);
+                cache.syncSp(vm);
                 try cache.push(vm, try builtins.tryGlobal(rt, try vm.name(cache.operand(0))));
             },
             .set_global => {
@@ -1319,18 +1323,11 @@ pub const Vm = struct {
                     .add_const => Value.fromNumber(lhs.asNumber() + rhs.asNumber()),
                     .sub_const => Value.fromNumber(lhs.asNumber() - rhs.asNumber()),
                     .mul_const => Value.fromNumber(lhs.asNumber() * rhs.asNumber()),
-                    .mod_const => Value.fromNumber(fastRemainder(lhs.asNumber(), rhs.asNumber())),
+                    .mod_const => fastRemainderVal(lhs.asNumber(), rhs.asNumber()),
                     else => unreachable,
                 } else blk: {
                     cache.syncSp(vm);
-                    const bop: BinaryOp = switch (op) {
-                        .add_const => .add,
-                        .sub_const => .sub,
-                        .mul_const => .mul,
-                        .mod_const => .mod,
-                        else => unreachable,
-                    };
-                    break :blk try ops.binary(rt, bop, lhs, rhs);
+                    break :blk try slowBinary(rt, op, lhs, rhs);
                 };
                 vm.stack[cache.sp - 1] = r;
             },
@@ -1342,20 +1339,50 @@ pub const Vm = struct {
                     .add_local => Value.fromNumber(lhs.asNumber() + rhs.asNumber()),
                     .sub_local => Value.fromNumber(lhs.asNumber() - rhs.asNumber()),
                     .mul_local => Value.fromNumber(lhs.asNumber() * rhs.asNumber()),
-                    .mod_local => Value.fromNumber(fastRemainder(lhs.asNumber(), rhs.asNumber())),
+                    .mod_local => fastRemainderVal(lhs.asNumber(), rhs.asNumber()),
                     else => unreachable,
                 } else blk: {
                     cache.syncSp(vm);
-                    const bop: BinaryOp = switch (op) {
-                        .add_local => .add,
-                        .sub_local => .sub,
-                        .mul_local => .mul,
-                        .mod_local => .mod,
-                        else => unreachable,
-                    };
-                    break :blk try ops.binary(rt, bop, lhs, rhs);
+                    break :blk try slowBinary(rt, op, lhs, rhs);
                 };
                 vm.stack[cache.sp - 1] = r;
+            },
+            .add_local_const, .sub_local_const, .mul_local_const, .mod_local_const => {
+                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.bug("uninit local in local_const");
+                const k = cache.operand(1);
+                if (k >= p.consts.len) return vm.bug("constant index out of range");
+                const lhs = s.asValue();
+                const rhs = p.consts[k];
+                try cache.ensurePush(vm);
+                const r: Value = if (lhs.isNumber() and rhs.isNumber()) switch (op) {
+                    .add_local_const => Value.fromNumber(lhs.asNumber() + rhs.asNumber()),
+                    .sub_local_const => Value.fromNumber(lhs.asNumber() - rhs.asNumber()),
+                    .mul_local_const => Value.fromNumber(lhs.asNumber() * rhs.asNumber()),
+                    .mod_local_const => fastRemainderVal(lhs.asNumber(), rhs.asNumber()),
+                    else => unreachable,
+                } else blk: {
+                    cache.syncSp(vm);
+                    break :blk try slowBinary(rt, op, lhs, rhs);
+                };
+                try cache.push(vm, r);
+            },
+            .add_local_local, .sub_local_local, .mul_local_local, .mod_local_local => {
+                const ls = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.bug("uninit lhs in local_local");
+                const rs = (try cache.valueSlot(vm, cache.operand(1))) orelse return vm.bug("uninit rhs in local_local");
+                const lhs = ls.asValue();
+                const rhs = rs.asValue();
+                try cache.ensurePush(vm);
+                const r: Value = if (lhs.isNumber() and rhs.isNumber()) switch (op) {
+                    .add_local_local => Value.fromNumber(lhs.asNumber() + rhs.asNumber()),
+                    .sub_local_local => Value.fromNumber(lhs.asNumber() - rhs.asNumber()),
+                    .mul_local_local => Value.fromNumber(lhs.asNumber() * rhs.asNumber()),
+                    .mod_local_local => fastRemainderVal(lhs.asNumber(), rhs.asNumber()),
+                    else => unreachable,
+                } else blk: {
+                    cache.syncSp(vm);
+                    break :blk try slowBinary(rt, op, lhs, rhs);
+                };
+                try cache.push(vm, r);
             },
             .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in, .instanceof => {
                 // M10.2b/M10.2c: fast path when both operands are already `.number` (`f64`),
@@ -1368,7 +1395,7 @@ pub const Vm = struct {
                     .sub => Value.fromNumber(lhs.asNumber() - rhs.asNumber()),
                     .mul => Value.fromNumber(lhs.asNumber() * rhs.asNumber()),
                     .div => Value.fromNumber(lhs.asNumber() / rhs.asNumber()),
-                    .mod => Value.fromNumber(fastRemainder(lhs.asNumber(), rhs.asNumber())),
+                    .mod => fastRemainderVal(lhs.asNumber(), rhs.asNumber()),
                     .shl => Value.fromNumber(ops.bitShl(lhs.asNumber(), rhs.asNumber())),
                     .shr => Value.fromNumber(ops.bitShr(lhs.asNumber(), rhs.asNumber())),
                     .ushr => Value.fromNumber(ops.bitUshr(lhs.asNumber(), rhs.asNumber())),
@@ -1383,12 +1410,12 @@ pub const Vm = struct {
                     .strict_ne => Value.fromBool(lhs.asNumber() != rhs.asNumber()),
                     .pow, .in, .instanceof => blk: {
                         cache.syncSp(vm);
-                        break :blk try ops.binary(rt, binaryOp(op), lhs, rhs);
+                        break :blk try slowBinary(rt, op, lhs, rhs);
                     },
                     else => unreachable,
                 } else blk: {
                     cache.syncSp(vm);
-                    break :blk try ops.binary(rt, binaryOp(op), lhs, rhs);
+                    break :blk try slowBinary(rt, op, lhs, rhs);
                 };
                 cache.sp -= 1;
                 vm.stack[cache.sp - 1] = r;
@@ -1685,7 +1712,7 @@ pub const Vm = struct {
                 return rt.throwValue(v);
             },
         }
-        if (next >= code.len) return vm.bug("pc outside the code");
+        if (!inline_safepoints and next >= code.len) return vm.bug("pc outside the code");
         cache.pc = next;
         return .running;
     }
@@ -2832,24 +2859,74 @@ inline fn insertPropIc(rt: *Runtime, p: *const Proto, pc: u32, entry: rt_mod.Pro
     b[0] = entry;
 }
 
-inline fn fastGetGlobal(rt: *Runtime, p: *const Proto, pc: u32, atom: *heap.String) ?Value {
+fn fastGetGlobal(rt: *Runtime, p: *const Proto, pc: u32, atom: *heap.String) ?Value {
     const r = builtins.realmIfInit(rt) orelse return null;
-    if (rt.host_globals.items.len != 0) return null;
     const b = propIcBucket(rt, p, pc);
     const ic = b[0];
-    if (ic.kind == 12 and ic.atom_addr == @intFromPtr(atom) and objVersion(r.global_object) == ic.shape_id) {
-        return builtins.resolveGlobalTargetByIndex(r, ic.slot);
+    if (ic.atom_addr != @intFromPtr(atom)) return null;
+    switch (ic.kind) {
+        12 => if (rt.host_globals.items.len == 0 and objVersion(r.global_object) == ic.shape_id) {
+            return builtins.resolveGlobalTargetByIndex(r, ic.slot);
+        },
+        13 => {
+            const go = r.global_object;
+            if (go.props == .shaped and go.props.shapeId() == ic.shape_id) {
+                go.obj.checkLive();
+                const v = go.props.getShapedSlot(ic.slot);
+                heap.checkValue(v);
+                return v;
+            }
+        },
+        14 => {
+            const go = r.global_object;
+            if (go.props == .dict and go.dict_version == ic.shape_id) {
+                go.obj.checkLive();
+                const v = go.props.dict.values()[ic.slot].value;
+                heap.checkValue(v);
+                return v;
+            }
+        },
+        else => {},
     }
     return null;
 }
 
 noinline fn populateGetGlobalIc(rt: *Runtime, p: *const Proto, pc: u32, atom: *heap.String, name: []const u8) void {
     const r = builtins.realmIfInit(rt) orelse return;
+    const go = r.global_object;
+    const key = heap.PropKey.fromAtom(atom);
+    if (go.props == .shaped) {
+        if (go.props.shaped.shape) |leaf| {
+            if (leaf.find(key)) |s| {
+                insertPropIc(rt, p, pc, .{
+                    .shape_id = leaf.id,
+                    .proto_shape_id = 0,
+                    .atom_addr = @intFromPtr(atom),
+                    .slot = s.slot,
+                    .kind = 13,
+                });
+                return;
+            }
+        }
+    } else if (go.dict_version != 0) {
+        if (go.props.dict.getIndex(key)) |idx| {
+            const prop = go.props.dict.values()[idx];
+            if (!prop.is_accessor and idx <= std.math.maxInt(u16)) {
+                insertPropIc(rt, p, pc, .{
+                    .shape_id = go.dict_version,
+                    .proto_shape_id = 0,
+                    .atom_addr = @intFromPtr(atom),
+                    .slot = @intCast(idx),
+                    .kind = 14,
+                });
+            }
+            return;
+        }
+    }
     if (rt.host_globals.items.len != 0) return;
-    if (r.global_object.props.get(heap.PropKey.fromAtom(atom)) != null) return;
     const idx = builtins.globalTargetIndex(name) orelse return;
     insertPropIc(rt, p, pc, .{
-        .shape_id = objVersion(r.global_object),
+        .shape_id = objVersion(go),
         .proto_shape_id = 0,
         .atom_addr = @intFromPtr(atom),
         .slot = idx,
@@ -3277,11 +3354,11 @@ fn fastTypedArraySet(base: Value, idx: Value, val: Value) bool {
 
 fn binaryOp(op: Op) BinaryOp {
     return switch (op) {
-        .add => .add,
-        .sub => .sub,
-        .mul => .mul,
+        .add, .add_const, .add_local, .add_local_const, .add_local_local => .add,
+        .sub, .sub_const, .sub_local, .sub_local_const, .sub_local_local => .sub,
+        .mul, .mul_const, .mul_local, .mul_local_const, .mul_local_local => .mul,
         .div => .div,
-        .mod => .mod,
+        .mod, .mod_const, .mod_local, .mod_local_const, .mod_local_local => .mod,
         .pow => .pow,
         .shl => .shl,
         .shr => .shr,
@@ -3301,23 +3378,45 @@ fn binaryOp(op: Op) BinaryOp {
     };
 }
 
+/// Out-of-line slow fallback for non-numeric or complex binary ops so `runLoopInner`
+/// stays compact across fused arithmetic opcodes without taking `&cache` (which would
+/// inhibit register promotion of `FrameCache`).
+noinline fn slowBinary(rt: *Runtime, op: Op, lhs: Value, rhs: Value) Error!Value {
+    @branchHint(.cold);
+    return ops.binary(rt, binaryOp(op), lhs, rhs);
+}
+
 /// M10.2c: fast exact-integer `%` when both operands are finite, integral, and within
 /// `[-Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]` with non-zero divisor. Preserves
 /// JS dividend-sign remainder and `-0` (`-4 % 2`, `-0 % 5`), falling back to `ops.remainder`
 /// for everything else.
 const pos_inf: f64 = std.math.inf(f64);
 
-inline fn fastRemainder(a: f64, b: f64) f64 {
-    if (a > 0 and a < b and b != pos_inf) return a;
+noinline fn slowRemainderVal(a: f64, b: f64) Value {
+    @branchHint(.cold);
     const max_safe: f64 = 9007199254740991.0; // 2^53 - 1
-    if (-max_safe <= a and a <= max_safe and -max_safe <= b and b <= max_safe and b != 0) {
+    if (@abs(a) <= max_safe and @abs(b) <= max_safe and b != 0) {
         const ai: i64 = @intFromFloat(a);
         const bi: i64 = @intFromFloat(b);
         if (@as(f64, @floatFromInt(ai)) == a and @as(f64, @floatFromInt(bi)) == b) {
-            const r = if (ai >= 0 and bi > 0 and (bi & (bi - 1)) == 0) ai & (bi - 1) else @rem(ai, bi);
-            if (r == 0) return if (std.math.signbit(a)) -0.0 else 0.0;
-            return @floatFromInt(r);
+            const r = @rem(ai, bi);
+            if (r == 0) return Value.fromNumber(if (std.math.signbit(a)) -0.0 else 0.0);
+            return .{ .bits = @bitCast(@as(f64, @floatFromInt(r))) };
         }
     }
-    return ops.remainder(a, b);
+    return Value.fromNumber(ops.remainder(a, b));
+}
+
+inline fn fastRemainderVal(a: f64, b: f64) Value {
+    if (a > 0 and a < b and b < pos_inf) return .{ .bits = @bitCast(a) };
+    const max_u32: f64 = 4294967295.0;
+    if (a > 0 and b > 0 and a <= max_u32 and b <= max_u32) {
+        const au: u32 = @intFromFloat(a);
+        const bu: u32 = @intFromFloat(b);
+        if (@as(f64, @floatFromInt(au)) == a and @as(f64, @floatFromInt(bu)) == b) {
+            const r: u32 = if ((bu & (bu - 1)) == 0) au & (bu - 1) else au % bu;
+            return .{ .bits = @bitCast(@as(f64, @floatFromInt(r))) };
+        }
+    }
+    return slowRemainderVal(a, b);
 }

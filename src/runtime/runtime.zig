@@ -192,7 +192,8 @@ pub const PropIc = struct {
     /// 7 = 2-hop grandproto shaped read, 8 = 2-hop grandproto dict read,
     /// 9 = negative (missing property -> undefined) up to 2 proto hops,
     /// 10 = String.prototype shaped read, 11 = String.prototype dict read,
-    /// 12 = builtin global target (validated against global_object version).
+    /// 12 = builtin global target (validated against global_object version),
+    /// 13 = global_object own shaped data read, 14 = global_object own dict data read.
     kind: u8 = 0,
 };
 
@@ -200,10 +201,8 @@ pub const Runtime = struct {
     gpa: Allocator,
     heap: Heap,
     out: *std.Io.Writer,
-    max_steps: u64,
     /// All limits, for the engines (call depth, stack slots, interpreter depth).
     limits: Limits,
-    steps: u64 = 0,
     /// Host handles (M9.1, D50): the table is one GC root set (marked in `markRoots`).
     handles: handles.Table,
     /// The shared execution context (M9.1, D51): a chain's budget, depth, engine records
@@ -282,6 +281,9 @@ pub const Runtime = struct {
     /// Optional wall-clock hook returning UTC epoch milliseconds (M50, D80).
     wall_clock: ?*const fn (ctx: ?*anyopaque) i64 = null,
     wall_clock_ctx: ?*anyopaque = null,
+    /// Step budget counter and limit kept adjacent (same cache line, away from heap buffer page offsets).
+    steps: u64 = 0,
+    max_steps: u64,
 
     pub const default_random_seed: u64 = 0x9e3779b97f4a7c15;
 

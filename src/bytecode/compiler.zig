@@ -731,7 +731,9 @@ const Compiler = struct {
             .@"try" => |t| return c.compileTry(t, s.span),
             .@"if" => |i| {
                 const to_else = try c.jumpIfFalseExpr(i.cond);
+                const saved_init = c.init_slots;
                 const then_completes = try c.stmt(i.then.*);
+                c.init_slots = saved_init;
                 const e = i.@"else" orelse {
                     c.patch(to_else, c.here());
                     return true;
@@ -739,10 +741,13 @@ const Compiler = struct {
                 const to_end = if (then_completes) try c.jumpForward(.jump) else null;
                 c.patch(to_else, c.here());
                 const else_completes = try c.stmt(e.*);
+                c.init_slots = saved_init;
                 if (to_end) |j| c.patch(j, c.here());
                 return then_completes or else_completes;
             },
             .@"while" => |w| {
+                const saved_init = c.init_slots;
+                defer c.init_slots = saved_init;
                 // top: cond; jump_if_false end; body; jump top; end:
                 var loop: Loop = .{};
                 defer c.deinitLoop(&loop);
@@ -757,6 +762,8 @@ const Compiler = struct {
                 return true; // the condition can be false
             },
             .do_while => |dw| {
+                const saved_init = c.init_slots;
+                defer c.init_slots = saved_init;
                 // top: body; cont: cond; jump_if_true top; end:
                 var loop: Loop = .{};
                 defer c.deinitLoop(&loop);
@@ -811,6 +818,8 @@ const Compiler = struct {
                 return to_end != null or loop.breaks.items.len > 0;
             },
             .for_of => |f| {
+                const saved_init = c.init_slots;
+                defer c.init_slots = saved_init;
                 // Store iterator in a hidden local slot so the operand stack stays empty
                 // across `body` (preserving `return`/`try`/`break`/`continue` stack invariants).
                 const loop_depth = c.depth;
@@ -890,6 +899,8 @@ const Compiler = struct {
                 return true;
             },
             .for_in => |f| {
+                const saved_init = c.init_slots;
+                defer c.init_slots = saved_init;
                 const loop_depth = c.depth;
                 const iter_slot = c.allocTemp();
                 defer c.freeTemp();
@@ -1195,6 +1206,7 @@ const Compiler = struct {
         const to_end = if (try_completes) try c.jumpForward(.jump) else null;
         const catch_pc = c.here();
         c.depth = try_depth;
+        const saved_init = c.init_slots;
         if (t.catch_param) |cp| {
             c.depth += 1;
             c.max_stack = @max(c.max_stack, c.depth);
@@ -1202,6 +1214,7 @@ const Compiler = struct {
             try c.bindPattern(cp, .init);
         }
         const catch_completes = try c.statements(cb, span);
+        c.init_slots = saved_init;
         if (to_end) |j| c.patch(j, c.here());
         if (try_end > try_start) {
             try c.handlers.append(c.s.gpa, .{
@@ -1390,7 +1403,9 @@ const Compiler = struct {
         defer _ = c.controls.pop();
 
         var last_completes = true;
+        const switch_init = c.init_slots;
         for (sw.cases, 0..) |cs, i| {
+            c.init_slots = switch_init;
             if (cs.test_expr != null) {
                 c.patch(case_jumps[i], c.here());
             } else {
@@ -1402,6 +1417,7 @@ const Compiler = struct {
             }
             last_completes = clause_completes;
         }
+        c.init_slots = switch_init;
         if (default_idx == null) c.patch(no_match_jump, c.here());
         for (switch_breaks.items) |j| c.patch(j, c.here());
         return (default_idx == null) or (switch_breaks.items.len > 0) or last_completes;
@@ -1572,6 +1588,51 @@ const Compiler = struct {
                     try c.expr(b.rhs);
                 },
                 else => {
+                    if (b.lhs.data == .identifier) {
+                        const lref = b.lhs.data.identifier;
+                        if (c.s.res.refs[lref.id] == .local) {
+                            const lb = c.s.res.refs[lref.id].local;
+                            if (!c.binding(lb).captured) {
+                                const ls = c.slotOf(lb);
+                                if (c.isSlotInit(ls)) {
+                                    if (b.rhs.data == .number) {
+                                        const fused_lc: ?Op = switch (b.op) {
+                                            .add => .add_local_const,
+                                            .sub => .sub_local_const,
+                                            .mul => .mul_local_const,
+                                            .mod => .mod_local_const,
+                                            else => null,
+                                        };
+                                        if (fused_lc) |fop| {
+                                            try c.emit(fop, &.{ ls, try c.number(b.rhs.data.number) });
+                                            return;
+                                        }
+                                    } else if (b.rhs.data == .identifier) {
+                                        const rref = b.rhs.data.identifier;
+                                        if (c.s.res.refs[rref.id] == .local) {
+                                            const rb = c.s.res.refs[rref.id].local;
+                                            if (!c.binding(rb).captured) {
+                                                const rs = c.slotOf(rb);
+                                                if (c.isSlotInit(rs)) {
+                                                    const fused_ll: ?Op = switch (b.op) {
+                                                        .add => .add_local_local,
+                                                        .sub => .sub_local_local,
+                                                        .mul => .mul_local_local,
+                                                        .mod => .mod_local_local,
+                                                        else => null,
+                                                    };
+                                                    if (fused_ll) |fop| {
+                                                        try c.emit(fop, &.{ ls, rs });
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     try c.expr(b.lhs);
                     if (b.rhs.data == .number) {
                         const fused: ?Op = switch (b.op) {

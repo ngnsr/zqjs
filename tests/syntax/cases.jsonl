@@ -710,3 +710,4 @@
 ["ok", "void (1 + 2);", "(void (+ 1 2))"]
 ["syntax", "void 2 ** 2;"]
 ["syntax", "void ({ a = 1 });"]
+["ok", "function* g() { (function yield() {}) }"]

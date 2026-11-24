@@ -9,7 +9,17 @@ comptime {
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Default to ReleaseSafe so `zig build test` / `test-fast` / `test-vm` never accidentally
+    // run slow unoptimized Debug builds (still supports -Doptimize=Debug / --release=fast|small).
+    const optimize: std.builtin.Optimize = b.option(
+        std.builtin.Optimize,
+        "optimize",
+        "Prioritize performance, safety, or binary size (default: ReleaseSafe)",
+    ) orelse switch (b.graph.release_mode) {
+        .fast => .fast,
+        .small => .small,
+        .off, .any, .safe => .safe,
+    };
     const strip = b.option(bool, "strip", "Strip debug info and symbol table (default: true for ReleaseSmall)") orelse (optimize == .small);
 
     // Two modules (M9.0, D46). `zqjs_internal` is everything (src/root.zig): tests, tools and

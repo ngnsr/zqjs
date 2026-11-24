@@ -2097,17 +2097,21 @@ pub const Heap = struct {
                     try h.toDictionary(o);
                 } else {
                     const next_sh = try h.transitionShape(leaf, key, .default);
-                    if (next_sh.slot >= INLINE_SLOTS) try h.ensureShapedExtra(o, next_sh.count - INLINE_SLOTS);
-                    o.props.setShapedSlot(next_sh.slot, value);
-                    o.props.shaped.shape = next_sh;
+                    if (next_sh.slot < INLINE_SLOTS) {
+                        sh.inline_slots[next_sh.slot] = value;
+                    } else {
+                        try h.ensureShapedExtra(o, next_sh.count - INLINE_SLOTS);
+                        sh.extra[next_sh.slot - INLINE_SLOTS] = value;
+                    }
+                    sh.shape = next_sh;
                     h.barrierObj(&o.obj, key.obj);
                     h.barrier(&o.obj, null, value);
                     return;
                 }
             } else {
                 const next_sh = try h.transitionShape(null, key, .default);
-                o.props.setShapedSlot(0, value);
-                o.props.shaped.shape = next_sh;
+                sh.inline_slots[0] = value;
+                sh.shape = next_sh;
                 h.barrierObj(&o.obj, key.obj);
                 h.barrier(&o.obj, null, value);
                 return;

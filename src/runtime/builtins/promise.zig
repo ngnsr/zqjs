@@ -61,47 +61,83 @@ fn thisPromise(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
     return common.unsupportedReceiver(rt, name);
 }
 
-pub fn promiseThen(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const p_obj = try thisPromise(rt, this, "then");
-    const raw_f = common.arg(args, 0);
-    const raw_r = common.arg(args, 1);
-    const on_fulfilled: Value = if (raw_f.isNative() or raw_f.isClosure()) raw_f else .undefined;
-    const on_rejected: Value = if (raw_r.isNative() or raw_r.isClosure()) raw_r else .undefined;
-
-    var root_buf = [_]Value{ Value.fromObject(p_obj), on_fulfilled, on_rejected, .undefined };
+fn capReactionRun(rt: *Runtime, env: *Object, val: Value, is_reject_branch: bool) Error!Value {
+    var root_buf = [_]Value{ Value.fromObject(env), val, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const r = try builtins.realm(rt);
-    const child = try rt.heap.newPromise(r.promise_prototype);
-    root_buf[3] = Value.fromObject(child);
-    const pr = &p_obj.kind.promise;
-
-    if (pr.state == .pending) {
-        try pr.reactions.ensureUnusedCapacity(rt.heap.allocator(), 1);
-        pr.reactions.appendAssumeCapacity(.{
-            .child = child,
-            .on_fulfilled = on_fulfilled,
-            .on_rejected = on_rejected,
-        });
-        rt.heap.barrier(&p_obj.obj, null, Value.fromObject(child));
-        rt.heap.barrier(&p_obj.obj, null, on_fulfilled);
-        rt.heap.barrier(&p_obj.obj, null, on_rejected);
+    const res_cap = env.kind.array.items[0];
+    const rej_cap = env.kind.array.items[1];
+    const user_cb = env.kind.array.items[2];
+    if (user_cb.isFunction()) {
+        if (rt.callCallable(user_cb, .undefined, &.{val})) |ret| {
+            root_buf[2] = ret;
+            _ = try rt.callCallable(res_cap, .undefined, &.{ret});
+        } else |e| {
+            if (e != error.Thrown) return e;
+            const err_val = try rt.catchValue();
+            root_buf[2] = err_val;
+            _ = try rt.callCallable(rej_cap, .undefined, &.{err_val});
+        }
+    } else if (is_reject_branch) {
+        _ = try rt.callCallable(rej_cap, .undefined, &.{val});
     } else {
-        const is_rejected = (pr.state == .rejected);
-        const cb = if (is_rejected) on_rejected else on_fulfilled;
-        const is_adopt = (!cb.isNative() and !cb.isClosure());
-        try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
-        rt.microtasks.appendAssumeCapacity(.{
-            .kind = if (is_adopt) .adopt else .reaction,
-            .child = child,
-            .cb = cb,
-            .arg = pr.result,
-            .adopt_rejected = is_rejected,
-        });
+        _ = try rt.callCallable(res_cap, .undefined, &.{val});
     }
-    return Value.fromObject(child);
+    return .undefined;
+}
+
+fn capFulfillCb(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
+    return capReactionRun(rt, env, common.arg(args, 0), false);
+}
+
+fn capRejectCb(rt: *Runtime, env: *Object, args: []const Value) Error!Value {
+    return capReactionRun(rt, env, common.arg(args, 0), true);
+}
+
+pub fn promiseThen(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const p_obj = try thisPromise(rt, this, "then");
+    const raw_f = common.arg(args, 0);
+    const raw_r = common.arg(args, 1);
+    const on_fulfilled: Value = if (raw_f.isFunction()) raw_f else .undefined;
+    const on_rejected: Value = if (raw_r.isFunction()) raw_r else .undefined;
+
+    var root_buf = [_]Value{ Value.fromObject(p_obj), on_fulfilled, on_rejected, .undefined, .undefined, .undefined, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const ctor = try common.speciesConstructor(rt, this, Value.fromNative(&builtins.promise_global));
+    root_buf[3] = ctor;
+
+    if (ctor.isNative() and ctor.asNative() == &builtins.promise_global) {
+        const r = try builtins.realm(rt);
+        const child = try rt.heap.newPromise(r.promise_prototype);
+        root_buf[4] = Value.fromObject(child);
+        try performPromiseThenCap(rt, p_obj, on_fulfilled, on_rejected, child);
+        return Value.fromObject(child);
+    }
+
+    const cap = try newPromiseCapabilityRecord(rt, ctor);
+    root_buf[4] = cap.promise;
+    root_buf[5] = cap.resolve;
+    root_buf[6] = cap.reject;
+
+    const ful_env = try rt.heap.newArray(null);
+    root_buf[7] = Value.fromObject(ful_env);
+    try rt.heap.appendElements(ful_env, &.{ cap.resolve, cap.reject, on_fulfilled });
+    const ful_cb = Value.fromClosure(try rt.heap.newNativeClosure(&capFulfillCb, ful_env));
+    root_buf[7] = ful_cb;
+
+    const rej_env = try rt.heap.newArray(null);
+    root_buf[8] = Value.fromObject(rej_env);
+    try rt.heap.appendElements(rej_env, &.{ cap.resolve, cap.reject, on_rejected });
+    const rej_cb = Value.fromClosure(try rt.heap.newNativeClosure(&capRejectCb, rej_env));
+    root_buf[8] = rej_cb;
+
+    try performPromiseThenCap(rt, p_obj, ful_cb, rej_cb, null);
+    return cap.promise;
 }
 
 /// PerformPromiseThen without a result capability (internal reactions, D68): `p` must be
@@ -125,7 +161,7 @@ pub fn performPromiseThenCap(rt: *Runtime, p_obj: *Object, on_fulfilled: Value, 
         const cb = if (is_rejected) on_rejected else on_fulfilled;
         try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
         rt.microtasks.appendAssumeCapacity(.{
-            .kind = if (cb.isNative() or cb.isClosure()) .reaction else .adopt,
+            .kind = if (cb.isFunction()) .reaction else .adopt,
             .child = child,
             .cb = cb,
             .arg = pr.result,
@@ -135,8 +171,14 @@ pub fn performPromiseThenCap(rt: *Runtime, p_obj: *Object, on_fulfilled: Value, 
 }
 
 fn promiseCatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    _ = try thisPromise(rt, this, "catch");
-    return promiseThen(rt, this, &.{ .undefined, common.arg(args, 0) });
+    const on_rejected = common.arg(args, 0);
+    var root_buf = [_]Value{ this, on_rejected, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    const then_fn = try object.get(rt, this, try object.named(rt, "then"));
+    root_buf[2] = then_fn;
+    return rt.callCallable(then_fn, this, &.{ .undefined, on_rejected });
 }
 
 fn promiseFinally(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -158,9 +200,9 @@ fn promiseFinally(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const env = try rt.heap.newArray(null);
         root_buf[3] = Value.fromObject(env);
         try rt.heap.appendElements(env, &.{ raw_f, ctor });
-        const then_fn = try rt.heap.newNativeClosure(&finallyThenCb, env);
+        const then_fn = try rt.heap.newNativeClosureWithLength(&finallyThenCb, env, 1);
         root_buf[4] = Value.fromClosure(then_fn);
-        const catch_fn = try rt.heap.newNativeClosure(&finallyCatchCb, env);
+        const catch_fn = try rt.heap.newNativeClosureWithLength(&finallyCatchCb, env, 1);
         root_buf[5] = Value.fromClosure(catch_fn);
         then_arg = root_buf[4];
         catch_arg = root_buf[5];
@@ -299,10 +341,10 @@ fn newPromiseCapabilityRecord(rt: *Runtime, ctor: Value) Error!PromiseCapRecord 
     root_buf[1] = Value.fromObject(env);
     try rt.heap.appendElements(env, &.{ .undefined, .undefined });
 
-    const exec = try rt.heap.newNativeClosure(&getCapabilitiesExecutor, env);
+    const exec = try rt.heap.newNativeClosureWithLength(&getCapabilitiesExecutor, env, 2);
     root_buf[2] = Value.fromClosure(exec);
 
-    const promise_val = try builtins.construct(rt, ctor, &.{root_buf[2]});
+    const promise_val = try proxy_reflect.constructWithNewTarget(rt, ctor, &.{root_buf[2]}, ctor);
     root_buf[3] = promise_val;
     const res_fn = env.kind.array.items[0];
     const rej_fn = env.kind.array.items[1];
@@ -478,7 +520,7 @@ fn promiseCombinator(rt: *Runtime, comptime kind: CombinatorKind, ctor: Value, i
         const cap_arr = try rt.heap.newArray(null);
         root_buf[9] = Value.fromObject(cap_arr);
         try rt.heap.appendElements(cap_arr, &.{ .undefined, .undefined });
-        const exec = try rt.heap.newNativeClosure(&capabilityExecutor, cap_arr);
+        const exec = try rt.heap.newNativeClosureWithLength(&capabilityExecutor, cap_arr, 2);
         root_buf[10] = Value.fromClosure(exec);
         root_buf[2] = try proxy_reflect.constructWithNewTarget(rt, ctor, &.{Value.fromClosure(exec)}, ctor);
         const res_cap = cap_arr.kind.array.items[0];
@@ -556,16 +598,16 @@ fn promiseCombinator(rt: *Runtime, comptime kind: CombinatorKind, ctor: Value, i
         }
 
         const cb_f: Value = switch (kind) {
-            .all => Value.fromClosure(try rt.heap.newNativeClosure(&allFulfillCb, root_buf[10].asObject())),
-            .all_settled => Value.fromClosure(try rt.heap.newNativeClosure(&allSettledFulfillCb, root_buf[10].asObject())),
+            .all => Value.fromClosure(try rt.heap.newNativeClosureWithLength(&allFulfillCb, root_buf[10].asObject(), 1)),
+            .all_settled => Value.fromClosure(try rt.heap.newNativeClosureWithLength(&allSettledFulfillCb, root_buf[10].asObject(), 1)),
             .race, .any => res_cap,
         };
         root_buf[11] = cb_f;
 
         const cb_r: Value = switch (kind) {
             .all, .race => rej_cap,
-            .all_settled => Value.fromClosure(try rt.heap.newNativeClosure(&allSettledRejectCb, root_buf[10].asObject())),
-            .any => Value.fromClosure(try rt.heap.newNativeClosure(&anyRejectCb, root_buf[10].asObject())),
+            .all_settled => Value.fromClosure(try rt.heap.newNativeClosureWithLength(&allSettledRejectCb, root_buf[10].asObject(), 1)),
+            .any => Value.fromClosure(try rt.heap.newNativeClosureWithLength(&anyRejectCb, root_buf[10].asObject(), 1)),
         };
         root_buf[12] = cb_r;
 
@@ -584,12 +626,20 @@ fn promiseCombinator(rt: *Runtime, comptime kind: CombinatorKind, ctor: Value, i
 
     if (count == 0) {
         switch (kind) {
-            .all, .all_settled => _ = try rt.callCallable(res_cap, .undefined, &.{root_buf[7]}),
+            .all, .all_settled => {
+                _ = rt.callCallable(res_cap, .undefined, &.{root_buf[7]}) catch |e| {
+                    if (e != error.Thrown) return e;
+                    return rejectCapabilityCaught(rt, rej_cap, p_out);
+                };
+            },
             .race => {},
             .any => {
                 const agg = try makeAggregateError(rt, root_buf[7]);
                 root_buf[9] = agg;
-                _ = try rt.callCallable(rej_cap, .undefined, &.{agg});
+                _ = rt.callCallable(rej_cap, .undefined, &.{agg}) catch |e| {
+                    if (e != error.Thrown) return e;
+                    return rejectCapabilityCaught(rt, rej_cap, p_out);
+                };
             },
         }
     } else if (kind != .race) {
@@ -601,11 +651,19 @@ fn promiseCombinator(rt: *Runtime, comptime kind: CombinatorKind, ctor: Value, i
         if (total_rem == 0 and !state_arr.kind.array.items[5].asBool()) {
             rt.heap.storeElement(state_arr, 5, Value.fromBool(true));
             switch (kind) {
-                .all, .all_settled => _ = try rt.callCallable(res_cap, .undefined, &.{root_buf[7]}),
+                .all, .all_settled => {
+                    _ = rt.callCallable(res_cap, .undefined, &.{root_buf[7]}) catch |e| {
+                        if (e != error.Thrown) return e;
+                        return rejectCapabilityCaught(rt, rej_cap, p_out);
+                    };
+                },
                 .any => {
                     const agg = try makeAggregateError(rt, root_buf[7]);
                     root_buf[9] = agg;
-                    _ = try rt.callCallable(rej_cap, .undefined, &.{agg});
+                    _ = rt.callCallable(rej_cap, .undefined, &.{agg}) catch |e| {
+                        if (e != error.Thrown) return e;
+                        return rejectCapabilityCaught(rt, rej_cap, p_out);
+                    };
                 },
                 .race => unreachable,
             }
@@ -756,18 +814,6 @@ pub fn resolvePromiseValue(rt: *Runtime, p_obj: *Object, val: Value) Error!void 
         return;
     }
 
-    if (val.isObject() and val.asObject().kind == .promise) {
-        try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
-        p_obj.kind.promise.already_resolved = true;
-        rt.microtasks.appendAssumeCapacity(.{
-            .kind = .resolve_promise,
-            .child = p_obj,
-            .cb = .undefined,
-            .arg = val,
-        });
-        return;
-    }
-
     if (val.isObjectLike()) {
         var root_buf = [_]Value{ Value.fromObject(p_obj), val, .undefined, .undefined, .undefined };
         var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
@@ -782,6 +828,17 @@ pub fn resolvePromiseValue(rt: *Runtime, p_obj: *Object, val: Value) Error!void 
             return e;
         };
         root_buf[2] = then_val;
+        if (val.isObject() and val.asObject().kind == .promise and then_val.isNative() and then_val.asNative() == &promise_then) {
+            try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
+            p_obj.kind.promise.already_resolved = true;
+            rt.microtasks.appendAssumeCapacity(.{
+                .kind = .resolve_promise,
+                .child = p_obj,
+                .cb = .undefined,
+                .arg = val,
+            });
+            return;
+        }
         if (then_val.isFunction()) {
             const env = try rt.heap.newArray(null);
             root_buf[3] = Value.fromObject(env);
@@ -809,9 +866,9 @@ fn thenableJobCb(rt: *Runtime, env: *Object, _: []const Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const res_fn = try rt.heap.newNativeClosure(&thenableResolveCb, env);
+    const res_fn = try rt.heap.newNativeClosureWithLength(&thenableResolveCb, env, 1);
     root_buf[1] = Value.fromClosure(res_fn);
-    const rej_fn = try rt.heap.newNativeClosure(&thenableRejectCb, env);
+    const rej_fn = try rt.heap.newNativeClosureWithLength(&thenableRejectCb, env, 1);
     root_buf[2] = Value.fromClosure(rej_fn);
 
     _ = rt.callCallable(env.kind.array.items[2], env.kind.array.items[1], &.{ root_buf[1], root_buf[2] }) catch |e| {
@@ -884,7 +941,7 @@ pub fn settlePromiseFromJob(rt: *Runtime, p_obj: *Object, is_rejected: bool, val
             continue;
         }
         const cb = if (is_rejected) rx.on_rejected else rx.on_fulfilled;
-        const is_adopt = (!cb.isNative() and !cb.isClosure());
+        const is_adopt = !cb.isFunction();
         rt.microtasks.appendAssumeCapacity(.{
             .kind = if (is_adopt) .adopt else .reaction,
             .child = rx.child,

@@ -605,7 +605,7 @@ pub const Runtime = struct {
                 }
             },
             .reaction => {
-                if (job.cb.isNative() or job.cb.isClosure()) {
+                if (job.cb.isFunction()) {
                     if (rt.callCallable(job.cb, .undefined, &.{job.arg})) |ret| {
                         if (job.child) |ch| try builtins_mod.resolvePromiseValue(rt, ch, ret);
                     } else |e| {

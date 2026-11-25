@@ -1,0 +1,6 @@
+cb lengths: 1:1
+species sub: true sub
+cap throw: RangeError:cap-boom
+catch seq: then,catch:boom
+species val: 15
+custom then: overridden

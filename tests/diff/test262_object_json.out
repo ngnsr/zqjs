@@ -1,0 +1,17 @@
+arrIter default: true [object Array Iterator]
+arrIter non-string: [object Object]
+arrIter deleted: [object Iterator]
+mapIter default: true [object Map Iterator]
+mapIter non-string: [object Object]
+mapIter deleted: [object Iterator]
+setIter default: true [object Set Iterator]
+setIter non-string: [object Object]
+setIter deleted: [object Iterator]
+proxy replacer flat: {"b":2}
+proxy replacer nested: {"b":{"b":4}}
+revoked proxy replacer: TypeError
+abrupt length replacer: RangeError
+abrupt toLength replacer: RangeError
+replacer Number obj: {"toString":2}
+replacer String obj: {"toString":2}
+deleted prop replacer: {"a":1,"b":"<replaced>"}

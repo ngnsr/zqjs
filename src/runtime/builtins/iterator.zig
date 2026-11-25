@@ -36,6 +36,12 @@ pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
     try common.method(rt, r.iterator_prototype, "some", &iterator_some);
     try common.method(rt, r.iterator_prototype, "every", &iterator_every);
     try common.method(rt, r.iterator_prototype, "find", &iterator_find);
+    try common.method(rt, r.array_iterator_prototype, "next", &iterator_next);
+    try common.defineToStringTag(rt, r.array_iterator_prototype, r.sym_to_string_tag, "Array Iterator");
+    try common.method(rt, r.map_iterator_prototype, "next", &iterator_next);
+    try common.defineToStringTag(rt, r.map_iterator_prototype, r.sym_to_string_tag, "Map Iterator");
+    try common.method(rt, r.set_iterator_prototype, "next", &iterator_next);
+    try common.defineToStringTag(rt, r.set_iterator_prototype, r.sym_to_string_tag, "Set Iterator");
     try common.method(rt, r.iterator_helper_prototype, "next", &iterator_helper_next);
     try common.method(rt, r.iterator_helper_prototype, "return", &iterator_helper_return);
     try common.defineToStringTag(rt, r.iterator_helper_prototype, r.sym_to_string_tag, "Iterator Helper");

@@ -123,6 +123,9 @@ pub const Realm = struct {
     promise_prototype: *Object,
     iterator_namespace: *Object,
     iterator_prototype: *Object,
+    array_iterator_prototype: *Object,
+    map_iterator_prototype: *Object,
+    set_iterator_prototype: *Object,
     iterator_helper_prototype: *Object,
     iterator_wrap_prototype: *Object,
     /// %GeneratorPrototype% (D67).
@@ -192,7 +195,7 @@ pub const Realm = struct {
     views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [62]*Object {
+    pub fn objects(r: *const Realm) [65]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -208,6 +211,9 @@ pub const Realm = struct {
             r.promise_prototype,
             r.iterator_namespace,
             r.iterator_prototype,
+            r.array_iterator_prototype,
+            r.map_iterator_prototype,
+            r.set_iterator_prototype,
             r.iterator_helper_prototype,
             r.iterator_wrap_prototype,
             r.generator_prototype,
@@ -327,6 +333,9 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .promise_prototype = try common.builtin(h, object_prototype, .promise_prototype),
         .iterator_namespace = try h.newObject(function_prototype),
         .iterator_prototype = iterator_prototype,
+        .array_iterator_prototype = try h.newObject(iterator_prototype),
+        .map_iterator_prototype = try h.newObject(iterator_prototype),
+        .set_iterator_prototype = try h.newObject(iterator_prototype),
         .iterator_helper_prototype = try h.newObject(iterator_prototype),
         .iterator_wrap_prototype = try h.newObject(iterator_prototype),
         .generator_prototype = try common.builtin(h, iterator_prototype, .generator_prototype),

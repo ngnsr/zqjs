@@ -31,3 +31,22 @@ const nt = Object.defineProperty(function() {}.bind(null), "prototype", {
     },
 });
 print("reflect ta sym err:", errName(() => Reflect.construct(Uint8Array, [Symbol()], nt)), protoAccessed);
+
+const dvDetachedAb = new ArrayBuffer(8);
+let dvProtoDetached = false;
+const dvNt = Object.defineProperty(function() {}.bind(null), "prototype", {
+    get() {
+        dvProtoAccessed();
+        return null;
+    },
+});
+function dvProtoAccessed() {
+    dvProtoDetached = true;
+    const detach = globalThis.$DETACHBUFFER || globalThis.detachArrayBuffer;
+    if (typeof detach === "function") {
+        detach(dvDetachedAb);
+    } else if (typeof structuredClone === "function") {
+        structuredClone(dvDetachedAb, { transfer: [dvDetachedAb] });
+    }
+}
+print("dv proto detach:", errName(() => Reflect.construct(DataView, [dvDetachedAb, 0], dvNt)), dvProtoDetached);

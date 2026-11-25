@@ -748,7 +748,13 @@ pub fn constructWithNewTarget(rt: *Runtime, target_in: Value, args: []const Valu
             if (target.asNative() == &builtins.object_global) {
                 return Value.fromObject(try rt.heap.newObject(po orelse (try builtins.realm(rt)).object_prototype));
             }
-            if (po) |proto_obj| if (root_buf[1].isObject()) rt.heap.storeObjectProto(root_buf[1].asObject(), proto_obj);
+            if (root_buf[1].isObject()) {
+                const inst = root_buf[1].asObject();
+                if (inst.kind == .data_view and inst.kind.data_view.buffer.kind.array_buffer.detached) {
+                    return rt.throw(.TypeError, &.{.{ .ascii = "Cannot construct DataView on a detached ArrayBuffer" }});
+                }
+                if (po) |proto_obj| rt.heap.storeObjectProto(inst, proto_obj);
+            }
             return root_buf[1];
         }
         return builtins.construct(rt, target, effective_args);

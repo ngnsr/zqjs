@@ -121,6 +121,7 @@ pub const Member = struct {
     object: *const Expr,
     key: PropertyKey,
     is_private: bool = false,
+    private_ref: u32 = 0,
 };
 
 /// An optional chain starting at the first `?.` (M24).
@@ -135,7 +136,10 @@ pub const OptionalChain = struct {
 
     pub const Kind = union(enum) {
         prop: []const u8,
-        private_prop: []const u8,
+        private_prop: struct {
+            name: []const u8,
+            private_ref: u32 = 0,
+        },
         elem: *const Expr,
         call: []const *const Expr,
     };
@@ -293,6 +297,8 @@ pub const Expr = struct {
         class: *const Class,
         /// `super(args...)` inside a derived constructor.
         super_call: []const *const Expr,
+        /// Synthetic `super(...argumentsList)` in a derived default constructor without calling `Symbol.iterator`.
+        super_call_forward: Ref,
         /// `super.prop` or `super[expr]` inside a class method/constructor.
         super_member: PropertyKey,
         /// `delete super.prop` / `delete super[expr]` (throws ReferenceError at runtime).
@@ -302,6 +308,7 @@ pub const Expr = struct {
             name: []const u8,
             rhs: *const Expr,
             span: Span,
+            private_ref: u32 = 0,
         },
         /// `import.meta` (M48, D78).
         import_meta,
@@ -323,8 +330,15 @@ pub const ClassField = struct {
     key: PropertyKey,
     is_static: bool,
     is_private: bool,
+    is_anon_fn_def: bool = false,
     init: ?*const Function, // zero-param initializer function (is_method=true, has_home_object=true), or null => undefined
     span: Span,
+};
+
+pub const ClassElementRef = union(enum) {
+    method: usize,
+    instance_field: usize,
+    static_field: usize,
 };
 
 pub const ClassStaticItem = union(enum) {
@@ -343,6 +357,7 @@ pub const Class = struct {
     instance_fields: []const ClassField = &.{},
     static_fields: []const ClassField = &.{},
     static_items: []const ClassStaticItem = &.{},
+    elements: []const ClassElementRef = &.{},
 };
 
 /// A function parameter (M26: pattern, optional default, optional rest).
@@ -510,6 +525,8 @@ pub const Script = struct {
     binding_count: u32,
     /// Number of functions plus one (the script is function 0).
     function_count: u32,
+    class_count: u32 = 0,
+    private_ref_count: u32 = 0,
     /// True when the top-level script itself uses `await` or `for await` (REPL mode).
     has_top_level_await: bool = false,
     is_strict: bool = false,

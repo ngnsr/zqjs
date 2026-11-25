@@ -415,9 +415,9 @@ const Dumper = struct {
                     try d.w.writeAll(if (s.optional) "?." else ".");
                     try d.w.writeAll(n);
                 },
-                .private_prop => |n| {
+                .private_prop => |pp| {
                     try d.w.writeAll(if (s.optional) "?." else ".");
-                    try d.w.writeAll(n);
+                    try d.w.writeAll(pp.name);
                 },
                 .elem => |e| {
                     try d.w.writeAll(if (s.optional) "?.[" else "[");
@@ -585,6 +585,7 @@ const Dumper = struct {
                 }
                 try w.writeByte(')');
             },
+            .super_call_forward => try w.writeAll("(super-forward)"),
             .delete_super => try w.writeAll("(delete super)"),
             .private_in => |pi| {
                 try w.print("(in {s} ", .{pi.name});

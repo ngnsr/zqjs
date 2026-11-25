@@ -68,6 +68,8 @@ pub fn parseWithOptions(arena: Allocator, source: []const u8, limits: Limits, op
         .ref_count = p.ref_count,
         .binding_count = p.binding_count,
         .function_count = p.function_count,
+        .class_count = p.class_count,
+        .private_ref_count = p.private_ref_count,
         .has_top_level_await = p.has_top_level_await,
         .is_strict = p.in_strict_mode,
         .source_kind = options.source_kind,
@@ -180,6 +182,7 @@ const Parser = struct {
     in_obj_method: bool = false,
     allow_cover_init: bool = false,
     class_count: u32 = 0,
+    private_ref_count: u32 = 0,
     has_top_level_await: bool = false,
     source_kind: ast.SourceKind = .script,
 
@@ -1984,9 +1987,11 @@ const Parser = struct {
                 try p.advance(); // in
                 const rhs = try p.binary(8);
                 try p.rejectCoverExpr(rhs);
+                const pref = p.private_ref_count;
+                p.private_ref_count += 1;
                 const lhs = try p.node(
                     .{ .start = priv_tok.start, .end = rhs.span.end },
-                    .{ .private_in = .{ .name = try p.identText(priv_tok), .rhs = rhs, .span = .{ .start = priv_tok.start, .end = priv_tok.end } } },
+                    .{ .private_in = .{ .name = try p.identText(priv_tok), .rhs = rhs, .span = .{ .start = priv_tok.start, .end = priv_tok.end }, .private_ref = pref } },
                     rhs.depth,
                 );
                 return p.binaryFrom(lhs, min_bp);
@@ -2175,7 +2180,9 @@ const Parser = struct {
                 if (p.tok.tag == .private_ident) {
                     const name = p.tok;
                     try p.advance();
-                    break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = try p.identText(name) }, .is_private = true } }, callee.depth);
+                    const pref = p.private_ref_count;
+                    p.private_ref_count += 1;
+                    break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = try p.identText(name) }, .is_private = true, .private_ref = pref } }, callee.depth);
                 }
                 const name = try p.expectPropertyName();
                 break :blk try p.node(.{ .start = callee.span.start, .end = name.end }, .{ .member = .{ .object = callee, .key = .{ .name = try p.identText(name) } } }, callee.depth);
@@ -2264,7 +2271,9 @@ const Parser = struct {
                 } else if (p.tok.tag == .private_ident) {
                     const name = p.tok;
                     try p.advance();
-                    try steps.append(p.arena, .{ .optional = true, .kind = .{ .private_prop = try p.identText(name) } });
+                    const pref = p.private_ref_count;
+                    p.private_ref_count += 1;
+                    try steps.append(p.arena, .{ .optional = true, .kind = .{ .private_prop = .{ .name = try p.identText(name), .private_ref = pref } } });
                     end = name.end;
                 } else {
                     const name = try p.expectPropertyName();
@@ -2289,7 +2298,9 @@ const Parser = struct {
                 if (p.tok.tag == .private_ident) {
                     const name = p.tok;
                     try p.advance();
-                    try steps.append(p.arena, .{ .optional = false, .kind = .{ .private_prop = try p.identText(name) } });
+                    const pref = p.private_ref_count;
+                    p.private_ref_count += 1;
+                    try steps.append(p.arena, .{ .optional = false, .kind = .{ .private_prop = .{ .name = try p.identText(name), .private_ref = pref } } });
                     end = name.end;
                 } else {
                     const name = try p.expectPropertyName();
@@ -3399,6 +3410,7 @@ const Parser = struct {
         var instance_fields: std.ArrayList(ast.ClassField) = .empty;
         var static_fields: std.ArrayList(ast.ClassField) = .empty;
         var static_items: std.ArrayList(ast.ClassStaticItem) = .empty;
+        var elements: std.ArrayList(ast.ClassElementRef) = .empty;
 
         while (p.tok.tag != .r_brace) {
             if (p.tok.tag == .eof) return p.fail(.{ .syntax_error = "unterminated class body" }, open_brace);
@@ -3543,6 +3555,7 @@ const Parser = struct {
                     return p.fail(.{ .syntax_error = "Classes may not have a field named 'constructor'" }, key_tok);
                 }
                 var init_fn: ?*const ast.Function = null;
+                var is_anon_fn_def = false;
                 var field_end = key_tok.end;
                 if (p.tok.tag == .eq) {
                     try p.advance();
@@ -3572,6 +3585,12 @@ const Parser = struct {
                     }
                     const init_expr = try p.nested();
                     field_end = init_expr.span.end;
+                    is_anon_fn_def = isAnonymousFunctionDefinition(init_expr);
+                    if (is_private) {
+                        inferExprName(init_expr, key.name);
+                    } else if (key == .name) {
+                        inferExprName(init_expr, key.name);
+                    }
                     const body = try p.arena.alloc(ast.Stmt, 1);
                     body[0] = .{ .span = init_expr.span, .data = .{ .@"return" = init_expr } };
                     const f = try p.arena.create(ast.Function);
@@ -3602,6 +3621,7 @@ const Parser = struct {
                     .key = key,
                     .is_static = is_static,
                     .is_private = is_private,
+                    .is_anon_fn_def = is_anon_fn_def,
                     .init = init_fn,
                     .span = .{ .start = elem_start, .end = field_end },
                 };
@@ -3609,8 +3629,11 @@ const Parser = struct {
                     const idx = static_fields.items.len;
                     try static_fields.append(p.arena, field);
                     try static_items.append(p.arena, .{ .field = idx });
+                    try elements.append(p.arena, .{ .static_field = idx });
                 } else {
+                    const idx = instance_fields.items.len;
                     try instance_fields.append(p.arena, field);
+                    try elements.append(p.arena, .{ .instance_field = idx });
                 }
                 continue;
             }
@@ -3621,13 +3644,16 @@ const Parser = struct {
             const outer_async_ctx = p.async_ctx;
             const outer_yield_ctx = p.yield_ctx;
             const outer_param_class_method = p.in_class_method;
+            const outer_static_block = p.in_static_block;
             p.async_ctx = if (is_async) .params else .none;
             p.yield_ctx = if (is_generator) .params else .none;
             p.in_class_method = true;
+            p.in_static_block = false;
             defer {
                 p.async_ctx = outer_async_ctx;
                 p.yield_ctx = outer_yield_ctx;
                 p.in_class_method = outer_param_class_method;
+                p.in_static_block = outer_static_block;
             }
             const params = try p.parseParams();
             if (method_kind != .method) {
@@ -3640,14 +3666,12 @@ const Parser = struct {
             const outer_labels = p.labels;
             const outer_derived = p.in_derived_ctor;
             const outer_method = p.in_class_method;
-            const outer_static_block = p.in_static_block;
             const outer_disallow_return = p.disallow_return;
             p.loop_depth = 0;
             p.switch_depth = 0;
             p.labels = .empty;
             p.in_derived_ctor = if (is_ctor and has_super) .direct else .none;
             p.in_class_method = true;
-            p.in_static_block = false;
             p.disallow_return = false;
             p.function_depth += 1;
             p.async_ctx = if (is_async) .body else .none;
@@ -3658,7 +3682,6 @@ const Parser = struct {
                 p.labels = outer_labels;
                 p.in_derived_ctor = outer_derived;
                 p.in_class_method = outer_method;
-                p.in_static_block = outer_static_block;
                 p.disallow_return = outer_disallow_return;
                 p.function_depth -= 1;
             }
@@ -3680,7 +3703,7 @@ const Parser = struct {
                 .has_home_object = true,
                 .length = paramLength(params),
                 .name = null,
-                .inferred_name = switch (key) {
+                .inferred_name = if (is_ctor) (if (name_decl) |nd| nd.name else "") else switch (key) {
                     .name => |n| n,
                     else => "",
                 },
@@ -3688,9 +3711,9 @@ const Parser = struct {
                 .body = parsed_body.body,
             };
             if (is_ctor) {
-                if (name_decl) |nd| f.inferred_name = nd.name;
                 explicit_ctor = f;
             } else {
+                const idx = methods.items.len;
                 try methods.append(p.arena, .{
                     .key = key,
                     .is_static = is_static,
@@ -3699,6 +3722,7 @@ const Parser = struct {
                     .func = f,
                     .span = .{ .start = elem_start, .end = parsed_body.end },
                 });
+                try elements.append(p.arena, .{ .method = idx });
             }
         }
         const close_brace = p.tok;
@@ -3717,6 +3741,7 @@ const Parser = struct {
             .instance_fields = instance_fields.items,
             .static_fields = static_fields.items,
             .static_items = static_items.items,
+            .elements = elements.items,
         };
         return cls;
     }
@@ -3754,7 +3779,7 @@ const Parser = struct {
             };
             return f;
         }
-        // Derived default constructor: `constructor(...args) { super(...args); }`
+        // Derived default constructor: forwards incoming arguments without triggering Array[Symbol.iterator].
         const rest_decl: ast.Declarator = .{
             .name = "args",
             .span = sp,
@@ -3768,11 +3793,7 @@ const Parser = struct {
 
         const ref_id = p.ref_count;
         p.ref_count += 1;
-        const args_ident = try p.node(sp, .{ .identifier = .{ .name = "args", .span = sp, .id = ref_id } }, 0);
-        const spread_arg = try p.node(sp, .{ .spread = args_ident }, 0);
-        const call_args = try p.arena.alloc(*const ast.Expr, 1);
-        call_args[0] = spread_arg;
-        const super_expr = try p.node(sp, .{ .super_call = call_args }, 0);
+        const super_expr = try p.node(sp, .{ .super_call_forward = .{ .name = "args", .span = sp, .id = ref_id } }, 0);
         const body = try p.arena.alloc(ast.Stmt, 1);
         body[0] = .{ .span = sp, .data = .{ .expression = super_expr } };
 
@@ -3802,6 +3823,14 @@ fn paramLength(params: []const ast.Param) u16 {
         if (param.default != null or param.is_rest) return @intCast(i);
     }
     return @intCast(params.len);
+}
+
+fn isAnonymousFunctionDefinition(e: *const ast.Expr) bool {
+    return switch (e.data) {
+        .function => |f| f.name == null and f.inferred_name.len == 0,
+        .class => |c| c.name == null and c.constructor.inferred_name.len == 0,
+        else => false,
+    };
 }
 
 fn inferExprName(e: *const ast.Expr, name: []const u8) void {

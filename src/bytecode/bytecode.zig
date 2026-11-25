@@ -145,15 +145,17 @@ pub const Op = enum(u8) {
     define_private_method,
     /// [target, fn_closure] → [target]: defines private accessor (argc bit0=is_setter) on target under current brand.
     define_private_accessor,
-    /// [target, key, val] → [target]: DefineOwnProperty(target, key, val) for public class fields.
+    /// [target, key, val] → [target]: DefineOwnProperty(target, key, val) for public class fields (argc bit0=is_anon_fn_def).
     define_public_field,
     /// [target, val] → [target]: defines private field on target under current brand.
     define_private_field,
-    /// [obj] → [val]: reads private member `#name` using current closure's brand.
+    /// [val] → [prop_key]: ECMAScript ToPropertyKey(val) normalized to String or Symbol.
+    to_property_key,
+    /// [obj, brand] → [val]: reads private member `#name` using explicit brand.
     get_private,
-    /// [obj, val] → [val]: writes private member `#name` using current closure's brand.
+    /// [obj, val, brand] → [val]: writes private member `#name` using explicit brand.
     set_private,
-    /// [obj] → [bool]: `#name in obj` using current closure's brand.
+    /// [obj, brand] → [bool]: `#name in obj` using explicit brand.
     in_private,
     /// [ctor, key] → [ctor]: appends pre-evaluated computed field key to ctor.meta.field_keys.
     store_field_key,
@@ -167,6 +169,8 @@ pub const Op = enum(u8) {
     super_call,
     /// [args_arr] → [this]: `super(...args)` with spread.
     super_call_spread,
+    /// [args_arr] → [this]: derived default constructor `super` call forwarding raw args without `Symbol.iterator`.
+    super_call_forward,
     /// [] → [val]: `super.name`.
     super_get_prop,
     /// [key] → [val]: `super[key]`.
@@ -439,17 +443,18 @@ pub const Op = enum(u8) {
             .define_elem_accessor => .{ .operands = &.{.argc}, .pops = 3, .pushes = 1 },
             .define_private_method => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
             .define_private_accessor => .{ .operands = &.{ .name, .argc }, .pops = 2, .pushes = 1 },
-            .define_public_field => .{ .operands = &.{}, .pops = 3, .pushes = 1 },
+            .define_public_field => .{ .operands = &.{.argc}, .pops = 3, .pushes = 1 },
             .define_private_field => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
-            .get_private => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
-            .set_private => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
-            .in_private => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
+            .to_property_key => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .get_private => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
+            .set_private => .{ .operands = &.{.name}, .pops = 3, .pushes = 1 },
+            .in_private => .{ .operands = &.{.name}, .pops = 2, .pushes = 1 },
             .store_field_key => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .add_instance_init => .{ .operands = &.{ .name, .argc }, .pops = 2, .pushes = 1 },
             .run_static_init => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .set_brand => .{ .operands = &.{}, .pops = 2, .pushes = 1 },
             .super_call => .{ .operands = &.{.argc}, .pops = 0, .pushes = 1 },
-            .super_call_spread => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .super_call_spread, .super_call_forward => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .super_get_prop => .{ .operands = &.{.name}, .pops = 0, .pushes = 1 },
             .super_get_elem => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
             .super_set_prop => .{ .operands = &.{.name}, .pops = 1, .pushes = 1 },
@@ -585,6 +590,10 @@ pub const Proto = struct {
     /// Parameters occupy slots param_slot … param_slot+param_count-1, filled by the call.
     param_count: u32 = 0,
     param_slot: u32 = 0,
+    /// Derived constructor's synthetic `this` cell slot when an inner arrow captures `this`/`super`.
+    this_slot: ?u32 = null,
+    /// Capture index of the enclosing derived constructor's `this` cell for an arrow function.
+    lexical_this_capture: ?u32 = null,
     /// How `make_closure` fills a new closure's captures, in order (empty for the script).
     captures: []const Capture = &.{},
     functions: []Proto = &.{},

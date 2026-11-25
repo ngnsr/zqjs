@@ -15,6 +15,7 @@ const bytecode = @import("../../bytecode/bytecode.zig");
 const builtins = @import("../builtins.zig");
 const common = @import("common.zig");
 const iterator = @import("iterator.zig");
+const obj_builtins = @import("object.zig");
 
 pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
     try initErrorProto(rt, r.error_prototype, r.error_namespace, "Error", &builtins.error_global);
@@ -216,11 +217,11 @@ pub fn setupClass(rt: *Runtime, ctor_val: Value, has_super: bool, super_val: Val
             return rt.throw(.TypeError, &.{.{ .ascii = "Class extends value is not a constructor or null" }});
         }
         const sp = try object.get(rt, super_val, try object.named(rt, "prototype"));
-        if (sp.isNull()) break :blk null;
-        if (!sp.isObject()) {
+        if (!sp.isNull() and !sp.isObject()) {
             return rt.throw(.TypeError, &.{.{ .ascii = "Class extends value has non-object prototype" }});
         }
         try rt.heap.storeClosureProto(ctor, super_val);
+        if (sp.isNull()) break :blk null;
         break :blk sp.asObject();
     };
 
@@ -229,6 +230,7 @@ pub fn setupClass(rt: *Runtime, ctor_val: Value, has_super: bool, super_val: Val
     const ctor_key = try rt.heap.internAscii("constructor");
     try rt.heap.defineProperty(proto_obj, ctor_key, .{ .value = ctor_val, .enumerable = false });
     try rt.heap.storeClosurePrototype(ctor, Value.fromObject(proto_obj));
+    (try rt.heap.ensureClosureMeta(ctor)).prototype_writable = false;
     try rt.heap.storeClosureHomeObject(ctor, Value.fromObject(proto_obj));
     try rt.heap.storeClosureBrand(ctor, ctor_val);
     return proto_obj;
@@ -249,10 +251,13 @@ pub fn runInstanceInits(rt: *Runtime, ctor: *heap_mod.Closure, this_val: Value) 
             .private_getter => try object.definePrivateAccessor(rt, this_val, ctor, entry.name.?, entry.func, false),
             .private_setter => try object.definePrivateAccessor(rt, this_val, ctor, entry.name.?, entry.func, true),
             .public_field => {
-                const key_val = ctor.meta.?.field_keys[entry.key_idx];
+                const is_anon = (entry.key_idx & 0x8000_0000) != 0;
+                const key_idx = entry.key_idx & 0x7fff_ffff;
+                const key_val = ctor.meta.?.field_keys[key_idx];
                 const val: Value = if (entry.func.isUndefined()) .undefined else try rt.callCallable(entry.func, this_val, &.{});
                 root_buf[2] = val;
                 const k = try object.key(rt, key_val);
+                if (is_anon) try setFunctionNameIfUnset(rt, val, k);
                 try object.definePublicField(rt, this_val, k, val);
                 root_buf[2] = .undefined;
             },
@@ -266,14 +271,91 @@ pub fn runInstanceInits(rt: *Runtime, ctor: *heap_mod.Closure, this_val: Value) 
     }
 }
 
+pub fn setFunctionName(rt: *Runtime, fn_val: Value, k: object.Key, prefix: ?[]const u8) Error!void {
+    if (!fn_val.isClosure()) return;
+    var root_buf = [_]Value{ fn_val, common.keyToRootValue(k) };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var base_str: *const heap_mod.String = switch (k) {
+        .atom => |a| a,
+        .index => |i| try object.atomOf(rt, .{ .index = i }),
+        .symbol => |sym| if (sym.description) |desc|
+            try rt.heap.newString(&.{ .{ .ascii = "[" }, .{ .utf16 = desc.units }, .{ .ascii = "]" } })
+        else
+            try rt.heap.ascii(""),
+    };
+    if (prefix) |pfx| {
+        base_str = try rt.heap.newString(&.{ .{ .ascii = pfx }, .{ .utf16 = base_str.units } });
+    }
+    const name_pk = heap_mod.PropKey.fromAtom(try rt.heap.internAscii("name"));
+    try rt.heap.defineClosurePropKey(@constCast(fn_val.asClosure()), name_pk, .{
+        .value = Value.fromString(base_str),
+        .enumerable = false,
+        .writable = false,
+        .configurable = true,
+    });
+}
+
+pub fn setFunctionNameIfUnset(rt: *Runtime, val: Value, k: object.Key) Error!void {
+    if (!val.isClosure()) return;
+    const c = val.asClosure();
+    const name_pk = heap_mod.PropKey.fromAtom(try rt.heap.internAscii("name"));
+    if (c.meta) |m| {
+        if (m.props.contains(name_pk) or m.name_deleted) return;
+    }
+    try setFunctionName(rt, val, k, null);
+}
+
+fn hasStaticInferredName(c: *const heap_mod.Closure) bool {
+    return switch (c.impl) {
+        .vm => |v| @as(*const bytecode.Proto, @ptrCast(@alignCast(v.proto))).inferred_name.len > 0,
+        .tree => |t| @as(*const ast.Function, @ptrCast(@alignCast(t.func))).inferred_name.len > 0,
+        else => true,
+    };
+}
+
 pub fn defineClassMethod(rt: *Runtime, target: Value, k: object.Key, method_val: Value) Error!void {
+    var root_buf = [_]Value{ target, method_val, common.keyToRootValue(k) };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     try rt.heap.storeClosureHomeObject(@constCast(method_val.asClosure()), target);
-    try object.defineNonEnumerable(rt, target, k, method_val);
+    if (k != .atom or !hasStaticInferredName(method_val.asClosure())) {
+        try setFunctionName(rt, method_val, k, null);
+    }
+    _ = try obj_builtins.defineOwnPropertyParsed(rt, target, k, .{
+        .has_val = true,
+        .val = method_val,
+        .has_writ = true,
+        .writ_val = true,
+        .has_enum = true,
+        .enum_val = false,
+        .has_conf = true,
+        .conf_val = true,
+    }, true);
 }
 
 pub fn defineClassAccessor(rt: *Runtime, target: Value, k: object.Key, fn_val: Value, is_setter: bool) Error!void {
+    var root_buf = [_]Value{ target, fn_val, common.keyToRootValue(k) };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), target);
-    try object.defineAccessor(rt, target, k, fn_val, is_setter, false);
+    try setFunctionName(rt, fn_val, k, if (is_setter) "set " else "get ");
+    _ = try obj_builtins.defineOwnPropertyParsed(rt, target, k, .{
+        .has_get = !is_setter,
+        .get_val = if (!is_setter) fn_val else .undefined,
+        .has_set = is_setter,
+        .set_val = if (is_setter) fn_val else .undefined,
+        .has_enum = true,
+        .enum_val = false,
+        .has_conf = true,
+        .conf_val = true,
+    }, true);
 }
 
 pub fn materializeClosurePrototype(rt: *Runtime, c: *heap_mod.Closure) Error!*Object {

@@ -80,6 +80,8 @@ const Verifier = struct {
         if (p.names.len > v.limits.max_constants) return v.fail(p, 0, "more names than max_constants");
         if (p.code.len == 0) return v.fail(p, 0, "empty code");
         if (@as(u64, p.param_slot) + p.param_count > p.slot_count) return v.fail(p, 0, "more parameters than slots");
+        if (p.this_slot) |ts| if (ts >= p.slot_count) return v.fail(p, 0, "this_slot out of range");
+        if (p.lexical_this_capture) |lc| if (lc >= p.captures.len) return v.fail(p, 0, "lexical_this_capture out of range");
         for (p.consts) |k| switch (k.tag()) {
             .number, .bigint, .string => {},
             else => return v.fail(p, 0, "constant is not a number, bigint, or string"),
@@ -104,7 +106,7 @@ const Verifier = struct {
                 .halt => if (p.kind != .script) return v.fail(p, at, "halt in a function"),
                 .@"return" => if (p.kind != .function and !p.is_async) return v.fail(p, at, "return outside a function"),
                 .push_callee => if (p.kind != .function) return v.fail(p, at, "push_callee outside a function"),
-                .get_arg, .rest_array, .make_arguments => if (p.kind != .function) return v.fail(p, at, "function-only instruction outside a function"),
+                .get_arg, .rest_array, .make_arguments, .super_call_forward => if (p.kind != .function) return v.fail(p, at, "function-only instruction outside a function"),
                 .await, .async_iter_next, .async_iter_result, .async_iter_close, .async_iter_close_throw, .async_iter_close_check, .get_async_iter => if (!p.is_async or (p.is_generator and !p.is_async_generator)) return v.fail(p, at, "await outside an async function"),
                 .generator_start, .yield, .yield_star_step => if (p.kind != .function or !p.is_generator) return v.fail(p, at, "generator instruction outside a generator"),
                 .async_yield_star_call, .async_yield_star_result => if (p.kind != .function or !p.is_async_generator) return v.fail(p, at, "async generator instruction outside an async generator"),

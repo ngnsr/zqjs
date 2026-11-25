@@ -1,0 +1,30 @@
+nested priv: [10,"TypeError","TypeError","TypeError","outer-only-m","inner","inner-m:inner",100,"s-inner",true,false,false,true]
+write-only read: TypeError
+double acc: TypeError
+order: ["m1","if1","sf1","sm1","if2","sf1-init:0","static-block:22"]
+num keys: zero zero big
+static proto: TypeError
+static proto: TypeError
+static proto: TypeError
+pair: 11 function function
+static pair: 7 function
+class names: "" "" NamedClassExpr
+method/field names: [myMethod] get [mySym] "set " fnField [mySym] custom ["#privFieldFn","#privMethod"]
+static name: function ok name
+rebound outer: 999 OuterMut
+inner const: TypeError
+class TDZ: ReferenceError
+class TDZ: ReferenceError
+class TDZ: ReferenceError
+class TDZ: ReferenceError
+static self: true true
+arrow before super: ReferenceError
+arrow after super: true
+super order: ["base:undefined","base:[object Object]","caught:ReferenceError"]
+default spread: 60 false
+direct catch: TypeError
+reflect catch: TypeError
+direct catch: ReferenceError
+reflect catch: ReferenceError
+proxy traps: ["fieldA:true,true,true","fieldB:true,true,true"]
+frozen field: TypeError

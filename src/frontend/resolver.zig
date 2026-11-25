@@ -67,6 +67,9 @@ pub const Resolution = struct {
     scopes: []const Scope,
     functions: []const Function,
     repl_bindings: []const ReplBinding = &.{},
+    class_names: []const ?u32 = &.{},
+    class_brands: []const ?u32 = &.{},
+    private_refs: []const Ref = &.{},
 
     pub const Ref = union(enum) {
         /// A binding of the function containing the reference (binding id).
@@ -123,6 +126,10 @@ pub const Resolution = struct {
         var_bindings: []const u32 = &.{},
         /// Implicit `arguments` object binding id, lazily allocated only when referenced.
         arguments_binding: ?u32 = null,
+        /// Derived constructor's synthetic `this` binding, lazily allocated when an inner arrow captures `this`/`super`.
+        this_binding: ?u32 = null,
+        /// Capture index of the enclosing derived constructor's `this_binding` for an arrow function.
+        lexical_this_capture: ?u32 = null,
     };
 
     pub const Capture = struct {
@@ -149,12 +156,21 @@ pub fn resolve(arena: Allocator, script: ast.Script, diag: *Diagnostic) Error!Re
 pub fn resolveWithRepl(arena: Allocator, script: ast.Script, repl_lookup: ?ReplLookup, diag: *Diagnostic) Error!Resolution {
     var bindings_list: std.ArrayList(Resolution.Binding) = .empty;
     try bindings_list.resize(arena, script.binding_count);
+    const class_names = try arena.alloc(?u32, script.class_count);
+    @memset(class_names, null);
+    const class_brands = try arena.alloc(?u32, script.class_count);
+    @memset(class_brands, null);
+    const private_refs = try arena.alloc(Resolution.Ref, script.private_ref_count);
+    @memset(private_refs, .global);
     var r: Resolver = .{
         .arena = arena,
         .diag = diag,
         .refs = try arena.alloc(Resolution.Ref, script.ref_count),
         .bindings = bindings_list,
         .functions = try arena.alloc(Resolution.Function, script.function_count),
+        .class_names = class_names,
+        .class_brands = class_brands,
+        .private_refs = private_refs,
         .repl_lookup = repl_lookup,
         .module_mode = script.source_kind == .module,
     };
@@ -172,7 +188,7 @@ pub fn resolveWithRepl(arena: Allocator, script: ast.Script, repl_lookup: ?ReplL
             b.alias_of = c;
         }
     }
-    // Fix up `parent_slot` for any capture targeting a lazily-slotted `arguments` binding.
+    // Fix up `parent_slot` for any capture targeting a lazily-slotted `arguments` or `this` binding.
     for (r.functions) |*func| {
         const caps = @constCast(func.captures);
         for (caps) |*cap| {
@@ -185,6 +201,9 @@ pub fn resolveWithRepl(arena: Allocator, script: ast.Script, repl_lookup: ?ReplL
         .scopes = r.scopes.items,
         .functions = r.functions,
         .repl_bindings = r.repl_bindings.items,
+        .class_names = r.class_names,
+        .class_brands = r.class_brands,
+        .private_refs = r.private_refs,
     };
 }
 
@@ -194,6 +213,7 @@ const Live = struct { name: []const u8, binding: u32, is_simple_catch: bool = fa
 const FnState = struct {
     id: u32,
     is_arrow: bool = false,
+    has_super_ctor: bool = false,
     /// Index in `live` where this function's bindings start (its slot 0).
     live_start: usize,
     var_scope: u32 = 0,
@@ -201,6 +221,7 @@ const FnState = struct {
     captures: std.ArrayList(Resolution.Capture) = .empty,
     var_bindings: std.ArrayList(u32) = .empty,
     arguments_binding: ?u32 = null,
+    this_binding: ?u32 = null,
 };
 
 const PrivateDecl = struct {
@@ -210,16 +231,24 @@ const PrivateDecl = struct {
     is_field_or_method: bool = false,
 };
 
+const PrivateScope = struct {
+    brand_binding: u32,
+    decls: std.StringHashMapUnmanaged(PrivateDecl),
+};
+
 const Resolver = struct {
     arena: Allocator,
     diag: *Diagnostic,
     refs: []Resolution.Ref,
     bindings: std.ArrayList(Resolution.Binding),
     functions: []Resolution.Function,
+    class_names: []?u32,
+    class_brands: []?u32,
+    private_refs: []Resolution.Ref,
     scopes: std.ArrayList(Resolution.Scope) = .empty,
     fns: std.ArrayList(FnState) = .empty,
     live: std.ArrayList(Live) = .empty,
-    private_scopes: std.ArrayList(std.StringHashMapUnmanaged(PrivateDecl)) = .empty,
+    private_scopes: std.ArrayList(PrivateScope) = .empty,
     repl_lookup: ?ReplLookup = null,
     repl_bindings: std.ArrayList(ReplBinding) = .empty,
     module_mode: bool = false,
@@ -257,6 +286,11 @@ const Resolver = struct {
             r.bindings.items[ab].slot = f.max_slots;
             f.max_slots += 1;
             r.functions[f.id].arguments_binding = ab;
+        }
+        if (f.this_binding) |tb| {
+            r.bindings.items[tb].slot = f.max_slots;
+            f.max_slots += 1;
+            r.functions[f.id].this_binding = tb;
         }
         r.functions[f.id].slot_count = f.max_slots;
         r.functions[f.id].captures = f.captures.items;
@@ -770,7 +804,7 @@ const Resolver = struct {
     /// a parameter scope (for parameters and their defaults, isolated from body `let`/`const`),
     /// then the body scope.
     fn function(r: *Resolver, f: *const ast.Function) Error!void {
-        try r.fns.append(r.arena, .{ .id = f.id, .is_arrow = f.is_arrow, .live_start = r.live.items.len });
+        try r.fns.append(r.arena, .{ .id = f.id, .is_arrow = f.is_arrow, .has_super_ctor = f.has_super_ctor, .live_start = r.live.items.len });
         const name_scope: ?Saved = if (f.kind == .expression and f.name != null) try r.enterScope() else null;
         if (name_scope != null) try r.declare(f.name.?, .function_name, false, true, null);
         const param_saved = try r.enterScope();
@@ -863,7 +897,7 @@ const Resolver = struct {
                 .cover_init => unreachable,
             },
             .array => |items| for (items) |item| try r.expr(item),
-            .this => {},
+            .this => try r.resolveLexicalThis(),
             .await => |inner| try r.expr(inner),
             .yield => |y| if (y.value) |v| try r.expr(v),
             .call, .new_call => |c| {
@@ -873,12 +907,14 @@ const Resolver = struct {
             .function => |f| try r.function(f),
             .class => |c| try r.resolveClass(c, true),
             .super_call => |args| for (args) |arg| try r.expr(arg),
-            .super_member => |k| if (k == .computed) try r.expr(k.computed),
+            .super_call_forward => |ref| r.refs[ref.id] = try r.lookup(ref.name),
+            .super_member => |k| {
+                try r.resolveLexicalThis();
+                if (k == .computed) try r.expr(k.computed);
+            },
             .delete_super => {},
             .private_in => |pi| {
-                if (!r.hasPrivateInScope(pi.name)) {
-                    return r.fail(.{ .syntax_error = "Private field must be declared in an enclosing class" }, pi.span);
-                }
+                try r.resolvePrivate(pi.name, pi.private_ref, pi.span);
                 try r.expr(pi.rhs);
             },
             .import_meta => {},
@@ -886,13 +922,69 @@ const Resolver = struct {
         }
     }
 
-    fn hasPrivateInScope(r: *const Resolver, name: []const u8) bool {
+    fn resolveLexicalThis(r: *Resolver) Error!void {
+        var owner_idx = r.fns.items.len - 1;
+        while (owner_idx > 0 and r.fns.items[owner_idx].is_arrow) : (owner_idx -= 1) {}
+        if (owner_idx == r.fns.items.len - 1) return;
+        const owner = &r.fns.items[owner_idx];
+        if (!owner.has_super_ctor) return;
+        const tb: u32 = owner.this_binding orelse blk: {
+            const ps = r.functions[owner.id].param_scope.?;
+            const scope = &r.scopes.items[ps];
+            const new_id: u32 = @intCast(r.bindings.items.len);
+            try r.bindings.append(r.arena, .{
+                .kind = .@"const",
+                .slot = 0, // assigned in finishFunction after max_slots settles
+                .scope = ps,
+                .index = scope.len,
+                .function = owner.id,
+                .captured = true,
+            });
+            scope.len += 1;
+            owner.this_binding = new_id;
+            r.functions[owner.id].this_binding = new_id;
+            break :blk new_id;
+        };
+        const cur_level = r.fns.items.len - 1;
+        const cap_idx = try r.captureIndex(cur_level, tb);
+        r.functions[r.current().id].lexical_this_capture = cap_idx;
+        r.functions[r.current().id].this_binding = tb;
+    }
+
+    fn declareSynthetic(r: *Resolver, name: []const u8, kind: Resolution.BindingKind) Error!u32 {
+        const f = r.current();
+        const scope = &r.scopes.items[r.scope];
+        const new_id: u32 = @intCast(r.bindings.items.len);
+        const slot: u32 = @intCast(r.live.items.len - f.live_start);
+        try r.bindings.append(r.arena, .{
+            .kind = kind,
+            .slot = slot,
+            .scope = r.scope,
+            .index = scope.len,
+            .function = f.id,
+        });
+        scope.len += 1;
+        try r.live.append(r.arena, .{ .name = name, .binding = new_id });
+        f.max_slots = @max(f.max_slots, slot + 1);
+        return new_id;
+    }
+
+    fn resolvePrivate(r: *Resolver, name: []const u8, private_ref_id: u32, s: ast.Span) Error!void {
         var i = r.private_scopes.items.len;
         while (i > 0) {
             i -= 1;
-            if (r.private_scopes.items[i].contains(name)) return true;
+            const ps = r.private_scopes.items[i];
+            if (!ps.decls.contains(name)) continue;
+            const b = ps.brand_binding;
+            if (r.bindings.items[b].function == r.current().id) {
+                r.private_refs[private_ref_id] = .{ .local = b };
+            } else {
+                r.bindings.items[b].captured = true;
+                r.private_refs[private_ref_id] = .{ .capture = .{ .binding = b, .index = try r.captureIndex(r.fns.items.len - 1, b) } };
+            }
+            return;
         }
-        return false;
+        return r.fail(.{ .syntax_error = "Private field must be declared in an enclosing class" }, s);
     }
 
     fn addPrivateDecl(r: *Resolver, map: *std.StringHashMapUnmanaged(PrivateDecl), name: []const u8, decl: PrivateDecl, s: ast.Span) Error!void {
@@ -913,47 +1005,86 @@ const Resolver = struct {
     }
 
     fn resolveClass(r: *Resolver, c: *const ast.Class, is_expr: bool) Error!void {
-        if (c.super_class) |sc| try r.expr(sc);
-        const saved: ?Saved = if (is_expr and c.name != null) blk: {
-            const s = try r.enterScope();
-            try r.declare(c.name.?, .@"const", false, false, null);
-            break :blk s;
-        } else null;
+        const has_private = for (c.methods) |m| {
+            if (m.is_private) break true;
+        } else for (c.instance_fields) |f| {
+            if (f.is_private) break true;
+        } else for (c.static_fields) |f| {
+            if (f.is_private) break true;
+        } else false;
+
+        const saved: ?Saved = if (c.name != null or has_private) try r.enterScope() else null;
         defer if (saved) |s| r.exitScope(s);
 
-        var priv_map: std.StringHashMapUnmanaged(PrivateDecl) = .empty;
-        for (c.methods) |m| {
-            if (!m.is_private) continue;
-            try r.addPrivateDecl(&priv_map, m.key.name, .{
-                .has_get = m.kind == .getter,
-                .has_set = m.kind == .setter,
-                .is_static = m.is_static,
-                .is_field_or_method = m.kind == .method,
-            }, m.span);
+        if (c.name) |nd| {
+            if (is_expr) {
+                try r.declare(nd, .@"const", false, false, null);
+                r.class_names[c.id] = nd.binding;
+            } else {
+                r.class_names[c.id] = try r.declareSynthetic(nd.name, .@"const");
+            }
         }
-        for (c.instance_fields) |f| {
-            if (!f.is_private) continue;
-            try r.addPrivateDecl(&priv_map, f.key.name, .{ .is_static = false, .is_field_or_method = true }, f.span);
+        if (c.super_class) |sc| try r.expr(sc);
+
+        if (has_private) {
+            var priv_map: std.StringHashMapUnmanaged(PrivateDecl) = .empty;
+            for (c.methods) |m| {
+                if (!m.is_private) continue;
+                try r.addPrivateDecl(&priv_map, m.key.name, .{
+                    .has_get = m.kind == .getter,
+                    .has_set = m.kind == .setter,
+                    .is_static = m.is_static,
+                    .is_field_or_method = m.kind == .method,
+                }, m.span);
+            }
+            for (c.instance_fields) |f| {
+                if (!f.is_private) continue;
+                try r.addPrivateDecl(&priv_map, f.key.name, .{ .is_static = false, .is_field_or_method = true }, f.span);
+            }
+            for (c.static_fields) |f| {
+                if (!f.is_private) continue;
+                try r.addPrivateDecl(&priv_map, f.key.name, .{ .is_static = true, .is_field_or_method = true }, f.span);
+            }
+            const brand_b = try r.declareSynthetic("", .@"const");
+            r.class_brands[c.id] = brand_b;
+            try r.private_scopes.append(r.arena, .{ .brand_binding = brand_b, .decls = priv_map });
         }
-        for (c.static_fields) |f| {
-            if (!f.is_private) continue;
-            try r.addPrivateDecl(&priv_map, f.key.name, .{ .is_static = true, .is_field_or_method = true }, f.span);
-        }
-        try r.private_scopes.append(r.arena, priv_map);
-        defer _ = r.private_scopes.pop();
+        defer if (has_private) {
+            _ = r.private_scopes.pop();
+        };
 
         try r.function(c.constructor);
-        for (c.methods) |m| {
-            if (m.key == .computed) try r.expr(m.key.computed);
-            try r.function(m.func);
-        }
-        for (c.instance_fields) |f| {
-            if (f.key == .computed) try r.expr(f.key.computed);
-            if (f.init) |init_fn| try r.function(init_fn);
-        }
-        for (c.static_fields) |f| {
-            if (f.key == .computed) try r.expr(f.key.computed);
-            if (f.init) |init_fn| try r.function(init_fn);
+        if (c.elements.len > 0) {
+            for (c.elements) |el| switch (el) {
+                .method => |idx| {
+                    const m = c.methods[idx];
+                    if (m.key == .computed) try r.expr(m.key.computed);
+                    try r.function(m.func);
+                },
+                .instance_field => |idx| {
+                    const f = c.instance_fields[idx];
+                    if (f.key == .computed) try r.expr(f.key.computed);
+                    if (f.init) |init_fn| try r.function(init_fn);
+                },
+                .static_field => |idx| {
+                    const f = c.static_fields[idx];
+                    if (f.key == .computed) try r.expr(f.key.computed);
+                    if (f.init) |init_fn| try r.function(init_fn);
+                },
+            };
+        } else {
+            for (c.methods) |m| {
+                if (m.key == .computed) try r.expr(m.key.computed);
+                try r.function(m.func);
+            }
+            for (c.instance_fields) |f| {
+                if (f.key == .computed) try r.expr(f.key.computed);
+                if (f.init) |init_fn| try r.function(init_fn);
+            }
+            for (c.static_fields) |f| {
+                if (f.key == .computed) try r.expr(f.key.computed);
+                if (f.init) |init_fn| try r.function(init_fn);
+            }
         }
         for (c.static_items) |item| switch (item) {
             .field => {},
@@ -964,9 +1095,7 @@ const Resolver = struct {
     fn member(r: *Resolver, m: ast.Member) Error!void {
         try r.expr(m.object);
         if (m.is_private) {
-            if (!r.hasPrivateInScope(m.key.name)) {
-                return r.fail(.{ .syntax_error = "Private field must be declared in an enclosing class" }, m.object.span);
-            }
+            try r.resolvePrivate(m.key.name, m.private_ref, m.object.span);
         } else if (m.key == .computed) try r.expr(m.key.computed);
     }
 
@@ -974,11 +1103,7 @@ const Resolver = struct {
         try r.expr(oc.base);
         for (oc.steps) |s| switch (s.kind) {
             .prop => {},
-            .private_prop => |name| {
-                if (!r.hasPrivateInScope(name)) {
-                    return r.fail(.{ .syntax_error = "Private field must be declared in an enclosing class" }, oc.base.span);
-                }
-            },
+            .private_prop => |pp| try r.resolvePrivate(pp.name, pp.private_ref, oc.base.span),
             .elem => |e| try r.expr(e),
             .call => |args| for (args) |arg| try r.expr(arg),
         };
@@ -988,7 +1113,10 @@ const Resolver = struct {
         switch (t) {
             .ref => |ref| try r.target(ref),
             .member => |m| try r.member(m),
-            .super_member => |k| if (k == .computed) try r.expr(k.computed),
+            .super_member => |k| {
+                try r.resolveLexicalThis();
+                if (k == .computed) try r.expr(k.computed);
+            },
         }
     }
 

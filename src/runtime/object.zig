@@ -108,6 +108,15 @@ pub fn propKey(rt: *Runtime, k: Key) Error!heap_mod.PropKey {
     };
 }
 
+/// ECMAScript `ToPropertyKey(v)` normalized to a runtime `String` or `Symbol` Value.
+pub fn toPropertyKeyValue(rt: *Runtime, v: Value) Error!Value {
+    return switch (try key(rt, v)) {
+        .symbol => |s| Value.fromSymbol(s),
+        .atom => |a| Value.fromString(a),
+        .index => |i| Value.fromString(try atomOf(rt, .{ .index = i })),
+    };
+}
+
 pub fn isNamed(k: Key, text: []const u8) bool {
     const a = switch (k) {
         .atom => |a| a,
@@ -746,13 +755,16 @@ pub fn defineAccessor(rt: *Runtime, target: Value, k: Key, fn_val: Value, is_set
 }
 
 pub fn definePublicField(rt: *Runtime, target: Value, k: Key, v: Value) Error!void {
-    const pk = try propKey(rt, k);
-    const prop: Property = .{ .value = v, .enumerable = true, .writable = true, .configurable = true };
-    switch (target.unpack()) {
-        .object => |o| try rt.heap.definePropKey(o, pk, prop),
-        .closure => |c| try rt.heap.defineClosurePropKey(@constCast(c), pk, prop),
-        else => unreachable,
-    }
+    _ = try builtins.defineOwnPropertyParsed(rt, target, k, .{
+        .has_val = true,
+        .val = v,
+        .has_writ = true,
+        .writ_val = true,
+        .has_enum = true,
+        .enum_val = true,
+        .has_conf = true,
+        .conf_val = true,
+    }, true);
 }
 
 fn privateLookup(target: Value, pk: heap_mod.PrivateKey) ?Property {
@@ -782,7 +794,12 @@ pub fn definePrivateMethod(rt: *Runtime, target: Value, brand: *const heap_mod.C
 pub fn definePrivateAccessor(rt: *Runtime, target: Value, brand: *const heap_mod.Closure, name_str: *String, fn_val: Value, is_setter: bool) Error!void {
     const pk: heap_mod.PrivateKey = .{ .brand = @constCast(brand), .name = name_str };
     const existing = privateLookup(target, pk);
-    const keep_other = existing != null and existing.?.is_accessor;
+    if (existing) |ex| {
+        if (!ex.is_accessor or (is_setter and !ex.setter.isUndefined()) or (!is_setter and !ex.value.isUndefined())) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Cannot initialize private member twice on the same object" }});
+        }
+    }
+    const keep_other = existing != null;
     const prop: Property = .{
         .is_accessor = true,
         .value = if (is_setter) (if (keep_other) existing.?.value else .undefined) else fn_val,
@@ -803,7 +820,13 @@ pub fn getPrivate(rt: *Runtime, base: Value, brand: *const heap_mod.Closure, nam
     const p = privateLookup(base, pk) orelse {
         return rt.throw(.TypeError, &.{.{ .ascii = "Cannot read private member from an object whose class did not declare it" }});
     };
-    return resolvePropValue(rt, base, p);
+    if (p.is_accessor) {
+        if (p.value.isUndefined()) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Private property has only a setter" }});
+        }
+        return rt.callCallable(p.value, base, &.{});
+    }
+    return p.value;
 }
 
 pub fn setPrivate(rt: *Runtime, base: Value, brand: *const heap_mod.Closure, name_str: *String, v: Value) Error!void {

@@ -1135,6 +1135,7 @@ pub const Vm = struct {
             .define_private_accessor,
             .define_public_field,
             .define_private_field,
+            .to_property_key,
             .get_private,
             .set_private,
             .in_private,
@@ -1144,6 +1145,7 @@ pub const Vm = struct {
             .set_brand,
             .super_call,
             .super_call_spread,
+            .super_call_forward,
             .super_get_prop,
             .super_get_elem,
             .super_set_prop,
@@ -1714,7 +1716,18 @@ pub const Vm = struct {
                         const ret_v = try cache.peek(vm, 0);
                         const f = vm.frame();
                         cache.syncSp(vm);
-                        vm.nested_result = if (f.is_construct and !ret_v.isObjectLike()) f.thisVal().? else ret_v;
+                        if (f.is_construct and f.proto.has_super_ctor) {
+                            cache.pc = @intCast(f.proto.code.len);
+                            cache.syncSp(vm);
+                            vm.nested_result = if (ret_v.isObjectLike())
+                                ret_v
+                            else if (ret_v.isUndefined())
+                                f.thisVal() orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }})
+                            else
+                                return rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
+                        } else {
+                            vm.nested_result = if (f.is_construct and !ret_v.isObjectLike()) f.thisVal().? else ret_v;
+                        }
                         vm.halted = true;
                         state_out.* = .halted;
                         return;
@@ -1735,8 +1748,7 @@ pub const Vm = struct {
                     return;
                 }
                 cache.syncSp(vm);
-                try vm.returnConstruct(ret_v);
-                cache.* = FrameCache.fromVm(vm, vm.pc);
+                try vm.returnConstruct(cache, ret_v);
                 return;
             },
             .halt => {
@@ -1830,14 +1842,19 @@ pub const Vm = struct {
                 try cache.drop(vm, 2);
             },
             .define_accessor => {
+                cache.syncSp(vm);
                 const fn_val = try cache.peek(vm, 0);
                 const target = try cache.peek(vm, 1);
                 const flags = cache.operand(1);
                 const is_setter = (flags & 1) != 0;
                 const enumerable = (flags & 2) != 0;
                 if (!fn_val.isClosure()) return vm.bug("define_accessor expects closure");
-                try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), target);
-                try object.defineAccessor(rt, target, try vm.nameKey(cache.operand(0)), fn_val, is_setter, enumerable);
+                if (enumerable) {
+                    try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), target);
+                    try object.defineAccessor(rt, target, try vm.nameKey(cache.operand(0)), fn_val, is_setter, true);
+                } else {
+                    try builtins.defineClassAccessor(rt, target, try vm.nameKey(cache.operand(0)), fn_val, is_setter);
+                }
                 try cache.drop(vm, 1);
             },
             .define_elem_accessor => {
@@ -1849,8 +1866,12 @@ pub const Vm = struct {
                 const is_setter = (flags & 1) != 0;
                 const enumerable = (flags & 2) != 0;
                 if (!fn_val.isClosure()) return vm.bug("define_elem_accessor expects closure");
-                try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), target);
-                try object.defineAccessor(rt, target, try object.key(rt, key_val), fn_val, is_setter, enumerable);
+                if (enumerable) {
+                    try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), target);
+                    try object.defineAccessor(rt, target, try object.key(rt, key_val), fn_val, is_setter, true);
+                } else {
+                    try builtins.defineClassAccessor(rt, target, try object.key(rt, key_val), fn_val, is_setter);
+                }
                 try cache.drop(vm, 2);
             },
             .define_private_method => {
@@ -1879,7 +1900,10 @@ pub const Vm = struct {
                 const val = try cache.peek(vm, 0);
                 const key_val = try cache.peek(vm, 1);
                 const target = try cache.peek(vm, 2);
-                try object.definePublicField(rt, target, try object.key(rt, key_val), val);
+                const is_anon = (cache.operand(0) & 1) != 0;
+                const k = try object.key(rt, key_val);
+                if (is_anon) try builtins.setFunctionNameIfUnset(rt, val, k);
+                try object.definePublicField(rt, target, k, val);
                 try cache.drop(vm, 2);
             },
             .define_private_field => {
@@ -1890,30 +1914,41 @@ pub const Vm = struct {
                 try object.definePrivateField(rt, target, brand_val.asClosure(), name_str, val);
                 try cache.drop(vm, 1);
             },
+            .to_property_key => {
+                cache.syncSp(vm);
+                const pk_val = try object.toPropertyKeyValue(rt, try cache.peek(vm, 0));
+                (try cache.top(vm)).* = pk_val;
+            },
             .get_private => {
-                const brand = try vm.currentBrand();
+                cache.syncSp(vm);
+                const brand_val = try cache.peek(vm, 0);
+                const obj = try cache.peek(vm, 1);
+                if (!brand_val.isClosure()) return vm.bug("get_private expects brand closure");
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                const r = try object.getPrivate(rt, try cache.peek(vm, 0), brand, name_str);
+                const r = try object.getPrivate(rt, obj, brand_val.asClosure(), name_str);
+                try cache.drop(vm, 1);
                 (try cache.top(vm)).* = r;
             },
             .set_private => {
-                const v = try cache.peek(vm, 0);
-                const brand = try vm.currentBrand();
+                cache.syncSp(vm);
+                const brand_val = try cache.peek(vm, 0);
+                const v = try cache.peek(vm, 1);
+                const obj = try cache.peek(vm, 2);
+                if (!brand_val.isClosure()) return vm.bug("set_private expects brand closure");
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                try object.setPrivate(rt, try cache.peek(vm, 1), brand, name_str, v);
-                try cache.drop(vm, 1);
+                try object.setPrivate(rt, obj, brand_val.asClosure(), name_str, v);
+                try cache.drop(vm, 2);
                 (try cache.top(vm)).* = v;
             },
             .in_private => {
-                const rhs = try cache.peek(vm, 0);
-                if (vm.currentBrandOrNull()) |brand| {
-                    const name_str = (try vm.nameKey(cache.operand(0))).atom;
-                    const b = try object.hasPrivate(rt, rhs, brand, name_str);
-                    (try cache.top(vm)).* = Value.fromBool(b);
-                } else {
-                    if (!rhs.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot use 'in' operator to search for private field in non-object" }});
-                    (try cache.top(vm)).* = Value.fromBool(false);
-                }
+                cache.syncSp(vm);
+                const brand_val = try cache.peek(vm, 0);
+                const rhs = try cache.peek(vm, 1);
+                if (!brand_val.isClosure()) return vm.bug("in_private expects brand closure");
+                const name_str = (try vm.nameKey(cache.operand(0))).atom;
+                const b = try object.hasPrivate(rt, rhs, brand_val.asClosure(), name_str);
+                try cache.drop(vm, 1);
+                (try cache.top(vm)).* = Value.fromBool(b);
             },
             .store_field_key => {
                 const key_val = try cache.peek(vm, 0);
@@ -1927,8 +1962,9 @@ pub const Vm = struct {
                 const ctor_val = try cache.peek(vm, 1);
                 if (!ctor_val.isClosure()) return vm.bug("add_instance_init expects closure");
                 const packed_op = cache.operand(1);
-                const kind: @FieldType(heap.InstanceInit, "kind") = @fromBackingInt(@intCast(@as(u8, @intCast(packed_op >> 16))));
-                const key_idx: u32 = packed_op & 0xffff;
+                const is_anon = ((packed_op >> 24) & 1) != 0;
+                const kind: @FieldType(heap.InstanceInit, "kind") = @fromBackingInt(@intCast(@as(u8, @intCast((packed_op >> 16) & 0xff))));
+                const key_idx: u32 = (packed_op & 0xffff) | (if (is_anon) @as(u32, 0x8000_0000) else 0);
                 const name_str: ?*heap.String = if (kind == .public_field) null else (try vm.nameKey(cache.operand(0))).atom;
                 if (fn_val.isClosure()) {
                     const proto_val = (ctor_val.asClosure().meta orelse return vm.bug("add_instance_init without meta")).prototype orelse return vm.bug("add_instance_init without prototype");
@@ -1969,7 +2005,7 @@ pub const Vm = struct {
                 if (try vm.callSuper(base, vm.stack[args_start..cache.sp], false, next)) return true;
                 cache.sp = base + 1;
             },
-            .super_call_spread => {
+            .super_call_spread, .super_call_forward => {
                 const arr_val = try cache.peek(vm, 0);
                 const base = cache.sp - 1;
                 if (!arr_val.isObject() or arr_val.asObject().kind != .array) return vm.bug("super_call_spread expects array");
@@ -2425,19 +2461,6 @@ pub const Vm = struct {
         return true;
     }
 
-    fn currentBrandOrNull(vm: *Vm) ?*const heap.Closure {
-        if (vm.frame().closure) |c| {
-            if (c.meta) |m| {
-                if (m.brand) |b| return b.asClosure();
-            }
-        }
-        return null;
-    }
-
-    fn currentBrand(vm: *Vm) Error!*const heap.Closure {
-        return vm.currentBrandOrNull() orelse vm.rt.throw(.TypeError, &.{.{ .ascii = "Cannot access private member outside its class" }});
-    }
-
     inline fn requireThis(vm: *Vm) Error!Value {
         const f = vm.frame();
         if (f.thisVal()) |t| return t;
@@ -2446,6 +2469,9 @@ pub const Vm = struct {
 
     noinline fn requireThisSlow(vm: *Vm) Error!Value {
         const f = vm.frame();
+        if (f.proto.lexical_this_capture) |lc| {
+            return (try vm.capture(lc)).value orelse vm.rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
+        }
         if (f.proto.has_super_ctor) {
             return vm.rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
         }
@@ -2455,9 +2481,6 @@ pub const Vm = struct {
     noinline fn callSuper(vm: *Vm, base: u32, args_slice: []const Value, is_spread: bool, next: u32) Error!bool {
         const rt = vm.rt;
         const f = vm.frame();
-        if (!f.this_opt.isNone()) {
-            return rt.throw(.ReferenceError, &.{.{ .ascii = "Super constructor may only be called once" }});
-        }
         const cur_closure = f.closure orelse return vm.bug("super() without closure");
         var target = try object.getPrototypeOfValue(rt, Value.fromClosure(cur_closure));
         var combined: []Value = &.{};
@@ -2479,21 +2502,36 @@ pub const Vm = struct {
         const inst = f.construct_instance orelse return vm.bug("super() without construct_instance");
         if (target.isObject()) {
             const res = try builtins.callProxyConstruct(rt, target.asObject(), effective_args, Value.fromClosure(cur_closure));
-            vm.frames.items[vm.frames.items.len - 1].this_opt = OptValue.some(res);
+            const caller = &vm.frames.items[vm.frames.items.len - 1];
+            if (!caller.this_opt.isNone()) {
+                return rt.throw(.ReferenceError, &.{.{ .ascii = "Super constructor may only be called once" }});
+            }
+            caller.this_opt = OptValue.some(res);
+            if (caller.proto.this_slot) |ts| {
+                rt.heap.storeCell(vm.locals[caller.locals_base + ts].asCell(), res);
+            }
             vm.stack[base] = res;
             vm.sp = base + 1;
             try builtins.runInstanceInits(rt, @constCast(cur_closure), res);
             return false;
         }
         if (target.isNative()) {
-            const res = if (target.asNative() == &builtins.object_global or target.asNative() == &builtins.iterator_global)
+            const is_default_proto = target.asNative() == &builtins.object_global or target.asNative() == &builtins.iterator_global;
+            const res = if (is_default_proto)
                 Value.fromObject(inst)
-            else blk: {
-                const r = try builtins.construct(rt, target, effective_args);
-                if (r.isObject()) rt.heap.storeObjectProto(r.asObject(), inst.proto);
-                break :blk r;
-            };
-            vm.frames.items[vm.frames.items.len - 1].this_opt = OptValue.some(res);
+            else
+                try builtins.construct(rt, target, effective_args);
+            const caller = &vm.frames.items[vm.frames.items.len - 1];
+            if (!caller.this_opt.isNone()) {
+                return rt.throw(.ReferenceError, &.{.{ .ascii = "Super constructor may only be called once" }});
+            }
+            if (!is_default_proto and res.isObject()) {
+                rt.heap.storeObjectProto(res.asObject(), inst.proto);
+            }
+            caller.this_opt = OptValue.some(res);
+            if (caller.proto.this_slot) |ts| {
+                rt.heap.storeCell(vm.locals[caller.locals_base + ts].asCell(), res);
+            }
             vm.stack[base] = res;
             vm.sp = base + 1;
             try builtins.runInstanceInits(rt, @constCast(cur_closure), res);
@@ -2514,34 +2552,45 @@ pub const Vm = struct {
     }
 
     /// Outlined return path for constructor / `super()` frames (keeps `.@"return"` tiny in `runLoop`).
-    noinline fn returnConstruct(vm: *Vm, ret_v: Value) Error!void {
+    noinline fn returnConstruct(vm: *Vm, cache: *FrameCache, ret_v: Value) Error!void {
         @branchHint(.cold);
         const rt = vm.rt;
-        const cur_f = vm.frame();
-        const v: Value = if (cur_f.proto.has_super_ctor) blk: {
+        const f = vm.frames.pop().?;
+        vm.locals_len = f.locals_base;
+        vm.reserved -= f.proto.slot_count + f.proto.max_stack;
+        vm.sp = f.result_index;
+        cache.* = FrameCache.fromVm(vm, f.return_pc - 1);
+        cache.syncSp(vm);
+        const v: Value = if (f.proto.has_super_ctor) blk: {
             if (ret_v.isObjectLike()) break :blk ret_v;
             if (ret_v.isUndefined()) {
-                break :blk cur_f.thisVal() orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
+                break :blk f.thisVal() orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }});
             }
             return rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
         } else if (!ret_v.isObjectLike())
-            Value.fromObject(cur_f.construct_instance.?)
+            Value.fromObject(f.construct_instance.?)
         else
             ret_v;
-        const f = vm.frames.pop().?;
         if (f.is_super_call) {
-            vm.frames.items[vm.frames.items.len - 1].this_opt = OptValue.some(v);
+            const caller = &vm.frames.items[vm.frames.items.len - 1];
+            if (!caller.this_opt.isNone()) {
+                return rt.throw(.ReferenceError, &.{.{ .ascii = "Super constructor may only be called once" }});
+            }
+            caller.this_opt = OptValue.some(v);
+            if (caller.proto.this_slot) |ts| {
+                rt.heap.storeCell(vm.locals[caller.locals_base + ts].asCell(), v);
+            }
         }
-        vm.locals_len = f.locals_base;
-        vm.reserved -= f.proto.slot_count + f.proto.max_stack;
         vm.stack[f.result_index] = v;
-        vm.sp = f.result_index + 1;
-        vm.pc = f.return_pc;
+        cache.sp = f.result_index + 1;
+        cache.syncSp(vm);
         if (f.is_super_call) {
             if (vm.frames.items[vm.frames.items.len - 1].closure) |dc| {
                 try builtins.runInstanceInits(rt, @constCast(dc), v);
             }
         }
+        cache.pc = f.return_pc;
+        cache.syncSp(vm);
     }
 
     noinline fn coerceThisSlow(vm: *Vm, t: Value) Error!Value {

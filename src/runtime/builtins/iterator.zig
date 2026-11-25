@@ -355,6 +355,10 @@ fn iteratorTakeOrDrop(rt: *Runtime, this: Value, args: []const Value, kind_id: f
         try iteratorCloseDirect(rt, this, false);
         return rt.throw(.RangeError, &.{.{ .ascii = "Iterator limit must not be NaN" }});
     }
+    if (std.math.isFinite(num_lim) and num_lim > 9007199254740991.0) {
+        try iteratorCloseDirect(rt, this, false);
+        return rt.throw(.RangeError, &.{.{ .ascii = "Iterator limit must not exceed Number.MAX_SAFE_INTEGER" }});
+    }
     const int_lim = if (!std.math.isFinite(num_lim) or num_lim == 0.0) num_lim else @trunc(num_lim);
     if (int_lim < 0.0) {
         try iteratorCloseDirect(rt, this, false);

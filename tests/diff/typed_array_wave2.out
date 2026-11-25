@@ -3,3 +3,4 @@ dv offset oob: RangeError
 dv len oob: RangeError
 custom of: 2 5 6
 non-ctor of: TypeError
+reflect ta sym err: TypeError false

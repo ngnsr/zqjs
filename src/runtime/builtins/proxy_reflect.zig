@@ -736,14 +736,20 @@ pub fn constructWithNewTarget(rt: *Runtime, target_in: Value, args: []const Valu
     }
     if (target.isNative()) {
         if (!common.sameValue(new_target, target)) {
+            var root_buf = [_]Value{ new_target, .undefined };
+            var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+
+            const res = try builtins.construct(rt, target, effective_args);
+            root_buf[1] = res;
             const p = try object.get(rt, new_target, try object.named(rt, "prototype"));
             const po: ?*Object = if (p.isObject()) p.asObject() else null;
             if (target.asNative() == &builtins.object_global) {
                 return Value.fromObject(try rt.heap.newObject(po orelse (try builtins.realm(rt)).object_prototype));
             }
-            const res = try builtins.construct(rt, target, effective_args);
-            if (po) |proto_obj| if (res.isObject()) rt.heap.storeObjectProto(res.asObject(), proto_obj);
-            return res;
+            if (po) |proto_obj| if (root_buf[1].isObject()) rt.heap.storeObjectProto(root_buf[1].asObject(), proto_obj);
+            return root_buf[1];
         }
         return builtins.construct(rt, target, effective_args);
     }

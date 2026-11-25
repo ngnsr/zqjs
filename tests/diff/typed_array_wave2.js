@@ -22,3 +22,12 @@ function CustomTA(len) {
 const customOf = TypedArray.of.call(CustomTA, 5, 6);
 print("custom of:", customOf.length, customOf[0], customOf[1]);
 print("non-ctor of:", errName(() => TypedArray.of.call({}, 1, 2)));
+
+let protoAccessed = false;
+const nt = Object.defineProperty(function() {}.bind(null), "prototype", {
+    get() {
+        protoAccessed = true;
+        return null;
+    },
+});
+print("reflect ta sym err:", errName(() => Reflect.construct(Uint8Array, [Symbol()], nt)), protoAccessed);

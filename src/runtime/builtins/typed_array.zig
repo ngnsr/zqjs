@@ -106,6 +106,8 @@ fn initArrayBufferAndViews(rt: *Runtime, r: *const builtins.Realm, v: *builtins.
     try common.method(rt, v.data_view_prototype, "setInt32", &dv_set_int32);
     try common.method(rt, v.data_view_prototype, "getUint32", &dv_get_uint32);
     try common.method(rt, v.data_view_prototype, "setUint32", &dv_set_uint32);
+    try common.method(rt, v.data_view_prototype, "getFloat16", &dv_get_float16);
+    try common.method(rt, v.data_view_prototype, "setFloat16", &dv_set_float16);
     try common.method(rt, v.data_view_prototype, "getFloat32", &dv_get_float32);
     try common.method(rt, v.data_view_prototype, "setFloat32", &dv_set_float32);
     try common.method(rt, v.data_view_prototype, "getFloat64", &dv_get_float64);
@@ -139,6 +141,9 @@ fn initArrayBufferAndViews(rt: *Runtime, r: *const builtins.Realm, v: *builtins.
     try common.method(rt, v.typed_array_prototype, "copyWithin", &ta_copy_within);
     try common.method(rt, v.typed_array_prototype, "reverse", &ta_reverse);
     try common.method(rt, v.typed_array_prototype, "sort", &ta_sort);
+    try common.method(rt, v.typed_array_prototype, "toReversed", &ta_to_reversed);
+    try common.method(rt, v.typed_array_prototype, "toSorted", &ta_to_sorted);
+    try common.method(rt, v.typed_array_prototype, "with", &ta_with);
     try common.method(rt, v.typed_array_prototype, "indexOf", &ta_index_of);
     try common.method(rt, v.typed_array_prototype, "lastIndexOf", &ta_last_index_of);
     try common.method(rt, v.typed_array_prototype, "includes", &ta_includes);
@@ -370,12 +375,12 @@ fn dvByteOffsetGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     return Value.fromNumber(@floatFromInt(dv.byte_offset));
 }
 
-const DataViewElem = enum { int8, uint8, int16, uint16, int32, uint32, float32, float64, bigint64, biguint64 };
+const DataViewElem = enum { int8, uint8, int16, uint16, int32, uint32, float16, float32, float64, bigint64, biguint64 };
 
 fn dvElemSize(comptime elem: DataViewElem) usize {
     return switch (elem) {
         .int8, .uint8 => 1,
-        .int16, .uint16 => 2,
+        .int16, .uint16, .float16 => 2,
         .int32, .uint32, .float32 => 4,
         .float64, .bigint64, .biguint64 => 8,
     };
@@ -407,6 +412,7 @@ fn dvGet(comptime elem: DataViewElem, rt: *Runtime, this: Value, args: []const V
             .uint16 => @floatFromInt(std.mem.readInt(u16, bytes[0..2], endian)),
             .int32 => @floatFromInt(std.mem.readInt(i32, bytes[0..4], endian)),
             .uint32 => @floatFromInt(std.mem.readInt(u32, bytes[0..4], endian)),
+            .float16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, bytes[0..2], endian)))),
             .float32 => @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, bytes[0..4], endian)))),
             .float64 => @bitCast(std.mem.readInt(u64, bytes[0..8], endian)),
             .bigint64, .biguint64 => unreachable,
@@ -440,6 +446,10 @@ fn dvSet(comptime elem: DataViewElem, rt: *Runtime, this: Value, args: []const V
         .uint16 => std.mem.writeInt(u16, bytes[0..2], @truncate(ops.toUint32(n)), endian),
         .int32 => std.mem.writeInt(i32, bytes[0..4], ops.toInt32(n), endian),
         .uint32 => std.mem.writeInt(u32, bytes[0..4], ops.toUint32(n), endian),
+        .float16 => {
+            const f: f16 = @floatCast(n);
+            std.mem.writeInt(u16, bytes[0..2], @bitCast(f), endian);
+        },
         .float32 => {
             const f: f32 = @floatCast(n);
             std.mem.writeInt(u32, bytes[0..4], @bitCast(f), endian);
@@ -520,6 +530,18 @@ const dv_get_uint32: Native = .{ .name = "getUint32", .length = 1, .call = struc
 const dv_set_uint32: Native = .{ .name = "setUint32", .length = 2, .call = struct {
     fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
         return dvSet(.uint32, rt, t, a);
+    }
+}.f };
+
+const dv_get_float16: Native = .{ .name = "getFloat16", .length = 1, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvGet(.float16, rt, t, a);
+    }
+}.f };
+
+const dv_set_float16: Native = .{ .name = "setFloat16", .length = 2, .call = struct {
+    fn f(rt: *Runtime, t: Value, a: []const Value) Error!Value {
+        return dvSet(.float16, rt, t, a);
     }
 }.f };
 
@@ -939,6 +961,12 @@ const ta_reverse: Native = .{ .name = "reverse", .length = 0, .call = taReverse 
 
 const ta_sort: Native = .{ .name = "sort", .length = 1, .call = taSort };
 
+const ta_to_reversed: Native = .{ .name = "toReversed", .length = 0, .call = taToReversed };
+
+const ta_to_sorted: Native = .{ .name = "toSorted", .length = 1, .call = taToSorted };
+
+const ta_with: Native = .{ .name = "with", .length = 2, .call = taWith };
+
 const ta_index_of: Native = .{ .name = "indexOf", .length = 1, .call = taIndexOf };
 
 const ta_last_index_of: Native = .{ .name = "lastIndexOf", .length = 1, .call = taLastIndexOf };
@@ -1081,15 +1109,16 @@ fn typedArraySpeciesCreate(rt: *Runtime, exemplar: *Object, args: []const Value,
 }
 
 fn taSubarray(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const o = try requireLiveTypedArray(rt, this);
+    const o = try requireTypedArray(rt, this);
     const ta = o.kind.typed_array;
     var root_buf = [_]Value{this};
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const begin_idx = try relativeIndex(rt, common.arg(args, 0), ta.length, 0);
-    const end_idx = try relativeIndex(rt, common.arg(args, 1), ta.length, ta.length);
+    const src_len: usize = if (ta.buffer.kind.array_buffer.detached) 0 else ta.length;
+    const begin_idx = try relativeIndex(rt, common.arg(args, 0), src_len, 0);
+    const end_idx = try relativeIndex(rt, common.arg(args, 1), src_len, src_len);
     const new_len = if (end_idx > begin_idx) end_idx - begin_idx else 0;
     const new_off = ta.byte_offset + begin_idx * ta.kind.bytesPerElement();
     const dst = try typedArraySpeciesCreate(rt, o, &.{
@@ -1337,7 +1366,9 @@ fn taSort(rt: *Runtime, this: Value, args: []const Value) Error!Value {
             const scratch = try rt.gpa.alloc(Value, ta.length);
             defer rt.gpa.free(scratch);
             try mergeSortTypedArrayValues(rt, vals, scratch, cmp);
-            for (vals, 0..) |v, i| try object.writeTypedArrayElement(rt, ta, i, v);
+            if (!ta.buffer.kind.array_buffer.detached) {
+                for (vals, 0..) |v, i| try object.writeTypedArrayElement(rt, ta, i, v);
+            }
         }
         return this;
     }
@@ -1357,8 +1388,149 @@ fn taSort(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         defer rt.gpa.free(scratch);
         try mergeSortTypedArray(rt, vals, scratch, cmp);
     }
-    for (vals, 0..) |n, i| object.writeTypedArrayNumber(ta, i, n);
+    if (!ta.buffer.kind.array_buffer.detached) {
+        for (vals, 0..) |n, i| object.writeTypedArrayNumber(ta, i, n);
+    }
     return this;
+}
+
+fn taToReversed(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    var root_buf = [_]Value{this};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const ta = o.kind.typed_array;
+    const dst = try allocateTypedArray(rt, ta.kind, ta.length);
+    const dst_ta = dst.kind.typed_array;
+    const bpe = ta.kind.bytesPerElement();
+    const src_data = ta.buffer.kind.array_buffer.data[ta.byte_offset..][0 .. ta.length * bpe];
+    const dst_data = dst_ta.buffer.kind.array_buffer.data[dst_ta.byte_offset..][0 .. ta.length * bpe];
+    for (0..ta.length) |k| {
+        const from = ta.length - 1 - k;
+        @memcpy(dst_data[k * bpe ..][0..bpe], src_data[from * bpe ..][0..bpe]);
+    }
+    return Value.fromObject(dst);
+}
+
+fn taToSorted(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const cmp = common.arg(args, 0);
+    if (!cmp.isUndefined() and !cmp.isFunction()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "The comparison function must be either a function or undefined" }});
+    }
+    const o = try requireLiveTypedArray(rt, this);
+    var root_buf = [_]Value{ this, cmp, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const ta = o.kind.typed_array;
+    const dst = try allocateTypedArray(rt, ta.kind, ta.length);
+    root_buf[2] = Value.fromObject(dst);
+    const dst_ta = dst.kind.typed_array;
+    if (ta.length == 0) return Value.fromObject(dst);
+    if (ta.length == 1) {
+        const bpe = ta.kind.bytesPerElement();
+        @memcpy(
+            dst_ta.buffer.kind.array_buffer.data[dst_ta.byte_offset..][0..bpe],
+            ta.buffer.kind.array_buffer.data[ta.byte_offset..][0..bpe],
+        );
+        return Value.fromObject(dst);
+    }
+
+    if (ta.kind.isBigInt()) {
+        if (cmp.isUndefined()) {
+            if (ta.kind == .bigint64) {
+                const vals = try rt.gpa.alloc(i64, ta.length);
+                defer rt.gpa.free(vals);
+                for (0..ta.length) |i| vals[i] = object.readTypedArrayI64(ta, i);
+                std.mem.sort(i64, vals, {}, std.sort.asc(i64));
+                const data = dst_ta.buffer.kind.array_buffer.data;
+                const native_endian = @import("builtin").cpu.arch.endian();
+                for (vals, 0..) |v, i| {
+                    std.mem.writeInt(i64, data[dst_ta.byte_offset + i * 8 ..][0..8], v, native_endian);
+                }
+            } else {
+                const vals = try rt.gpa.alloc(u64, ta.length);
+                defer rt.gpa.free(vals);
+                for (0..ta.length) |i| vals[i] = object.readTypedArrayU64(ta, i);
+                std.mem.sort(u64, vals, {}, std.sort.asc(u64));
+                const data = dst_ta.buffer.kind.array_buffer.data;
+                const native_endian = @import("builtin").cpu.arch.endian();
+                for (vals, 0..) |v, i| {
+                    std.mem.writeInt(u64, data[dst_ta.byte_offset + i * 8 ..][0..8], v, native_endian);
+                }
+            }
+        } else {
+            const vals = try rt.gpa.alloc(Value, ta.length);
+            defer rt.gpa.free(vals);
+            for (0..ta.length) |i| vals[i] = try object.readTypedArrayElement(rt, ta, i);
+            var val_roots: rt_mod.ValueRoots = .{ .values = vals };
+            try val_roots.register(rt);
+            defer val_roots.unregister(rt);
+            const scratch = try rt.gpa.alloc(Value, ta.length);
+            defer rt.gpa.free(scratch);
+            try mergeSortTypedArrayValues(rt, vals, scratch, cmp);
+            for (vals, 0..) |v, i| try object.writeTypedArrayElement(rt, dst_ta, i, v);
+        }
+        return Value.fromObject(dst);
+    }
+
+    const vals = try rt.gpa.alloc(f64, ta.length);
+    defer rt.gpa.free(vals);
+    for (0..ta.length) |i| vals[i] = object.readTypedArrayNumber(ta, i).asNumber();
+
+    if (cmp.isUndefined()) {
+        std.mem.sort(f64, vals, {}, numericSortLess);
+    } else {
+        const scratch = try rt.gpa.alloc(f64, ta.length);
+        defer rt.gpa.free(scratch);
+        try mergeSortTypedArray(rt, vals, scratch, cmp);
+    }
+    for (vals, 0..) |n, i| object.writeTypedArrayNumber(dst_ta, i, n);
+    return Value.fromObject(dst);
+}
+
+fn taWith(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireLiveTypedArray(rt, this);
+    const idx_arg = common.arg(args, 0);
+    const val_arg = common.arg(args, 1);
+    var root_buf = [_]Value{ this, idx_arg, val_arg, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const ta = o.kind.typed_array;
+    const len = ta.length;
+    const rel = try common.toIntegerOrInfinity(rt, idx_arg);
+    const actual_f = if (rel >= 0.0) rel else @as(f64, @floatFromInt(len)) + rel;
+
+    const is_bigint = ta.kind.isBigInt();
+    const big_val: *const heap_mod.BigInt = if (is_bigint) blk: {
+        const b = try ops.toBigInt(rt, val_arg);
+        root_buf[3] = Value.fromBigInt(b);
+        break :blk b;
+    } else undefined;
+    const num_val: f64 = if (!is_bigint) try ops.toNumber(rt, val_arg) else 0.0;
+
+    if (ta.buffer.kind.array_buffer.detached or !std.math.isFinite(actual_f) or actual_f < 0.0 or actual_f >= @as(f64, @floatFromInt(len))) {
+        return rt.throw(.RangeError, &.{.{ .ascii = "Invalid typed array index" }});
+    }
+    const actual_idx: usize = @intFromFloat(actual_f);
+    const dst = try allocateTypedArray(rt, ta.kind, len);
+    const dst_ta = dst.kind.typed_array;
+    const bpe = ta.kind.bytesPerElement();
+    @memcpy(
+        dst_ta.buffer.kind.array_buffer.data[dst_ta.byte_offset..][0 .. len * bpe],
+        ta.buffer.kind.array_buffer.data[ta.byte_offset..][0 .. len * bpe],
+    );
+    if (is_bigint) {
+        object.writeTypedArrayBigInt(dst_ta, actual_idx, big_val);
+    } else {
+        object.writeTypedArrayNumber(dst_ta, actual_idx, num_val);
+    }
+    return Value.fromObject(dst);
 }
 
 fn taIndexOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {

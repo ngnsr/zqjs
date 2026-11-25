@@ -1,0 +1,22 @@
+f16 0: 1.5 3e00
+f16 -0: true 8000
+f16 inf: Infinity
+f16 max: 65504
+f16 sub: 5.960464477539063e-8
+f16 nan: true
+f16 oob: RangeError RangeError
+f16 detached: TypeError TypeError
+orig: 3,-1,2,0
+toReversed: true 0,2,-1,3
+toSorted: true -1,0,2,3
+toSorted desc: 3,2,0,-1
+with: true 3,99,2,0 3,-1,2,42
+with oob: RangeError RangeError
+toSorted bad cmp: TypeError
+f64 toSorted: -1.5 true true 2.5 true
+bi toReversed: 3,-5,10
+bi toSorted: -5,3,10
+bi toSorted cmp: 10,3,-5
+bi with: 10,77,3
+subarray detached: TypeError begin,end
+sort detach: true 0

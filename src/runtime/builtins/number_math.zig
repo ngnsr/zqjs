@@ -474,6 +474,161 @@ fn numberToLocaleString(rt: *Runtime, this: Value, _: []const Value) Error!Value
     return Value.fromString(try common.toStringObj(rt, Value.fromNumber(n)));
 }
 
+const ExactDecimal = struct {
+    /// Exact significant decimal digits ('0'..'9'), digits[0] != '0'.
+    /// Max exact decimal digits of any finite IEEE-754 f64 is 767 (< 2^53 * 5^1074).
+    digits: [800]u8 = undefined,
+    len: usize = 0,
+    /// Decimal exponent such that value = (digits[0] . digits[1..len]) * 10^exp.
+    exp: i32 = 0,
+
+    fn fromPositiveFinite(ax: f64) ExactDecimal {
+        std.debug.assert(ax > 0.0 and std.math.isFinite(ax));
+        const bits: u64 = @bitCast(ax);
+        const exp_bits: u11 = @truncate(bits >> 52);
+        const frac_bits: u52 = @truncate(bits);
+
+        var sig: u64 = undefined;
+        var bin_exp: i32 = undefined;
+        if (exp_bits == 0) {
+            sig = frac_bits;
+            bin_exp = -1074;
+        } else {
+            sig = (@as(u64, 1) << 52) | frac_bits;
+            bin_exp = @as(i32, exp_bits) - 1075;
+        }
+
+        const tz: u6 = @intCast(@ctz(sig));
+        sig >>= tz;
+        bin_exp += @as(i32, tz);
+
+        // Base 10^9 limbs (little-endian). Max 86 limbs for 767 digits.
+        const base: u64 = 1_000_000_000;
+        var limbs: [90]u32 = undefined;
+        var nlimbs: usize = 0;
+        var tmp = sig;
+        while (tmp > 0) {
+            limbs[nlimbs] = @intCast(tmp % base);
+            nlimbs += 1;
+            tmp /= base;
+        }
+
+        if (bin_exp > 0) {
+            var rem: u32 = @intCast(bin_exp);
+            while (rem > 0) {
+                const shift: u5 = @intCast(@min(rem, 29));
+                const mul: u64 = @as(u64, 1) << shift;
+                var carry: u64 = 0;
+                for (0..nlimbs) |i| {
+                    const prod = @as(u64, limbs[i]) * mul + carry;
+                    limbs[i] = @intCast(prod % base);
+                    carry = prod / base;
+                }
+                while (carry > 0) {
+                    limbs[nlimbs] = @intCast(carry % base);
+                    nlimbs += 1;
+                    carry /= base;
+                }
+                rem -= shift;
+            }
+        } else if (bin_exp < 0) {
+            const pow5_table = [_]u32{
+                1,
+                5,
+                25,
+                125,
+                625,
+                3125,
+                15625,
+                78125,
+                390625,
+                1953125,
+                9765625,
+                48828125,
+                244140625,
+                1220703125,
+            };
+            var rem: u32 = @intCast(-bin_exp);
+            while (rem > 0) {
+                const step: u32 = @min(rem, 13);
+                const mul: u64 = pow5_table[step];
+                var carry: u64 = 0;
+                for (0..nlimbs) |i| {
+                    const prod = @as(u64, limbs[i]) * mul + carry;
+                    limbs[i] = @intCast(prod % base);
+                    carry = prod / base;
+                }
+                while (carry > 0) {
+                    limbs[nlimbs] = @intCast(carry % base);
+                    nlimbs += 1;
+                    carry /= base;
+                }
+                rem -= step;
+            }
+        }
+
+        var res: ExactDecimal = .{};
+        const top = limbs[nlimbs - 1];
+        var top_buf: [10]u8 = undefined;
+        const top_str = std.fmt.bufPrint(&top_buf, "{d}", .{top}) catch unreachable;
+        @memcpy(res.digits[0..top_str.len], top_str);
+        var pos: usize = top_str.len;
+
+        var idx = nlimbs - 1;
+        while (idx > 0) {
+            idx -= 1;
+            var v = limbs[idx];
+            var j: usize = 9;
+            while (j > 0) {
+                j -= 1;
+                res.digits[pos + j] = @intCast('0' + (v % 10));
+                v /= 10;
+            }
+            pos += 9;
+        }
+
+        res.exp = @as(i32, @intCast(pos - 1)) + @min(bin_exp, 0);
+        res.len = pos;
+        return res;
+    }
+
+    /// Rounds the exact positive decimal to `keep` (>= 1) significant digits,
+    /// breaking exact half-way ties upward (ECMAScript's "pick the larger n").
+    fn roundSignificant(self: *ExactDecimal, keep: usize) void {
+        std.debug.assert(keep >= 1 and keep <= self.digits.len);
+        if (keep >= self.len) {
+            @memset(self.digits[self.len..keep], '0');
+            self.len = keep;
+            return;
+        }
+        const round_up = self.digits[keep] >= '5';
+        self.len = keep;
+        if (!round_up) return;
+        var i: usize = keep;
+        while (i > 0) {
+            i -= 1;
+            if (self.digits[i] < '9') {
+                self.digits[i] += 1;
+                return;
+            }
+            self.digits[i] = '0';
+        }
+        self.digits[0] = '1';
+        self.exp += 1;
+    }
+};
+
+fn formatExpSuffix(out: []u8, exp: i32) usize {
+    out[0] = 'e';
+    if (exp >= 0) {
+        out[1] = '+';
+        const es = std.fmt.bufPrint(out[2..], "{d}", .{exp}) catch unreachable;
+        return 2 + es.len;
+    }
+    const es = std.fmt.bufPrint(out[1..], "{d}", .{exp}) catch unreachable;
+    return 1 + es.len;
+}
+
 fn formatJsExp(out: []u8, raw: []const u8) []const u8 {
     // Normalize Zig scientific output `...eN` -> `...e+N` (JS always emits an explicit sign).
     const e_pos = std.mem.indexOfScalar(u8, raw, 'e') orelse {
@@ -500,11 +655,73 @@ fn numberToFixed(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     if (!std.math.isFinite(x_raw) or @abs(x_raw) >= 1e21) {
         return Value.fromString(try common.toStringObj(rt, Value.fromNumber(x_raw)));
     }
-    const x = if (x_raw == 0.0) 0.0 else x_raw;
     const f: usize = @intFromFloat(f_f);
-    var buf: [512]u8 = undefined;
-    const rendered = std.fmt.float.render(&buf, x, .{ .mode = .decimal, .precision = f }) catch unreachable;
-    return Value.fromString(try rt.heap.ascii(rendered));
+    var out: [256]u8 = undefined;
+    var oi: usize = 0;
+
+    if (x_raw == 0.0) {
+        out[oi] = '0';
+        oi += 1;
+        if (f > 0) {
+            out[oi] = '.';
+            oi += 1;
+            @memset(out[oi..][0..f], '0');
+            oi += f;
+        }
+        return Value.fromString(try rt.heap.ascii(out[0..oi]));
+    }
+
+    if (x_raw < 0.0) {
+        out[oi] = '-';
+        oi += 1;
+    }
+    var dec = ExactDecimal.fromPositiveFinite(@abs(x_raw));
+    const keep_i32: i32 = dec.exp + 1 + @as(i32, @intCast(f));
+    if (keep_i32 <= 0) {
+        const round_up = (keep_i32 == 0 and dec.digits[0] >= '5');
+        if (f == 0) {
+            out[oi] = if (round_up) '1' else '0';
+            oi += 1;
+        } else {
+            out[oi] = '0';
+            out[oi + 1] = '.';
+            oi += 2;
+            @memset(out[oi..][0..f], '0');
+            if (round_up) out[oi + f - 1] = '1';
+            oi += f;
+        }
+        return Value.fromString(try rt.heap.ascii(out[0..oi]));
+    }
+
+    dec.roundSignificant(@intCast(keep_i32));
+    if (dec.exp >= 0) {
+        const int_digits: usize = @intCast(dec.exp + 1);
+        const total_digits = int_digits + f;
+        if (dec.len < total_digits) {
+            @memset(dec.digits[dec.len..total_digits], '0');
+            dec.len = total_digits;
+        }
+        @memcpy(out[oi..][0..int_digits], dec.digits[0..int_digits]);
+        oi += int_digits;
+        if (f > 0) {
+            out[oi] = '.';
+            oi += 1;
+            @memcpy(out[oi..][0..f], dec.digits[int_digits..][0..f]);
+            oi += f;
+        }
+    } else {
+        // 0 < value < 1 after rounding, so f > 0.
+        out[oi] = '0';
+        out[oi + 1] = '.';
+        oi += 2;
+        const zeros: usize = @intCast(-dec.exp - 1);
+        @memset(out[oi..][0..zeros], '0');
+        oi += zeros;
+        const sig_frac = f - zeros;
+        @memcpy(out[oi..][0..sig_frac], dec.digits[0..sig_frac]);
+        oi += sig_frac;
+    }
+    return Value.fromString(try rt.heap.ascii(out[0..oi]));
 }
 
 fn numberToExponential(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -517,12 +734,48 @@ fn numberToExponential(rt: *Runtime, this: Value, args: []const Value) Error!Val
     if (!f_arg.isUndefined() and (f_f < 0.0 or f_f > 100.0)) {
         return rt.throw(.RangeError, &.{.{ .ascii = "toExponential() argument must be between 0 and 100" }});
     }
-    const x = if (x_raw == 0.0) 0.0 else x_raw;
-    const prec: ?usize = if (f_arg.isUndefined()) null else @intFromFloat(f_f);
-    var raw_buf: [512]u8 = undefined;
-    const raw = std.fmt.float.render(&raw_buf, x, .{ .mode = .scientific, .precision = prec }) catch unreachable;
-    var out_buf: [512]u8 = undefined;
-    return Value.fromString(try rt.heap.ascii(formatJsExp(&out_buf, raw)));
+    if (f_arg.isUndefined()) {
+        const x = if (x_raw == 0.0) 0.0 else x_raw;
+        var raw_buf: [256]u8 = undefined;
+        const raw = std.fmt.float.render(&raw_buf, x, .{ .mode = .scientific, .precision = null }) catch unreachable;
+        var out_buf: [256]u8 = undefined;
+        return Value.fromString(try rt.heap.ascii(formatJsExp(&out_buf, raw)));
+    }
+
+    const f: usize = @intFromFloat(f_f);
+    var out: [256]u8 = undefined;
+    var oi: usize = 0;
+
+    if (x_raw == 0.0) {
+        out[oi] = '0';
+        oi += 1;
+        if (f > 0) {
+            out[oi] = '.';
+            oi += 1;
+            @memset(out[oi..][0..f], '0');
+            oi += f;
+        }
+        @memcpy(out[oi..][0..3], "e+0");
+        oi += 3;
+        return Value.fromString(try rt.heap.ascii(out[0..oi]));
+    }
+
+    if (x_raw < 0.0) {
+        out[oi] = '-';
+        oi += 1;
+    }
+    var dec = ExactDecimal.fromPositiveFinite(@abs(x_raw));
+    dec.roundSignificant(f + 1);
+    out[oi] = dec.digits[0];
+    oi += 1;
+    if (f > 0) {
+        out[oi] = '.';
+        oi += 1;
+        @memcpy(out[oi..][0..f], dec.digits[1..][0..f]);
+        oi += f;
+    }
+    oi += formatExpSuffix(out[oi..], dec.exp);
+    return Value.fromString(try rt.heap.ascii(out[0..oi]));
 }
 
 fn numberToPrecision(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -539,61 +792,49 @@ fn numberToPrecision(rt: *Runtime, this: Value, args: []const Value) Error!Value
         return rt.throw(.RangeError, &.{.{ .ascii = "toPrecision() argument must be between 1 and 100" }});
     }
     const p: usize = @intFromFloat(p_f);
-    const neg = x_raw < 0.0;
-    const ax = if (x_raw == 0.0) 0.0 else @abs(x_raw);
-
-    var raw_buf: [512]u8 = undefined;
-    const raw = std.fmt.float.render(&raw_buf, ax, .{ .mode = .scientific, .precision = p - 1 }) catch unreachable;
-    const e_pos = std.mem.indexOfScalar(u8, raw, 'e') orelse unreachable;
-    const exp = std.fmt.parseInt(i32, raw[e_pos + 1 ..], 10) catch unreachable;
-
-    // Extract the p significant digits (skipping any '.').
-    var digits: [128]u8 = undefined;
-    var dlen: usize = 0;
-    for (raw[0..e_pos]) |ch| {
-        if (ch != '.') {
-            digits[dlen] = ch;
-            dlen += 1;
-        }
-    }
-    while (dlen < p) : (dlen += 1) digits[dlen] = '0';
-
-    var out: [512]u8 = undefined;
+    var out: [256]u8 = undefined;
     var oi: usize = 0;
-    if (neg) {
-        out[oi] = '-';
-        oi += 1;
-    }
-    if (exp < -6 or exp >= @as(i32, @intCast(p))) {
-        out[oi] = digits[0];
+
+    if (x_raw == 0.0) {
+        out[oi] = '0';
         oi += 1;
         if (p > 1) {
             out[oi] = '.';
             oi += 1;
-            @memcpy(out[oi..][0 .. p - 1], digits[1..p]);
+            @memset(out[oi..][0 .. p - 1], '0');
             oi += p - 1;
         }
-        out[oi] = 'e';
+        return Value.fromString(try rt.heap.ascii(out[0..oi]));
+    }
+
+    if (x_raw < 0.0) {
+        out[oi] = '-';
         oi += 1;
-        if (exp >= 0) {
-            out[oi] = '+';
+    }
+    var dec = ExactDecimal.fromPositiveFinite(@abs(x_raw));
+    dec.roundSignificant(p);
+    const exp = dec.exp;
+
+    if (exp < -6 or exp >= @as(i32, @intCast(p))) {
+        out[oi] = dec.digits[0];
+        oi += 1;
+        if (p > 1) {
+            out[oi] = '.';
             oi += 1;
-            const es = std.fmt.bufPrint(out[oi..], "{d}", .{exp}) catch unreachable;
-            oi += es.len;
-        } else {
-            const es = std.fmt.bufPrint(out[oi..], "{d}", .{exp}) catch unreachable;
-            oi += es.len;
+            @memcpy(out[oi..][0 .. p - 1], dec.digits[1..p]);
+            oi += p - 1;
         }
+        oi += formatExpSuffix(out[oi..], exp);
     } else if (exp == @as(i32, @intCast(p)) - 1) {
-        @memcpy(out[oi..][0..p], digits[0..p]);
+        @memcpy(out[oi..][0..p], dec.digits[0..p]);
         oi += p;
     } else if (exp >= 0) {
         const int_digits: usize = @intCast(exp + 1);
-        @memcpy(out[oi..][0..int_digits], digits[0..int_digits]);
+        @memcpy(out[oi..][0..int_digits], dec.digits[0..int_digits]);
         oi += int_digits;
         out[oi] = '.';
         oi += 1;
-        @memcpy(out[oi..][0 .. p - int_digits], digits[int_digits..p]);
+        @memcpy(out[oi..][0 .. p - int_digits], dec.digits[int_digits..p]);
         oi += p - int_digits;
     } else {
         out[oi] = '0';
@@ -602,7 +843,7 @@ fn numberToPrecision(rt: *Runtime, this: Value, args: []const Value) Error!Value
         const zeros: usize = @intCast(-exp - 1);
         @memset(out[oi..][0..zeros], '0');
         oi += zeros;
-        @memcpy(out[oi..][0..p], digits[0..p]);
+        @memcpy(out[oi..][0..p], dec.digits[0..p]);
         oi += p;
     }
     return Value.fromString(try rt.heap.ascii(out[0..oi]));

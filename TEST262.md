@@ -43,18 +43,18 @@ ZQJS includes a parallel [tc39/test262](https://github.com/tc39/test262) conform
 
 ---
 
-## Results (M66 — Built-ins Wave 1: Array/Function/`%ThrowTypeError%`/Object/Proxy/RegExp/String + Frontend `CoverInitializedName` & `super` Property Access)
+## Results (M67 — Classes `99.91%`/`99.75%`, Promise `98.89%`, `JSON.parse` `100%`, `Error.prototype.stack`, `Number` Exact Decimal Rounding, `TypedArray`/`DataView`, Built-ins Wave 1 + Parser `CoverInitializedName`/`super`)
 
-Measured at `32f497f` with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
+Measured at `7b21167` with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
 
 | Suite | Collected | Skipped (meta) | Executed | Unsupported | Limit | Applicable | Pass | Fail | Pass / Executed | Pass / Applicable |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `built-ins` | 23,885 | 6,981 | 16,904 | 1,453 | 466 | 14,985 | **14,582** | 403 | **86.26%** | **97.31%** |
-| `language` | 23,832 | 968 | 22,864 | 2,131 | 1 | 20,732 | **20,415** | 317 | **89.29%** | **98.47%** |
-| **Combined** | **47,717** | **7,949** | **39,768** | **3,584** | **467** | **35,717** | **34,997** | **720** | **88.00%** | **97.98%** |
+| `built-ins` | 23,885 | 6,981 | 16,904 | 1,408 | 467 | 15,029 | **14,688** | 341 | **86.89%** | **97.73%** |
+| `language` | 23,832 | 968 | 22,864 | 2,127 | 1 | 20,736 | **20,500** | 236 | **89.66%** | **98.86%** |
+| **Combined** | **47,717** | **7,949** | **39,768** | **3,535** | **468** | **35,765** | **35,188** | **577** | **88.48%** | **98.39%** |
 
 - **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,768 executed tests.
-- Building on M64 (`34,595` PASS, `972` FAIL), splitting `src/runtime/builtins.zig` into 12 submodules, fixing Array/Function/`%ThrowTypeError%`/Object/Proxy/RegExp/String spec semantics, and fixing parser `CoverInitializedName` in `for-in`/`for-of`/`for-await-of` + `super` property access in object methods & class method params unlocked **+402** net passes (`34,595 → 34,997`, **97.98%** Pass / Applicable, **88.00%** Pass / Executed, failures reduced `972 → 720`).
+- Building on M64 (`34,595` PASS, `972` FAIL), splitting `src/runtime/builtins.zig` into 12 submodules and landing conformance waves across Classes (`statements/class` `99.91%`, `expressions/class` `99.75%`), Promise (`98.89%`), `JSON.parse` (`100%`), `Error.prototype.stack`, `Number.prototype.{toFixed,toExponential,toPrecision}` exact decimal rounding, `TypedArray`/`DataView`, Array/Function/`%ThrowTypeError%`/Object/Proxy/RegExp/String, and parser `CoverInitializedName`/`super` unlocked **+593** net passes (`34,595 → 35,188`, **98.39%** Pass / Applicable, **88.48%** Pass / Executed, failures slashed **-40.6%** from `972 → 577`).
 
 ### Built-ins Breakdown (Applicable Tests)
 

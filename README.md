@@ -9,7 +9,7 @@ Designed for host-controlled scripting (games, plugins, tools, sandboxed automat
 - **Faster than QuickJS (`0.74×` geomean, 10 of 11 benchmarks faster):** Pure bytecode interpreter (no JIT / no RWX) with 8-byte NaN-boxed values, 64-byte frames, Shapes (hidden classes), inline caches, and fused superinstructions.
 - **Zero dependencies & compact footprint:** Pure Zig (`0.17.1`), `2.2 MB` stripped `ReleaseFast` CLI (`1.5 MB` `ReleaseSmall`). Embedders (`@import("zqjs")` / `libzqjs.a`) link only the engine.
 - **Modern JavaScript (ES2025 core):** Classes & private fields, closures, generators, `async`/`await`, ES Modules, `BigInt`, `Symbol`, `Proxy`/`Reflect`, `Map`/`Set`/`WeakMap`/`WeakSet`, `ArrayBuffer`/`TypedArray`/`DataView`, `RegExp`, `Date`, `Promise`, `JSON`, and `structuredClone` ([LANGUAGE.md](LANGUAGE.md)).
-- **Explicit Compatibility Contract & Test262 Verified:** Unsupported features report `Unsupported(<feature>)` cleanly instead of silently misbehaving. Verified against **39,768 Test262 tests** (**`34,997` PASS** — `89.29%` of all `language` tests, `86.26%` of `built-ins`, **`97.98%`** of applicable tests, **0 crashes / 0 internal errors / 0 timeouts** — [TEST262.md](TEST262.md)).
+- **Explicit Compatibility Contract & Test262 Verified:** Unsupported features report `Unsupported(<feature>)` cleanly instead of silently misbehaving. Verified against **39,768 Test262 tests** (**`35,188` PASS** — `89.66%` of all `language` tests, `86.89%` of `built-ins`, **`98.39%`** of applicable tests, **0 crashes / 0 internal errors / 0 timeouts** — [TEST262.md](TEST262.md)).
 - **Generational GC & Hard Sandboxing:** Non-moving generational GC (~0.06 ms p95 minor pauses at 100k–1M live objects), cooperative step slicing, and hard caps on heap, call depth, stack, strings, and `BigInt` ([GC_DESIGN.md](GC_DESIGN.md)).
 - **Embeddable & Interactive:** Opaque Zig API, C11 ABI (`include/zqjs.h`), differential tree-walker oracle (`--engine=treewalk`), and an interactive REPL with syntax highlighting, `Tab` completion, and `Ctrl-R` history.
 
@@ -171,7 +171,7 @@ zig build raylib-demo    # interactive GUI window (requires Raylib)
 
 - [EMBEDDING.md](EMBEDDING.md) — Zig & C11 embedding API (lifecycle, handles, step slices, modules, errors)
 - [LANGUAGE.md](LANGUAGE.md) — supported JavaScript subset and Node compatibility contract
-- [TEST262.md](TEST262.md) — ECMAScript Test262 conformance runner and results (39,768 executed tests, `34,997` PASS)
+- [TEST262.md](TEST262.md) — ECMAScript Test262 conformance runner and results (39,768 executed tests, `35,188` PASS)
 - [PERF_PLAN.md](PERF_PLAN.md) — performance architecture, M52–M65 progression (`0.74×` QuickJS geomean), and why JIT is deferred
 - [ARCHITECTURE.md](ARCHITECTURE.md) — module layout and ownership
 - [GC_DESIGN.md](GC_DESIGN.md) — generational collector, card tables, ephemerons, and verification

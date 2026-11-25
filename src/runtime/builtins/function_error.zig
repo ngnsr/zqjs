@@ -187,7 +187,7 @@ pub fn closureLength(c: *const heap_mod.Closure) u16 {
         .tree => |t| @as(*const ast.Function, @ptrCast(@alignCast(t.func))).length,
         .bound => |b| b.length,
         .promise_cap => 1,
-        .native_closure => 0,
+        .native_closure => |nc| nc.length,
     };
 }
 

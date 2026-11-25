@@ -158,7 +158,7 @@ pub const Closure = struct {
         /// Native Promise resolve/reject capability (M18).
         promise_cap: struct { promise: *Object, is_reject: bool },
         /// Native closure with a bound environment object (M19).
-        native_closure: struct { func: *const anyopaque, env: *Object },
+        native_closure: struct { func: *const anyopaque, env: *Object, length: u16 = 0 },
         /// Bound function created by `Function.prototype.bind` (M31, D62).
         bound: *BoundClosure,
     },
@@ -2730,10 +2730,14 @@ pub const Heap = struct {
     }
 
     pub fn newNativeClosure(h: *Heap, func: *const anyopaque, env: *Object) Error!*Closure {
+        return h.newNativeClosureWithLength(func, env, 0);
+    }
+
+    pub fn newNativeClosureWithLength(h: *Heap, func: *const anyopaque, env: *Object, length: u16) Error!*Closure {
         const charge = try h.reserve(@sizeOf(Closure), 0, 2);
         errdefer h.bytes -= charge;
         const c = try h.gpa.create(Closure);
-        c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .native_closure = .{ .func = func, .env = env } } };
+        c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .native_closure = .{ .func = func, .env = env, .length = length } } };
         h.young = &c.obj;
         return c;
     }

@@ -732,9 +732,17 @@ test "M18.1: Promise state, self-resolution, native adoption, queue fault preser
 
 test "M18.2: Promise.prototype.then/catch receivers, microtask limits, and OOM" {
     try expectUnsupported("let o = { then: Promise.resolve(1).then }; o.then(function () {});", "", "('then')");
-    try expectUnsupported("let o = { catch: Promise.resolve(1).catch }; o.catch(function () {});", "", "('catch')");
 
     for (support.engines) |engine| {
+        var r_catch = try support.run(
+            testing.allocator,
+            "let o = { catch: Promise.resolve(1).catch }; o.catch(function () {});",
+            .{},
+            engine,
+            .normal,
+        );
+        defer r_catch.deinit(testing.allocator);
+        try testing.expect(std.mem.indexOf(u8, r_catch.err, "TypeError") != null);
         var r_steps = try support.run(
             testing.allocator,
             "Promise.resolve(1).then(function () { let s = 0; for (let i = 0; i < 100; i++) s += i; return s; });",

@@ -1675,17 +1675,17 @@ fn taToLocaleString(rt: *Runtime, this: Value, args: []const Value) Error!Value 
 
 fn taKeys(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     _ = try requireLiveTypedArray(rt, this);
-    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).iterator_prototype, this, .array_keys));
+    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).array_iterator_prototype, this, .array_keys));
 }
 
 fn taValues(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     _ = try requireLiveTypedArray(rt, this);
-    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).iterator_prototype, this, .array_values));
+    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).array_iterator_prototype, this, .array_values));
 }
 
 fn taEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     _ = try requireLiveTypedArray(rt, this);
-    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).iterator_prototype, this, .array_entries));
+    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).array_iterator_prototype, this, .array_entries));
 }
 
 fn taForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {

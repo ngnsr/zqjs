@@ -440,17 +440,17 @@ fn arrayToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 
 fn arrayKeys(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     if (this.isUndefined() or this.isNull()) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
-    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).iterator_prototype, this, .array_keys));
+    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).array_iterator_prototype, this, .array_keys));
 }
 
 fn arrayValues(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     if (this.isUndefined() or this.isNull()) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
-    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).iterator_prototype, this, .array_values));
+    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).array_iterator_prototype, this, .array_values));
 }
 
 fn arrayEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     if (this.isUndefined() or this.isNull()) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
-    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).iterator_prototype, this, .array_entries));
+    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).array_iterator_prototype, this, .array_entries));
 }
 
 fn arrayForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {

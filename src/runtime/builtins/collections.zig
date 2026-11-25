@@ -181,17 +181,17 @@ fn mapClear(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 
 fn mapKeys(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     _ = try thisMap(rt, this, "keys");
-    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).iterator_prototype, this, .map_keys));
+    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).map_iterator_prototype, this, .map_keys));
 }
 
 fn mapValues(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     _ = try thisMap(rt, this, "values");
-    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).iterator_prototype, this, .map_values));
+    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).map_iterator_prototype, this, .map_values));
 }
 
 fn mapEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     _ = try thisMap(rt, this, "entries");
-    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).iterator_prototype, this, .map_entries));
+    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).map_iterator_prototype, this, .map_entries));
 }
 
 fn mapForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -358,12 +358,12 @@ fn setClear(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 
 fn setValues(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     _ = try thisSet(rt, this, "values");
-    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).iterator_prototype, this, .set_values));
+    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).set_iterator_prototype, this, .set_values));
 }
 
 fn setEntries(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     _ = try thisSet(rt, this, "entries");
-    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).iterator_prototype, this, .set_entries));
+    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).set_iterator_prototype, this, .set_entries));
 }
 
 fn setForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {

@@ -407,39 +407,74 @@ const Parser = struct {
 
 // ------------------------------------------------------------ JSON.stringify (M15.2)
 
+const StringListRoot = struct {
+    list: *const std.ArrayList(*const heap_mod.String),
+
+    fn mark(ctx: *anyopaque, h: *heap_mod.Heap) void {
+        const self: *StringListRoot = @ptrCast(@alignCast(ctx));
+        for (self.list.items) |str| h.markObj(@constCast(&str.obj));
+    }
+};
+
 fn jsonStringify(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const val = if (args.len > 0) args[0] else Value.undefined;
     var replacer_fn: ?Value = null;
     var prop_list: std.ArrayList(*const heap_mod.String) = .empty;
     defer prop_list.deinit(rt.gpa);
 
-    var root_buf = [_]Value{ val, if (args.len >= 2) args[1] else .undefined, if (args.len >= 3) args[2] else .undefined };
+    var root_buf = [_]Value{ val, if (args.len >= 2) args[1] else .undefined, if (args.len >= 3) args[2] else .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
+    var prop_list_root: StringListRoot = .{ .list = &prop_list };
+    try rt.addRoots(.{ .ctx = &prop_list_root, .mark = StringListRoot.mark });
+    defer rt.removeRoots(&prop_list_root);
+
+    var use_prop_list = false;
     if (args.len >= 2) {
         if (args[1].isFunction()) {
             replacer_fn = args[1];
-        } else if (args[1].isObject() and args[1].asObject().kind == .array) {
-            for (args[1].asObject().kind.array.items) |item| {
-                if (item.isHole()) continue;
-                const cand: *const heap_mod.String = switch (item.unpack()) {
+        } else if (try isArrayVal(rt, args[1])) {
+            use_prop_list = true;
+            const replacer = args[1];
+            const len_val = try object.get(rt, replacer, try object.named(rt, "length"));
+            const len_f = try common.toLength(rt, len_val);
+            const len: u64 = @intFromFloat(len_f);
+            var k: u64 = 0;
+            while (k < len) : (k += 1) {
+                const elem_key: object.Key = if (k <= std.math.maxInt(u32) - 1)
+                    .{ .index = @intCast(k) }
+                else blk: {
+                    var idx_buf: [24]u8 = undefined;
+                    const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{k}) catch unreachable;
+                    break :blk .{ .atom = try rt.heap.internAscii(idx_str) };
+                };
+                const item = try object.get(rt, replacer, elem_key);
+                root_buf[3] = item;
+                const cand: ?*const heap_mod.String = switch (item.unpack()) {
                     .string => |s| s,
                     .number => |n| blk: {
                         var buf: ops.NumberBuf = undefined;
                         break :blk try rt.heap.ascii(ops.formatNumber(&buf, n));
                     },
-                    else => continue,
+                    .object => |o| if (o.kind == .primitive_wrapper and (o.kind.primitive_wrapper.isString() or o.kind.primitive_wrapper.isNumber()))
+                        (try ops.toStringValue(rt, item)).asString()
+                    else
+                        null,
+                    else => null,
                 };
-                var dup = false;
-                for (prop_list.items) |existing| {
-                    if (std.mem.eql(u16, existing.units, cand.units)) {
-                        dup = true;
-                        break;
+                root_buf[3] = .undefined;
+                if (cand) |c| {
+                    var dup = false;
+                    for (prop_list.items) |existing| {
+                        if (std.mem.eql(u16, existing.units, c.units)) {
+                            dup = true;
+                            break;
+                        }
                     }
+                    if (!dup) try prop_list.append(rt.gpa, c);
                 }
-                if (!dup) try prop_list.append(rt.gpa, cand);
             }
         }
     }
@@ -475,7 +510,6 @@ fn jsonStringify(rt: *Runtime, _: Value, args: []const Value) Error!Value {
         }
     }
 
-    const use_prop_list = args.len >= 2 and args[1].isObject() and args[1].asObject().kind == .array;
     return (try stringifyWithOptions(rt, val, replacer_fn, if (use_prop_list) prop_list.items else null, gap_buf[0..gap_len])) orelse Value.undefined;
 }
 
@@ -761,11 +795,6 @@ const Stringifier = struct {
 
             for (keys) |k| {
                 if (k == .symbol) continue;
-                if (obj.kind != .proxy) {
-                    if (try object.ownProp(s.rt, obj, k)) |p| {
-                        if (!p.enumerable) continue;
-                    } else continue;
-                }
                 const key_val: Value = switch (k) {
                     .atom => |a| Value.fromString(a),
                     .index => |i| blk: {

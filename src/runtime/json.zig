@@ -11,6 +11,8 @@ const Error = rt_mod.Error;
 const ops = @import("ops.zig");
 const object = @import("object.zig");
 const builtins = @import("builtins.zig");
+const common = @import("builtins/common.zig");
+const obj_builtins = @import("builtins/object.zig");
 
 pub const parse_native: Native = .{ .name = "parse", .length = 2, .call = jsonParse };
 pub const stringify_native: Native = .{ .name = "stringify", .length = 3, .call = jsonStringify };
@@ -48,6 +50,36 @@ const KeySliceRoot = struct {
     }
 };
 
+fn isArrayVal(rt: *Runtime, val: Value) Error!bool {
+    var cur = val;
+    while (cur.isObject()) {
+        const o = cur.asObject();
+        if (o.kind == .array) return true;
+        if (o.kind == .proxy) {
+            if (o.kind.proxy.handler == null) {
+                return rt.throw(.TypeError, &.{.{ .ascii = "Cannot perform 'IsArray' on a proxy that has been revoked" }});
+            }
+            cur = o.kind.proxy.target orelse return false;
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+fn createDataProperty(rt: *Runtime, target: Value, k: object.Key, v: Value) Error!void {
+    _ = try obj_builtins.defineOwnPropertyParsed(rt, target, k, .{
+        .has_val = true,
+        .val = v,
+        .has_writ = true,
+        .writ_val = true,
+        .has_enum = true,
+        .enum_val = true,
+        .has_conf = true,
+        .conf_val = true,
+    }, false);
+}
+
 fn internalizeJSONProperty(
     rt: *Runtime,
     holder: *Object,
@@ -65,21 +97,27 @@ fn internalizeJSONProperty(
 
     if (val.isObject()) {
         const val_obj = val.asObject();
-        if (val_obj.kind == .array) {
-            const len = val_obj.kind.array.items.len;
-            for (0..len) |i| {
-                var idx_buf: [20]u8 = undefined;
+        if (try isArrayVal(rt, val)) {
+            const len_val = try object.get(rt, val, try object.named(rt, "length"));
+            const len_f = try common.toLength(rt, len_val);
+            const len: u64 = @intFromFloat(len_f);
+            var i: u64 = 0;
+            while (i < len) : (i += 1) {
+                var idx_buf: [24]u8 = undefined;
                 const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{i}) catch unreachable;
                 const prop_str = try rt.heap.ascii(idx_str);
                 const prop_val: Value = Value.fromString(prop_str);
                 root_buf[4] = prop_val;
-                const elem_key = object.Key{ .index = @intCast(i) };
+                const elem_key: object.Key = if (i <= std.math.maxInt(u32) - 1)
+                    .{ .index = @intCast(i) }
+                else
+                    .{ .atom = try rt.heap.internAscii(idx_str) };
                 const new_elem = try internalizeJSONProperty(rt, val_obj, elem_key, prop_val, reviver, depth + 1);
                 root_buf[5] = new_elem;
                 if (new_elem.isUndefined()) {
-                    _ = try object.delete(rt, Value.fromObject(val_obj), elem_key);
+                    _ = try object.delete(rt, val, elem_key);
                 } else {
-                    try object.set(rt, Value.fromObject(val_obj), elem_key, new_elem);
+                    try createDataProperty(rt, val, elem_key, new_elem);
                 }
                 root_buf[4] = .undefined;
                 root_buf[5] = .undefined;
@@ -93,9 +131,6 @@ fn internalizeJSONProperty(
 
             for (keys) |k| {
                 if (k == .symbol) continue;
-                if (try object.ownProp(rt, val_obj, k)) |p| {
-                    if (!p.enumerable) continue;
-                } else continue;
                 const prop_str = switch (k) {
                     .atom => |a| a,
                     .index => |i| blk: {
@@ -110,9 +145,9 @@ fn internalizeJSONProperty(
                 const new_elem = try internalizeJSONProperty(rt, val_obj, k, prop_val, reviver, depth + 1);
                 root_buf[5] = new_elem;
                 if (new_elem.isUndefined()) {
-                    _ = try object.delete(rt, Value.fromObject(val_obj), k);
+                    _ = try object.delete(rt, val, k);
                 } else {
-                    try object.define(rt, val_obj, k, new_elem);
+                    try createDataProperty(rt, val, k, new_elem);
                 }
                 root_buf[4] = .undefined;
                 root_buf[5] = .undefined;

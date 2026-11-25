@@ -1,0 +1,11 @@
+err stack type: string
+err stack set: custom-stack
+take MAX_SAFE: 10,20
+revived objProxy: true
+revived arrProxy skips non-index: false
+revived revoked proxy: TypeError
+reviver bad length: RangeError
+reviver array define err: RangeError
+reviver array delete err: RangeError
+reviver proto prop: 1 3 true
+reviver non-conf: 1 2

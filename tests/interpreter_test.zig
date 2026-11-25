@@ -1228,3 +1228,50 @@ test "M31: checkAllAllocationFailures over functions as objects, constructors, c
         try testing.expectEqual(@as(usize, 0), sa.deinit());
     }
 }
+
+test "Test262: Error.prototype.stack accessor and Iterator drop/take MAX_SAFE_INTEGER limit (both engines)" {
+    const src =
+        \\function errName(fn) {
+        \\    try { fn(); return "ok"; } catch (e) { return e.name; }
+        \\}
+        \\const d = Object.getOwnPropertyDescriptor(Error.prototype, "stack");
+        \\print("desc:", typeof d.get, typeof d.set, d.get.name, d.get.length, d.set.name, d.set.length, d.enumerable, d.configurable);
+        \\print("get prim:", errName(() => d.get.call(null)), errName(() => d.get.call(1)));
+        \\print("get non-err:", d.get.call({}), d.get.call(new Proxy(new Error("x"), {})));
+        \\print("get err:", typeof d.get.call(new Error("x")));
+        \\print("set prim:", errName(() => d.set.call(null, "a")), errName(() => d.set.call({}, 123)));
+        \\print("set proto:", errName(() => d.set.call(Error.prototype, "a")));
+        \\const plain = {};
+        \\d.set.call(plain, "custom");
+        \\const pd = Object.getOwnPropertyDescriptor(plain, "stack");
+        \\print("set plain:", pd.value, pd.writable, pd.enumerable, pd.configurable);
+        \\const rejDef = new Proxy({}, { defineProperty() { return false; } });
+        \\const rejSet = new Proxy({ stack: "a" }, { set() { return false; } });
+        \\print("set proxy rej:", errName(() => d.set.call(rejDef, "b")), errName(() => d.set.call(rejSet, "b")));
+        \\let dropClosed = 0;
+        \\const dropIter = { next() { return { done: true, value: undefined }; }, return() { dropClosed++; return {}; } };
+        \\print("drop:", errName(() => Iterator.prototype.drop.call(dropIter, Number.MAX_SAFE_INTEGER + 1)), dropClosed);
+        \\let takeClosed = 0;
+        \\const takeIter = { next() { return { done: true, value: undefined }; }, return() { takeClosed++; return {}; } };
+        \\print("take:", errName(() => Iterator.prototype.take.call(takeIter, Number.MAX_SAFE_INTEGER + 1)), takeClosed);
+    ;
+    const expected =
+        \\desc: function function get stack 0 set stack 1 false true
+        \\get prim: TypeError TypeError
+        \\get non-err: undefined undefined
+        \\get err: string
+        \\set prim: TypeError TypeError
+        \\set proto: TypeError
+        \\set plain: custom true true true
+        \\set proxy rej: TypeError TypeError
+        \\drop: RangeError 1
+        \\take: RangeError 1
+        \\
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("", r.err);
+        try testing.expectEqualStrings(expected, r.out);
+    }
+}

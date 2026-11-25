@@ -15,6 +15,7 @@ const bytecode = @import("../../bytecode/bytecode.zig");
 const builtins = @import("../builtins.zig");
 const common = @import("common.zig");
 const iterator = @import("iterator.zig");
+const obj_builtins = @import("object.zig");
 
 pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
     try initErrorProto(rt, r.error_prototype, r.error_namespace, "Error", &builtins.error_global);
@@ -27,6 +28,8 @@ pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
         .configurable = true,
     });
     try common.method(rt, r.error_prototype, "toString", &error_to_string);
+    try object.defineAccessor(rt, Value.fromObject(r.error_prototype), try object.named(rt, "stack"), Value.fromNative(&error_stack_get), false, false);
+    try object.defineAccessor(rt, Value.fromObject(r.error_prototype), try object.named(rt, "stack"), Value.fromNative(&error_stack_set), true, false);
     try initErrorProto(rt, r.type_error_prototype, r.type_error_namespace, "TypeError", &builtins.type_error_global);
     try initErrorProto(rt, r.range_error_prototype, r.range_error_namespace, "RangeError", &builtins.range_error_global);
     try initErrorProto(rt, r.syntax_error_prototype, r.syntax_error_namespace, "SyntaxError", &builtins.syntax_error_global);
@@ -448,6 +451,56 @@ fn errorIsError(_: *Runtime, _: Value, args: []const Value) Error!Value {
 }
 
 const error_to_string: Native = .{ .name = "toString", .call = errorToString };
+
+const error_stack_get: Native = .{ .name = "get stack", .length = 0, .call = errorStackGet };
+
+const error_stack_set: Native = .{ .name = "set stack", .length = 1, .call = errorStackSet };
+
+fn errorStackGet(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    if (!this.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Error.prototype.stack getter called on non-object" }});
+    }
+    if (!this.isObject() or this.asObject().ordinary_tag != .@"error") {
+        return .undefined;
+    }
+    return Value.fromString(try rt.heap.ascii(""));
+}
+
+fn errorStackSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    if (!this.isObjectLike()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Error.prototype.stack setter called on non-object" }});
+    }
+    const v = common.arg(args, 0);
+    if (!v.isString()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Error.prototype.stack value must be a string" }});
+    }
+    const r = try builtins.realm(rt);
+    if (this.isObject() and this.asObject() == r.error_prototype) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot set stack on Error.prototype" }});
+    }
+    var root_buf = [_]Value{ this, v };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const k = try object.named(rt, "stack");
+    const desc = try obj_builtins.getOwnPropertyRaw(rt, this, k);
+    if (desc == null) {
+        _ = try obj_builtins.defineOwnPropertyParsed(rt, this, k, .{
+            .has_val = true,
+            .val = v,
+            .has_writ = true,
+            .writ_val = true,
+            .has_enum = true,
+            .enum_val = true,
+            .has_conf = true,
+            .conf_val = true,
+        }, true);
+    } else {
+        try object.setStrict(rt, this, k, v);
+    }
+    return .undefined;
+}
 
 fn initErrorProto(rt: *Runtime, proto: *Object, ns: *Object, name_ascii: []const u8, ctor: *const Native) Error!void {
     try common.immutableConstant(rt, ns, "prototype", Value.fromObject(proto));

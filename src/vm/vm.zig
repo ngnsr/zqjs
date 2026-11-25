@@ -1714,21 +1714,11 @@ pub const Vm = struct {
                     // result, and the call ends here — no caller frame to unwind to.
                     if (vm.nested and vm.frames.items.len == 1) {
                         const ret_v = try cache.peek(vm, 0);
-                        const f = vm.frame();
                         cache.syncSp(vm);
-                        if (f.is_construct and f.proto.has_super_ctor) {
-                            cache.pc = @intCast(f.proto.code.len);
-                            cache.syncSp(vm);
-                            vm.nested_result = if (ret_v.isObjectLike())
-                                ret_v
-                            else if (ret_v.isUndefined())
-                                f.thisVal() orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }})
-                            else
-                                return rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
-                        } else {
-                            vm.nested_result = if (f.is_construct and !ret_v.isObjectLike()) f.thisVal().? else ret_v;
-                        }
-                        vm.halted = true;
+                        vm.returnNested(ret_v) catch |e| {
+                            cache.pc = vm.pc;
+                            return e;
+                        };
                         state_out.* = .halted;
                         return;
                     }
@@ -1748,7 +1738,11 @@ pub const Vm = struct {
                     return;
                 }
                 cache.syncSp(vm);
-                try vm.returnConstruct(cache, ret_v);
+                vm.returnConstruct(ret_v) catch |e| {
+                    cache.* = FrameCache.fromVm(vm, vm.pc);
+                    return e;
+                };
+                cache.* = FrameCache.fromVm(vm, vm.pc);
                 return;
             },
             .halt => {
@@ -2551,16 +2545,35 @@ pub const Vm = struct {
         return true;
     }
 
-    /// Outlined return path for constructor / `super()` frames (keeps `.@"return"` tiny in `runLoop`).
-    noinline fn returnConstruct(vm: *Vm, cache: *FrameCache, ret_v: Value) Error!void {
+    /// Outlined return path for nested call frames (keeps `.@"return"` tiny in `runLoop`).
+    noinline fn returnNested(vm: *Vm, ret_v: Value) Error!void {
+        @branchHint(.cold);
+        const rt = vm.rt;
+        const f = vm.frame();
+        if (f.is_construct and f.proto.has_super_ctor) {
+            vm.pc = @intCast(f.proto.code.len);
+            vm.nested_result = if (ret_v.isObjectLike())
+                ret_v
+            else if (ret_v.isUndefined())
+                f.thisVal() orelse return rt.throw(.ReferenceError, &.{.{ .ascii = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor" }})
+            else
+                return rt.throw(.TypeError, &.{.{ .ascii = "Derived constructors may only return object or undefined" }});
+        } else {
+            vm.nested_result = if (f.is_construct and !ret_v.isObjectLike()) f.thisVal().? else ret_v;
+        }
+        vm.halted = true;
+    }
+
+    /// Outlined return path for constructor / `super()` frames (keeps `.@"return"` tiny in `runLoop`,
+    /// without taking `*FrameCache` so LLVM keeps `FrameCache` promoted to registers).
+    noinline fn returnConstruct(vm: *Vm, ret_v: Value) Error!void {
         @branchHint(.cold);
         const rt = vm.rt;
         const f = vm.frames.pop().?;
         vm.locals_len = f.locals_base;
         vm.reserved -= f.proto.slot_count + f.proto.max_stack;
         vm.sp = f.result_index;
-        cache.* = FrameCache.fromVm(vm, f.return_pc - 1);
-        cache.syncSp(vm);
+        vm.pc = f.return_pc - 1;
         const v: Value = if (f.proto.has_super_ctor) blk: {
             if (ret_v.isObjectLike()) break :blk ret_v;
             if (ret_v.isUndefined()) {
@@ -2582,15 +2595,13 @@ pub const Vm = struct {
             }
         }
         vm.stack[f.result_index] = v;
-        cache.sp = f.result_index + 1;
-        cache.syncSp(vm);
+        vm.sp = f.result_index + 1;
         if (f.is_super_call) {
             if (vm.frames.items[vm.frames.items.len - 1].closure) |dc| {
                 try builtins.runInstanceInits(rt, @constCast(dc), v);
             }
         }
-        cache.pc = f.return_pc;
-        cache.syncSp(vm);
+        vm.pc = f.return_pc;
     }
 
     noinline fn coerceThisSlow(vm: *Vm, t: Value) Error!Value {

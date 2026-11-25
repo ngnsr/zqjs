@@ -411,7 +411,10 @@ fn regexpExecImpl(rt: *Runtime, rx_obj: *Object, s: *const heap_mod.String) Erro
 }
 
 fn regexpExec(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const rx_obj = try thisRegExp(rt, this, "exec");
+    if (!this.isObject() or this.asObject().kind != .regexp) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype.exec called on incompatible receiver" }});
+    }
+    const rx_obj = this.asObject();
     var root_buf = [_]Value{ Value.fromObject(rx_obj), common.arg(args, 0) };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
@@ -422,7 +425,10 @@ fn regexpExec(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn regexpTest(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const rx_obj = try thisRegExp(rt, this, "test");
+    if (!this.isObject() or this.asObject().kind != .regexp) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype.test called on incompatible receiver" }});
+    }
+    const rx_obj = this.asObject();
     var root_buf = [_]Value{ Value.fromObject(rx_obj), common.arg(args, 0), .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);

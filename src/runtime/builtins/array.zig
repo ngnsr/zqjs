@@ -1127,7 +1127,13 @@ fn arrayUnshift(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn arraySplice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const a = try thisArray(rt, this, "splice");
+    if (this.isUndefined() or this.isNull()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot convert undefined or null to object" }});
+    }
+    if (!this.isObject() or this.asObject().kind != .array) {
+        return common.unsupportedReceiver(rt, "splice");
+    }
+    const a = this.asObject();
     const len = a.kind.array.items.len;
     const actual_start: usize = if (args.len == 0) 0 else common.resolveRelativeIndex(try common.toIntegerOrInfinity(rt, args[0]), len);
     const actual_delete: usize = if (args.len == 0)

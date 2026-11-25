@@ -1391,7 +1391,9 @@ fn generatorThrow(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn iteratorNext(rt: *Runtime, this: Value, _: []const Value) Error!Value {
-    if (!this.isObject() or this.asObject().kind != .iterator) return common.unsupportedReceiver(rt, "next");
+    if (!this.isObject() or this.asObject().kind != .iterator) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Iterator.prototype.next called on incompatible receiver" }});
+    }
     const r = try builtins.realm(rt);
     const next_v = try iteratorNextVal(rt, this.asObject());
     const out = try rt.heap.newObject(r.object_prototype);

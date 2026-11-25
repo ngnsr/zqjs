@@ -1,0 +1,3 @@
+iter_non_own_slot_typeerror: true
+regexp_proto_exec_test_typeerror: true true
+array_splice_null_typeerror: true

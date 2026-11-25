@@ -173,6 +173,8 @@ pub const Env = struct {
     values: []?Value,
 };
 
+pub const inline_string_cap = 16;
+
 pub const String = struct {
     obj: Obj,
     /// UTF-16 code units, possibly with lone surrogates. Immutable.
@@ -183,6 +185,8 @@ pub const String = struct {
         /// a canonical numeric string ≤ 2^32 − 2 (D13).
         index: ?u32,
     } = null,
+    /// Inline storage for short strings (len <= inline_string_cap) to avoid a second heap allocation.
+    inline_buf: [inline_string_cap]u16 = undefined,
 };
 
 pub const Symbol = struct {
@@ -919,6 +923,9 @@ pub const Heap = struct {
     shapes: ?*Shape = null,
     free_shapes: ?*Shape = null,
     shape_slabs: std.ArrayList(*[64]Shape) = .empty,
+    /// Slab pool and intrusive freelist (via `Obj.next`) for `String` allocations.
+    free_strings: ?*Obj = null,
+    string_slabs: std.ArrayList(*[64]String) = .empty,
     next_shape_id: u32 = 0,
     next_dict_version: u32 = 0,
     /// `allocator()` refused an allocation because of the heap limit (see `failed`).
@@ -1564,6 +1571,8 @@ pub const Heap = struct {
         if (h.root_shape) |r| r.extra_transitions.deinit(h.gpa);
         for (h.shape_slabs.items) |slab| h.gpa.destroy(slab);
         h.shape_slabs.deinit(h.gpa);
+        for (h.string_slabs.items) |slab| h.gpa.destroy(slab);
+        h.string_slabs.deinit(h.gpa);
         h.* = undefined;
     }
 
@@ -2869,7 +2878,7 @@ pub const Heap = struct {
         switch (obj.kind) {
             .string => {
                 const s: *String = @fieldParentPtr("obj", obj);
-                h.gpa.free(s.units);
+                if (s.units.ptr != &s.inline_buf) h.gpa.free(s.units);
                 s.units = &poison_units;
                 s.atom = null;
             },
@@ -2959,7 +2968,10 @@ pub const Heap = struct {
 
     fn freeStruct(h: *Heap, obj: *Obj, kind: Obj.Kind) void {
         switch (kind) {
-            .string => h.gpa.destroy(@as(*String, @fieldParentPtr("obj", obj))),
+            .string => {
+                obj.next = h.free_strings;
+                h.free_strings = obj;
+            },
             .symbol => h.gpa.destroy(@as(*Symbol, @fieldParentPtr("obj", obj))),
             .bigint => h.gpa.destroy(@as(*BigInt, @fieldParentPtr("obj", obj))),
             .cell => h.gpa.destroy(@as(*Cell, @fieldParentPtr("obj", obj))),
@@ -2982,6 +2994,22 @@ pub const Heap = struct {
         return o;
     }
 
+    fn allocString(h: *Heap) Error!*String {
+        if (h.free_strings) |node| {
+            h.free_strings = node.next;
+            return @fieldParentPtr("obj", node);
+        }
+        const slab = try h.gpa.create([64]String);
+        errdefer h.gpa.destroy(slab);
+        try h.string_slabs.append(h.gpa, slab);
+        var i: usize = 63;
+        while (i >= 1) : (i -= 1) {
+            slab[i].obj.next = h.free_strings;
+            h.free_strings = &slab[i].obj;
+        }
+        return &slab[0];
+    }
+
     /// A new string made of the concatenation of `pieces`.
     pub fn newString(h: *Heap, pieces: []const Piece) Error!*String {
         var len: usize = 0;
@@ -2991,6 +3019,26 @@ pub const Heap = struct {
         const payload = std.math.mul(usize, len, @sizeOf(u16)) catch return h.exceeded(.heap_bytes);
         const charge = try h.reserve(@sizeOf(String), payload, 2);
         errdefer h.bytes -= charge;
+
+        if (len <= inline_string_cap) {
+            const s = try h.allocString();
+            s.obj = h.newHeader(.string);
+            s.atom = null;
+            var i: usize = 0;
+            for (pieces) |p| switch (p) {
+                .utf16 => |u| {
+                    @memcpy(s.inline_buf[i..][0..u.len], u);
+                    i += u.len;
+                },
+                .ascii => |a| for (a) |c| {
+                    s.inline_buf[i] = c;
+                    i += 1;
+                },
+            };
+            s.units = s.inline_buf[0..len];
+            h.young = &s.obj;
+            return s;
+        }
 
         const units = try h.gpa.alloc(u16, len);
         errdefer h.gpa.free(units);
@@ -3006,8 +3054,10 @@ pub const Heap = struct {
             },
         };
 
-        const s = try h.gpa.create(String);
-        s.* = .{ .obj = h.newHeader(.string), .units = units };
+        const s = try h.allocString();
+        s.obj = h.newHeader(.string);
+        s.units = units;
+        s.atom = null;
         h.young = &s.obj;
         return s;
     }

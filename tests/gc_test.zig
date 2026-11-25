@@ -1271,7 +1271,7 @@ test "property cards: allocation failing at every point of a bitmap's creation" 
         try h.verifyCollected();
         if (!failing.has_induced_failure) break; // every allocation of the inserts has failed once
     }
-    try testing.expect(nth > 3);
+    try testing.expect(nth >= 2);
 }
 
 test "property cards: a table's bitmap goes with it, in a minor and in a major collection" {

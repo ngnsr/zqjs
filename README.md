@@ -69,7 +69,21 @@ See [LANGUAGE.md](LANGUAGE.md) for the complete specification and [TEST262.md](T
 
 ---
 
-## Requirements
+## Install
+
+Prebuilt CLI binaries and C embedding archives (`libzqjs.a` / `zqjs.lib` + `include/zqjs.h`) are published on [GitHub Releases](https://github.com/ngnsr/zqjs/releases) for macOS (`arm64`, `x86_64`), Linux (`x86_64`, `arm64` static), Windows (`x86_64`), and `wasm32-wasi`.
+
+```sh
+# macOS / Linux (verifies SHA-256, installs to ~/.local/bin)
+curl -fsSL https://raw.githubusercontent.com/ngnsr/zqjs/main/install.sh | sh
+
+# Optional: pin a version or custom directory
+curl -fsSL https://raw.githubusercontent.com/ngnsr/zqjs/main/install.sh | ZQJS_VERSION=v0.2.0 ZQJS_INSTALL=/usr/local/bin sh
+```
+
+## Build from Source
+
+### Requirements
 
 - **Zig `0.17.1` exactly** (enforced by `build.zig`; see `DESIGN_DECISIONS.md` D17).
 - **Optional (dev/golden checks only):** Node `26.x` and Python 3 (stdlib only) for `zig build check-goldens`, `tools/bench_compare.py`, and `tools/test262.py`. Not required to build, embed, or run `zig build test`.

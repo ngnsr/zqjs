@@ -32,6 +32,7 @@ const Error = rt_mod.Error;
 const ops = @import("../runtime/ops.zig");
 const object = @import("../runtime/object.zig");
 const builtins = @import("../runtime/builtins.zig");
+const proxy_reflect = @import("../runtime/builtins/proxy_reflect.zig");
 const bigint = @import("../runtime/bigint.zig");
 const coroutine = @import("../runtime/coroutine.zig");
 const module = @import("../runtime/module.zig");
@@ -313,11 +314,11 @@ const Task = union(enum) {
     member_base: struct { key: ast.PropertyKey, is_delete: bool, is_private: bool = false, private_ref: u32 = 0 },
     member_finish: struct { named: ?[]const u8, is_delete: bool, is_private: bool = false },
     private_in_finish: struct { name: []const u8, private_ref: u32 },
-    opt_after_base: struct { oc: ast.OptionalChain, is_delete: bool },
-    opt_after_member_key: struct { oc: ast.OptionalChain, named: ?[]const u8, is_delete: bool },
-    opt_step: struct { oc: ast.OptionalChain, idx: usize, is_delete: bool },
-    opt_elem_finish: struct { oc: ast.OptionalChain, idx: usize, is_delete: bool },
-    opt_call_finish: struct { oc: ast.OptionalChain, idx: usize, is_delete: bool, args_base: usize },
+    opt_after_base: struct { oc: ast.OptionalChain, is_delete: bool, keep_receiver: bool = false },
+    opt_after_member_key: struct { oc: ast.OptionalChain, named: ?[]const u8, is_delete: bool, keep_receiver: bool = false },
+    opt_step: struct { oc: ast.OptionalChain, idx: usize, is_delete: bool, keep_receiver: bool = false },
+    opt_elem_finish: struct { oc: ast.OptionalChain, idx: usize, is_delete: bool, keep_receiver: bool = false },
+    opt_call_finish: struct { oc: ast.OptionalChain, idx: usize, is_delete: bool, keep_receiver: bool = false, args_base: usize },
     array_next: struct { items: []const *const ast.Expr, idx: usize },
     array_elem_push,
     array_spread_push,
@@ -1855,9 +1856,9 @@ const Machine = struct {
             .opt_after_base => |oa| {
                 const mem = oa.oc.base.data.member;
                 switch (mem.key) {
-                    .name => |n| try m.pushTask(.{ .opt_after_member_key = .{ .oc = oa.oc, .named = n, .is_delete = oa.is_delete } }),
+                    .name => |n| try m.pushTask(.{ .opt_after_member_key = .{ .oc = oa.oc, .named = n, .is_delete = oa.is_delete, .keep_receiver = oa.keep_receiver } }),
                     .computed => |e| {
-                        try m.pushTask(.{ .opt_after_member_key = .{ .oc = oa.oc, .named = null, .is_delete = oa.is_delete } });
+                        try m.pushTask(.{ .opt_after_member_key = .{ .oc = oa.oc, .named = null, .is_delete = oa.is_delete, .keep_receiver = oa.keep_receiver } });
                         try m.pushTask(.{ .eval = e });
                     },
                     .string, .number => unreachable,
@@ -1868,11 +1869,12 @@ const Machine = struct {
                 const base = m.values.items[m.values.items.len - 1]; // stays as receiver
                 const val = try object.get(rt, base, try m.toKey(kv));
                 try m.pushVal(val);
-                try m.pushTask(.{ .opt_step = .{ .oc = oa.oc, .idx = 0, .is_delete = oa.is_delete } });
+                try m.pushTask(.{ .opt_step = .{ .oc = oa.oc, .idx = 0, .is_delete = oa.is_delete, .keep_receiver = oa.keep_receiver } });
             },
             .opt_step => |os| {
                 // Top of values: [..., receiver, val]
                 if (os.idx >= os.oc.steps.len) {
+                    if (os.keep_receiver) return;
                     const val = m.popVal();
                     _ = m.popVal(); // receiver
                     try m.pushVal(val);
@@ -1881,6 +1883,12 @@ const Machine = struct {
                 const step = os.oc.steps[os.idx];
                 const val = m.values.items[m.values.items.len - 1];
                 if (step.optional and val.isNullish()) {
+                    if (os.keep_receiver) {
+                        const vals = m.values.items;
+                        vals[vals.len - 2] = .undefined;
+                        vals[vals.len - 1] = .undefined;
+                        return;
+                    }
                     _ = m.popVal(); // val
                     _ = m.popVal(); // receiver
                     try m.pushVal(if (os.is_delete) Value.fromBool(true) else .undefined);
@@ -1899,7 +1907,7 @@ const Machine = struct {
                         const vals = m.values.items;
                         vals[vals.len - 2] = val; // receiver = val
                         vals[vals.len - 1] = next_val;
-                        try m.pushTask(.{ .opt_step = .{ .oc = os.oc, .idx = os.idx + 1, .is_delete = os.is_delete } });
+                        try m.pushTask(.{ .opt_step = .{ .oc = os.oc, .idx = os.idx + 1, .is_delete = os.is_delete, .keep_receiver = os.keep_receiver } });
                     },
                     .private_prop => |pp| {
                         const brand = try m.resolvePrivateBrand(pp.private_ref);
@@ -1907,15 +1915,15 @@ const Machine = struct {
                         const vals = m.values.items;
                         vals[vals.len - 2] = val; // receiver = val
                         vals[vals.len - 1] = next_val;
-                        try m.pushTask(.{ .opt_step = .{ .oc = os.oc, .idx = os.idx + 1, .is_delete = os.is_delete } });
+                        try m.pushTask(.{ .opt_step = .{ .oc = os.oc, .idx = os.idx + 1, .is_delete = os.is_delete, .keep_receiver = os.keep_receiver } });
                     },
                     .elem => |e| {
-                        try m.pushTask(.{ .opt_elem_finish = .{ .oc = os.oc, .idx = os.idx, .is_delete = os.is_delete } });
+                        try m.pushTask(.{ .opt_elem_finish = .{ .oc = os.oc, .idx = os.idx, .is_delete = os.is_delete, .keep_receiver = os.keep_receiver } });
                         try m.pushTask(.{ .eval = e });
                     },
                     .call => |args| {
                         const args_base = m.values.items.len;
-                        try m.pushTask(.{ .opt_call_finish = .{ .oc = os.oc, .idx = os.idx, .is_delete = os.is_delete, .args_base = args_base } });
+                        try m.pushTask(.{ .opt_call_finish = .{ .oc = os.oc, .idx = os.idx, .is_delete = os.is_delete, .keep_receiver = os.keep_receiver, .args_base = args_base } });
                         if (args.len > 0) {
                             try m.pushTask(.{ .eval_args_next = .{ .args = args, .idx = 0, .args_base = args_base } });
                         }
@@ -1936,7 +1944,7 @@ const Machine = struct {
                 const vals = m.values.items;
                 vals[vals.len - 2] = val;
                 vals[vals.len - 1] = next_val;
-                try m.pushTask(.{ .opt_step = .{ .oc = oe.oc, .idx = oe.idx + 1, .is_delete = oe.is_delete } });
+                try m.pushTask(.{ .opt_step = .{ .oc = oe.oc, .idx = oe.idx + 1, .is_delete = oe.is_delete, .keep_receiver = oe.keep_receiver } });
             },
             .opt_call_finish => |oc_call| {
                 // values: [..., receiver, callee, arg0, ...]
@@ -1944,21 +1952,21 @@ const Machine = struct {
                 const callee = vals[oc_call.args_base - 1];
                 const receiver = vals[oc_call.args_base - 2];
                 vals[oc_call.args_base - 2] = .undefined;
-                try m.pushTask(.{ .opt_step = .{ .oc = oc_call.oc, .idx = oc_call.idx + 1, .is_delete = oc_call.is_delete } });
+                try m.pushTask(.{ .opt_step = .{ .oc = oc_call.oc, .idx = oc_call.idx + 1, .is_delete = oc_call.is_delete, .keep_receiver = oc_call.keep_receiver } });
                 try m.invokeCallable(callee, if (receiver.isUndefined()) null else receiver, oc_call.args_base, oc_call.args_base - 1);
             },
             .super_get_elem => {
                 const this_val = try m.requireThis();
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_get_elem without home_object");
                 const k = try m.toKey(.{ .value = m.popVal() });
-                try m.pushVal(try object.getSuper(rt, home, this_val, k));
+                try m.pushVal(try getSuperChecked(rt, home, this_val, k));
             },
             .super_assign_plain => |named| {
                 const this_val = try m.requireThis();
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_assign without home_object");
                 const val = m.popVal();
                 const kv: KeyValue = if (named) |n| .{ .named = n } else .{ .value = m.popVal() };
-                try object.setSuper(rt, home, this_val, try m.toKey(kv), val, m.isStrict());
+                try setSuperChecked(rt, home, this_val, try m.toKey(kv), val, m.isStrict());
                 try m.pushVal(val);
             },
             .super_assign_after_key => |sa| {
@@ -1966,7 +1974,7 @@ const Machine = struct {
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_assign without home_object");
                 const kv: KeyValue = if (sa.named) |n| .{ .named = n } else .{ .value = m.values.items[m.values.items.len - 1] };
                 const k = try m.toKey(kv);
-                const old = try object.getSuper(rt, home, this_val, k);
+                const old = try getSuperChecked(rt, home, this_val, k);
                 switch (sa.op) {
                     .plain => unreachable,
                     .compound => |op| {
@@ -1992,7 +2000,7 @@ const Machine = struct {
                 const old = m.popVal();
                 const kv: KeyValue = if (sc.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const new_val = try ops.binary(rt, sc.op, old, rhs);
-                try object.setSuper(rt, home, this_val, try m.toKey(kv), new_val, m.isStrict());
+                try setSuperChecked(rt, home, this_val, try m.toKey(kv), new_val, m.isStrict());
                 try m.pushVal(new_val);
             },
             .super_assign_logical => |sl| {
@@ -2000,7 +2008,7 @@ const Machine = struct {
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_assign without home_object");
                 const rhs = m.popVal();
                 const kv: KeyValue = if (sl.named) |n| .{ .named = n } else .{ .value = m.popVal() };
-                try object.setSuper(rt, home, this_val, try m.toKey(kv), rhs, m.isStrict());
+                try setSuperChecked(rt, home, this_val, try m.toKey(kv), rhs, m.isStrict());
                 try m.pushVal(rhs);
             },
             .super_update_finish => |su| {
@@ -2008,19 +2016,20 @@ const Machine = struct {
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_update without home_object");
                 const kv: KeyValue = if (su.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const k = try m.toKey(kv);
-                const s = try stepNumeric(rt, try object.getSuper(rt, home, this_val, k), su.op == .inc);
-                try object.setSuper(rt, home, this_val, k, s.new, m.isStrict());
+                const s = try stepNumeric(rt, try getSuperChecked(rt, home, this_val, k), su.op == .inc);
+                try setSuperChecked(rt, home, this_val, k, s.new, m.isStrict());
                 try m.pushVal(if (su.prefix) s.new else s.old);
             },
             .super_call_member_key => |sm| {
                 const this_val = try m.requireThis();
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_call_member_key without home_object");
                 const kv: KeyValue = if (sm.named) |n| .{ .named = n } else .{ .value = m.popVal() };
-                const callee = try object.getSuper(rt, home, this_val, try m.toKey(kv));
+                const callee = try getSuperChecked(rt, home, this_val, try m.toKey(kv));
                 try m.pushVal(callee);
                 const args_base = m.values.items.len;
                 if (sm.tagged) |tt| {
                     const tpl = try builtins.getTemplateObjectFromUnits(rt, @intFromPtr(tt), tt.cooked, tt.raw);
+                    try freezeTemplateObject(rt, tpl);
                     try m.pushVal(tpl);
                 }
                 try m.pushTask(.{ .invoke_call = .{ .has_receiver = true, .args_base = args_base } });
@@ -2107,11 +2116,15 @@ const Machine = struct {
                                 }
                             }
                         }
+                        if (isAnonymousFnDef(pr.value) and !(pr.key == .name and std.mem.eql(u8, pr.key.name, "__proto__"))) {
+                            try builtins.setFunctionNameIfUnset(rt, v, op.key);
+                        }
                         try object.define(rt, o, op.key, v);
                     },
                     .getter, .setter => {
                         if (!v.isClosure()) return rt.bug("object accessor expects closure");
                         try rt.heap.storeClosureHomeObject(@constCast(v.asClosure()), Value.fromObject(o));
+                        try setAccessorName(rt, v, op.key, pr.kind == .setter);
                         try object.defineAccessor(rt, Value.fromObject(o), op.key, v, pr.kind == .setter, true);
                     },
                 }
@@ -2156,6 +2169,7 @@ const Machine = struct {
                 const args_base = m.values.items.len;
                 if (cm.tagged) |tt| {
                     const tpl = try builtins.getTemplateObjectFromUnits(rt, @intFromPtr(tt), tt.cooked, tt.raw);
+                    try freezeTemplateObject(rt, tpl);
                     try m.pushVal(tpl);
                 }
                 try m.pushTask(.{ .invoke_call = .{ .has_receiver = true, .args_base = args_base } });
@@ -2168,6 +2182,7 @@ const Machine = struct {
                 const args_base = m.values.items.len;
                 if (ca.tagged) |tt| {
                     const tpl = try builtins.getTemplateObjectFromUnits(rt, @intFromPtr(tt), tt.cooked, tt.raw);
+                    try freezeTemplateObject(rt, tpl);
                     try m.pushVal(tpl);
                 }
                 try m.pushTask(.{ .invoke_call = .{ .has_receiver = ca.has_receiver, .args_base = args_base } });
@@ -2656,7 +2671,7 @@ const Machine = struct {
                 const home = m.current_closure.?.meta.?.home_object orelse return rt.bug("super_assign without home_object");
                 const kv: KeyValue = if (named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const val = m.popVal();
-                try object.setSuper(rt, home, this_val, try m.toKey(kv), val, m.isStrict());
+                try setSuperChecked(rt, home, this_val, try m.toKey(kv), val, m.isStrict());
             },
             .bind_pattern => |bp| {
                 const val = m.popVal();
@@ -3295,7 +3310,7 @@ const Machine = struct {
                 switch (k) {
                     .name => |n| {
                         m.depth -= 1;
-                        try m.pushVal(try object.getSuper(rt, home, this_val, try m.toKey(.{ .named = n })));
+                        try m.pushVal(try getSuperChecked(rt, home, this_val, try m.toKey(.{ .named = n })));
                     },
                     .computed => |ke| {
                         try m.pushTask(.depth_pop);
@@ -3463,8 +3478,8 @@ const Machine = struct {
                 try m.pushTask(.{ .member_base = .{ .key = mem.key, .is_delete = true } });
                 try m.pushEval(mem.object);
             },
-            .optional_chain => |oc| try m.startOptionalChain(oc, false),
-            .delete_optional => |oc| try m.startOptionalChain(oc, true),
+            .optional_chain => |oc| try m.startOptionalChain(oc, false, false),
+            .delete_optional => |oc| try m.startOptionalChain(oc, true, false),
             .array => |items| {
                 const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
                 try m.pushVal(Value.fromObject(arr));
@@ -3502,6 +3517,9 @@ const Machine = struct {
                         },
                         .string, .number => unreachable,
                     }
+                } else if (c.callee.data == .optional_chain and optionalChainEndsWithProp(c.callee.data.optional_chain)) {
+                    try m.pushTask(.{ .call_after_callee = .{ .args = c.args, .has_receiver = true } });
+                    try m.startOptionalChain(c.callee.data.optional_chain, false, true);
                 } else {
                     try m.pushTask(.{ .call_after_callee = .{ .args = c.args, .has_receiver = false } });
                     try m.pushEval(c.callee);
@@ -3537,15 +3555,23 @@ const Machine = struct {
         }
     }
 
-    fn startOptionalChain(m: *Machine, oc: ast.OptionalChain, is_delete: bool) Error!void {
+    fn startOptionalChain(m: *Machine, oc: ast.OptionalChain, is_delete: bool, keep_receiver: bool) Error!void {
         try m.pushTask(.depth_pop);
         if (oc.steps[0].kind == .call and oc.base.data == .member) {
             const mem = oc.base.data.member;
-            try m.pushTask(.{ .opt_after_base = .{ .oc = oc, .is_delete = is_delete } });
+            try m.pushTask(.{ .opt_after_base = .{ .oc = oc, .is_delete = is_delete, .keep_receiver = keep_receiver } });
             try m.pushTask(.{ .eval = mem.object });
+        } else if (oc.steps[0].kind == .call and oc.base.data == .super_member) {
+            const this_val = try m.requireThis();
+            try m.pushVal(this_val);
+            try m.pushTask(.{ .opt_step = .{ .oc = oc, .idx = 0, .is_delete = is_delete, .keep_receiver = keep_receiver } });
+            try m.pushTask(.{ .eval = oc.base });
+        } else if (oc.steps[0].kind == .call and oc.base.data == .optional_chain and optionalChainEndsWithProp(oc.base.data.optional_chain)) {
+            try m.pushTask(.{ .opt_step = .{ .oc = oc, .idx = 0, .is_delete = is_delete, .keep_receiver = keep_receiver } });
+            try m.startOptionalChain(oc.base.data.optional_chain, false, true);
         } else {
             try m.pushVal(.undefined); // null receiver
-            try m.pushTask(.{ .opt_step = .{ .oc = oc, .idx = 0, .is_delete = is_delete } });
+            try m.pushTask(.{ .opt_step = .{ .oc = oc, .idx = 0, .is_delete = is_delete, .keep_receiver = keep_receiver } });
             try m.pushTask(.{ .eval = oc.base });
         }
     }
@@ -3995,15 +4021,7 @@ const Machine = struct {
         switch (pat.data) {
             .binding => |d| m.store(d.binding, val),
             .target => |t| switch (t) {
-                .ref => |ref| {
-                    if (m.bindingOf(ref) != null) {
-                        try m.write(ref, val);
-                    } else if (builtins.isBuiltinGlobal(ref.name)) {
-                        return rt.fail(.builtin);
-                    } else {
-                        return rt.throw(.ReferenceError, &.{ .{ .ascii = ref.name }, .{ .ascii = " is not defined" } });
-                    }
-                },
+                .ref => |ref| try m.write(ref, val),
                 .member => |mem| {
                     try m.pushVal(val);
                     try m.pushTask(.{ .bind_target_member_base = .{ .key = mem.key, .is_private = mem.is_private, .private_ref = mem.private_ref } });
@@ -4180,6 +4198,87 @@ fn keyIn(k: object.Key, list: []const object.Key) bool {
     return false;
 }
 
+fn isAnonymousFnDef(e: *const ast.Expr) bool {
+    return switch (e.data) {
+        .function => |f| f.name == null,
+        .class => |cls| cls.name == null,
+        else => false,
+    };
+}
+
+fn optionalChainEndsWithProp(oc: ast.OptionalChain) bool {
+    if (oc.steps.len == 0) return false;
+    return switch (oc.steps[oc.steps.len - 1].kind) {
+        .prop, .private_prop, .elem => true,
+        .call => false,
+    };
+}
+
+fn getSuperChecked(rt: *Runtime, home: Value, receiver: Value, k: object.Key) Error!Value {
+    const super_base = try object.getPrototypeOfValue(rt, home);
+    try object.requireObjectCoercible(rt, super_base, null);
+    return object.getWithReceiver(rt, super_base, receiver, k);
+}
+
+fn setSuperChecked(rt: *Runtime, home: Value, receiver: Value, k: object.Key, v: Value, strict: bool) Error!void {
+    const super_base = try object.getPrototypeOfValue(rt, home);
+    try object.requireObjectCoercible(rt, super_base, null);
+    return object.setSuper(rt, home, receiver, k, v, strict);
+}
+
+fn freezeTemplateObject(rt: *Runtime, obj_val: Value) Error!void {
+    if (!obj_val.isObject()) return;
+    const arr = obj_val.asObject();
+    if (!arr.extensible) return;
+    var root_buf = [_]Value{obj_val};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const raw_atom = try rt.heap.internAscii("raw");
+    const raw_pk = heap.PropKey.fromAtom(raw_atom);
+    if (arr.props.get(raw_pk)) |raw_prop| {
+        if (raw_prop.value.isObject()) {
+            const raw_arr = raw_prop.value.asObject();
+            raw_arr.extensible = false;
+            raw_arr.array_elements_writable = false;
+            raw_arr.array_elements_configurable = false;
+            raw_arr.array_length_writable = false;
+        }
+        try rt.heap.defineProperty(arr, raw_atom, .{
+            .value = raw_prop.value,
+            .writable = false,
+            .enumerable = false,
+            .configurable = false,
+        });
+    }
+    arr.extensible = false;
+    arr.array_elements_writable = false;
+    arr.array_elements_configurable = false;
+    arr.array_length_writable = false;
+}
+
+fn setAccessorName(rt: *Runtime, fn_val: Value, k: object.Key, is_setter: bool) Error!void {
+    if (!fn_val.isClosure()) return;
+    const prefix: []const u8 = if (is_setter) "set " else "get ";
+    const base_str: *const heap.String = switch (k) {
+        .atom => |a| a,
+        .index => |i| try object.atomOf(rt, .{ .index = i }),
+        .symbol => |sym| if (sym.description) |d|
+            try rt.heap.newString(&.{ .{ .ascii = "[" }, .{ .utf16 = d.units }, .{ .ascii = "]" } })
+        else
+            try rt.heap.ascii(""),
+    };
+    const full = try rt.heap.newString(&.{ .{ .ascii = prefix }, .{ .utf16 = base_str.units } });
+    const name_pk = heap.PropKey.fromAtom(try rt.heap.internAscii("name"));
+    try rt.heap.defineClosurePropKey(@constCast(fn_val.asClosure()), name_pk, .{
+        .value = Value.fromString(full),
+        .enumerable = false,
+        .writable = false,
+        .configurable = true,
+    });
+}
+
 fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []const object.Key) Error!void {
     switch (src.unpack()) {
         .string => |s| {
@@ -4191,16 +4290,22 @@ fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []c
             }
         },
         .object, .closure => {
-            const keys = if (src.isObject())
+            var base_roots_buf = [_]Value{ Value.fromObject(dst), src, .undefined };
+            var base_roots: rt_mod.ValueRoots = .{ .values = &base_roots_buf };
+            try base_roots.register(rt);
+            defer base_roots.unregister(rt);
+
+            const is_proxy = src.isObject() and src.asObject().kind == .proxy;
+            const keys = if (is_proxy)
+                try proxy_reflect.ownKeysAllValue(rt, src)
+            else if (src.isObject())
                 try object.ownAllKeys(rt, src.asObject())
             else
                 try object.ownAllKeysClosure(rt, src.asClosure());
             defer rt.gpa.free(keys);
-            const root_vals = try rt.gpa.alloc(Value, 2 + keys.len);
+            const root_vals = try rt.gpa.alloc(Value, keys.len);
             defer rt.gpa.free(root_vals);
-            root_vals[0] = Value.fromObject(dst);
-            root_vals[1] = src;
-            for (keys, root_vals[2..]) |k, *rv| rv.* = switch (k) {
+            for (keys, root_vals) |k, *rv| rv.* = switch (k) {
                 .atom => |a| Value.fromString(a),
                 .symbol => |s| Value.fromSymbol(s),
                 .index => .undefined,
@@ -4211,8 +4316,14 @@ fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []c
 
             for (keys) |k| {
                 if (keyIn(k, excluded)) continue;
+                if (is_proxy) {
+                    const desc = (try builtins.proxyGetOwnPropertyDescriptor(rt, src.asObject(), k)) orelse continue;
+                    if (!desc.enumerable) continue;
+                }
                 const v = try object.get(rt, src, k);
+                base_roots_buf[2] = v;
                 try object.define(rt, dst, k, v);
+                base_roots_buf[2] = .undefined;
             }
         },
         .undefined, .null, .boolean, .number, .bigint, .symbol, .native => {},

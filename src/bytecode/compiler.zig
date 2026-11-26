@@ -223,6 +223,7 @@ const ControlContext = union(enum) {
     label: *LabelTarget,
     finally_region: *FinallyContext,
     finally_body: *FinallyContext,
+    iter_cleanup: u32,
 };
 
 const BigIntIndexCtx = struct {
@@ -997,7 +998,7 @@ const Compiler = struct {
                     switch (c.controls.items[i]) {
                         .loop => |l| break .{ .loop_break = l },
                         .@"switch" => |sb| break .{ .switch_break = sb },
-                        .label, .finally_region, .finally_body => {},
+                        .label, .finally_region, .finally_body, .iter_cleanup => {},
                     }
                 } else unreachable;
                 try c.emitJump(jt);
@@ -1015,7 +1016,7 @@ const Compiler = struct {
                     i -= 1;
                     switch (c.controls.items[i]) {
                         .loop => |l| break .{ .loop_continue = l },
-                        .@"switch", .label, .finally_region, .finally_body => {},
+                        .@"switch", .label, .finally_region, .finally_body, .iter_cleanup => {},
                     }
                 } else unreachable;
                 try c.emitJump(jt);
@@ -1084,6 +1085,7 @@ const Compiler = struct {
                     return;
                 },
                 .loop => |l| if (l.iter_slot) |slot| try c.emitIterClose(slot, l.is_await),
+                .iter_cleanup => |slot| try c.emitIterClose(slot, false),
                 .@"switch", .label => {},
             }
         }
@@ -1197,6 +1199,7 @@ const Compiler = struct {
                     try fr.to_finally.append(c.s.gpa, try c.jumpForward(.jump));
                     return;
                 },
+                .iter_cleanup => |slot| try c.emitIterClose(slot, false),
             }
         }
         unreachable;
@@ -1742,6 +1745,9 @@ const Compiler = struct {
                                 try c.emit(.dup, &.{});
                                 try c.emitMemberGet(m, n);
                             } else {
+                                if (m.key.computed.data != .string and m.key.computed.data != .number) {
+                                    try c.emit(.prep_elem_ref, &.{});
+                                }
                                 try c.emit(.dup2, &.{});
                                 try c.emit(.get_elem, &.{});
                             }
@@ -1755,6 +1761,9 @@ const Compiler = struct {
                                 try c.emit(.dup, &.{});
                                 try c.emitMemberGet(m, n);
                             } else {
+                                if (m.key.computed.data != .string and m.key.computed.data != .number) {
+                                    try c.emit(.prep_elem_ref, &.{});
+                                }
                                 try c.emit(.dup2, &.{});
                                 try c.emit(.get_elem, &.{});
                             }
@@ -1860,6 +1869,9 @@ const Compiler = struct {
                         try c.emit(.dup, &.{});
                         try c.emitMemberGet(m, n);
                     } else {
+                        if (m.key.computed.data != .string and m.key.computed.data != .number) {
+                            try c.emit(.prep_elem_ref, &.{});
+                        }
                         try c.emit(.dup2, &.{});
                         try c.emit(.get_elem, &.{});
                     }
@@ -1921,9 +1933,9 @@ const Compiler = struct {
                 },
             },
             .member => |m| try c.member(m, .get),
-            .optional_chain => |oc| try c.optionalChain(oc, false),
+            .optional_chain => |oc| try c.optionalChain(oc, false, false),
             .delete => |m| try c.member(m, .delete),
-            .delete_optional => |oc| try c.optionalChain(oc, true),
+            .delete_optional => |oc| try c.optionalChain(oc, true, false),
             .this => try c.emit(.push_this, &.{}),
             .array => |items| {
                 const has_spread = for (items) |item| {
@@ -1961,6 +1973,7 @@ const Compiler = struct {
                                 if (acc_flags) |f| {
                                     try c.emit(.define_elem_accessor, &.{f});
                                 } else {
+                                    if (isAnonymousFnDef(pr.value)) try c.emit(.set_fn_name, &.{});
                                     try c.emit(.define_elem, &.{});
                                 }
                             },
@@ -1970,15 +1983,22 @@ const Compiler = struct {
                                 if (acc_flags) |f| {
                                     try c.emit(.define_elem_accessor, &.{f});
                                 } else {
+                                    if (isAnonymousFnDef(pr.value)) try c.emit(.set_fn_name, &.{});
                                     try c.emit(.define_elem, &.{});
                                 }
                             },
                             .computed => |k| {
                                 try c.expr(k);
+                                const val_is_pure = switch (pr.value.data) {
+                                    .number, .string, .boolean, .null, .bigint => true,
+                                    else => false,
+                                };
+                                if (!val_is_pure) try c.emit(.to_property_key, &.{});
                                 try c.expr(pr.value);
                                 if (acc_flags) |f| {
                                     try c.emit(.define_elem_accessor, &.{f});
                                 } else {
+                                    if (isAnonymousFnDef(pr.value)) try c.emit(.set_fn_name, &.{});
                                     try c.emit(.define_elem, &.{});
                                 }
                             },
@@ -2049,12 +2069,29 @@ const Compiler = struct {
         try targets.append(c.s.gpa, try c.jumpForward(.jump_if_true));
     }
 
-    fn optionalChain(c: *Compiler, oc: ast.OptionalChain, is_delete: bool) Error!void {
+    fn isAnonymousFnDef(e: *const ast.Expr) bool {
+        return switch (e.data) {
+            .function => |f| f.name == null,
+            .class => |cls| cls.name == null,
+            else => false,
+        };
+    }
+
+    fn optionalChainEndsWithProp(oc: ast.OptionalChain) bool {
+        if (oc.steps.len == 0) return false;
+        return switch (oc.steps[oc.steps.len - 1].kind) {
+            .prop, .private_prop, .elem => true,
+            .call => false,
+        };
+    }
+
+    fn optionalChain(c: *Compiler, oc: ast.OptionalChain, is_delete: bool, keep_receiver: bool) Error!void {
         var short_1: std.ArrayList(u32) = .empty;
         defer short_1.deinit(c.s.gpa);
         var short_2: std.ArrayList(u32) = .empty;
         defer short_2.deinit(c.s.gpa);
 
+        const base_depth = c.depth;
         var has_receiver = false;
         if (oc.steps[0].kind == .call and oc.base.data == .member) {
             const m = oc.base.data.member;
@@ -2069,6 +2106,20 @@ const Compiler = struct {
                 .string, .number => unreachable,
             }
             has_receiver = true;
+        } else if (oc.steps[0].kind == .call and oc.base.data == .super_member) {
+            try c.emit(.push_this, &.{});
+            switch (oc.base.data.super_member) {
+                .name => |n| try c.emit(.super_get_prop, &.{try c.name(n)}),
+                .computed => |k| {
+                    try c.expr(k);
+                    try c.emit(.super_get_elem, &.{});
+                },
+                .string, .number => unreachable,
+            }
+            has_receiver = true;
+        } else if (oc.steps[0].kind == .call and oc.base.data == .optional_chain and optionalChainEndsWithProp(oc.base.data.optional_chain)) {
+            try c.optionalChain(oc.base.data.optional_chain, false, true);
+            has_receiver = true;
         } else {
             try c.expr(oc.base);
         }
@@ -2077,12 +2128,13 @@ const Compiler = struct {
             if (step.optional) {
                 try c.jumpIfNullish(if (has_receiver) &short_2 else &short_1);
             }
+            const want_recv = (i + 1 < oc.steps.len and oc.steps[i + 1].kind == .call) or (keep_receiver and i == oc.steps.len - 1);
             switch (step.kind) {
                 .prop => |n| {
                     if (is_delete and i == oc.steps.len - 1) {
                         try c.emit(.delete_prop, &.{try c.name(n)});
                     } else {
-                        if (i + 1 < oc.steps.len and oc.steps[i + 1].kind == .call) {
+                        if (want_recv) {
                             try c.emit(.dup, &.{});
                             has_receiver = true;
                         }
@@ -2090,7 +2142,7 @@ const Compiler = struct {
                     }
                 },
                 .private_prop => |pp| {
-                    if (i + 1 < oc.steps.len and oc.steps[i + 1].kind == .call) {
+                    if (want_recv) {
                         try c.emit(.dup, &.{});
                         has_receiver = true;
                     }
@@ -2102,7 +2154,7 @@ const Compiler = struct {
                         try c.expr(k);
                         try c.emit(.delete_elem, &.{});
                     } else {
-                        if (i + 1 < oc.steps.len and oc.steps[i + 1].kind == .call) {
+                        if (want_recv) {
                             try c.emit(.dup, &.{});
                             has_receiver = true;
                         }
@@ -2125,17 +2177,20 @@ const Compiler = struct {
                 },
             }
         }
-        std.debug.assert(!has_receiver);
+        std.debug.assert(has_receiver == keep_receiver);
 
         const to_end = try c.jumpForward(.jump);
         if (short_2.items.len > 0) {
-            c.depth += 1;
+            c.depth = base_depth + 2;
             for (short_2.items) |j| c.patch(j, c.here());
             try c.emit(.pop, &.{});
+        } else {
+            c.depth = base_depth + 1;
         }
         for (short_1.items) |j| c.patch(j, c.here());
         try c.emit(.pop, &.{});
         try c.emit(if (is_delete) .push_true else .push_undefined, &.{});
+        if (keep_receiver) try c.emit(.push_undefined, &.{});
         c.patch(to_end, c.here());
     }
 
@@ -2262,6 +2317,8 @@ const Compiler = struct {
                 try c.emit(.init_local, &.{iter_slot});
                 const base_depth = c.depth;
                 const elems_start = c.here();
+                try c.controls.append(c.s.gpa, .{ .iter_cleanup = iter_slot });
+                errdefer _ = c.controls.pop();
                 for (arr.elems) |maybe_el| {
                     const el = maybe_el orelse {
                         try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
@@ -2288,6 +2345,7 @@ const Compiler = struct {
                     try c.emit(.iter_rest, &.{});
                     if (ms) |slots| try c.storeMemberSlots(slots) else try c.bindPattern(rest, mode);
                 }
+                _ = c.controls.pop();
                 const elems_end = c.here();
                 if (arr.rest == null) {
                     try c.emit(.get_local, &.{ iter_slot, try c.name("<iter>") });
@@ -2327,6 +2385,7 @@ const Compiler = struct {
                     var k_slot: ?u32 = null;
                     if (pr.key == .computed) {
                         try c.expr(pr.key.computed);
+                        try c.emit(.to_property_key, &.{});
                         k_slot = c.allocTemp();
                         try c.emit(.init_local, &.{k_slot.?});
                         try computed_slots.append(c.s.gpa, k_slot.?);
@@ -2613,6 +2672,10 @@ const Compiler = struct {
                 },
                 .string, .number => unreachable,
             }
+            return true;
+        }
+        if (callee.data == .optional_chain and optionalChainEndsWithProp(callee.data.optional_chain)) {
+            try c.optionalChain(callee.data.optional_chain, false, true);
             return true;
         }
         const method = callee.data == .member;

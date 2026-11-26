@@ -50,6 +50,7 @@ const ops = @import("../runtime/ops.zig");
 const object = @import("../runtime/object.zig");
 const bigint = @import("../runtime/bigint.zig");
 const builtins = @import("../runtime/builtins.zig");
+const proxy_reflect = @import("../runtime/builtins/proxy_reflect.zig");
 const coroutine = @import("../runtime/coroutine.zig");
 const module = @import("../runtime/module.zig");
 const BinaryOp = @import("../frontend/ast.zig").BinaryOp;
@@ -1139,6 +1140,8 @@ pub const Vm = struct {
             .define_private_accessor,
             .define_public_field,
             .define_private_field,
+            .set_fn_name,
+            .prep_elem_ref,
             .to_property_key,
             .get_private,
             .set_private,
@@ -1800,6 +1803,7 @@ pub const Vm = struct {
                 const site = &p.templates[idx];
                 try cache.ensurePush(vm);
                 const obj = try builtins.getTemplateObjectFromConsts(rt, @intFromPtr(site), site.cooked, site.raw, p.consts);
+                try freezeTemplateObject(rt, obj);
                 try cache.push(vm, obj);
             },
             .get_import_meta => {
@@ -1848,8 +1852,10 @@ pub const Vm = struct {
                 const enumerable = (flags & 2) != 0;
                 if (!fn_val.isClosure()) return vm.bug("define_accessor expects closure");
                 if (enumerable) {
+                    const k = try vm.nameKey(cache.operand(0));
                     try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), target);
-                    try object.defineAccessor(rt, target, try vm.nameKey(cache.operand(0)), fn_val, is_setter, true);
+                    try setAccessorName(rt, fn_val, k, is_setter);
+                    try object.defineAccessor(rt, target, k, fn_val, is_setter, true);
                 } else {
                     try builtins.defineClassAccessor(rt, target, try vm.nameKey(cache.operand(0)), fn_val, is_setter);
                 }
@@ -1865,8 +1871,10 @@ pub const Vm = struct {
                 const enumerable = (flags & 2) != 0;
                 if (!fn_val.isClosure()) return vm.bug("define_elem_accessor expects closure");
                 if (enumerable) {
+                    const k = try object.key(rt, key_val);
                     try rt.heap.storeClosureHomeObject(@constCast(fn_val.asClosure()), target);
-                    try object.defineAccessor(rt, target, try object.key(rt, key_val), fn_val, is_setter, true);
+                    try setAccessorName(rt, fn_val, k, is_setter);
+                    try object.defineAccessor(rt, target, k, fn_val, is_setter, true);
                 } else {
                     try builtins.defineClassAccessor(rt, target, try object.key(rt, key_val), fn_val, is_setter);
                 }
@@ -1911,6 +1919,25 @@ pub const Vm = struct {
                 const name_str = (try vm.nameKey(cache.operand(0))).atom;
                 try object.definePrivateField(rt, target, brand_val.asClosure(), name_str, val);
                 try cache.drop(vm, 1);
+            },
+            .set_fn_name => {
+                cache.syncSp(vm);
+                const val = try cache.peek(vm, 0);
+                const key_val = try cache.peek(vm, 1);
+                const k = try object.key(rt, key_val);
+                try builtins.setFunctionNameIfUnset(rt, val, k);
+            },
+            .prep_elem_ref => {
+                const base = try cache.peek(vm, 1);
+                if (base.isUndefined() or base.isNull()) {
+                    cache.syncSp(vm);
+                    try object.requireObjectCoercible(rt, base, null);
+                }
+                const k = try cache.peek(vm, 0);
+                if (!k.isString() and !k.isSymbol()) {
+                    cache.syncSp(vm);
+                    (try cache.top(vm)).* = try object.toPropertyKeyValue(rt, k);
+                }
             },
             .to_property_key => {
                 cache.syncSp(vm);
@@ -2016,20 +2043,26 @@ pub const Vm = struct {
                 const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_get_prop without home_object");
                 try cache.ensurePush(vm);
-                try cache.push(vm, try object.getSuper(rt, home, this_val, try vm.nameKey(cache.operand(0))));
+                const super_base = try object.getPrototypeOfValue(rt, home);
+                try object.requireObjectCoercible(rt, super_base, null);
+                try cache.push(vm, try object.getWithReceiver(rt, super_base, this_val, try vm.nameKey(cache.operand(0))));
             },
             .super_get_elem => {
                 cache.syncSp(vm);
                 const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_get_elem without home_object");
                 const k = try object.key(rt, try cache.peek(vm, 0));
-                (try cache.top(vm)).* = try object.getSuper(rt, home, this_val, k);
+                const super_base = try object.getPrototypeOfValue(rt, home);
+                try object.requireObjectCoercible(rt, super_base, null);
+                (try cache.top(vm)).* = try object.getWithReceiver(rt, super_base, this_val, k);
             },
             .super_set_prop => {
                 cache.syncSp(vm);
                 const this_val = try vm.requireThis();
                 const home = vm.frame().closure.?.meta.?.home_object orelse return vm.bug("super_set_prop without home_object");
                 const val = try cache.peek(vm, 0);
+                const super_base = try object.getPrototypeOfValue(rt, home);
+                try object.requireObjectCoercible(rt, super_base, null);
                 try object.setSuper(rt, home, this_val, try vm.nameKey(cache.operand(0)), val, p.is_strict);
             },
             .super_set_elem => {
@@ -2039,6 +2072,8 @@ pub const Vm = struct {
                 const val = try cache.peek(vm, 0);
                 const key_val = try cache.peek(vm, 1);
                 const k = try object.key(rt, key_val);
+                const super_base = try object.getPrototypeOfValue(rt, home);
+                try object.requireObjectCoercible(rt, super_base, null);
                 try object.setSuper(rt, home, this_val, k, val, p.is_strict);
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = val;
@@ -2955,6 +2990,59 @@ fn keyIn(k: object.Key, list: []const object.Key) bool {
     return false;
 }
 
+fn freezeTemplateObject(rt: *Runtime, obj_val: Value) Error!void {
+    if (!obj_val.isObject()) return;
+    const arr = obj_val.asObject();
+    if (!arr.extensible) return;
+    var root_buf = [_]Value{obj_val};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const raw_atom = try rt.heap.internAscii("raw");
+    const raw_pk = heap.PropKey.fromAtom(raw_atom);
+    if (arr.props.get(raw_pk)) |raw_prop| {
+        if (raw_prop.value.isObject()) {
+            const raw_arr = raw_prop.value.asObject();
+            raw_arr.extensible = false;
+            raw_arr.array_elements_writable = false;
+            raw_arr.array_elements_configurable = false;
+            raw_arr.array_length_writable = false;
+        }
+        try rt.heap.defineProperty(arr, raw_atom, .{
+            .value = raw_prop.value,
+            .writable = false,
+            .enumerable = false,
+            .configurable = false,
+        });
+    }
+    arr.extensible = false;
+    arr.array_elements_writable = false;
+    arr.array_elements_configurable = false;
+    arr.array_length_writable = false;
+}
+
+fn setAccessorName(rt: *Runtime, fn_val: Value, k: object.Key, is_setter: bool) Error!void {
+    if (!fn_val.isClosure()) return;
+    const prefix: []const u8 = if (is_setter) "set " else "get ";
+    const base_str: *const heap.String = switch (k) {
+        .atom => |a| a,
+        .index => |i| try object.atomOf(rt, .{ .index = i }),
+        .symbol => |sym| if (sym.description) |d|
+            try rt.heap.newString(&.{ .{ .ascii = "[" }, .{ .utf16 = d.units }, .{ .ascii = "]" } })
+        else
+            try rt.heap.ascii(""),
+    };
+    const full = try rt.heap.newString(&.{ .{ .ascii = prefix }, .{ .utf16 = base_str.units } });
+    const name_pk = heap.PropKey.fromAtom(try rt.heap.internAscii("name"));
+    try rt.heap.defineClosurePropKey(@constCast(fn_val.asClosure()), name_pk, .{
+        .value = Value.fromString(full),
+        .enumerable = false,
+        .writable = false,
+        .configurable = true,
+    });
+}
+
 fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []const object.Key) Error!void {
     switch (src.unpack()) {
         .string => |s| {
@@ -2966,16 +3054,22 @@ fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []c
             }
         },
         .object, .closure => {
-            const keys = if (src.isObject())
+            var base_roots_buf = [_]Value{ Value.fromObject(dst), src, .undefined };
+            var base_roots: rt_mod.ValueRoots = .{ .values = &base_roots_buf };
+            try base_roots.register(rt);
+            defer base_roots.unregister(rt);
+
+            const is_proxy = src.isObject() and src.asObject().kind == .proxy;
+            const keys = if (is_proxy)
+                try proxy_reflect.ownKeysAllValue(rt, src)
+            else if (src.isObject())
                 try object.ownAllKeys(rt, src.asObject())
             else
                 try object.ownAllKeysClosure(rt, src.asClosure());
             defer rt.gpa.free(keys);
-            const root_vals = try rt.gpa.alloc(Value, 2 + keys.len);
+            const root_vals = try rt.gpa.alloc(Value, keys.len);
             defer rt.gpa.free(root_vals);
-            root_vals[0] = Value.fromObject(dst);
-            root_vals[1] = src;
-            for (keys, root_vals[2..]) |k, *rv| rv.* = switch (k) {
+            for (keys, root_vals) |k, *rv| rv.* = switch (k) {
                 .atom => |a| Value.fromString(a),
                 .symbol => |s| Value.fromSymbol(s),
                 .index => .undefined,
@@ -2986,8 +3080,14 @@ fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []c
 
             for (keys) |k| {
                 if (keyIn(k, excluded)) continue;
+                if (is_proxy) {
+                    const desc = (try builtins.proxyGetOwnPropertyDescriptor(rt, src.asObject(), k)) orelse continue;
+                    if (!desc.enumerable) continue;
+                }
                 const v = try object.get(rt, src, k);
+                base_roots_buf[2] = v;
                 try object.define(rt, dst, k, v);
+                base_roots_buf[2] = .undefined;
             }
         },
         .undefined, .null, .boolean, .number, .bigint, .symbol, .native => {},

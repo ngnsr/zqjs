@@ -2783,3 +2783,81 @@ test "M52: set_prop IC (storePropertyAt) and fastArraySet generational write bar
         try testing.expectEqualStrings("young-prop-42 young-elem-99\n", got);
     }
 }
+
+test "slab pools: Object, Closure, and Cell recycle freelists, preserve accounting, rollback, and gc-stress tombstones" {
+    var h = heap.Heap.init(testing.allocator, .{});
+    defer h.deinit();
+
+    const dummy_proto: u8 = 0;
+    const obj_n: usize = @TypeOf(h.object_pool).capacity + 16;
+    const cl_n: usize = @TypeOf(h.closure_pool).capacity + 16;
+    const cell_n: usize = @TypeOf(h.cell_pool).capacity + 16;
+
+    var last_obj: *heap.Object = undefined;
+    var last_closure: *heap.Closure = undefined;
+    var last_cell: *heap.Cell = undefined;
+
+    for (0..obj_n) |_| last_obj = try h.newObject(null);
+    for (0..cl_n) |_| last_closure = try h.newVmClosure(&dummy_proto, 0);
+    for (0..cell_n) |i| last_cell = try h.newCell(zqjs.Value.fromNumber(@floatFromInt(i)));
+
+    try testing.expectEqual(@as(usize, 2), h.object_pool.slabs.items.len);
+    try testing.expectEqual(@as(usize, 2), h.closure_pool.slabs.items.len);
+    try testing.expectEqual(@as(usize, 2), h.cell_pool.slabs.items.len);
+
+    const expected_bytes = obj_n * (@sizeOf(heap.Object) + heap.per_allocation_overhead) +
+        cl_n * (@sizeOf(heap.Closure) + 2 * heap.per_allocation_overhead) +
+        cell_n * (@sizeOf(heap.Cell) + heap.per_allocation_overhead);
+    try testing.expectEqual(expected_bytes, h.bytes);
+    try h.verify();
+
+    // Sweep all allocations.
+    try collectMinor(&h, &.{});
+    try testing.expectEqual(@as(usize, 0), h.bytes);
+    try h.verifyCollected();
+
+    if (heap.gc_stress) {
+        // Zombie tombstones must not be recycled into freelists while alive.
+        try testing.expectEqual(heap.Obj.Kind.dead, last_obj.obj.kind);
+        try testing.expectEqual(heap.Obj.Kind.object, last_obj.obj.debug.was);
+        try testing.expectEqual(heap.Obj.Kind.dead, last_closure.obj.kind);
+        try testing.expectEqual(heap.Obj.Kind.closure, last_closure.obj.debug.was);
+        try testing.expectEqual(heap.Obj.Kind.dead, last_cell.obj.kind);
+        try testing.expectEqual(heap.Obj.Kind.cell, last_cell.obj.debug.was);
+    }
+
+    // Re-allocating the same counts must reuse freelist slots without growing slabs in normal mode,
+    // and must allocate fresh slabs (never reusing tombstones) in -Dgc-stress mode.
+    for (0..obj_n) |_| {
+        const o = try h.newObject(null);
+        if (heap.gc_stress) try testing.expect(o != last_obj);
+    }
+    for (0..cl_n) |_| {
+        const cl = try h.newVmClosure(&dummy_proto, 0);
+        if (heap.gc_stress) try testing.expect(cl != last_closure);
+    }
+    for (0..cell_n) |i| {
+        const ce = try h.newCell(zqjs.Value.fromNumber(@floatFromInt(i)));
+        if (heap.gc_stress) try testing.expect(ce != last_cell);
+    }
+    if (heap.gc_stress) {
+        try testing.expect(h.object_pool.slabs.items.len > 2);
+        try testing.expect(h.closure_pool.slabs.items.len > 2);
+        try testing.expect(h.cell_pool.slabs.items.len > 2);
+    } else {
+        try testing.expectEqual(@as(usize, 2), h.object_pool.slabs.items.len);
+        try testing.expectEqual(@as(usize, 2), h.closure_pool.slabs.items.len);
+        try testing.expectEqual(@as(usize, 2), h.cell_pool.slabs.items.len);
+    }
+    try testing.expectEqual(expected_bytes, h.bytes);
+
+    // Rollback must restore exact byte accounting and return slots cleanly.
+    const m = h.mark();
+    _ = try h.newObject(null);
+    _ = try h.newVmClosure(&dummy_proto, 0);
+    _ = try h.newCell(.null);
+    try testing.expect(h.bytes > expected_bytes);
+    h.rollback(m);
+    try testing.expectEqual(expected_bytes, h.bytes);
+    try h.verify();
+}

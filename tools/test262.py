@@ -279,47 +279,33 @@ def run_single_test(args: tuple[Any, ...]) -> dict[str, Any]:
         if is_module and is_raw:
             cmd.append(test_path_str)
         elif is_module:
-            # Put core harness in a sibling module imported FIRST so it evaluates
-            # before any static `import` declarations in `source` (including self-imports).
+            # Preload core harness + includes into the shared runtime before running
+            # the unmodified entry module so self-imports resolve to the same canonical
+            # module record and parse-error line numbers stay exact.
             harness_parts: list[str] = [
                 HOST_SHIM,
                 harness_bundle_cache["sta.js"],
                 harness_bundle_cache["assert.js"],
-                "globalThis.Test262Error = Test262Error; globalThis.assert = assert; globalThis.$262 = $262;\n",
             ]
             if is_async:
                 harness_parts.append(harness_bundle_cache["doneprintHandle.js"])
-                harness_parts.append("globalThis.$DONE = $DONE;\n")
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                dir=str(test_path.parent),
-                prefix=".zqjs_t262_h_",
-                suffix=".mjs",
-                delete=False,
-                encoding="utf-8",
-            ) as hf:
-                hf.write("\n".join(harness_parts))
-                tmp_harness = hf.name
-            mod_parts: list[str] = [f"import './{Path(tmp_harness).name}';\n"]
             for inc in includes:
                 if inc in ("sta.js", "assert.js", "doneprintHandle.js"):
                     continue
                 inc_src = harness_bundle_cache.get(inc, "")
                 if not inc_src:
                     return {"path": rel_path, "status": "skip", "reason": f"missing_include:{inc}"}
-                mod_parts.append(inc_src)
-            mod_parts.append(source)
+                harness_parts.append(inc_src)
             with tempfile.NamedTemporaryFile(
                 mode="w",
-                dir=str(test_path.parent),
-                prefix=".zqjs_t262_",
-                suffix=".mjs",
+                prefix=".zqjs_t262_preload_",
+                suffix=".js",
                 delete=False,
                 encoding="utf-8",
-            ) as tf:
-                tf.write("\n".join(mod_parts))
-                tmp_file = tf.name
-            cmd.append(tmp_file)
+            ) as hf:
+                hf.write("\n".join(harness_parts))
+                tmp_harness = hf.name
+            cmd.extend(["--preload", tmp_harness, test_path_str])
         else:
             tmp_dir = str(test_path.parent) if "import(" in source else None
             with tempfile.NamedTemporaryFile(

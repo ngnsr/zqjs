@@ -3368,3 +3368,73 @@ test "M48: host virtual loader with dynamic import() and top-level await" {
     defer res_h.release();
     try testing.expectEqual(@as(?f64, 100), res_h.number());
 }
+
+test "Failure formatting: custom thrown error objects without invoking getters (D46/E10)" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const rt = try zqjs.Runtime.create(testing.allocator, .{ .output = &out.writer });
+    defer rt.destroy();
+
+    const cases = [_]struct { src: []const u8, expected: []const u8 }{
+        .{
+            .src = "throw { name: 'CustomError', message: 'boom' };",
+            .expected = "Uncaught CustomError: boom",
+        },
+        .{
+            .src = "throw { name: 'CustomError' };",
+            .expected = "Uncaught CustomError",
+        },
+        .{
+            .src =
+            \\function ProtoErr(m) { this.message = m; }
+            \\ProtoErr.prototype.name = 'ProtoErr';
+            \\throw new ProtoErr('from proto');
+            ,
+            .expected = "Uncaught ProtoErr: from proto",
+        },
+        .{
+            .src =
+            \\function Test262Error(m) { this.message = m || ''; }
+            \\Test262Error.prototype.toString = function() { return 'Test262Error: ' + this.message; };
+            \\throw new Test262Error('bad value');
+            ,
+            .expected = "Uncaught Test262Error: bad value",
+        },
+        .{
+            .src =
+            \\function Test262Error(m) { this.message = m || ''; }
+            \\throw new Test262Error();
+            ,
+            .expected = "Uncaught Test262Error",
+        },
+        .{
+            .src =
+            \\let called = false;
+            \\throw {
+            \\  name: 'SafeErr',
+            \\  get message() { called = true; print('GETTER'); return 'nope'; }
+            \\};
+            ,
+            .expected = "Uncaught SafeErr",
+        },
+        .{
+            .src =
+            \\throw {
+            \\  get name() { print('GETTER'); return 'Nope'; },
+            \\  message: 'x'
+            \\};
+            ,
+            .expected = "Uncaught [object Object]",
+        },
+    };
+
+    for (cases) |c| {
+        const p = try rt.compile("custom_err.js", c.src, null);
+        defer p.destroy();
+        var failure: zqjs.Failure = .{};
+        try testing.expectError(error.Thrown, rt.run(p, &failure));
+        try testing.expectEqual(zqjs.Failure.Kind.thrown, failure.kind);
+        try testing.expectEqualStrings(c.expected, failure.message());
+    }
+    try testing.expectEqualStrings("", out.written());
+}

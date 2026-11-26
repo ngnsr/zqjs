@@ -1,31 +1,33 @@
-# Runs on pushes and pull requests that touch code, tests, tools or the build.
-# Same commands as a local check (see README). Docs-only changes (*.md) skip CI.
+# Runs on pushes and pull requests that touch code, tests, tools, or the build.
+# Docs-only changes (*.md) skip CI.
 name: CI
 
-# Allowlist, not a *.md ignore list: other non-code files stay out of CI by default.
-# Keep both lists in sync.
 on:
-  # Automatic triggers disabled (no CI quota).
-  # push:
-  #   branches: ["**"] # not tags: a tag points at a commit CI already checked
-  #   paths:
-  #     - "src/**"
-  #     - "tests/**"
-  #     - "tools/**"
-  #     - "build.zig"
-  #     - "build.zig.zon"
-  #     - ".github/workflows/ci.yml"
-  # pull_request:
-  #   paths:
-  #     - "src/**"
-  #     - "tests/**"
-  #     - "tools/**"
-  #     - "build.zig"
-  #     - "build.zig.zon"
-  #     - ".github/workflows/ci.yml"
-  workflow_dispatch: # manual run from the Actions tab
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "include/**"
+      - "tests/**"
+      - "tools/**"
+      - "examples/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - ".gitattributes"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "include/**"
+      - "tests/**"
+      - "tools/**"
+      - "examples/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - ".gitattributes"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
 
-# A newer push to the same branch cancels the older run (saves CI minutes).
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -35,82 +37,60 @@ permissions:
 
 jobs:
   check:
-    # One job per (platform, test configuration), all in parallel: the configurations are
-    # independent builds, and run one after another they took ~7 min a platform.
     name: ${{ matrix.platform.name }} / ${{ matrix.suite.name }}
-    # A same-repo PR branch is already checked by its push run; only fork PRs need their own.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.platform.os }}
     timeout-minutes: 30
     strategy:
-      fail-fast: false # one job failing shouldn't hide the others' results
+      fail-fast: false
       matrix:
         platform:
-          # `cpu` pins the build's CPU where the runners differ. The Zig cache key includes
-          # the exact CPU of a `native` build, and GitHub's x86_64 runners are a mix of
-          # models, so a native build there missed the cache almost every run (each test
-          # binary recompiled, ~5 min a job). The pow step below still runs native.
           - { name: macOS arm64, os: macos-latest, cpu: "" }
           - { name: Linux x86_64, os: ubuntu-latest, cpu: "-Dcpu=x86_64_v3" }
-          # GitHub's arm64 Linux runners are free for public repositories; for a private
-          # repository this job may need a paid runner (or remove it).
           - { name: Linux arm64, os: ubuntu-24.04-arm, cpu: "" }
-        # Both stress modes at once: the VM moves its stacks on every call (D36), and both
-        # engines collect at every safepoint, keep collected objects as tombstones and
-        # verify the heap before and after every collection (D8, GC_DESIGN §11).
-        # ReleaseSafe checks the tree-walker's measured stack use in another mode (D37),
-        # and that the stress checks don't exist only in Debug.
+          - { name: Windows x86_64, os: windows-latest, cpu: "-Dcpu=x86_64_v3" }
         suite:
+          # build.zig defaults to ReleaseSafe.
           - { name: tests, flags: "" }
           - { name: gc-stress + stack-stress, flags: "-Dgc-stress -Dstack-stress" }
-          - { name: ReleaseSafe, flags: "-Doptimize=ReleaseSafe" }
-          - { name: gc-stress ReleaseSafe, flags: "-Dgc-stress -Doptimize=ReleaseSafe" }
     steps:
       - uses: actions/checkout@v4
 
-      # Exact toolchain pin (DESIGN_DECISIONS D17); build.zig also refuses other versions.
+      # Exact toolchain pin (DESIGN_DECISIONS D17); build.zig refuses other versions.
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
-          # One Zig cache per test configuration (the OS is already in the key): with a
-          # shared key each job restored whichever configuration saved last, and recompiled.
           cache-key: ${{ matrix.suite.name }}
-
-      - name: Tests (${{ matrix.suite.name }})
-        run: zig build test ${{ matrix.suite.flags }} ${{ matrix.platform.cpu }} --summary all
-
-      # The checks below run once per platform, in the plain-tests job.
-
-      # Dev-time tools for check-goldens: node (goldens, syntax contract) and Python 3
-      # (pow reference values; standard library only, preinstalled on the runners).
-      - if: matrix.suite.name == 'tests'
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
 
       - name: Formatting
         if: matrix.suite.name == 'tests'
         run: zig fmt --check .
 
-      # M8.1: each deliberately broken GC piece must be caught by the heap verifier.
+      - name: Tests (${{ matrix.suite.name }})
+        run: zig build test -j2 ${{ matrix.suite.flags }} ${{ matrix.platform.cpu }} --summary all
+
+      # M8.1: each deliberately broken GC mutant must be caught by the heap verifier.
       - name: GC mutants
         if: matrix.suite.name == 'tests'
-        run: zig build gc-mutants ${{ matrix.platform.cpu }} --summary all
+        run: zig build gc-mutants -j2 ${{ matrix.platform.cpu }} --summary all
 
-      - name: Generated files and node contract
-        if: matrix.suite.name == 'tests'
-        run: zig build check-goldens ${{ matrix.platform.cpu }}
+      # Verify syntax/diff/pow goldens against pinned arm64 Node 26.
+      - if: matrix.suite.name == 'tests' && matrix.platform.os == 'macos-latest'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26
 
-      - name: Release build
+      - name: Generated files and Node contract
+        if: matrix.suite.name == 'tests' && matrix.platform.os == 'macos-latest'
+        run: zig build check-goldens
+
+      - name: Release build & embedding example
         if: matrix.suite.name == 'tests'
         run: |
-          zig build --release=fast ${{ matrix.platform.cpu }}
-          # The embedding example builds and runs in release mode too (M9.0).
-          zig build example --release=fast ${{ matrix.platform.cpu }}
+          zig build -Doptimize=ReleaseFast ${{ matrix.platform.cpu }}
+          zig build example -Doptimize=ReleaseFast ${{ matrix.platform.cpu }}
 
-      # pow must give bit-identical results everywhere (DESIGN_DECISIONS D25). The expected
-      # hash was measured on aarch64-macos and x86_64 under Rosetta 2; these runners add
-      # real x86_64 and arm64 Linux hardware.
+      # pow must give bit-identical results everywhere (DESIGN_DECISIONS D25).
       - name: pow portability hash
         if: matrix.suite.name == 'tests'
         shell: bash

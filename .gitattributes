@@ -1,0 +1,13 @@
+# Enforce LF line endings across platforms (required by `zig fmt --check` and golden `.out`/`.jsonl` tests on Windows).
+* text=auto eol=lf
+*.zig text eol=lf
+*.zon text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.out text eol=lf
+*.jsonl text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf

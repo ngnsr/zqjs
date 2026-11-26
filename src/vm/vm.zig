@@ -3182,6 +3182,10 @@ fn fastArraySet(rt: *Runtime, base: Value, idx: Value, val: Value) bool {
 inline fn fastStrictEq(lhs: Value, rhs: Value) bool {
     if (lhs.isNumber() and rhs.isNumber()) return lhs.asNumber() == rhs.asNumber();
     if (lhs.bits == rhs.bits) return !lhs.isNumber();
+    return fastStrictEqSlow(lhs, rhs);
+}
+
+noinline fn fastStrictEqSlow(lhs: Value, rhs: Value) bool {
     if (lhs.isString() and rhs.isString()) return std.mem.eql(u16, lhs.asString().units, rhs.asString().units);
     if (lhs.isBigInt() and rhs.isBigInt()) return bigint.cmp(lhs.asBigInt(), rhs.asBigInt()) == .eq;
     return false;
@@ -3414,6 +3418,13 @@ inline fn matchGetPropIc(o: *const heap.Object, atom_addr: usize, sid: u32, ic: 
     return null;
 }
 
+noinline fn fastGetPropPoly(o: *const heap.Object, atom_addr: usize, sid: u32, b: *const [4]rt_mod.PropIc) ?Value {
+    for (b[1..]) |ic| {
+        if (matchGetPropIc(o, atom_addr, sid, ic)) |v| return v;
+    }
+    return null;
+}
+
 fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) ?Value {
     const atom_addr = @intFromPtr(atom);
     if (!base.isObject()) {
@@ -3425,8 +3436,7 @@ fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
             const r = builtins.realmIfInit(rt) orelse return null;
             const sp = r.string_prototype;
             const b = propIcBucket(rt, p, pc);
-            inline for (0..4) |i| {
-                const ic = b[i];
+            for (b) |ic| {
                 if (ic.atom_addr == atom_addr) {
                     if (ic.kind == 10 and sp.props == .shaped and sp.props.shapeId() == ic.proto_shape_id) {
                         const v = sp.props.getShapedSlot(ic.slot);
@@ -3458,10 +3468,8 @@ fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
     o.obj.checkLive();
     const sid = objVersion(o);
     const b = propIcBucket(rt, p, pc);
-    inline for (0..4) |i| {
-        if (matchGetPropIc(o, atom_addr, sid, b[i])) |v| return v;
-    }
-    return null;
+    if (matchGetPropIc(o, atom_addr, sid, b[0])) |v| return v;
+    return fastGetPropPoly(o, atom_addr, sid, b);
 }
 
 noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) void {
@@ -3686,6 +3694,46 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
     }
 }
 
+inline fn matchSetPropIc(rt: *Runtime, o: *heap.Object, atom: *heap.String, atom_addr: usize, sid: u32, val: Value, ic: rt_mod.PropIc) bool {
+    if (ic.atom_addr != atom_addr or sid != ic.shape_id) return false;
+    if (ic.kind == 3) {
+        rt.heap.storeShapedSlot(o, ic.slot, val);
+        return true;
+    }
+    if (ic.kind == 4 and o.extensible) {
+        // Verify prototype chain up to 2 hops matches cached shapes (proving no Proxy / setter / non-writable prop).
+        const p1_sid: u32 = if (o.proto) |pr1| blk: {
+            if (pr1.kind != .ordinary) return false;
+            break :blk pr1.props.shapeId();
+        } else 0;
+        if (p1_sid != ic.proto_shape_id) return false;
+        if (o.proto) |pr1| {
+            const p2_sid: u32 = if (pr1.proto) |pr2| blk: {
+                if (pr2.kind != .ordinary or pr2.proto != null) return false;
+                break :blk pr2.props.shapeId();
+            } else 0;
+            if (p2_sid != ic.grandproto_shape_id) return false;
+        }
+        const parent = o.props.shaped.shape orelse (rt.heap.root_shape orelse return false);
+        const next_sh = parent.findTransition(heap.PropKey.fromAtom(atom), .default) orelse return false;
+        if (next_sh.slot < heap.INLINE_SLOTS) {
+            o.props.setShapedSlot(next_sh.slot, val);
+            o.props.shaped.shape = next_sh;
+            rt.heap.barrierObj(&o.obj, &atom.obj);
+            rt.heap.barrier(&o.obj, null, val);
+            return true;
+        }
+    }
+    return false;
+}
+
+noinline fn fastSetPropPoly(rt: *Runtime, o: *heap.Object, atom: *heap.String, atom_addr: usize, sid: u32, val: Value, b: *const [4]rt_mod.PropIc) bool {
+    for (b[1..]) |ic| {
+        if (matchSetPropIc(rt, o, atom, atom_addr, sid, val, ic)) return true;
+    }
+    return false;
+}
+
 fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String, val: Value) bool {
     if (!base.isObject()) return false;
     const o = base.asObject();
@@ -3694,40 +3742,8 @@ fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
     const atom_addr = @intFromPtr(atom);
     const sid = o.props.shapeId();
     const b = propIcBucket(rt, p, pc);
-    for (b) |ic| {
-        if (ic.atom_addr == atom_addr and sid == ic.shape_id) {
-            if (ic.kind == 3) {
-                rt.heap.storeShapedSlot(o, ic.slot, val);
-                return true;
-            }
-            if (ic.kind == 4 and o.extensible) {
-                // Verify prototype chain up to 2 hops matches cached shapes (proving no Proxy / setter / non-writable prop).
-                const p1_sid: u32 = if (o.proto) |pr1| blk: {
-                    if (pr1.kind != .ordinary) return false;
-                    break :blk pr1.props.shapeId();
-                } else 0;
-                if (p1_sid != ic.proto_shape_id) continue;
-                if (o.proto) |pr1| {
-                    const p2_sid: u32 = if (pr1.proto) |pr2| blk: {
-                        if (pr2.kind != .ordinary or pr2.proto != null) return false;
-                        break :blk pr2.props.shapeId();
-                    } else 0;
-                    if (p2_sid != ic.grandproto_shape_id) continue;
-                }
-                const parent = o.props.shaped.shape orelse (rt.heap.root_shape orelse return false);
-                const next_sh = parent.findTransition(heap.PropKey.fromAtom(atom), .default) orelse return false;
-                if (next_sh.slot < heap.INLINE_SLOTS) {
-                    o.props.setShapedSlot(next_sh.slot, val);
-                    o.props.shaped.shape = next_sh;
-                    rt.heap.barrierObj(&o.obj, &atom.obj);
-                    rt.heap.barrier(&o.obj, null, val);
-                    return true;
-                }
-                return false;
-            }
-        }
-    }
-    return false;
+    if (matchSetPropIc(rt, o, atom, atom_addr, sid, val, b[0])) return true;
+    return fastSetPropPoly(rt, o, atom, atom_addr, sid, val, b);
 }
 
 noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String, old_sid: u32) void {

@@ -602,6 +602,9 @@ pub const Proto = struct {
     this_slot: ?u32 = null,
     /// Capture index of the enclosing derived constructor's `this` cell for an arrow function.
     lexical_this_capture: ?u32 = null,
+    /// Hidden local slot initialized to `new.target` at frame entry when referenced by this function
+    /// or an inner arrow (or on derived constructors to forward `new.target` across `super()`).
+    new_target_slot: ?u32 = null,
     /// How `make_closure` fills a new closure's captures, in order (empty for the script).
     captures: []const Capture = &.{},
     functions: []Proto = &.{},

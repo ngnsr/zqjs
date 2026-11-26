@@ -2342,6 +2342,15 @@ const Parser = struct {
     fn newExpr(p: *Parser) Error!*const ast.Expr {
         const start = p.tok.start;
         try p.advance();
+        if (p.tok.tag == .dot) {
+            try p.advance();
+            if (p.tok.tag != .identifier or !std.mem.eql(u8, p.tok.text(p.source()), "target")) {
+                return p.fail(.{ .syntax_error = "The only valid meta property for new is 'new.target'" }, p.tok);
+            }
+            const target_tok = p.tok;
+            try p.advance();
+            return p.members(try p.node(.{ .start = start, .end = target_tok.end }, .new_target, 0));
+        }
         if (p.depth >= p.limits.max_nesting_depth) return p.limitExceeded(p.tok.start, p.tok.end);
         p.depth += 1;
         defer p.depth -= 1;

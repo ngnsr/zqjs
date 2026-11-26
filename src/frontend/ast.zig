@@ -310,6 +310,8 @@ pub const Expr = struct {
             span: Span,
             private_ref: u32 = 0,
         },
+        /// `new.target` meta-property.
+        new_target,
         /// `import.meta` (M48, D78).
         import_meta,
         /// `import(specifier)` (M48, D78).

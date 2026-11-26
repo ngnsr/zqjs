@@ -38,6 +38,7 @@ fn listing(p: Proto, path: []u32, depth: usize, w: *Writer) Writer.Error!void {
         if (p.param_count > 0 and p.param_slot > 0) try w.print(" from s{d}", .{p.param_slot});
         if (p.captures.len > 0) try w.writeAll(", captures");
         for (p.captures) |c| try w.print(" {s}{d}", .{ if (c.from == .parent_slot) "s" else "^", c.index });
+        if (p.new_target_slot) |nts| try w.print(", new_target s{d}", .{nts});
         try w.writeByte('\n');
     }
     try w.print("slots {d}, max_stack {d}, code {d} bytes\n", .{ p.slot_count, p.max_stack, p.code.len });

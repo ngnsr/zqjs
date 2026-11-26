@@ -132,6 +132,11 @@ pub const Resolution = struct {
         this_binding: ?u32 = null,
         /// Capture index of the enclosing derived constructor's `this_binding` for an arrow function.
         lexical_this_capture: ?u32 = null,
+        /// Synthetic `new.target` binding id on a non-arrow function, lazily allocated when referenced
+        /// by this function or an inner arrow (or unconditionally for derived constructors to forward `new.target` to `super()`).
+        new_target_binding: ?u32 = null,
+        /// Capture index of the enclosing non-arrow function's `new_target_binding` for an arrow function.
+        new_target_capture: ?u32 = null,
     };
 
     pub const Capture = struct {
@@ -224,6 +229,7 @@ const FnState = struct {
     var_bindings: std.ArrayList(u32) = .empty,
     arguments_binding: ?u32 = null,
     this_binding: ?u32 = null,
+    new_target_binding: ?u32 = null,
 };
 
 const PrivateDecl = struct {
@@ -293,6 +299,11 @@ const Resolver = struct {
             r.bindings.items[tb].slot = f.max_slots;
             f.max_slots += 1;
             r.functions[f.id].this_binding = tb;
+        }
+        if (f.new_target_binding) |ntb| {
+            r.bindings.items[ntb].slot = f.max_slots;
+            f.max_slots += 1;
+            r.functions[f.id].new_target_binding = ntb;
         }
         r.functions[f.id].slot_count = f.max_slots;
         r.functions[f.id].captures = f.captures.items;
@@ -817,6 +828,9 @@ const Resolver = struct {
         if (name_scope != null) try r.declare(f.name.?, .function_name, false, true, null);
         const param_saved = try r.enterScope();
         r.functions[f.id].param_scope = r.scope;
+        if (f.has_super_ctor) {
+            _ = try r.ensureNewTargetBinding(r.fns.items.len - 1);
+        }
         const is_simple = for (f.params) |p| {
             if (p.pattern.data != .binding or p.default != null or p.is_rest) break false;
         } else true;
@@ -925,6 +939,7 @@ const Resolver = struct {
                 try r.resolvePrivate(pi.name, pi.private_ref, pi.span);
                 try r.expr(pi.rhs);
             },
+            .new_target => try r.resolveNewTarget(e.span),
             .import_meta => {},
             .dynamic_import => |spec| try r.expr(spec),
         }
@@ -957,6 +972,42 @@ const Resolver = struct {
         const cap_idx = try r.captureIndex(cur_level, tb);
         r.functions[r.current().id].lexical_this_capture = cap_idx;
         r.functions[r.current().id].this_binding = tb;
+    }
+
+    fn ensureNewTargetBinding(r: *Resolver, owner_idx: usize) Error!u32 {
+        const owner = &r.fns.items[owner_idx];
+        return owner.new_target_binding orelse blk: {
+            const ps = r.functions[owner.id].param_scope.?;
+            const scope = &r.scopes.items[ps];
+            const new_id: u32 = @intCast(r.bindings.items.len);
+            try r.bindings.append(r.arena, .{
+                .kind = .@"const",
+                .slot = 0, // assigned in finishFunction after max_slots settles
+                .scope = ps,
+                .index = scope.len,
+                .function = owner.id,
+            });
+            scope.len += 1;
+            owner.new_target_binding = new_id;
+            r.functions[owner.id].new_target_binding = new_id;
+            break :blk new_id;
+        };
+    }
+
+    fn resolveNewTarget(r: *Resolver, s: ast.Span) Error!void {
+        var owner_idx = r.fns.items.len - 1;
+        while (owner_idx > 0 and r.fns.items[owner_idx].is_arrow) : (owner_idx -= 1) {}
+        if (owner_idx == 0) {
+            return r.fail(.{ .syntax_error = "new.target expression is not allowed here" }, s);
+        }
+        const ntb = try r.ensureNewTargetBinding(owner_idx);
+        const cur_level = r.fns.items.len - 1;
+        if (owner_idx != cur_level) {
+            r.bindings.items[ntb].captured = true;
+            const cap_idx = try r.captureIndex(cur_level, ntb);
+            r.functions[r.current().id].new_target_capture = cap_idx;
+            r.functions[r.current().id].new_target_binding = ntb;
+        }
     }
 
     fn declareSynthetic(r: *Resolver, name: []const u8, kind: Resolution.BindingKind) Error!u32 {

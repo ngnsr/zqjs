@@ -2277,10 +2277,15 @@ const Machine = struct {
                 const r = try builtins.realm(rt);
                 const instance = try rt.heap.newObject(if (proto_val.isObject()) proto_val.asObject() else r.object_prototype);
                 const init_this: ?Value = if (f.has_super_ctor) null else Value.fromObject(instance);
-                try m.pushClosureCallSync(tc, f, t.env, init_this, args_base, args_base - 1, instance, false);
+                try m.pushClosureCallSync(tc, f, t.env, init_this, args_base, args_base - 1, instance, false, new_target);
             },
             .invoke_super_call => |args_base| {
                 const cur_closure = m.current_closure orelse return rt.bug("super() without closure");
+                const cur_func = m.current_func orelse return rt.bug("super() without function");
+                const super_new_target: Value = if (m.res.functions[cur_func.id].new_target_binding) |ntb|
+                    m.load(ntb) orelse return rt.bug("uninitialized new.target binding")
+                else
+                    Value.fromClosure(cur_closure);
                 var target = try object.getPrototypeOfValue(rt, Value.fromClosure(cur_closure));
                 if (target.isClosure() and target.asClosure().impl == .bound) {
                     const b = target.asClosure().impl.bound;
@@ -2294,7 +2299,7 @@ const Machine = struct {
                 }
                 const inst = m.construct_instance orelse return rt.bug("super() without construct_instance");
                 if (target.isObject()) {
-                    const res_v = try builtins.callProxyConstruct(rt, target.asObject(), m.values.items[args_base..], Value.fromClosure(cur_closure));
+                    const res_v = try builtins.callProxyConstruct(rt, target.asObject(), m.values.items[args_base..], super_new_target);
                     if (m.this != null) {
                         return rt.throw(.ReferenceError, &.{.{ .ascii = "Super constructor may only be called once" }});
                     }
@@ -2332,7 +2337,7 @@ const Machine = struct {
                 const t = tc.impl.tree;
                 const f: *const ast.Function = @ptrCast(@alignCast(t.func));
                 const init_this: ?Value = if (f.has_super_ctor) null else Value.fromObject(inst);
-                try m.pushClosureCallSync(tc, f, t.env, init_this, args_base, args_base, inst, true);
+                try m.pushClosureCallSync(tc, f, t.env, init_this, args_base, args_base, inst, true, super_new_target);
             },
             .call_bind_param => |bp| {
                 const p = bp.func.params[bp.idx];
@@ -3475,6 +3480,13 @@ const Machine = struct {
                 try m.pushTask(.{ .private_in_finish = .{ .name = pi.name, .private_ref = pi.private_ref } });
                 try m.pushEval(pi.rhs);
             },
+            .new_target => {
+                const cf = m.current_func orelse return rt.bug("new.target outside function");
+                const ntb = m.res.functions[cf.id].new_target_binding orelse return rt.bug("new.target without binding");
+                const v = m.load(ntb) orelse return rt.bug("uninitialized new.target binding");
+                m.depth -= 1;
+                try m.pushVal(v);
+            },
             .import_meta => {
                 const mod_ptr = m.module_record orelse return rt.bug("import.meta outside a module");
                 const meta_obj = try module.getImportMeta(rt, @ptrCast(@alignCast(mod_ptr)));
@@ -3712,10 +3724,10 @@ const Machine = struct {
             try m.pushVal(p);
             return;
         }
-        return m.pushClosureCallSync(closure, f, t.env, this, args_base, result_base, null, false);
+        return m.pushClosureCallSync(closure, f, t.env, this, args_base, result_base, null, false, .undefined);
     }
 
-    fn pushClosureCallSync(m: *Machine, closure: *const heap.Closure, f: *const ast.Function, env: ?*Env, this: ?Value, args_base: usize, result_base: usize, construct_instance: ?*heap.Object, is_super_call: bool) Error!void {
+    fn pushClosureCallSync(m: *Machine, closure: *const heap.Closure, f: *const ast.Function, env: ?*Env, this: ?Value, args_base: usize, result_base: usize, construct_instance: ?*heap.Object, is_super_call: bool, new_target: Value) Error!void {
         if (m.calls >= m.rt.limits.max_call_depth) return m.rt.limit(.call_depth);
         try m.enter();
         m.calls += 1;
@@ -3754,6 +3766,9 @@ const Machine = struct {
         if (m.res.functions[f.id].param_scope) |ps| {
             if (m.res.scopes[ps].len > 0) _ = try m.pushScope(ps);
         }
+        if (!f.is_arrow) if (m.res.functions[f.id].new_target_binding) |ntb| {
+            m.store(ntb, new_target);
+        };
         if (m.res.functions[f.id].arguments_binding) |ab| {
             const arg_obj = try builtins.newArgumentsObject(m.rt, m.values.items[args_base..]);
             m.store(ab, Value.fromObject(arg_obj));
@@ -3809,7 +3824,7 @@ const Machine = struct {
         try m.pushTask(.{ .barrier = @intCast(values_base) });
         const args_base = m.values.items.len;
         try m.values.appendSlice(m.rt.gpa, args);
-        try m.pushClosureCallSync(closure, f, t.env, init_this, args_base, values_base, instance, false);
+        try m.pushClosureCallSync(closure, f, t.env, init_this, args_base, values_base, instance, false, new_target);
         _ = try m.runLoop(stop_len);
         return m.popVal();
     }
@@ -3848,7 +3863,7 @@ const Machine = struct {
         try m.pushTask(.{ .barrier = @intCast(values_base) });
         const args_base = m.values.items.len;
         try m.values.appendSlice(m.rt.gpa, args);
-        try m.pushClosureCallSync(closure, f, t.env, this, args_base, values_base, null, false);
+        try m.pushClosureCallSync(closure, f, t.env, this, args_base, values_base, null, false, .undefined);
         // Run until `.barrier` is reached (either via normal return from `call_return`
         // or via `unwind` hitting `.barrier`).
         _ = try m.runLoop(stop_len);
@@ -3905,7 +3920,7 @@ const Machine = struct {
         m_ptr.module_record = t.module_record;
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
         try m_ptr.values.appendSlice(rt.gpa, ctx.args);
-        try m_ptr.pushClosureCallSync(ctx.closure, f, t.env, ctx.this, 0, 0, null, false);
+        try m_ptr.pushClosureCallSync(ctx.closure, f, t.env, ctx.this, 0, 0, null, false, .undefined);
         co.engine = m_ptr;
         co.state = .running;
         return runCoroMachine(m_ptr, ctx.caller.calls, ctx.caller.depth, .start);

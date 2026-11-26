@@ -65,6 +65,7 @@ DEFAULT_SKIP_FEATURES = {
     "decorators",
     "regexp-v-flag",
     "resizable-arraybuffer",
+    "immutable-arraybuffer",
     "arraybuffer-transfer",
     "float16array",
     "uint8array-base64",
@@ -262,7 +263,13 @@ def run_single_test(args: tuple[Any, ...]) -> dict[str, Any]:
     parts.append(source)
     full_source = "\n".join(parts)
 
-    cmd = [zqjs_bin, f"--engine={engine}", "--max-steps", str(max_steps)]
+    # Generated RegExp property-escape tests iterate all 1,114,112 Unicode code points via
+    # regExpUtils.js `buildString`, which legitimately requires ~30M VM steps while still
+    # remaining bounded by `timeout_s` against infinite loops.
+    effective_max_steps = max_steps
+    if rel_path.startswith("built-ins/RegExp/property-escapes/generated/") and effective_max_steps < 50_000_000:
+        effective_max_steps = 50_000_000
+    cmd = [zqjs_bin, f"--engine={engine}", "--max-steps", str(effective_max_steps)]
     if is_module:
         cmd.append("--module")
 

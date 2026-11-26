@@ -3,10 +3,13 @@
 //! and piped non-TTY fallback (D71).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const posix = std.posix;
 const complete = @import("complete.zig");
+
+const has_posix_tty = builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding;
 
 pub const ReadResult = union(enum) {
     line: []const u8,
@@ -31,15 +34,17 @@ pub const EditorConfig = struct {
     highlight_fn: ?HighlightFn = null,
 };
 
-var saved_termios_fd: ?posix.fd_t = null;
-var saved_termios: posix.termios = undefined;
+const PosixTermios = if (has_posix_tty) struct {
+    var saved_fd: ?posix.fd_t = null;
+    var saved_termios: posix.termios = undefined;
 
-fn restoreTermiosSignalHandler(_: posix.SIG) callconv(.c) void {
-    if (saved_termios_fd) |fd| {
-        posix.tcsetattr(fd, .FLUSH, saved_termios) catch {};
+    fn restoreSignalHandler(_: posix.SIG) callconv(.c) void {
+        if (saved_fd) |fd| {
+            posix.tcsetattr(fd, .FLUSH, saved_termios) catch {};
+        }
+        std.process.exit(130);
     }
-    std.process.exit(130);
-}
+} else struct {};
 
 pub const LineEditor = struct {
     gpa: Allocator,
@@ -104,19 +109,29 @@ pub const LineEditor = struct {
     }
 
     pub fn isTty() bool {
+        if (comptime !has_posix_tty) return false;
         var term: posix.termios = undefined;
         return posix.errno(posix.system.tcgetattr(posix.STDIN_FILENO, &term)) == .SUCCESS;
     }
 
-    /// Reads one line from stdin (raw mode if TTY, plain line-by-line if piped).
+    /// Reads one line from stdin (raw mode if POSIX TTY, plain line-by-line if piped or non-POSIX).
     pub fn readLine(ed: *LineEditor, prompt: []const u8, out: *Writer) !ReadResult {
+        if (comptime !has_posix_tty) {
+            if (ed.config.io) |io| {
+                if (prompt.len > 0 and (std.Io.File.stdin().isTty(io) catch false)) {
+                    try out.writeAll(prompt);
+                    try out.flush();
+                }
+            }
+            return ed.readPiped(out);
+        }
         if (!isTty()) {
             return ed.readPiped(out);
         }
         const fd = posix.STDIN_FILENO;
         const orig = try posix.tcgetattr(fd);
-        saved_termios = orig;
-        saved_termios_fd = fd;
+        PosixTermios.saved_termios = orig;
+        PosixTermios.saved_fd = fd;
 
         var raw = orig;
         raw.iflag.BRKINT = false;
@@ -136,11 +151,11 @@ pub const LineEditor = struct {
         try posix.tcsetattr(fd, .NOW, raw);
         defer {
             posix.tcsetattr(fd, .NOW, orig) catch {};
-            saved_termios_fd = null;
+            PosixTermios.saved_fd = null;
         }
 
         const sa: posix.Sigaction = .{
-            .handler = .{ .handler = restoreTermiosSignalHandler },
+            .handler = .{ .handler = PosixTermios.restoreSignalHandler },
             .mask = posix.sigemptyset(),
             .flags = 0,
         };
@@ -158,6 +173,11 @@ pub const LineEditor = struct {
     }
 
     fn readPiped(ed: *LineEditor, _: *Writer) !ReadResult {
+        if (comptime !has_posix_tty) {
+            const io = ed.config.io orelse return .eof;
+            var stdin_reader: IoStdinReader = .{ .io = io };
+            return ed.readPipedFromStream(stdin_reader.interface());
+        }
         var fd_reader: FdReader = .{ .fd = posix.STDIN_FILENO };
         return ed.readPipedFromStream(fd_reader.interface());
     }
@@ -542,7 +562,7 @@ fn printColumns(matches: []const []const u8, out: *Writer) Writer.Error!void {
     }
 }
 
-const FdReader = struct {
+const FdReader = if (has_posix_tty) struct {
     fd: posix.fd_t,
 
     fn readByteFn(ctx: *anyopaque) anyerror!?u8 {
@@ -554,6 +574,27 @@ const FdReader = struct {
     }
 
     fn interface(self: *FdReader) ByteReader {
+        return .{ .ctx = self, .read_byte = readByteFn };
+    }
+} else struct {};
+
+const IoStdinReader = struct {
+    io: std.Io,
+
+    fn readByteFn(ctx: *anyopaque) anyerror!?u8 {
+        const self: *IoStdinReader = @ptrCast(@alignCast(ctx));
+        const stdin = std.Io.File.stdin();
+        var byte: [1]u8 = undefined;
+        while (true) {
+            const n = stdin.readStreaming(self.io, &.{&byte}) catch |e| switch (e) {
+                error.EndOfStream => return null,
+                else => return e,
+            };
+            if (n > 0) return byte[0];
+        }
+    }
+
+    fn interface(self: *IoStdinReader) ByteReader {
         return .{ .ctx = self, .read_byte = readByteFn };
     }
 };

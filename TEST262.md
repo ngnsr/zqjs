@@ -43,37 +43,40 @@ ZQJS includes a parallel [tc39/test262](https://github.com/tc39/test262) conform
 
 ---
 
-## Results (M67 — Classes `99.91%`/`99.75%`, Promise `98.89%`, `JSON.parse` `100%`, `Error.prototype.stack`, `Number` Exact Decimal Rounding, `TypedArray`/`DataView`, Built-ins Wave 1 + Parser `CoverInitializedName`/`super`)
+## Results (M68 — `99.13%` Applicable, `90.68%` Executed, `36,018` PASS, `0` Internal Errors)
 
-Measured at `7b21167` with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
+Measured at `238babd` with `zig build cli -Doptimize=ReleaseFast`, `--engine=vm`, `--mode=nonstrict`:
 
 | Suite | Collected | Skipped (meta) | Executed | Unsupported | Limit | Applicable | Pass | Fail | Pass / Executed | Pass / Applicable |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `built-ins` | 23,885 | 6,981 | 16,904 | 1,408 | 467 | 15,029 | **14,688** | 341 | **86.89%** | **97.73%** |
-| `language` | 23,832 | 968 | 22,864 | 2,127 | 1 | 20,736 | **20,500** | 236 | **89.66%** | **98.86%** |
-| **Combined** | **47,717** | **7,949** | **39,768** | **3,535** | **468** | **35,765** | **35,188** | **577** | **88.48%** | **98.39%** |
+| `built-ins` | 23,885 | 7,029 | 16,856 | 1,240 | 28 | 15,588 | **15,390** | 198 | **91.30%** | **98.73%** |
+| `language` | 23,832 | 968 | 22,864 | 2,116 | 1 | 20,747 | **20,628** | 119 | **90.22%** | **99.43%** |
+| **Combined** | **47,717** | **7,997** | **39,720** | **3,356** | **29** | **36,335** | **36,018** | **317** | **90.68%** | **99.13%** |
 
-- **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,768 executed tests.
-- Building on M64 (`34,595` PASS, `972` FAIL), splitting `src/runtime/builtins.zig` into 12 submodules and landing conformance waves across Classes (`statements/class` `99.91%`, `expressions/class` `99.75%`), Promise (`98.89%`), `JSON.parse` (`100%`), `Error.prototype.stack`, `Number.prototype.{toFixed,toExponential,toPrecision}` exact decimal rounding, `TypedArray`/`DataView`, Array/Function/`%ThrowTypeError%`/Object/Proxy/RegExp/String, and parser `CoverInitializedName`/`super` unlocked **+593** net passes (`34,595 → 35,188`, **98.39%** Pass / Applicable, **88.48%** Pass / Executed, failures slashed **-40.6%** from `972 → 577`).
+- **0 internal errors** (`exit=70` / crashes) and **0 timeouts** across all 39,720 executed tests.
+- Of the 317 remaining failures, **173** are `$262.createRealm` (`167`) / `$262.evalScript` (`6`) host-hook stubs — leaving only **144 real spec failures** (`50` in `built-ins`, `94` in `language`) across the entire 39,720-test run.
+- Building on M67 (`35,188` PASS, `577` FAIL), M68 landed 11 conformance & runtime waves — materialized global `prop-desc` + complete `Math` (`317/317`, 100%), `Promise`/`Function`/`Symbol` conformance, `Date` sub-minute LMT timezone offsets + `JSON.stringify` GC rooting, ES2025 cyclic module/TLA evaluation + `--preload`, `language/expressions` (`ToPropertyKey` once, `SetFunctionName`, `super` null-proto, frozen tagged templates, optional-chaining `this`), `for-of`/`for-in` head grammar, `RegExp` Unicode 17.0 property-escape tables (`100%`), `TypedArray` callable iterables & `DataView` detached `byteOffset`, incompatible array/regexp/iterator receiver checks, and allocation-free custom thrown error formatting (`line-terminators` `32/32`, 100%) — unlocking **+830** net passes (`35,188 → 36,018`, **99.13%** Pass / Applicable, **90.68%** Pass / Executed, failures cut **-45.1%** from `577 → 317`).
 
 ### Built-ins Breakdown (Applicable Tests)
 
-- **100.0%:** `AggregateError` (3/3), `Array` (197/197), `ArrayBuffer` (13/13), `AsyncFromSyncIteratorPrototype` (1/1), `AsyncFunction` (1/1), `BigInt` (29/29), `Error` (15/15), `GeneratorPrototype` (3/3), `Infinity` (1/1), `JSON` (47/47), `Map` (27/27), `Math` (120/120), `NaN` (1/1), `NativeErrors` (36/36), `Object` (258/258), `Proxy` (17/17), `Reflect` (40/40), `Set` (18/18), `String` (216/216), `WeakMap` (14/14), `WeakSet` (12/12), `global` (4/4), `isFinite` (6/6), `isNaN` (6/6), `parseFloat` (45/45), `parseInt` (34/34).
-- **90–99%:** `Number` (161/164, 98.2%), `RegExp` (295/301, 98.0%), `DataView` (27/28, 96.4%), `decodeURIComponent` (11/12, 91.7%), `decodeURI` (10/11, 90.9%), `Promise` (152/168, 90.5%).
-- **< 90%:** `TypedArrayConstructors` (33/37, 89.2%), `encodeURI` (8/9, 88.9%), `encodeURIComponent` (8/9, 88.9%), `Function` (38/44, 86.4%), `Symbol` (13/16, 81.2%), `TypedArray` (1/4, 25.0%), `Iterator` (0/2, 0.0%).
+- **100.0%:** `AsyncFunction` (5/5), `AsyncIteratorPrototype` (4/4), `GeneratorPrototype` (61/61), `Infinity` (5/5), `MapIteratorPrototype` (11/11), `Math` (317/317), `NaN` (5/5), `Reflect` (152/152), `SetIteratorPrototype` (11/11), `decodeURI` (54/54), `decodeURIComponent` (55/55), `encodeURI` (30/30), `encodeURIComponent` (30/30), `isFinite` (15/15), `isNaN` (15/15), `parseFloat` (54/54), `parseInt` (55/55), `undefined` (6/6).
+- **99.0–99.9%:** `TypedArray` (1,212/1,213, 99.9%), `Promise` (631/632, 99.8%), `Iterator` (401/402, 99.8%), `Number` (332/333, 99.7%), `String` (1,117/1,121, 99.6%), `DataView` (478/480, 99.6%), `Date` (599/602, 99.5%), `Set` (289/291, 99.3%), `Array` (2,680/2,699, 99.3%), `RegExp` (1,505/1,516, 99.3%), `Map` (127/128, 99.2%), `Object` (3,080/3,109, 99.1%).
+- **90.0–98.9%:** `WeakMap` (90/91, 98.9%), `ArrayBuffer` (78/79, 98.7%), `WeakSet` (77/78, 98.7%), `BigInt` (75/76, 98.7%), `JSON` (138/140, 98.6%), `Boolean` (46/47, 97.9%), `TypedArrayConstructors` (644/667, 96.6%), `ArrayIteratorPrototype` (26/27, 96.3%), `AggregateError` (22/23, 95.7%), `Function` (243/256, 94.9%), `global` (18/19, 94.7%), `AsyncGeneratorPrototype` (45/48, 93.8%), `NativeErrors` (80/86, 93.0%), `ThrowTypeError` (13/14, 92.9%), `Error` (63/68, 92.6%), `AsyncFromSyncIteratorPrototype` (35/38, 92.1%).
+- **< 90% (primarily `$262.createRealm`):** `RegExpStringIteratorPrototype` (15/17, 88.2%), `Proxy` (261/298, 87.6% — 36 `createRealm`), `Symbol` (74/89, 83.1% — 15 `createRealm`), `GeneratorFunction` (3/4, 75.0%), `AsyncGeneratorFunction` (3/4, 75.0%), `StringIteratorPrototype` (5/7, 71.4%), `eval` (0/1, 0.0%).
 
 ---
 
 ## Remaining Spec Edge Cases for Future Improvements
 
-### Runtime & Built-ins
-1. **`Number.prototype.{toFixed, toExponential, toPrecision}`** (`S15.7.4_A3.5.js`..`A3.7.js`): not yet implemented.
-2. **`Promise` combinators (`Object.defineProperty` on `Promise` / `C`)**: `Promise` constructor is a `.native` function, so `Object.defineProperty(Promise, "resolve", ...)` fails with `Object.defineProperty called on non-object` (`function_properties`).
-3. **`Function.prototype.bind`** (`instance-length-exceeds-int32.js`, `instance-length-tointeger.js`): `length` clamping / `ToIntegerOrInfinity` edge cases.
-4. **Host test hooks**: `$262.createRealm` / `$262.detachArrayBuffer` (`class-ctor-realm.js`, `detached-buffer.js`).
+### Host Test Hooks (173 of 317 failures)
+1. **`$262.createRealm` (167) & `$262.evalScript` (6)**: cross-realm prototype checks (`proto-from-ctor-realm`) and `evalScript` host hooks are not implemented in the CLI stub.
 
-### Parser & Static Semantics (`language`)
-5. **`dynamic-import` & self-importing module tests**: tests that self-import `./<self>.js` cannot see the harness injected into the temporary entry module without a native `--preload` flag in `zqjs`.
-6. **Generator / async-generator / destructuring `yield` & `eval` early errors**: `param-dflt-yield-id-strict.js`, `early-errors-expression-binding-identifier-eval.js`, and destructuring assignment `yield` checks.
-7. **Computed static `"prototype"` method on classes**: `computed-property-names/class/static/*-prototype.js` should throw `TypeError` when redefining non-configurable `C.prototype`.
-8. **Unicode line terminators (`U+2028`/`U+2029`) in `for-await-of` / destructuring shorthand**: remaining `for-await-of` destructuring edge cases.
+### Runtime & Built-ins (50 real failures + `defineProperty` on array indices)
+2. **`Object.defineProperty` / `getOwnPropertyDescriptor` & Annex B (`built-ins/Object`, 28 fails)**: array-element descriptor overrides (`410` `Unsupported(builtin): defineProperty` in `built-ins/`), non-configurable property edge cases, and intentionally excluded Annex B `__defineGetter__`/`__lookupGetter__`/`__proto__`.
+3. **`AsyncGeneratorPrototype.return` (3) & `AsyncFromSyncIteratorPrototype` (3)**: broken-promise / poisoned-wrapper rejection edge cases.
+4. **Tail built-ins (~16 fails total)**: `Array.from`/`length` coercion (3), `RegExpStringIteratorPrototype`/`StringIteratorPrototype` (4), `TypedArrayConstructors/internals/Set` OOB receiver (1), `DataView.prototype.byteLength` detached (1, matches Node 26 `TypeError` vs ES2026 `0`).
+
+### Language & Modules (94 real failures)
+5. **`language/module-code` (30 fails)**: module namespace exotic internal methods (`define-own-property`, `delete-non-exported`, `has-property-str-found-uninit`) and remaining cyclic/live-binding edge cases.
+6. **`language/arguments-object` (29 fails)**: sloppy-mode mapped `arguments` aliasing (`21` tests; ZQJS currently implements unmapped `arguments`).
+7. **`language/statements` (13), `language/expressions` (12), `language/global-code` (8)**: remaining `for-await-of` microtask tick ordering, parser `fn-name-lhs-cover`, private fields on non-extensible return-override objects, and sloppy global `var`/function declaration re-declaration rules.

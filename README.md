@@ -6,10 +6,10 @@ Designed for host-controlled scripting (games, plugins, tools, sandboxed automat
 
 ## Highlights
 
-- **Faster than QuickJS (`0.74×` geomean, 10 of 11 benchmarks faster):** Pure bytecode interpreter (no JIT / no RWX) with 8-byte NaN-boxed values, 64-byte frames, Shapes (hidden classes), inline caches, and fused superinstructions.
+- **Faster than QuickJS (`0.73×` geomean, 10 of 11 benchmarks faster):** Pure bytecode interpreter (no JIT / no RWX) with 8-byte NaN-boxed values, 64-byte frames, Shapes (hidden classes), inline caches, slab-pooled heap allocation, and fused superinstructions.
 - **Zero dependencies & compact footprint:** Pure Zig (`0.17.1`), `2.2 MB` stripped `ReleaseFast` CLI (`1.5 MB` `ReleaseSmall`). Embedders (`@import("zqjs")` / `libzqjs.a`) link only the engine.
 - **Modern JavaScript (ES2025 core):** Classes & private fields, closures, generators, `async`/`await`, ES Modules, `BigInt`, `Symbol`, `Proxy`/`Reflect`, `Map`/`Set`/`WeakMap`/`WeakSet`, `ArrayBuffer`/`TypedArray`/`DataView`, `RegExp`, `Date`, `Promise`, `JSON`, and `structuredClone` ([LANGUAGE.md](LANGUAGE.md)).
-- **Explicit Compatibility Contract & Test262 Verified:** Unsupported features report `Unsupported(<feature>)` cleanly instead of silently misbehaving. Verified against **39,768 Test262 tests** (**`35,188` PASS** — `89.66%` of all `language` tests, `86.89%` of `built-ins`, **`98.39%`** of applicable tests, **0 crashes / 0 internal errors / 0 timeouts** — [TEST262.md](TEST262.md)).
+- **Explicit Compatibility Contract & Test262 Verified:** Unsupported features report `Unsupported(<feature>)` cleanly instead of silently misbehaving. Verified against **39,720 Test262 tests** (**`36,018` PASS** — `91.30%` of all `built-ins` tests, `90.22%` of `language`, **`90.68%`** overall, **`99.13%`** of applicable tests, **0 crashes / 0 internal errors / 0 timeouts** — [TEST262.md](TEST262.md)).
 - **Generational GC & Hard Sandboxing:** Non-moving generational GC (~0.06 ms p95 minor pauses at 100k–1M live objects), cooperative step slicing, and hard caps on heap, call depth, stack, strings, and `BigInt` ([GC_DESIGN.md](GC_DESIGN.md)).
 - **Embeddable & Interactive:** Opaque Zig API, C11 ABI (`include/zqjs.h`), differential tree-walker oracle (`--engine=treewalk`), and an interactive REPL with syntax highlighting, `Tab` completion, and `Ctrl-R` history.
 
@@ -30,23 +30,23 @@ CLI-to-CLI end-to-end medians (startup + parse + compile + execute, 11 alternati
 
 | Benchmark | ZQJS med | QuickJS med | Ratio (`zqjs/qjs`) |
 |---|---:|---:|---:|
-| `closures.js` | **48.9 ms** | 123.9 ms | **`0.39×`** (2.5× faster) |
-| `branch_dense.js` | **61.0 ms** | 104.8 ms | **`0.58×`** (42% faster) |
-| `int_loop.js` | **42.6 ms** | 69.1 ms | **`0.62×`** (38% faster) |
-| `scopes.js` | **24.4 ms** | 35.3 ms | **`0.69×`** (31% faster) |
-| `float_math.js` | **93.6 ms** | 133.4 ms | **`0.70×`** (30% faster) |
-| `fib.js` | **25.7 ms** | 33.2 ms | **`0.78×`** (22% faster) |
-| `global_reads.js` | **21.4 ms** | 24.5 ms | **`0.88×`** (12% faster) |
-| `arrays.js` | **148.6 ms** | 165.9 ms | **`0.90×`** (10% faster) |
-| `call_chain.js` | **47.2 ms** | 50.8 ms | **`0.93×`** (7% faster) |
-| `objects.js` | **30.9 ms** | 31.7 ms | **`0.97×`** (3% faster) |
-| `strings.js` | 12.2 ms | **12.1 ms** | `1.01×` |
-| **Geometric mean** | — | — | **`0.74×`** |
+| `closures.js` | **46.0 ms** | 122.0 ms | **`0.38×`** (2.6× faster) |
+| `branch_dense.js` | **60.0 ms** | 104.2 ms | **`0.58×`** (42% faster) |
+| `int_loop.js` | **42.1 ms** | 67.9 ms | **`0.62×`** (38% faster) |
+| `scopes.js` | **24.1 ms** | 34.9 ms | **`0.69×`** (31% faster) |
+| `float_math.js` | **94.8 ms** | 133.8 ms | **`0.71×`** (29% faster) |
+| `strings.js` | **8.6 ms** | 11.5 ms | **`0.75×`** (25% faster) |
+| `fib.js` | **26.3 ms** | 32.8 ms | **`0.80×`** (20% faster) |
+| `call_chain.js` | **45.8 ms** | 50.5 ms | **`0.91×`** (9% faster) |
+| `arrays.js` | **151.7 ms** | 165.3 ms | **`0.92×`** (8% faster) |
+| `global_reads.js` | **22.6 ms** | 24.1 ms | **`0.94×`** (6% faster) |
+| `objects.js` | 32.0 ms | **31.8 ms** | `1.01×` |
+| **Geometric mean** | — | — | **`0.73×`** |
 
 **C-ABI embedding throughput (`zig build bench-c`):**
-- `js_to_c_native`: **7.3M–8.3M calls/s** (~120–137 ns/call)
-- `host_js_c_js_roundtrip`: **~4.0M round-trips/s** (~252 ns/trip)
-- `frame_loop_3600` (3,600 game frames): **`11.0 µs` p50** / `12.0 µs` p95 per frame, `141 KiB` live heap
+- `js_to_c_native`: **~7.37M calls/s** (~136 ns/call)
+- `host_js_c_js_roundtrip`: **~4.14M round-trips/s** (~242 ns/trip)
+- `frame_loop_3600` (3,600 game frames): **`17.0 µs` p50** / `18.0 µs` p95 per frame, **`21.0 µs`** max GC pause
 
 ---
 
@@ -171,8 +171,8 @@ zig build raylib-demo    # interactive GUI window (requires Raylib)
 
 - [EMBEDDING.md](EMBEDDING.md) — Zig & C11 embedding API (lifecycle, handles, step slices, modules, errors)
 - [LANGUAGE.md](LANGUAGE.md) — supported JavaScript subset and Node compatibility contract
-- [TEST262.md](TEST262.md) — ECMAScript Test262 conformance runner and results (39,768 executed tests, `35,188` PASS)
-- [PERF_PLAN.md](PERF_PLAN.md) — performance architecture, M52–M65 progression (`0.74×` QuickJS geomean), and why JIT is deferred
+- [TEST262.md](TEST262.md) — ECMAScript Test262 conformance runner and results (39,720 executed tests, `36,018` PASS, `99.13%` applicable)
+- [PERF_PLAN.md](PERF_PLAN.md) — performance architecture, M52–M68 progression (`0.73×` QuickJS geomean), and why JIT is deferred
 - [ARCHITECTURE.md](ARCHITECTURE.md) — module layout and ownership
 - [GC_DESIGN.md](GC_DESIGN.md) — generational collector, card tables, ephemerons, and verification
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — architectural decision log (D1–D89)

@@ -3,7 +3,7 @@
 
 // Generates src/regex_unicode.bin and src/regex_unicode.zig directly from
 // Node.js's RegExp engine so Unicode property escapes and /i case folding
-// match Node v26 exactly.
+// match the host Node.js Unicode tables exactly.
 
 const fs = require("fs");
 const path = require("path");
@@ -383,6 +383,11 @@ const scEntries = []; // [name, tableIdx]
 const scxEntries = []; // [name, tableIdx]
 for (const aliases of SCRIPT_CODES) {
   const canon = aliases[0];
+  try {
+    new RegExp(`\\p{sc=${canon}}`, "u");
+  } catch {
+    continue;
+  }
   const scTid = internRanges(extractRanges(`sc=${canon}`));
   const scxTid = internRanges(extractRanges(`scx=${canon}`));
   for (const a of aliases) {

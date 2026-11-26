@@ -1,0 +1,185 @@
+# Cross-compiles release binaries and C embedding archives for all platforms
+# from a single Linux runner on `v*` tags (or manual dry runs via workflow_dispatch).
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Dry-run version label (builds & uploads workflow artifacts only; does not publish a GitHub Release)"
+        required: false
+        default: "dev"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            target: aarch64-macos
+            optimize: ReleaseFast
+            archive: tar.gz
+            smoke: none
+          - name: macos-x86_64
+            target: x86_64-macos
+            optimize: ReleaseFast
+            archive: tar.gz
+            smoke: none
+          - name: linux-x86_64
+            target: x86_64-linux-musl
+            optimize: ReleaseFast
+            archive: tar.gz
+            smoke: native
+          - name: linux-arm64
+            target: aarch64-linux-musl
+            optimize: ReleaseFast
+            archive: tar.gz
+            smoke: none
+          - name: windows-x86_64
+            target: x86_64-windows
+            optimize: ReleaseFast
+            archive: zip
+            smoke: none
+          - name: wasm32-wasi
+            target: wasm32-wasi
+            optimize: ReleaseSmall
+            archive: tar.gz
+            smoke: wasi
+    steps:
+      - uses: actions/checkout@v4
+
+      # Exact toolchain pin (DESIGN_DECISIONS D17); build.zig refuses other versions.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+          cache-key: release-${{ matrix.name }}
+
+      - if: matrix.smoke == 'wasi'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build & package ${{ matrix.name }}
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          MAT_NAME: ${{ matrix.name }}
+          MAT_TARGET: ${{ matrix.target }}
+          MAT_OPTIMIZE: ${{ matrix.optimize }}
+          MAT_ARCHIVE: ${{ matrix.archive }}
+          MAT_SMOKE: ${{ matrix.smoke }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="${INPUT_TAG:-dev}"
+          fi
+          case "$VERSION" in
+            *[!a-zA-Z0-9._-]*|"")
+              echo "Invalid version label: $VERSION" >&2
+              exit 1
+              ;;
+          esac
+
+          PKG="zqjs-${VERSION}-${MAT_NAME}"
+          STAGE="dist/${PKG}"
+          mkdir -p "$STAGE" out
+
+          zig build -j4 \
+            -Dtarget="$MAT_TARGET" \
+            -Doptimize="$MAT_OPTIMIZE" \
+            -Dstrip=true \
+            --prefix "$PWD/$STAGE" \
+            --summary all
+
+          cp LICENSE "$STAGE/LICENSE"
+          ls -lh "$STAGE/bin" "$STAGE/lib" "$STAGE/include"
+
+          if [ "$MAT_SMOKE" = "native" ]; then
+            out=$("$STAGE/bin/zqjs" -e 'print("ok", 2 + 2);')
+            test "$out" = "ok 4"
+          elif [ "$MAT_SMOKE" = "wasi" ]; then
+            node --no-warnings -e '
+              const fs = require("fs");
+              const { WASI } = require("node:wasi");
+              (async () => {
+                const wasm = await WebAssembly.compile(fs.readFileSync(process.argv[1]));
+                const wasi = new WASI({ version: "preview1", args: ["zqjs", "-e", "print(\"ok\", 2 + 2);"] });
+                const inst = await WebAssembly.instantiate(wasm, wasi.getImportObject());
+                const rc = wasi.start(inst);
+                if (rc !== 0) process.exit(rc);
+              })();
+            ' "$STAGE/bin/zqjs.wasm"
+          fi
+
+          if [ "$MAT_ARCHIVE" = "zip" ]; then
+            (cd dist && zip -qr "../out/${PKG}.zip" "$PKG")
+          else
+            tar -C dist -czf "out/${PKG}.tar.gz" "$PKG"
+          fi
+          ls -lh out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    name: Checksums & GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum zqjs-* | sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: release-assets/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=""
+          case "$TAG" in
+            *-*) prerelease_flag="--prerelease" ;;
+          esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" release-assets/* \
+              --title "$TAG" \
+              --generate-notes \
+              $prerelease_flag
+          fi

@@ -56,7 +56,7 @@ jobs:
             archive: tar.gz
             smoke: wasi
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Exact toolchain pin (DESIGN_DECISIONS D17); build.zig refuses other versions.
       - uses: mlugg/setup-zig@v2
@@ -65,7 +65,7 @@ jobs:
           cache-key: release-${{ matrix.name }}
 
       - if: matrix.smoke == 'wasi'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -130,7 +130,7 @@ jobs:
           fi
           ls -lh out/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.name }}
           path: out/*
@@ -144,7 +144,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
@@ -157,7 +157,7 @@ jobs:
           sha256sum zqjs-* | sort -k2 > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-bundle
           path: release-assets/*

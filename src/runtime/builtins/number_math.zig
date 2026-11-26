@@ -1173,12 +1173,24 @@ fn registerMath(rt: *Runtime, m: *Object) Error!void {
     try common.method(rt, m, "acos", &math_acos);
     try common.method(rt, m, "atan", &math_atan);
     try common.method(rt, m, "atan2", &math_atan2);
+    try common.method(rt, m, "sinh", &math_sinh);
+    try common.method(rt, m, "cosh", &math_cosh);
+    try common.method(rt, m, "tanh", &math_tanh);
+    try common.method(rt, m, "asinh", &math_asinh);
+    try common.method(rt, m, "acosh", &math_acosh);
+    try common.method(rt, m, "atanh", &math_atanh);
+    try common.method(rt, m, "cbrt", &math_cbrt);
     try common.method(rt, m, "log", &math_log);
+    try common.method(rt, m, "log1p", &math_log1p);
+    try common.method(rt, m, "log10", &math_log10);
+    try common.method(rt, m, "log2", &math_log2);
     try common.method(rt, m, "exp", &math_exp);
+    try common.method(rt, m, "expm1", &math_expm1);
     try common.method(rt, m, "sign", &math_sign);
     try common.method(rt, m, "clz32", &math_clz32);
     try common.method(rt, m, "imul", &math_imul);
     try common.method(rt, m, "fround", &math_fround);
+    try common.method(rt, m, "f16round", &math_f16round);
     try common.method(rt, m, "hypot", &math_hypot);
     try common.method(rt, m, "random", &math_random);
 }
@@ -1215,9 +1227,31 @@ const math_atan: Native = .{ .name = "atan", .length = 1, .call = mathAtan };
 
 const math_atan2: Native = .{ .name = "atan2", .length = 2, .call = mathAtan2 };
 
+const math_sinh: Native = .{ .name = "sinh", .length = 1, .call = mathSinh };
+
+const math_cosh: Native = .{ .name = "cosh", .length = 1, .call = mathCosh };
+
+const math_tanh: Native = .{ .name = "tanh", .length = 1, .call = mathTanh };
+
+const math_asinh: Native = .{ .name = "asinh", .length = 1, .call = mathAsinh };
+
+const math_acosh: Native = .{ .name = "acosh", .length = 1, .call = mathAcosh };
+
+const math_atanh: Native = .{ .name = "atanh", .length = 1, .call = mathAtanh };
+
+const math_cbrt: Native = .{ .name = "cbrt", .length = 1, .call = mathCbrt };
+
 const math_log: Native = .{ .name = "log", .length = 1, .call = mathLog };
 
+const math_log1p: Native = .{ .name = "log1p", .length = 1, .call = mathLog1p };
+
+const math_log10: Native = .{ .name = "log10", .length = 1, .call = mathLog10 };
+
+const math_log2: Native = .{ .name = "log2", .length = 1, .call = mathLog2 };
+
 const math_exp: Native = .{ .name = "exp", .length = 1, .call = mathExp };
+
+const math_expm1: Native = .{ .name = "expm1", .length = 1, .call = mathExpm1 };
 
 const math_sign: Native = .{ .name = "sign", .length = 1, .call = mathSign };
 
@@ -1226,6 +1260,8 @@ const math_clz32: Native = .{ .name = "clz32", .length = 1, .call = mathClz32 };
 const math_imul: Native = .{ .name = "imul", .length = 2, .call = mathImul };
 
 const math_fround: Native = .{ .name = "fround", .length = 1, .call = mathFround };
+
+const math_f16round: Native = .{ .name = "f16round", .length = 1, .call = mathF16round };
 
 const math_hypot: Native = .{ .name = "hypot", .length = 2, .call = mathHypot };
 
@@ -1328,8 +1364,92 @@ fn mathLog(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     return Value.fromNumber(@log(try ops.toNumber(rt, common.arg(args, 0))));
 }
 
+fn mathLog1p(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, common.arg(args, 0));
+    if (std.math.isNan(x) or x < -1.0) return Value.fromNumber(std.math.nan(f64));
+    if (x == -1.0) return Value.fromNumber(-std.math.inf(f64));
+    if (x == 0.0 or std.math.isPositiveInf(x)) return Value.fromNumber(x);
+    return Value.fromNumber(std.math.log1p(x));
+}
+
+fn mathLog10(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, common.arg(args, 0));
+    if (std.math.isNan(x) or x < 0.0) return Value.fromNumber(std.math.nan(f64));
+    if (x == 0.0) return Value.fromNumber(-std.math.inf(f64));
+    if (x == 1.0) return Value.fromNumber(0.0);
+    if (std.math.isPositiveInf(x)) return Value.fromNumber(x);
+    return Value.fromNumber(@log10(x));
+}
+
+fn mathLog2(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, common.arg(args, 0));
+    if (std.math.isNan(x) or x < 0.0) return Value.fromNumber(std.math.nan(f64));
+    if (x == 0.0) return Value.fromNumber(-std.math.inf(f64));
+    if (x == 1.0) return Value.fromNumber(0.0);
+    if (std.math.isPositiveInf(x)) return Value.fromNumber(x);
+    return Value.fromNumber(@log2(x));
+}
+
 fn mathExp(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     return Value.fromNumber(@exp(try ops.toNumber(rt, common.arg(args, 0))));
+}
+
+fn mathExpm1(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, common.arg(args, 0));
+    if (std.math.isNan(x) or x == 0.0 or std.math.isPositiveInf(x)) return Value.fromNumber(x);
+    if (std.math.isNegativeInf(x)) return Value.fromNumber(-1.0);
+    return Value.fromNumber(std.math.expm1(x));
+}
+
+fn mathSinh(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, common.arg(args, 0));
+    if (!std.math.isFinite(x) or x == 0.0) return Value.fromNumber(x);
+    return Value.fromNumber(std.math.sinh(x));
+}
+
+fn mathCosh(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, common.arg(args, 0));
+    if (std.math.isNan(x)) return Value.fromNumber(x);
+    if (x == 0.0) return Value.fromNumber(1.0);
+    if (std.math.isInf(x)) return Value.fromNumber(std.math.inf(f64));
+    return Value.fromNumber(std.math.cosh(x));
+}
+
+fn mathTanh(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, common.arg(args, 0));
+    if (std.math.isNan(x) or x == 0.0) return Value.fromNumber(x);
+    if (std.math.isPositiveInf(x)) return Value.fromNumber(1.0);
+    if (std.math.isNegativeInf(x)) return Value.fromNumber(-1.0);
+    return Value.fromNumber(std.math.tanh(x));
+}
+
+fn mathAsinh(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, common.arg(args, 0));
+    if (!std.math.isFinite(x) or x == 0.0) return Value.fromNumber(x);
+    return Value.fromNumber(std.math.asinh(x));
+}
+
+fn mathAcosh(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, common.arg(args, 0));
+    if (std.math.isNan(x) or x < 1.0) return Value.fromNumber(std.math.nan(f64));
+    if (x == 1.0) return Value.fromNumber(0.0);
+    if (std.math.isPositiveInf(x)) return Value.fromNumber(x);
+    return Value.fromNumber(std.math.acosh(x));
+}
+
+fn mathAtanh(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, common.arg(args, 0));
+    if (std.math.isNan(x) or x < -1.0 or x > 1.0) return Value.fromNumber(std.math.nan(f64));
+    if (x == -1.0) return Value.fromNumber(-std.math.inf(f64));
+    if (x == 1.0) return Value.fromNumber(std.math.inf(f64));
+    if (x == 0.0) return Value.fromNumber(x);
+    return Value.fromNumber(std.math.atanh(x));
+}
+
+fn mathCbrt(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, common.arg(args, 0));
+    if (!std.math.isFinite(x) or x == 0.0) return Value.fromNumber(x);
+    return Value.fromNumber(std.math.cbrt(x));
 }
 
 fn mathSign(rt: *Runtime, _: Value, args: []const Value) Error!Value {
@@ -1353,6 +1473,12 @@ fn mathFround(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const x = try ops.toNumber(rt, common.arg(args, 0));
     if (!std.math.isFinite(x) or x == 0.0) return Value.fromNumber(x);
     return Value.fromNumber(@as(f64, @floatCast(@as(f32, @floatCast(x)))));
+}
+
+fn mathF16round(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const x = try ops.toNumber(rt, common.arg(args, 0));
+    if (!std.math.isFinite(x) or x == 0.0) return Value.fromNumber(x);
+    return Value.fromNumber(@as(f64, @floatCast(@as(f16, @floatCast(x)))));
 }
 
 fn mathHypot(rt: *Runtime, _: Value, args: []const Value) Error!Value {

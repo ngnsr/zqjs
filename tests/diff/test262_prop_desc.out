@@ -1,0 +1,60 @@
+global Object true true true true true true true
+global Array true true true true true true true
+global ArrayBuffer true true true true true true true
+global BigInt true true true true true true true
+global BigInt64Array true true true true true true true
+global BigUint64Array true true true true true true true
+global Boolean true true true true true true true
+global Date true true true true true true true
+global Error true true true true true true true
+global EvalError true true true true true true true
+global RangeError true true true true true true true
+global ReferenceError true true true true true true true
+global SyntaxError true true true true true true true
+global TypeError true true true true true true true
+global URIError true true true true true true true
+global AggregateError true true true true true true true
+global Function true true true true true true true
+global Iterator true true true true true true true
+global JSON true true true true true true true
+global Math true true true true true true true
+global Number true true true true true true true
+global Reflect true true true true true true true
+global RegExp true true true true true true true
+global String true true true true true true true
+global parseInt true true true true true true true
+global parseFloat true true true true true true true
+global isNaN true true true true true true true
+global isFinite true true true true true true true
+global encodeURI true true true true true true true
+global decodeURI true true true true true true true
+global encodeURIComponent true true true true true true true
+global decodeURIComponent true true true true true true true
+deleted Math ref: ReferenceError 3
+const global undefined false false false false true
+const global NaN false false false false true
+const global Infinity false false false false true
+Math.acosh function true 1 true false true
+Math.asinh function true 1 true false true
+Math.atanh function true 1 true false true
+Math.cbrt function true 1 true false true
+Math.cosh function true 1 true false true
+Math.expm1 function true 1 true false true
+Math.f16round function true 1 true false true
+Math.log10 function true 1 true false true
+Math.log1p function true 1 true false true
+Math.log2 function true 1 true false true
+Math.sinh function true 1 true false true
+Math.tanh function true 1 true false true
+acosh: true true Infinity
+asinh: true true -Infinity Infinity
+atanh: true -Infinity Infinity true
+cbrt: 3 -2 true -Infinity
+cosh: 1 1 Infinity true
+expm1: true true -1 Infinity
+f16round: 1.5 1.3369140625 true Infinity true
+log10: 3 true -Infinity -Infinity true
+log1p: true true -Infinity true Infinity
+log2: 10 true -Infinity -Infinity true
+sinh: true true -Infinity Infinity
+tanh: true true 1 -1

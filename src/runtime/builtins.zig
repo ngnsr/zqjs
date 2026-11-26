@@ -410,6 +410,17 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try common.defineToStringTag(rt, r.json, r.sym_to_string_tag, "JSON");
     try function_error.register(rt, &r);
     try regexp.register(rt, &r);
+    for (builtin_globals.keys(), 0..) |name, i| {
+        const target = builtin_globals.values()[i];
+        const is_const = target == .undefined or target == .nan or target == .inf;
+        const k = try h.internAscii(name);
+        try h.defineProperty(r.global_object, k, .{
+            .value = resolveGlobalTargetByIndex(&r, @intCast(i)),
+            .enumerable = false,
+            .writable = !is_const,
+            .configurable = !is_const,
+        });
+    }
     _ = &r;
     rt.realm = r;
     return &rt.realm.?;
@@ -741,12 +752,11 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
             }
             return p.value;
         }
-    }
-    if (builtin_globals.get(name)) |target| {
+    } else if (builtin_globals.get(name)) |target| {
         return try resolveGlobalTarget(rt, target);
     }
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return Value.fromNative(n);
-    if (names.has(.global, name)) {
+    if (names.has(.global, name) and !builtin_globals.has(name)) {
         rt.unsupported_name = try rt.heap.internAscii(name);
         return rt.fail(.builtin);
     }
@@ -761,7 +771,7 @@ pub fn setGlobal(rt: *Runtime, name: []const u8, val: Value, strict: bool) Error
     defer roots.unregister(rt);
 
     const k = try object.named(rt, name);
-    var exists = r.global_object.props.get(try object.propKey(rt, k)) != null or builtin_globals.get(name) != null;
+    var exists = r.global_object.props.get(try object.propKey(rt, k)) != null;
     if (!exists) {
         for (rt.host_globals.items) |n| {
             if (std.mem.eql(u8, n.name, name)) {
@@ -784,6 +794,10 @@ pub fn coerceThis(rt: *Runtime, raw: ?Value, is_strict: bool) Error!?Value {
     return try common.toObjectReceiver(rt, v);
 }
 
+pub fn isImplementedGlobal(name: []const u8) bool {
+    return builtin_globals.has(name);
+}
+
 pub fn globalOwnProp(rt: *Runtime, atom: *const heap_mod.String) Error!?heap_mod.Property {
     if (atom.units.len > 64) return null;
     var buf: [64]u8 = undefined;
@@ -792,15 +806,6 @@ pub fn globalOwnProp(rt: *Runtime, atom: *const heap_mod.String) Error!?heap_mod
         buf[i] = @intCast(u);
     }
     const name = buf[0..atom.units.len];
-    if (builtin_globals.get(name)) |target| {
-        const is_const = target == .undefined or target == .nan or target == .inf;
-        return .{
-            .value = try resolveGlobalTarget(rt, target),
-            .enumerable = false,
-            .writable = !is_const,
-            .configurable = !is_const,
-        };
-    }
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) {
         return .{
             .value = Value.fromNative(n),

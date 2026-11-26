@@ -139,7 +139,9 @@ fn nodeHas(b: names.Builtin, k: Key) bool {
         if (u > 0x7f) return false;
         buf[i] = @intCast(u);
     }
-    return names.has(b, buf[0..a.units.len]);
+    const name = buf[0..a.units.len];
+    if (b == .global and builtins.isImplementedGlobal(name)) return false;
+    return names.has(b, name);
 }
 
 /// Unsupported(builtin), recording which member.

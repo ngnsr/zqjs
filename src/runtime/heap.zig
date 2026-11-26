@@ -901,6 +901,50 @@ pub const Piece = union(enum) {
     }
 };
 
+/// Fixed-capacity slab pool with an intrusive freelist (via `Obj.next`) for recycled
+/// slots and a linear bump cursor for fresh slabs (zero pre-linking overhead).
+fn SlabPool(comptime T: type, comptime target_bytes: usize) type {
+    const cap = @max(16, target_bytes / @sizeOf(T));
+    return struct {
+        pub const capacity = cap;
+        free: ?*Obj = null,
+        bump_idx: usize = cap,
+        slabs: std.ArrayList(*[cap]T) = .empty,
+
+        inline fn alloc(self: *@This(), gpa: Allocator) Allocator.Error!*T {
+            if (self.free) |node| {
+                self.free = node.next;
+                return @fieldParentPtr("obj", node);
+            }
+            if (self.bump_idx < cap) {
+                const slab = self.slabs.items[self.slabs.items.len - 1];
+                const slot = &slab[self.bump_idx];
+                self.bump_idx += 1;
+                return slot;
+            }
+            return self.allocSlab(gpa);
+        }
+
+        noinline fn allocSlab(self: *@This(), gpa: Allocator) Allocator.Error!*T {
+            const slab = try gpa.create([cap]T);
+            errdefer gpa.destroy(slab);
+            try self.slabs.append(gpa, slab);
+            self.bump_idx = 1;
+            return &slab[0];
+        }
+
+        inline fn recycle(self: *@This(), obj: *Obj) void {
+            obj.next = self.free;
+            self.free = obj;
+        }
+
+        fn deinit(self: *@This(), gpa: Allocator) void {
+            for (self.slabs.items) |slab| gpa.destroy(slab);
+            self.slabs.deinit(gpa);
+        }
+    };
+}
+
 pub const Heap = struct {
     gpa: Allocator,
     max_bytes: usize,
@@ -923,9 +967,12 @@ pub const Heap = struct {
     shapes: ?*Shape = null,
     free_shapes: ?*Shape = null,
     shape_slabs: std.ArrayList(*[64]Shape) = .empty,
-    /// Slab pool and intrusive freelist (via `Obj.next`) for `String` allocations.
-    free_strings: ?*Obj = null,
-    string_slabs: std.ArrayList(*[64]String) = .empty,
+    /// Slab pools with intrusive freelists (via `Obj.next`) for high-frequency GC object types.
+    /// Target slab sizes match `SmpAllocator` power-of-2 classes to avoid internal fragmentation.
+    string_pool: SlabPool(String, 8192) = .{},
+    object_pool: SlabPool(Object, 32768) = .{},
+    closure_pool: SlabPool(Closure, 8192) = .{},
+    cell_pool: SlabPool(Cell, 4096) = .{},
     next_shape_id: u32 = 0,
     next_dict_version: u32 = 0,
     /// `allocator()` refused an allocation because of the heap limit (see `failed`).
@@ -1571,8 +1618,10 @@ pub const Heap = struct {
         if (h.root_shape) |r| r.extra_transitions.deinit(h.gpa);
         for (h.shape_slabs.items) |slab| h.gpa.destroy(slab);
         h.shape_slabs.deinit(h.gpa);
-        for (h.string_slabs.items) |slab| h.gpa.destroy(slab);
-        h.string_slabs.deinit(h.gpa);
+        h.string_pool.deinit(h.gpa);
+        h.object_pool.deinit(h.gpa);
+        h.closure_pool.deinit(h.gpa);
+        h.cell_pool.deinit(h.gpa);
         h.* = undefined;
     }
 
@@ -1604,7 +1653,7 @@ pub const Heap = struct {
     pub fn newObject(h: *Heap, proto: ?*Object) Error!*Object {
         const charge = try h.reserve(@sizeOf(Object), 0, 1);
         errdefer h.bytes -= charge;
-        const o = try h.gpa.create(Object);
+        const o = try h.allocObject();
         o.* = .{ .obj = h.newHeader(.object), .proto = proto };
         h.young = &o.obj;
         return o;
@@ -2701,7 +2750,7 @@ pub const Heap = struct {
     pub fn newCell(h: *Heap, value: ?Value) Error!*Cell {
         const charge = try h.reserve(@sizeOf(Cell), 0, 1);
         errdefer h.bytes -= charge;
-        const c = try h.gpa.create(Cell);
+        const c = try h.allocCell();
         c.* = .{ .obj = h.newHeader(.cell), .value = value };
         h.young = &c.obj;
         return c;
@@ -2714,7 +2763,7 @@ pub const Heap = struct {
         errdefer h.bytes -= charge;
         const captures = try h.gpa.alloc(*Cell, n);
         errdefer h.gpa.free(captures);
-        const c = try h.gpa.create(Closure);
+        const c = try h.allocClosure();
         c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .vm = .{ .proto = proto, .captures = captures } } };
         h.young = &c.obj;
         return c;
@@ -2723,7 +2772,7 @@ pub const Heap = struct {
     pub fn newTreeClosure(h: *Heap, func: *const anyopaque, env: ?*Env) Error!*Closure {
         const charge = try h.reserve(@sizeOf(Closure), 0, 2); // same charge as a VM closure
         errdefer h.bytes -= charge;
-        const c = try h.gpa.create(Closure);
+        const c = try h.allocClosure();
         c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .tree = .{ .func = func, .env = env } } };
         h.young = &c.obj;
         return c;
@@ -2732,7 +2781,7 @@ pub const Heap = struct {
     pub fn newPromiseCapability(h: *Heap, promise: *Object, is_reject: bool) Error!*Closure {
         const charge = try h.reserve(@sizeOf(Closure), 0, 2);
         errdefer h.bytes -= charge;
-        const c = try h.gpa.create(Closure);
+        const c = try h.allocClosure();
         c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .promise_cap = .{ .promise = promise, .is_reject = is_reject } } };
         h.young = &c.obj;
         return c;
@@ -2745,7 +2794,7 @@ pub const Heap = struct {
     pub fn newNativeClosureWithLength(h: *Heap, func: *const anyopaque, env: *Object, length: u16) Error!*Closure {
         const charge = try h.reserve(@sizeOf(Closure), 0, 2);
         errdefer h.bytes -= charge;
-        const c = try h.gpa.create(Closure);
+        const c = try h.allocClosure();
         c.* = .{ .obj = h.newHeader(.closure), .impl = .{ .native_closure = .{ .func = func, .env = env, .length = length } } };
         h.young = &c.obj;
         return c;
@@ -2765,7 +2814,7 @@ pub const Heap = struct {
         errdefer h.allocator().destroy(b);
         const charge = try h.reserve(@sizeOf(Closure), 0, 2);
         errdefer h.bytes -= charge;
-        const c = try h.gpa.create(Closure);
+        const c = try h.allocClosure();
         b.* = .{
             .target = target,
             .bound_this = bound_this,
@@ -2968,16 +3017,13 @@ pub const Heap = struct {
 
     fn freeStruct(h: *Heap, obj: *Obj, kind: Obj.Kind) void {
         switch (kind) {
-            .string => {
-                obj.next = h.free_strings;
-                h.free_strings = obj;
-            },
+            .string => h.string_pool.recycle(obj),
             .symbol => h.gpa.destroy(@as(*Symbol, @fieldParentPtr("obj", obj))),
             .bigint => h.gpa.destroy(@as(*BigInt, @fieldParentPtr("obj", obj))),
-            .cell => h.gpa.destroy(@as(*Cell, @fieldParentPtr("obj", obj))),
-            .closure => h.gpa.destroy(@as(*Closure, @fieldParentPtr("obj", obj))),
+            .cell => h.cell_pool.recycle(obj),
+            .closure => h.closure_pool.recycle(obj),
             .env => h.gpa.destroy(@as(*Env, @fieldParentPtr("obj", obj))),
-            .object => h.gpa.destroy(@as(*Object, @fieldParentPtr("obj", obj))),
+            .object => h.object_pool.recycle(obj),
             .coroutine => h.gpa.destroy(@as(*Coroutine, @fieldParentPtr("obj", obj))),
             .dead => unreachable,
         }
@@ -2994,20 +3040,20 @@ pub const Heap = struct {
         return o;
     }
 
-    fn allocString(h: *Heap) Error!*String {
-        if (h.free_strings) |node| {
-            h.free_strings = node.next;
-            return @fieldParentPtr("obj", node);
-        }
-        const slab = try h.gpa.create([64]String);
-        errdefer h.gpa.destroy(slab);
-        try h.string_slabs.append(h.gpa, slab);
-        var i: usize = 63;
-        while (i >= 1) : (i -= 1) {
-            slab[i].obj.next = h.free_strings;
-            h.free_strings = &slab[i].obj;
-        }
-        return &slab[0];
+    inline fn allocString(h: *Heap) Error!*String {
+        return h.string_pool.alloc(h.gpa);
+    }
+
+    inline fn allocObject(h: *Heap) Error!*Object {
+        return h.object_pool.alloc(h.gpa);
+    }
+
+    inline fn allocClosure(h: *Heap) Error!*Closure {
+        return h.closure_pool.alloc(h.gpa);
+    }
+
+    inline fn allocCell(h: *Heap) Error!*Cell {
+        return h.cell_pool.alloc(h.gpa);
     }
 
     /// A new string made of the concatenation of `pieces`.

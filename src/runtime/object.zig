@@ -332,9 +332,10 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
             };
         },
         .module_namespace => |ns| {
-            if (k == .atom) {
+            if (k != .symbol) {
+                const pk = try propKey(rt, k);
                 for (ns.entries) |e| {
-                    if (e.name == k.atom) {
+                    if (e.name == pk.asAtom()) {
                         const v = e.cell.value orelse return rt.throw(.ReferenceError, &.{
                             .{ .ascii = "Cannot access '" },
                             .{ .utf16 = e.name.units },
@@ -343,6 +344,7 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
                         return .{ .value = v, .enumerable = true, .writable = true, .configurable = false };
                     }
                 }
+                return null;
             }
         },
         .typed_array => |ta| {
@@ -403,7 +405,7 @@ const ChainHit = union(enum) {
     accessor: Property,
     data: struct { is_own: bool, writable: bool },
     proxy: *Object,
-    typed_array_oob,
+    typed_array_oob: *Object,
 };
 
 fn sameTarget(a: Value, b: ?Value) bool {
@@ -424,7 +426,7 @@ fn lookupSetChain(rt: *Runtime, start: Value, base: ?Value, k: Key) Error!ChainH
                 if (o.kind == .proxy) return .{ .proxy = o };
                 if (o.kind == .typed_array) {
                     if (canonicalNumericIndex(k)) |n| {
-                        if (validIntegerIndex(o.kind.typed_array, n) == null) return .typed_array_oob;
+                        if (validIntegerIndex(o.kind.typed_array, n) == null) return .{ .typed_array_oob = o };
                     }
                 }
                 if (try ownProp(rt, o, k)) |p| {
@@ -553,7 +555,17 @@ pub fn setWithReceiver(rt: *Runtime, base: Value, k: Key, v: Value, receiver: Va
             if (!ok and strict) return rt.throw(.TypeError, &.{.{ .ascii = "'set' on proxy: trap returned falsish" }});
             return ok;
         },
-        .typed_array_oob => return true,
+        .typed_array_oob => |ta_obj| {
+            // ES §10.4.5.5: if SameValue(O, Receiver), TypedArraySetElement coerces V even when OOB.
+            if (sameTarget(Value.fromObject(ta_obj), receiver)) {
+                if (ta_obj.kind.typed_array.kind.isBigInt()) {
+                    _ = try ops.toBigInt(rt, v);
+                } else {
+                    _ = try ops.toNumber(rt, v);
+                }
+            }
+            return true;
+        },
         .accessor => |p| return invokeSetter(rt, p, receiver, v, strict),
         .data => |d| if (!d.writable) {
             if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
@@ -580,7 +592,16 @@ pub fn setSuper(rt: *Runtime, home: Value, receiver: Value, k: Key, v: Value, st
                 if (!ok and strict) return rt.throw(.TypeError, &.{.{ .ascii = "'set' on proxy: trap returned falsish" }});
                 return;
             },
-            .typed_array_oob => return,
+            .typed_array_oob => |ta_obj| {
+                if (sameTarget(Value.fromObject(ta_obj), receiver)) {
+                    if (ta_obj.kind.typed_array.kind.isBigInt()) {
+                        _ = try ops.toBigInt(rt, v);
+                    } else {
+                        _ = try ops.toNumber(rt, v);
+                    }
+                }
+                return;
+            },
             .accessor => |p| {
                 _ = try invokeSetter(rt, p, receiver, v, strict);
                 return;
@@ -866,9 +887,18 @@ fn putOwn(rt: *Runtime, o: *Object, k: Key, v: Value) Error!void {
 }
 
 fn setLength(rt: *Runtime, arr: *Object, v: Value, strict: bool) Error!bool {
-    const n = try ops.toNumber(rt, v);
-    if (!(n >= 0 and n <= max_index + 1 and @floor(n) == n)) return rt.throw(.RangeError, &.{.{ .ascii = "Invalid array length" }});
-    const len: usize = @intFromFloat(n);
+    var root_buf = [_]Value{ Value.fromObject(arr), v };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    // ES ArraySetLength: coerce [[Value]] via ToUint32 then ToNumber before checking [[Writable]].
+    const new_len = ops.toUint32(try ops.toNumber(rt, v));
+    const number_len = try ops.toNumber(rt, v);
+    if (@as(f64, @floatFromInt(new_len)) != number_len) {
+        return rt.throw(.RangeError, &.{.{ .ascii = "Invalid array length" }});
+    }
+    const len: usize = @intCast(new_len);
     const cur_len = arr.kind.array.items.len;
     if (!arr.array_length_writable) {
         if (len == cur_len) return true;
@@ -962,7 +992,16 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
             .symbol => {},
         },
         .regexp => if (isNamed(k, "lastIndex")) return false, // non-configurable
-        .module_namespace => return false,
+        .module_namespace => |ns| {
+            // ES §10.4.6.10: symbols fall through to OrdinaryDelete; non-exported strings return true.
+            if (k != .symbol) {
+                const pk = try propKey(rt, k);
+                for (ns.entries) |e| {
+                    if (e.name == pk.asAtom()) return false;
+                }
+                return true;
+            }
+        },
         .typed_array => |ta| {
             if (canonicalNumericIndex(k)) |n| {
                 return validIntegerIndex(ta, n) == null;
@@ -1049,6 +1088,16 @@ fn hasInChain(rt: *Runtime, start: *Object, k: Key) Error!bool {
     while (o) |cur| : (o = cur.proto) {
         if (cur.kind == .proxy) {
             return builtins.proxyHas(rt, cur, k);
+        }
+        if (cur.kind == .module_namespace) {
+            // ES §10.4.6.7: string keys check [[Exports]] without dereferencing uninitialized bindings.
+            if (k != .symbol) {
+                const pk = try propKey(rt, k);
+                for (cur.kind.module_namespace.entries) |e| {
+                    if (e.name == pk.asAtom()) return true;
+                }
+                return false;
+            }
         }
         if (cur.kind == .typed_array) {
             if (canonicalNumericIndex(k)) |n| {

@@ -1,0 +1,5 @@
+strict set: TypeError number,number 3
+reflect set: false number,number 3
+same len: true number,number 3
+ta oob proto=receiver: true 1
+bigint ta oob proto=receiver: true 1

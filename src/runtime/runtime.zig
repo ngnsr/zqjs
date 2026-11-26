@@ -180,7 +180,7 @@ pub const ExecContext = struct {
 };
 
 pub const PropIc = struct {
-    shape_id: u32 = heap_mod.DICT_SHAPE_ID,
+    shape_id: u32 = 0,
     proto_shape_id: u32 = 0,
     /// For `kind == 4` (shaped ADD transition): expected shape id of `o.proto.proto` (e.g. `Object.prototype`).
     grandproto_shape_id: u32 = 0,
@@ -294,7 +294,7 @@ pub const Runtime = struct {
     pub fn ensurePropIc(rt: *Runtime) error{OutOfMemory}!void {
         if (rt.prop_ic == null) {
             const t = try rt.gpa.create([2048][4]PropIc);
-            t.* = @splat(@splat(.{}));
+            @memset(std.mem.asBytes(t), 0);
             rt.prop_ic = t;
         }
     }

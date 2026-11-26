@@ -21,9 +21,9 @@ Each milestone ships unit tests, golden/edge-case tests, a runnable demo and doc
 | 9.2 | C ABI: header, opaque handles, error codes, a C example and integration tests in CI | **done** |
 | D1 | Demo (separate project, not a dependency): a Raylib game whose logic is a ZQJS script | **done** |
 | 10 | Fuzzing all layers, benchmarks, Guard Malloc / Valgrind CI | **done** |
-| 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | – |
-| 11.1–59 | Language, runtime, REPL, ES modules, Test262 harness, built-ins & Tier 1–2 VM perf (see milestone log below; D55–D89) | **done** |
-| Perf | Remaining Tier 1–2 interpreter optimizations toward QuickJS parity (see `PERF_PLAN.md`) | in progress |
+| 11 | Bytecode inspector/debugger: single-step, stack/frames, heap browser, manual GC, breakpoints | **done** |
+| 11.1–69 | Language, runtime, REPL, ES modules, Test262 harness (`99.32%` appl), built-ins & Tier 1–2 VM perf (`0.71×` QuickJS, 11/11 faster; D55–D89) | **done** |
+| Perf | Real-world macro-benchmark optimizations (e.g. Zod v4: `proto_promoted`, non-number `strict_eq`, polymorphic IC; see `PERF_PLAN.md`) | in progress |
 
 ## Direction after M8.1 (reviewed 2026-11-15)
 

@@ -475,3 +475,189 @@ test "M48: top-level await, for await, linear/diamond/parallel TLA, sync->TLA, a
     };
     try expectBothEngines(&entries5, "main.js", "const ns = await import('./tla_dyn.js'); print(ns.v);", "async_ok\n");
 }
+
+test "Test262 module conformance: ambiguous bindings, namespace re-exports, unicode sort (both engines)" {
+    // 1. Ambiguous star re-exports are omitted from namespace object
+    const ambig_entries = [_]MemEntry{
+        .{ .id = "a.js", .src = "export const first = 1; export const both = 'a';" },
+        .{ .id = "b.js", .src = "export const second = 2; export const both = 'b';" },
+        .{ .id = "re.js", .src = "export * from './a.js'; export * from './b.js';" },
+    };
+    try expectBothEngines(
+        &ambig_entries,
+        "main.js",
+        "import * as ns from './re.js'; print('first' in ns, 'second' in ns, 'both' in ns, Object.keys(ns).join(','));",
+        "true true false first,second\n",
+    );
+
+    // 2. Same namespace re-exported via `export * as` and `import * as; export { ... }` is unambiguous
+    const ns_unambig_entries = [_]MemEntry{
+        .{ .id = "target.js", .src = "export const v = 42;" },
+        .{ .id = "f1.js", .src = "export * as foo from './target.js';" },
+        .{ .id = "f2.js", .src = "import * as t from './target.js'; export { t as foo };" },
+        .{ .id = "re.js", .src = "export * from './f1.js'; export * from './f2.js';" },
+    };
+    try expectBothEngines(
+        &ns_unambig_entries,
+        "main.js",
+        "import { foo } from './re.js'; print(typeof foo, foo.v);",
+        "object 42\n",
+    );
+
+    // 3. Mutual `export * as` cycle does not infinitely recurse in getNamespace
+    const mutual_ns_entries = [_]MemEntry{
+        .{ .id = "a.js", .src = "export const x = 1; export * as b from './b.js';" },
+        .{ .id = "b.js", .src = "export const y = 2; export * as a from './a.js';" },
+    };
+    try expectBothEngines(
+        &mutual_ns_entries,
+        "main.js",
+        "import * as a from './a.js'; print(a.x, a.b.y, a.b.a === a);",
+        "1 2 true\n",
+    );
+
+    // 4. Unicode & escaped export names sort in UTF-16 code-unit order
+    const sort_entries = [_]MemEntry{
+        .{ .id = "u.js", .src = "var x = 1; export { x as π, x as \\u03bc, x as λ, x as _, x as $ }; export default null;" },
+    };
+    try expectBothEngines(
+        &sort_entries,
+        "main.js",
+        "import * as ns from './u.js'; print(Object.getOwnPropertyNames(ns).map(k => k.charCodeAt(0)).join(','));",
+        "36,95,100,955,956,960\n",
+    );
+}
+
+test "Test262 module conformance: TLA ordering, cycles, errored cycle dynamic import, DFS (both engines)" {
+    // 1. Async module does not block sibling sync module
+    const sibling_entries = [_]MemEntry{
+        .{ .id = "tla.js", .src = "globalThis.flag = false; await 0; globalThis.flag = true;" },
+        .{ .id = "sync.js", .src = "export const seen = globalThis.flag;" },
+    };
+    try expectBothEngines(
+        &sibling_entries,
+        "main.js",
+        "import './tla.js'; import { seen } from './sync.js'; print(seen, globalThis.flag);",
+        "false true\n",
+    );
+
+    // 2. DFS invariant via GatherAvailableAncestors + AsyncEvaluationOrder
+    const dfs_entries = [_]MemEntry{
+        .{ .id = "async.js", .src = "await Promise.resolve(); globalThis.ord = 'async';" },
+        .{ .id = "d1.js", .src = "import './async.js'; globalThis.ord += ':d1';" },
+        .{ .id = "d2.js", .src = "import './async.js'; globalThis.ord += ':d2';" },
+        .{ .id = "ind.js", .src = "import './d1.js'; import './d2.js'; globalThis.ord += ':ind';" },
+    };
+    try expectBothEngines(
+        &dfs_entries,
+        "main.js",
+        "import './d1.js'; import './d2.js'; import './ind.js'; print(globalThis.ord);",
+        "async:d1:d2:ind\n",
+    );
+
+    // 3. Pending async dep from separate cycle waits for cycle root
+    const cyc_entries = [_]MemEntry{
+        .{ .id = "setup.js", .src = "globalThis.logs = [];" },
+        .{ .id = "leaf.js", .src = "import './root.js'; globalThis.logs.push('leaf_s'); await Promise.resolve(); globalThis.logs.push('leaf_e');" },
+        .{ .id = "root.js", .src = "import './leaf.js'; globalThis.logs.push('root_s'); await Promise.resolve(); globalThis.logs.push('root_e');" },
+        .{ .id = "imp.js", .src = "import './leaf.js'; globalThis.logs.push('imp');" },
+    };
+    try expectBothEngines(
+        &cyc_entries,
+        "main.js",
+        "import './setup.js'; import './root.js'; import './imp.js'; print(globalThis.logs.join(','));",
+        "leaf_s,leaf_e,root_s,root_e,imp\n",
+    );
+
+    // 4. Re-importing parent of already-evaluated TLA module does not hang
+    const no_hang_entries = [_]MemEntry{
+        .{ .id = "tla.js", .src = "await Promise.resolve();" },
+        .{ .id = "parent.js", .src = "import './tla.js'; export const ok = 'yes';" },
+        .{ .id = "grand.js", .src = "import { ok } from './parent.js'; export { ok };" },
+    };
+    try expectBothEngines(
+        &no_hang_entries,
+        "main.js",
+        "import './parent.js'; const ns = await import('./grand.js'); print(ns.ok);",
+        "yes\n",
+    );
+
+    // 5. Dynamic import of fulfilled member of errored async cycle rejects with cycle root error
+    const err_cyc_entries = [_]MemEntry{
+        .{ .id = "a.js", .src = "import './b.js'; export const a = 1;" },
+        .{ .id = "c.js", .src = "import './a.js'; export const c = 3;" },
+        .{ .id = "b.js", .src = "import './c.js'; await Promise.resolve(); throw new Error('boom_b');" },
+        .{ .id = "entry_bad.js", .src = "import './b.js';" },
+    };
+    try expectBothEngines(
+        &err_cyc_entries,
+        "main.js",
+        \\let e1 = null, e2 = null;
+        \\try { await import('./entry_bad.js'); } catch (e) { e1 = e; }
+        \\try { await import('./c.js'); } catch (e) { e2 = e; }
+        \\print(e1.message, e1 === e2);
+    ,
+        "boom_b true\n",
+    );
+
+    // 6. Dynamic import does not preempt active DFS evaluation order
+    const verify_dfs_entries = [_]MemEntry{
+        .{ .id = "shared.js", .src = "export const order = []; export function done(p) { return p.then(() => print(order.join(','))); }" },
+        .{ .id = "a.js", .src = "import { order, done } from './shared.js'; done(import('./b.js')); order.push('A');" },
+        .{ .id = "b.js", .src = "import { order } from './shared.js'; order.push('B');" },
+    };
+    try expectBothEngines(
+        &verify_dfs_entries,
+        "main.js",
+        "import './a.js'; import './b.js';",
+        "A,B\n",
+    );
+}
+
+test "CLI --preload helper: preload globals visible to self-importing module (both engines)" {
+    for ([_]Engine{ .vm, .treewalk }) |engine| {
+        var out_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out_buf.deinit();
+
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        var pool: module.PreloadPool = .{};
+        defer pool.deinit(testing.allocator);
+
+        var rt = Runtime.init(testing.allocator, .{}, &out_buf.writer);
+        defer rt.deinit();
+        rt.stack_base = @frameAddress();
+        try rt.addRoots(.{ .ctx = &pool, .mark = module.PreloadPool.markRoots });
+        defer rt.removeRoots(&pool);
+
+        var diag: zqjs.Diagnostic = .{};
+        try module.runPreloadScript(
+            &rt,
+            arena.allocator(),
+            "function checkEq(a, b) { if (a !== b) throw new Error('mismatch'); } var PRELOAD_TAG = 'ok';",
+            engine,
+            true,
+            &diag,
+            &pool,
+        );
+
+        const self_src =
+            \\import * as self from './self.js';
+            \\export let val = 10;
+            \\checkEq(PRELOAD_TAG, 'ok');
+            \\checkEq(self.val, 10);
+            \\val = 20;
+            \\print(self.val, PRELOAD_TAG);
+        ;
+        const entries = [_]MemEntry{
+            .{ .id = "self.js", .src = self_src },
+        };
+        const ml: MemLoader = .{ .entries = &entries };
+        rt.modules.loader = ml.loader();
+
+        var mod_diag: module.ModuleDiag = .{};
+        _ = try module.runEntry(&rt, "self.js", self_src, engine, &mod_diag);
+        try testing.expectEqualStrings("20 ok\n", out_buf.written());
+    }
+}

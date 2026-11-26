@@ -20,6 +20,7 @@ const usage =
     \\
     \\  --repl             start the interactive REPL
     \\  --module           execute input as an ES Module (default for .mjs files)
+    \\  --preload FILE     execute script FILE in the same runtime before the entry (repeatable)
     \\  --no-color         disable ANSI colors in REPL output
     \\  --max-steps N      stop after N execution steps (0 = unlimited, default 200000000)
     \\  --engine=vm        run on the bytecode VM (default)
@@ -59,6 +60,7 @@ pub fn main(init: std.process.Init) !u8 {
     var command: Command = .run;
     var no_color = false;
     var force_module = false;
+    var preloads: std.ArrayList([]const u8) = .empty;
     var limits: zqjs.Limits = .{ .max_steps = cli_default_steps };
     var options: zqjs.RunOptions = .{};
     while (rest.len > 0 and std.mem.startsWith(u8, rest[0], "--")) {
@@ -66,6 +68,9 @@ pub fn main(init: std.process.Init) !u8 {
             command = .repl;
         } else if (std.mem.eql(u8, rest[0], "--module")) {
             force_module = true;
+        } else if (std.mem.eql(u8, rest[0], "--preload") and rest.len > 1) {
+            try preloads.append(arena, rest[1]);
+            rest = rest[1..];
         } else if (std.mem.eql(u8, rest[0], "--no-color")) {
             no_color = true;
         } else if (std.mem.eql(u8, rest[0], "--test")) {
@@ -145,6 +150,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     switch (command) {
         .run => {
+            if (preloads.items.len > 0) {
+                return runWithPreloads(gpa, arena, io, preloads.items, name, source, is_module, limits, options, out, err);
+            }
             if (is_module) {
                 return zqjs.runModule(gpa, name, source, io, limits, options, out, err);
             }
@@ -155,6 +163,9 @@ pub fn main(init: std.process.Init) !u8 {
         },
         .@"test" => {
             options.mode = .harness;
+            if (preloads.items.len > 0) {
+                return runWithPreloads(gpa, arena, io, preloads.items, name, source, is_module, limits, options, out, err);
+            }
             if (is_module) {
                 return zqjs.runModule(gpa, name, source, io, limits, options, out, err);
             }
@@ -163,6 +174,152 @@ pub fn main(init: std.process.Init) !u8 {
         .dump => return dump(arena, name, source, limits, out, err),
         .dump_bytecode => return dumpBytecode(gpa, arena, name, source, limits, out, err),
         .repl => unreachable,
+    }
+}
+
+fn runWithPreloads(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    preloads: []const []const u8,
+    name: []const u8,
+    source: []const u8,
+    is_module: bool,
+    limits: zqjs.Limits,
+    options: zqjs.RunOptions,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    const mode = options.mode;
+    const report = if (mode == .harness) out else err;
+
+    var pool: zqjs.module.PreloadPool = .{};
+    defer pool.deinit(gpa);
+
+    var rt = zqjs.Runtime.init(gpa, limits, out);
+    defer rt.deinit();
+    rt.stack_base = @frameAddress();
+    rt.heap.collect_always = options.collect_always or rt.heap.collect_always;
+    rt.heap.verify_always = options.verify_heap or rt.heap.verify_always;
+
+    try rt.addRoots(.{ .ctx = &pool, .mark = zqjs.module.PreloadPool.markRoots });
+    defer rt.removeRoots(&pool);
+
+    var fs_loader: zqjs.module.FsLoader = .{
+        .gpa = gpa,
+        .io = io,
+        .max_source_bytes = limits.max_source_bytes,
+        .fallback_referrer = name,
+    };
+    rt.modules.loader = fs_loader.loader();
+
+    for (preloads) |preload_path| {
+        const preload_src = std.Io.Dir.cwd().readFileAlloc(io, preload_path, arena, .limited(limits.max_source_bytes + 1)) catch |e| switch (e) {
+            error.StreamTooLong => {
+                try report.print("{s}: LimitExceeded(source_bytes)\n", .{preload_path});
+                return 1;
+            },
+            else => {
+                try report.print("{s}: cannot read file: {s}\n", .{ preload_path, @errorName(e) });
+                return 1;
+            },
+        };
+        var diag: zqjs.Diagnostic = .{};
+        zqjs.module.runPreloadScript(&rt, arena, preload_src, options.engine, true, &diag, &pool) catch |e| {
+            return reportPreloadOrModuleErr(&rt, e, diag, preload_src, preload_path, mode, report);
+        };
+    }
+
+    if (is_module) {
+        const canonical = zqjs.module.resolveFsPath(gpa, io, null, name) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ModuleNotFound => try gpa.dupe(u8, name),
+        };
+        defer gpa.free(canonical);
+
+        var mod_diag: zqjs.module.ModuleDiag = .{};
+        _ = zqjs.module.runEntry(&rt, canonical, source, options.engine, &mod_diag) catch |e| {
+            if (e == error.ModuleNotFound) {
+                try report.print("{s}: Cannot find module '{s}'\n", .{ name, mod_diag.name });
+                return 1;
+            }
+            return reportPreloadOrModuleErr(&rt, e, mod_diag.diag, mod_diag.source, name, mode, report);
+        };
+        return 0;
+    }
+
+    var diag: zqjs.Diagnostic = .{};
+    zqjs.module.runPreloadScript(&rt, arena, source, options.engine, false, &diag, &pool) catch |e| {
+        return reportPreloadOrModuleErr(&rt, e, diag, source, name, mode, report);
+    };
+    return 0;
+}
+
+fn reportPreloadOrModuleErr(
+    rt: *zqjs.Runtime,
+    e: anyerror,
+    diag: zqjs.Diagnostic,
+    source: []const u8,
+    name: []const u8,
+    mode: zqjs.RunMode,
+    report: *std.Io.Writer,
+) !u8 {
+    switch (e) {
+        error.OutOfMemory, error.WriteFailed => |host| return host,
+        error.InvalidBytecode, error.Internal => {
+            try report.print("{s}: internal error: {s}\n", .{ name, rt.internal_reason orelse "invalid bytecode" });
+            return 70;
+        },
+        error.SyntaxError, error.Unsupported => {
+            if (source.len > 0) {
+                try diag.render(source, name, report);
+            } else if (e == error.Unsupported) {
+                if (rt.unsupported) |u| {
+                    try report.print("{s}: Unsupported({s})\n", .{ name, @tagName(u) });
+                } else {
+                    try report.print("{s}: {s}\n", .{ name, @errorName(e) });
+                }
+            } else if (diag.detail == .syntax_error) {
+                try report.print("{s}: SyntaxError: {s}\n", .{ name, diag.detail.syntax_error });
+            } else {
+                try report.print("{s}: {s}\n", .{ name, @errorName(e) });
+            }
+            return 1;
+        },
+        error.Thrown => {
+            if (rt.thrown_value) |v| {
+                try report.writeAll("Uncaught ");
+                if (mode == .normal) {
+                    var buf: zqjs.ops.NumberBuf = undefined;
+                    if (zqjs.ops.toPiece(rt, v, &buf)) |piece| switch (piece) {
+                        .ascii => |a| try report.writeAll(a),
+                        .utf16 => |u| try zqjs.ops.writeUtf16(report, u),
+                    } else |_| try report.writeAll("[value]");
+                }
+                try report.writeByte('\n');
+            } else {
+                const ex = rt.exception.?;
+                try report.print("Uncaught {s}", .{@tagName(ex.name)});
+                if (mode == .normal) {
+                    try report.writeAll(": ");
+                    try zqjs.ops.writeUtf16(report, ex.message.units);
+                }
+                try report.writeByte('\n');
+            }
+            return 1;
+        },
+        error.HostError => {
+            try report.print("{s}: {s}\n", .{ name, rt.host_message_buf[0..rt.host_message_len] });
+            return 1;
+        },
+        error.LimitExceeded => {
+            try report.print("{s}: LimitExceeded({s})\n", .{ name, @tagName(rt.limitHit().?) });
+            return 1;
+        },
+        else => {
+            try report.print("{s}: {s}\n", .{ name, @errorName(e) });
+            return 1;
+        },
     }
 }
 

@@ -78,8 +78,15 @@ const ImportLink = struct {
 
 const IndirectExport = struct {
     dep: *ModuleRecord,
-    imported_name: []const u8,
+    /// `null` means `export * as ns` / re-exported namespace binding (`~all~`).
+    imported_name: ?[]const u8,
     span: ast.Span,
+};
+
+pub const AsyncEvalOrder = union(enum) {
+    unset,
+    evaluating: u64,
+    done,
 };
 
 pub const ModuleRecord = struct {
@@ -91,13 +98,14 @@ pub const ModuleRecord = struct {
     proto: ?*Proto = null,
     cells: []*heap.Cell = &.{},
     namespace: ?*heap.Object = null,
+    namespace_cell: ?*heap.Cell = null,
     import_meta: ?*heap.Object = null,
     status: Status = .unlinked,
     eval_error: ?Value = null,
     eval_fault: ?RuntimeError = null,
 
     has_tla: bool = false,
-    async_eval: bool = false,
+    async_eval_order: AsyncEvalOrder = .unset,
     proto_promoted: bool = false,
     pending_async_deps: u32 = 0,
     async_parents: std.ArrayList(*ModuleRecord) = .empty,
@@ -110,7 +118,6 @@ pub const ModuleRecord = struct {
     local_exports: std.StringHashMapUnmanaged(*heap.Cell) = .empty,
     indirect_exports: std.StringHashMapUnmanaged(IndirectExport) = .empty,
     star_reexports: std.ArrayList(*ModuleRecord) = .empty,
-    ns_reexports: std.StringHashMapUnmanaged(struct { dep: *ModuleRecord, cell: *heap.Cell }) = .empty,
     deps: std.ArrayList(*ModuleRecord) = .empty,
     import_links: std.ArrayList(ImportLink) = .empty,
 
@@ -124,7 +131,6 @@ pub const ModuleRecord = struct {
         m.local_exports.deinit(gpa);
         m.indirect_exports.deinit(gpa);
         m.star_reexports.deinit(gpa);
-        m.ns_reexports.deinit(gpa);
         m.deps.deinit(gpa);
         m.import_links.deinit(gpa);
         m.arena.deinit();
@@ -138,6 +144,7 @@ pub const ModuleRegistry = struct {
     map: std.StringHashMapUnmanaged(*ModuleRecord) = .empty,
     list: std.ArrayList(*ModuleRecord) = .empty,
     loader: ?ModuleLoader = null,
+    async_eval_counter: u64 = 0,
 
     pub fn deinit(reg: *ModuleRegistry, gpa: Allocator) void {
         for (reg.list.items) |m| {
@@ -152,11 +159,10 @@ pub const ModuleRegistry = struct {
         for (reg.list.items) |m| {
             for (m.cells) |cell| h.markObj(&cell.obj);
             if (m.namespace) |ns| h.markObj(&ns.obj);
+            if (m.namespace_cell) |nc| h.markObj(&nc.obj);
             if (m.import_meta) |im| h.markObj(&im.obj);
             if (m.eval_promise) |ep| h.markObj(&ep.obj);
             if (m.eval_error) |v| h.markValue(v);
-            var ns_it = m.ns_reexports.valueIterator();
-            while (ns_it.next()) |entry| h.markObj(&entry.cell.obj);
             if (m.proto) |p| {
                 if (!h.in_minor or !m.proto_promoted) {
                     markProto(p, h);
@@ -166,12 +172,125 @@ pub const ModuleRegistry = struct {
         }
     }
 
-    fn markProto(p: *const Proto, h: *heap.Heap) void {
+    pub fn markProto(p: *const Proto, h: *heap.Heap) void {
         for (p.consts) |c| h.markValue(c);
         for (p.name_atoms) |a| h.markObj(@constCast(&a.obj));
         for (p.functions) |*child| markProto(child, h);
     }
 };
+
+/// Holds compiled `Proto`s and top-level `Cell` slices owned by `--preload` scripts
+/// so closures they define remain live and GC-rooted across subsequent execution.
+pub const PreloadPool = struct {
+    protos: std.ArrayList(*Proto) = .empty,
+    cell_slices: std.ArrayList([]*heap.Cell) = .empty,
+
+    pub fn deinit(self: *PreloadPool, gpa: Allocator) void {
+        for (self.protos.items) |p| {
+            p.deinit(gpa);
+            gpa.destroy(p);
+        }
+        self.protos.deinit(gpa);
+        for (self.cell_slices.items) |cs| gpa.free(cs);
+        self.cell_slices.deinit(gpa);
+    }
+
+    pub fn markRoots(ctx: *anyopaque, h: *heap.Heap) void {
+        const self: *const PreloadPool = @ptrCast(@alignCast(ctx));
+        for (self.protos.items) |p| ModuleRegistry.markProto(p, h);
+        for (self.cell_slices.items) |cs| {
+            for (cs) |cell| h.markObj(&cell.obj);
+        }
+    }
+};
+
+fn emptyReplLookup(_: *const anyopaque, _: []const u8) ?resolver.ReplKind {
+    return null;
+}
+
+/// Executes a preloaded script in an existing `Runtime` so globals and functions it defines
+/// remain live and GC-safe across subsequent script or module execution on both engines.
+/// When `export_globals` is true, top-level declarations are exposed on `globalThis` so
+/// subsequent `--preload` scripts and ES modules can reference them directly.
+pub fn runPreloadScript(
+    rt: *Runtime,
+    arena: Allocator,
+    source: []const u8,
+    engine: Engine,
+    export_globals: bool,
+    diag: *Diagnostic,
+    pool: *PreloadPool,
+) (ModuleError || RuntimeError)!void {
+    const script = parser.parse(arena, source, rt.limits, diag) catch |e| return switch (e) {
+        error.SyntaxError => error.SyntaxError,
+        error.Unsupported => error.Unsupported,
+        error.LimitExceeded => error.LimitExceeded,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+    const res_ptr = try arena.create(Resolution);
+    const dummy_ctx: u8 = 0;
+    const repl_lookup: ?resolver.ReplLookup = if (export_globals) .{
+        .ctx = &dummy_ctx,
+        .get = emptyReplLookup,
+    } else null;
+    res_ptr.* = resolver.resolveWithRepl(arena, script, repl_lookup, diag) catch |e| return switch (e) {
+        error.SyntaxError => error.SyntaxError,
+        error.Unsupported => error.Unsupported,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+
+    var cells: []*heap.Cell = &.{};
+    if (res_ptr.repl_bindings.len > 0) {
+        cells = try rt.gpa.alloc(*heap.Cell, res_ptr.repl_bindings.len);
+        var cells_owned = false;
+        errdefer if (!cells_owned) rt.gpa.free(cells);
+        for (res_ptr.repl_bindings, 0..) |rb, i| {
+            const init_val: ?Value = if (rb.kind == .@"var") .undefined else null;
+            cells[i] = rt.heap.newCell(init_val) catch |e| return mapHeapErr(e, rt);
+        }
+        try pool.cell_slices.append(rt.gpa, cells);
+        cells_owned = true;
+    }
+
+    if (engine == .vm) {
+        const p = try rt.gpa.create(Proto);
+        var owned_by_pool = false;
+        errdefer if (!owned_by_pool) rt.gpa.destroy(p);
+        p.* = compiler.compile(rt.gpa, &rt.heap, script, res_ptr.*, rt.limits, diag) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.LimitExceeded => return error.LimitExceeded,
+        };
+        errdefer if (!owned_by_pool) p.deinit(rt.gpa);
+        var vfail: verify.Failure = .{};
+        _ = verify.verify(rt.gpa, p, rt.limits, &vfail) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidBytecode => return error.InvalidBytecode,
+        };
+        if (cells.len > 0) setProtoReplCells(p, cells);
+        try pool.protos.append(rt.gpa, p);
+        owned_by_pool = true;
+        var vm = try Vm.init(rt, p);
+        defer vm.deinit();
+        try vm.run();
+    } else {
+        try machine.runRepl(rt, script, res_ptr, cells);
+    }
+
+    if (export_globals and cells.len > 0) {
+        const realm = try builtins.realm(rt);
+        for (res_ptr.repl_bindings, 0..) |rb, i| {
+            if (cells[i].value) |val| {
+                const atom = try rt.heap.internUtf8(rb.name);
+                try rt.heap.defineProperty(realm.global_object, atom, .{
+                    .value = val,
+                    .writable = true,
+                    .enumerable = true,
+                    .configurable = true,
+                });
+            }
+        }
+    }
+}
 
 fn setProtoReplCells(p: *Proto, cells: []*heap.Cell) void {
     p.repl_cells = cells;
@@ -193,23 +312,30 @@ pub fn runEntry(
     mod_diag: *ModuleDiag,
 ) (ModuleError || RuntimeError)!*heap.Object {
     const entry = try loadAndLink(rt, specifier, entry_source, engine, mod_diag);
-    try evaluateModule(rt, entry, engine);
-    if (entry.eval_promise) |ep| {
-        var held = [_]Value{Value.fromObject(ep)};
-        var roots: ValueRoots = .{ .values = &held };
-        try roots.register(rt);
-        defer roots.unregister(rt);
+    const ep = try evaluateModule(rt, entry, engine);
+    var held = [_]Value{Value.fromObject(ep)};
+    var roots: ValueRoots = .{ .values = &held };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    if (engine == .vm) {
         const prev_caller = rt.closure_caller;
-        if (engine == .vm and rt.closure_caller == null) {
+        if (rt.closure_caller == null) {
             rt.closure_caller = .{ .ctx = rt, .call = Vm.callStandalone, .construct = Vm.constructStandalone };
         }
         defer rt.closure_caller = prev_caller;
         try rt.drainMicrotasks();
-        switch (ep.kind.promise.state) {
-            .fulfilled => {},
-            .rejected => return rt.throwValue(ep.kind.promise.result),
-            .pending => {},
-        }
+    } else if (rt.closure_caller == null) {
+        // Install a Machine closure_caller while draining microtasks on treewalk.
+        var empty_script = entry.script;
+        empty_script.statements = &.{};
+        try machine.runModule(rt, empty_script, &entry.res, entry.cells, entry);
+    } else {
+        try rt.drainMicrotasks();
+    }
+    switch (ep.kind.promise.state) {
+        .fulfilled => {},
+        .rejected => return rt.throwValue(ep.kind.promise.result),
+        .pending => {},
     }
     return try getNamespace(rt, entry);
 }
@@ -431,7 +557,8 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                 for (imp.named) |sp| {
                     const ri = m.res.bindings[sp.local.binding].repl_index.?;
                     is_import[ri] = true;
-                    try m.import_links.append(gpa, .{ .repl_idx = ri, .dep = dep, .imported_name = sp.imported, .span = sp.span });
+                    const imp_name = try decodeIdentName(m.arena.allocator(), sp.imported);
+                    try m.import_links.append(gpa, .{ .repl_idx = ri, .dep = dep, .imported_name = imp_name, .span = sp.span });
                 }
             },
             .export_decl => |exp| switch (exp) {
@@ -439,9 +566,11 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                     const dep = m.deps.items[dep_idx];
                     dep_idx += 1;
                     for (rn.specifiers) |sp| {
-                        try m.indirect_exports.put(gpa, sp.exported, .{
+                        const exp_name = try decodeIdentName(m.arena.allocator(), sp.exported);
+                        const imp_name = try decodeIdentName(m.arena.allocator(), sp.imported);
+                        try m.indirect_exports.put(gpa, exp_name, .{
                             .dep = dep,
-                            .imported_name = sp.imported,
+                            .imported_name = imp_name,
                             .span = sp.span,
                         });
                     }
@@ -450,9 +579,12 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
                     const dep = m.deps.items[dep_idx];
                     dep_idx += 1;
                     if (ra.namespace) |ns_name| {
-                        const cell = rt.heap.newCell(null) catch |e| return mapHeapErr(e, rt);
-                        try m.ns_reexports.put(gpa, ns_name, .{ .dep = dep, .cell = cell });
-                        try m.local_exports.put(gpa, ns_name, cell);
+                        const dec_ns = try decodeIdentName(m.arena.allocator(), ns_name);
+                        try m.indirect_exports.put(gpa, dec_ns, .{
+                            .dep = dep,
+                            .imported_name = null,
+                            .span = s.span,
+                        });
                     } else {
                         try m.star_reexports.append(gpa, dep);
                     }
@@ -475,11 +607,13 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
             .declaration => |decl| for (decl.declarators) |d| try addPatternExports(gpa, m, d.pattern),
             .function => |f| {
                 const ri = m.res.bindings[f.name.?.binding].repl_index.?;
-                try m.local_exports.put(gpa, f.name.?.name, m.cells[ri]);
+                const exp_name = try decodeIdentName(m.arena.allocator(), f.name.?.name);
+                try m.local_exports.put(gpa, exp_name, m.cells[ri]);
             },
             .class => |cls| {
                 const ri = m.res.bindings[cls.name.?.binding].repl_index.?;
-                try m.local_exports.put(gpa, cls.name.?.name, m.cells[ri]);
+                const exp_name = try decodeIdentName(m.arena.allocator(), cls.name.?.name);
+                try m.local_exports.put(gpa, exp_name, m.cells[ri]);
             },
             .default_expr => |de| {
                 const ri = m.res.bindings[de.binding].repl_index.?;
@@ -495,39 +629,38 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
             },
             .named => |specs| for (specs) |sp| {
                 const ri = m.res.refs[sp.local.id].repl;
-                if (is_import[ri]) {
-                    for (m.import_links.items) |link| {
-                        if (link.repl_idx == ri) {
-                            if (link.imported_name) |imp_name| {
-                                try m.indirect_exports.put(gpa, sp.exported, .{
-                                    .dep = link.dep,
-                                    .imported_name = imp_name,
-                                    .span = sp.span,
-                                });
-                            }
-                            break;
-                        }
+                const exp_name = try decodeIdentName(m.arena.allocator(), sp.exported);
+                var matched_import: ?ImportLink = null;
+                for (m.import_links.items) |link| {
+                    if (link.repl_idx == ri) {
+                        matched_import = link;
+                        break;
                     }
+                }
+                if (matched_import) |link| {
+                    try m.indirect_exports.put(gpa, exp_name, .{
+                        .dep = link.dep,
+                        .imported_name = link.imported_name,
+                        .span = sp.span,
+                    });
                 } else {
-                    try m.local_exports.put(gpa, sp.exported, m.cells[ri]);
+                    try m.local_exports.put(gpa, exp_name, m.cells[ri]);
                 }
             },
             .reexport_named, .reexport_all => {},
         };
     }
 
-    // Step 2: Populate `export * as ns` cells, and resolve all imports & indirect re-exports across the graph.
+    // Step 2: Resolve all imports & indirect re-exports across the graph.
     for (mods) |m| {
-        var ns_it = m.ns_reexports.valueIterator();
-        while (ns_it.next()) |entry| {
-            const ns_obj = getNamespace(rt, entry.dep) catch |e| return mapRuntimeToModErr(e);
-            rt.heap.storeCell(entry.cell, Value.fromObject(ns_obj));
-        }
         for (m.import_links.items) |link| {
             if (link.imported_name) |imp_name| {
                 const resolved = try resolveExportTop(gpa, link.dep, imp_name);
                 switch (resolved) {
                     .resolved => |r| m.cells[link.repl_idx] = r.cell,
+                    .namespace => |target| {
+                        m.cells[link.repl_idx] = getNamespaceCell(rt, target) catch |e| return mapRuntimeToModErr(e);
+                    },
                     .not_found => {
                         mod_diag.diag = .{ .detail = .{ .syntax_error = "does not provide an export named" }, .start = link.span.start, .end = link.span.end };
                         return error.SyntaxError;
@@ -546,9 +679,10 @@ fn linkGraph(rt: *Runtime, engine: Engine, start_len: usize, mod_diag: *ModuleDi
         var ind_it = m.indirect_exports.iterator();
         while (ind_it.next()) |entry| {
             const ind = entry.value_ptr.*;
-            const resolved = try resolveExportTop(gpa, ind.dep, ind.imported_name);
+            const imp_name = ind.imported_name orelse continue;
+            const resolved = try resolveExportTop(gpa, ind.dep, imp_name);
             switch (resolved) {
-                .resolved => {},
+                .resolved, .namespace => {},
                 .not_found => {
                     mod_diag.diag = .{ .detail = .{ .syntax_error = "does not provide an export named" }, .start = ind.span.start, .end = ind.span.end };
                     return error.SyntaxError;
@@ -653,11 +787,56 @@ fn mapHeapErr(e: heap.Error, rt: *Runtime) ModuleError {
     };
 }
 
+fn decodeIdentName(arena: Allocator, raw: []const u8) error{OutOfMemory}![]const u8 {
+    if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] == '\\' and i + 1 < raw.len and raw[i + 1] == 'u') {
+            if (i + 2 < raw.len and raw[i + 2] == '{') {
+                if (std.mem.indexOfScalarPos(u8, raw, i + 3, '}')) |close| {
+                    if (std.fmt.parseInt(u21, raw[i + 3 .. close], 16)) |cp| {
+                        var buf: [4]u8 = undefined;
+                        if (std.unicode.utf8Encode(cp, &buf)) |n| {
+                            try out.appendSlice(arena, buf[0..n]);
+                            i = close + 1;
+                            continue;
+                        } else |_| {}
+                    } else |_| {}
+                }
+            } else if (i + 6 <= raw.len) {
+                if (std.fmt.parseInt(u16, raw[i + 2 .. i + 6], 16)) |cu1| {
+                    var cp: u21 = cu1;
+                    var next_i = i + 6;
+                    if (cu1 >= 0xD800 and cu1 <= 0xDBFF and next_i + 6 <= raw.len and raw[next_i] == '\\' and raw[next_i + 1] == 'u') {
+                        if (std.fmt.parseInt(u16, raw[next_i + 2 .. next_i + 6], 16)) |cu2| {
+                            if (cu2 >= 0xDC00 and cu2 <= 0xDFFF) {
+                                cp = 0x10000 + (@as(u21, cu1 - 0xD800) << 10) + @as(u21, cu2 - 0xDC00);
+                                next_i += 6;
+                            }
+                        } else |_| {}
+                    }
+                    var buf: [4]u8 = undefined;
+                    if (std.unicode.utf8Encode(cp, &buf)) |n| {
+                        try out.appendSlice(arena, buf[0..n]);
+                        i = next_i;
+                        continue;
+                    } else |_| {}
+                } else |_| {}
+            }
+        }
+        try out.append(arena, raw[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(arena);
+}
+
 fn addPatternExports(gpa: Allocator, m: *ModuleRecord, pat: *const ast.Pattern) Allocator.Error!void {
     switch (pat.data) {
         .binding => |d| {
             const ri = m.res.bindings[d.binding].repl_index.?;
-            try m.local_exports.put(gpa, d.name, m.cells[ri]);
+            const exp_name = try decodeIdentName(m.arena.allocator(), d.name);
+            try m.local_exports.put(gpa, exp_name, m.cells[ri]);
         },
         .array => |arr| {
             for (arr.elems) |maybe| if (maybe) |el| try addPatternExports(gpa, m, el.pattern);
@@ -678,6 +857,7 @@ const ResolveKey = struct {
 
 const ResolveResult = union(enum) {
     resolved: struct { mod: *const ModuleRecord, cell: *heap.Cell },
+    namespace: *ModuleRecord,
     not_found,
     ambiguous,
 };
@@ -698,7 +878,10 @@ fn resolveExport(gpa: Allocator, mod: *const ModuleRecord, name: []const u8, vis
         return .{ .resolved = .{ .mod = mod, .cell = cell } };
     }
     if (mod.indirect_exports.get(name)) |ind| {
-        return resolveExport(gpa, ind.dep, ind.imported_name, visited);
+        if (ind.imported_name) |imp_name| {
+            return resolveExport(gpa, ind.dep, imp_name, visited);
+        }
+        return .{ .namespace = ind.dep };
     }
     if (std.mem.eql(u8, name, "default")) return .not_found;
 
@@ -713,6 +896,15 @@ fn resolveExport(gpa: Allocator, mod: *const ModuleRecord, name: []const u8, vis
                 .resolved => |prev| {
                     if (prev.cell != r.cell) return .ambiguous;
                 },
+                .namespace => return .ambiguous,
+                .ambiguous => unreachable,
+            },
+            .namespace => |target| switch (star_res) {
+                .not_found => star_res = .{ .namespace = target },
+                .namespace => |prev_target| {
+                    if (prev_target != target) return .ambiguous;
+                },
+                .resolved => return .ambiguous,
                 .ambiguous => unreachable,
             },
         }
@@ -720,23 +912,48 @@ fn resolveExport(gpa: Allocator, mod: *const ModuleRecord, name: []const u8, vis
     return star_res;
 }
 
+fn getNamespaceCell(rt: *Runtime, mod: *ModuleRecord) RuntimeError!*heap.Cell {
+    if (mod.namespace_cell) |c| return c;
+    _ = try getNamespace(rt, mod);
+    return mod.namespace_cell.?;
+}
+
 pub fn getNamespace(rt: *Runtime, mod: *ModuleRecord) RuntimeError!*heap.Object {
     if (mod.namespace) |ns| return ns;
+    if (mod.namespace_cell == null) {
+        mod.namespace_cell = try rt.heap.newCell(null);
+    }
 
-    var names: std.StringHashMapUnmanaged(*heap.Cell) = .empty;
+    var names: std.StringHashMapUnmanaged(void) = .empty;
     defer names.deinit(rt.gpa);
     var visited: std.AutoHashMapUnmanaged(*const ModuleRecord, void) = .empty;
     defer visited.deinit(rt.gpa);
 
     try collectExportedNames(rt.gpa, mod, &names, &visited, false);
 
+    // Root interned atoms in a temporary GC array while collecting entries so `-Dgc-stress`
+    // cannot sweep weak atoms before `newModuleNamespace` takes ownership.
+    const atom_roots = try rt.heap.newArray(null);
+    var held = [_]Value{ Value.fromObject(atom_roots), .undefined };
+    var roots: ValueRoots = .{ .values = &held };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     var entries: std.ArrayList(heap.ModuleExport) = .empty;
     defer entries.deinit(rt.gpa);
 
-    var it = names.iterator();
-    while (it.next()) |e| {
-        const atom = try rt.heap.internAscii(e.key_ptr.*);
-        try entries.append(rt.gpa, .{ .name = atom, .cell = e.value_ptr.* });
+    var it = names.keyIterator();
+    while (it.next()) |key_ptr| {
+        const export_name = key_ptr.*;
+        const resolved = try resolveExportTop(rt.gpa, mod, export_name);
+        const cell: *heap.Cell = switch (resolved) {
+            .resolved => |r| r.cell,
+            .namespace => |target| try getNamespaceCell(rt, target),
+            .ambiguous, .not_found => continue,
+        };
+        const atom = try rt.heap.internUtf8(export_name);
+        try rt.heap.appendElement(atom_roots, Value.fromString(atom));
+        try entries.append(rt.gpa, .{ .name = atom, .cell = cell });
     }
 
     std.mem.sort(heap.ModuleExport, entries.items, {}, struct {
@@ -746,6 +963,7 @@ pub fn getNamespace(rt: *Runtime, mod: *ModuleRecord) RuntimeError!*heap.Object 
     }.lt);
 
     const ns_obj = try rt.heap.newModuleNamespace(entries.items);
+    held[1] = Value.fromObject(ns_obj);
     const realm = try builtins.realm(rt);
     const tag_str = try rt.heap.internAscii("Module");
     try rt.heap.definePropKey(ns_obj, heap.PropKey.fromSymbol(realm.sym_to_string_tag), .{
@@ -755,36 +973,30 @@ pub fn getNamespace(rt: *Runtime, mod: *ModuleRecord) RuntimeError!*heap.Object 
         .configurable = false,
     });
     mod.namespace = ns_obj;
+    rt.heap.storeCell(mod.namespace_cell.?, Value.fromObject(ns_obj));
     return ns_obj;
 }
 
 fn collectExportedNames(
     gpa: Allocator,
     mod: *const ModuleRecord,
-    out: *std.StringHashMapUnmanaged(*heap.Cell),
+    out: *std.StringHashMapUnmanaged(void),
     visited: *std.AutoHashMapUnmanaged(*const ModuleRecord, void),
     via_star: bool,
 ) error{OutOfMemory}!void {
     if (visited.contains(mod)) return;
     try visited.put(gpa, mod, {});
 
-    var loc_it = mod.local_exports.iterator();
-    while (loc_it.next()) |e| {
-        if (via_star and std.mem.eql(u8, e.key_ptr.*, "default")) continue;
-        if (!out.contains(e.key_ptr.*)) {
-            try out.put(gpa, e.key_ptr.*, e.value_ptr.*);
-        }
+    var loc_it = mod.local_exports.keyIterator();
+    while (loc_it.next()) |k| {
+        if (via_star and std.mem.eql(u8, k.*, "default")) continue;
+        try out.put(gpa, k.*, {});
     }
 
-    var ind_it = mod.indirect_exports.iterator();
-    while (ind_it.next()) |e| {
-        if (via_star and std.mem.eql(u8, e.key_ptr.*, "default")) continue;
-        if (!out.contains(e.key_ptr.*)) {
-            if (try resolveExportTop(gpa, e.value_ptr.dep, e.value_ptr.imported_name) == .resolved) {
-                const res = try resolveExportTop(gpa, e.value_ptr.dep, e.value_ptr.imported_name);
-                try out.put(gpa, e.key_ptr.*, res.resolved.cell);
-            }
-        }
+    var ind_it = mod.indirect_exports.keyIterator();
+    while (ind_it.next()) |k| {
+        if (via_star and std.mem.eql(u8, k.*, "default")) continue;
+        try out.put(gpa, k.*, {});
     }
 
     for (mod.star_reexports.items) |star_dep| {
@@ -844,7 +1056,7 @@ pub fn dynamicImport(
     const r = try builtins.realm(rt);
     const p = try rt.heap.newPromise(r.promise_prototype);
 
-    var held = [_]Value{ Value.fromObject(p), specifier_val, .undefined, .undefined, .undefined };
+    var held = [_]Value{ Value.fromObject(p), specifier_val, .undefined, .undefined };
     var roots: ValueRoots = .{ .values = &held };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -859,16 +1071,50 @@ pub fn dynamicImport(
     };
     held[1] = spec_str_val;
 
+    // Defer loading/linking/evaluation to a microtask per ES `HostLoadImportedModule` /
+    // `ContinueDynamicImport` so dynamic `import()` never preempts an active DFS `Evaluate`.
+    const env = try rt.heap.newArray(null);
+    held[2] = Value.fromObject(env);
+    const ref_num: f64 = if (referrer_mod) |rm| @floatFromInt(rm.mod_index) else -1.0;
+    try rt.heap.appendElements(env, &.{
+        Value.fromObject(p),
+        spec_str_val,
+        Value.fromNumber(ref_num),
+        Value.fromNumber(@floatFromInt(@backingInt(engine))),
+    });
+    const job_cb = try rt.heap.newNativeClosure(&dynImportJobCb, env);
+    held[3] = Value.fromClosure(job_cb);
+    try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
+    rt.microtasks.appendAssumeCapacity(.{
+        .kind = .reaction,
+        .child = null,
+        .cb = held[3],
+        .arg = .undefined,
+    });
+    return p;
+}
+
+fn dynImportJobCb(rt: *Runtime, env: *heap.Object, _: []const Value) RuntimeError!Value {
+    const p = env.kind.array.items[0].asObject();
+    const spec_str_val = env.kind.array.items[1];
+    const ref_num = env.kind.array.items[2].asNumber();
+    const engine: Engine = @fromBackingInt(@intCast(@as(u8, @intFromFloat(env.kind.array.items[3].asNumber()))));
+
+    var held = [_]Value{ Value.fromObject(p), spec_str_val, .undefined, .undefined, .undefined };
+    var roots: ValueRoots = .{ .values = &held };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
     const spec_utf8 = std.unicode.utf16LeToUtf8Alloc(rt.gpa, spec_str_val.asString().units) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try rejectPromiseWithError(rt, p, .TypeError, "Invalid module specifier");
-            return p;
+            return .undefined;
         },
     };
     defer rt.gpa.free(spec_utf8);
 
-    const referrer_id: ?[]const u8 = if (referrer_mod) |rm| rm.canonical_id else null;
+    const referrer_id: ?[]const u8 = if (ref_num >= 0) rt.modules.list.items[@intFromFloat(ref_num)].canonical_id else null;
     const start_len = rt.modules.list.items.len;
     var mod_diag: ModuleDiag = .{};
 
@@ -883,71 +1129,21 @@ pub fn dynamicImport(
                 else => "SyntaxError",
             };
             try rejectPromiseWithError(rt, p, .SyntaxError, msg);
-            return p;
+            return .undefined;
         },
         error.ModuleNotFound => {
             try rejectPromiseWithError(rt, p, .TypeError, "Cannot find module");
-            return p;
+            return .undefined;
         },
         error.HostError => {
             try rejectPromiseWithError(rt, p, .TypeError, "Module load failed");
-            return p;
+            return .undefined;
         },
     };
 
-    switch (target_mod.status) {
-        .evaluated => {
-            const ns = try getNamespace(rt, target_mod);
-            held[2] = Value.fromObject(ns);
-            try builtins.resolvePromiseValue(rt, p, held[2]);
-            return p;
-        },
-        .errored => {
-            if (target_mod.eval_error) |v| {
-                try builtins.settlePromiseFromJob(rt, p, true, v);
-                return p;
-            }
-            return target_mod.eval_fault.?;
-        },
-        .evaluating => {
-            const ns = try getNamespace(rt, target_mod);
-            held[2] = Value.fromObject(ns);
-            try builtins.resolvePromiseValue(rt, p, held[2]);
-            return p;
-        },
-        .evaluating_async => {
-            try attachDynImportReaction(rt, target_mod, p, &held);
-            return p;
-        },
-        .linked => {
-            evaluateModule(rt, target_mod, engine) catch |e| switch (e) {
-                error.Thrown => {
-                    const err_val = try rt.catchValue();
-                    try builtins.settlePromiseFromJob(rt, p, true, err_val);
-                    return p;
-                },
-                else => return e,
-            };
-            switch (target_mod.status) {
-                .evaluated => {
-                    const ns = try getNamespace(rt, target_mod);
-                    held[2] = Value.fromObject(ns);
-                    try builtins.resolvePromiseValue(rt, p, held[2]);
-                },
-                .evaluating_async => try attachDynImportReaction(rt, target_mod, p, &held),
-                .errored => {
-                    if (target_mod.eval_error) |v| {
-                        try builtins.settlePromiseFromJob(rt, p, true, v);
-                    } else {
-                        return target_mod.eval_fault.?;
-                    }
-                },
-                else => unreachable,
-            }
-            return p;
-        },
-        .unlinked, .linking => return rt.bug("evaluating unlinked module"),
-    }
+    const ep = try evaluateModule(rt, target_mod, engine);
+    try attachDynImportReaction(rt, target_mod, ep, p, &held);
+    return .undefined;
 }
 
 fn loadAndLinkFromReferrer(
@@ -964,8 +1160,7 @@ fn loadAndLinkFromReferrer(
     return mod;
 }
 
-fn attachDynImportReaction(rt: *Runtime, target: *ModuleRecord, result_p: *heap.Object, held: *[5]Value) RuntimeError!void {
-    const ep = target.eval_promise orelse return rt.bug("evaluating_async module missing eval_promise");
+fn attachDynImportReaction(rt: *Runtime, target: *ModuleRecord, ep: *heap.Object, result_p: *heap.Object, held: *[5]Value) RuntimeError!void {
     const env = try rt.heap.newArray(null);
     held[2] = Value.fromObject(env);
     try rt.heap.appendElements(env, &.{ Value.fromNumber(@floatFromInt(target.mod_index)), Value.fromObject(result_p) });
@@ -1007,31 +1202,57 @@ fn rejectPromiseWithError(rt: *Runtime, p: *heap.Object, err_name: @FieldType(rt
     return e;
 }
 
-pub fn evaluateModule(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeError!void {
-    switch (mod.status) {
-        .evaluated, .evaluating, .evaluating_async => return,
-        .errored => {
-            if (mod.eval_error) |v| return rt.throwValue(v);
-            return mod.eval_fault.?;
-        },
-        .linked => {},
+/// ES2025 `Evaluate()` on a Cyclic Module Record.
+/// Returns the module's (or its cycle root's) top-level capability promise.
+pub fn evaluateModule(rt: *Runtime, start_mod: *ModuleRecord, engine: Engine) RuntimeError!*heap.Object {
+    const mod: *ModuleRecord = switch (start_mod.status) {
+        .evaluating_async, .evaluated, .errored => start_mod.cycle_root orelse start_mod,
+        .linked => start_mod,
+        .evaluating => start_mod,
         .unlinked, .linking => return rt.bug("evaluating unlinked module"),
-    }
+    };
+
+    if (mod.eval_fault) |fault| return fault;
+    if (mod.eval_promise) |ep| return ep;
+
+    const r = try builtins.realm(rt);
+    const cap = try rt.heap.newPromise(r.promise_prototype);
+    mod.eval_promise = cap;
 
     var stack: std.ArrayList(*ModuleRecord) = .empty;
     defer stack.deinit(rt.gpa);
 
     _ = innerModuleEvaluation(rt, mod, engine, &stack, 0) catch |e| {
-        const err_val: ?Value = if (e == error.Thrown) (rt.catchValue() catch null) else null;
+        if (e == error.Thrown) {
+            const err_val = try rt.catchValue();
+            for (stack.items) |w| {
+                if (w.status == .evaluating) {
+                    w.status = .errored;
+                    w.eval_error = err_val;
+                    if (w.async_eval_order == .evaluating) w.async_eval_order = .done;
+                }
+            }
+            mod.status = .errored;
+            mod.eval_error = err_val;
+            if (mod.async_eval_order == .evaluating) mod.async_eval_order = .done;
+            try builtins.settlePromiseFromJob(rt, cap, true, err_val);
+            return cap;
+        }
         for (stack.items) |w| {
             if (w.status == .evaluating) {
                 w.status = .errored;
-                if (err_val) |v| w.eval_error = v else w.eval_fault = e;
+                w.eval_fault = e;
             }
         }
-        if (err_val) |v| return rt.throwValue(v);
+        mod.status = .errored;
+        mod.eval_fault = e;
         return e;
     };
+
+    if (mod.async_eval_order != .evaluating) {
+        try builtins.resolvePromiseValue(rt, cap, .undefined);
+    }
+    return cap;
 }
 
 fn innerModuleEvaluation(
@@ -1060,80 +1281,38 @@ fn innerModuleEvaluation(
 
     for (mod.deps.items) |dep| {
         next_index = try innerModuleEvaluation(rt, dep, engine, stack, next_index);
-        if (dep.status == .evaluating) {
-            mod.dfs_ancestor_index = @min(mod.dfs_ancestor_index, dep.dfs_ancestor_index);
+        var req = dep;
+        if (req.status == .evaluating) {
+            mod.dfs_ancestor_index = @min(mod.dfs_ancestor_index, req.dfs_ancestor_index);
         } else {
-            const dep_root = dep.cycle_root orelse dep;
-            if (dep_root.status == .errored) {
-                if (dep_root.eval_error) |v| return rt.throwValue(v);
-                return dep_root.eval_fault.?;
+            req = req.cycle_root orelse req;
+            if (req.status == .errored) {
+                if (req.eval_error) |v| return rt.throwValue(v);
+                return req.eval_fault.?;
             }
-            if (dep_root.async_eval) {
-                mod.pending_async_deps += 1;
-                try dep_root.async_parents.append(rt.gpa, mod);
-            }
+        }
+        if (req.async_eval_order == .evaluating) {
+            mod.pending_async_deps += 1;
+            try req.async_parents.append(rt.gpa, mod);
         }
     }
 
     if (mod.pending_async_deps > 0 or mod.has_tla) {
-        mod.async_eval = true;
+        rt.modules.async_eval_counter += 1;
+        mod.async_eval_order = .{ .evaluating = rt.modules.async_eval_counter };
+        if (mod.pending_async_deps == 0) {
+            try executeAsyncModule(rt, mod, engine);
+        }
+    } else {
+        try runSyncModuleBody(rt, mod, engine);
     }
 
     if (mod.dfs_ancestor_index == mod.dfs_index) {
-        var scc: std.ArrayList(*ModuleRecord) = .empty;
-        defer scc.deinit(rt.gpa);
-        var has_async = false;
         while (true) {
             const w = stack.pop().?;
+            w.status = if (w.async_eval_order == .unset) .evaluated else .evaluating_async;
             w.cycle_root = mod;
-            if (w.async_eval) has_async = true;
-            try scc.append(rt.gpa, w);
             if (w == mod) break;
-        }
-
-        if (!has_async) {
-            for (scc.items) |w| {
-                runSyncModuleBody(rt, w, engine) catch |e| {
-                    w.status = .errored;
-                    if (e == error.Thrown) {
-                        if (rt.catchValue()) |val| {
-                            w.eval_error = val;
-                            _ = rt.throwValue(val) catch {};
-                        } else |_| {
-                            w.eval_fault = e;
-                        }
-                    } else {
-                        w.eval_fault = e;
-                    }
-                    return e;
-                };
-                w.status = .evaluated;
-            }
-        } else {
-            const r = try builtins.realm(rt);
-            for (scc.items) |w| {
-                w.async_eval = true;
-                w.status = .evaluating_async;
-                if (w.eval_promise == null) {
-                    w.eval_promise = try rt.heap.newPromise(r.promise_prototype);
-                }
-            }
-            // In a cycle with TLA, a non-TLA member depending on a TLA member in the same SCC must wait for it.
-            for (scc.items) |w| {
-                if (!w.has_tla and w.pending_async_deps == 0) {
-                    for (w.deps.items) |dep| {
-                        if (dep != w and dep.cycle_root == mod and dep.has_tla) {
-                            w.pending_async_deps += 1;
-                            try dep.async_parents.append(rt.gpa, w);
-                        }
-                    }
-                }
-            }
-            for (scc.items) |w| {
-                if (w.pending_async_deps == 0) {
-                    try executeAsyncModule(rt, w, engine);
-                }
-            }
         }
     }
 
@@ -1142,37 +1321,27 @@ fn innerModuleEvaluation(
 
 fn runSyncModuleBody(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeError!void {
     if (engine == .vm) {
-        try runVmModule(rt, mod.proto.?, true);
-    } else {
-        try machine.runModule(rt, mod.script, &mod.res, mod.cells, mod);
-    }
-}
-
-fn runAsyncDepSyncBody(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeError!void {
-    if (engine == .vm) {
-        try runVmModule(rt, mod.proto.?, false);
+        try runVmModule(rt, mod.proto.?);
     } else {
         try machine.runModuleBody(rt, mod.script, &mod.res, mod.cells, mod);
     }
 }
 
-fn runVmModule(rt: *Runtime, proto: *const Proto, drain: bool) RuntimeError!void {
+fn runVmModule(rt: *Runtime, proto: *const Proto) RuntimeError!void {
     var vm = try Vm.init(rt, proto);
     defer vm.deinit();
-    const is_nested = rt.engine_roots != null;
-    if (is_nested) {
-        vm.nested = true;
-        try rt.addRoots(vm.roots());
-    }
-    defer if (is_nested) rt.removeRoots(&vm);
+    // Always run as nested so `Vm.run()` does not drain microtasks mid-`InnerModuleEvaluation`
+    // (which would let sibling TLA modules settle before the DFS graph finishes).
+    vm.nested = true;
+    try rt.addRoots(vm.roots());
+    defer rt.removeRoots(&vm);
     try vm.run();
-    if (drain) try rt.drainMicrotasks();
 }
 
 fn executeAsyncModule(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeError!void {
     if (mod.status == .errored) return;
     if (!mod.has_tla) {
-        runAsyncDepSyncBody(rt, mod, engine) catch |e| {
+        runSyncModuleBody(rt, mod, engine) catch |e| {
             return handleAsyncModuleFailure(rt, mod, e);
         };
         try fulfillAsyncModule(rt, mod, engine);
@@ -1231,23 +1400,71 @@ fn asyncModRejectCb(rt: *Runtime, env: *heap.Object, args: []const Value) Runtim
     return .undefined;
 }
 
+fn gatherAvailableAncestors(
+    gpa: Allocator,
+    mod: *ModuleRecord,
+    exec_list: *std.ArrayList(*ModuleRecord),
+) error{OutOfMemory}!void {
+    for (mod.async_parents.items) |m| {
+        if (m.status == .errored) continue;
+        var in_list = false;
+        for (exec_list.items) |existing| {
+            if (existing == m) {
+                in_list = true;
+                break;
+            }
+        }
+        if (in_list) continue;
+        if (m.pending_async_deps == 0) continue;
+        m.pending_async_deps -= 1;
+        if (m.pending_async_deps == 0) {
+            try exec_list.append(gpa, m);
+            if (!m.has_tla) {
+                try gatherAvailableAncestors(gpa, m, exec_list);
+            }
+        }
+    }
+}
+
 fn fulfillAsyncModule(rt: *Runtime, mod: *ModuleRecord, engine: Engine) RuntimeError!void {
     if (mod.status == .errored) return;
+    mod.async_eval_order = .done;
     mod.status = .evaluated;
     if (mod.eval_promise) |ep| {
         try builtins.resolvePromiseValue(rt, ep, .undefined);
     }
-    for (mod.async_parents.items) |parent| {
-        if (parent.status != .evaluating_async) continue;
-        parent.pending_async_deps -= 1;
-        if (parent.pending_async_deps == 0) {
-            try executeAsyncModule(rt, parent, engine);
+
+    var exec_list: std.ArrayList(*ModuleRecord) = .empty;
+    defer exec_list.deinit(rt.gpa);
+    try gatherAvailableAncestors(rt.gpa, mod, &exec_list);
+
+    std.mem.sort(*ModuleRecord, exec_list.items, {}, struct {
+        fn lt(_: void, a: *ModuleRecord, b: *ModuleRecord) bool {
+            return a.async_eval_order.evaluating < b.async_eval_order.evaluating;
+        }
+    }.lt);
+
+    for (exec_list.items) |m| {
+        if (m.status == .errored) continue;
+        if (m.has_tla) {
+            try executeAsyncModule(rt, m, engine);
+        } else {
+            runSyncModuleBody(rt, m, engine) catch |e| {
+                try handleAsyncModuleFailure(rt, m, e);
+                continue;
+            };
+            m.async_eval_order = .done;
+            m.status = .evaluated;
+            if (m.eval_promise) |ep| {
+                try builtins.resolvePromiseValue(rt, ep, .undefined);
+            }
         }
     }
 }
 
 fn rejectAsyncModule(rt: *Runtime, mod: *ModuleRecord, reason: Value) RuntimeError!void {
     if (mod.status == .errored) return;
+    mod.async_eval_order = .done;
     mod.status = .errored;
     mod.eval_error = reason;
     if (mod.eval_promise) |ep| {

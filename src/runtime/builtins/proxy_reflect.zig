@@ -744,7 +744,10 @@ pub fn constructWithNewTarget(rt: *Runtime, target_in: Value, args: []const Valu
             const res = try builtins.construct(rt, target, effective_args);
             root_buf[1] = res;
             const p = try object.get(rt, new_target, try object.named(rt, "prototype"));
-            const po: ?*Object = if (p.isObject()) p.asObject() else null;
+            const po: ?*Object = if (p.isObject()) p.asObject() else blk: {
+                try checkFunctionRealm(rt, new_target);
+                break :blk null;
+            };
             if (target.asNative() == &builtins.object_global) {
                 return Value.fromObject(try rt.heap.newObject(po orelse (try builtins.realm(rt)).object_prototype));
             }
@@ -760,6 +763,28 @@ pub fn constructWithNewTarget(rt: *Runtime, target_in: Value, args: []const Valu
         return builtins.construct(rt, target, effective_args);
     }
     return rt.constructClosure(target.asClosure(), effective_args, new_target);
+}
+
+pub fn checkFunctionRealm(rt: *Runtime, obj: Value) Error!void {
+    var cur = obj;
+    var depth: usize = 0;
+    while (depth < 1024) : (depth += 1) {
+        switch (cur.unpack()) {
+            .closure => |c| switch (c.impl) {
+                .bound => |b| cur = b.target,
+                else => return,
+            },
+            .object => |o| {
+                if (o.kind == .proxy) {
+                    if (o.kind.proxy.handler == null) {
+                        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot perform 'GetFunctionRealm' on a proxy that has been revoked" }});
+                    }
+                    cur = o.kind.proxy.target.?;
+                } else return;
+            },
+            else => return,
+        }
+    }
 }
 
 fn requireReflectTarget(rt: *Runtime, v: Value, name: []const u8) Error!Value {

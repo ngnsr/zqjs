@@ -1819,17 +1819,21 @@ test "local-const / local-local arithmetic superinstructions, TDZ in switch/if/t
         \\let accHits = 0;
         \\Object.defineProperty(globalThis, 'gx', { get() { accHits++; return 7; }, configurable: true });
         \\for (let i = 0; i < 3; i++) sum += gx;
+        \\const origMath = Math;
         \\globalThis.Math = { abs(x) { return x + 100; } };
         \\let m1 = Math.abs(5);
         \\delete globalThis.Math;
+        \\let mathDelThrows = false;
+        \\try { Math; } catch (e) { mathDelThrows = e instanceof ReferenceError; }
+        \\globalThis.Math = origMath;
         \\let m2 = Math.abs(-5);
-        \\print(sum, delThrows, accHits, m1, m2);
+        \\print(sum, delThrows, accHits, m1, mathDelThrows, m2);
     ;
     const prog = try rt.compile("global_ic_and_local_arith.js", src, null);
     defer prog.destroy();
     try rt.run(prog, null);
     try testing.expectEqualStrings(
-        "12 8 20 2 13 7 30 1\ntrue true 1.5 2.5 2 2 NaN\nhi1 hi3 6 7 9\ntrue true\n121 true 3 105 5\n",
+        "12 8 20 2 13 7 30 1\ntrue true 1.5 2.5 2 2 NaN\nhi1 hi3 6 7 9\ntrue true\n121 true 3 105 true 5\n",
         out.buffered(),
     );
 }

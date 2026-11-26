@@ -103,7 +103,7 @@ const $262 = {
   gc: function () {},
   evalScript: function () { throw new Error("evalScript not supported"); },
   createRealm: function () { throw new Error("createRealm not supported"); },
-  detachArrayBuffer: function (ab) { structuredClone(ab, { transfer: [ab] }); }
+  detachArrayBuffer: function (ab) { try { structuredClone(ab, { transfer: [ab] }); } catch (e) { if (!e || e.name !== "DataCloneError") throw e; } }
 };
 """
 

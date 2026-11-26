@@ -288,15 +288,19 @@ pub fn promiseConstruct(rt: *Runtime, args: []const Value) Error!Value {
 
 pub fn resolveToPromise(rt: *Runtime, x: Value) Error!Value {
     const r = try builtins.realm(rt);
-    if (x.isObject() and x.asObject().kind == .promise and x.asObject().proto == r.promise_prototype) {
-        return x;
-    }
-    const p = try rt.heap.newPromise(r.promise_prototype);
-    var root_buf = [_]Value{ Value.fromObject(p), x };
+    var root_buf = [_]Value{ x, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
-    try resolvePromiseValue(rt, p, x);
+    if (x.isObject() and x.asObject().kind == .promise) {
+        const x_ctor = try object.get(rt, x, try object.named(rt, "constructor"));
+        if (x_ctor.isNative() and x_ctor.asNative() == &builtins.promise_global) {
+            return x;
+        }
+    }
+    const p = try rt.heap.newPromise(r.promise_prototype);
+    root_buf[1] = Value.fromObject(p);
+    try resolvePromiseValue(rt, p, root_buf[0]);
     return Value.fromObject(p);
 }
 

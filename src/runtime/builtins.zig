@@ -125,6 +125,8 @@ pub const Realm = struct {
     iterator_namespace: *Object,
     iterator_prototype: *Object,
     array_iterator_prototype: *Object,
+    string_iterator_prototype: *Object,
+    regexp_string_iterator_prototype: *Object,
     map_iterator_prototype: *Object,
     set_iterator_prototype: *Object,
     iterator_helper_prototype: *Object,
@@ -196,7 +198,7 @@ pub const Realm = struct {
     views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [65]*Object {
+    pub fn objects(r: *const Realm) [67]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -213,6 +215,8 @@ pub const Realm = struct {
             r.iterator_namespace,
             r.iterator_prototype,
             r.array_iterator_prototype,
+            r.string_iterator_prototype,
+            r.regexp_string_iterator_prototype,
             r.map_iterator_prototype,
             r.set_iterator_prototype,
             r.iterator_helper_prototype,
@@ -335,6 +339,8 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .iterator_namespace = try h.newObject(function_prototype),
         .iterator_prototype = iterator_prototype,
         .array_iterator_prototype = try h.newObject(iterator_prototype),
+        .string_iterator_prototype = try h.newObject(iterator_prototype),
+        .regexp_string_iterator_prototype = try h.newObject(iterator_prototype),
         .map_iterator_prototype = try h.newObject(iterator_prototype),
         .set_iterator_prototype = try h.newObject(iterator_prototype),
         .iterator_helper_prototype = try h.newObject(iterator_prototype),
@@ -757,6 +763,22 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
         return rt.fail(.builtin);
     }
     return null;
+}
+
+pub fn defineGlobalVar(rt: *Runtime, name: []const u8) Error!void {
+    const r = try realm(rt);
+    const k = try object.named(rt, name);
+    const pk = try object.propKey(rt, k);
+    if (r.global_object.props.get(pk) != null) return;
+    if (!r.global_object.extensible) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot define property on non-extensible global object" }});
+    }
+    try rt.heap.definePropKey(r.global_object, pk, .{
+        .value = .undefined,
+        .writable = true,
+        .enumerable = true,
+        .configurable = false,
+    });
 }
 
 pub fn setGlobal(rt: *Runtime, name: []const u8, val: Value, strict: bool) Error!void {

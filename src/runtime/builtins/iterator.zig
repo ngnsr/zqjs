@@ -38,6 +38,10 @@ pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
     try common.method(rt, r.iterator_prototype, "find", &iterator_find);
     try common.method(rt, r.array_iterator_prototype, "next", &iterator_next);
     try common.defineToStringTag(rt, r.array_iterator_prototype, r.sym_to_string_tag, "Array Iterator");
+    try common.method(rt, r.string_iterator_prototype, "next", &iterator_next);
+    try common.defineToStringTag(rt, r.string_iterator_prototype, r.sym_to_string_tag, "String Iterator");
+    try common.method(rt, r.regexp_string_iterator_prototype, "next", &iterator_next);
+    try common.defineToStringTag(rt, r.regexp_string_iterator_prototype, r.sym_to_string_tag, "RegExp String Iterator");
     try common.method(rt, r.map_iterator_prototype, "next", &iterator_next);
     try common.defineToStringTag(rt, r.map_iterator_prototype, r.sym_to_string_tag, "Map Iterator");
     try common.method(rt, r.set_iterator_prototype, "next", &iterator_next);
@@ -843,7 +847,10 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
         .array_values, .array_keys, .array_entries => {
             if (it.target.asObject().kind == .typed_array) {
                 const ta = it.target.asObject().kind.typed_array;
-                if (!ta.buffer.kind.array_buffer.detached and it.cursor < ta.length) {
+                if (ta.buffer.kind.array_buffer.detached) {
+                    return rt.throw(.TypeError, &.{.{ .ascii = "Cannot perform ArrayIterator.prototype.next on a detached ArrayBuffer" }});
+                }
+                if (it.cursor < ta.length) {
                     const i = it.cursor;
                     it.cursor += 1;
                     const idx_val: Value = Value.fromNumber(@floatFromInt(i));
@@ -1341,7 +1348,16 @@ fn asyncFromSyncStep(rt: *Runtime, p: *Object, rec: *Object, args: []const Value
     const done = ops.toBoolean(try object.get(rt, res, try object.named(rt, "done")));
     const value = try object.get(rt, res, try object.named(rt, "value"));
     root_buf[2] = value;
-    const wrapper = try promise.resolveToPromise(rt, value);
+    const wrapper = promise.resolveToPromise(rt, value) catch |e| {
+        if (e != error.Thrown) return e;
+        if (!done and mode != .@"return") {
+            const err_val = try rt.catchValue();
+            root_buf[2] = err_val;
+            try iteratorClose(rt, rec, true);
+            return rt.throwValue(root_buf[2]);
+        }
+        return e;
+    };
     root_buf[2] = wrapper;
     const on_ful = try rt.heap.newNativeClosure(if (done) @ptrCast(&asyncFromSyncUnwrapDone) else @ptrCast(&asyncFromSyncUnwrap), rec);
     root_buf[3] = Value.fromClosure(on_ful);

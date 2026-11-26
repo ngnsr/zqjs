@@ -108,6 +108,8 @@ pub const Resolution = struct {
         /// Non-null when this declarator merges into an earlier canonical binding
         /// (duplicate `var`, `var` matching a parameter, or `function` matching `var`).
         alias_of: ?u32 = null,
+        /// Non-null for non-module script-level `var` bindings, which live on `globalThis`.
+        global_name: ?[]const u8 = null,
     };
 
     pub const Scope = struct { len: u32 = 0 };
@@ -422,6 +424,11 @@ const Resolver = struct {
                 try f.var_bindings.append(r.arena, d.binding);
                 return;
             }
+            r.bindings.items[d.binding] = .{ .kind = .@"var", .slot = 0, .scope = r.scope, .index = scope.len, .function = f.id, .global_name = d.name };
+            scope.len += 1;
+            try r.live.append(r.arena, .{ .name = d.name, .binding = d.binding });
+            try f.var_bindings.append(r.arena, d.binding);
+            return;
         }
         const slot: u32 = @intCast(r.live.items.len - f.live_start);
         r.bindings.items[d.binding] = .{ .kind = .@"var", .slot = slot, .scope = r.scope, .index = scope.len, .function = f.id };
@@ -1163,6 +1170,7 @@ const Resolver = struct {
             i -= 1;
             if (!std.mem.eql(u8, r.live.items[i].name, name)) continue;
             const b = r.live.items[i].binding;
+            if (r.bindings.items[b].global_name != null) return .global;
             if (r.bindings.items[b].repl_index) |repl_idx| return .{ .repl = repl_idx };
             if (r.bindings.items[b].function == r.current().id) return .{ .local = b };
             r.bindings.items[b].captured = true;

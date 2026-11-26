@@ -1192,6 +1192,7 @@ pub const Vm = struct {
             .async_yield_star_result,
             .get_import_meta,
             .dynamic_import,
+            .define_global_var,
             => {
                 cache.syncSp(vm);
                 if (try vm.executeCold(op, pc, next)) {
@@ -2319,6 +2320,9 @@ pub const Vm = struct {
             .async_iter_close_check => {
                 try builtins.asyncIterCloseCheck(rt, try cache.peek(vm, 0));
                 try cache.drop(vm, 1);
+            },
+            .define_global_var => {
+                try builtins.defineGlobalVar(rt, try vm.name(cache.operand(0)));
             },
             .async_yield_star_call => {
                 const rec = try cache.peek(vm, 2);

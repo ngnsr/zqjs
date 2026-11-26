@@ -554,16 +554,17 @@ fn setSymmetricDifference(rt: *Runtime, this: Value, args: []const Value) Error!
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const out = try cloneSet(rt, s);
-    root_buf[4] = Value.fromObject(out);
     const iter = try getSetKeysIterator(rt, rec);
     root_buf[5] = Value.fromObject(iter);
+    const out = try cloneSet(rt, s);
+    root_buf[4] = Value.fromObject(out);
     while (try iterator.iteratorNextVal(rt, iter)) |v| {
         root_buf[6] = v;
-        if (heap_mod.Heap.setHas(out, v)) {
-            _ = heap_mod.Heap.setDelete(out, v);
-        } else if (!heap_mod.Heap.setHas(s, v)) {
-            try rt.heap.setAdd(out, v);
+        const in_result = heap_mod.Heap.setHas(out, v);
+        if (heap_mod.Heap.setHas(s, v)) {
+            if (in_result) _ = heap_mod.Heap.setDelete(out, v);
+        } else {
+            if (!in_result) try rt.heap.setAdd(out, v);
         }
         root_buf[6] = .undefined;
     }

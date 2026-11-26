@@ -1125,7 +1125,7 @@ fn stringSplitRegExp(
 
 fn stringIterator(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     const s = try thisString(rt, this, "[Symbol.iterator]");
-    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).iterator_prototype, Value.fromString(s), .string_chars));
+    return Value.fromObject(try rt.heap.newIterator((try builtins.realm(rt)).string_iterator_prototype, Value.fromString(s), .string_chars));
 }
 
 pub fn getTemplateObjectFromConsts(

@@ -703,7 +703,7 @@ const Parser = struct {
         var list: std.ArrayList(ast.DeclItem) = .empty;
         while (true) {
             const start_tok = p.tok;
-            const pat = try p.parseBindingPattern(true);
+            const pat = try p.parseBindingPattern(kind != .@"var");
             if (p.isText(p.tok, "in")) {
                 if (p.for_await_head) return p.fail(.{ .syntax_error = "for await requires 'of'" }, p.tok);
                 if (!allow_for_of or list.items.len > 0) return p.fail(.{ .syntax_error = "invalid for-in declaration" }, p.tok);
@@ -798,6 +798,7 @@ const Parser = struct {
         try p.advance();
 
         var init: ?ast.ForInit = null;
+        const lhs_starts_with_async = !is_await and p.isText(p.tok, "async");
         p.no_in = true;
         p.for_await_head = is_await;
         const outer_cover = p.allow_cover_init;
@@ -832,9 +833,17 @@ const Parser = struct {
             return .{ .span = .{ .start = start, .end = body.span.end }, .data = .{ .for_in = .{ .target = target, .object = obj_expr, .body = body } } };
         }
         if (p.isText(p.tok, "of")) {
+            if (lhs_starts_with_async) {
+                if (init) |in| {
+                    if (in == .expression and in.expression.data == .identifier) {
+                        return p.failAt(.{ .syntax_error = "the left-hand side of a for-of loop may not be 'async'" }, in.expression.span.start, in.expression.span.end);
+                    }
+                }
+            }
             const target = try p.extractForEachTarget(init, "for-of");
             try p.advance();
-            const iterable = try p.expression();
+            const iterable = try p.assignment();
+            if (p.tok.tag == .comma) return p.fail(.{ .syntax_error = "unexpected ',' in for-of head" }, p.tok);
             try p.expectAfterExpression(.r_paren);
             const body = try p.loopBody();
             return .{ .span = .{ .start = start, .end = body.span.end }, .data = .{ .for_of = .{ .target = target, .iterable = iterable, .body = body, .is_await = is_await } } };
@@ -2427,6 +2436,7 @@ const Parser = struct {
             mut.has_hole = has_hole;
             mut.has_rest_trailing_comma = has_rest_trailing_comma;
         }
+        p.last_was_paren = false;
         return arr;
     }
 
@@ -2623,6 +2633,7 @@ const Parser = struct {
             mut.has_hole = has_hole;
             mut.has_rest_trailing_comma = has_rest_trailing_comma;
         }
+        p.last_was_paren = false;
         return obj;
     }
 

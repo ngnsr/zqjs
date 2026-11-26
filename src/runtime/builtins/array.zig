@@ -66,7 +66,7 @@ pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
     try object.defineAccessor(rt, Value.fromObject(r.array_namespace), .{ .symbol = r.sym_species }, Value.fromNative(&common.species_getter), false, false);
 }
 
-const array_push: Native = .{ .name = "push", .length = 1, .call = arrayPush };
+pub const array_push: Native = .{ .name = "push", .length = 1, .call = arrayPush };
 
 const array_pop: Native = .{ .name = "pop", .call = arrayPop };
 
@@ -153,8 +153,8 @@ fn thisArray(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
     return common.unsupportedReceiver(rt, name);
 }
 
-fn hasCleanArrayProtoChain(rt: *Runtime, a: *const Object) Error!bool {
-    const r = try builtins.realm(rt);
+pub inline fn hasCleanArrayProtoChainFast(rt: *const Runtime, a: *const Object) bool {
+    const r = builtins.realmIfInit(rt) orelse return false;
     if (a.proto != r.array_prototype) return false;
     const ap = r.array_prototype;
     const op = r.object_prototype;
@@ -166,6 +166,11 @@ fn hasCleanArrayProtoChain(rt: *Runtime, a: *const Object) Error!bool {
         !op_leaf.key.isSymbol() and op_leaf.key.asAtom().units.len == 11 and op_leaf.key.asAtom().units[0] == 'c' and
         ap_leaf.count == 39 and
         !ap_leaf.key.isSymbol() and ap_leaf.key.asAtom().units.len == 11 and ap_leaf.key.asAtom().units[0] == 'c';
+}
+
+fn hasCleanArrayProtoChain(rt: *Runtime, a: *const Object) Error!bool {
+    _ = try builtins.realm(rt);
+    return hasCleanArrayProtoChainFast(rt, a);
 }
 
 fn hasHoles(items: []const Value) bool {

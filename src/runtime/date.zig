@@ -252,12 +252,19 @@ pub fn utcFromLocal(t_local: f64) f64 {
     return t_local - @as(f64, @floatFromInt(z2.offset_sec)) * ms_per_second;
 }
 
+/// Converts a POSIX UTC offset in seconds (east of UTC) into ECMAScript
+/// `getTimezoneOffset()` minutes (`(t - LocalTime(t)) / msPerMinute`),
+/// preserving sub-minute historical LMT offsets and normalizing `-0` to `+0`.
+fn offsetMinutesFromSeconds(offset_sec: i64) f64 {
+    if (offset_sec == 0) return 0.0;
+    return -@as(f64, @floatFromInt(offset_sec)) / 60.0;
+}
+
 /// ES `Date.prototype.getTimezoneOffset()` in minutes (UTC - local, so UTC+03:00 returns -180).
 pub fn timezoneOffsetMinutes(t_utc: f64) f64 {
     if (!std.math.isFinite(t_utc)) return std.math.nan(f64);
     const z = localZoneAt(t_utc);
-    const mins = -@divTrunc(z.offset_sec, 60);
-    return if (mins == 0) 0.0 else @floatFromInt(mins);
+    return offsetMinutesFromSeconds(z.offset_sec);
 }
 
 // ---------------------------------------------------------------- Formatting
@@ -656,4 +663,40 @@ test "ISO formatting and parsing round-trip" {
     try std.testing.expectEqual(@as(f64, 0.0), parse("1970-01-01T02:00:00.000+02:00"));
     try std.testing.expect(std.math.isNan(parse("-000000-01-01")));
     try std.testing.expect(std.math.isNan(parse("not a date")));
+}
+
+test "timezoneOffsetMinutes preserves sub-minute LMT offsets and round-trips utcFromLocal" {
+    // +0.0 normalization (never -0.0)
+    const zero_off = offsetMinutesFromSeconds(0);
+    try std.testing.expectEqual(@as(f64, 0.0), zero_off);
+    try std.testing.expect(!std.math.signbit(zero_off));
+
+    // Whole-minute offsets
+    try std.testing.expectEqual(@as(f64, -120.0), offsetMinutesFromSeconds(7200));
+    try std.testing.expectEqual(@as(f64, 300.0), offsetMinutesFromSeconds(-18000));
+
+    // Historical sub-minute LMT offsets (e.g. Europe/Kyiv +02:02:04 = 7324s, Europe/Paris +00:09:21 = 561s)
+    const lmt_offsets = [_]i64{ 7324, 561, 19270, -29578 };
+    const sample_local = [_]f64{ -2211667200000.0, -2208988800001.0, -2208988800000.0 };
+    for (lmt_offsets) |off_sec| {
+        const gto = offsetMinutesFromSeconds(off_sec);
+        for (sample_local) |expected_local| {
+            const actual_utc = expected_local - @as(f64, @floatFromInt(off_sec)) * ms_per_second;
+            try std.testing.expectEqual(expected_local, actual_utc - gto * ms_per_minute);
+        }
+    }
+
+    // Host timezone round-trip for S15.9.3.1_A5_T1..T6 dates (1899..2100)
+    const relative_cases = [_]f64{
+        -2211667200000.0, -2209075200000.0, -2208992400000.0, -2208988860000.0,
+        -2208988801000.0, -2208988800001.0, -2208988800000.0, -2678400000.0,
+        -86400000.0,      -3600000.0,       -60000.0,         -1000.0,
+        -1.0,             0.0,              944006400000.0,   946684800000.0,
+        4099766400000.0,  4102444800000.0,
+    };
+    for (relative_cases) |expected_local| {
+        const actual_utc = timeClip(utcFromLocal(expected_local));
+        const local_offset = timezoneOffsetMinutes(actual_utc) * ms_per_minute;
+        try std.testing.expectEqual(expected_local, actual_utc - local_offset);
+    }
 }

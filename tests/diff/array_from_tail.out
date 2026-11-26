@@ -1,0 +1,20 @@
+from_del: 3 127,127,127 3
+from_boundary: 5 true true true true true
+push_gc: 200 0 199
+push_frozen: TypeError 2
+push_sealed: TypeError 2
+push_nw_len: TypeError 2
+push_override: 2 1,50 1
+push_proxy: 2 10,20 1=20|length=2
+push_arraylike: 2 a b 2
+push_proto_setter: 7 2 false
+elem_shaped: 10 20 42 own undefined
+elem_getter: 99 1
+elem_deleted: undefined 2 undefined
+elem_num_str: zero 5
+elem_dict: 0 195 undefined
+elem_dyn: 10
+create_null: null 7 false
+create_props: 100 1 102
+create_prim: TypeError,TypeError,TypeError,TypeError
+create_override: 1 true true

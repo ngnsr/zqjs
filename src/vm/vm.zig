@@ -40,6 +40,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
 const Value = @import("../runtime/value.zig").Value;
+const Native = @import("../runtime/value.zig").Native;
 const heap = @import("../runtime/heap.zig");
 const Cell = heap.Cell;
 const Closure = heap.Closure;
@@ -50,6 +51,7 @@ const ops = @import("../runtime/ops.zig");
 const object = @import("../runtime/object.zig");
 const bigint = @import("../runtime/bigint.zig");
 const builtins = @import("../runtime/builtins.zig");
+const array_builtins = @import("../runtime/builtins/array.zig");
 const proxy_reflect = @import("../runtime/builtins/proxy_reflect.zig");
 const coroutine = @import("../runtime/coroutine.zig");
 const module = @import("../runtime/module.zig");
@@ -1124,9 +1126,12 @@ pub const Vm = struct {
                 }
                 const n = cache.operand(0);
                 if (n > cache.sp - cache.stack_base) return vm.bug("stack underflow");
-                const arr = try rt.heap.newArray((try builtins.realm(rt)).array_prototype);
-                try rt.heap.appendElements(arr, vm.stack[cache.sp - n .. cache.sp]);
-                cache.sp -= n;
+                const r = builtins.realmIfInit(rt) orelse try builtins.realm(rt);
+                const arr = try rt.heap.newArray(r.array_prototype);
+                if (n != 0) {
+                    try rt.heap.appendElements(arr, vm.stack[cache.sp - n .. cache.sp]);
+                    cache.sp -= n;
+                }
                 try cache.push(vm, Value.fromObject(arr));
             },
             .new_regexp,
@@ -1310,7 +1315,7 @@ pub const Vm = struct {
             .get_elem => {
                 const idx = try cache.peek(vm, 0);
                 const base = try cache.peek(vm, 1);
-                const r: Value = fastArrayGet(base, idx) orelse fastTypedArrayGet(base, idx) orelse blk: {
+                const r: Value = fastArrayGet(base, idx) orelse fastElemGetOther(base, idx) orelse blk: {
                     cache.syncSp(vm);
                     try object.requireObjectCoercible(rt, base, idx);
                     const k = try object.key(rt, idx);
@@ -1325,7 +1330,7 @@ pub const Vm = struct {
                 const base = base_slot.asValue();
                 const idx = idx_slot.asValue();
                 try cache.ensurePush(vm);
-                const r: Value = fastArrayGet(base, idx) orelse fastTypedArrayGet(base, idx) orelse blk: {
+                const r: Value = fastArrayGet(base, idx) orelse fastElemGetOther(base, idx) orelse blk: {
                     cache.syncSp(vm);
                     try object.requireObjectCoercible(rt, base, idx);
                     const k = try object.key(rt, idx);
@@ -1690,25 +1695,21 @@ pub const Vm = struct {
                     cache.sp = base + 1;
                 } else if (callee_v.isNative()) {
                     const n = callee_v.asNative();
-                    // A built-in native *borrows* the argument slice: valid only during the call; it
-                    // cannot call back into JS, so the stack cannot move under it. A host native
-                    // (D53) receives temporary handles owned by its native-call record. If either
-                    // fails, nothing has been popped: the stack is still a valid pre-call state (D35).
-                    cache.syncSp(vm);
-                    const receiver: ?Value = if (is_method) vm.stack[base] else null;
-                    const this_obj: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
-                    const result = (if (n.host) |h| blk: {
-                        vm.syncChainDepth();
-                        break :blk h.call(rt, h.ctx, this_obj, vm.stack[args..cache.sp]);
-                    } else n.call(rt, receiver orelse .undefined, vm.stack[args..cache.sp])) catch |e| {
-                        if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
-                            return rt.limit(.steps);
-                        return e;
-                    };
-                    if (rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
-                        return rt.limit(.steps);
-                    vm.stack[base] = result;
-                    cache.sp = base + 1;
+                    if (is_method and argc == 1 and n == &array_builtins.array_push) {
+                        if (try fastArrayPush1(rt, vm.stack[base], vm.stack[args])) |res| {
+                            vm.stack[base] = res;
+                            cache.sp = base + 1;
+                        } else {
+                            @branchHint(.cold);
+                            cache.syncSp(vm);
+                            try vm.callNativeSlow(n, is_method, base, args);
+                            cache.sp = base + 1;
+                        }
+                    } else {
+                        cache.syncSp(vm);
+                        try vm.callNativeSlow(n, is_method, base, args);
+                        cache.sp = base + 1;
+                    }
                 } else {
                     cache.syncSp(vm);
                     try vm.callOtherSlow(callee_v, is_method, base, args);
@@ -2384,6 +2385,27 @@ pub const Vm = struct {
             },
             .tree => return vm.bug("a non-VM closure in the VM"),
         }
+    }
+
+    noinline fn callNativeSlow(vm: *Vm, n: *const Native, is_method: bool, base: u32, args: u32) Error!void {
+        const rt = vm.rt;
+        // A built-in native *borrows* the argument slice: valid only during the call; it
+        // cannot call back into JS, so the stack cannot move under it. A host native
+        // (D53) receives temporary handles owned by its native-call record. If either
+        // fails, nothing has been popped: the stack is still a valid pre-call state (D35).
+        const receiver: ?Value = if (is_method) vm.stack[base] else null;
+        const this_obj: ?Value = if (receiver) |r| (if (r.isObjectLike()) r else null) else null;
+        const result = (if (n.host) |h| blk: {
+            vm.syncChainDepth();
+            break :blk h.call(rt, h.ctx, this_obj, vm.stack[args..vm.sp]);
+        } else n.call(rt, receiver orelse .undefined, vm.stack[args..vm.sp])) catch |e| {
+            if (e != error.Internal and rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
+                return rt.limit(.steps);
+            return e;
+        };
+        if (rt.exec_ctx.active and rt.exec_ctx.budget_fault != null)
+            return rt.limit(.steps);
+        vm.stack[base] = result;
     }
 
     noinline fn callOtherSlow(vm: *Vm, callee_v: Value, is_method: bool, base: u32, args: u32) Error!void {
@@ -3593,10 +3615,56 @@ noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
     }
 }
 
-noinline fn fastTypedArrayGet(base: Value, idx: Value) ?Value {
-    if (!base.isObject() or !idx.isNumber()) return null;
+noinline fn fastArrayPush1(rt: *Runtime, receiver: Value, val: Value) Error!?Value {
+    if (!receiver.isObject()) return null;
+    const a = receiver.asObject();
+    if (a.kind != .array or !a.extensible or !a.array_length_writable or !a.array_elements_writable) return null;
+    const cur = a.kind.array.items.len;
+    if (cur >= heap.Heap.MAX_DENSE_ARRAY_LEN) return null;
+    if (!array_builtins.hasCleanArrayProtoChainFast(rt, a)) return null;
+    try rt.heap.appendElement(a, val);
+    return Value.fromNumber(@floatFromInt(cur + 1));
+}
+
+noinline fn fastElemGetOther(base: Value, idx: Value) ?Value {
+    if (!base.isObject()) return null;
     const o = base.asObject();
-    if (o.kind != .typed_array) return null;
+    if (idx.isString()) {
+        if (o.kind != .ordinary or o.builtin != null or o.props != .shaped) return null;
+        const leaf = o.props.shaped.shape orelse return null;
+        const s = idx.asString();
+        o.obj.checkLive();
+        s.obj.checkLive();
+        if (s.atom) |a| {
+            if (a.index != null) return null;
+            if (leaf.find(heap.PropKey.fromAtom(@constCast(s)))) |sh| {
+                const v = o.props.getShapedSlot(sh.slot);
+                heap.checkValue(v);
+                return v;
+            }
+            return null;
+        }
+        // Uninterned string key (e.g. string literal constant in `p.consts`):
+        // scan small shaped objects directly before falling back to atom interning.
+        if (leaf.count <= 8) {
+            const units = s.units;
+            var cur: ?*const heap.Shape = leaf;
+            while (cur) |sh| : (cur = sh.parent) {
+                if (sh.count == 0) break;
+                if (!sh.key.isSymbol()) {
+                    const k = sh.key.asAtom();
+                    if (k.units.len == units.len and std.mem.eql(u16, k.units, units)) {
+                        if (k.atom.?.index != null) return null;
+                        const v = o.props.getShapedSlot(sh.slot);
+                        heap.checkValue(v);
+                        return v;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+    if (o.kind != .typed_array or !idx.isNumber()) return null;
     const ta = o.kind.typed_array;
     if (ta.kind.isBigInt() or ta.buffer.kind.array_buffer.detached) return null;
     const n = idx.asNumber();

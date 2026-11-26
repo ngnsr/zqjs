@@ -278,9 +278,14 @@ pub fn runPreloadScript(
 
     if (export_globals and cells.len > 0) {
         const realm = try builtins.realm(rt);
+        var held = [_]Value{.undefined};
+        var roots: ValueRoots = .{ .values = &held };
+        try roots.register(rt);
+        defer roots.unregister(rt);
         for (res_ptr.repl_bindings, 0..) |rb, i| {
             if (cells[i].value) |val| {
                 const atom = try rt.heap.internUtf8(rb.name);
+                held[0] = Value.fromString(atom);
                 try rt.heap.defineProperty(realm.global_object, atom, .{
                     .value = val,
                     .writable = true,

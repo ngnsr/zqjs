@@ -661,3 +661,135 @@ test "CLI --preload helper: preload globals visible to self-importing module (bo
         try testing.expectEqualStrings("20 ok\n", out_buf.written());
     }
 }
+
+test "CLI --preload helper: multi-preload var/function globals and dynamic Function() Unsupported(builtin) (both engines)" {
+    for ([_]Engine{ .vm, .treewalk }) |engine| {
+        // 1. Sequential preloads share globals and expose var/function/const to ES modules.
+        {
+            var out_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer out_buf.deinit();
+
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+
+            var pool: module.PreloadPool = .{};
+            defer pool.deinit(testing.allocator);
+
+            var rt = Runtime.init(testing.allocator, .{}, &out_buf.writer);
+            defer rt.deinit();
+            rt.stack_base = @frameAddress();
+            try rt.addRoots(.{ .ctx = &pool, .mark = module.PreloadPool.markRoots });
+            defer rt.removeRoots(&pool);
+
+            var diag: zqjs.Diagnostic = .{};
+            try module.runPreloadScript(
+                &rt,
+                arena.allocator(),
+                "var BASE = 40; function addBase(n) { return BASE + n; }",
+                engine,
+                true,
+                &diag,
+                &pool,
+            );
+            try module.runPreloadScript(
+                &rt,
+                arena.allocator(),
+                "const COMBINED = addBase(2); function getGlobal() { return globalThis; }",
+                engine,
+                true,
+                &diag,
+                &pool,
+            );
+
+            const mod_src =
+                \\import './dep.js';
+                \\print(BASE, COMBINED, addBase(5), getGlobal().DEP_RAN);
+            ;
+            const entries = [_]MemEntry{
+                .{ .id = "dep.js", .src = "getGlobal().DEP_RAN = addBase(1);" },
+                .{ .id = "main.js", .src = mod_src },
+            };
+            const ml: MemLoader = .{ .entries = &entries };
+            rt.modules.loader = ml.loader();
+
+            var mod_diag: module.ModuleDiag = .{};
+            _ = try module.runEntry(&rt, "main.js", mod_src, engine, &mod_diag);
+            try testing.expectEqualStrings("40 42 45 41\n", out_buf.written());
+        }
+
+        // 2. Dynamic `Function("return this;")` inside a preload script reports Unsupported(builtin),
+        //    not a parse SyntaxError (regression for fnGlobalObject.js preload failure cluster).
+        {
+            var out_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer out_buf.deinit();
+
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+
+            var pool: module.PreloadPool = .{};
+            defer pool.deinit(testing.allocator);
+
+            var rt = Runtime.init(testing.allocator, .{}, &out_buf.writer);
+            defer rt.deinit();
+            rt.stack_base = @frameAddress();
+            try rt.addRoots(.{ .ctx = &pool, .mark = module.PreloadPool.markRoots });
+            defer rt.removeRoots(&pool);
+
+            var diag: zqjs.Diagnostic = .{};
+            const res = module.runPreloadScript(
+                &rt,
+                arena.allocator(),
+                "var __g = Function('return this;')(); function fnGlobalObject() { return __g; }",
+                engine,
+                true,
+                &diag,
+                &pool,
+            );
+            try testing.expectError(error.Unsupported, res);
+            try testing.expectEqual(@as(?zqjs.Feature, .builtin), rt.unsupported);
+        }
+    }
+}
+
+test "ES module abrupt completion caching: direct throw, export default throw, and dynamic re-import (both engines)" {
+    for ([_]Engine{ .vm, .treewalk }) |engine| {
+        // 1. Direct abrupt throw and `export default (function(){ throw ... })()` both return Thrown
+        //    with the custom error object preserved on `rt.thrown_value`.
+        for ([_][]const u8{
+            "function CustomErr(m) { this.message = m; } throw new CustomErr('self');",
+            "function CustomErr(m) { this.message = m; } export default (function() { throw new CustomErr('dflt'); })();",
+        }) |src| {
+            var out_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer out_buf.deinit();
+
+            var rt = Runtime.init(testing.allocator, .{}, &out_buf.writer);
+            defer rt.deinit();
+            rt.stack_base = @frameAddress();
+
+            var mod_diag: module.ModuleDiag = .{};
+            const res = module.runEntry(&rt, "abrupt.js", src, engine, &mod_diag);
+            try testing.expectError(error.Thrown, res);
+            try testing.expect(rt.thrown_value != null);
+            try testing.expect(rt.thrown_value.?.isObject());
+        }
+
+        // 2. Errored module is evaluated at most once and caches exact thrown object identity
+        //    across repeated dynamic imports.
+        const entries = [_]MemEntry{
+            .{ .id = "boom.js", .src =
+            \\globalThis.boomRuns = (globalThis.boomRuns || 0) + 1;
+            \\export default (function() { throw { tag: 'cached', run: globalThis.boomRuns }; })();
+            },
+        };
+        const main_src =
+            \\let e1, e2;
+            \\try { await import('./boom.js'); } catch (e) { e1 = e; }
+            \\try { await import('./boom.js'); } catch (e) { e2 = e; }
+            \\print(globalThis.boomRuns, e1 === e2, e1.tag, e1.run);
+        ;
+        const res = try runMemModules(testing.allocator, &entries, "main.js", main_src, engine, .{});
+        defer testing.allocator.free(res.out);
+        if (res.err) |e| return e;
+        try testing.expectEqualStrings("1 true cached 1\n", res.out);
+    }
+}

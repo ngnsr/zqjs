@@ -1668,7 +1668,7 @@ pub const Heap = struct {
         return o;
     }
 
-    pub fn newArray(h: *Heap, proto: ?*Object) Error!*Object {
+    pub noinline fn newArray(h: *Heap, proto: ?*Object) Error!*Object {
         const o = try h.newObject(proto);
         o.kind = .{ .array = .empty };
         return o;

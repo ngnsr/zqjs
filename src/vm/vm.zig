@@ -3593,7 +3593,7 @@ noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
     }
 }
 
-fn fastTypedArrayGet(base: Value, idx: Value) ?Value {
+noinline fn fastTypedArrayGet(base: Value, idx: Value) ?Value {
     if (!base.isObject() or !idx.isNumber()) return null;
     const o = base.asObject();
     if (o.kind != .typed_array) return null;
@@ -3605,7 +3605,7 @@ fn fastTypedArrayGet(base: Value, idx: Value) ?Value {
     return object.readTypedArrayNumber(ta, @intFromFloat(n));
 }
 
-fn fastTypedArraySet(base: Value, idx: Value, val: Value) bool {
+noinline fn fastTypedArraySet(base: Value, idx: Value, val: Value) bool {
     if (!base.isObject() or !idx.isNumber() or !val.isNumber()) return false;
     const o = base.asObject();
     if (o.kind != .typed_array) return false;

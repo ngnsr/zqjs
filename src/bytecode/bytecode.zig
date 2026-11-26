@@ -149,6 +149,10 @@ pub const Op = enum(u8) {
     define_public_field,
     /// [target, val] → [target]: defines private field on target under current brand.
     define_private_field,
+    /// [key, val] → [key, val]: SetFunctionName(val, key) if val is a closure without an own `name`.
+    set_fn_name,
+    /// [base, key] → [base, ToPropertyKey(key)]: RequireObjectCoercible(base) before ToPropertyKey(key).
+    prep_elem_ref,
     /// [val] → [prop_key]: ECMAScript ToPropertyKey(val) normalized to String or Symbol.
     to_property_key,
     /// [obj, brand] → [val]: reads private member `#name` using explicit brand.
@@ -487,6 +491,7 @@ pub const Op = enum(u8) {
             .add_local_const, .sub_local_const, .mul_local_const, .mod_local_const => .{ .operands = &.{ .slot, .@"const" }, .pops = 0, .pushes = 1 },
             .add_local_local, .sub_local_local, .mul_local_local, .mod_local_local => .{ .operands = &.{ .slot, .slot }, .pops = 0, .pushes = 1 },
             .neg, .to_number, .to_numeric, .to_string, .not, .bit_not, .typeof, .inc, .dec => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .set_fn_name, .prep_elem_ref => .{ .operands = &.{}, .pops = 2, .pushes = 2 },
             .jump => .{ .operands = &.{.target}, .pops = 0, .pushes = 0 },
             .jump_if_false, .jump_if_true => .{ .operands = &.{.target}, .pops = 1, .pushes = 0 },
             .lt_jump_if_false, .le_jump_if_false, .gt_jump_if_false, .ge_jump_if_false, .strict_eq_jump_if_false, .strict_ne_jump_if_false => .{ .operands = &.{.target}, .pops = 2, .pushes = 0 },

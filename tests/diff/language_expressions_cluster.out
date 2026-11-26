@@ -1,0 +1,11 @@
+propkey_assign: 10
+null_base_order: true false
+obj_key_before_val: ok
+fn_names: get [demo] set [demo] [demo] 
+rest_proxy_gopd: b undefined
+super_null_proto: true true 1
+dstr_order: src,sk,sk-str,tgt,tk,get,tk-str,set:7
+gen_dstr_close: 1 99 true
+tpl_frozen: true true false false false
+opt_this: 42 42 42
+opt_super: sub-ok

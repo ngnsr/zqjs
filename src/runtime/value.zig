@@ -257,7 +257,7 @@ pub const Value = packed struct(u64) {
     }
 
     pub inline fn isFunction(v: Value) bool {
-        return v.isNative() or v.isClosure() or (v.isObject() and v.asObject().kind == .proxy and v.asObject().kind.proxy.is_callable);
+        return v.isNative() or v.isClosure() or (v.isObject() and ((v.asObject().kind == .proxy and v.asObject().kind.proxy.is_callable) or v.asObject().builtin == .function_prototype));
     }
 
     pub inline fn isObjectLike(v: Value) bool {

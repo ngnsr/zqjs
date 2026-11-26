@@ -562,7 +562,7 @@ pub const Runtime = struct {
                     },
                 }
             },
-            .object => |o| if (o.kind == .proxy) builtins_mod.callProxy(rt, o, this_val, args) else rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
+            .object => |o| if (o.kind == .proxy) builtins_mod.callProxy(rt, o, this_val, args) else if (o.builtin == .function_prototype) .undefined else rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
             else => rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
         };
     }

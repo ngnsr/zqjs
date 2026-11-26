@@ -53,6 +53,7 @@ pub const FunctionKind = function_error.FunctionKind;
 pub const functionKind = function_error.functionKind;
 pub const closureDefaultProto = function_error.closureDefaultProto;
 pub const isConstructor = function_error.isConstructor;
+pub const checkFunctionRealm = proxy_reflect.checkFunctionRealm;
 pub const closureName = function_error.closureName;
 pub const closureLength = function_error.closureLength;
 pub const isClassConstructor = function_error.isClassConstructor;
@@ -192,6 +193,7 @@ pub const Realm = struct {
     math: *Object,
     json: *Object,
     global_object: *Object,
+    deleted_builtin_globals: u64 = 0,
     views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
@@ -731,6 +733,43 @@ fn resolveGlobalTarget(rt: *Runtime, target: GlobalTarget) Error!Value {
     };
 }
 
+fn builtinGlobalIndexFromAtom(atom: *const heap_mod.String) ?usize {
+    if (atom.units.len > 64) return null;
+    var buf: [64]u8 = undefined;
+    for (atom.units, 0..) |u, i| {
+        if (u > 0x7f) return null;
+        buf[i] = @intCast(u);
+    }
+    return builtin_globals.getIndex(buf[0..atom.units.len]);
+}
+
+pub inline fn isBuiltinGlobalDeleted(r: *const Realm, idx: usize) bool {
+    return (r.deleted_builtin_globals & (@as(u64, 1) << @intCast(idx))) != 0;
+}
+
+pub fn isGlobalBuiltinDeletedAtom(rt: *const Runtime, atom: *const heap_mod.String) bool {
+    const r = if (rt.realm) |*rlm| rlm else return false;
+    const idx = builtinGlobalIndexFromAtom(atom) orelse return false;
+    return isBuiltinGlobalDeleted(r, idx);
+}
+
+pub fn markGlobalBuiltinDeleted(rt: *Runtime, atom: *const heap_mod.String) void {
+    const idx = builtinGlobalIndexFromAtom(atom) orelse return;
+    if (rt.realm) |*r| r.deleted_builtin_globals |= (@as(u64, 1) << @intCast(idx));
+}
+
+pub fn deleteGlobalBuiltin(rt: *Runtime, atom: *const heap_mod.String) Error!bool {
+    const idx = builtinGlobalIndexFromAtom(atom) orelse return true;
+    if (rt.realm == null) _ = try realm(rt);
+    const r = &rt.realm.?;
+    if (isBuiltinGlobalDeleted(r, idx)) return true;
+    const target = builtin_globals.values()[idx];
+    const is_const = target == .undefined or target == .nan or target == .inf;
+    if (is_const) return false;
+    r.deleted_builtin_globals |= (@as(u64, 1) << @intCast(idx));
+    return true;
+}
+
 fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
     if (rt.realm) |r| {
         const k = try object.named(rt, name);
@@ -742,8 +781,11 @@ fn lookupGlobal(rt: *Runtime, name: []const u8) Error!?Value {
             return p.value;
         }
     }
-    if (builtin_globals.get(name)) |target| {
-        return try resolveGlobalTarget(rt, target);
+    if (builtin_globals.getIndex(name)) |idx| {
+        if (rt.realm == null or !isBuiltinGlobalDeleted(&rt.realm.?, idx)) {
+            return try resolveGlobalTarget(rt, builtin_globals.values()[idx]);
+        }
+        return null;
     }
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) return Value.fromNative(n);
     if (names.has(.global, name)) {
@@ -761,7 +803,12 @@ pub fn setGlobal(rt: *Runtime, name: []const u8, val: Value, strict: bool) Error
     defer roots.unregister(rt);
 
     const k = try object.named(rt, name);
-    var exists = r.global_object.props.get(try object.propKey(rt, k)) != null or builtin_globals.get(name) != null;
+    var exists = r.global_object.props.get(try object.propKey(rt, k)) != null;
+    if (!exists) {
+        if (builtin_globals.getIndex(name)) |idx| {
+            exists = !isBuiltinGlobalDeleted(r, idx);
+        }
+    }
     if (!exists) {
         for (rt.host_globals.items) |n| {
             if (std.mem.eql(u8, n.name, name)) {
@@ -792,14 +839,17 @@ pub fn globalOwnProp(rt: *Runtime, atom: *const heap_mod.String) Error!?heap_mod
         buf[i] = @intCast(u);
     }
     const name = buf[0..atom.units.len];
-    if (builtin_globals.get(name)) |target| {
-        const is_const = target == .undefined or target == .nan or target == .inf;
-        return .{
-            .value = try resolveGlobalTarget(rt, target),
-            .enumerable = false,
-            .writable = !is_const,
-            .configurable = !is_const,
-        };
+    if (builtin_globals.getIndex(name)) |idx| {
+        if (rt.realm == null or !isBuiltinGlobalDeleted(&rt.realm.?, idx)) {
+            const target = builtin_globals.values()[idx];
+            const is_const = target == .undefined or target == .nan or target == .inf;
+            return .{
+                .value = try resolveGlobalTarget(rt, target),
+                .enumerable = false,
+                .writable = !is_const,
+                .configurable = !is_const,
+            };
+        }
     }
     for (rt.host_globals.items) |n| if (std.mem.eql(u8, n.name, name)) {
         return .{

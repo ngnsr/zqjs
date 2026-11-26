@@ -1,0 +1,11 @@
+fn_proto_typeof: function
+fn_proto_call: undefined undefined
+sym_is_ctor: true
+new_sym_throws: true
+revoked_proxy_ctor: true
+del_const: false false
+del_weakset: true false
+reassigned_weakset: 123 true false
+try_resolve: 42
+try_reject: boom
+finally_subclass_count: 6

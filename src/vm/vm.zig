@@ -336,7 +336,11 @@ pub const Vm = struct {
 
         const proto_val = try object.get(rt, new_target, try object.named(rt, "prototype"));
         const r = try builtins.realm(rt);
-        const instance = try rt.heap.newObject(if (proto_val.isObject()) proto_val.asObject() else r.object_prototype);
+        const instance_proto = if (proto_val.isObject()) proto_val.asObject() else blk: {
+            try builtins.checkFunctionRealm(rt, new_target);
+            break :blk r.object_prototype;
+        };
+        const instance = try rt.heap.newObject(instance_proto);
         root_buf[2] = Value.fromObject(instance);
         const init_this: ?Value = if (callee.has_super_ctor) null else Value.fromObject(instance);
         return callNested(rt, caller_vm, c, init_this, args, true, instance);
@@ -2211,9 +2215,15 @@ pub const Vm = struct {
                         .tree => return vm.bug("a non-VM closure in the VM"),
                     },
                     .object => |o| {
-                        if (o.kind != .proxy or !o.kind.proxy.is_callable) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
-                        vm.stack[base] = try builtins.callProxy(rt, o, receiver orelse .undefined, args_slice);
-                        cache.sp = base + 1;
+                        if (o.builtin == .function_prototype) {
+                            vm.stack[base] = .undefined;
+                            cache.sp = base + 1;
+                        } else if (o.kind == .proxy and o.kind.proxy.is_callable) {
+                            vm.stack[base] = try builtins.callProxy(rt, o, receiver orelse .undefined, args_slice);
+                            cache.sp = base + 1;
+                        } else {
+                            return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
+                        }
                     },
                     else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
                 }
@@ -2346,6 +2356,10 @@ pub const Vm = struct {
         const rt = vm.rt;
         if (callee_v.isObject()) {
             const o = callee_v.asObject();
+            if (o.builtin == .function_prototype) {
+                vm.stack[base] = .undefined;
+                return;
+            }
             if (o.kind == .proxy and o.kind.proxy.is_callable) {
                 const receiver: Value = if (is_method) vm.stack[base] else .undefined;
                 vm.stack[base] = try builtins.callProxy(rt, o, receiver, vm.stack[args..vm.sp]);
@@ -2400,6 +2414,10 @@ pub const Vm = struct {
                 .tree, .bound => return vm.bug("invalid bound target in the VM"),
             },
             .object => |o| {
+                if (o.builtin == .function_prototype) {
+                    vm.stack[base] = .undefined;
+                    return false;
+                }
                 if (o.kind != .proxy or !o.kind.proxy.is_callable) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
                 vm.stack[base] = try builtins.callProxy(rt, o, b.bound_this, combined);
                 return false;
@@ -3025,7 +3043,7 @@ fn fastGetGlobal(rt: *Runtime, p: *const Proto, pc: u32, atom: *heap.String) ?Va
     const ic = b[0];
     if (ic.atom_addr != @intFromPtr(atom)) return null;
     switch (ic.kind) {
-        12 => if (rt.host_globals.items.len == 0 and objVersion(r.global_object) == ic.shape_id) {
+        12 => if (rt.host_globals.items.len == 0 and objVersion(r.global_object) == ic.shape_id and !builtins.isBuiltinGlobalDeleted(r, ic.slot)) {
             return builtins.resolveGlobalTargetByIndex(r, ic.slot);
         },
         13 => {
@@ -3085,6 +3103,7 @@ noinline fn populateGetGlobalIc(rt: *Runtime, p: *const Proto, pc: u32, atom: *h
     }
     if (rt.host_globals.items.len != 0) return;
     const idx = builtins.globalTargetIndex(name) orelse return;
+    if (builtins.isBuiltinGlobalDeleted(r, idx)) return;
     insertPropIc(rt, p, pc, .{
         .shape_id = objVersion(go),
         .proto_shape_id = 0,

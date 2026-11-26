@@ -156,7 +156,7 @@ pub fn closureDefaultProto(rt: *Runtime, c: *const heap_mod.Closure) Error!*Obje
 
 pub fn isConstructor(v: Value) bool {
     return switch (v.unpack()) {
-        .native => |n| n.construct != null or (n.namespace != null and n.namespace.? != .symbol),
+        .native => |n| n.construct != null or n.namespace != null,
         .closure => |c| switch (c.impl) {
             .vm, .tree => hasAutoPrototype(c) and !isGeneratorFunction(c),
             .bound => |b| isConstructor(b.target),

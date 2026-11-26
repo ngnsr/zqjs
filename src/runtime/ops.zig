@@ -545,7 +545,7 @@ pub fn typeOf(rt: *Runtime, v: Value) Error!Value {
         .string => "string",
         .symbol => "symbol",
         .native, .closure => "function",
-        .object => |o| if (o.kind == .proxy and o.kind.proxy.is_callable) "function" else "object",
+        .object => |o| if ((o.kind == .proxy and o.kind.proxy.is_callable) or o.builtin == .function_prototype) "function" else "object",
     };
     return Value.fromString(try rt.heap.ascii(s));
 }

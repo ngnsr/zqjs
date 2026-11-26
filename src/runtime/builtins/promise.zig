@@ -422,30 +422,29 @@ fn promiseTryStatic(rt: *Runtime, this: Value, args: []const Value) Error!Value 
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const cap = try newPromiseCapabilityRecord(rt, this);
-    root_buf[2] = cap.promise;
-    root_buf[3] = cap.resolve;
-    root_buf[4] = cap.reject;
-
     const call_args = if (args.len > 1) args[1..] else &[_]Value{};
-    const res = blk: {
+    var threw = false;
+    const outcome: Value = blk: {
         if (!cb.isFunction()) {
-            const err_val = try function_error.makeEngineError(rt, .TypeError, try rt.heap.ascii("Promise.try requires a callable argument"));
-            root_buf[5] = err_val;
-            _ = try rt.callCallable(cap.reject, .undefined, &.{err_val});
-            return cap.promise;
+            threw = true;
+            break :blk try function_error.makeEngineError(rt, .TypeError, try rt.heap.ascii("Promise.try requires a callable argument"));
         }
         break :blk rt.callCallable(cb, .undefined, call_args) catch |e| {
             if (e != error.Thrown) return e;
-            const err_val = try rt.catchValue();
-            root_buf[5] = err_val;
-            _ = try rt.callCallable(cap.reject, .undefined, &.{err_val});
-            return cap.promise;
+            threw = true;
+            break :blk try rt.catchValue();
         };
     };
-    root_buf[5] = res;
-    _ = try rt.callCallable(cap.resolve, .undefined, &.{res});
-    return cap.promise;
+    root_buf[5] = outcome;
+    if (threw) {
+        const cap = try newPromiseCapabilityRecord(rt, this);
+        root_buf[2] = cap.promise;
+        root_buf[3] = cap.resolve;
+        root_buf[4] = cap.reject;
+        _ = try rt.callCallable(cap.reject, .undefined, &.{root_buf[5]});
+        return cap.promise;
+    }
+    return promiseResolveWithCtor(rt, this, root_buf[5]);
 }
 
 const CombinatorKind = enum { all, all_settled, race, any };
@@ -794,6 +793,17 @@ pub fn callPromiseCapability(rt: *Runtime, p_obj: *Object, is_reject: bool, args
     return .undefined;
 }
 
+fn isDefaultPromiseForFastResolve(rt: *Runtime, p_obj: *Object) Error!bool {
+    const r = try builtins.realm(rt);
+    if (p_obj.proto != r.promise_prototype) return false;
+    const ctor_pk = heap_mod.PropKey.fromAtom(try rt.heap.internAscii("constructor"));
+    if (p_obj.props.get(ctor_pk) != null) return false;
+    const proto_ctor = r.promise_prototype.props.get(ctor_pk) orelse return false;
+    if (proto_ctor.is_accessor or !proto_ctor.value.isNative() or proto_ctor.value.asNative() != &builtins.promise_global) return false;
+    const sp = r.promise_namespace.props.get(heap_mod.PropKey.fromSymbol(r.sym_species)) orelse return false;
+    return sp.is_accessor and sp.value.isNative() and sp.value.asNative() == &common.species_getter;
+}
+
 /// Atomic Promise resolution: all allocations and queue reservations succeed
 /// before any Promise state or reaction list is mutated.
 pub fn resolvePromiseValue(rt: *Runtime, p_obj: *Object, val: Value) Error!void {
@@ -828,7 +838,7 @@ pub fn resolvePromiseValue(rt: *Runtime, p_obj: *Object, val: Value) Error!void 
             return e;
         };
         root_buf[2] = then_val;
-        if (val.isObject() and val.asObject().kind == .promise and then_val.isNative() and then_val.asNative() == &promise_then) {
+        if (val.isObject() and val.asObject().kind == .promise and then_val.isNative() and then_val.asNative() == &promise_then and try isDefaultPromiseForFastResolve(rt, val.asObject())) {
             try rt.microtasks.ensureUnusedCapacity(rt.gpa, 1);
             p_obj.kind.promise.already_resolved = true;
             rt.microtasks.appendAssumeCapacity(.{

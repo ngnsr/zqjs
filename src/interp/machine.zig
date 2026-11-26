@@ -3631,10 +3631,16 @@ const Machine = struct {
                 try m.pushClosureCall(cl, receiver, args_base, result_base);
             },
             .object => |o| {
-                if (o.kind != .proxy or !o.kind.proxy.is_callable) return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
-                const res_v = try builtins.callProxy(rt, o, receiver orelse .undefined, args);
-                m.values.shrinkRetainingCapacity(result_base);
-                try m.pushVal(res_v);
+                if (o.builtin == .function_prototype) {
+                    m.values.shrinkRetainingCapacity(result_base);
+                    try m.pushVal(.undefined);
+                } else if (o.kind == .proxy and o.kind.proxy.is_callable) {
+                    const res_v = try builtins.callProxy(rt, o, receiver orelse .undefined, args);
+                    m.values.shrinkRetainingCapacity(result_base);
+                    try m.pushVal(res_v);
+                } else {
+                    return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }});
+                }
             },
             else => return rt.throw(.TypeError, &.{.{ .ascii = "value is not a function" }}),
         }
@@ -3749,7 +3755,11 @@ const Machine = struct {
 
         const proto_val = try object.get(m.rt, new_target, try object.named(m.rt, "prototype"));
         const r = try builtins.realm(m.rt);
-        const instance = try m.rt.heap.newObject(if (proto_val.isObject()) proto_val.asObject() else r.object_prototype);
+        const instance_proto = if (proto_val.isObject()) proto_val.asObject() else blk: {
+            try builtins.checkFunctionRealm(m.rt, new_target);
+            break :blk r.object_prototype;
+        };
+        const instance = try m.rt.heap.newObject(instance_proto);
         ret_root[3] = Value.fromObject(instance);
         const init_this: ?Value = if (f.has_super_ctor) null else Value.fromObject(instance);
 

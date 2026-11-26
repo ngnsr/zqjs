@@ -1,0 +1,7 @@
+non-callable: object TypeError TypeError TypeError TypeError
+non-callable: boolean TypeError TypeError TypeError TypeError
+non-callable: number TypeError TypeError TypeError TypeError
+throwing getter: RangeError RangeError
+iterable fn num: 3 10,20,30
+iterable fn big: 3 1,-2,3
+array-like fn: 2 7,8

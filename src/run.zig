@@ -119,6 +119,9 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
 }
 
 fn runTraced(vm: *Vm, t: *Writer) RuntimeError!void {
+    const prev_caller = vm.rt.closure_caller;
+    vm.rt.closure_caller = vm.closureCaller();
+    defer vm.rt.closure_caller = prev_caller;
     while (true) {
         if (!vm.halted) {
             // Indented by call depth. Padded to a column, so the stacks line up; a line too

@@ -191,7 +191,7 @@ fn arrayPush(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     if (o_val.isObject() and o_val.asObject().kind == .array) {
         const a = o_val.asObject();
         const cur = a.kind.array.items.len;
-        if (a.extensible and a.array_length_writable and
+        if (a.extensible and a.array_length_writable and !a.has_index_overrides and
             args.len <= heap_mod.Heap.MAX_DENSE_ARRAY_LEN and
             cur <= heap_mod.Heap.MAX_DENSE_ARRAY_LEN - args.len and
             try hasCleanArrayProtoChain(rt, a))
@@ -294,6 +294,7 @@ fn arraySlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const cur_items = a.kind.array.items;
         if (out_obj.extensible and out_obj.array_length_writable and
             out_obj.array_elements_writable and out_obj.array_elements_configurable and
+            !out_obj.has_index_overrides and
             out_obj.kind.array.items.len == 0 and end <= cur_items.len and
             (start >= end or !hasHoles(cur_items[start..end])))
         {
@@ -794,7 +795,8 @@ fn concatAppendItem(rt: *Runtime, out: Value, n: *usize, item: Value, elem_root:
     if (try isConcatSpreadable(rt, item)) {
         const out_fast = out.isObject() and out.asObject().kind == .array and
             out.asObject().extensible and out.asObject().array_length_writable and
-            out.asObject().array_elements_writable and out.asObject().array_elements_configurable;
+            out.asObject().array_elements_writable and out.asObject().array_elements_configurable and
+            !out.asObject().has_index_overrides;
         if (item.isObject() and item.asObject().kind == .array) {
             const items = item.asObject().kind.array.items;
             if (out_fast and n.* == out.asObject().kind.array.items.len and !hasHoles(items) and
@@ -1154,17 +1156,19 @@ fn arraySplice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     };
     const insert_items = if (args.len > 2) args[2..] else &[_]Value{};
     const insert_count = insert_items.len;
-    if ((insert_count != actual_delete) and !a.array_length_writable) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property 'length'" }});
-    }
-    if (insert_count > actual_delete and (!a.extensible or !a.array_length_writable)) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot add property, object is not extensible" }});
-    }
-    if (insert_count < actual_delete and (!a.array_elements_configurable or !a.array_length_writable)) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property of non-configurable array" }});
-    }
-    if ((insert_count > 0 or (insert_count < actual_delete and actual_start + actual_delete < len)) and !a.array_elements_writable) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
+    if (!a.has_index_overrides) {
+        if ((insert_count != actual_delete) and !a.array_length_writable) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property 'length'" }});
+        }
+        if (insert_count > actual_delete and (!a.extensible or !a.array_length_writable)) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Cannot add property, object is not extensible" }});
+        }
+        if (insert_count < actual_delete and (!a.array_elements_configurable or !a.array_length_writable)) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property of non-configurable array" }});
+        }
+        if ((insert_count > 0 or (insert_count < actual_delete and actual_start + actual_delete < len)) and !a.array_elements_writable) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Cannot assign to read only property" }});
+        }
     }
 
     var root_buf = [_]Value{ this, .undefined, .undefined };
@@ -1178,6 +1182,7 @@ fn arraySplice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const out_fast = out.isObject() and out.asObject().kind == .array and
         out.asObject().extensible and out.asObject().array_length_writable and
         out.asObject().array_elements_writable and out.asObject().array_elements_configurable and
+        !out.asObject().has_index_overrides and
         out.asObject().kind.array.items.len == 0 and
         actual_start + actual_delete <= a.kind.array.items.len and
         !hasHoles(a.kind.array.items[actual_start .. actual_start + actual_delete]);
@@ -1201,6 +1206,58 @@ fn arraySplice(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         }
         try object.setStrict(rt, out, try object.named(rt, "length"), Value.fromNumber(@floatFromInt(actual_delete)));
         try ensureWritableArrayLength(rt, out);
+    }
+
+    if (a.has_index_overrides) {
+        const args_copy = try rt.gpa.dupe(Value, insert_items);
+        defer rt.gpa.free(args_copy);
+        var arg_roots: rt_mod.ValueRoots = .{ .values = args_copy };
+        try arg_roots.register(rt);
+        defer arg_roots.unregister(rt);
+
+        if (insert_count < actual_delete) {
+            var k: usize = actual_start;
+            while (k < len - actual_delete) : (k += 1) {
+                const from_k = try common.indexKey(rt, k + actual_delete);
+                const to_k = try common.indexKey(rt, k + insert_count);
+                if (try object.has(rt, from_k, this)) {
+                    root_buf[2] = try object.get(rt, this, from_k);
+                    try object.setStrict(rt, this, to_k, root_buf[2]);
+                    root_buf[2] = .undefined;
+                } else {
+                    if (!try object.delete(rt, this, to_k)) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property" }});
+                }
+            }
+            var del_k: usize = len;
+            const target_len = len - actual_delete + insert_count;
+            while (del_k > target_len) {
+                del_k -= 1;
+                if (!try object.delete(rt, this, try common.indexKey(rt, del_k))) {
+                    return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property" }});
+                }
+            }
+        } else if (insert_count > actual_delete) {
+            var k: usize = len - actual_delete;
+            while (k > actual_start) {
+                k -= 1;
+                const from_k = try common.indexKey(rt, k + actual_delete);
+                const to_k = try common.indexKey(rt, k + insert_count);
+                if (try object.has(rt, from_k, this)) {
+                    root_buf[2] = try object.get(rt, this, from_k);
+                    try object.setStrict(rt, this, to_k, root_buf[2]);
+                    root_buf[2] = .undefined;
+                } else {
+                    if (!try object.delete(rt, this, to_k)) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property" }});
+                }
+            }
+        }
+        for (args_copy, 0..) |v, j| {
+            try object.setStrict(rt, this, try common.indexKey(rt, actual_start + j), v);
+        }
+        const new_len = len - actual_delete + insert_count;
+        try object.setStrict(rt, this, try object.named(rt, "length"), Value.fromNumber(@floatFromInt(new_len)));
+        try ensureWritableArrayLength(rt, this);
+        return out;
     }
 
     const cur_len = a.kind.array.items.len;
@@ -1275,7 +1332,7 @@ fn arraySort(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     }
 
     const item_count = defined_count + undef_count;
-    const clean_dense = is_arr and o_val.asObject().array_elements_writable and try hasCleanArrayProtoChain(rt, o_val.asObject());
+    const clean_dense = is_arr and !o_val.asObject().has_index_overrides and o_val.asObject().array_elements_writable and try hasCleanArrayProtoChain(rt, o_val.asObject());
     for (0..item_count) |j| {
         const v: Value = if (j < defined_count) snap.kind.array.items[j] else .undefined;
         if (clean_dense and j < o_val.asObject().kind.array.items.len) {
@@ -1285,7 +1342,7 @@ fn arraySort(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         }
     }
     for (item_count..len) |j| {
-        if (is_arr and j < o_val.asObject().kind.array.items.len and o_val.asObject().kind.array.items[j].isHole() and try hasCleanArrayProtoChain(rt, o_val.asObject())) {
+        if (is_arr and !o_val.asObject().has_index_overrides and j < o_val.asObject().kind.array.items.len and o_val.asObject().kind.array.items[j].isHole() and try hasCleanArrayProtoChain(rt, o_val.asObject())) {
             continue;
         }
         if (!try object.delete(rt, o_val, try common.indexKey(rt, j))) {
@@ -1522,7 +1579,7 @@ fn arrayCopyWithin(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         if (is_arr) {
             const a = o_val.asObject();
             const items = a.kind.array.items;
-            if (a.array_elements_writable and
+            if (a.array_elements_writable and !a.has_index_overrides and
                 from + count <= items.len and to + count <= items.len and
                 !hasHoles(items[from .. from + count]) and
                 try hasCleanArrayProtoChain(rt, a))

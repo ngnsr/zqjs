@@ -1346,3 +1346,266 @@ test "console: log/info/debug/warn/error/assert, descriptors, detached calls, an
         try testing.expectEqualStrings(expected, r.out);
     }
 }
+
+test "array index Object.defineProperty overrides: data flags, accessors, length shrink, keys, freeze/seal, array methods" {
+    const src =
+        \\// 1. Non-writable, non-enumerable, non-configurable data descriptors
+        \\const a = [10, 20, 30, 40];
+        \\Object.defineProperty(a, 1, { value: 200, writable: false, enumerable: false, configurable: true });
+        \\Object.defineProperty(a, 2, { value: 300, writable: true, enumerable: true, configurable: false });
+        \\const d1 = Object.getOwnPropertyDescriptor(a, 1);
+        \\const d2 = Object.getOwnPropertyDescriptor(a, 2);
+        \\print("d1:", d1.value, d1.writable, d1.enumerable, d1.configurable);
+        \\print("d2:", d2.value, d2.writable, d2.enumerable, d2.configurable);
+        \\a[1] = 999; // sloppy no-op
+        \\print("after sloppy write a[1]:", a[1]);
+        \\let strictWriteErr = false;
+        \\try { (function() { "use strict"; a[1] = 999; })(); } catch (e) { strictWriteErr = e instanceof TypeError; }
+        \\print("strict write err:", strictWriteErr);
+        \\print("keys:", Object.keys(a).join(","));
+        \\print("ownNames:", Object.getOwnPropertyNames(a).join(","));
+        \\print("values:", Object.values(a).join(","));
+        \\print("entries:", Object.entries(a).map(e => e[0] + ":" + e[1]).join(","));
+        \\const forInKeys = [];
+        \\for (const k in a) forInKeys.push(k);
+        \\print("forIn:", forInKeys.join(","));
+        \\print("in:", 0 in a, 1 in a, 2 in a, 99 in a);
+        \\print("del non-conf:", delete a[2], a[2]);
+        \\print("del conf:", delete a[1], 1 in a, a[1]);
+        \\
+        \\// 2. a.length = 0 stops at non-configurable index 2 (ES2025 ArraySetLength)
+        \\a.length = 0; // sloppy: shrinks to 3 (deletes 3, stops at non-configurable 2)
+        \\print("sloppy shrink len:", a.length, 3 in a, a[2]);
+        \\let strictShrinkErr = false;
+        \\try { (function() { "use strict"; a.length = 0; })(); } catch (e) { strictShrinkErr = e instanceof TypeError; }
+        \\print("strict shrink err:", strictShrinkErr, a.length);
+        \\let defLenErr = false;
+        \\try { Object.defineProperty(a, "length", { value: 0, writable: false }); } catch (e) { defLenErr = e instanceof TypeError; }
+        \\print("defLen err:", defLenErr, a.length, Object.getOwnPropertyDescriptor(a, "length").writable);
+        \\
+        \\// 3. Getter/setter array indices + writable non-enumerable update
+        \\const b = [1, 2];
+        \\let backing = 50;
+        \\let setCount = 0;
+        \\Object.defineProperty(b, 0, {
+        \\  get() { return backing; },
+        \\  set(v) { setCount++; backing = v * 2; },
+        \\  enumerable: true,
+        \\  configurable: true,
+        \\});
+        \\Object.defineProperty(b, 3, { value: 7, writable: true, enumerable: false, configurable: true });
+        \\print("b len:", b.length, "b[0]:", b[0], "b[3]:", b[3]);
+        \\b[0] = 21;
+        \\b[3] = 77;
+        \\print("after set:", b[0], setCount, b[3], Object.getOwnPropertyDescriptor(b, 3).enumerable);
+        \\print("b keys:", Object.keys(b).join(","), "b names:", Object.getOwnPropertyNames(b).join(","));
+        \\print("b map:", b.map(x => x + 1).join(","));
+        \\print("b filter:", b.filter(x => x > 10).join(","));
+        \\print("b slice:", b.slice(0, 4).join(","));
+        \\
+        \\// 4. Array mutators: push, pop, shift, unshift, splice, reverse, sort, copyWithin
+        \\const c = [3, 1, 2];
+        \\let cLog = [];
+        \\Object.defineProperty(c, 1, {
+        \\  get() { return 10; },
+        \\  set(v) { cLog.push("set1:" + v); },
+        \\  enumerable: true,
+        \\  configurable: true,
+        \\});
+        \\c.push(4);
+        \\print("push:", c.length, c[3]);
+        \\print("pop:", c.pop(), c.length);
+        \\c.reverse();
+        \\print("reverse:", c[0], c[1], c[2], cLog.join("|"));
+        \\const s = [1, 2, 3, 4];
+        \\Object.defineProperty(s, 1, { value: 20, writable: false, enumerable: true, configurable: true });
+        \\let spliceErr = false;
+        \\try { s.splice(1, 1, 99); } catch (e) { spliceErr = e instanceof TypeError; }
+        \\print("splice non-writable err:", spliceErr, s[1]);
+        \\let sortErr = false;
+        \\try { s.sort((x, y) => y - x); } catch (e) { sortErr = e instanceof TypeError; }
+        \\print("sort non-writable err:", sortErr);
+        \\let cwErr = false;
+        \\try { s.copyWithin(1, 0, 1); } catch (e) { cwErr = e instanceof TypeError; }
+        \\print("copyWithin non-writable err:", cwErr);
+        \\
+        \\// 5. Object.freeze / Object.seal / Object.isFrozen / Object.isSealed
+        \\const f = [1];
+        \\Object.defineProperty(f, 0, { value: 1, writable: false, configurable: false });
+        \\Object.defineProperty(f, "length", { writable: false });
+        \\Object.preventExtensions(f);
+        \\print("manual frozen:", Object.isSealed(f), Object.isFrozen(f));
+        \\const g = [1, 2];
+        \\Object.defineProperty(g, 0, { get() { return 5; }, configurable: true });
+        \\Object.freeze(g);
+        \\print("frozen accessor:", Object.isFrozen(g), g[0], Object.getOwnPropertyDescriptor(g, 0).configurable);
+    ;
+    const expected =
+        \\d1: 200 false false true
+        \\d2: 300 true true false
+        \\after sloppy write a[1]: 200
+        \\strict write err: true
+        \\keys: 0,2,3
+        \\ownNames: 0,1,2,3,length
+        \\values: 10,300,40
+        \\entries: 0:10,2:300,3:40
+        \\forIn: 0,2,3
+        \\in: true true true false
+        \\del non-conf: false 300
+        \\del conf: true false undefined
+        \\sloppy shrink len: 3 false 300
+        \\strict shrink err: true 3
+        \\defLen err: true 3 false
+        \\b len: 4 b[0]: 50 b[3]: 7
+        \\after set: 42 1 77 false
+        \\b keys: 0,1 b names: 0,1,3,length
+        \\b map: 43,3,,78
+        \\b filter: 42,77
+        \\b slice: 42,2,,77
+        \\push: 4 4
+        \\pop: 4 3
+        \\reverse: 2 10 3 
+        \\splice non-writable err: true 20
+        \\sort non-writable err: true
+        \\copyWithin non-writable err: true
+        \\manual frozen: true true
+        \\frozen accessor: true 5 false
+        \\
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("", r.err);
+        try testing.expectEqualStrings(expected, r.out);
+    }
+}
+
+test "array index Object.defineProperty overrides: GC stress on getter/setter closures and values" {
+    const src =
+        \\const arr = [{ tag: "init" }];
+        \\let box = { n: 1 };
+        \\Object.defineProperty(arr, 0, {
+        \\  get() { return { seen: box.n }; },
+        \\  set(v) { box = { n: v.n + 1 }; },
+        \\  enumerable: true,
+        \\  configurable: true,
+        \\});
+        \\Object.defineProperty(arr, 1, {
+        \\  value: { payload: "kept" },
+        \\  writable: false,
+        \\  enumerable: false,
+        \\  configurable: true,
+        \\});
+        \\let sum = 0;
+        \\for (let i = 0; i < 60; i++) {
+        \\  const garbage = { a: [i, i + 1], s: "tmp_" + i };
+        \\  arr[0] = { n: i };
+        \\  sum += arr[0].seen;
+        \\  if (garbage.a[0] < 0) print(garbage);
+        \\}
+        \\print(sum, arr[1].payload);
+    ;
+    const expected = "1830 kept\n";
+    for (support.engines) |engine| {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer err_w.deinit();
+        const code = try zqjs.runSource(testing.allocator, "gc_arr_override.js", src, .{}, .{
+            .mode = .normal,
+            .engine = engine,
+            .collect_always = true,
+            .verify_heap = true,
+        }, &out.writer, &err_w.writer);
+        try testing.expectEqual(@as(u8, 0), code);
+        try testing.expectEqualStrings("", err_w.written());
+        try testing.expectEqualStrings(expected, out.written());
+    }
+}
+
+test "instanceof fast and slow paths: primitives, closures, natives, proxies, Symbol.hasInstance, bound, mutated Function.prototype" {
+    const src =
+        \\class Base {}
+        \\class Sub extends Base {}
+        \\const b = new Base();
+        \\const s = new Sub();
+        \\print("fast ctor:", b instanceof Base, s instanceof Base, s instanceof Sub, b instanceof Sub);
+        \\print("fast prim:", 1 instanceof Base, "a" instanceof String, null instanceof Object, undefined instanceof Array, true instanceof Boolean);
+        \\print("fast native:", [] instanceof Array, [] instanceof Object, ({}) instanceof Array, new Date() instanceof Date);
+        \\
+        \\// Non-object prototype throws TypeError for objects, returns false for primitives
+        \\const arrow = () => {};
+        \\let arrowObjErr = false;
+        \\try { ({}) instanceof arrow; } catch (e) { arrowObjErr = e instanceof TypeError; }
+        \\print("arrow:", 1 instanceof arrow, arrowObjErr);
+        \\function BadProto() {}
+        \\BadProto.prototype = 42;
+        \\let badProtoErr = false;
+        \\try { ({}) instanceof BadProto; } catch (e) { badProtoErr = e instanceof TypeError; }
+        \\print("badProto:", 1 instanceof BadProto, badProtoErr);
+        \\
+        \\// Own prototype accessor on a non-constructable closure (arrow has no auto-prototype)
+        \\let protoGetterCalls = 0;
+        \\const AccProto = () => {};
+        \\Object.defineProperty(AccProto, "prototype", {
+        \\  get() { protoGetterCalls++; return Base.prototype; },
+        \\});
+        \\print("accProto:", b instanceof AccProto, protoGetterCalls);
+        \\
+        \\// Bound constructor (including bound custom Symbol.hasInstance on primitive!)
+        \\const BoundBase = Base.bind();
+        \\print("bound:", b instanceof BoundBase, 1 instanceof BoundBase);
+        \\class CustomNum {
+        \\  static [Symbol.hasInstance](x) { return typeof x === "number"; }
+        \\}
+        \\class SubCustomNum extends CustomNum {}
+        \\const BoundCustom = CustomNum.bind();
+        \\print("custom:", 42 instanceof CustomNum, "x" instanceof CustomNum, 42 instanceof SubCustomNum, 42 instanceof BoundCustom);
+        \\
+        \\// Proxy LHS and Proxy in prototype chain
+        \\let proxyProtoCalls = 0;
+        \\const pLhs = new Proxy({}, {
+        \\  getPrototypeOf() { proxyProtoCalls++; return Base.prototype; },
+        \\});
+        \\const childOfProxy = Object.create(pLhs);
+        \\print("proxy:", pLhs instanceof Base, childOfProxy instanceof Base, proxyProtoCalls);
+        \\
+        \\// Proxy RHS
+        \\let rhsTrap = 0;
+        \\const pRhs = new Proxy(Base, {
+        \\  get(t, k, r) {
+        \\    if (k === Symbol.hasInstance) rhsTrap++;
+        \\    return Reflect.get(t, k, r);
+        \\  },
+        \\});
+        \\print("proxyRhs:", b instanceof pRhs, rhsTrap);
+        \\
+        \\// Replaced [[Prototype]] with custom Symbol.hasInstance (bypassing Function.prototype)
+        \\let customProtoCalls = 0;
+        \\function AltCtor() {}
+        \\Object.setPrototypeOf(AltCtor, {
+        \\  [Symbol.hasInstance](x) { customProtoCalls++; return x === "magic"; },
+        \\});
+        \\print("altProto:", "magic" instanceof AltCtor, b instanceof AltCtor, customProtoCalls);
+    ;
+    const expected =
+        \\fast ctor: true true true false
+        \\fast prim: false false false false false
+        \\fast native: true true false true
+        \\arrow: false true
+        \\badProto: false true
+        \\accProto: true 1
+        \\bound: true false
+        \\custom: true false true true
+        \\proxy: true true 2
+        \\proxyRhs: true 1
+        \\altProto: true false 2
+        \\
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("", r.err);
+        try testing.expectEqualStrings(expected, r.out);
+    }
+}

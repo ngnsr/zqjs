@@ -850,6 +850,10 @@ pub const Vm = struct {
         return vm.frame().proto;
     }
 
+    pub fn closureCaller(vm: *Vm) rt_mod.ClosureCaller {
+        return .{ .ctx = vm, .call = callFromBuiltin, .construct = constructFromBuiltin };
+    }
+
     pub fn step(vm: *Vm) Error!State {
         if (vm.fault) |e| return e;
         if (vm.halted) return .halted;
@@ -3123,7 +3127,7 @@ fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []c
 fn fastArrayGet(base: Value, idx: Value) ?Value {
     if (!base.isObject() or !idx.isNumber()) return null;
     const o = base.asObject();
-    if (o.kind != .array) return null;
+    if (o.kind != .array or o.has_index_overrides) return null;
     const n = idx.asNumber();
     const elems = o.kind.array.items;
     if (!(n >= 0 and n < @as(f64, @floatFromInt(elems.len)) and @floor(n) == n)) return null;
@@ -3137,7 +3141,7 @@ fn fastArrayGet(base: Value, idx: Value) ?Value {
 fn fastArraySet(rt: *Runtime, base: Value, idx: Value, val: Value) bool {
     if (!base.isObject() or !idx.isNumber()) return false;
     const o = base.asObject();
-    if (o.kind != .array or !o.array_elements_writable) return false;
+    if (o.kind != .array or !o.array_elements_writable or o.has_index_overrides) return false;
     const n = idx.asNumber();
     const elems = o.kind.array.items;
     if (!(n >= 0 and n < @as(f64, @floatFromInt(elems.len)) and @floor(n) == n)) return false;
@@ -3622,7 +3626,7 @@ noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
 noinline fn fastArrayPush1(rt: *Runtime, receiver: Value, val: Value) Error!?Value {
     if (!receiver.isObject()) return null;
     const a = receiver.asObject();
-    if (a.kind != .array or !a.extensible or !a.array_length_writable or !a.array_elements_writable) return null;
+    if (a.kind != .array or !a.extensible or !a.array_length_writable or !a.array_elements_writable or a.has_index_overrides) return null;
     const cur = a.kind.array.items.len;
     if (cur >= heap.Heap.MAX_DENSE_ARRAY_LEN) return null;
     if (!array_builtins.hasCleanArrayProtoChainFast(rt, a)) return null;

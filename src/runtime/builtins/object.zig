@@ -245,6 +245,19 @@ fn objectKeys(rt: *Runtime, _: Value, args: []const Value) Error!Value {
         },
         .string => |s| for (0..s.units.len) |i| try pushKey(rt, out, .{ .index = @intCast(i) }),
         .object => |o| {
+            if (o.kind == .module_namespace) {
+                // ES EnumerableOwnProperties calls [[GetOwnProperty]] on each export,
+                // which triggers TDZ ReferenceError for uninitialized bindings.
+                for (o.kind.module_namespace.entries) |e| {
+                    if (e.cell.value == null) {
+                        return rt.throw(.ReferenceError, &.{
+                            .{ .ascii = "Cannot access '" },
+                            .{ .utf16 = e.name.units },
+                            .{ .ascii = "' before initialization" },
+                        });
+                    }
+                }
+            }
             const keys = try object.ownKeys(rt, o);
             defer rt.gpa.free(keys);
             const key_vals = try rt.gpa.alloc(Value, keys.len);
@@ -379,9 +392,10 @@ pub fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap
                     };
                 },
                 .module_namespace => |ns| {
-                    if (k == .atom) {
+                    if (k != .symbol) {
+                        const pk = try object.propKey(rt, k);
                         for (ns.entries) |e| {
-                            if (e.name == k.atom) {
+                            if (e.name == pk.asAtom()) {
                                 const v = e.cell.value orelse return rt.throw(.ReferenceError, &.{
                                     .{ .ascii = "Cannot access '" },
                                     .{ .utf16 = e.name.units },
@@ -390,6 +404,7 @@ pub fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap
                                 return .{ .value = v, .enumerable = true, .writable = true, .configurable = false };
                             }
                         }
+                        return null;
                     }
                 },
                 .typed_array => |ta| {
@@ -715,6 +730,24 @@ pub fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Pa
             }
             return true;
         }
+    }
+
+    if (target.isObject() and target.asObject().kind == .module_namespace and k != .symbol) {
+        // ES2025 §10.4.6.6: Module Namespace [[DefineOwnProperty]] for string keys.
+        const current = (try getOwnPropertyRaw(rt, target, k)) orelse {
+            if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot define property on module namespace" }});
+            return false;
+        };
+        if ((d.has_conf and d.conf_val) or
+            (d.has_enum and !d.enum_val) or
+            d.isAccessor() or
+            (d.has_writ and !d.writ_val) or
+            (d.has_val and !common.sameValue(d.val, current.value)))
+        {
+            if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property on module namespace" }});
+            return false;
+        }
+        return true;
     }
 
     var desc = d;
@@ -1256,6 +1289,22 @@ fn setIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!Value {
                 .typed_array => |ta| if (ta.length > 0) {
                     return rt.throw(.TypeError, &.{.{ .ascii = "Cannot freeze array buffer views with elements" }});
                 },
+                .module_namespace => |ns| {
+                    // ES SetIntegrityLevel calls [[GetOwnProperty]]/[[DefineOwnProperty]] on each export:
+                    // uninitialized bindings throw ReferenceError; freeze rejects writable:false with TypeError.
+                    for (ns.entries) |e| {
+                        if (e.cell.value == null) {
+                            return rt.throw(.ReferenceError, &.{
+                                .{ .ascii = "Cannot access '" },
+                                .{ .utf16 = e.name.units },
+                                .{ .ascii = "' before initialization" },
+                            });
+                        }
+                        if (freeze) {
+                            return rt.throw(.TypeError, &.{.{ .ascii = "Cannot redefine property on module namespace" }});
+                        }
+                    }
+                },
                 else => {},
             }
         },
@@ -1320,6 +1369,18 @@ fn testIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!bool {
                 },
                 .regexp => if (freeze and o.regexp_last_index_writable) return false,
                 .typed_array => |ta| if (freeze and ta.length > 0) return false,
+                .module_namespace => |ns| {
+                    for (ns.entries) |e| {
+                        if (e.cell.value == null) {
+                            return rt.throw(.ReferenceError, &.{
+                                .{ .ascii = "Cannot access '" },
+                                .{ .utf16 = e.name.units },
+                                .{ .ascii = "' before initialization" },
+                            });
+                        }
+                        if (freeze) return false;
+                    }
+                },
                 else => {},
             }
             return true;

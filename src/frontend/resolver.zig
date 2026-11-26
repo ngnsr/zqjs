@@ -442,6 +442,7 @@ const Resolver = struct {
                     const b = r.bindings.items[l.binding];
                     if (b.function != f.id) continue;
                     if (b.scope == f.var_scope) continue;
+                    if (b.kind == .function_name) continue; // outer name scope of a named function expression
                     if (param_scope != null and b.scope == param_scope.?) continue;
                     if (!std.mem.eql(u8, l.name, d.name)) continue;
                     // Annex B B.3.5: `catch (e) { var e; }` is valid in sloppy JS with dual bindings.

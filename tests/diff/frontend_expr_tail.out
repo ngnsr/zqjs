@@ -1,0 +1,14 @@
+f1: ""
+f2: ""
+f3: ""
+f4: "f4"
+f5: "f5"
+f6: ""
+f7: "f7"
+f8: ""
+f9: ""
+C1: function
+C2: 42
+scope-var-open: outside undefined
+scope-var-block: 99
+fn-name-still-works: function

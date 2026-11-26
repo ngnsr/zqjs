@@ -139,7 +139,9 @@ fn nodeHas(b: names.Builtin, k: Key) bool {
         if (u > 0x7f) return false;
         buf[i] = @intCast(u);
     }
-    return names.has(b, buf[0..a.units.len]);
+    const name = buf[0..a.units.len];
+    if (b == .global and builtins.isImplementedGlobal(name)) return false;
+    return names.has(b, name);
 }
 
 /// Unsupported(builtin), recording which member.
@@ -977,16 +979,6 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
         },
         .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .date => {},
     }
-    if (o.builtin == .global and k == .atom) {
-        const pk = try propKey(rt, k);
-        if (o.props.get(pk)) |p| {
-            if (!p.configurable) return false;
-            try rt.heap.removePropKey(o, pk);
-            builtins.markGlobalBuiltinDeleted(rt, k.atom);
-            return true;
-        }
-        return builtins.deleteGlobalBuiltin(rt, k.atom);
-    }
     if (o.props.count() == 0) return true;
     const pk = try propKey(rt, k);
     if (o.props.get(pk)) |p| if (!p.configurable) return false;
@@ -1065,10 +1057,7 @@ fn hasInChain(rt: *Runtime, start: *Object, k: Key) Error!bool {
         }
         if (try ownProp(rt, cur, k) != null) return true;
         // node has it there, so the answer is known even if the value isn't.
-        if (cur.builtin) |b| {
-            if (b == .global and k == .atom and builtins.isGlobalBuiltinDeletedAtom(rt, k.atom)) continue;
-            if (nodeHas(b, k)) return true;
-        }
+        if (cur.builtin) |b| if (nodeHas(b, k)) return true;
     }
     return false;
 }

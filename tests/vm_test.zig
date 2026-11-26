@@ -1271,12 +1271,12 @@ test "M11.3a: Math.random is deterministic per runtime seed and unimplemented Ma
     try testing.expectEqualStrings(out3.writer.buffered(), out4.writer.buffered());
     try testing.expect(!std.mem.eql(u8, out1.writer.buffered(), out3.writer.buffered()));
 
-    // 3. Unimplemented Math member (e.g. Math.cosh) raises Unsupported(builtin).
-    const unsup = try rt1.compile("unsup.js", "Math.cosh;", null);
+    // 3. Unimplemented built-in member (e.g. JSON.rawJSON) raises Unsupported(builtin).
+    const unsup = try rt1.compile("unsup.js", "JSON.rawJSON;", null);
     defer unsup.destroy();
     var f: api.Failure = .{};
     try testing.expectError(error.Unsupported, rt1.run(unsup, &f));
-    try testing.expect(std.mem.indexOf(u8, f.message(), "cosh") != null);
+    try testing.expect(std.mem.indexOf(u8, f.message(), "rawJSON") != null);
 }
 
 const CountingAllocator = struct {

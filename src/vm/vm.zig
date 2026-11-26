@@ -957,7 +957,7 @@ pub const Vm = struct {
                         cache.syncSp(vm);
                         const gname = try vm.name(name_idx);
                         const v = try builtins.global(rt, gname);
-                        populateGetGlobalIc(rt, p, pc, atom, gname);
+                        populateGetGlobalIc(rt, p, pc, atom);
                         try cache.push(vm, v);
                     }
                 } else {
@@ -3043,9 +3043,6 @@ fn fastGetGlobal(rt: *Runtime, p: *const Proto, pc: u32, atom: *heap.String) ?Va
     const ic = b[0];
     if (ic.atom_addr != @intFromPtr(atom)) return null;
     switch (ic.kind) {
-        12 => if (rt.host_globals.items.len == 0 and objVersion(r.global_object) == ic.shape_id and !builtins.isBuiltinGlobalDeleted(r, ic.slot)) {
-            return builtins.resolveGlobalTargetByIndex(r, ic.slot);
-        },
         13 => {
             const go = r.global_object;
             if (go.props == .shaped and go.props.shapeId() == ic.shape_id) {
@@ -3069,7 +3066,7 @@ fn fastGetGlobal(rt: *Runtime, p: *const Proto, pc: u32, atom: *heap.String) ?Va
     return null;
 }
 
-noinline fn populateGetGlobalIc(rt: *Runtime, p: *const Proto, pc: u32, atom: *heap.String, name: []const u8) void {
+noinline fn populateGetGlobalIc(rt: *Runtime, p: *const Proto, pc: u32, atom: *heap.String) void {
     const r = builtins.realmIfInit(rt) orelse return;
     const go = r.global_object;
     const key = heap.PropKey.fromAtom(atom);
@@ -3101,16 +3098,6 @@ noinline fn populateGetGlobalIc(rt: *Runtime, p: *const Proto, pc: u32, atom: *h
             return;
         }
     }
-    if (rt.host_globals.items.len != 0) return;
-    const idx = builtins.globalTargetIndex(name) orelse return;
-    if (builtins.isBuiltinGlobalDeleted(r, idx)) return;
-    insertPropIc(rt, p, pc, .{
-        .shape_id = objVersion(go),
-        .proto_shape_id = 0,
-        .atom_addr = @intFromPtr(atom),
-        .slot = idx,
-        .kind = 12,
-    });
 }
 
 inline fn isLengthAtom(atom: *const heap.String) bool {

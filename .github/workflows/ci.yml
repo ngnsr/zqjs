@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   check:
-    name: ${{ matrix.platform.name }} / ${{ matrix.suite.name }}
+    name: ${{ matrix.platform.name }}
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.platform.os }}
     timeout-minutes: 35
@@ -49,10 +49,6 @@ jobs:
           - { name: Linux x86_64, os: ubuntu-latest, cpu: "-Dcpu=x86_64_v3", jobs: "-j4" }
           - { name: Linux arm64, os: ubuntu-24.04-arm, cpu: "", jobs: "-j4" }
           - { name: Windows x86_64, os: windows-latest, cpu: "-Dcpu=x86_64_v3", jobs: "-j4" }
-        suite:
-          # build.zig defaults to ReleaseSafe.
-          - { name: tests, flags: "" }
-          - { name: gc-stress + stack-stress, flags: "-Dgc-stress -Dstack-stress" }
     steps:
       - uses: actions/checkout@v4
 
@@ -60,34 +56,31 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
-          cache-key: ${{ matrix.suite.name }}
+          cache-key: tests
 
       - name: Formatting
-        if: matrix.suite.name == 'tests'
         run: zig fmt --check .
 
-      - name: Tests (${{ matrix.suite.name }})
-        run: zig build test ${{ matrix.platform.jobs }} ${{ matrix.suite.flags }} ${{ matrix.platform.cpu }} --summary all
+      - name: Tests (ReleaseSafe)
+        run: zig build test ${{ matrix.platform.jobs }} ${{ matrix.platform.cpu }} --summary all
 
       # Verify syntax/diff/pow goldens against pinned arm64 Node 26.
-      - if: matrix.suite.name == 'tests' && matrix.platform.os == 'macos-latest'
+      - if: matrix.platform.os == 'macos-latest'
         uses: actions/setup-node@v4
         with:
           node-version: 26
 
       - name: Generated files and Node contract
-        if: matrix.suite.name == 'tests' && matrix.platform.os == 'macos-latest'
+        if: matrix.platform.os == 'macos-latest'
         run: zig build check-goldens
 
       - name: Release build & embedding example
-        if: matrix.suite.name == 'tests'
         run: |
           zig build ${{ matrix.platform.jobs }} -Doptimize=ReleaseFast ${{ matrix.platform.cpu }}
           zig build example ${{ matrix.platform.jobs }} -Doptimize=ReleaseFast ${{ matrix.platform.cpu }}
 
       # pow must give bit-identical results everywhere (DESIGN_DECISIONS D25).
       - name: pow portability hash
-        if: matrix.suite.name == 'tests'
         shell: bash
         run: |
           expected=b02251ea683f1d7d845373dba7eba1a0aa02f8253761095beb95de2a03ab2b19
@@ -95,20 +88,22 @@ jobs:
           echo "$out"
           grep -q "$expected" <<< "$out" || { echo "pow results differ from the reference hash"; exit 1; }
 
-  # M8.1: each deliberately broken GC mutant must be caught by the heap verifier.
-  # Run as a dedicated parallel job so it doesn't add 9 monolithic LLVM compiles to every OS tests job.
-  gc-mutants:
-    name: GC Mutants (Linux x86_64)
+  # GC/stack stress + M8.1 verifier mutants (run once on fast Linux x86_64).
+  gc-stress:
+    name: GC Stress & Mutants (Linux x86_64)
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
-          cache-key: gc-mutants
+          cache-key: gc-stress-mutants
+
+      - name: Tests (gc-stress + stack-stress)
+        run: zig build test -j4 -Dgc-stress -Dstack-stress -Dcpu=x86_64_v3 --summary all
 
       - name: GC mutants
         run: zig build gc-mutants -j4 -Dcpu=x86_64_v3 --summary all

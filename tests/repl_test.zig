@@ -279,6 +279,21 @@ test "repl: completeness checker and read-only Tab completion" {
     defer res6.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), res6.matches.len);
     try testing.expectEqualStrings("keys", res6.matches[0]);
+
+    // console and console. completion
+    var res7 = try complete.complete(testing.allocator, "conso", 5, &s.rt, s.completionLookup());
+    defer res7.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), res7.matches.len);
+    try testing.expectEqualStrings("console", res7.matches[0]);
+
+    var res8 = try complete.complete(testing.allocator, "console.l", 9, &s.rt, s.completionLookup());
+    defer res8.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), res8.matches.len);
+    try testing.expectEqualStrings("log", res8.matches[0]);
+
+    var res9 = try complete.complete(testing.allocator, "console.", 8, &s.rt, s.completionLookup());
+    defer res9.deinit(testing.allocator);
+    try testing.expect(res9.matches.len >= 6);
 }
 
 test "repl: dot-commands (.ast, .bc, .gc, .mem, .clear, .load)" {

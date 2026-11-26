@@ -194,11 +194,12 @@ pub const Realm = struct {
     sym_is_concat_spreadable: *heap_mod.Symbol,
     math: *Object,
     json: *Object,
+    console: *Object,
     global_object: *Object,
     views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [67]*Object {
+    pub fn objects(r: *const Realm) [68]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -266,6 +267,7 @@ pub const Realm = struct {
             r.bigint_namespace,
             r.math,
             r.json,
+            r.console,
             r.global_object,
         };
     }
@@ -402,6 +404,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .sym_is_concat_spreadable = try h.newSymbol(try h.ascii("Symbol.isConcatSpreadable"), false),
         .math = try common.builtin(h, object_prototype, .math),
         .json = try common.builtin(h, object_prototype, .json),
+        .console = try h.newObject(object_prototype),
         .global_object = try common.builtin(h, object_prototype, .global),
     };
     try object_builtins.register(rt, &r);
@@ -415,6 +418,19 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try common.method(rt, r.json, "parse", &json.parse_native);
     try common.method(rt, r.json, "stringify", &json.stringify_native);
     try common.defineToStringTag(rt, r.json, r.sym_to_string_tag, "JSON");
+    // WHATWG Console namespace: methods are enumerable/writable/configurable own properties.
+    for ([_]struct { []const u8, *const Native }{
+        .{ "log", &console_log },
+        .{ "info", &console_info },
+        .{ "debug", &console_debug },
+        .{ "warn", &console_warn },
+        .{ "error", &console_error },
+        .{ "assert", &console_assert },
+    }) |entry| {
+        const k = try h.internAscii(entry[0]);
+        try h.defineProperty(r.console, k, .{ .value = Value.fromNative(entry[1]) });
+    }
+    try common.defineToStringTag(rt, r.console, r.sym_to_string_tag, "console");
     try function_error.register(rt, &r);
     try regexp.register(rt, &r);
     for (builtin_globals.keys(), 0..) |name, i| {
@@ -595,6 +611,12 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
 // ---------------------------------------------------------------- globals
 
 pub const print: Native = .{ .name = "print", .call = common.printImpl };
+pub const console_log: Native = .{ .name = "log", .call = common.printImpl };
+pub const console_info: Native = .{ .name = "info", .call = common.printImpl };
+pub const console_debug: Native = .{ .name = "debug", .call = common.printImpl };
+pub const console_warn: Native = .{ .name = "warn", .call = common.printImpl };
+pub const console_error: Native = .{ .name = "error", .call = common.printImpl };
+pub const console_assert: Native = .{ .name = "assert", .call = common.consoleAssertImpl };
 pub const object_global: Native = .{ .name = "Object", .length = 1, .call = object_builtins.objectCall, .construct = object_builtins.objectConstruct, .namespace = .object };
 pub const array_global: Native = .{ .name = "Array", .length = 1, .call = array.arrayCall, .construct = array.arrayConstruct, .namespace = .array };
 pub const string_global: Native = .{ .name = "String", .length = 1, .call = string.stringCall, .construct = string.stringConstruct, .namespace = .string };
@@ -651,6 +673,7 @@ const GlobalTarget = union(enum) {
     inf,
     math,
     json,
+    console,
     reflect,
     global_this,
     native: *const Native,
@@ -711,6 +734,7 @@ const builtin_globals = std.StaticStringMap(GlobalTarget).initComptime([_]struct
     .{ "BigUint64Array", .{ .native = &typed_array_ctors[10] } },
     .{ "Math", .math },
     .{ "JSON", .json },
+    .{ "console", .console },
     .{ "structuredClone", .{ .native = &structured_clone_global } },
 });
 
@@ -725,6 +749,7 @@ pub inline fn resolveGlobalTargetByIndex(r: *const Realm, idx: u16) Value {
         .inf => Value.fromNumber(std.math.inf(f64)),
         .math => Value.fromObject(r.math),
         .json => Value.fromObject(r.json),
+        .console => Value.fromObject(r.console),
         .reflect => Value.fromObject(r.reflect),
         .global_this => Value.fromObject(r.global_object),
         .native => |n| Value.fromNative(n),
@@ -738,6 +763,7 @@ fn resolveGlobalTarget(rt: *Runtime, target: GlobalTarget) Error!Value {
         .inf => Value.fromNumber(std.math.inf(f64)),
         .math => Value.fromObject((try realm(rt)).math),
         .json => Value.fromObject((try realm(rt)).json),
+        .console => Value.fromObject((try realm(rt)).console),
         .reflect => Value.fromObject((try realm(rt)).reflect),
         .global_this => Value.fromObject((try realm(rt)).global_object),
         .native => |n| Value.fromNative(n),

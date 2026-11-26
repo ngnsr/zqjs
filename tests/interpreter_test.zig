@@ -346,7 +346,7 @@ test "built-ins: known to node but not implemented is Unsupported, naming the me
     try expectUnsupported("Object.prototype.__defineGetter__;", "", "('__defineGetter__')");
     try expectUnsupported("({}).toLocaleString;", "", "('toLocaleString')");
     try expectUnsupported("({}).__lookupGetter__;", "", "('__lookupGetter__')");
-    try expectUnsupported("console;", "", "('console')");
+    try expectUnsupported("Atomics;", "", "('Atomics')");
     try expectUnsupported("Function('return 1');", "", "Unsupported(builtin)");
     // Names node doesn't have are plain misses (undefined / ReferenceError), not Unsupported.
     for (support.engines) |engine| {
@@ -1266,6 +1266,77 @@ test "Test262: Error.prototype.stack accessor and Iterator drop/take MAX_SAFE_IN
         \\set proxy rej: TypeError TypeError
         \\drop: RangeError 1
         \\take: RangeError 1
+        \\
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("", r.err);
+        try testing.expectEqualStrings(expected, r.out);
+    }
+}
+
+test "console: log/info/debug/warn/error/assert, descriptors, detached calls, and GC rooting" {
+    const src =
+        \\const gd = Object.getOwnPropertyDescriptor(globalThis, "console");
+        \\const ld = Object.getOwnPropertyDescriptor(console, "log");
+        \\console.log("shape:", typeof console, globalThis.console === console, Object.prototype.toString.call(console));
+        \\console.log("global desc:", gd.writable, gd.enumerable, gd.configurable);
+        \\console.log("log desc:", ld.writable, ld.enumerable, ld.configurable, console.log.name, console.log.length, console.assert.name, console.assert.length);
+        \\console.log("keys:", Object.keys(console).join(","), console.nonexistent);
+        \\console.log();
+        \\console.info("i", 1, true, null, undefined, 42n, Symbol("s"));
+        \\console.debug("d", [1, 2]);
+        \\console.warn("w");
+        \\console.error("e");
+        \\const { log, assert } = console;
+        \\const retLog = log("detached");
+        \\console.log("retLog:", retLog);
+        \\let sideEffect = false;
+        \\const retPass = assert(true, { toString() { sideEffect = true; return "nope"; } });
+        \\console.log("assert pass:", retPass, sideEffect);
+        \\const retFail0 = console.assert();
+        \\console.assert(false);
+        \\console.assert(0, "zero", 123);
+        \\console.assert("", Symbol("tag"));
+        \\console.log("retFail0:", retFail0);
+        \\const allocToString = {
+        \\    toString() {
+        \\        let s = "";
+        \\        for (let i = 0; i < 64; i++) s = "x" + i;
+        \\        return "ok:" + s;
+        \\    }
+        \\};
+        \\console.log(allocToString, { toString() { return "second"; } });
+        \\console.assert(false, allocToString, { toString() { return "third"; } });
+        \\const saved = globalThis.console;
+        \\delete globalThis.console;
+        \\print("after delete:", globalThis.console);
+        \\globalThis.console = saved;
+        \\console.log("restored");
+    ;
+    const expected =
+        \\shape: object true [object console]
+        \\global desc: true false true
+        \\log desc: true true true log 0 assert 0
+        \\keys: log,info,debug,warn,error,assert undefined
+        \\
+        \\i 1 true null undefined 42 Symbol(s)
+        \\d 1,2
+        \\w
+        \\e
+        \\detached
+        \\retLog: undefined
+        \\assert pass: undefined false
+        \\Assertion failed
+        \\Assertion failed
+        \\Assertion failed: zero 123
+        \\Assertion failed: Symbol(tag)
+        \\retFail0: undefined
+        \\ok:x63 second
+        \\Assertion failed: ok:x63 third
+        \\after delete: undefined
+        \\restored
         \\
     ;
     for (support.engines) |engine| {

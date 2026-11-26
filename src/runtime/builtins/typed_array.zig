@@ -371,7 +371,7 @@ fn dvByteLengthGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 fn dvByteOffsetGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     const o = try requireDataView(rt, this);
     const dv = o.kind.data_view;
-    if (dv.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
+    if (dv.buffer.kind.array_buffer.detached) return Value.fromNumber(0);
     return Value.fromNumber(@floatFromInt(dv.byte_offset));
 }
 
@@ -666,24 +666,26 @@ fn allocateTypedArray(rt: *Runtime, kind: heap_mod.TypedArrayKind, len: usize) E
 fn collectIterableToArray(rt: *Runtime, source: Value, method_fn: Value) Error!*Object {
     const r = try builtins.realm(rt);
     const arr = try rt.heap.newArray(r.array_prototype);
-    var root_buf = [_]Value{ source, method_fn, Value.fromObject(arr), .undefined, .undefined };
+    var root_buf = [_]Value{ source, method_fn, Value.fromObject(arr), .undefined, .undefined, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
 
     const iter = try rt.callCallable(method_fn, source, &.{});
-    if (!iter.isObject()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
+    if (!iter.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
     root_buf[3] = iter;
     const next_fn = try object.get(rt, iter, try object.named(rt, "next"));
     if (!next_fn.isFunction()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator next is not a function" }});
     root_buf[4] = next_fn;
 
     const done_key = try object.named(rt, "done");
+    root_buf[5] = Value.fromString(done_key.atom);
     const value_key = try object.named(rt, "value");
+    root_buf[6] = Value.fromString(value_key.atom);
     while (true) {
         try rt.step();
         const step = try rt.callCallable(next_fn, iter, &.{});
-        if (!step.isObject()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
+        if (!step.isObjectLike()) return rt.throw(.TypeError, &.{.{ .ascii = "Iterator result is not an object" }});
         var step_buf = [_]Value{step};
         var step_roots: rt_mod.ValueRoots = .{ .values = &step_buf };
         try step_roots.register(rt);
@@ -703,11 +705,11 @@ fn typedArrayConstructKind(rt: *Runtime, kind: heap_mod.TypedArrayKind, args: []
         return Value.fromObject(try allocateTypedArray(rt, kind, 0));
     }
     const arg0 = args[0];
-    if (!arg0.isObject()) {
+    if (!arg0.isObjectLike()) {
         const len = try toIndex(rt, arg0);
         return Value.fromObject(try allocateTypedArray(rt, kind, len));
     }
-    switch (arg0.asObject().kind) {
+    if (arg0.isObject()) switch (arg0.asObject().kind) {
         .typed_array => |src| {
             if (src.buffer.kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "Source TypedArray buffer is detached" }});
             if (src.kind.isBigInt() != kind.isBigInt()) {
@@ -755,38 +757,37 @@ fn typedArrayConstructKind(rt: *Runtime, kind: heap_mod.TypedArrayKind, args: []
             if (arg0.asObject().kind.array_buffer.detached) return rt.throw(.TypeError, &.{.{ .ascii = "ArrayBuffer is detached" }});
             return Value.fromObject(try rt.heap.newTypedArray(proto, arg0.asObject(), kind, offset, new_len));
         },
-        else => {
-            var root_buf = [_]Value{ arg0, .undefined };
-            var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
-            try roots.register(rt);
-            defer roots.unregister(rt);
+        else => {},
+    };
+    var root_buf = [_]Value{ arg0, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
 
-            const iter_prop = try object.get(rt, arg0, .{ .symbol = r.sym_iterator });
-            if (!iter_prop.isUndefined() and !iter_prop.isNull()) {
-                if (!iter_prop.isFunction()) {
-                    return rt.throw(.TypeError, &.{.{ .ascii = "Iterator is not a function" }});
-                }
-                const arr = try collectIterableToArray(rt, arg0, iter_prop);
-                root_buf[1] = Value.fromObject(arr);
-                const len = arr.kind.array.items.len;
-                const dst = try allocateTypedArray(rt, kind, len);
-                root_buf[0] = Value.fromObject(dst);
-                for (0..len) |i| {
-                    try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, arr.kind.array.items[i]);
-                }
-                return Value.fromObject(dst);
-            }
-            const len_f = try common.toLength(rt, try object.get(rt, arg0, try object.named(rt, "length")));
-            const len: usize = @intFromFloat(len_f);
-            const dst = try allocateTypedArray(rt, kind, len);
-            root_buf[1] = Value.fromObject(dst);
-            for (0..len) |i| {
-                const v = try object.get(rt, arg0, .{ .index = @intCast(i) });
-                try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, v);
-            }
-            return Value.fromObject(dst);
-        },
+    const iter_prop = try object.get(rt, arg0, .{ .symbol = r.sym_iterator });
+    if (!iter_prop.isUndefined() and !iter_prop.isNull()) {
+        if (!iter_prop.isFunction()) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Iterator is not a function" }});
+        }
+        const arr = try collectIterableToArray(rt, arg0, iter_prop);
+        root_buf[1] = Value.fromObject(arr);
+        const len = arr.kind.array.items.len;
+        const dst = try allocateTypedArray(rt, kind, len);
+        root_buf[0] = Value.fromObject(dst);
+        for (0..len) |i| {
+            try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, arr.kind.array.items[i]);
+        }
+        return Value.fromObject(dst);
     }
+    const len_f = try common.toLength(rt, try object.get(rt, arg0, try object.named(rt, "length")));
+    const len: usize = @intFromFloat(len_f);
+    const dst = try allocateTypedArray(rt, kind, len);
+    root_buf[1] = Value.fromObject(dst);
+    for (0..len) |i| {
+        const v = try object.get(rt, arg0, .{ .index = @intCast(i) });
+        try object.writeTypedArrayElement(rt, dst.kind.typed_array, i, v);
+    }
+    return Value.fromObject(dst);
 }
 
 fn constructorTypedArrayKind(v: Value) ?heap_mod.TypedArrayKind {

@@ -439,7 +439,9 @@ fn jsonStringify(rt: *Runtime, _: Value, args: []const Value) Error!Value {
             use_prop_list = true;
             const replacer = args[1];
             const len_val = try object.get(rt, replacer, try object.named(rt, "length"));
+            root_buf[3] = len_val;
             const len_f = try common.toLength(rt, len_val);
+            root_buf[3] = .undefined;
             const len: u64 = @intFromFloat(len_f);
             var k: u64 = 0;
             while (k < len) : (k += 1) {
@@ -698,7 +700,7 @@ const Stringifier = struct {
             return;
         }
 
-        var roots_buf = [_]Value{ Value.fromObject(arr), .undefined };
+        var roots_buf = [_]Value{ Value.fromObject(arr), .undefined, .undefined };
         var roots = rt_mod.ValueRoots{ .values = &roots_buf };
         try roots.register(s.rt);
         defer roots.unregister(s.rt);
@@ -710,11 +712,13 @@ const Stringifier = struct {
             if (s.gap.len > 0) try s.writeIndent(step_indent);
             const raw: Value = if (i < arr.kind.array.items.len) arr.kind.array.items[i] else .undefined;
             const elem: Value = if (raw.isHole()) try object.get(s.rt, Value.fromObject(arr), .{ .index = @intCast(i) }) else raw;
+            roots_buf[2] = elem;
             var buf: [20]u8 = undefined;
             const idx_str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
             const key_val: Value = Value.fromString(try s.rt.heap.ascii(idx_str));
             roots_buf[1] = key_val;
             if (!try s.writeValue(Value.fromObject(arr), elem, key_val)) try s.writeAscii("null");
+            roots_buf[2] = .undefined;
         }
         if (s.gap.len > 0) try s.writeIndent(step_indent - 1);
         try s.writeUnit(']');

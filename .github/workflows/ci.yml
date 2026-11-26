@@ -40,15 +40,15 @@ jobs:
     name: ${{ matrix.platform.name }} / ${{ matrix.suite.name }}
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.platform.os }}
-    timeout-minutes: 30
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
         platform:
-          - { name: macOS arm64, os: macos-latest, cpu: "" }
-          - { name: Linux x86_64, os: ubuntu-latest, cpu: "-Dcpu=x86_64_v3" }
-          - { name: Linux arm64, os: ubuntu-24.04-arm, cpu: "" }
-          - { name: Windows x86_64, os: windows-latest, cpu: "-Dcpu=x86_64_v3" }
+          - { name: macOS arm64, os: macos-latest, cpu: "", jobs: "-j2" }
+          - { name: Linux x86_64, os: ubuntu-latest, cpu: "-Dcpu=x86_64_v3", jobs: "-j4" }
+          - { name: Linux arm64, os: ubuntu-24.04-arm, cpu: "", jobs: "-j4" }
+          - { name: Windows x86_64, os: windows-latest, cpu: "-Dcpu=x86_64_v3", jobs: "-j4" }
         suite:
           # build.zig defaults to ReleaseSafe.
           - { name: tests, flags: "" }
@@ -67,12 +67,7 @@ jobs:
         run: zig fmt --check .
 
       - name: Tests (${{ matrix.suite.name }})
-        run: zig build test -j2 ${{ matrix.suite.flags }} ${{ matrix.platform.cpu }} --summary all
-
-      # M8.1: each deliberately broken GC mutant must be caught by the heap verifier.
-      - name: GC mutants
-        if: matrix.suite.name == 'tests'
-        run: zig build gc-mutants -j2 ${{ matrix.platform.cpu }} --summary all
+        run: zig build test ${{ matrix.platform.jobs }} ${{ matrix.suite.flags }} ${{ matrix.platform.cpu }} --summary all
 
       # Verify syntax/diff/pow goldens against pinned arm64 Node 26.
       - if: matrix.suite.name == 'tests' && matrix.platform.os == 'macos-latest'
@@ -87,8 +82,8 @@ jobs:
       - name: Release build & embedding example
         if: matrix.suite.name == 'tests'
         run: |
-          zig build -Doptimize=ReleaseFast ${{ matrix.platform.cpu }}
-          zig build example -Doptimize=ReleaseFast ${{ matrix.platform.cpu }}
+          zig build ${{ matrix.platform.jobs }} -Doptimize=ReleaseFast ${{ matrix.platform.cpu }}
+          zig build example ${{ matrix.platform.jobs }} -Doptimize=ReleaseFast ${{ matrix.platform.cpu }}
 
       # pow must give bit-identical results everywhere (DESIGN_DECISIONS D25).
       - name: pow portability hash
@@ -99,3 +94,68 @@ jobs:
           out=$(zig build pow-bits -- tests/ops/pow.jsonl)
           echo "$out"
           grep -q "$expected" <<< "$out" || { echo "pow results differ from the reference hash"; exit 1; }
+
+  # M8.1: each deliberately broken GC mutant must be caught by the heap verifier.
+  # Run as a dedicated parallel job so it doesn't add 9 monolithic LLVM compiles to every OS tests job.
+  gc-mutants:
+    name: GC Mutants (Linux x86_64)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+          cache-key: gc-mutants
+
+      - name: GC mutants
+        run: zig build gc-mutants -j4 -Dcpu=x86_64_v3 --summary all
+
+  wasm:
+    name: WASM (wasm32-wasi)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+          cache-key: wasm32-wasi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build zqjs.wasm & libzqjs.a (ReleaseSmall)
+        run: zig build -j4 -Dtarget=wasm32-wasi -Doptimize=ReleaseSmall --summary all
+
+      - name: Smoke-test zqjs.wasm via node:wasi
+        run: |
+          node --no-warnings -e '
+          const fs = require("fs");
+          const { WASI } = require("node:wasi");
+          (async () => {
+            const wasm = await WebAssembly.compile(fs.readFileSync("zig-out/bin/zqjs.wasm"));
+            const cases = [
+              { code: "function fib(n){return n<2?n:fib(n-1)+fib(n-2);} print(fib(20));", exit: 0 },
+              { code: "const p = new Proxy({x:21},{get(t,k){return t[k]*2;}}); print(p.x, (2n**64n).toString());", exit: 0 },
+              { code: "print(/\\p{Script=Cyrillic}+/u.test(\"Привіт\"), 2**53-1);", exit: 0 },
+              { code: "async function f(){ return await Promise.resolve(42); } f().then(print);", exit: 0 },
+              { code: "while(true){}", exit: 1 },
+            ];
+            for (const c of cases) {
+              const wasi = new WASI({ version: "preview1", args: ["zqjs", "--max-steps", "500000", "-e", c.code] });
+              const inst = await WebAssembly.instantiate(wasm, wasi.getImportObject());
+              const rc = wasi.start(inst);
+              if (rc !== c.exit) {
+                console.error("WASM test failed:", c.code, "expected", c.exit, "got", rc);
+                process.exit(1);
+              }
+            }
+            console.log("WASM WASI smoke tests passed!");
+          })();
+          '

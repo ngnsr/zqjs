@@ -10,7 +10,10 @@ const Allocator = std.mem.Allocator;
 const zqjs = @import("zqjs");
 const internal = @import("zqjs_internal");
 
-const default_allocator: Allocator = std.heap.smp_allocator;
+const default_allocator: Allocator = if (@import("builtin").cpu.arch.isWasm())
+    std.heap.wasm_allocator
+else
+    std.heap.smp_allocator;
 
 const c_runtime_magic: u32 = 0x5A51_4352; // "ZQCR"
 const c_program_magic: u32 = 0x5A51_4350; // "ZQCP"

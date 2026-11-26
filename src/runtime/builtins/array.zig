@@ -826,7 +826,8 @@ fn concatAppendItem(rt: *Runtime, out: Value, n: *usize, item: Value, elem_root:
         }
         const len_f = try common.toLength(rt, try object.get(rt, item, try object.named(rt, "length")));
         const len: usize = @intFromFloat(len_f);
-        if (n.* > 9007199254740991 or len > 9007199254740991 - n.*) {
+        const max_safe_int: u64 = 9007199254740991;
+        if (@as(u64, n.*) > max_safe_int or @as(u64, len) > max_safe_int - @as(u64, n.*)) {
             return rt.throw(.TypeError, &.{.{ .ascii = "Array length exceeds maximum safe integer" }});
         }
         for (0..len) |i| {
@@ -839,7 +840,8 @@ fn concatAppendItem(rt: *Runtime, out: Value, n: *usize, item: Value, elem_root:
             n.* += 1;
         }
     } else {
-        if (n.* >= 9007199254740991) {
+        const max_safe_int: u64 = 9007199254740991;
+        if (@as(u64, n.*) >= max_safe_int) {
             return rt.throw(.TypeError, &.{.{ .ascii = "Array length exceeds maximum safe integer" }});
         }
         try common.arrayAppendOrDefine(rt, out, n.*, item);
@@ -1449,7 +1451,7 @@ fn flattenIntoArray(
             const next_depth = if (std.math.isInf(depth)) depth else depth - 1.0;
             target_index = try flattenIntoArray(rt, target, element, element_len, target_index, next_depth, null, .undefined, rec_depth + 1);
         } else {
-            if (target_index >= 9007199254740991) {
+            if (@as(u64, target_index) >= 9007199254740991) {
                 return rt.throw(.TypeError, &.{.{ .ascii = "Array length exceeds maximum safe integer" }});
             }
             try common.arrayAppendOrDefine(rt, target, target_index, element);

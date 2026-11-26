@@ -58,7 +58,11 @@ fn childThreadB(p: *zqjs.Program) void {
 }
 
 test "child: run the guard scenario named by ZQJS_GUARD_CHILD (expected panic)" {
-    const scenario = std.process.Environ.getPosix(std.testing.environ, "ZQJS_GUARD_CHILD") orelse return;
+    const scenario = std.testing.environ.getAlloc(testing.allocator, "ZQJS_GUARD_CHILD") catch |e| switch (e) {
+        error.EnvironmentVariableMissing => return,
+        else => return e,
+    };
+    defer testing.allocator.free(scenario);
     if (std.mem.eql(u8, scenario, "writer-reenter") or std.mem.eql(u8, scenario, "writer-destroy")) {
         var buf: [1]u8 = undefined;
         var writer: std.Io.Writer = .{
@@ -1180,7 +1184,7 @@ test "handles: Runtime.destroy with live tokens frees everything (E1)" {
 }
 
 test "the guard and the tag checks panic, as expected, in a child process (E1, E2)" {
-    if (std.process.Environ.getPosix(std.testing.environ, "ZQJS_GUARD_CHILD") != null) return; // we are the child
+    if (std.testing.environ.containsConstant("ZQJS_GUARD_CHILD")) return; // we are the child
 
     const gpa = testing.allocator;
     const exe = try std.process.executablePathAlloc(std.testing.io, gpa);
@@ -1224,7 +1228,7 @@ test "the guard and the tag checks panic, as expected, in a child process (E1, E
     };
     const count = if (std.debug.runtime_safety) scenarios.len else scenarios.len - 1;
 
-    var map = std.process.Environ.Map.init(gpa);
+    var map = try std.testing.environ.createMap(gpa);
     defer map.deinit();
     for (scenarios[0..count]) |s| {
         try map.put("ZQJS_GUARD_CHILD", s.name);

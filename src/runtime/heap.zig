@@ -52,8 +52,9 @@ pub const per_allocation_overhead = 16;
 
 pub const Obj = struct {
     kind: Kind,
-    /// The list of every object (the sweep list).
-    next: ?*Obj,
+    /// The list of every object (the sweep list). Aligned to 8 so `Obj` stays at offset 0
+    /// of 8-byte-aligned heap types (`Object`, `Cell`, etc.) on 32-bit targets like `wasm32`.
+    next: ?*Obj align(8),
     /// Set during a collection's mark phase; cleared by the sweep (D8).
     marked: bool = false,
     /// On the `old` list: survived a collection (M8.1). Never cleared.

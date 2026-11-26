@@ -159,7 +159,7 @@ pub const Frame = struct {
 };
 
 comptime {
-    std.debug.assert(@sizeOf(Frame) == 64);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(Frame) == 64);
 }
 
 pub const Vm = struct {

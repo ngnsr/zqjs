@@ -42,7 +42,12 @@ pub fn main(init: std.process.Init) !u8 {
     // The runtime's allocator (M8.1 P2): smp_allocator in release builds, where libc
     // malloc's free was ~80% of a minor collection; safe builds keep the std default,
     // which checks for leaks. Embedders choose their own (Runtime.init takes one).
-    const gpa = if (std.debug.runtime_safety) init.gpa else std.heap.smp_allocator;
+    const gpa = if (@import("builtin").cpu.arch.isWasm())
+        std.heap.wasm_allocator
+    else if (std.debug.runtime_safety)
+        init.gpa
+    else
+        std.heap.smp_allocator;
 
     // Streaming, not positional, writers: with `> file 2>&1` both descriptors share one
     // file offset, and positional writers would each start at 0 and overwrite each other.

@@ -455,7 +455,7 @@ fn numberToString(rt: *Runtime, this: Value, args: []const Value) Error!Value {
                 const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
                 while (v > 0) {
                     idx -= 1;
-                    out_buf[idx] = digits[v % radix];
+                    out_buf[idx] = digits[@intCast(v % radix)];
                     v /= radix;
                 }
                 if (neg) {

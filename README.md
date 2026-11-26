@@ -159,11 +159,7 @@ int main(void) {
 }
 ```
 
-For a C11 multi-plugin cooperative host, see [examples/plugin_host.c](examples/plugin_host.c) (`zig build plugin-host`). For a Raylib game demo scripted in ZQJS (optional Raylib dependency; `zig build test` stays Raylib-free), see [examples/raylib_c_demo.c](examples/raylib_c_demo.c) or [zqjs-raylib](https://github.com/ngnsr/zqjs-raylib):
-```sh
-zig build raylib-smoke   # headless 60-frame + error-handling smoke test
-zig build raylib-demo    # interactive GUI window (requires Raylib)
-```
+For a C11 multi-plugin cooperative host, see [examples/plugin_host.c](examples/plugin_host.c) (`zig build plugin-host`). For a standalone C11 Raylib game demo with live `game.js` hot-reload and step-budget sandboxing, see [zqjs-raylib](https://github.com/ngnsr/zqjs-raylib).
 
 ---
 

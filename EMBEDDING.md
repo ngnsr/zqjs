@@ -276,12 +276,10 @@ zqjs_handle_release(rt, out_count);
 zqjs_handle_release(rt, state);
 ```
 
-#### Examples & Raylib C-ABI Demo (M11.4, M12.4)
+#### Examples & Standalone Raylib Demo
 - **[examples/c_embed.c](examples/c_embed.c):** minimal standalone C11 embedding example linking `zig-out/lib/libzqjs.a` and `zig-out/include/zqjs.h`.
-- **[examples/raylib_c_demo.c](examples/raylib_c_demo.c):** C11 Raylib host where JS owns `update(input)` / `draw()` / `state` via `initGame({ update, draw, state })` and C owns the frame loop, native drawing bindings, and error teardown.
-  - **Prerequisites:** Raylib installed (auto-detected at `/opt/homebrew/opt/raylib` on macOS, via `pkg-config` elsewhere, or with `-Draylib-prefix=<path>`). Default `zig build` and `zig build test` do not require Raylib.
-  - **Headless smoke test:** `zig build raylib-smoke` (runs `--frames 60 --verify-errors` without opening a GUI window).
-  - **Interactive GUI:** `zig build raylib-demo` (opens the 800x480 Raylib window).
+- **[examples/plugin_host.c](examples/plugin_host.c):** dependency-free C11 multi-plugin cooperative host (`zig build plugin-host`).
+- **[zqjs-raylib](https://github.com/ngnsr/zqjs-raylib):** standalone C11 + Raylib host where an external `game.js` owns gameplay/rendering with live hot-reload on file save and per-frame step/heap sandboxing.
 
 ### 12. ES Modules & Host Module Loader (`setModuleLoader`, `runModule`, C ABI 1.3.0, D72)
 - Register a host `ModuleLoader` via `rt.setModuleLoader(loader)` (or `zqjs_set_module_loader(rt, loader, ctx)` in C). The callback receives `(ctx, referrer_id, specifier)` and returns `{ canonical_id, source }` (or `error.ModuleNotFound` / `error.HostError`). The engine copies both strings immediately and invokes the optional `free` callback if provided.

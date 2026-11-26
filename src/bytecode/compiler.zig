@@ -129,6 +129,10 @@ const Shared = struct {
         for (c.s.res.functions[c.function].var_bindings) |vb| {
             const b = c.binding(vb);
             if (b.repl_index != null) continue;
+            if (b.global_name) |gname| {
+                try c.emit(.define_global_var, &.{try c.name(gname)});
+                continue;
+            }
             const sl = c.slotOf(vb);
             if (b.captured) {
                 try c.emit(.new_cell, &.{sl});
@@ -660,7 +664,7 @@ const Compiler = struct {
 
     /// The binding's scope is being entered: TDZ (a fresh cell if captured).
     fn enterBinding(c: *Compiler, b: u32) Error!void {
-        if (c.binding(b).repl_index != null) return;
+        if (c.binding(b).repl_index != null or c.binding(b).global_name != null) return;
         const sl = c.slotOf(b);
         c.clearSlotInit(sl);
         try c.emit(if (c.binding(b).captured) .new_cell else .clear_local, &.{sl});
@@ -670,6 +674,11 @@ const Compiler = struct {
     fn initBinding(c: *Compiler, b: u32) Error!void {
         if (c.binding(b).repl_index) |repl_idx| {
             try c.emit(.init_repl, &.{repl_idx});
+            return;
+        }
+        if (c.binding(b).global_name) |gname| {
+            try c.emit(.set_global, &.{try c.name(gname)});
+            try c.emit(.pop, &.{});
             return;
         }
         const sl = c.slotOf(b);

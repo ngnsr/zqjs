@@ -1079,5 +1079,5 @@ fn regexpSymMatchAll(rt: *Runtime, this: Value, args: []const Value) Error!Value
     const is_unicode = std.mem.indexOfScalar(u16, flags_s.units, 'u') != null or
         std.mem.indexOfScalar(u16, flags_s.units, 'v') != null;
     const r = try builtins.realm(rt);
-    return Value.fromObject(try rt.heap.newMatchAllIterator(r.iterator_prototype, matcher, s, is_global, is_unicode));
+    return Value.fromObject(try rt.heap.newMatchAllIterator(r.regexp_string_iterator_prototype, matcher, s, is_global, is_unicode));
 }

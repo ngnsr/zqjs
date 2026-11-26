@@ -600,6 +600,13 @@ const Machine = struct {
         m.rt.heap.storeEnv(m.envOf(b), m.res.bindings[b].index, v);
     }
 
+    fn storeBinding(m: *Machine, b: u32, v: Value) Error!void {
+        if (m.res.bindings[b].global_name) |gname| {
+            return builtins.setGlobal(m.rt, gname, v, m.isStrict());
+        }
+        m.store(b, v);
+    }
+
     fn pushScope(m: *Machine, scope: ?u32) Error!bool {
         const s = scope orelse return false;
         m.env = try m.rt.heap.newEnv(m.env, s, m.res.scopes[s].len);
@@ -608,7 +615,7 @@ const Machine = struct {
 
     fn patternScope(m: *const Machine, pat: *const ast.Pattern) ?u32 {
         switch (pat.data) {
-            .binding => |d| return if (m.res.bindings[d.binding].repl_index != null) null else m.res.bindings[d.binding].scope,
+            .binding => |d| return if (m.res.bindings[d.binding].repl_index != null or m.res.bindings[d.binding].global_name != null) null else m.res.bindings[d.binding].scope,
             .target => return null,
             .array => |arr| {
                 for (arr.elems) |maybe| if (maybe) |el| if (m.patternScope(el.pattern)) |s| return s;
@@ -628,7 +635,7 @@ const Machine = struct {
             .declaration => |decl| if (decl.kind != .@"var") for (decl.declarators) |d| {
                 if (m.patternScope(d.pattern)) |sc| return sc;
             },
-            .function => |f| if (m.res.bindings[f.name.?.binding].repl_index == null) return m.res.bindings[f.name.?.binding].scope,
+            .function => |f| if (m.res.bindings[f.name.?.binding].repl_index == null and m.res.bindings[f.name.?.binding].global_name == null) return m.res.bindings[f.name.?.binding].scope,
             .class => |c| if (m.res.bindings[c.name.?.binding].repl_index == null) return m.res.bindings[c.name.?.binding].scope,
             else => {},
         };
@@ -640,7 +647,11 @@ const Machine = struct {
         const sc = info.body_scope orelse m.scopeOf(stmts);
         _ = try m.pushScope(sc);
         for (info.var_bindings) |vb| {
-            if (m.res.bindings[vb].repl_index == null) m.store(vb, .undefined);
+            if (m.res.bindings[vb].global_name) |gname| {
+                try builtins.defineGlobalVar(m.rt, gname);
+            } else if (m.res.bindings[vb].repl_index == null) {
+                m.store(vb, .undefined);
+            }
         }
         try m.pushBody(stmts);
     }
@@ -683,7 +694,7 @@ const Machine = struct {
         if (!(m.is_module and m.current_func == null)) {
             for (stmts) |s| if (s.data == .function) {
                 const f = s.data.function;
-                m.store(f.name.?.binding, Value.fromClosure(try m.makeTreeClosure(f, m.env)));
+                try m.storeBinding(f.name.?.binding, Value.fromClosure(try m.makeTreeClosure(f, m.env)));
             };
         }
         if (stmts.len > 0) {
@@ -3076,7 +3087,7 @@ const Machine = struct {
                 }
                 for (stmts) |st| if (st.data == .function) {
                     const f = st.data.function;
-                    m.store(f.name.?.binding, Value.fromClosure(try m.makeTreeClosure(f, m.env)));
+                    try m.storeBinding(f.name.?.binding, Value.fromClosure(try m.makeTreeClosure(f, m.env)));
                 };
                 if (stmts.len > 0) {
                     if (stmts.len > 1) {
@@ -4019,7 +4030,7 @@ const Machine = struct {
     fn stepBindPattern(m: *Machine, pat: *const ast.Pattern, val: Value, mode: BindMode) Error!void {
         const rt = m.rt;
         switch (pat.data) {
-            .binding => |d| m.store(d.binding, val),
+            .binding => |d| try m.storeBinding(d.binding, val),
             .target => |t| switch (t) {
                 .ref => |ref| try m.write(ref, val),
                 .member => |mem| {

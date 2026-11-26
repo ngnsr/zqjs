@@ -380,6 +380,8 @@ pub const Op = enum(u8) {
     for_in_init,
     /// [iter] → [key, done]: advance `for...in` iterator; pushes `(undefined, true)` when done (D69).
     for_in_next,
+    /// [] → []: CreateGlobalVarBinding(name) on `globalThis` if not already an own property.
+    define_global_var,
 
     pub const Info = struct {
         operands: []const Operand,
@@ -513,6 +515,7 @@ pub const Op = enum(u8) {
             .throw => .{ .operands = &.{}, .pops = 1, .pushes = 0 },
             .get_import_meta => .{ .operands = &.{}, .pops = 0, .pushes = 1 },
             .dynamic_import => .{ .operands = &.{}, .pops = 1, .pushes = 1 },
+            .define_global_var => .{ .operands = &.{.name}, .pops = 0, .pushes = 0 },
         };
     }
 

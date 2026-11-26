@@ -98,42 +98,76 @@ pub fn resumeCoroutine(rt: *Runtime, co: *Coroutine, val: Value, rejected: bool)
     try finishStep(rt, co, outcome);
 }
 
-pub fn finishStep(rt: *Runtime, co: *Coroutine, outcome: Outcome) Error!void {
+pub fn finishStep(rt: *Runtime, co: *Coroutine, outcome0: Outcome) Error!void {
     const promise = co.promise orelse {
         co.state = .done;
         destroyEngine(rt, co);
         return rt.bug("an async step on a generator coroutine");
     };
-    switch (outcome) {
-        .returned => |v| {
-            co.state = .done;
-            destroyEngine(rt, co);
-            try builtins.resolvePromiseValue(rt, promise, v);
-        },
-        .threw => {
-            co.state = .done;
-            destroyEngine(rt, co);
-            const err_val = try rt.catchValue();
-            try builtins.settlePromiseFromJob(rt, promise, true, err_val);
-        },
-        .yielded => {
-            co.state = .done;
-            destroyEngine(rt, co);
-            return rt.bug("yield in an async function");
-        },
-        .awaiting => |v| try suspendAwait(rt, co, v),
+    var roots: CoroutineRoots = .{ .promise = promise, .coroutine = co };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+    var outcome = outcome0;
+    while (true) {
+        switch (outcome) {
+            .returned => |v| {
+                co.state = .done;
+                destroyEngine(rt, co);
+                try builtins.resolvePromiseValue(rt, promise, v);
+                return;
+            },
+            .threw => {
+                co.state = .done;
+                destroyEngine(rt, co);
+                const err_val = try rt.catchValue();
+                try builtins.settlePromiseFromJob(rt, promise, true, err_val);
+                return;
+            },
+            .yielded => {
+                co.state = .done;
+                destroyEngine(rt, co);
+                return rt.bug("yield in an async function");
+            },
+            .awaiting => |v| {
+                const awaited_p = builtins.resolveToPromise(rt, v) catch |e| {
+                    if (e == error.Thrown) {
+                        const err_val = try rt.catchValue();
+                        const eng = co.engine orelse {
+                            co.state = .done;
+                            destroyEngine(rt, co);
+                            return rt.bug("an awaiting coroutine without an engine");
+                        };
+                        co.state = .running;
+                        const resume_fn: ResumeFn = @ptrCast(@alignCast(co.vtable.@"resume"));
+                        outcome = resume_fn(eng, err_val, .throw) catch |re| {
+                            co.state = .done;
+                            destroyEngine(rt, co);
+                            return re;
+                        };
+                        continue;
+                    }
+                    co.state = .done;
+                    destroyEngine(rt, co);
+                    return e;
+                };
+                try suspendAwaitPromise(rt, co, awaited_p.asObject());
+                return;
+            },
+        }
     }
 }
 
-/// D56's `await` suspension: a reaction on the awaited promise resumes `co` from an
-/// `.await_resume` microtask. On a fault the coroutine is done.
-fn suspendAwait(rt: *Runtime, co: *Coroutine, v: Value) Error!void {
+/// D56's `await` suspension on an already-resolved promise: a reaction on `awaited_p`
+/// resumes `co` from an `.await_resume` microtask. On a fault the coroutine is done.
+fn suspendAwaitPromise(rt: *Runtime, co: *Coroutine, awaited_p: *heap.Object) Error!void {
     errdefer {
         co.state = .done;
         destroyEngine(rt, co);
     }
-    const awaited_p_val = try builtins.resolveToPromise(rt, v);
-    const awaited_p = awaited_p_val.asObject();
+    var root_buf = [_]Value{Value.fromObject(awaited_p)};
+    var val_roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try val_roots.register(rt);
+    defer val_roots.unregister(rt);
     try chargeSuspended(rt, co);
 
     const pr = &awaited_p.kind.promise;
@@ -308,8 +342,21 @@ fn resumeAsyncGenerator(rt: *Runtime, gen: *heap.Object, mode: ResumeMode, val: 
     g.state = .executing;
     if (mode == .@"return" and at_yield) {
         const co = g.co.?;
+        var root_buf = [_]Value{ Value.fromObject(gen), val };
+        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+        try roots.register(rt);
+        defer roots.unregister(rt);
         co.resume_return = true;
-        suspendAwait(rt, co, val) catch |e| {
+        const awaited_p = builtins.resolveToPromise(rt, val) catch |e| {
+            if (e == error.Thrown) {
+                co.resume_return = false;
+                const err_val = try rt.catchValue();
+                return runAsyncGenerator(rt, gen, .throw, err_val);
+            }
+            faultAsyncGenerator(rt, gen);
+            return e;
+        };
+        suspendAwaitPromise(rt, co, awaited_p.asObject()) catch |e| {
             faultAsyncGenerator(rt, gen);
             return e;
         };
@@ -324,6 +371,10 @@ fn runAsyncGenerator(rt: *Runtime, gen: *heap.Object, mode0: ResumeMode, val0: V
     const g = &gen.kind.generator;
     var mode = mode0;
     var val = val0;
+    var gen_root_buf = [_]Value{ Value.fromObject(gen), .undefined };
+    var gen_roots: rt_mod.ValueRoots = .{ .values = &gen_root_buf };
+    try gen_roots.register(rt);
+    defer gen_roots.unregister(rt);
     while (true) {
         const co = g.co orelse return rt.bug("an executing async generator without a coroutine");
         const eng = co.engine orelse return rt.bug("an executing async generator without an engine");
@@ -339,7 +390,19 @@ fn runAsyncGenerator(rt: *Runtime, gen: *heap.Object, mode0: ResumeMode, val0: V
         };
         switch (outcome) {
             .awaiting => |v| {
-                suspendAwait(rt, co, v) catch |e| {
+                gen_root_buf[1] = v;
+                const awaited_p = builtins.resolveToPromise(rt, v) catch |e| {
+                    if (e == error.Thrown) {
+                        mode = .throw;
+                        val = try rt.catchValue();
+                        gen_root_buf[1] = val;
+                        continue;
+                    }
+                    faultAsyncGenerator(rt, gen);
+                    return e;
+                };
+                gen_root_buf[1] = .undefined;
+                suspendAwaitPromise(rt, co, awaited_p.asObject()) catch |e| {
                     faultAsyncGenerator(rt, gen);
                     return e;
                 };
@@ -427,7 +490,13 @@ fn awaitReturn(rt: *Runtime, gen: *heap.Object) Error!void {
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
-    root_buf[1] = try builtins.resolveToPromise(rt, g.queue.items[0].value);
+    root_buf[1] = builtins.resolveToPromise(rt, g.queue.items[0].value) catch |e| {
+        if (e != error.Thrown) return e;
+        root_buf[1] = try rt.catchValue();
+        g.state = .completed;
+        try completeStep(rt, gen, root_buf[1], true, true);
+        return drainQueue(rt, gen);
+    };
     root_buf[2] = Value.fromClosure(try rt.heap.newNativeClosure(@ptrCast(&awaitReturnFulfilled), gen));
     root_buf[3] = Value.fromClosure(try rt.heap.newNativeClosure(@ptrCast(&awaitReturnRejected), gen));
     try builtins.performPromiseThen(rt, root_buf[1].asObject(), root_buf[2], root_buf[3]);

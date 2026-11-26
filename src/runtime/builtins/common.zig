@@ -192,6 +192,17 @@ pub fn printImpl(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return .undefined;
 }
 
+pub fn consoleAssertImpl(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    if (args.len > 0 and ops.toBoolean(args[0])) return .undefined;
+    if (args.len <= 1) {
+        try rt.out.writeAll("Assertion failed\n");
+        return .undefined;
+    }
+    try rt.out.writeAll("Assertion failed: ");
+    return printImpl(rt, .undefined, args[1..]);
+}
+
 pub fn arg(args: []const Value, i: usize) Value {
     return if (i < args.len) args[i] else .undefined;
 }

@@ -98,6 +98,7 @@ pub const builtin_globals: []const []const u8 = &.{
     "SyntaxError",
     "TypeError",
     "URIError",
+    "console",
     "isFinite",
     "isNaN",
     "parseFloat",
@@ -415,6 +416,7 @@ fn resolveRootValue(rt: *const Runtime, repl_lookup: ?ReplBindingLookup, name: [
     if (rt.realm) |r| {
         if (std.mem.eql(u8, name, "Math")) return Value.fromObject(r.math);
         if (std.mem.eql(u8, name, "JSON")) return Value.fromObject(r.json);
+        if (std.mem.eql(u8, name, "console")) return Value.fromObject(r.console);
         if (std.mem.eql(u8, name, "Object")) return Value.fromObject(r.object_namespace);
         if (std.mem.eql(u8, name, "Array")) return Value.fromObject(r.array_namespace);
         if (std.mem.eql(u8, name, "String")) return Value.fromObject(r.string_namespace);

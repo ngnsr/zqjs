@@ -56,8 +56,8 @@ ZQJS implements a clean, modern subset of ECMAScript with an explicit, testable 
 
 | Outcome | Guarantee |
 |---|---|
-| **`ok`** | Matches Node 22 stdout and uncaught exception *name* |
-| **`SyntaxError`** | Node 22 also rejects the program with a `SyntaxError` |
+| **`ok`** | Matches Node 26 stdout and uncaught exception *name* |
+| **`SyntaxError`** | Node 26 also rejects the program with a `SyntaxError` |
 | **`Unsupported(id)`** | Explicitly outside ZQJS (terminates immediately; uncatchable, never silently wrong) |
 | **`LimitExceeded(limit)`** | Configured resource limit hit (terminates immediately; uncatchable) |
 
@@ -72,7 +72,7 @@ See [LANGUAGE.md](LANGUAGE.md) for the complete specification and [TEST262.md](T
 ## Requirements
 
 - **Zig `0.17.1` exactly** (enforced by `build.zig`; see `DESIGN_DECISIONS.md` D17).
-- **Optional (dev/golden checks only):** Node `22.x` and Python 3 (stdlib only) for `zig build check-goldens`, `tools/bench_compare.py`, and `tools/test262.py`. Not required to build, embed, or run `zig build test`.
+- **Optional (dev/golden checks only):** Node `26.x` and Python 3 (stdlib only) for `zig build check-goldens`, `tools/bench_compare.py`, and `tools/test262.py`. Not required to build, embed, or run `zig build test`.
 
 ## Usage
 
@@ -96,7 +96,7 @@ zig-out/bin/zqjs --engine=treewalk program.js    # run on the reference interpre
 zig build test --summary all                     # defaults to ReleaseSafe
 zig build test -Dgc-stress -Dstack-stress --summary all
 zig build gc-mutants                             # deliberately broken GC builds must be caught
-zig build check-goldens                          # verify syntax/diff goldens against Node 22
+zig build check-goldens                          # verify syntax/diff goldens against Node 26
 zig build test --fuzz=100K -Dtest-filter="fuzz: frontend"
 
 # Benchmarks
@@ -178,3 +178,9 @@ zig build raylib-demo    # interactive GUI window (requires Raylib)
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — architectural decision log (D1–D89)
 - [ROADMAP.md](ROADMAP.md) — milestone history (M1–M59) and remaining work
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — licenses of ported code (musl/Arm `pow`)
+
+---
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). Third-party attributions (including the MIT-licensed musl/Arm `pow` port) are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

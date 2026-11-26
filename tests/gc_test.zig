@@ -2861,3 +2861,92 @@ test "slab pools: Object, Closure, and Cell recycle freelists, preserve accounti
     try testing.expectEqual(expected_bytes, h.bytes);
     try h.verify();
 }
+
+test "wave3: Vm.proto_promoted skips minor proto walks while major GC keeps nested constants/atoms and modules live" {
+    var out_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var rt = zqjs.Runtime.init(testing.allocator, .{ .nursery_bytes = 4096 }, &out);
+    defer rt.deinit();
+
+    // 1. VM script with nested closures, string constants, and unique property atoms across
+    //    repeated minor GCs followed by explicit major GCs.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\function makeNested(tag) {
+        \\  const prefix = 'nested_const_alpha_';
+        \\  return function inner(n) {
+        \\    const o = { wave3PropKeyA: prefix + tag, wave3PropKeyB: n };
+        \\    return o.wave3PropKeyA + ':' + o.wave3PropKeyB;
+        \\  };
+        \\}
+        \\const fn1 = makeNested('ok');
+        \\let last = '';
+        \\for (let i = 0; i < 400; i++) {
+        \\  const tmp = { junk: 'churn_' + i, arr: [i, i + 1, i + 2] };
+        \\  if (tmp.arr[0] === 399) last = fn1(i);
+        \\}
+        \\print(last);
+    ;
+    var diag: zqjs.Diagnostic = .{};
+    const script = try zqjs.parse(arena.allocator(), src, .{}, &diag);
+    const res = try zqjs.resolve(arena.allocator(), script, &diag);
+    var proto = try zqjs.compile(testing.allocator, &rt.heap, script, res, .{}, &diag);
+    defer proto.deinit(testing.allocator);
+    var vf: zqjs.verify.Failure = .{};
+    _ = try zqjs.verify.verify(testing.allocator, &proto, .{}, &vf);
+
+    var vm = try zqjs.Vm.init(&rt, &proto);
+    defer vm.deinit();
+    rt.engine_roots = vm.roots();
+
+    // Force a minor GC before execution completes: proto_promoted must flip true.
+    try testing.expect(!vm.proto_promoted);
+    rt.collect();
+    try testing.expect(vm.proto_promoted);
+    try rt.heap.verifyCollected();
+
+    // Force a major GC while proto_promoted is true: constants/atoms must NOT be swept.
+    rt.heap.major_requested = true;
+    rt.collect();
+    try testing.expect(vm.proto_promoted);
+    try rt.heap.verifyCollected();
+
+    // Run to completion (triggers multiple minor GCs with proto_promoted == true),
+    // then run another major GC and verify output + heap integrity.
+    try vm.run();
+    try testing.expect(rt.heap.stats.minor > 0);
+    rt.heap.major_requested = true;
+    rt.collect();
+    try rt.heap.verifyCollected();
+    try testing.expectEqualStrings("nested_const_alpha_ok:399\n", out.buffered());
+
+    // 2. ModuleRecord.proto_promoted: compile + evaluate an ES module, trigger minor + major GCs,
+    //    and verify module exports & nested closure constants remain live.
+    const mod_src =
+        \\export function greet(x) {
+        \\  const label = 'mod_const_beta_';
+        \\  return ({ modAtomKey: label + x }).modAtomKey;
+        \\}
+        \\let acc = '';
+        \\for (let i = 0; i < 200; i++) {
+        \\  const g = { a: 'm_' + i };
+        \\  if (i === 199) acc = greet(g.a);
+        \\}
+        \\export const result = acc;
+    ;
+    var mod_diag: zqjs.module.ModuleDiag = .{};
+    const mod = try zqjs.module.loadAndLink(&rt, "entry.js", mod_src, .vm, &mod_diag);
+    _ = try zqjs.module.evaluateModule(&rt, mod, .vm);
+    try rt.drainMicrotasks();
+
+    // Minor GC promotes module proto, then major GC + minor GC must keep it intact.
+    rt.collect();
+    try testing.expect(mod.proto_promoted);
+    rt.heap.major_requested = true;
+    rt.collect();
+    rt.collect();
+    try rt.heap.verifyCollected();
+    const res_cell = mod.local_exports.get("result").?;
+    try testing.expectEqualSlices(u16, utf16("mod_const_beta_m_199"), res_cell.value.?.asString().units);
+}

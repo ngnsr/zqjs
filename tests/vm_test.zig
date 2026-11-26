@@ -1837,3 +1837,123 @@ test "local-const / local-local arithmetic superinstructions, TDZ in switch/if/t
         out.buffered(),
     );
 }
+
+test "wave3: 4-way polymorphic get/set IC, 3-hop prototype IC, RegExp prototype IC, and non-number strict_eq/strict_ne" {
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const rt = try api.Runtime.create(testing.allocator, .{ .output = &out });
+    defer rt.destroy();
+
+    const src =
+        \\// 1. Polymorphic 4+ shape get and set IC (including ADD-transition and own-slot updates)
+        \\function readX(o) { return o.x; }
+        \\function writeX(o, v) { o.x = v; }
+        \\const shapes = [
+        \\  { x: 1 },
+        \\  { a: 0, x: 2 },
+        \\  { b: 0, c: 0, x: 3 },
+        \\  { d: 0, e: 0, f: 0, x: 4 },
+        \\  { g: 0, h: 0, i: 0, j: 0, x: 5 },
+        \\];
+        \\let polySum = 0;
+        \\for (let round = 0; round < 4; round++) {
+        \\  for (let i = 0; i < shapes.length; i++) {
+        \\    polySum += readX(shapes[i]);
+        \\    writeX(shapes[i], readX(shapes[i]) + 1);
+        \\  }
+        \\}
+        \\print(polySum, shapes.map(s => s.x).join(','));
+        \\
+        \\// 2. 3-hop prototype chain IC (shaped, dict, negative hit, and mid-chain mutation invalidation)
+        \\const rootProto = { rootVal: 100, rootFn() { return this.id + 1000; } };
+        \\const baseProto = Object.create(rootProto);
+        \\baseProto.baseVal = 20;
+        \\const subProto = Object.create(baseProto);
+        \\subProto.subVal = 3;
+        \\const inst = Object.create(subProto);
+        \\inst.id = 7;
+        \\function getRoot(o) { return o.rootVal; }
+        \\function callRoot(o) { return o.rootFn(); }
+        \\function getMissing(o) { return o.notAnywhere; }
+        \\let rSum = 0;
+        \\for (let i = 0; i < 4; i++) rSum += getRoot(inst) + callRoot(inst) + (getMissing(inst) === undefined ? 1 : 0);
+        \\// Shadow on middle hop must invalidate 3-hop IC immediately.
+        \\baseProto.rootVal = 55;
+        \\const afterShadow = getRoot(inst);
+        \\// Transition rootProto to dict (via accessor) and verify 3-hop dict IC works.
+        \\Object.defineProperty(rootProto, 'acc', { get() { return 1; }, configurable: true });
+        \\rootProto.dictRoot = 88;
+        \\function getDictRoot(o) { return o.dictRoot; }
+        \\const dr = getDictRoot(inst) + getDictRoot(inst);
+        \\print(rSum, afterShadow, dr);
+        \\
+        \\// 3. RegExp.prototype.test / exec IC + lastIndex bailout + shadowing + prototype change
+        \\const re = /ab/g;
+        \\let hits = 0;
+        \\for (let i = 0; i < 3; i++) {
+        \\  if (re.test('ab ab')) hits++;
+        \\}
+        \\const liAfter = re.lastIndex;
+        \\re.lastIndex = 0;
+        \\const m = re.exec('zzab');
+        \\const liExec = re.lastIndex;
+        \\const re2 = /xy/;
+        \\let t1 = re2.test('xy');
+        \\re2.test = () => 'shadowed';
+        \\let t2 = re2.test('xy');
+        \\const re3 = /pq/;
+        \\let t3 = re3.test('pq');
+        \\Object.setPrototypeOf(re3, { test() { return 'reproto'; } });
+        \\let t4 = re3.test('pq');
+        \\print(hits, liAfter, m ? m[0] : 'null', liExec, t1, t2, t3, t4);
+        \\
+        \\// 4. Inline non-number strict_eq / strict_ne across expressions, branches, and local-const jif
+        \\const sA = 'hello' + '_world';
+        \\const sB = 'hello_' + 'world';
+        \\const sC = 'other';
+        \\const sym1 = Symbol('k');
+        \\const sym2 = Symbol('k');
+        \\const symF1 = Symbol.for('shared');
+        \\const symF2 = Symbol.for('shared');
+        \\const bi1 = 123456789012345678901234567890n;
+        \\const bi2 = 123456789012345678901234567890n + 0n;
+        \\const bi3 = bi1 + 1n;
+        \\const o1 = {};
+        \\const o2 = {};
+        \\const eqChecks = [
+        \\  sA === sB, sA !== sB, sA === sC, sA !== sC,
+        \\  bi1 === bi2, bi1 !== bi2, bi1 === bi3, bi1 === 1,
+        \\  sym1 === sym1, sym1 === sym2, symF1 === symF2,
+        \\  NaN === NaN, NaN !== NaN, -0 === 0, -0 !== 0,
+        \\  null === null, null === undefined, undefined === undefined,
+        \\  true === true, true === false, o1 === o1, o1 === o2,
+        \\];
+        \\let branchMask = 0;
+        \\if (sA === sB) branchMask |= 1;
+        \\if (sA !== sC) branchMask |= 2;
+        \\if (bi1 === bi2) branchMask |= 4;
+        \\if (bi1 !== bi3) branchMask |= 8;
+        \\if (sym1 !== sym2) branchMask |= 16;
+        \\if (NaN !== NaN) branchMask |= 32;
+        \\if (-0 === 0) branchMask |= 64;
+        \\// local_const_jif with non-number local compared against numeric literal
+        \\let lcHits = 0;
+        \\const mixed = [0, -0, NaN, '0', 0n, null, undefined, false, o1];
+        \\for (let i = 0; i < mixed.length; i++) {
+        \\  const v = mixed[i];
+        \\  if (v === 0) lcHits += 1;
+        \\  if (v !== 0) lcHits += 10;
+        \\}
+        \\print(eqChecks.map(b => b ? '1' : '0').join(''), branchMask, lcHits);
+    ;
+    const prog = try rt.compile("wave3_ic_strict_eq.js", src, null);
+    defer prog.destroy();
+    try rt.run(prog, null);
+    try testing.expectEqualStrings(
+        "90 5,6,7,8,9\n" ++
+            "4432 55 176\n" ++
+            "2 0 ab 4 true shadowed true reproto\n" ++
+            "1001100010101101011010 127 72\n",
+        out.buffered(),
+    );
+}

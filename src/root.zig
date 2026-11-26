@@ -44,6 +44,11 @@ pub const repl = struct {
     pub const editor = @import("repl/editor.zig");
     pub const Session = session.Session;
 };
+pub const debug = struct {
+    pub const debugger = @import("debug/debugger.zig");
+    pub const inspector = @import("debug/inspector.zig");
+    pub const Debugger = debugger.Debugger;
+};
 
 // Small unit tests live next to the code they test (`test` blocks in each file);
 // integration, golden and fuzz tests live in tests/ (one test binary per file, build.zig).
@@ -62,4 +67,6 @@ test {
     _ = @import("bytecode/bytecode.zig");
     _ = @import("bytecode/verify.zig");
     _ = @import("interp/machine.zig");
+    _ = @import("debug/inspector.zig");
+    _ = @import("debug/debugger.zig");
 }

@@ -132,6 +132,17 @@ pub fn build(b: *std.Build) void {
         b.step(entry.step, b.fmt("Run only {s}", .{entry.file})).dependOn(&single.step);
     }
 
+    // M11 Bytecode Inspector & Debugger tests (single-binary step, also wired into `zig build test`).
+    const debug_tests = b.addRunArtifact(b.addTest(.{ .name = "debug_test", .filters = filters, .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/debug_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    }) }));
+    debug_tests.setCwd(b.path("."));
+    test_step.dependOn(&debug_tests.step);
+    b.step("test-debug", "Run M11 bytecode inspector and debugger tests").dependOn(&debug_tests.step);
+
     // The embedding API's tests see only `zqjs`, as an embedder does: an import of
     // `zqjs_internal` there fails to build.
     const api_tests = b.addRunArtifact(b.addTest(.{ .name = "api_test", .filters = filters, .root_module = b.createModule(.{

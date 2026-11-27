@@ -180,20 +180,23 @@ pub const ExecContext = struct {
 };
 
 pub const PropIc = struct {
-    shape_id: u32 = heap_mod.DICT_SHAPE_ID,
+    shape_id: u32 = 0,
     proto_shape_id: u32 = 0,
     /// For `kind == 4` (shaped ADD transition): expected shape id of `o.proto.proto` (e.g. `Object.prototype`).
     grandproto_shape_id: u32 = 0,
+    /// For 3-hop prototype reads (`kind == 15/16`) and 3-hop negative hits (`kind == 9`).
+    greatgrandproto_shape_id: u32 = 0,
     atom_addr: usize = 0,
     slot: u16 = 0,
     /// 0 = empty, 1 = own shaped read, 2 = 1-hop proto shaped read,
     /// 3 = own shaped writable write, 4 = own shaped inline ADD transition,
     /// 5 = 1-hop proto dict read, 6 = own dict read,
     /// 7 = 2-hop grandproto shaped read, 8 = 2-hop grandproto dict read,
-    /// 9 = negative (missing property -> undefined) up to 2 proto hops,
+    /// 9 = negative (missing property -> undefined) up to 3 proto hops,
     /// 10 = String.prototype shaped read, 11 = String.prototype dict read,
     /// 12 = builtin global target (validated against global_object version),
-    /// 13 = global_object own shaped data read, 14 = global_object own dict data read.
+    /// 13 = global_object own shaped data read, 14 = global_object own dict data read,
+    /// 15 = 3-hop greatgrandproto shaped read, 16 = 3-hop greatgrandproto dict read.
     kind: u8 = 0,
 };
 
@@ -281,11 +284,20 @@ pub const Runtime = struct {
     /// Step budget counter and limit kept adjacent (same cache line, away from heap buffer page offsets).
     steps: u64 = 0,
     max_steps: u64,
-    /// Direct-mapped monomorphic property inline cache (M52/M58, D82/D88): placed at the end
-    /// so `heap`, `steps`, and `max_steps` stay within small immediate offsets of `*Runtime`.
-    prop_ic: [1024][2]PropIc = @splat(@splat(.{})),
+    /// 4-way polymorphic property inline cache (M52/M58, D82/D88): lazily heap-allocated
+    /// on first IC population so `Runtime` stays small on stack-constrained host threads
+    /// while `heap`, `steps`, and `max_steps` stay within small immediate offsets of `*Runtime`.
+    prop_ic: ?*[2048][4]PropIc = null,
 
     pub const default_random_seed: u64 = 0x9e3779b97f4a7c15;
+
+    pub fn ensurePropIc(rt: *Runtime) error{OutOfMemory}!void {
+        if (rt.prop_ic == null) {
+            const t = try rt.gpa.create([2048][4]PropIc);
+            @memset(std.mem.asBytes(t), 0);
+            rt.prop_ic = t;
+        }
+    }
 
     pub fn isNativePropDeleted(rt: *const Runtime, n: *const Native, is_length: bool) bool {
         if (rt.deleted_native_props.count() == 0) return false;
@@ -345,6 +357,7 @@ pub const Runtime = struct {
         rt.global_symbols.deinit(rt.gpa);
         rt.deleted_native_props.deinit(rt.gpa);
         rt.microtasks.deinit(rt.gpa);
+        if (rt.prop_ic) |ic| rt.gpa.destroy(ic);
         rt.modules.deinit(rt.gpa);
         rt.heap.deinit();
         rt.* = undefined;

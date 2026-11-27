@@ -184,6 +184,7 @@ pub const ModuleRegistry = struct {
 pub const PreloadPool = struct {
     protos: std.ArrayList(*Proto) = .empty,
     cell_slices: std.ArrayList([]*heap.Cell) = .empty,
+    promoted_count: usize = 0,
 
     pub fn deinit(self: *PreloadPool, gpa: Allocator) void {
         for (self.protos.items) |p| {
@@ -196,8 +197,10 @@ pub const PreloadPool = struct {
     }
 
     pub fn markRoots(ctx: *anyopaque, h: *heap.Heap) void {
-        const self: *const PreloadPool = @ptrCast(@alignCast(ctx));
-        for (self.protos.items) |p| ModuleRegistry.markProto(p, h);
+        const self: *PreloadPool = @ptrCast(@alignCast(ctx));
+        const start: usize = if (h.in_minor) self.promoted_count else 0;
+        for (self.protos.items[start..]) |p| ModuleRegistry.markProto(p, h);
+        self.promoted_count = self.protos.items.len;
         for (self.cell_slices.items) |cs| {
             for (cs) |cell| h.markObj(&cell.obj);
         }

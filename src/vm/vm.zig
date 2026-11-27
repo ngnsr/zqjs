@@ -202,6 +202,9 @@ pub const Vm = struct {
     base_chain_depth: u32 = 0,
     /// Maximum `frames.items.len` allowed for this VM (`max_call_depth -| base_chain_depth`).
     frame_limit: u32 = 0,
+    /// Set once `frames[0].proto`'s immutable constants and atoms have been traced and
+    /// promoted to the old generation, so subsequent minor GCs can skip walking it.
+    proto_promoted: bool = false,
 
     inline fn enterDepthScope(vm: *Vm) void {
         if (vm.chain) |cx| {
@@ -225,6 +228,12 @@ pub const Vm = struct {
     /// closures). Allocates with `rt.gpa`; on failure nothing is left allocated.
     pub fn init(rt: *Runtime, script: *const Proto) Error!Vm {
         if (@as(u64, script.slot_count) + script.max_stack > rt.limits.max_stack_slots) return rt.limit(.stack_slots);
+        const created_ic = rt.prop_ic == null;
+        try rt.ensurePropIc();
+        errdefer if (created_ic) {
+            rt.gpa.destroy(rt.prop_ic.?);
+            rt.prop_ic = null;
+        };
         var vm: Vm = .{ .rt = rt, .frame_limit = rt.limits.max_call_depth };
         errdefer vm.deinit();
         try vm.reserve(script);
@@ -272,6 +281,12 @@ pub const Vm = struct {
         const effective_this: ?Value = if (callee.is_arrow) (if (c.meta) |m| m.lexical_this else null) else if (is_construct) this else try builtins.coerceThis(rt, this, callee.is_strict);
         const argc: u32 = @intCast(args.len);
         if (@as(u64, argc) + callee.slot_count + callee.max_stack > rt.limits.max_stack_slots) return rt.limit(.stack_slots);
+        const created_ic = rt.prop_ic == null;
+        try rt.ensurePropIc();
+        errdefer if (created_ic) {
+            rt.gpa.destroy(rt.prop_ic.?);
+            rt.prop_ic = null;
+        };
         var vm: Vm = .{ .rt = rt, .nested = true, .frame_limit = rt.limits.max_call_depth };
         errdefer vm.deinit();
         try vm.reserveWithExtra(callee, argc);
@@ -790,14 +805,17 @@ pub const Vm = struct {
     }
 
     fn markRoots(ctx: *anyopaque, h: *heap.Heap) void {
-        const vm: *const Vm = @ptrCast(@alignCast(ctx));
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
         const mark_obj = struct {
             fn call(hh: *heap.Heap, o: *heap.Obj) void {
                 hh.markObj(o);
             }
         }.call;
         visitRoots(vm, h, mark_obj);
-        markProto(h, vm.frames.items[0].proto);
+        if (!h.in_minor or !vm.proto_promoted) {
+            markProto(h, vm.frames.items[0].proto);
+            vm.proto_promoted = true;
+        }
     }
 
     /// The VM's own live state, shared by `markRoots` and a suspended coroutine's trace.
@@ -1467,7 +1485,14 @@ pub const Vm = struct {
                 };
                 try cache.push(vm, r);
             },
-            .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .strict_eq, .strict_ne, .in, .instanceof => {
+            .strict_eq, .strict_ne => {
+                const lhs = try cache.peek(vm, 1);
+                const rhs = try cache.peek(vm, 0);
+                const eq = fastStrictEq(lhs, rhs);
+                cache.sp -= 1;
+                vm.stack[cache.sp - 1] = Value.fromBool(if (op == .strict_eq) eq else !eq);
+            },
+            .add, .sub, .mul, .div, .mod, .pow, .shl, .shr, .ushr, .bit_and, .bit_xor, .bit_or, .lt, .le, .gt, .ge, .in, .instanceof => {
                 // M10.2b/M10.2c: fast path when both operands are already `.number` (`f64`),
                 // matching IEEE-754 / JS semantics for NaN, infinities, and -0. All mixed or
                 // out-of-domain cases fall back to `ops.binary`.
@@ -1489,8 +1514,6 @@ pub const Vm = struct {
                     .le => Value.fromBool(lhs.asNumber() <= rhs.asNumber()),
                     .gt => Value.fromBool(lhs.asNumber() > rhs.asNumber()),
                     .ge => Value.fromBool(lhs.asNumber() >= rhs.asNumber()),
-                    .strict_eq => Value.fromBool(lhs.asNumber() == rhs.asNumber()),
-                    .strict_ne => Value.fromBool(lhs.asNumber() != rhs.asNumber()),
                     .pow, .in, .instanceof => blk: {
                         cache.syncSp(vm);
                         break :blk try slowBinary(rt, op, lhs, rhs);
@@ -1552,7 +1575,15 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
                 if (truthy == (op == .jump_if_true)) next = try cache.target(vm);
             },
-            .lt_jump_if_false, .le_jump_if_false, .gt_jump_if_false, .ge_jump_if_false, .strict_eq_jump_if_false, .strict_ne_jump_if_false => {
+            .strict_eq_jump_if_false, .strict_ne_jump_if_false => {
+                const lhs = try cache.peek(vm, 1);
+                const rhs = try cache.peek(vm, 0);
+                const eq = fastStrictEq(lhs, rhs);
+                const cond = if (op == .strict_eq_jump_if_false) eq else !eq;
+                cache.sp -= 2;
+                if (!cond) next = try cache.target(vm);
+            },
+            .lt_jump_if_false, .le_jump_if_false, .gt_jump_if_false, .ge_jump_if_false => {
                 const lhs = try cache.peek(vm, 1);
                 const rhs = try cache.peek(vm, 0);
                 const cond: bool = if (lhs.isNumber() and rhs.isNumber()) switch (op) {
@@ -1560,8 +1591,6 @@ pub const Vm = struct {
                     .le_jump_if_false => lhs.asNumber() <= rhs.asNumber(),
                     .gt_jump_if_false => lhs.asNumber() > rhs.asNumber(),
                     .ge_jump_if_false => lhs.asNumber() >= rhs.asNumber(),
-                    .strict_eq_jump_if_false => lhs.asNumber() == rhs.asNumber(),
-                    .strict_ne_jump_if_false => lhs.asNumber() != rhs.asNumber(),
                     else => unreachable,
                 } else blk: {
                     cache.syncSp(vm);
@@ -1570,8 +1599,6 @@ pub const Vm = struct {
                         .le_jump_if_false => .le,
                         .gt_jump_if_false => .gt,
                         .ge_jump_if_false => .ge,
-                        .strict_eq_jump_if_false => .strict_eq,
-                        .strict_ne_jump_if_false => .strict_ne,
                         else => unreachable,
                     };
                     const bv = try ops.binary(rt, bop, lhs, rhs);
@@ -1580,7 +1607,15 @@ pub const Vm = struct {
                 cache.sp -= 2;
                 if (!cond) next = try cache.target(vm);
             },
-            .lt_local_const_jif, .le_local_const_jif, .strict_eq_local_const_jif, .strict_ne_local_const_jif => {
+            .strict_eq_local_const_jif, .strict_ne_local_const_jif => {
+                const s = (try cache.valueSlot(vm, cache.operand(1))) orelse return vm.bug("uninit local in local_const_jif");
+                const k = cache.operand(2);
+                if (k >= p.consts.len) return vm.bug("constant index out of range");
+                const eq = fastStrictEq(s.asValue(), p.consts[k]);
+                const cond = if (op == .strict_eq_local_const_jif) eq else !eq;
+                if (!cond) next = try cache.target(vm);
+            },
+            .lt_local_const_jif, .le_local_const_jif => {
                 const s = (try cache.valueSlot(vm, cache.operand(1))) orelse return vm.bug("uninit local in local_const_jif");
                 const k = cache.operand(2);
                 if (k >= p.consts.len) return vm.bug("constant index out of range");
@@ -1589,16 +1624,12 @@ pub const Vm = struct {
                 const cond: bool = if (lhs.isNumber() and rhs.isNumber()) switch (op) {
                     .lt_local_const_jif => lhs.asNumber() < rhs.asNumber(),
                     .le_local_const_jif => lhs.asNumber() <= rhs.asNumber(),
-                    .strict_eq_local_const_jif => lhs.asNumber() == rhs.asNumber(),
-                    .strict_ne_local_const_jif => lhs.asNumber() != rhs.asNumber(),
                     else => unreachable,
                 } else blk: {
                     cache.syncSp(vm);
                     const bop: BinaryOp = switch (op) {
                         .lt_local_const_jif => .lt,
                         .le_local_const_jif => .le,
-                        .strict_eq_local_const_jif => .strict_eq,
-                        .strict_ne_local_const_jif => .strict_ne,
                         else => unreachable,
                     };
                     const bv = try ops.binary(rt, bop, lhs, rhs);
@@ -3148,17 +3179,40 @@ fn fastArraySet(rt: *Runtime, base: Value, idx: Value, val: Value) bool {
     return true;
 }
 
-inline fn propIcBucket(rt: *Runtime, p: *const Proto, pc: u32) *[2]rt_mod.PropIc {
+inline fn fastStrictEq(lhs: Value, rhs: Value) bool {
+    if (lhs.isNumber() and rhs.isNumber()) return lhs.asNumber() == rhs.asNumber();
+    if (lhs.bits == rhs.bits) return !lhs.isNumber();
+    return fastStrictEqSlow(lhs, rhs);
+}
+
+noinline fn fastStrictEqSlow(lhs: Value, rhs: Value) bool {
+    if (lhs.isString() and rhs.isString()) return std.mem.eql(u16, lhs.asString().units, rhs.asString().units);
+    if (lhs.isBigInt() and rhs.isBigInt()) return bigint.cmp(lhs.asBigInt(), rhs.asBigInt()) == .eq;
+    return false;
+}
+
+inline fn propIcBucket(rt: *Runtime, p: *const Proto, pc: u32) *[4]rt_mod.PropIc {
     const h = (@intFromPtr(p) >> 4) ^ (@as(usize, pc) *% 2654435761);
-    return &rt.prop_ic[(h ^ (h >> 11)) & (rt.prop_ic.len - 1)];
+    const table = rt.prop_ic.?;
+    return &table[(h ^ (h >> 11)) & (table.len - 1)];
 }
 
 inline fn insertPropIc(rt: *Runtime, p: *const Proto, pc: u32, entry: rt_mod.PropIc) void {
     const b = propIcBucket(rt, p, pc);
-    if (b[0].atom_addr == entry.atom_addr and b[0].shape_id == entry.shape_id and b[0].kind == entry.kind) {
-        b[0] = entry;
-        return;
+    inline for (0..4) |i| {
+        if (b[i].atom_addr == entry.atom_addr and
+            b[i].shape_id == entry.shape_id and
+            b[i].kind == entry.kind and
+            b[i].proto_shape_id == entry.proto_shape_id and
+            b[i].grandproto_shape_id == entry.grandproto_shape_id and
+            b[i].greatgrandproto_shape_id == entry.greatgrandproto_shape_id)
+        {
+            b[i] = entry;
+            return;
+        }
     }
+    b[3] = b[2];
+    b[2] = b[1];
     b[1] = b[0];
     b[0] = entry;
 }
@@ -3166,28 +3220,32 @@ inline fn insertPropIc(rt: *Runtime, p: *const Proto, pc: u32, entry: rt_mod.Pro
 fn fastGetGlobal(rt: *Runtime, p: *const Proto, pc: u32, atom: *heap.String) ?Value {
     const r = builtins.realmIfInit(rt) orelse return null;
     const b = propIcBucket(rt, p, pc);
-    const ic = b[0];
-    if (ic.atom_addr != @intFromPtr(atom)) return null;
-    switch (ic.kind) {
-        13 => {
-            const go = r.global_object;
-            if (go.props == .shaped and go.props.shapeId() == ic.shape_id) {
-                go.obj.checkLive();
-                const v = go.props.getShapedSlot(ic.slot);
-                heap.checkValue(v);
-                return v;
+    const atom_addr = @intFromPtr(atom);
+    inline for (0..4) |i| {
+        const ic = b[i];
+        if (ic.atom_addr == atom_addr) {
+            switch (ic.kind) {
+                13 => {
+                    const go = r.global_object;
+                    if (go.props == .shaped and go.props.shapeId() == ic.shape_id) {
+                        go.obj.checkLive();
+                        const v = go.props.getShapedSlot(ic.slot);
+                        heap.checkValue(v);
+                        return v;
+                    }
+                },
+                14 => {
+                    const go = r.global_object;
+                    if (go.props == .dict and go.dict_version == ic.shape_id) {
+                        go.obj.checkLive();
+                        const v = go.props.dict.values()[ic.slot].value;
+                        heap.checkValue(v);
+                        return v;
+                    }
+                },
+                else => {},
             }
-        },
-        14 => {
-            const go = r.global_object;
-            if (go.props == .dict and go.dict_version == ic.shape_id) {
-                go.obj.checkLive();
-                const v = go.props.dict.values()[ic.slot].value;
-                heap.checkValue(v);
-                return v;
-            }
-        },
-        else => {},
+        }
     }
     return null;
 }
@@ -3229,6 +3287,12 @@ noinline fn populateGetGlobalIc(rt: *Runtime, p: *const Proto, pc: u32, atom: *h
 inline fn isLengthAtom(atom: *const heap.String) bool {
     const u = atom.units;
     return u.len == 6 and u[0] == 'l' and u[1] == 'e' and u[2] == 'n' and u[3] == 'g' and u[4] == 't' and u[5] == 'h';
+}
+
+inline fn isLastIndexAtom(atom: *const heap.String) bool {
+    const u = atom.units;
+    return u.len == 9 and u[0] == 'l' and u[1] == 'a' and u[2] == 's' and u[3] == 't' and
+        u[4] == 'I' and u[5] == 'n' and u[6] == 'd' and u[7] == 'e' and u[8] == 'x';
 }
 
 inline fn objVersion(o: *const heap.Object) u32 {
@@ -3297,6 +3361,34 @@ inline fn matchGetPropIc(o: *const heap.Object, atom_addr: usize, sid: u32, ic: 
                 }
             }
         },
+        15, 16 => {
+            if (o.proto) |proto| {
+                if (proto.kind == .ordinary and objVersion(proto) == ic.proto_shape_id) {
+                    proto.obj.checkLive();
+                    if (proto.proto) |gp| {
+                        if (gp.kind == .ordinary and objVersion(gp) == ic.grandproto_shape_id) {
+                            gp.obj.checkLive();
+                            if (gp.proto) |ggp| {
+                                if (ggp.kind == .ordinary) {
+                                    ggp.obj.checkLive();
+                                    if (ic.kind == 15) {
+                                        if (ggp.props.shapeId() == ic.greatgrandproto_shape_id) {
+                                            const v = ggp.props.getShapedSlot(ic.slot);
+                                            heap.checkValue(v);
+                                            return v;
+                                        }
+                                    } else if (ggp.props == .dict and ggp.dict_version == ic.greatgrandproto_shape_id) {
+                                        const v = ggp.props.dict.values()[ic.slot].value;
+                                        heap.checkValue(v);
+                                        return v;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
         9 => {
             if (ic.proto_shape_id == 0) {
                 if (o.proto == null) return .undefined;
@@ -3306,15 +3398,29 @@ inline fn matchGetPropIc(o: *const heap.Object, atom_addr: usize, sid: u32, ic: 
                     if (ic.grandproto_shape_id == 0) {
                         if (proto.proto == null) return .undefined;
                     } else if (proto.proto) |gp| {
-                        if (gp.kind == .ordinary and objVersion(gp) == ic.grandproto_shape_id and gp.proto == null) {
+                        if (gp.kind == .ordinary and objVersion(gp) == ic.grandproto_shape_id) {
                             gp.obj.checkLive();
-                            return .undefined;
+                            if (ic.greatgrandproto_shape_id == 0) {
+                                if (gp.proto == null) return .undefined;
+                            } else if (gp.proto) |ggp| {
+                                if (ggp.kind == .ordinary and objVersion(ggp) == ic.greatgrandproto_shape_id and ggp.proto == null) {
+                                    ggp.obj.checkLive();
+                                    return .undefined;
+                                }
+                            }
                         }
                     }
                 }
             }
         },
         else => {},
+    }
+    return null;
+}
+
+noinline fn fastGetPropPoly(o: *const heap.Object, atom_addr: usize, sid: u32, b: *const [4]rt_mod.PropIc) ?Value {
+    for (b[1..]) |ic| {
+        if (matchGetPropIc(o, atom_addr, sid, ic)) |v| return v;
     }
     return null;
 }
@@ -3330,8 +3436,7 @@ fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
             const r = builtins.realmIfInit(rt) orelse return null;
             const sp = r.string_prototype;
             const b = propIcBucket(rt, p, pc);
-            inline for (0..2) |i| {
-                const ic = b[i];
+            for (b) |ic| {
                 if (ic.atom_addr == atom_addr) {
                     if (ic.kind == 10 and sp.props == .shaped and sp.props.shapeId() == ic.proto_shape_id) {
                         const v = sp.props.getShapedSlot(ic.slot);
@@ -3349,13 +3454,14 @@ fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
         return null;
     }
     const o = base.asObject();
-    const is_array = o.kind == .array;
-    if (is_array) {
+    if (o.kind == .array) {
         if (isLengthAtom(atom)) {
             o.obj.checkLive();
             return Value.fromNumber(@floatFromInt(o.kind.array.items.len));
         }
         if (atom.atom.?.index != null) return null;
+    } else if (o.kind == .regexp) {
+        if (isLastIndexAtom(atom)) return null;
     } else if (o.kind != .ordinary or o.builtin != null) {
         return null;
     }
@@ -3363,7 +3469,7 @@ fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
     const sid = objVersion(o);
     const b = propIcBucket(rt, p, pc);
     if (matchGetPropIc(o, atom_addr, sid, b[0])) |v| return v;
-    return matchGetPropIc(o, atom_addr, sid, b[1]);
+    return fastGetPropPoly(o, atom_addr, sid, b);
 }
 
 noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) void {
@@ -3402,9 +3508,10 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
         return;
     }
     const o = base.asObject();
-    const is_array = o.kind == .array;
-    if (is_array) {
+    if (o.kind == .array) {
         if (atom.atom.?.index != null or isLengthAtom(atom)) return;
+    } else if (o.kind == .regexp) {
+        if (isLastIndexAtom(atom)) return;
     } else if (o.kind != .ordinary or o.builtin != null) {
         return;
     }
@@ -3487,7 +3594,8 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
                         return;
                     }
                 }
-            } else if (gp.dict_version != 0) {
+            } else {
+                if (gp.dict_version == 0) return;
                 if (gp.props.dict.getIndex(key)) |idx| {
                     const prop = gp.props.dict.values()[idx];
                     if (!prop.is_accessor and idx <= std.math.maxInt(u16)) {
@@ -3503,11 +3611,60 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
                     return;
                 }
             }
-            if (gp.proto == null and (gp.props == .shaped or gp.dict_version != 0)) {
+            const gpver = objVersion(gp);
+            // 3-hop prototype lookup (e.g. Instance -> Sub.prototype -> Base.prototype -> Root.prototype)
+            if (gp.proto) |ggp| {
+                if (ggp.kind != .ordinary) return;
+                if (ggp.props == .shaped) {
+                    if (ggp.props.shaped.shape) |ggpleaf| {
+                        if (ggpleaf.find(key)) |ggps| {
+                            insertPropIc(rt, p, pc, .{
+                                .shape_id = sid,
+                                .proto_shape_id = pver,
+                                .grandproto_shape_id = gpver,
+                                .greatgrandproto_shape_id = ggpleaf.id,
+                                .atom_addr = @intFromPtr(atom),
+                                .slot = ggps.slot,
+                                .kind = 15,
+                            });
+                            return;
+                        }
+                    }
+                } else {
+                    if (ggp.dict_version == 0) return;
+                    if (ggp.props.dict.getIndex(key)) |idx| {
+                        const prop = ggp.props.dict.values()[idx];
+                        if (!prop.is_accessor and idx <= std.math.maxInt(u16)) {
+                            insertPropIc(rt, p, pc, .{
+                                .shape_id = sid,
+                                .proto_shape_id = pver,
+                                .grandproto_shape_id = gpver,
+                                .greatgrandproto_shape_id = ggp.dict_version,
+                                .atom_addr = @intFromPtr(atom),
+                                .slot = @intCast(idx),
+                                .kind = 16,
+                            });
+                        }
+                        return;
+                    }
+                }
+                if (ggp.proto == null) {
+                    insertPropIc(rt, p, pc, .{
+                        .shape_id = sid,
+                        .proto_shape_id = pver,
+                        .grandproto_shape_id = gpver,
+                        .greatgrandproto_shape_id = objVersion(ggp),
+                        .atom_addr = @intFromPtr(atom),
+                        .slot = 0,
+                        .kind = 9,
+                    });
+                }
+            } else {
                 insertPropIc(rt, p, pc, .{
                     .shape_id = sid,
                     .proto_shape_id = pver,
-                    .grandproto_shape_id = objVersion(gp),
+                    .grandproto_shape_id = gpver,
+                    .greatgrandproto_shape_id = 0,
                     .atom_addr = @intFromPtr(atom),
                     .slot = 0,
                     .kind = 9,
@@ -3518,6 +3675,7 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
                 .shape_id = sid,
                 .proto_shape_id = objVersion(proto),
                 .grandproto_shape_id = 0,
+                .greatgrandproto_shape_id = 0,
                 .atom_addr = @intFromPtr(atom),
                 .slot = 0,
                 .kind = 9,
@@ -3528,6 +3686,7 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
             .shape_id = sid,
             .proto_shape_id = 0,
             .grandproto_shape_id = 0,
+            .greatgrandproto_shape_id = 0,
             .atom_addr = @intFromPtr(atom),
             .slot = 0,
             .kind = 9,
@@ -3535,15 +3694,8 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
     }
 }
 
-fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String, val: Value) bool {
-    if (!base.isObject()) return false;
-    const o = base.asObject();
-    if (o.kind != .ordinary or o.builtin != null) return false;
-    o.obj.checkLive();
-    const ic = propIcBucket(rt, p, pc)[0];
-    if (ic.atom_addr != @intFromPtr(atom)) return false;
-    const sid = o.props.shapeId();
-    if (sid != ic.shape_id) return false;
+inline fn matchSetPropIc(rt: *Runtime, o: *heap.Object, atom: *heap.String, atom_addr: usize, sid: u32, val: Value, ic: rt_mod.PropIc) bool {
+    if (ic.atom_addr != atom_addr or sid != ic.shape_id) return false;
     if (ic.kind == 3) {
         rt.heap.storeShapedSlot(o, ic.slot, val);
         return true;
@@ -3573,6 +3725,25 @@ fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
         }
     }
     return false;
+}
+
+noinline fn fastSetPropPoly(rt: *Runtime, o: *heap.Object, atom: *heap.String, atom_addr: usize, sid: u32, val: Value, b: *const [4]rt_mod.PropIc) bool {
+    for (b[1..]) |ic| {
+        if (matchSetPropIc(rt, o, atom, atom_addr, sid, val, ic)) return true;
+    }
+    return false;
+}
+
+fn fastSetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String, val: Value) bool {
+    if (!base.isObject()) return false;
+    const o = base.asObject();
+    if (o.kind != .ordinary or o.builtin != null) return false;
+    o.obj.checkLive();
+    const atom_addr = @intFromPtr(atom);
+    const sid = o.props.shapeId();
+    const b = propIcBucket(rt, p, pc);
+    if (matchSetPropIc(rt, o, atom, atom_addr, sid, val, b[0])) return true;
+    return fastSetPropPoly(rt, o, atom, atom_addr, sid, val, b);
 }
 
 noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String, old_sid: u32) void {

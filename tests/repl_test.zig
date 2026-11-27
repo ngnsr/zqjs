@@ -439,3 +439,71 @@ test "repl: GC stress across 25+ chunks with closures, async generators, and obj
     }
     try expectEval(s, "acc > 0;", "true");
 }
+
+test "repl: .trace on flushes buffered stderr immediately after each eval" {
+    const BufferedSink = struct {
+        gpa: std.mem.Allocator,
+        flushed: std.ArrayList(u8) = .empty,
+        buf: [1024]u8 = undefined,
+        writer: std.Io.Writer = undefined,
+
+        fn init(self: *@This(), gpa: std.mem.Allocator) void {
+            self.* = .{ .gpa = gpa };
+            self.writer = .{
+                .vtable = &.{ .drain = drain },
+                .buffer = &self.buf,
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.flushed.deinit(self.gpa);
+        }
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @fieldParentPtr("writer", w);
+            const buffered = w.buffered();
+            if (buffered.len > 0) {
+                self.flushed.appendSlice(self.gpa, buffered) catch return error.WriteFailed;
+                w.end = 0;
+            }
+            for (data[0 .. data.len - 1]) |slice| {
+                if (slice.len > 0) {
+                    self.flushed.appendSlice(self.gpa, slice) catch return error.WriteFailed;
+                }
+            }
+            const last = data[data.len - 1];
+            if (last.len > 0) {
+                for (0..splat) |_| {
+                    self.flushed.appendSlice(self.gpa, last) catch return error.WriteFailed;
+                }
+            }
+            return std.Io.Writer.countSplat(data, splat);
+        }
+    };
+
+    var out_sink: BufferedSink = undefined;
+    out_sink.init(testing.allocator);
+    defer out_sink.deinit();
+
+    var err_sink: BufferedSink = undefined;
+    err_sink.init(testing.allocator);
+    defer err_sink.deinit();
+
+    const s = try Session.create(testing.allocator, &out_sink.writer, &err_sink.writer, .{});
+    defer s.destroy();
+
+    _ = try s.runDotCommand(".trace on");
+    try testing.expect(std.mem.indexOf(u8, out_sink.flushed.items, "trace: on") != null);
+
+    // A short expression produces well under 1024 bytes of trace output; it must
+    // be flushed to stderr before eval() returns, not held until session exit.
+    try expectEval(s, "1 + 2", "3");
+    try testing.expect(err_sink.flushed.items.len > 0);
+    try testing.expect(err_sink.flushed.items.len < err_sink.buf.len);
+    try testing.expect(std.mem.indexOf(u8, err_sink.flushed.items, "add") != null);
+
+    err_sink.flushed.clearRetainingCapacity();
+    _ = try s.runDotCommand(".trace off");
+    try expectEval(s, "4 + 5", "9");
+    try testing.expectEqual(@as(usize, 0), err_sink.flushed.items.len);
+}

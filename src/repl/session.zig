@@ -951,6 +951,7 @@ pub const Session = struct {
 };
 
 fn runTraced(vm: *Vm, t: *Writer) RuntimeError!void {
+    errdefer t.flush() catch {};
     while (true) {
         if (!vm.halted) {
             try t.splatByteAll(' ', 2 * (vm.frames.items.len - 1));
@@ -966,6 +967,9 @@ fn runTraced(vm: *Vm, t: *Writer) RuntimeError!void {
             }
             try t.writeByte('\n');
         }
-        if (try vm.step() == .halted) return;
+        if (try vm.step() == .halted) {
+            try t.flush();
+            return;
+        }
     }
 }

@@ -100,6 +100,50 @@ pub fn newArgumentsObject(rt: *Runtime, args: []const Value) Error!*heap_mod.Obj
     return obj;
 }
 
+/// ES2025 §10.4.4.7 `CreateMappedArgumentsObject`: sloppy-mode simple-parameter `arguments`
+/// with live `[[ParameterMap]]` cells and a writable/configurable data `callee` property.
+pub fn newMappedArgumentsObject(
+    rt: *Runtime,
+    args: []const Value,
+    callee: Value,
+    mapped_cells: []const ?*heap_mod.Cell,
+) Error!*heap_mod.Object {
+    const r = try builtins.realm(rt);
+    const obj = try rt.heap.newMappedArguments(r.object_prototype, mapped_cells);
+    var root_buf = [_]Value{ Value.fromObject(obj), callee };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var idx_buf: [20]u8 = undefined;
+    for (args, 0..) |v, i| {
+        const s = std.fmt.bufPrint(&idx_buf, "{d}", .{i}) catch unreachable;
+        const k = try rt.heap.internUtf8(s);
+        try rt.heap.defineProperty(obj, k, .{
+            .value = v,
+            .writable = true,
+            .enumerable = true,
+            .configurable = true,
+        });
+    }
+    const len_key = try rt.heap.internUtf8("length");
+    try rt.heap.defineProperty(obj, len_key, .{
+        .value = Value.fromNumber(@floatFromInt(args.len)),
+        .writable = true,
+        .enumerable = false,
+        .configurable = true,
+    });
+    const callee_k = try rt.heap.internUtf8("callee");
+    try rt.heap.defineProperty(obj, callee_k, .{
+        .value = root_buf[1],
+        .writable = true,
+        .enumerable = false,
+        .configurable = true,
+    });
+    try common.symbolMethod(rt, obj, r.sym_iterator, &array_builtins.array_values);
+    return obj;
+}
+
 const object_to_string: Native = .{ .name = "toString", .call = objectToString };
 
 const object_value_of: Native = .{ .name = "valueOf", .call = objectValueOf };
@@ -132,6 +176,7 @@ pub fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
             .regexp => "RegExp",
             .date => "Date",
             .module_namespace => "Module",
+            .mapped_arguments => "Arguments",
             .ordinary => switch (o.ordinary_tag) {
                 .arguments => "Arguments",
                 .@"error" => "Error",
@@ -427,6 +472,26 @@ pub fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap
                     }
                 },
                 .proxy => return proxy_reflect.proxyGetOwnPropertyDescriptor(rt, o, k),
+                .mapped_arguments => |map| {
+                    if (o.props.count() > 0) {
+                        if (o.props.get(try object.propKey(rt, k))) |prop| {
+                            if (k == .index and k.index < map.len) {
+                                if (map[k.index]) |cell| {
+                                    return .{
+                                        .is_accessor = prop.is_accessor,
+                                        .value = cell.value orelse .undefined,
+                                        .setter = prop.setter,
+                                        .writable = prop.writable,
+                                        .enumerable = prop.enumerable,
+                                        .configurable = prop.configurable,
+                                    };
+                                }
+                            }
+                            return prop;
+                        }
+                    }
+                    return null;
+                },
                 .primitive_wrapper => |pv| if (pv.isString()) {
                     const s = pv.asString();
                     switch (k) {
@@ -938,7 +1003,20 @@ pub fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Pa
 
     const pk = try object.propKey(rt, k);
     switch (target.unpack()) {
-        .object => |o| try rt.heap.definePropKey(o, pk, next),
+        .object => |o| {
+            try rt.heap.definePropKey(o, pk, next);
+            // ES2025 §10.4.4.2 step 7: post-define parameter map sync/unlink.
+            if (o.kind == .mapped_arguments and k == .index and k.index < o.kind.mapped_arguments.len) {
+                if (o.kind.mapped_arguments[k.index]) |cell| {
+                    if (desc.isAccessor()) {
+                        rt.heap.unlinkMappedArg(o, k.index);
+                    } else {
+                        if (desc.has_val) rt.heap.storeCell(cell, desc.val);
+                        if (desc.has_writ and !desc.writ_val) rt.heap.unlinkMappedArg(o, k.index);
+                    }
+                }
+            }
+        },
         .closure => |c| try rt.heap.defineClosurePropKey(@constCast(c), pk, next),
         else => unreachable,
     }
@@ -1290,6 +1368,22 @@ fn setIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!Value {
                 return target;
             }
             o.extensible = false;
+            if (o.kind == .mapped_arguments and freeze) {
+                var root_buf = [_]Value{target};
+                var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+                try roots.register(rt);
+                defer roots.unregister(rt);
+                const map = o.kind.mapped_arguments;
+                for (map, 0..) |mc, i| {
+                    if (mc) |cell| {
+                        const pk = try object.propKey(rt, .{ .index = @intCast(i) });
+                        if (o.props.contains(pk)) {
+                            try rt.heap.storePropKey(o, pk, cell.value orelse .undefined);
+                        }
+                        rt.heap.unlinkMappedArg(o, i);
+                    }
+                }
+            }
             if (o.props.count() > 0) {
                 try rt.heap.toDictionary(o);
                 for (o.props.dict.values()) |*p| {

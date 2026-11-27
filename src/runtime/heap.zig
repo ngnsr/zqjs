@@ -172,6 +172,8 @@ pub const Env = struct {
     parent: ?*Env,
     scope: u32,
     values: []?Value,
+    /// Optional per-slot cells for sloppy mapped-arguments parameter scopes (empty for all other scopes).
+    cells: []?*Cell = &.{},
 };
 
 pub const inline_string_cap = 16;
@@ -874,6 +876,9 @@ pub const Object = struct {
         date: f64,
         /// Boxed primitive wrapper (`new Boolean`, `new Number`, `new String`, `Object(prim)`).
         primitive_wrapper: Value,
+        /// ES2025 §10.4.4.7 mapped arguments exotic object: `[[ParameterMap]]` indexed by
+        /// argument index `0..min(argc, param_count)-1`; `null` entry means unlinked.
+        mapped_arguments: []?*Cell,
     } = .ordinary,
     /// Set on the built-in objects: which node object's names classify lookups that
     /// miss here (builtin_names.zig, D39).
@@ -1393,6 +1398,7 @@ pub const Heap = struct {
                 },
                 .array_buffer, .date => {},
                 .primitive_wrapper => |pv| visitValue(pv, &scan, RememberedScan.child),
+                .mapped_arguments => |map| for (map) |mc| if (mc) |c| RememberedScan.child(&scan, &c.obj),
                 .typed_array => |ta| RememberedScan.child(&scan, &ta.buffer.obj),
                 .data_view => |dv| RememberedScan.child(&scan, &dv.buffer.obj),
                 .weak_map => |*wm| {
@@ -1788,6 +1794,30 @@ pub const Heap = struct {
         o.kind = .{ .primitive_wrapper = val };
         h.barrier(&o.obj, null, val);
         return o;
+    }
+
+    /// An ES2025 §10.4.4.7 mapped arguments exotic object holding `[[ParameterMap]]` cells.
+    pub fn newMappedArguments(h: *Heap, proto: ?*Object, cells: []const ?*Cell) Error!*Object {
+        const o = try h.newObject(proto);
+        o.ordinary_tag = .arguments;
+        if (cells.len > 0) {
+            const copy = h.allocator().alloc(?*Cell, cells.len) catch |err| return h.failed(err);
+            @memcpy(copy, cells);
+            o.kind = .{ .mapped_arguments = copy };
+            for (copy) |mc| if (mc) |c| h.barrierObj(&o.obj, &c.obj);
+        } else {
+            o.kind = .{ .mapped_arguments = &.{} };
+        }
+        return o;
+    }
+
+    /// Removes index `index` from a mapped arguments object's `[[ParameterMap]]` (ES2025 §10.4.4.2 / §10.4.4.5).
+    pub fn unlinkMappedArg(h: *Heap, o: *Object, index: usize) void {
+        _ = h;
+        std.debug.assert(o.kind == .mapped_arguments);
+        if (index < o.kind.mapped_arguments.len) {
+            o.kind.mapped_arguments[index] = null;
+        }
     }
 
     pub fn newIterator(h: *Heap, proto: ?*Object, target: Value, kind: IteratorKind) Error!*Object {
@@ -2432,6 +2462,18 @@ pub const Heap = struct {
         h.barrier(&e.obj, old, value);
     }
 
+    /// Attaches a shared `Cell` to slot `index` of a tree-walker `Env` (for sloppy mapped arguments).
+    pub fn initEnvCell(h: *Heap, e: *Env, index: usize, cell: *Cell) Error!void {
+        e.obj.checkLive();
+        if (e.cells.len == 0) {
+            const slice = h.allocator().alloc(?*Cell, e.values.len) catch |err| return h.failed(err);
+            @memset(slice, null);
+            e.cells = slice;
+        }
+        e.cells[index] = cell;
+        h.barrierObj(&e.obj, &cell.obj);
+    }
+
     pub fn ensureClosureMeta(h: *Heap, c: *Closure) Error!*ClosureMeta {
         c.obj.checkLive();
         if (c.meta) |m| return m;
@@ -2638,7 +2680,7 @@ pub const Heap = struct {
     fn elementsOf(arr: *Object) *std.ArrayList(Value) {
         return switch (arr.kind) {
             .array => |*elements| elements,
-            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .module_namespace, .array_buffer, .typed_array, .data_view, .weak_map, .weak_set, .proxy, .date, .primitive_wrapper => unreachable, // only arrays have elements
+            .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .module_namespace, .array_buffer, .typed_array, .data_view, .weak_map, .weak_set, .proxy, .date, .primitive_wrapper, .mapped_arguments => unreachable, // only arrays have elements
         };
     }
 
@@ -2968,6 +3010,10 @@ pub const Heap = struct {
                 const e: *Env = @fieldParentPtr("obj", obj);
                 h.gpa.free(e.values);
                 e.values = &.{};
+                if (e.cells.len > 0) {
+                    h.allocator().free(e.cells);
+                    e.cells = &.{};
+                }
                 e.parent = null;
             },
             .object => {
@@ -2997,6 +3043,7 @@ pub const Heap = struct {
                     .module_namespace => |ns| h.allocator().free(ns.entries),
                     .array_buffer => |ab| h.allocator().free(ab.data),
                     .typed_array, .data_view, .date, .primitive_wrapper => {},
+                    .mapped_arguments => |map| if (map.len > 0) h.allocator().free(map),
                     .weak_map => |*wm| wm.entries.deinit(h.allocator()),
                     .weak_set => |*ws| ws.entries.deinit(h.allocator()),
                     .proxy => |px| h.allocator().destroy(px),
@@ -3194,6 +3241,7 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
             const e: *Env = @fieldParentPtr("obj", obj);
             if (e.parent) |p| visit(ctx, &p.obj);
             for (e.values) |slot| if (slot) |v| visitValue(v, ctx, visit);
+            for (e.cells) |mc| if (mc) |c| visit(ctx, &c.obj);
         },
         .object => {
             const o: *Object = @fieldParentPtr("obj", obj);
@@ -3234,6 +3282,7 @@ pub fn forEachChild(obj: *Obj, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *
                 },
                 .array_buffer, .date => {},
                 .primitive_wrapper => |pv| visitValue(pv, ctx, visit),
+                .mapped_arguments => |map| for (map) |mc| if (mc) |c| visit(ctx, &c.obj),
                 .typed_array => |ta| visit(ctx, &ta.buffer.obj),
                 .data_view => |dv| visit(ctx, &dv.buffer.obj),
                 // WeakMap/WeakSet keys and WeakMap values are traced by the ephemeron

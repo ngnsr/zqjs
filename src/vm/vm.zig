@@ -2157,7 +2157,25 @@ pub const Vm = struct {
             .make_arguments => {
                 cache.syncSp(vm);
                 const f = vm.frame();
-                const arg_obj = try builtins.newArgumentsObject(rt, vm.stack[f.args_start..][0..f.argc]);
+                const arg_obj = if (p.has_mapped_arguments) blk: {
+                    const map_len: usize = @min(f.argc, p.param_count);
+                    var stack_cells: [16]?*Cell = undefined;
+                    const cells: []?*Cell = if (map_len <= stack_cells.len)
+                        stack_cells[0..map_len]
+                    else
+                        try rt.gpa.alloc(?*Cell, map_len);
+                    defer if (map_len > stack_cells.len) rt.gpa.free(cells);
+                    const locals = vm.locals[f.locals_base..];
+                    for (0..map_len) |i| {
+                        cells[i] = try vm.cellIn(&locals[p.param_slot + i]);
+                    }
+                    break :blk try builtins.newMappedArgumentsObject(
+                        rt,
+                        vm.stack[f.args_start..][0..f.argc],
+                        Value.fromClosure(f.closure.?),
+                        cells,
+                    );
+                } else try builtins.newArgumentsObject(rt, vm.stack[f.args_start..][0..f.argc]);
                 try cache.push(vm, Value.fromObject(arg_obj));
             },
             .array_spread => {

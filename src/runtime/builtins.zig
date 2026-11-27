@@ -65,6 +65,7 @@ pub const setFunctionNameIfUnset = function_error.setFunctionNameIfUnset;
 pub const materializeClosurePrototype = function_error.materializeClosurePrototype;
 pub const makeEngineError = function_error.makeEngineError;
 pub const newArgumentsObject = object_builtins.newArgumentsObject;
+pub const newMappedArgumentsObject = object_builtins.newMappedArgumentsObject;
 pub const defineOwnPropertyParsed = object_builtins.defineOwnPropertyParsed;
 pub const ordinarySetWithReceiver = object_builtins.ordinarySetWithReceiver;
 pub const forInInit = object_builtins.forInInit;

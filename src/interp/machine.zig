@@ -589,7 +589,10 @@ const Machine = struct {
 
     fn load(m: *const Machine, b: u32) ?Value {
         if (m.res.bindings[b].repl_index) |ri| return m.repl_cells[ri].value;
-        return m.envOf(b).values[m.res.bindings[b].index];
+        const env = m.envOf(b);
+        const idx = m.res.bindings[b].index;
+        if (env.cells.len > 0) if (env.cells[idx]) |cell| return cell.value;
+        return env.values[idx];
     }
 
     fn store(m: *Machine, b: u32, v: Value) void {
@@ -597,7 +600,13 @@ const Machine = struct {
             m.rt.heap.storeCell(m.repl_cells[ri], v);
             return;
         }
-        m.rt.heap.storeEnv(m.envOf(b), m.res.bindings[b].index, v);
+        const env = m.envOf(b);
+        const idx = m.res.bindings[b].index;
+        if (env.cells.len > 0) if (env.cells[idx]) |cell| {
+            m.rt.heap.storeCell(cell, v);
+            return;
+        };
+        m.rt.heap.storeEnv(env, idx, v);
     }
 
     fn storeBinding(m: *Machine, b: u32, v: Value) Error!void {
@@ -3770,7 +3779,31 @@ const Machine = struct {
             m.store(ntb, new_target);
         };
         if (m.res.functions[f.id].arguments_binding) |ab| {
-            const arg_obj = try builtins.newArgumentsObject(m.rt, m.values.items[args_base..]);
+            const fn_info = m.res.functions[f.id];
+            const args_slice = m.values.items[args_base..];
+            const arg_obj = if (!f.is_strict and !f.is_arrow and fn_info.is_simple_params) blk: {
+                const map_len: usize = @min(args_slice.len, f.params.len);
+                var stack_cells: [16]?*heap.Cell = undefined;
+                const cells: []?*heap.Cell = if (map_len <= stack_cells.len)
+                    stack_cells[0..map_len]
+                else
+                    try m.rt.gpa.alloc(?*heap.Cell, map_len);
+                defer if (map_len > stack_cells.len) m.rt.gpa.free(cells);
+                for (0..map_len) |i| {
+                    const param_b = f.params[i].pattern.data.binding.binding;
+                    const param_env = m.envOf(param_b);
+                    const param_idx = m.res.bindings[param_b].index;
+                    const cell = try m.rt.heap.newCell(m.values.items[args_base + i]);
+                    try m.rt.heap.initEnvCell(param_env, param_idx, cell);
+                    cells[i] = cell;
+                }
+                break :blk try builtins.newMappedArgumentsObject(
+                    m.rt,
+                    m.values.items[args_base..],
+                    Value.fromClosure(closure),
+                    cells,
+                );
+            } else try builtins.newArgumentsObject(m.rt, args_slice);
             m.store(ab, Value.fromObject(arg_obj));
         }
         const argc: u32 = @intCast(m.values.items.len - args_base);

@@ -578,6 +578,8 @@ pub const Proto = struct {
     is_method: bool = false,
     is_class_constructor: bool = false,
     is_strict: bool = false,
+    /// True for sloppy-mode non-arrow functions with simple parameter lists (ES2025 §10.4.4.7).
+    has_mapped_arguments: bool = false,
     has_super_ctor: bool = false,
     has_home_object: bool = false,
     length: u16 = 0,

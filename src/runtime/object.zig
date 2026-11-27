@@ -384,6 +384,26 @@ pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
                 .symbol => {},
             }
         },
+        .mapped_arguments => |map| {
+            if (o.props.count() > 0) {
+                if (o.props.get(try propKey(rt, k))) |prop| {
+                    if (k == .index and k.index < map.len) {
+                        if (map[k.index]) |cell| {
+                            return .{
+                                .is_accessor = prop.is_accessor,
+                                .value = cell.value orelse .undefined,
+                                .setter = prop.setter,
+                                .writable = prop.writable,
+                                .enumerable = prop.enumerable,
+                                .configurable = prop.configurable,
+                            };
+                        }
+                    }
+                    return prop;
+                }
+            }
+            return null;
+        },
         .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
     if (o.props.count() > 0) {
@@ -735,6 +755,13 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!b
                             if (validIntegerIndex(ta, n)) |idx| writeTypedArrayNumber(ta, idx, num);
                         }
                         return true;
+                    }
+                },
+                .mapped_arguments => |map| {
+                    if (k == .index and k.index < map.len) {
+                        if (map[k.index]) |cell| {
+                            rt.heap.storeCell(cell, v);
+                        }
                     }
                 },
                 .ordinary, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date, .primitive_wrapper => {},
@@ -1097,12 +1124,15 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
                 .symbol => {},
             }
         },
-        .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .date => {},
+        .ordinary, .map, .set, .iterator, .promise, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .date, .mapped_arguments => {},
     }
     if (o.props.count() == 0) return true;
     const pk = try propKey(rt, k);
     if (o.props.get(pk)) |p| if (!p.configurable) return false;
     try rt.heap.removePropKey(o, pk);
+    if (o.kind == .mapped_arguments and k == .index) {
+        rt.heap.unlinkMappedArg(o, k.index);
+    }
     return true;
 }
 
@@ -1470,7 +1500,7 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
         .primitive_wrapper => |pv| if (pv.isString()) {
             for (0..pv.asString().units.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
-        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date, .mapped_arguments => {},
     }
     const first_named = if (o.kind == .array and o.has_index_overrides) 0 else out.items.len;
     try appendPropStoreKeys(rt, &out, &o.props, first_named, false, false);
@@ -1491,7 +1521,7 @@ pub fn ownPropertyNames(rt: *Runtime, o: *Object) Error![]Key {
         .primitive_wrapper => |pv| if (pv.isString()) {
             for (0..pv.asString().units.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
-        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date, .mapped_arguments => {},
     }
     const first_named = if (o.kind == .array and o.has_index_overrides) 0 else out.items.len;
     try appendPropStoreKeys(rt, &out, &o.props, first_named, false, true);
@@ -1518,7 +1548,7 @@ pub fn ownAllKeys(rt: *Runtime, o: *Object) Error![]Key {
         .primitive_wrapper => |pv| if (pv.isString()) {
             for (0..pv.asString().units.len) |i| try out.append(rt.gpa, .{ .index = @intCast(i) });
         },
-        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
+        .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date, .mapped_arguments => {},
     }
     const first_named = if (o.kind == .array and o.has_index_overrides) 0 else out.items.len;
     try appendPropStoreKeys(rt, &out, &o.props, first_named, true, false);

@@ -185,6 +185,7 @@ fn cloneObject(ctx: *CloneContext, src: *Object) Error!*Object {
 
     return switch (src.kind) {
         .ordinary => if (src.ordinary_tag == .@"error") try cloneError(ctx, src) else try cloneOrdinary(ctx, src),
+        .mapped_arguments => try cloneOrdinary(ctx, src),
         .array => try cloneArray(ctx, src),
         .map => try cloneMap(ctx, src),
         .set => try cloneSet(ctx, src),

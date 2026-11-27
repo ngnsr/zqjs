@@ -497,6 +497,7 @@ fn objectKindTag(o: *const Object) ObjectKind {
         .proxy => .proxy,
         .date => .date,
         .primitive_wrapper => .primitive_wrapper,
+        .mapped_arguments => .ordinary,
     };
 }
 

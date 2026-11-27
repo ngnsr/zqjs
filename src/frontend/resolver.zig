@@ -851,6 +851,11 @@ const Resolver = struct {
             r.param_scope_end = prev_pend;
         }
         try r.block(f.body, .body);
+        if (r.current().arguments_binding != null and !f.is_strict and !f.is_arrow and is_simple) {
+            for (f.params) |p| {
+                r.bindings.items[p.pattern.data.binding.binding].captured = true;
+            }
+        }
         r.exitScope(param_saved);
         if (name_scope) |sv| r.exitScope(sv);
         r.finishFunction();

@@ -87,6 +87,18 @@ const Shared = struct {
                 try c.initBinding(n.binding);
             };
             const fn_info = c.s.res.functions[func.id];
+            if (fn_info.is_simple_params) {
+                // Parameters arrive as plain values; box the captured ones before `make_arguments`
+                // so sloppy mapped arguments can share the exact same parameter Cells.
+                for (func.params) |p| {
+                    const b = p.pattern.data.binding.binding;
+                    if (c.binding(b).captured) {
+                        try c.emit(.box_local, &.{c.slotOf(b)});
+                    } else {
+                        c.markSlotInit(c.slotOf(b));
+                    }
+                }
+            }
             if (fn_info.arguments_binding) |ab| {
                 if (c.binding(ab).captured) try c.emit(.new_cell, &.{c.slotOf(ab)});
                 try c.emit(.make_arguments, &.{});
@@ -102,17 +114,7 @@ const Shared = struct {
                     c.markSlotInit(c.slotOf(ntb));
                 }
             };
-            if (fn_info.is_simple_params) {
-                // Parameters arrive as plain values; box the captured ones.
-                for (func.params) |p| {
-                    const b = p.pattern.data.binding.binding;
-                    if (c.binding(b).captured) {
-                        try c.emit(.box_local, &.{c.slotOf(b)});
-                    } else {
-                        c.markSlotInit(c.slotOf(b));
-                    }
-                }
-            } else {
+            if (!fn_info.is_simple_params) {
                 for (func.params) |p| try c.enterPatternBindings(p.pattern);
                 for (func.params, 0..) |p, i| {
                     if (p.is_rest) {
@@ -356,6 +358,7 @@ const Compiler = struct {
             .is_method = if (f) |func| func.is_method else false,
             .is_class_constructor = if (f) |func| func.is_class_constructor else false,
             .is_strict = if (f) |func| func.is_strict else c.s.script_strict,
+            .has_mapped_arguments = if (f) |func| (!func.is_strict and !func.is_arrow and info.is_simple_params) else false,
             .has_super_ctor = if (f) |func| func.has_super_ctor else false,
             .has_home_object = if (f) |func| func.has_home_object else false,
             .length = if (f) |func| func.length else 0,

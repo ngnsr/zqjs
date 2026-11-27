@@ -1791,3 +1791,228 @@ test "new.target: early SyntaxErrors at top-level, top-level arrows, invalid tar
         }
     }
 }
+
+test "ES2025 §10.4.4.7 mapped arguments: aliasing, callee, delete, defineProperty, freeze/seal, unmapped modes" {
+    const src =
+        \\// 1. Bidirectional aliasing & Object.prototype.toString
+        \\function bidir(a, b) {
+        \\    const tag = Object.prototype.toString.call(arguments);
+        \\    a = 10;
+        \\    const r1 = arguments[0];
+        \\    arguments[1] = 20;
+        \\    const r2 = b;
+        \\    const d0 = Object.getOwnPropertyDescriptor(arguments, 0);
+        \\    return [tag, r1, r2, d0.value, d0.writable, d0.enumerable, d0.configurable];
+        \\}
+        \\print("bidir:", bidir(1, 2).join("|"));
+        \\
+        \\// 2. Unmapped when i >= argc or i >= param_count
+        \\function bounds(a, b) {
+        \\    arguments[1] = 99;
+        \\    const bAfter = b;
+        \\    arguments[2] = 77;
+        \\    return [a, bAfter, arguments[1], arguments[2], arguments.length];
+        \\}
+        \\print("bounds:", bounds(5).join("|"));
+        \\function extra(a) {
+        \\    a = 11;
+        \\    arguments[1] = 22;
+        \\    return [arguments[0], arguments[1], arguments.length];
+        \\}
+        \\print("extra:", extra(1, 2).join("|"));
+        \\
+        \\// 3. arguments.callee: sloppy (with and without params) vs strict & non-simple
+        \\function sloppyCallee(a) {
+        \\    const d = Object.getOwnPropertyDescriptor(arguments, "callee");
+        \\    const same = arguments.callee === sloppyCallee;
+        \\    arguments.callee = 123;
+        \\    return [same, d.writable, d.enumerable, d.configurable, arguments.callee];
+        \\}
+        \\print("callee-sloppy:", sloppyCallee(1).join("|"));
+        \\function sloppyZero() {
+        \\    return arguments.callee === sloppyZero;
+        \\}
+        \\print("callee-zero:", sloppyZero());
+        \\function strictCallee(a) {
+        \\    "use strict";
+        \\    a = 99;
+        \\    let threw = false;
+        \\    try { void arguments.callee; } catch (e) { threw = e instanceof TypeError; }
+        \\    return [arguments[0], threw];
+        \\}
+        \\print("callee-strict:", strictCallee(1).join("|"));
+        \\function defaultUnmapped(a = 1) {
+        \\    a = 99;
+        \\    let threw = false;
+        \\    try { void arguments.callee; } catch (e) { threw = e instanceof TypeError; }
+        \\    return [arguments[0], threw];
+        \\}
+        \\print("unmapped-default:", defaultUnmapped(2).join("|"));
+        \\function restUnmapped(a, ...r) {
+        \\    a = 99;
+        \\    let threw = false;
+        \\    try { void arguments.callee; } catch (e) { threw = e instanceof TypeError; }
+        \\    return [arguments[0], r.length, threw];
+        \\}
+        \\print("unmapped-rest:", restUnmapped(3, 4).join("|"));
+        \\function destructUnmapped({ x }) {
+        \\    x = 99;
+        \\    let threw = false;
+        \\    try { void arguments.callee; } catch (e) { threw = e instanceof TypeError; }
+        \\    return [arguments[0].x, threw];
+        \\}
+        \\print("unmapped-destruct:", destructUnmapped({ x: 5 }).join("|"));
+        \\
+        \\// 4. delete arguments[0] unlinking + re-add
+        \\function delUnlink(a) {
+        \\    a = 10;
+        \\    const delOk = delete arguments[0];
+        \\    const has0 = 0 in arguments;
+        \\    arguments[0] = 500;
+        \\    const aAfterReadd = a;
+        \\    a = 600;
+        \\    const arg0AfterParam = arguments[0];
+        \\    return [delOk, has0, aAfterReadd, arg0AfterParam];
+        \\}
+        \\print("delete:", delUnlink(1).join("|"));
+        \\
+        \\// 5. Object.defineProperty: accessor unlink, writable:false w/ and w/o value, enumerable/configurable stay mapped
+        \\function defAccessor(a) {
+        \\    a = 7;
+        \\    Object.defineProperty(arguments, 0, { get() { return 42; }, configurable: true });
+        \\    const v1 = arguments[0];
+        \\    const a1 = a;
+        \\    a = 8;
+        \\    const v2 = arguments[0];
+        \\    return [v1, a1, v2, a];
+        \\}
+        \\print("def-accessor:", defAccessor(1).join("|"));
+        \\
+        \\function defWritableNoVal(a) {
+        \\    a = 33;
+        \\    Object.defineProperty(arguments, 0, { writable: false });
+        \\    const v1 = arguments[0];
+        \\    a = 44;
+        \\    const v2 = arguments[0];
+        \\    arguments[0] = 55;
+        \\    return [v1, v2, arguments[0], a];
+        \\}
+        \\print("def-writ-noval:", defWritableNoVal(1).join("|"));
+        \\
+        \\function defWritableWithVal(a) {
+        \\    Object.defineProperty(arguments, 0, { value: 88, writable: false });
+        \\    const a1 = a;
+        \\    const v1 = arguments[0];
+        \\    a = 99;
+        \\    return [a1, v1, arguments[0], a];
+        \\}
+        \\print("def-writ-val:", defWritableWithVal(1).join("|"));
+        \\
+        \\function defEnumConfStayMapped(a, b) {
+        \\    Object.defineProperty(arguments, 0, { enumerable: false });
+        \\    Object.defineProperty(arguments, 1, { configurable: false });
+        \\    a = 101;
+        \\    arguments[1] = 202;
+        \\    const delNonConf = delete arguments[1];
+        \\    b = 303;
+        \\    const d0 = Object.getOwnPropertyDescriptor(arguments, 0);
+        \\    const d1 = Object.getOwnPropertyDescriptor(arguments, 1);
+        \\    return [arguments[0], b, delNonConf, arguments[1], d0.enumerable, d0.value, d1.configurable, d1.value];
+        \\}
+        \\print("def-enum-conf:", defEnumConfStayMapped(1, 2).join("|"));
+        \\
+        \\// 6. Object.seal stays mapped; Object.freeze snapshots live value and unlinks
+        \\function sealFreeze(a, b) {
+        \\    Object.seal(arguments);
+        \\    a = 71;
+        \\    const sealedLive = arguments[0];
+        \\    b = 82;
+        \\    Object.freeze(arguments);
+        \\    b = 93;
+        \\    return [sealedLive, arguments[1], b];
+        \\}
+        \\print("seal-freeze:", sealFreeze(1, 2).join("|"));
+        \\
+        \\// 7. Receiver != arguments does not mutate parameter
+        \\function receiverCheck(a) {
+        \\    const child = Object.create(arguments);
+        \\    child[0] = 777;
+        \\    const a1 = a;
+        \\    const r2 = Reflect.set(arguments, 0, 888, {});
+        \\    return [a1, child[0], a, r2];
+        \\}
+        \\print("receiver:", receiverCheck(5).join("|"));
+    ;
+    const expected =
+        \\bidir: [object Arguments]|10|20|10|true|true|true
+        \\bounds: 5||99|77|1
+        \\extra: 11|22|2
+        \\callee-sloppy: true|true|false|true|123
+        \\callee-zero: true
+        \\callee-strict: 1|true
+        \\unmapped-default: 2|true
+        \\unmapped-rest: 3|1|true
+        \\unmapped-destruct: 5|true
+        \\delete: true|false|10|500
+        \\def-accessor: 42|7|42|8
+        \\def-writ-noval: 33|33|33|44
+        \\def-writ-val: 88|88|88|99
+        \\def-enum-conf: 101|303|false|303|false|101|false|303
+        \\seal-freeze: 71|82|93
+        \\receiver: 5|777|5|true
+        \\
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("", r.err);
+        try testing.expectEqualStrings(expected, r.out);
+    }
+}
+
+test "ES2025 §10.4.4.7 mapped arguments: escaping closure and GC stress (collect_always + verify_heap)" {
+    const src =
+        \\function makeEscaping(a, b) {
+        \\    const reader = () => [a, arguments[0], b, arguments[1]];
+        \\    const mutateParam = (v) => { a = v; };
+        \\    const mutateArg = (v) => { arguments[1] = v; };
+        \\    const unlinkZero = () => { delete arguments[0]; };
+        \\    return { reader, mutateParam, mutateArg, unlinkZero, args: arguments };
+        \\}
+        \\const h = makeEscaping({ k: "initA" }, { k: "initB" });
+        \\// Allocate garbage to force promotions & minor/major collections under collect_always.
+        \\for (let i = 0; i < 40; i++) {
+        \\    const tmp = { n: i, s: "garbage-" + i };
+        \\    void tmp;
+        \\}
+        \\h.mutateParam({ k: "newA" });
+        \\h.mutateArg({ k: "newB" });
+        \\const r1 = h.reader();
+        \\print("r1:", r1[0].k, r1[1].k, r1[0] === r1[1], r1[2].k, r1[3].k, r1[2] === r1[3]);
+        \\h.unlinkZero();
+        \\h.mutateParam({ k: "afterUnlink" });
+        \\h.args[0] = { k: "readded" };
+        \\const r2 = h.reader();
+        \\print("r2:", r2[0].k, r2[1].k, r2[2].k, r2[3].k);
+    ;
+    const expected =
+        \\r1: newA newA true newB newB true
+        \\r2: afterUnlink readded newB newB
+        \\
+    ;
+    for (support.engines) |engine| {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer err_w.deinit();
+        const code = try zqjs.runSource(testing.allocator, "gc_mapped_args.js", src, .{}, .{
+            .mode = .normal,
+            .engine = engine,
+            .collect_always = true,
+            .verify_heap = true,
+        }, &out.writer, &err_w.writer);
+        try testing.expectEqual(@as(u8, 0), code);
+        try testing.expectEqualStrings("", err_w.written());
+        try testing.expectEqualStrings(expected, out.written());
+    }
+}

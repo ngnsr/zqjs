@@ -4,6 +4,8 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>zqjs — Browser WASM Playground</title>
+  <!-- Inline SVG favicon keeps the page a single file. -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23d89b3c'/%3E%3Ctext x='16' y='21.5' text-anchor='middle' font-family='ui-monospace,Menlo,Consolas,monospace' font-size='15' font-weight='700' fill='%231b1d21'%3Ezq%3C/text%3E%3C/svg%3E" />
   <style>
     /* Chill Gray Dark (default) */
     :root {
@@ -98,6 +100,15 @@
       display: flex;
       align-items: center;
       gap: 10px;
+    }
+
+    .brand-mark { width: 24px; height: 24px; flex-shrink: 0; }
+    .brand-mark rect { fill: var(--accent); }
+    .brand-mark text {
+      fill: var(--on-accent);
+      font-family: var(--mono);
+      font-size: 15px;
+      font-weight: 700;
     }
 
     .brand h1 {
@@ -568,6 +579,10 @@
   <div class="app">
     <header>
       <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+          <rect width="32" height="32" rx="7" />
+          <text x="16" y="21.5" text-anchor="middle">zq</text>
+        </svg>
         <h1>zqjs</h1>
         <span id="version-badge" class="badge">loading wasm…</span>
       </div>
@@ -662,7 +677,7 @@
     </main>
 
     <footer class="telemetry">
-      <span class="stat">Time: <strong id="stat-time">—</strong></span>
+      <span class="stat" id="stat-time-label" title="Wall-clock time of the whole run: parse, compile, execute, plus the AST and bytecode dumps.">Total: <strong id="stat-time">—</strong></span>
       <span class="stat">Steps: <strong id="stat-steps">—</strong></span>
       <span class="stat">Peak Heap: <strong id="stat-peak">—</strong></span>
       <span class="stat">GC: <strong id="stat-gc">—</strong></span>
@@ -875,6 +890,32 @@ while (true) {
 
     function formatNumber(n) {
       return Number(n).toLocaleString("en-US");
+    }
+
+    // Browsers coarsen performance.now() (Safari 1 ms; Firefox/Tor/Brave fingerprinting protection
+    // 16.67 ms), so a sub-tick run reads as 0. Measure the tick once so Time never fakes precision.
+    const TIMER_TICK_MS = (() => {
+      const deadline = performance.now() + 40;
+      let last = performance.now();
+      let tick = Infinity;
+      for (let seen = 0; seen < 2;) {
+        const now = performance.now();
+        if (now !== last) { tick = Math.min(tick, now - last); last = now; seen++; }
+        if (now > deadline) break;
+      }
+      return tick;
+    })();
+    // A clock that never ticked within the probe is unknown, not coarse.
+    const TIMER_COARSE = Number.isFinite(TIMER_TICK_MS) && TIMER_TICK_MS >= 0.5;
+    if (TIMER_COARSE) {
+      document.getElementById("stat-time-label").title +=
+        ` This browser rounds timers to ${+TIMER_TICK_MS.toFixed(2)} ms; Steps is the exact, deterministic cost.`;
+    }
+
+    function formatElapsed(ms) {
+      if (!TIMER_COARSE) return `${ms.toFixed(2)} ms`;
+      const tick = +TIMER_TICK_MS.toFixed(2);
+      return ms < TIMER_TICK_MS ? `< ${tick} ms` : `~${Math.round(ms)} ms`;
     }
 
     // ---------- JS syntax highlighting ----------
@@ -1333,7 +1374,7 @@ while (true) {
       const minorGc = stats.minorCollections || 0;
       const majorGc = Math.max(0, totalGc - minorGc);
 
-      statTime.textContent = `${elapsedMs.toFixed(2)} ms`;
+      statTime.textContent = formatElapsed(elapsedMs);
       statSteps.textContent = formatNumber(stats.steps || 0);
       statPeak.textContent = formatBytes(stats.peakHeapBytes || 0);
       statGc.textContent = `${totalGc} (${minorGc} minor / ${majorGc} major)`;

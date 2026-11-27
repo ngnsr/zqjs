@@ -80,7 +80,10 @@ fn initArrayBufferAndViews(rt: *Runtime, r: *const builtins.Realm, v: *builtins.
     try object.defineAccessor(rt, Value.fromObject(v.array_buffer_namespace), .{ .symbol = r.sym_species }, Value.fromNative(&common.species_getter), false, false);
     try common.constant(rt, v.array_buffer_prototype, "constructor", Value.fromNative(&builtins.array_buffer_global));
     try object.defineAccessor(rt, Value.fromObject(v.array_buffer_prototype), try object.named(rt, "byteLength"), Value.fromNative(&ab_byte_length_getter), false, false);
+    try object.defineAccessor(rt, Value.fromObject(v.array_buffer_prototype), try object.named(rt, "detached"), Value.fromNative(&ab_detached_getter), false, false);
     try common.method(rt, v.array_buffer_prototype, "slice", &ab_slice);
+    try common.method(rt, v.array_buffer_prototype, "transfer", &ab_transfer);
+    try common.method(rt, v.array_buffer_prototype, "transferToFixedLength", &ab_transfer_to_fixed_length);
     try common.defineToStringTag(rt, v.array_buffer_prototype, r.sym_to_string_tag, "ArrayBuffer");
 
     // DataView
@@ -252,7 +255,13 @@ const ab_is_view: Native = .{ .name = "isView", .length = 1, .call = abIsView };
 
 const ab_byte_length_getter: Native = .{ .name = "get byteLength", .call = abByteLengthGetter };
 
+const ab_detached_getter: Native = .{ .name = "get detached", .call = abDetachedGetter };
+
 const ab_slice: Native = .{ .name = "slice", .length = 2, .call = abSlice };
+
+const ab_transfer: Native = .{ .name = "transfer", .length = 0, .call = abTransfer };
+
+const ab_transfer_to_fixed_length: Native = .{ .name = "transferToFixedLength", .length = 0, .call = abTransferToFixedLength };
 
 fn abIsView(_: *Runtime, _: Value, args: []const Value) Error!Value {
     const v = common.arg(args, 0);
@@ -274,6 +283,49 @@ fn abByteLengthGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     const o = try requireArrayBuffer(rt, this);
     const ab = o.kind.array_buffer;
     return Value.fromNumber(if (ab.detached) 0 else @floatFromInt(ab.data.len));
+}
+
+fn abDetachedGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireArrayBuffer(rt, this);
+    return Value.fromBool(o.kind.array_buffer.detached);
+}
+
+fn abTransfer(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return abCopyAndDetach(rt, this, args);
+}
+
+fn abTransferToFixedLength(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    return abCopyAndDetach(rt, this, args);
+}
+
+fn abCopyAndDetach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireArrayBuffer(rt, this);
+    var root_buf = [_]Value{this};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const new_len_arg = common.arg(args, 0);
+    // ES2024 §25.1.3.10 steps 3-5: ToIndex(newLength) runs before the detached check so
+    // RangeErrors win over TypeError on detached buffers and valueOf() may detach `this`.
+    const new_byte_len: usize = if (new_len_arg.isUndefined())
+        o.kind.array_buffer.data.len
+    else
+        try toIndex(rt, new_len_arg);
+
+    if (o.kind.array_buffer.detached) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Cannot transfer a detached ArrayBuffer" }});
+    }
+
+    const vr = try viewsRealm(rt);
+    const new_ab = try rt.heap.newArrayBuffer(vr.array_buffer_prototype, new_byte_len);
+    const old_data = o.kind.array_buffer.data;
+    const copy_len = @min(old_data.len, new_byte_len);
+    if (copy_len > 0) {
+        @memcpy(new_ab.kind.array_buffer.data[0..copy_len], old_data[0..copy_len]);
+    }
+    rt.heap.detachArrayBuffer(o, true);
+    return Value.fromObject(new_ab);
 }
 
 fn abSlice(rt: *Runtime, this: Value, args: []const Value) Error!Value {

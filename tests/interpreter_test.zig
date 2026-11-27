@@ -410,7 +410,7 @@ test "M11.3b: Array/String unimplemented methods, non-matching receivers, and no
 }
 
 test "M14.2: Map unsupported methods, non-Map receivers, and non-Map new() targets" {
-    try expectUnsupported("new Map().getOrInsert;", "", "('getOrInsert')");
+    try expectUnsupported("new Map().__lookupGetter__;", "", "('__lookupGetter__')");
     try expectUnsupported("let o = { get: new Map().get }; o.get('x');", "", "Unsupported(builtin)");
     try expectUnsupported("new Function();", "", "Unsupported(builtin)");
 }
@@ -2335,6 +2335,258 @@ test "ES2026 Uint8Array Base64 and Hex GC stress (collect_always + verify_heap)"
         var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
         defer err_w.deinit();
         const code = try zqjs.runSource(testing.allocator, "gc_uint8_b64_hex.js", src, .{}, .{
+            .mode = .normal,
+            .engine = engine,
+            .collect_always = true,
+            .verify_heap = true,
+        }, &out.writer, &err_w.writer);
+        try testing.expectEqual(@as(u8, 0), code);
+        try testing.expectEqualStrings("", err_w.written());
+        try testing.expectEqualStrings(expected, out.written());
+    }
+}
+
+test "ES2026 Map and WeakMap upsert (getOrInsert, getOrInsertComputed)" {
+    const src =
+        \\function errName(fn) {
+        \\    try { fn(); return "OK"; } catch (e) { return e.name; }
+        \\}
+        \\function checkMethodDesc(proto, name, len) {
+        \\    const d = Object.getOwnPropertyDescriptor(proto, name);
+        \\    return !!d && d.writable === true && d.enumerable === false && d.configurable === true
+        \\        && typeof d.value === "function" && d.value.name === name && d.value.length === len;
+        \\}
+        \\print("desc:",
+        \\    checkMethodDesc(Map.prototype, "getOrInsert", 2),
+        \\    checkMethodDesc(Map.prototype, "getOrInsertComputed", 2),
+        \\    checkMethodDesc(WeakMap.prototype, "getOrInsert", 2),
+        \\    checkMethodDesc(WeakMap.prototype, "getOrInsertComputed", 2)
+        \\);
+        \\
+        \\// Map.prototype.getOrInsert
+        \\const m = new Map();
+        \\print("m-ins:", m.getOrInsert(-0, "zero"), m.getOrInsert(0, "other"), Object.is([...m.keys()][0], 0));
+        \\m.set("u", undefined);
+        \\print("m-undef:", m.getOrInsert("u", "fallback"), m.get("u"));
+        \\print("m-recv:", errName(() => Map.prototype.getOrInsert.call({}, "a", 1)), errName(() => Map.prototype.getOrInsert.call(new WeakMap(), {}, 1)));
+        \\
+        \\// Map.prototype.getOrInsertComputed
+        \\let calls = 0;
+        \\let cbKeyIsPosZero = false;
+        \\const m2 = new Map();
+        \\const v1 = m2.getOrInsertComputed(-0, (k) => { calls++; cbKeyIsPosZero = Object.is(k, 0); return "computed"; });
+        \\const v2 = m2.getOrInsertComputed(0, () => { calls++; return "never"; });
+        \\m2.set("u", undefined);
+        \\const v3 = m2.getOrInsertComputed("u", () => { calls++; return "never"; });
+        \\print("mc-basic:", v1, v2, v3, calls, cbKeyIsPosZero);
+        \\
+        \\// Callback inserts same key -> overwritten in place
+        \\const m3 = new Map([["a", 1]]);
+        \\const ov = m3.getOrInsertComputed("b", (k) => { m3.set(k, "inner"); m3.set("c", 3); return "outer"; });
+        \\print("mc-mut:", ov, m3.get("b"), [...m3.keys()].join(","));
+        \\
+        \\// Callback clears map -> still inserts
+        \\const m4 = new Map([["x", 1]]);
+        \\const cl = m4.getOrInsertComputed("y", () => { m4.clear(); return 99; });
+        \\print("mc-clear:", cl, m4.size, m4.get("y"));
+        \\
+        \\// Non-callable throws TypeError even when key already exists; non-Map receiver throws TypeError
+        \\print("mc-err:",
+        \\    errName(() => m2.getOrInsertComputed(0, 123)),
+        \\    errName(() => m2.getOrInsertComputed("missing", null)),
+        \\    errName(() => Map.prototype.getOrInsertComputed.call({}, "a", () => 1))
+        \\);
+        \\
+        \\// WeakMap.prototype.getOrInsert & getOrInsertComputed
+        \\const wm = new WeakMap();
+        \\const kObj = {};
+        \\const kSym = Symbol("local");
+        \\print("wm-ins:",
+        \\    wm.getOrInsert(kObj, "objVal"),
+        \\    wm.getOrInsert(kObj, "ignored"),
+        \\    wm.getOrInsert(kSym, "symVal"),
+        \\    wm.getOrInsert(kSym, "ignored")
+        \\);
+        \\const kUndef = {};
+        \\wm.set(kUndef, undefined);
+        \\let wmCalls = 0;
+        \\print("wm-undef:", wm.getOrInsert(kUndef, "no"), wm.getOrInsertComputed(kUndef, () => { wmCalls++; return "no"; }), wmCalls);
+        \\
+        \\// Callback mutating WeakMap
+        \\const kMut = {};
+        \\const wmMut = wm.getOrInsertComputed(kMut, (k) => { wm.set(k, "inner"); return k === kMut ? "outer" : "bad"; });
+        \\print("wm-mut:", wmMut, wm.get(kMut));
+        \\
+        \\// Invalid WeakMap keys (registered Symbol.for and primitives) throw TypeError BEFORE callback check
+        \\const badKeys = [Symbol.for("reg"), 1, "str", null, undefined, true];
+        \\const keyErrs = badKeys.map((k) => errName(() => wm.getOrInsert(k, 1)));
+        \\const compKeyErrs = badKeys.map((k) => errName(() => wm.getOrInsertComputed(k, "not-callable")));
+        \\print("wm-badkeys:", keyErrs.every((e) => e === "TypeError"), compKeyErrs.every((e) => e === "TypeError"));
+        \\print("wm-err:",
+        \\    errName(() => wm.getOrInsertComputed(kObj, 42)),
+        \\    errName(() => WeakMap.prototype.getOrInsert.call({}, kObj, 1)),
+        \\    errName(() => WeakMap.prototype.getOrInsertComputed.call(new Map(), kObj, () => 1))
+        \\);
+    ;
+    const expected =
+        \\desc: true true true true
+        \\m-ins: zero zero true
+        \\m-undef: undefined undefined
+        \\m-recv: TypeError TypeError
+        \\mc-basic: computed computed undefined 1 true
+        \\mc-mut: outer outer a,b,c
+        \\mc-clear: 99 1 99
+        \\mc-err: TypeError TypeError TypeError
+        \\wm-ins: objVal objVal symVal symVal
+        \\wm-undef: undefined undefined 0
+        \\wm-mut: outer outer
+        \\wm-badkeys: true true
+        \\wm-err: TypeError TypeError TypeError
+        \\
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("", r.err);
+        try testing.expectEqualStrings(expected, r.out);
+    }
+}
+
+test "ES2024 ArrayBuffer detached, transfer, transferToFixedLength" {
+    const src =
+        \\function errName(fn) {
+        \\    try { fn(); return "OK"; } catch (e) { return e.name; }
+        \\}
+        \\const dDet = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "detached");
+        \\const dTr = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "transfer");
+        \\const dTrF = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "transferToFixedLength");
+        \\print("desc:",
+        \\    !!dDet && typeof dDet.get === "function" && dDet.set === undefined && dDet.enumerable === false && dDet.configurable === true && dDet.get.name === "get detached" && dDet.get.length === 0,
+        \\    !!dTr && dTr.writable === true && dTr.enumerable === false && dTr.configurable === true && dTr.value.name === "transfer" && dTr.value.length === 0,
+        \\    !!dTrF && dTrF.writable === true && dTrF.enumerable === false && dTrF.configurable === true && dTrF.value.name === "transferToFixedLength" && dTrF.value.length === 0
+        \\);
+        \\
+        \\// Same-size transfer + detach verification
+        \\const ab1 = new ArrayBuffer(4);
+        \\const u1 = new Uint8Array(ab1);
+        \\u1.set([10, 20, 30, 40]);
+        \\const dv1 = new DataView(ab1);
+        \\print("pre:", ab1.detached, ab1.byteLength);
+        \\const ab2 = ab1.transfer();
+        \\print("same:", ab1.detached, ab1.byteLength, ab2.detached, ab2.byteLength, [...new Uint8Array(ab2)].join(","));
+        \\print("views:", u1.length, errName(() => dv1.byteLength), errName(() => dv1.getUint8(0)));
+        \\
+        \\// Grow (zero-fill tail) and shrink
+        \\const ab3 = ab2.transfer(6);
+        \\print("grow:", ab2.detached, ab3.byteLength, [...new Uint8Array(ab3)].join(","));
+        \\const ab4 = ab3.transferToFixedLength(2);
+        \\print("shrink:", ab3.detached, ab4.byteLength, [...new Uint8Array(ab4)].join(","));
+        \\const ab5 = ab4.transferToFixedLength(0);
+        \\print("zero:", ab4.detached, ab5.detached, ab5.byteLength);
+        \\
+        \\// Already detached throws TypeError, but invalid newLength throws RangeError even on detached buffer
+        \\print("detached-err:",
+        \\    errName(() => ab1.transfer()),
+        \\    errName(() => ab1.transferToFixedLength()),
+        \\    errName(() => ab1.transfer(-1)),
+        \\    errName(() => ab1.transfer(Infinity)),
+        \\    errName(() => ab1.transferToFixedLength(-1)),
+        \\    errName(() => ab1.transferToFixedLength(Infinity))
+        \\);
+        \\
+        \\// newLength.valueOf() detaching receiver throws TypeError
+        \\const ab6 = new ArrayBuffer(4);
+        \\const detachInValueOf = { valueOf() { ab6.transfer(); return 4; } };
+        \\print("valueof-detach:", errName(() => ab6.transfer(detachInValueOf)), ab6.detached);
+        \\
+        \\// Incompatible receivers
+        \\print("recv:",
+        \\    errName(() => Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "detached").get.call({})),
+        \\    errName(() => ArrayBuffer.prototype.transfer.call({})),
+        \\    errName(() => ArrayBuffer.prototype.transferToFixedLength.call({}))
+        \\);
+    ;
+    const expected =
+        \\desc: true true true
+        \\pre: false 4
+        \\same: true 0 false 4 10,20,30,40
+        \\views: 0 TypeError TypeError
+        \\grow: true 6 10,20,30,40,0,0
+        \\shrink: true 2 10,20
+        \\zero: true false 0
+        \\detached-err: TypeError TypeError RangeError RangeError RangeError RangeError
+        \\valueof-detach: TypeError true
+        \\recv: TypeError TypeError TypeError
+        \\
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("", r.err);
+        try testing.expectEqualStrings(expected, r.out);
+    }
+}
+
+test "ES2023 hashbang comments end-to-end" {
+    const valid_src = "#!/usr/bin/env zqjs\nprint(42);\n";
+    const invalid_src = " #!/usr/bin/env zqjs\nprint(42);\n";
+    for (support.engines) |engine| {
+        var r_ok = try support.run(testing.allocator, valid_src, .{}, engine, .normal);
+        defer r_ok.deinit(testing.allocator);
+        try testing.expectEqualStrings("", r_ok.err);
+        try testing.expectEqualStrings("42\n", r_ok.out);
+
+        var r_err = try support.run(testing.allocator, invalid_src, .{}, engine, .normal);
+        defer r_err.deinit(testing.allocator);
+        try testing.expect(std.mem.indexOf(u8, r_err.err, "SyntaxError") != null);
+    }
+}
+
+test "ES2026 upsert and ES2024 ArrayBuffer transfer GC stress (collect_always + verify_heap)" {
+    const src =
+        \\function churn(tag) {
+        \\    for (let i = 0; i < 20; i++) {
+        \\        const tmp = { k: tag + i, arr: [i, i + 1] };
+        \\        void tmp;
+        \\    }
+        \\}
+        \\const m = new Map();
+        \\for (let i = 0; i < 10; i++) {
+        \\    const v = m.getOrInsertComputed("k" + i, (k) => {
+        \\        churn(k);
+        \\        if (i % 2 === 0) m.set(k, "temp");
+        \\        return { label: k, n: i };
+        \\    });
+        \\    if (v.n !== i) throw new Error("map mismatch");
+        \\}
+        \\const wm = new WeakMap();
+        \\const keys = [];
+        \\for (let i = 0; i < 10; i++) {
+        \\    const k = i % 2 === 0 ? { id: i } : Symbol("s" + i);
+        \\    keys.push(k);
+        \\    const v = wm.getOrInsertComputed(k, () => {
+        \\        churn("wm" + i);
+        \\        wm.set(k, "inner");
+        \\        return { idx: i };
+        \\    });
+        \\    if (v.idx !== i) throw new Error("weakmap mismatch");
+        \\}
+        \\let ab = new ArrayBuffer(4);
+        \\new Uint8Array(ab).set([1, 2, 3, 4]);
+        \\ab = ab.transfer({ valueOf() { churn("tr"); return 8; } });
+        \\ab = ab.transferToFixedLength({ valueOf() { churn("trf"); return 3; } });
+        \\print(m.size, wm.get(keys[9]).idx, ab.byteLength, [...new Uint8Array(ab)].join(","));
+    ;
+    const expected =
+        \\10 9 3 1,2,3
+        \\
+    ;
+    for (support.engines) |engine| {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer err_w.deinit();
+        const code = try zqjs.runSource(testing.allocator, "gc_upsert_transfer.js", src, .{}, .{
             .mode = .normal,
             .engine = engine,
             .collect_always = true,

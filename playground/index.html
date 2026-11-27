@@ -1,0 +1,830 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>zqjs — Browser WASM Playground</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --bg-panel: #161b22;
+      --bg-elev: #1f2630;
+      --border: #2b3441;
+      --text: #e6edf3;
+      --text-dim: #8b949e;
+      --accent: #f7a41d;
+      --accent-hover: #ffb946;
+      --ok: #3fb950;
+      --err: #f85149;
+      --err-bg: rgba(248, 81, 73, 0.12);
+      --warn: #d29922;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      min-height: 540px;
+    }
+
+    /* Top header */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 16px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      font-family: var(--mono);
+      color: var(--accent);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+    }
+
+    .badge.ready {
+      color: var(--ok);
+      border-color: rgba(63, 185, 80, 0.4);
+    }
+
+    .badge.err {
+      color: var(--err);
+      border-color: rgba(248, 81, 73, 0.45);
+    }
+
+    .preset-wrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .preset-wrap label {
+      color: var(--text-dim);
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    /* Controls bar */
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 16px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+
+    button, select {
+      font-family: var(--sans);
+      font-size: 13px;
+      color: var(--text);
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 5px 10px;
+      cursor: pointer;
+    }
+
+    button:hover, select:hover {
+      border-color: #48566a;
+    }
+
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .btn-run {
+      background: var(--accent);
+      color: #0d1117;
+      border-color: var(--accent);
+      font-weight: 600;
+      padding: 5px 14px;
+    }
+
+    .btn-run:hover:not(:disabled) {
+      background: var(--accent-hover);
+      border-color: var(--accent-hover);
+    }
+
+    .btn-stop {
+      color: var(--err);
+      border-color: rgba(248, 81, 73, 0.4);
+    }
+
+    .btn-stop:hover:not(:disabled) {
+      background: var(--err-bg);
+    }
+
+    .segmented {
+      display: inline-flex;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      background: var(--bg-panel);
+    }
+
+    .segmented button {
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      color: var(--text-dim);
+      padding: 5px 10px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .segmented button.active {
+      background: var(--bg-elev);
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .control-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-dim);
+      font-size: 12px;
+    }
+
+    .control-group input[type="checkbox"] {
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+
+    .spacer { flex: 1; }
+
+    .shortcut-hint {
+      color: var(--text-dim);
+      font-size: 11px;
+      font-family: var(--mono);
+    }
+
+    /* Main workspace */
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      min-height: 0;
+    }
+
+    .pane {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      min-width: 0;
+    }
+
+    .pane-left {
+      border-right: 1px solid var(--border);
+    }
+
+    .pane-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px;
+      height: 36px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .pane-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    textarea#editor {
+      flex: 1;
+      width: 100%;
+      margin: 0;
+      padding: 14px 16px;
+      border: none;
+      outline: none;
+      resize: none;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.55;
+      tab-size: 2;
+      white-space: pre;
+      overflow: auto;
+    }
+
+    /* Tabs */
+    .tabs {
+      display: flex;
+      gap: 4px;
+      height: 100%;
+    }
+
+    .tab-btn {
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      border-radius: 0;
+      color: var(--text-dim);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 0 10px;
+      height: 100%;
+    }
+
+    .tab-btn:hover {
+      color: var(--text);
+    }
+
+    .tab-btn.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+
+    .exit-badge {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: var(--bg-elev);
+      color: var(--text-dim);
+    }
+
+    .exit-badge.ok {
+      background: rgba(63, 185, 80, 0.14);
+      color: var(--ok);
+    }
+
+    .exit-badge.fail {
+      background: var(--err-bg);
+      color: var(--err);
+    }
+
+    .output-body {
+      flex: 1;
+      overflow: auto;
+      padding: 14px 16px;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.5;
+      background: var(--bg);
+    }
+
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    pre.code-out {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    pre.stderr-out {
+      margin: 12px 0 0 0;
+      padding: 10px 12px;
+      border-radius: 6px;
+      background: var(--err-bg);
+      border: 1px solid rgba(248, 81, 73, 0.35);
+      color: #ff9490;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    pre.stderr-out:first-child {
+      margin-top: 0;
+    }
+
+    .empty-state {
+      color: var(--text-dim);
+      font-style: italic;
+    }
+
+    /* Telemetry footer */
+    .telemetry {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      padding: 7px 16px;
+      background: var(--bg-panel);
+      border-top: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--text-dim);
+      flex-wrap: wrap;
+    }
+
+    .stat strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    @media (max-width: 860px) {
+      .app { height: auto; min-height: 100vh; }
+      main { grid-template-columns: 1fr; }
+      .pane-left {
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+        min-height: 44vh;
+      }
+      .pane-right { min-height: 44vh; }
+      .shortcut-hint { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand">
+        <h1>zqjs</h1>
+        <span id="version-badge" class="badge">loading wasm…</span>
+      </div>
+      <div class="preset-wrap">
+        <label for="preset-select">Example</label>
+        <select id="preset-select"></select>
+      </div>
+    </header>
+
+    <div class="controls">
+      <button id="run-btn" class="btn-run" disabled>Run</button>
+      <button id="reset-btn" class="btn-stop">Stop / Reset Worker</button>
+
+      <div class="segmented" role="group" aria-label="Execution engine">
+        <button id="eng-vm" class="active" data-engine="vm">VM</button>
+        <button id="eng-treewalk" data-engine="treewalk">Tree-walker</button>
+      </div>
+
+      <label class="control-group">
+        <input type="checkbox" id="module-toggle" />
+        ES Module
+      </label>
+
+      <label class="control-group">
+        Max Steps
+        <select id="max-steps">
+          <option value="100000">100K</option>
+          <option value="5000000" selected>5M</option>
+          <option value="50000000">50M</option>
+        </select>
+      </label>
+
+      <label class="control-group">
+        Max Heap
+        <select id="max-heap">
+          <option value="4194304">4 MiB</option>
+          <option value="33554432" selected>32 MiB</option>
+          <option value="134217728">128 MiB</option>
+        </select>
+      </label>
+
+      <span class="spacer"></span>
+      <span class="shortcut-hint">Cmd/Ctrl + Enter to run</span>
+    </div>
+
+    <main>
+      <section class="pane pane-left">
+        <div class="pane-header">
+          <span class="pane-title">Source</span>
+          <span id="status-text" class="pane-title">Idle</span>
+        </div>
+        <textarea id="editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
+      </section>
+
+      <section class="pane pane-right">
+        <div class="pane-header">
+          <div class="tabs" role="tablist">
+            <button class="tab-btn active" data-tab="output">Output</button>
+            <button class="tab-btn" data-tab="bytecode">Bytecode</button>
+            <button class="tab-btn" data-tab="ast">AST</button>
+          </div>
+          <span id="exit-badge" class="exit-badge">exit —</span>
+        </div>
+
+        <div class="output-body">
+          <div id="panel-output" class="tab-panel active">
+            <div class="empty-state">Click Run (or press Cmd/Ctrl+Enter) to execute JavaScript in WASM.</div>
+          </div>
+          <div id="panel-bytecode" class="tab-panel">
+            <pre id="bytecode-pre" class="code-out empty-state">No bytecode yet.</pre>
+          </div>
+          <div id="panel-ast" class="tab-panel">
+            <pre id="ast-pre" class="code-out empty-state">No AST yet.</pre>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="telemetry">
+      <span class="stat">Time: <strong id="stat-time">—</strong></span>
+      <span class="stat">Steps: <strong id="stat-steps">—</strong></span>
+      <span class="stat">Peak Heap: <strong id="stat-peak">—</strong></span>
+      <span class="stat">GC: <strong id="stat-gc">—</strong></span>
+    </footer>
+  </div>
+
+  <script>
+    const PRESETS = [
+      {
+        name: "1. Fibonacci & Closures",
+        isModule: false,
+        code: `// Memoized Fibonacci using closures and Map
+function memoize(fn) {
+  const cache = new Map();
+  return function (n) {
+    if (cache.has(n)) return cache.get(n);
+    const value = fn(n);
+    cache.set(n, value);
+    return value;
+  };
+}
+
+const fib = memoize((n) => (n < 2 ? n : fib(n - 1) + fib(n - 2)));
+
+for (let i = 0; i <= 12; i++) {
+  console.log(\`fib(\${i}) = \${fib(i)}\`);
+}
+console.log("fib(40) =", fib(40));
+`,
+      },
+      {
+        name: "2. ES2025 Classes & Private Fields",
+        isModule: false,
+        code: `// Classes, private fields, getters, and static blocks
+class Counter {
+  #value = 0;
+  #step;
+
+  constructor(initial = 0, step = 1) {
+    this.#value = initial;
+    this.#step = step;
+  }
+
+  inc() {
+    this.#value += this.#step;
+    return this;
+  }
+
+  get value() {
+    return this.#value;
+  }
+
+  static fromRange(start, count, step = 2) {
+    const c = new Counter(start, step);
+    for (let i = 0; i < count; i++) c.inc();
+    return c;
+  }
+}
+
+const c = Counter.fromRange(10, 4, 3);
+console.log("Counter value:", c.value);
+console.log("Private field hidden from keys:", Object.keys(c));
+`,
+      },
+      {
+        name: "3. Uint8Array Base64 & Hex",
+        isModule: false,
+        code: `// ES2025 Uint8Array Base64 & Hex conversions
+const bytes = new Uint8Array([0x7a, 0x71, 0x6a, 0x73, 0x20, 0x57, 0x41, 0x53, 0x4d]);
+
+const hex = bytes.toHex();
+const b64 = bytes.toBase64();
+console.log("Hex:   ", hex);
+console.log("Base64:", b64);
+
+const decoded = Uint8Array.fromBase64(b64);
+console.log("Round-trip hex match:", decoded.toHex() === hex);
+
+const fromHex = Uint8Array.fromHex("deadbeef");
+console.log("fromHex:", Array.from(fromHex));
+`,
+      },
+      {
+        name: "4. RegExp Unicode & Proxy",
+        isModule: false,
+        code: `// RegExp named captures + Proxy trap logging
+const re = /(?<lang>[a-z]+)-(?<year>\\d{4})/u;
+const match = re.exec("engine: zqjs-2026!");
+console.log("Matched groups:", match.groups.lang, match.groups.year);
+
+const target = { host: "wasm32-freestanding", sandbox: true };
+const tracked = new Proxy(target, {
+  get(obj, prop, receiver) {
+    console.log(\`[proxy get] \${String(prop)}\`);
+    return Reflect.get(obj, prop, receiver);
+  },
+  set(obj, prop, value, receiver) {
+    console.log(\`[proxy set] \${String(prop)} = \${value}\`);
+    return Reflect.set(obj, prop, value, receiver);
+  },
+});
+
+console.log("host:", tracked.host);
+tracked.version = 1;
+console.log("target:", JSON.stringify(target));
+`,
+      },
+      {
+        name: "5. Async / Await & Generators",
+        isModule: false,
+        code: `// Generators + Promise microtasks with async/await
+function* range(start, end) {
+  for (let i = start; i <= end; i++) yield i;
+}
+
+async function sumSquares(iter) {
+  let total = 0;
+  for (const n of iter) {
+    const sq = await Promise.resolve(n * n);
+    total += sq;
+  }
+  return total;
+}
+
+sumSquares(range(1, 6)).then((total) => {
+  console.log("Sum of squares 1..6:", total);
+});
+`,
+      },
+      {
+        name: "6. Sandbox Limit Demo (while (true))",
+        isModule: false,
+        code: `// Deterministic step budget stops runaway loops cleanly!
+let iterations = 0;
+while (true) {
+  iterations++;
+}
+`,
+      },
+    ];
+
+    const editor = document.getElementById("editor");
+    const presetSelect = document.getElementById("preset-select");
+    const runBtn = document.getElementById("run-btn");
+    const resetBtn = document.getElementById("reset-btn");
+    const versionBadge = document.getElementById("version-badge");
+    const statusText = document.getElementById("status-text");
+    const exitBadge = document.getElementById("exit-badge");
+    const moduleToggle = document.getElementById("module-toggle");
+    const maxStepsSelect = document.getElementById("max-steps");
+    const maxHeapSelect = document.getElementById("max-heap");
+    const panelOutput = document.getElementById("panel-output");
+    const bytecodePre = document.getElementById("bytecode-pre");
+    const astPre = document.getElementById("ast-pre");
+    const statTime = document.getElementById("stat-time");
+    const statSteps = document.getElementById("stat-steps");
+    const statPeak = document.getElementById("stat-peak");
+    const statGc = document.getElementById("stat-gc");
+
+    let engine = "vm";
+    let worker = null;
+    let workerReady = false;
+    let running = false;
+
+    function formatBytes(bytes) {
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+      return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
+    }
+
+    function formatNumber(n) {
+      return Number(n).toLocaleString("en-US");
+    }
+
+    function spawnWorker() {
+      if (worker) {
+        worker.terminate();
+        worker = null;
+      }
+      workerReady = false;
+      running = false;
+      runBtn.disabled = true;
+      versionBadge.textContent = "loading wasm…";
+      versionBadge.className = "badge";
+      statusText.textContent = "Loading WASM";
+
+      worker = new Worker("./worker.js");
+      worker.onmessage = (event) => {
+        const msg = event.data;
+        if (!msg || typeof msg !== "object") return;
+
+        if (msg.type === "ready") {
+          workerReady = true;
+          runBtn.disabled = false;
+          versionBadge.textContent = `v${msg.version}`;
+          versionBadge.className = "badge ready";
+          statusText.textContent = "Ready";
+        } else if (msg.type === "result") {
+          running = false;
+          runBtn.disabled = false;
+          statusText.textContent = "Done";
+          renderResult(msg.data, msg.elapsedMs);
+        } else if (msg.type === "error") {
+          running = false;
+          runBtn.disabled = !workerReady;
+          statusText.textContent = "Error";
+          renderWorkerError(msg.message);
+        }
+      };
+
+      worker.onerror = (err) => {
+        running = false;
+        workerReady = false;
+        runBtn.disabled = true;
+        versionBadge.textContent = "worker error";
+        versionBadge.className = "badge err";
+        statusText.textContent = "Error";
+        renderWorkerError(err.message || "Worker crashed.");
+      };
+    }
+
+    function renderWorkerError(message) {
+      exitBadge.textContent = "error";
+      exitBadge.className = "exit-badge fail";
+      panelOutput.innerHTML = "";
+      const pre = document.createElement("pre");
+      pre.className = "stderr-out";
+      pre.textContent = message;
+      panelOutput.appendChild(pre);
+    }
+
+    function renderResult(data, elapsedMs) {
+      exitBadge.textContent = `exit ${data.exitCode}`;
+      exitBadge.className = data.ok ? "exit-badge ok" : "exit-badge fail";
+
+      panelOutput.innerHTML = "";
+      const hasStdout = data.stdout && data.stdout.length > 0;
+      const hasStderr = data.stderr && data.stderr.length > 0;
+
+      if (hasStdout) {
+        const pre = document.createElement("pre");
+        pre.className = "code-out";
+        pre.textContent = data.stdout;
+        panelOutput.appendChild(pre);
+      }
+      if (hasStderr) {
+        const pre = document.createElement("pre");
+        pre.className = "stderr-out";
+        pre.textContent = data.stderr;
+        panelOutput.appendChild(pre);
+      }
+      if (!hasStdout && !hasStderr) {
+        const empty = document.createElement("div");
+        empty.className = "empty-state";
+        empty.textContent = "(no output)";
+        panelOutput.appendChild(empty);
+      }
+
+      if (data.bytecode && data.bytecode.length > 0) {
+        bytecodePre.className = "code-out";
+        bytecodePre.textContent = data.bytecode;
+      } else {
+        bytecodePre.className = "code-out empty-state";
+        bytecodePre.textContent = moduleToggle.checked
+          ? "Bytecode disassembly is only shown for scripts."
+          : "No bytecode (compile failed or skipped).";
+      }
+
+      if (data.ast && data.ast.length > 0) {
+        astPre.className = "code-out";
+        astPre.textContent = data.ast;
+      } else {
+        astPre.className = "code-out empty-state";
+        astPre.textContent = moduleToggle.checked
+          ? "AST dump is only shown for scripts."
+          : "No AST (parse/resolve failed).";
+      }
+
+      const stats = data.stats || {};
+      const totalGc = stats.collections || 0;
+      const minorGc = stats.minorCollections || 0;
+      const majorGc = Math.max(0, totalGc - minorGc);
+
+      statTime.textContent = `${elapsedMs.toFixed(2)} ms`;
+      statSteps.textContent = formatNumber(stats.steps || 0);
+      statPeak.textContent = formatBytes(stats.peakHeapBytes || 0);
+      statGc.textContent = `${totalGc} (${minorGc} minor / ${majorGc} major)`;
+    }
+
+    function runCode() {
+      if (!worker || !workerReady || running) return;
+      running = true;
+      runBtn.disabled = true;
+      statusText.textContent = "Running…";
+      worker.postMessage({
+        type: "eval",
+        code: editor.value,
+        engine,
+        isModule: moduleToggle.checked,
+        maxSteps: Number(maxStepsSelect.value),
+        maxHeapBytes: Number(maxHeapSelect.value),
+      });
+    }
+
+    // Populate presets
+    PRESETS.forEach((preset, idx) => {
+      const opt = document.createElement("option");
+      opt.value = String(idx);
+      opt.textContent = preset.name;
+      presetSelect.appendChild(opt);
+    });
+
+    function loadPreset(idx) {
+      const preset = PRESETS[idx] || PRESETS[0];
+      editor.value = preset.code;
+      moduleToggle.checked = Boolean(preset.isModule);
+    }
+
+    presetSelect.addEventListener("change", () => {
+      loadPreset(Number(presetSelect.value));
+    });
+
+    runBtn.addEventListener("click", runCode);
+    resetBtn.addEventListener("click", () => {
+      spawnWorker();
+      exitBadge.textContent = "reset";
+      exitBadge.className = "exit-badge";
+    });
+
+    document.querySelectorAll(".segmented button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".segmented button").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        engine = btn.dataset.engine;
+      });
+    });
+
+    document.querySelectorAll(".tab-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+        document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+        btn.classList.add("active");
+        document.getElementById(`panel-${btn.dataset.tab}`).classList.add("active");
+      });
+    });
+
+    editor.addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        runCode();
+        return;
+      }
+      if (e.key === "Tab") {
+        e.preventDefault();
+        const start = editor.selectionStart;
+        const end = editor.selectionEnd;
+        const val = editor.value;
+        editor.value = val.slice(0, start) + "  " + val.slice(end);
+        editor.selectionStart = editor.selectionEnd = start + 2;
+      }
+    });
+
+    loadPreset(0);
+    spawnWorker();
+  </script>
+</body>
+</html>

@@ -27,6 +27,7 @@
       --selection: rgba(216, 155, 60, 0.28);
       --hl-comment: #6c7380;
       --hl-string: #9fbf7a;
+      --hl-escape: #e5c07b;
       --hl-number: #d6a06b;
       --hl-keyword: #c49bd6;
       --hl-global: #7fb2d9;
@@ -56,6 +57,7 @@
       --selection: rgba(184, 110, 0, 0.2);
       --hl-comment: #8d9097;
       --hl-string: #4f7a28;
+      --hl-escape: #a0522d;
       --hl-number: #a5531b;
       --hl-keyword: #8a3fa0;
       --hl-global: #2a6496;
@@ -392,6 +394,7 @@
 
     .tok-comment { color: var(--hl-comment); font-style: italic; }
     .tok-string { color: var(--hl-string); }
+    .tok-escape { color: var(--hl-escape); font-weight: 600; }
     .tok-number { color: var(--hl-number); }
     .tok-keyword { color: var(--hl-keyword); }
     .tok-global { color: var(--hl-global); }
@@ -882,6 +885,18 @@ while (true) {
       return `<span class="${cls}">${escapeHtml(text)}</span>`;
     }
 
+    // A string literal with its escape sequences (\n, \', \x41, \u{1F600}, …) picked out.
+    const ESCAPE_SEQ = /\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]*\}?|u[0-9a-fA-F]{4}|[\s\S])/g;
+    function stringHtml(text) {
+      let out = "";
+      let last = 0;
+      for (const m of text.matchAll(ESCAPE_SEQ)) {
+        out += escapeHtml(text.slice(last, m.index)) + span("tok-escape", m[0]);
+        last = m.index + m[0].length;
+      }
+      return `<span class="tok-string">${out}${escapeHtml(text.slice(last))}</span>`;
+    }
+
     function formatBytes(bytes) {
       if (bytes < 1024) return `${bytes} B`;
       if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
@@ -954,7 +969,7 @@ while (true) {
         out += escapeHtml(src.slice(last, m.index));
         last = m.index + m[0].length;
         if (m[1]) out += span("tok-comment", m[0]);
-        else if (m[2]) out += span("tok-string", m[0]);
+        else if (m[2]) out += stringHtml(m[0]);
         else if (m[3]) out += span("tok-number", m[0]);
         else if (KEYWORD_SET.has(m[0])) out += span("tok-keyword", m[0]);
         else if (GLOBAL_SET.has(m[0]) && src[m.index - 1] !== ".") out += span("tok-global", m[0]);
@@ -1175,7 +1190,7 @@ while (true) {
     }
 
     function atomHtml(n, isHead) {
-      if (n.s !== undefined) return span("tok-string", n.s);
+      if (n.s !== undefined) return stringHtml(n.s);
       const a = n.a;
       if (isHead) return span(AST_NODES.has(a) ? "tok-node" : "tok-head", a);
       if (/^-?(?:\d|\.\d)/.test(a) || a === "NaN" || a === "Infinity") return span("tok-number", a);
@@ -1234,8 +1249,8 @@ while (true) {
       m = /^(\s+)([a-z]\d+)(\s+)(.*)$/.exec(line);
       if (m) {
         const v = m[4];
-        const cls = /^"/.test(v) ? "tok-string" : /^-?\d/.test(v) ? "tok-number" : "tok-global";
-        return m[1] + span("tok-annot", m[2]) + m[3] + span(cls, v);
+        if (/^"/.test(v)) return m[1] + span("tok-annot", m[2]) + m[3] + stringHtml(v);
+        return m[1] + span("tok-annot", m[2]) + m[3] + span(/^-?\d/.test(v) ? "tok-number" : "tok-global", v);
       }
       return escapeHtml(line);
     }

@@ -793,3 +793,74 @@ test "ES module abrupt completion caching: direct throw, export default throw, a
         try testing.expectEqualStrings("1 true cached 1\n", res.out);
     }
 }
+
+test "CLI --sandbox: runModule with allow_fs_imports = false (both engines)" {
+    for ([_]Engine{ .vm, .treewalk }) |engine| {
+        const opts: zqjs.RunOptions = .{ .engine = engine, .allow_fs_imports = false };
+
+        // 1. Self-contained module executes cleanly and import.meta.url equals logical name (no cwd realpath leak).
+        {
+            var out_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer out_buf.deinit();
+            var err_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer err_buf.deinit();
+
+            const code = try zqjs.runModule(
+                testing.allocator,
+                "src/main.zig",
+                "export const x = 7; print(x, import.meta.url);",
+                std.testing.io,
+                .{},
+                opts,
+                &out_buf.writer,
+                &err_buf.writer,
+            );
+            try testing.expectEqual(@as(u8, 0), code);
+            try testing.expectEqualStrings("7 src/main.zig\n", out_buf.written());
+            try testing.expectEqualStrings("", err_buf.written());
+        }
+
+        // 2. Static import fails with Cannot find module (exit 1) without touching disk.
+        {
+            var out_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer out_buf.deinit();
+            var err_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer err_buf.deinit();
+
+            const code = try zqjs.runModule(
+                testing.allocator,
+                "<sandbox>",
+                "import './src/main.zig';",
+                std.testing.io,
+                .{},
+                opts,
+                &out_buf.writer,
+                &err_buf.writer,
+            );
+            try testing.expectEqual(@as(u8, 1), code);
+            try testing.expect(std.mem.indexOf(u8, err_buf.written(), "Cannot find module") != null);
+        }
+
+        // 3. Dynamic import() rejects with TypeError without touching disk.
+        {
+            var out_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer out_buf.deinit();
+            var err_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer err_buf.deinit();
+
+            const code = try zqjs.runModule(
+                testing.allocator,
+                "<sandbox>",
+                "try { await import('./src/main.zig'); print('BAD'); } catch (e) { print('BLOCKED', e instanceof TypeError); }",
+                std.testing.io,
+                .{},
+                opts,
+                &out_buf.writer,
+                &err_buf.writer,
+            );
+            try testing.expectEqual(@as(u8, 0), code);
+            try testing.expectEqualStrings("BLOCKED true\n", out_buf.written());
+            try testing.expectEqualStrings("", err_buf.written());
+        }
+    }
+}

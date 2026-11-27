@@ -1,28 +1,36 @@
 //! CLI.
-//!   zqjs [options] FILE | zqjs [options] -e SOURCE
+//!   zqjs [options] FILE | zqjs [options] - | zqjs [options] -e SOURCE
 //! options:
+//!   -V, --version    print version and exit
+//!   --sandbox        disable JS/REPL filesystem access (imports, .load/.save, history)
 //!   --test           harness output mode (used to compare with node)
 //!   --dump-ast       print the resolved AST instead of running
 //!   --dump-bytecode  compile, verify and print the bytecode instead of running
 //!   --max-steps N    execution budget; 0 = unlimited (default: cli_default_steps)
+//!   --max-heap SIZE  heap limit (e.g. 64M, 512K, 1G; default: 256M)
 //!   --engine=E       vm (default) or treewalk (the reference interpreter)
 //!   --trace          VM: print each instruction and the operand stack to stderr
 //!   --verify-heap    verify the heap after every collection (a GC debugging aid)
 
 const std = @import("std");
+const cli_options = @import("cli_options");
 const zqjs = @import("zqjs_internal");
 const api = @import("zqjs");
 
 const usage =
     \\usage: zqjs [--repl] [options]
-    \\       zqjs [--test | --dump-ast | --dump-bytecode] [options] FILE
+    \\       zqjs [--test | --dump-ast | --dump-bytecode] [options] FILE | -
     \\       zqjs [--test | --dump-ast | --dump-bytecode] [options] -e SOURCE
+    \\       zqjs -V | --version
     \\
+    \\  -V, --version      print version and exit
     \\  --repl             start the interactive REPL
     \\  --module           execute input as an ES Module (default for .mjs files)
     \\  --preload FILE     execute script FILE in the same runtime before the entry (repeatable)
+    \\  --sandbox          disable JS/REPL filesystem access (imports, .load/.save, history)
     \\  --no-color         disable ANSI colors in REPL output
     \\  --max-steps N      stop after N execution steps (0 = unlimited, default 200000000)
+    \\  --max-heap SIZE    heap limit in bytes with optional B/K/M/G suffix (default 256M)
     \\  --engine=vm        run on the bytecode VM (default)
     \\  --engine=treewalk  run on the tree-walking reference interpreter
     \\  --trace            VM: print each instruction and the operand stack to stderr
@@ -65,17 +73,24 @@ pub fn main(init: std.process.Init) !u8 {
     var command: Command = .run;
     var no_color = false;
     var force_module = false;
+    var sandbox = false;
     var preloads: std.ArrayList([]const u8) = .empty;
     var limits: zqjs.Limits = .{ .max_steps = cli_default_steps };
     var options: zqjs.RunOptions = .{};
-    while (rest.len > 0 and std.mem.startsWith(u8, rest[0], "--")) {
-        if (std.mem.eql(u8, rest[0], "--repl")) {
+    while (rest.len > 0 and (std.mem.startsWith(u8, rest[0], "--") or std.mem.eql(u8, rest[0], "-V"))) {
+        if (std.mem.eql(u8, rest[0], "--version") or std.mem.eql(u8, rest[0], "-V")) {
+            try out.print("zqjs {s}\n", .{cli_options.version});
+            return 0;
+        } else if (std.mem.eql(u8, rest[0], "--repl")) {
             command = .repl;
         } else if (std.mem.eql(u8, rest[0], "--module")) {
             force_module = true;
         } else if (std.mem.eql(u8, rest[0], "--preload") and rest.len > 1) {
             try preloads.append(arena, rest[1]);
             rest = rest[1..];
+        } else if (std.mem.eql(u8, rest[0], "--sandbox")) {
+            sandbox = true;
+            options.allow_fs_imports = false;
         } else if (std.mem.eql(u8, rest[0], "--no-color")) {
             no_color = true;
         } else if (std.mem.eql(u8, rest[0], "--test")) {
@@ -100,6 +115,13 @@ pub fn main(init: std.process.Init) !u8 {
             };
             limits.max_steps = if (n == 0) std.math.maxInt(u64) else n;
             rest = rest[1..];
+        } else if (std.mem.eql(u8, rest[0], "--max-heap") and rest.len > 1) {
+            const bytes = zqjs.limits.parseByteSize(rest[1]) orelse {
+                try err.print("--max-heap: invalid size: {s}\n", .{rest[1]});
+                return 2;
+            };
+            limits.max_heap_bytes = bytes;
+            rest = rest[1..];
         } else {
             try err.writeAll(usage);
             return 2;
@@ -114,7 +136,9 @@ pub fn main(init: std.process.Init) !u8 {
         }
         const env_no_color = init.environ_map.get("NO_COLOR") != null;
         const color = !no_color and !env_no_color and zqjs.repl.editor.LineEditor.isTty();
-        const history_path: ?[]const u8 = if (init.environ_map.get("ZQJS_REPL_HISTORY")) |hp|
+        const history_path: ?[]const u8 = if (sandbox)
+            null
+        else if (init.environ_map.get("ZQJS_REPL_HISTORY")) |hp|
             (if (hp.len == 0) null else hp)
         else if (init.environ_map.get("HOME")) |home|
             try std.fmt.allocPrint(arena, "{s}/.zqjs_history", .{home})
@@ -127,6 +151,7 @@ pub fn main(init: std.process.Init) !u8 {
             .trace = options.trace != null,
             .verify_heap = options.verify_heap,
             .color = color,
+            .sandbox = sandbox,
             .io = io,
             .history_path = history_path,
         });
@@ -135,8 +160,30 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     const is_eval = rest.len == 2 and std.mem.eql(u8, rest[0], "-e");
+    const is_stdin = rest.len == 1 and std.mem.eql(u8, rest[0], "-");
     const name: []const u8, const source: []const u8 = blk: {
         if (is_eval) break :blk .{ "<eval>", rest[1] };
+        if (is_stdin) {
+            var in_buf: [4096]u8 = undefined;
+            var stdin_reader = std.Io.File.stdin().readerStreaming(io, &in_buf);
+            const data = stdin_reader.interface.allocRemaining(arena, .limited(limits.max_source_bytes + 1)) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.StreamTooLong => {
+                    try err.print("<stdin>: LimitExceeded(source_bytes)\n", .{});
+                    return 1;
+                },
+                error.ReadFailed => {
+                    const err_name = if (stdin_reader.err) |re| @errorName(re) else @errorName(e);
+                    try err.print("<stdin>: cannot read stdin: {s}\n", .{err_name});
+                    return 1;
+                },
+            };
+            if (data.len > limits.max_source_bytes) {
+                try err.print("<stdin>: LimitExceeded(source_bytes)\n", .{});
+                return 1;
+            }
+            break :blk .{ "<stdin>", data };
+        }
         if (rest.len == 1) break :blk .{ rest[0], std.Io.Dir.cwd().readFileAlloc(io, rest[0], arena, .limited(limits.max_source_bytes + 1)) catch |e| switch (e) {
             error.StreamTooLong => {
                 try err.print("{s}: LimitExceeded(source_bytes)\n", .{rest[0]});
@@ -151,7 +198,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
 
-    const is_module = force_module or (!is_eval and std.mem.endsWith(u8, name, ".mjs"));
+    const is_module = force_module or (!is_eval and !is_stdin and std.mem.endsWith(u8, name, ".mjs"));
 
     switch (command) {
         .run => {
@@ -162,7 +209,7 @@ pub fn main(init: std.process.Init) !u8 {
                 return zqjs.runModule(gpa, name, source, io, limits, options, out, err);
             }
             if (options.engine == .vm and options.trace == null and !options.verify_heap) {
-                return runPublic(gpa, io, name, source, limits, out, err);
+                return runPublic(gpa, io, name, source, limits, options.allow_fs_imports, out, err);
             }
             return zqjs.runSource(gpa, name, source, limits, options, out, err);
         },
@@ -216,7 +263,9 @@ fn runWithPreloads(
         .max_source_bytes = limits.max_source_bytes,
         .fallback_referrer = name,
     };
-    rt.modules.loader = fs_loader.loader();
+    if (options.allow_fs_imports) {
+        rt.modules.loader = fs_loader.loader();
+    }
 
     for (preloads) |preload_path| {
         const preload_src = std.Io.Dir.cwd().readFileAlloc(io, preload_path, arena, .limited(limits.max_source_bytes + 1)) catch |e| switch (e) {
@@ -236,10 +285,13 @@ fn runWithPreloads(
     }
 
     if (is_module) {
-        const canonical = zqjs.module.resolveFsPath(gpa, io, null, name) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ModuleNotFound => try gpa.dupe(u8, name),
-        };
+        const canonical = if (options.allow_fs_imports)
+            zqjs.module.resolveFsPath(gpa, io, null, name) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ModuleNotFound => try gpa.dupe(u8, name),
+            }
+        else
+            try gpa.dupe(u8, name);
         defer gpa.free(canonical);
 
         var mod_diag: zqjs.module.ModuleDiag = .{};
@@ -471,7 +523,7 @@ fn writeThrown(rt: *zqjs.Runtime, mode: zqjs.RunMode, report: *std.Io.Writer) st
     }
 }
 
-fn runPublic(gpa: std.mem.Allocator, io: std.Io, name: []const u8, source: []const u8, limits: api.Limits, out: *std.Io.Writer, err: *std.Io.Writer) !u8 {
+fn runPublic(gpa: std.mem.Allocator, io: std.Io, name: []const u8, source: []const u8, limits: api.Limits, allow_fs_imports: bool, out: *std.Io.Writer, err: *std.Io.Writer) !u8 {
     const rt = try api.Runtime.create(gpa, .{ .limits = limits, .output = out });
     defer rt.destroy();
 
@@ -481,7 +533,9 @@ fn runPublic(gpa: std.mem.Allocator, io: std.Io, name: []const u8, source: []con
         .max_source_bytes = limits.max_source_bytes,
         .fallback_referrer = name,
     };
-    rt.setModuleLoader(fs_loader.loader()) catch unreachable;
+    if (allow_fs_imports) {
+        rt.setModuleLoader(fs_loader.loader()) catch unreachable;
+    }
 
     var diag: api.Diagnostic = .{};
     const program = rt.compile(name, source, &diag) catch |e| switch (e) {

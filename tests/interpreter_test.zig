@@ -2081,3 +2081,267 @@ test "ES2025 §10.4.4.7 mapped arguments: escaping closure and GC stress (collec
         try testing.expectEqualStrings(expected, out.written());
     }
 }
+
+test "ES2026 Uint8Array Base64 and Hex methods (dual-engine)" {
+    const src =
+        \\// 1. Method presence & descriptors: ONLY on Uint8Array / Uint8Array.prototype
+        \\const TA = Object.getPrototypeOf(Uint8Array);
+        \\const staticNames = ["fromBase64", "fromHex"];
+        \\const protoNames = ["toBase64", "toHex", "setFromBase64", "setFromHex"];
+        \\const expectedLengths = { fromBase64: 1, fromHex: 1, toBase64: 0, toHex: 0, setFromBase64: 1, setFromHex: 1 };
+        \\let descOk = true;
+        \\for (const name of staticNames) {
+        \\    const d = Object.getOwnPropertyDescriptor(Uint8Array, name);
+        \\    if (!d || typeof d.value !== "function" || !d.writable || d.enumerable || !d.configurable) descOk = false;
+        \\    if (d.value.name !== name || d.value.length !== expectedLengths[name]) descOk = false;
+        \\    if (name in TA || name in Int8Array || name in Uint8ClampedArray) descOk = false;
+        \\}
+        \\for (const name of protoNames) {
+        \\    const d = Object.getOwnPropertyDescriptor(Uint8Array.prototype, name);
+        \\    if (!d || typeof d.value !== "function" || !d.writable || d.enumerable || !d.configurable) descOk = false;
+        \\    if (d.value.name !== name || d.value.length !== expectedLengths[name]) descOk = false;
+        \\    if (name in TA.prototype || name in Int8Array.prototype || name in Uint8ClampedArray.prototype) descOk = false;
+        \\}
+        \\print("desc:", descOk);
+        \\
+        \\// 2. toBase64 / fromBase64 roundtrips, base64url, omitPadding
+        \\const bytes = new Uint8Array([0xfb, 0xff, 0xbf, 0x00, 0x66]);
+        \\const b64 = bytes.toBase64();
+        \\const b64NoPad = bytes.toBase64({ omitPadding: true });
+        \\const b64url = bytes.toBase64({ alphabet: "base64url" });
+        \\const b64urlNoPad = bytes.toBase64({ alphabet: "base64url", omitPadding: true });
+        \\print("encode:", b64, b64NoPad, b64url, b64urlNoPad, new Uint8Array(0).toBase64());
+        \\print("rt:", [...Uint8Array.fromBase64(b64)].join(","), [...Uint8Array.fromBase64(b64NoPad)].join(","));
+        \\print("rt-url:", [...Uint8Array.fromBase64(b64url, { alphabet: "base64url" })].join(","), [...Uint8Array.fromBase64(b64urlNoPad, { alphabet: "base64url" })].join(","));
+        \\
+        \\// 3. Whitespace & lastChunkHandling modes
+        \\print("ws5:", [...Uint8Array.fromBase64("\t\n\f\r Zg = = \t\r\n")].join(","));
+        \\function errName(fn) { try { fn(); return "ok"; } catch (e) { return e.name; } }
+        \\print("ws-bad:", errName(() => Uint8Array.fromBase64("\vZg==")), errName(() => Uint8Array.fromBase64("\u00A0Zg==")));
+        \\print("alpha-mismatch:", errName(() => Uint8Array.fromBase64("-_==")), errName(() => Uint8Array.fromBase64("+/==", { alphabet: "base64url" })));
+        \\print("lch-1char:",
+        \\    errName(() => Uint8Array.fromBase64("Z")),
+        \\    errName(() => Uint8Array.fromBase64("Z", { lastChunkHandling: "strict" })),
+        \\    Uint8Array.fromBase64("Z", { lastChunkHandling: "stop-before-partial" }).length
+        \\);
+        \\print("lch-2char:",
+        \\    [...Uint8Array.fromBase64("Zg")].join(","),
+        \\    errName(() => Uint8Array.fromBase64("Zg", { lastChunkHandling: "strict" })),
+        \\    Uint8Array.fromBase64("Zg", { lastChunkHandling: "stop-before-partial" }).length
+        \\);
+        \\print("lch-pad-stop:",
+        \\    [...Uint8Array.fromBase64("Zg==", { lastChunkHandling: "stop-before-partial" })].join(","),
+        \\    Uint8Array.fromBase64("Zg=", { lastChunkHandling: "stop-before-partial" }).length,
+        \\    errName(() => Uint8Array.fromBase64("Zg=a", { lastChunkHandling: "stop-before-partial" }))
+        \\);
+        \\print("overflow-bits:",
+        \\    [...Uint8Array.fromBase64("Zh==")].join(","),
+        \\    errName(() => Uint8Array.fromBase64("Zh==", { lastChunkHandling: "strict" })),
+        \\    [...Uint8Array.fromBase64("Zh==", { lastChunkHandling: "stop-before-partial" })].join(","),
+        \\    errName(() => Uint8Array.fromBase64("Zm9=", { lastChunkHandling: "strict" })),
+        \\    [...Uint8Array.fromBase64("Zm9=")].join(",")
+        \\);
+        \\print("bad-pad:",
+        \\    errName(() => Uint8Array.fromBase64("=")),
+        \\    errName(() => Uint8Array.fromBase64("===")),
+        \\    errName(() => Uint8Array.fromBase64("Zg=")),
+        \\    errName(() => Uint8Array.fromBase64("Zg==a"))
+        \\);
+        \\
+        \\// 4. Receiver, argument, options, and detached buffer validation
+        \\print("recv:",
+        \\    errName(() => Uint8Array.prototype.toBase64.call(new Uint8ClampedArray(1))),
+        \\    errName(() => Uint8Array.prototype.toBase64.call(new Int8Array(1))),
+        \\    errName(() => Uint8Array.prototype.toHex.call({})),
+        \\    errName(() => Uint8Array.prototype.setFromBase64.call(new Uint8ClampedArray(1), "Zg==")),
+        \\    errName(() => Uint8Array.prototype.setFromHex.call(new Int8Array(1), "66"))
+        \\);
+        \\print("str-arg:",
+        \\    errName(() => Uint8Array.fromBase64(new String("Zg=="))),
+        \\    errName(() => Uint8Array.fromBase64(123)),
+        \\    errName(() => Uint8Array.fromHex(undefined)),
+        \\    errName(() => new Uint8Array(4).setFromBase64(null)),
+        \\    errName(() => new Uint8Array(4).setFromHex(new String("66")))
+        \\);
+        \\print("opts-bad:",
+        \\    errName(() => Uint8Array.fromBase64("Zg==", null)),
+        \\    errName(() => Uint8Array.fromBase64("Zg==", 42)),
+        \\    errName(() => Uint8Array.fromBase64("Zg==", { alphabet: "hex" })),
+        \\    errName(() => Uint8Array.fromBase64("Zg==", { alphabet: 1 })),
+        \\    errName(() => Uint8Array.fromBase64("Zg==", { lastChunkHandling: "bad" })),
+        \\    errName(() => new Uint8Array(1).toBase64("base64"))
+        \\);
+        \\const order = [];
+        \\new Uint8Array([1]).toBase64({
+        \\    get alphabet() { order.push("a"); return "base64"; },
+        \\    get omitPadding() { order.push("o"); return true; },
+        \\});
+        \\Uint8Array.fromBase64("Zg==", {
+        \\    get alphabet() { order.push("fa"); return "base64"; },
+        \\    get lastChunkHandling() { order.push("fl"); return "strict"; },
+        \\});
+        \\print("opt-order:", order.join(","));
+        \\const det1 = new Uint8Array([1, 2, 3]);
+        \\structuredClone(det1.buffer, { transfer: [det1.buffer] });
+        \\print("pre-detached:",
+        \\    errName(() => det1.toBase64()),
+        \\    errName(() => det1.toHex()),
+        \\    errName(() => det1.setFromBase64("Zg==")),
+        \\    errName(() => det1.setFromHex("66"))
+        \\);
+        \\const det2 = new Uint8Array([1, 2, 3]);
+        \\const det3 = new Uint8Array(3);
+        \\print("getter-detached:",
+        \\    errName(() => det2.toBase64({ get alphabet() { structuredClone(det2.buffer, { transfer: [det2.buffer] }); return "base64"; } })),
+        \\    errName(() => det3.setFromBase64("Zg==", { get lastChunkHandling() { structuredClone(det3.buffer, { transfer: [det3.buffer] }); return "loose"; } }))
+        \\);
+        \\let detHits1 = 0;
+        \\let detHits2 = 0;
+        \\const detErr1 = errName(() => det1.toBase64({ get alphabet() { detHits1++; return "base64"; } }));
+        \\const detErr2 = errName(() => det1.setFromBase64("Zg==", { get alphabet() { detHits2++; return "base64"; } }));
+        \\print("detached-reads-opts:", detErr1, detHits1, detErr2, detHits2);
+        \\
+        \\// 5. setFromBase64 exact { read, written }, truncation, 0-len, partial writes
+        \\const rExact = new Uint8Array(3).setFromBase64("Zm9v");
+        \\const rExactWs = new Uint8Array(3).setFromBase64("Zm9v   ");
+        \\const rRoomWs = new Uint8Array(4).setFromBase64("Zm9v   ");
+        \\const rSmall2 = new Uint8Array(2).setFromBase64("Zm9v");
+        \\const rSmall1Of2 = new Uint8Array(1).setFromBase64("Zm8");
+        \\const rSmall1Pad = new Uint8Array(1).setFromBase64("Zg==");
+        \\const rFullBeforeBad = new Uint8Array(3).setFromBase64("Zm9v!!!");
+        \\const rZero = new Uint8Array(0).setFromBase64("!!!invalid!!!");
+        \\const rStop1 = new Uint8Array(4).setFromBase64("Zm9v  Z", { lastChunkHandling: "stop-before-partial" });
+        \\const rStop2 = new Uint8Array(4).setFromBase64("Zm9v  Zg", { lastChunkHandling: "stop-before-partial" });
+        \\const rStopPad = new Uint8Array(4).setFromBase64("Zm9v  Zg==", { lastChunkHandling: "stop-before-partial" });
+        \\print("setb64:",
+        \\    `${rExact.read}/${rExact.written}`,
+        \\    `${rExactWs.read}/${rExactWs.written}`,
+        \\    `${rRoomWs.read}/${rRoomWs.written}`,
+        \\    `${rSmall2.read}/${rSmall2.written}`,
+        \\    `${rSmall1Of2.read}/${rSmall1Of2.written}`,
+        \\    `${rSmall1Pad.read}/${rSmall1Pad.written}`,
+        \\    `${rFullBeforeBad.read}/${rFullBeforeBad.written}`,
+        \\    `${rZero.read}/${rZero.written}`,
+        \\    `${rStop1.read}/${rStop1.written}`,
+        \\    `${rStop2.read}/${rStop2.written}`,
+        \\    `${rStopPad.read}/${rStopPad.written}`
+        \\);
+        \\const rd = Object.getOwnPropertyDescriptor(rExact, "read");
+        \\print("res-obj:", Object.getPrototypeOf(rExact) === Object.prototype, rd.writable, rd.enumerable, rd.configurable);
+        \\const partialB64 = new Uint8Array(4);
+        \\const partialB64Err = errName(() => partialB64.setFromBase64("Zm9v!!!"));
+        \\print("partial-b64:", partialB64Err, [...partialB64].join(","));
+        \\
+        \\// 6. toHex / fromHex / setFromHex & subarray views
+        \\const hx = new Uint8Array([0x00, 0x0a, 0xab, 0xff]);
+        \\print("hex:", hx.toHex(), [...Uint8Array.fromHex("000AabFF")].join(","), new Uint8Array(0).toHex(), Uint8Array.fromHex("").length);
+        \\print("hex-err:",
+        \\    errName(() => Uint8Array.fromHex("a")),
+        \\    errName(() => Uint8Array.fromHex(" 41")),
+        \\    errName(() => Uint8Array.fromHex("4g")),
+        \\    errName(() => new Uint8Array(0).setFromHex("a"))
+        \\);
+        \\const hexTrunc = new Uint8Array(1);
+        \\const rHexTrunc = hexTrunc.setFromHex("41zz");
+        \\const hexPart = new Uint8Array(2);
+        \\const hexPartErr = errName(() => hexPart.setFromHex("41zz"));
+        \\const hexOdd = new Uint8Array(2);
+        \\const hexOddErr = errName(() => hexOdd.setFromHex("41z"));
+        \\print("sethex:", `${rHexTrunc.read}/${rHexTrunc.written}`, hexTrunc[0], hexPartErr, [...hexPart].join(","), hexOddErr, [...hexOdd].join(","));
+        \\
+        \\// 7. Non-zero byteOffset subarray views
+        \\const backing = new Uint8Array([9, 102, 111, 111, 8]);
+        \\const view = backing.subarray(1, 4);
+        \\print("sub-enc:", view.toBase64(), view.toHex());
+        \\const rSubB64 = view.setFromBase64("YmFy");
+        \\print("sub-b64:", `${rSubB64.read}/${rSubB64.written}`, [...backing].join(","));
+        \\const rSubHex = view.setFromHex("010203");
+        \\print("sub-hex:", `${rSubHex.read}/${rSubHex.written}`, [...backing].join(","));
+    ;
+    const expected =
+        \\desc: true
+        \\encode: +/+/AGY= +/+/AGY -_-_AGY= -_-_AGY 
+        \\rt: 251,255,191,0,102 251,255,191,0,102
+        \\rt-url: 251,255,191,0,102 251,255,191,0,102
+        \\ws5: 102
+        \\ws-bad: SyntaxError SyntaxError
+        \\alpha-mismatch: SyntaxError SyntaxError
+        \\lch-1char: SyntaxError SyntaxError 0
+        \\lch-2char: 102 SyntaxError 0
+        \\lch-pad-stop: 102 0 SyntaxError
+        \\overflow-bits: 102 SyntaxError 102 SyntaxError 102,111
+        \\bad-pad: SyntaxError SyntaxError SyntaxError SyntaxError
+        \\recv: TypeError TypeError TypeError TypeError TypeError
+        \\str-arg: TypeError TypeError TypeError TypeError TypeError
+        \\opts-bad: TypeError TypeError TypeError TypeError TypeError TypeError
+        \\opt-order: a,o,fa,fl
+        \\pre-detached: TypeError TypeError TypeError TypeError
+        \\getter-detached: TypeError TypeError
+        \\detached-reads-opts: TypeError 1 TypeError 1
+        \\setb64: 4/3 4/3 7/3 0/0 0/0 4/1 4/3 0/0 4/3 4/3 10/4
+        \\res-obj: true true true true
+        \\partial-b64: SyntaxError 102,111,111,0
+        \\hex: 000aabff 0,10,171,255  0
+        \\hex-err: SyntaxError SyntaxError SyntaxError SyntaxError
+        \\sethex: 2/1 65 SyntaxError 65,0 SyntaxError 0,0
+        \\sub-enc: Zm9v 666f6f
+        \\sub-b64: 4/3 9,98,97,114,8
+        \\sub-hex: 6/3 9,1,2,3,8
+        \\
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("", r.err);
+        try testing.expectEqualStrings(expected, r.out);
+    }
+}
+
+test "ES2026 Uint8Array Base64 and Hex GC stress (collect_always + verify_heap)" {
+    const src =
+        \\function churn(tag) {
+        \\    for (let i = 0; i < 20; i++) {
+        \\        const tmp = { k: tag + i, arr: [i, i + 1] };
+        \\        void tmp;
+        \\    }
+        \\}
+        \\const u8 = new Uint8Array([0xfb, 0xff, 0xbf, 0x66, 0x6f, 0x6f]);
+        \\const b64 = u8.toBase64({
+        \\    get alphabet() { churn("a"); return "base64url"; },
+        \\    get omitPadding() { churn("o"); return true; },
+        \\});
+        \\const decoded = Uint8Array.fromBase64(b64, {
+        \\    get alphabet() { churn("fa"); return "base64url"; },
+        \\    get lastChunkHandling() { churn("fl"); return "loose"; },
+        \\});
+        \\const dst = new Uint8Array(6);
+        \\const r1 = dst.setFromBase64(b64, {
+        \\    get alphabet() { churn("sa"); return "base64url"; },
+        \\    get lastChunkHandling() { churn("sl"); return "loose"; },
+        \\});
+        \\const hex = decoded.toHex();
+        \\const fromHex = Uint8Array.fromHex(hex);
+        \\const dst2 = new Uint8Array(6);
+        \\const r2 = dst2.setFromHex(hex);
+        \\print(b64, hex, r1.read, r1.written, r2.read, r2.written, fromHex.toHex() === dst2.toHex());
+    ;
+    const expected =
+        \\-_-_Zm9v fbffbf666f6f 8 6 12 6 true
+        \\
+    ;
+    for (support.engines) |engine| {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer err_w.deinit();
+        const code = try zqjs.runSource(testing.allocator, "gc_uint8_b64_hex.js", src, .{}, .{
+            .mode = .normal,
+            .engine = engine,
+            .collect_always = true,
+            .verify_heap = true,
+        }, &out.writer, &err_w.writer);
+        try testing.expectEqual(@as(u8, 0), code);
+        try testing.expectEqualStrings("", err_w.written());
+        try testing.expectEqualStrings(expected, out.written());
+    }
+}

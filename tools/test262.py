@@ -68,7 +68,6 @@ DEFAULT_SKIP_FEATURES = {
     "immutable-arraybuffer",
     "arraybuffer-transfer",
     "float16array",
-    "uint8array-base64",
     "regexp-modifiers",
     "regexp-duplicate-named-groups",
     "symbols-as-weakmap-keys",

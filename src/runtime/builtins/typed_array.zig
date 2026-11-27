@@ -201,6 +201,17 @@ fn initArrayBufferAndViews(rt: *Runtime, r: *const builtins.Realm, v: *builtins.
             .configurable = false,
         });
     }
+
+    // Uint8Array-only Base64 and Hex methods (ES2026)
+    const uint8_idx = @backingInt(heap_mod.TypedArrayKind.uint8);
+    const uint8_ns = v.typed_array_namespaces[uint8_idx];
+    const uint8_proto = v.typed_array_prototypes[uint8_idx];
+    try common.method(rt, uint8_ns, "fromBase64", &u8_from_base64);
+    try common.method(rt, uint8_ns, "fromHex", &u8_from_hex);
+    try common.method(rt, uint8_proto, "toBase64", &u8_to_base64);
+    try common.method(rt, uint8_proto, "toHex", &u8_to_hex);
+    try common.method(rt, uint8_proto, "setFromBase64", &u8_set_from_base64);
+    try common.method(rt, uint8_proto, "setFromHex", &u8_set_from_hex);
 }
 
 fn toIndex(rt: *Runtime, v: Value) Error!usize {
@@ -1871,6 +1882,483 @@ fn taReduce(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 
 fn taReduceRight(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return taReduceImpl(rt, this, args, true);
+}
+
+// ---- Uint8Array Base64 & Hex (ES2026 / TC39 proposal-arraybuffer-base64)
+
+const u8_from_base64: Native = .{ .name = "fromBase64", .length = 1, .call = u8FromBase64 };
+const u8_from_hex: Native = .{ .name = "fromHex", .length = 1, .call = u8FromHex };
+const u8_to_base64: Native = .{ .name = "toBase64", .length = 0, .call = u8ToBase64 };
+const u8_to_hex: Native = .{ .name = "toHex", .length = 0, .call = u8ToHex };
+const u8_set_from_base64: Native = .{ .name = "setFromBase64", .length = 1, .call = u8SetFromBase64 };
+const u8_set_from_hex: Native = .{ .name = "setFromHex", .length = 1, .call = u8SetFromHex };
+
+const Base64Alphabet = enum { base64, base64url };
+const LastChunkHandling = enum { loose, strict, stop_before_partial };
+
+fn requireUint8Array(rt: *Runtime, this: Value) Error!*Object {
+    if (!this.isObject() or this.asObject().kind != .typed_array) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Method Uint8Array.prototype called on incompatible receiver" }});
+    }
+    const o = this.asObject();
+    if (o.kind.typed_array.kind != .uint8) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Method Uint8Array.prototype requires a Uint8Array receiver" }});
+    }
+    return o;
+}
+
+fn stringEqualsAscii(s: *const heap_mod.String, ascii: []const u8) bool {
+    if (s.units.len != ascii.len) return false;
+    for (s.units, ascii) |u, c| {
+        if (u != c) return false;
+    }
+    return true;
+}
+
+fn readAlphabetOption(rt: *Runtime, opts: Value) Error!Base64Alphabet {
+    const val = try object.get(rt, opts, try object.named(rt, "alphabet"));
+    if (val.isUndefined()) return .base64;
+    if (!val.isString()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Expected alphabet option to be 'base64' or 'base64url'" }});
+    }
+    const s = val.asString();
+    if (stringEqualsAscii(s, "base64")) return .base64;
+    if (stringEqualsAscii(s, "base64url")) return .base64url;
+    return rt.throw(.TypeError, &.{.{ .ascii = "Expected alphabet option to be 'base64' or 'base64url'" }});
+}
+
+fn readLastChunkHandlingOption(rt: *Runtime, opts: Value) Error!LastChunkHandling {
+    const val = try object.get(rt, opts, try object.named(rt, "lastChunkHandling"));
+    if (val.isUndefined()) return .loose;
+    if (!val.isString()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Expected lastChunkHandling option to be 'loose', 'strict', or 'stop-before-partial'" }});
+    }
+    const s = val.asString();
+    if (stringEqualsAscii(s, "loose")) return .loose;
+    if (stringEqualsAscii(s, "strict")) return .strict;
+    if (stringEqualsAscii(s, "stop-before-partial")) return .stop_before_partial;
+    return rt.throw(.TypeError, &.{.{ .ascii = "Expected lastChunkHandling option to be 'loose', 'strict', or 'stop-before-partial'" }});
+}
+
+inline fn isBase64AsciiWhitespace(u: u16) bool {
+    return u == 0x09 or u == 0x0A or u == 0x0C or u == 0x0D or u == 0x20;
+}
+
+fn skipAsciiWhitespace(units: []const u16, start: usize) usize {
+    var i = start;
+    while (i < units.len and isBase64AsciiWhitespace(units[i])) : (i += 1) {}
+    return i;
+}
+
+fn decodeBase64Char(u: u16, alphabet: Base64Alphabet) ?u8 {
+    if (u >= 'A' and u <= 'Z') return @intCast(u - 'A');
+    if (u >= 'a' and u <= 'z') return @intCast(u - 'a' + 26);
+    if (u >= '0' and u <= '9') return @intCast(u - '0' + 52);
+    return switch (alphabet) {
+        .base64 => if (u == '+') 62 else if (u == '/') 63 else null,
+        .base64url => if (u == '-') 62 else if (u == '_') 63 else null,
+    };
+}
+
+fn hexDigit(u: u16) ?u8 {
+    if (u >= '0' and u <= '9') return @intCast(u - '0');
+    if (u >= 'a' and u <= 'f') return @intCast(u - 'a' + 10);
+    if (u >= 'A' and u <= 'F') return @intCast(u - 'A' + 10);
+    return null;
+}
+
+const Base64DecodeResult = struct {
+    read: usize,
+    written: usize,
+    syntax_error: bool,
+};
+
+fn decodeBase64Chunk(chunk: [4]u8, chunk_len: usize, throw_on_extra_bits: bool, out_bytes: *[3]u8) ?usize {
+    switch (chunk_len) {
+        2 => {
+            if (throw_on_extra_bits and (chunk[1] & 0x0F) != 0) return null;
+            out_bytes[0] = (chunk[0] << 2) | (chunk[1] >> 4);
+            return 1;
+        },
+        3 => {
+            if (throw_on_extra_bits and (chunk[2] & 0x03) != 0) return null;
+            out_bytes[0] = (chunk[0] << 2) | (chunk[1] >> 4);
+            out_bytes[1] = ((chunk[1] & 0x0F) << 4) | (chunk[2] >> 2);
+            return 2;
+        },
+        4 => {
+            out_bytes[0] = (chunk[0] << 2) | (chunk[1] >> 4);
+            out_bytes[1] = ((chunk[1] & 0x0F) << 4) | (chunk[2] >> 2);
+            out_bytes[2] = ((chunk[2] & 0x03) << 6) | chunk[3];
+            return 3;
+        },
+        else => unreachable,
+    }
+}
+
+/// Core `FromBase64` algorithm. Writes into `fixed_dst` when non-null (for `setFromBase64`),
+/// or appends to `dyn_dst` when `fixed_dst` is null (for `fromBase64`).
+fn fromBase64Core(
+    rt: *Runtime,
+    units: []const u16,
+    alphabet: Base64Alphabet,
+    last_chunk_handling: LastChunkHandling,
+    fixed_dst: ?[]u8,
+    dyn_dst: ?*std.ArrayList(u8),
+) Error!Base64DecodeResult {
+    const max_len: usize = if (fixed_dst) |d| d.len else std.math.maxInt(usize);
+    if (max_len == 0) return .{ .read = 0, .written = 0, .syntax_error = false };
+
+    var read_idx: usize = 0;
+    var written: usize = 0;
+    var chunk: [4]u8 = undefined;
+    var chunk_len: usize = 0;
+    var index: usize = 0;
+    const length = units.len;
+
+    while (true) {
+        index = skipAsciiWhitespace(units, index);
+        if (index == length) {
+            if (chunk_len > 0) {
+                if (last_chunk_handling == .stop_before_partial) {
+                    return .{ .read = read_idx, .written = written, .syntax_error = false };
+                }
+                if (last_chunk_handling == .loose) {
+                    if (chunk_len == 1) {
+                        return .{ .read = read_idx, .written = written, .syntax_error = true };
+                    }
+                    var decoded: [3]u8 = undefined;
+                    const n = decodeBase64Chunk(chunk, chunk_len, false, &decoded).?;
+                    try emitDecodedBytes(rt, fixed_dst, dyn_dst, &written, decoded[0..n]);
+                    return .{ .read = length, .written = written, .syntax_error = false };
+                }
+                return .{ .read = read_idx, .written = written, .syntax_error = true };
+            }
+            return .{ .read = length, .written = written, .syntax_error = false };
+        }
+
+        const ch = units[index];
+        index += 1;
+
+        if (ch == '=') {
+            if (chunk_len < 2) {
+                return .{ .read = read_idx, .written = written, .syntax_error = true };
+            }
+            index = skipAsciiWhitespace(units, index);
+            if (chunk_len == 2) {
+                if (index == length) {
+                    if (last_chunk_handling == .stop_before_partial) {
+                        return .{ .read = read_idx, .written = written, .syntax_error = false };
+                    }
+                    return .{ .read = read_idx, .written = written, .syntax_error = true };
+                }
+                if (units[index] == '=') {
+                    index = skipAsciiWhitespace(units, index + 1);
+                } else {
+                    return .{ .read = read_idx, .written = written, .syntax_error = true };
+                }
+            }
+            if (index < length) {
+                return .{ .read = read_idx, .written = written, .syntax_error = true };
+            }
+            var decoded: [3]u8 = undefined;
+            const throw_extra = last_chunk_handling == .strict;
+            const n = decodeBase64Chunk(chunk, chunk_len, throw_extra, &decoded) orelse {
+                return .{ .read = read_idx, .written = written, .syntax_error = true };
+            };
+            try emitDecodedBytes(rt, fixed_dst, dyn_dst, &written, decoded[0..n]);
+            return .{ .read = length, .written = written, .syntax_error = false };
+        }
+
+        const val = decodeBase64Char(ch, alphabet) orelse {
+            return .{ .read = read_idx, .written = written, .syntax_error = true };
+        };
+
+        const remaining = max_len - written;
+        if ((remaining == 1 and chunk_len == 2) or (remaining == 2 and chunk_len == 3)) {
+            return .{ .read = read_idx, .written = written, .syntax_error = false };
+        }
+
+        chunk[chunk_len] = val;
+        chunk_len += 1;
+        if (chunk_len == 4) {
+            var decoded: [3]u8 = undefined;
+            const n = decodeBase64Chunk(chunk, 4, false, &decoded).?;
+            try emitDecodedBytes(rt, fixed_dst, dyn_dst, &written, decoded[0..n]);
+            chunk_len = 0;
+            read_idx = index;
+            if (written == max_len) {
+                return .{ .read = read_idx, .written = written, .syntax_error = false };
+            }
+        }
+    }
+}
+
+fn emitDecodedBytes(
+    rt: *Runtime,
+    fixed_dst: ?[]u8,
+    dyn_dst: ?*std.ArrayList(u8),
+    written: *usize,
+    bytes: []const u8,
+) Error!void {
+    if (fixed_dst) |dst| {
+        @memcpy(dst[written.*..][0..bytes.len], bytes);
+        written.* += bytes.len;
+    } else {
+        const list = dyn_dst.?;
+        if (list.items.len + bytes.len > rt.heap.max_bytes) return rt.heap.exceeded(.heap_bytes);
+        try list.appendSlice(rt.gpa, bytes);
+        written.* += bytes.len;
+    }
+}
+
+fn makeReadWrittenObject(rt: *Runtime, read_count: usize, written_count: usize) Error!Value {
+    const r = try builtins.realm(rt);
+    const res = try rt.heap.newObject(r.object_prototype);
+    var root_buf = [_]Value{Value.fromObject(res)};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    try rt.heap.defineProperty(res, try rt.heap.internAscii("read"), .{
+        .value = Value.fromNumber(@floatFromInt(read_count)),
+    });
+    try rt.heap.defineProperty(res, try rt.heap.internAscii("written"), .{
+        .value = Value.fromNumber(@floatFromInt(written_count)),
+    });
+    return Value.fromObject(res);
+}
+
+fn u8ToBase64(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireUint8Array(rt, this);
+    const options = common.arg(args, 0);
+    var root_buf = [_]Value{ this, options };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var alphabet: Base64Alphabet = .base64;
+    var omit_padding: bool = false;
+    if (!options.isUndefined()) {
+        if (!options.isObjectLike()) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Options must be an object" }});
+        }
+        alphabet = try readAlphabetOption(rt, options);
+        const omit_val = try object.get(rt, options, try object.named(rt, "omitPadding"));
+        omit_padding = ops.toBoolean(omit_val);
+    }
+
+    const ta = o.kind.typed_array;
+    if (ta.buffer.kind.array_buffer.detached) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
+    }
+    const src = ta.buffer.kind.array_buffer.data[ta.byte_offset .. ta.byte_offset + ta.length];
+    if (src.len == 0) return Value.fromString(try rt.heap.ascii(""));
+
+    const full_triples = src.len / 3;
+    const rem = src.len % 3;
+    const base_len = std.math.mul(usize, full_triples, 4) catch return rt.limit(.string_length);
+    const tail_len: usize = if (rem == 0) 0 else if (omit_padding) rem + 1 else 4;
+    const out_len = std.math.add(usize, base_len, tail_len) catch return rt.limit(.string_length);
+    if (out_len > rt.heap.max_string_length) return rt.limit(.string_length);
+    if (out_len > rt.heap.max_bytes) return rt.heap.exceeded(.heap_bytes);
+
+    const out = try rt.gpa.alloc(u8, out_len);
+    defer rt.gpa.free(out);
+
+    const table: *const [64]u8 = switch (alphabet) {
+        .base64 => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+        .base64url => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_",
+    };
+
+    var si: usize = 0;
+    var di: usize = 0;
+    const triple_end = full_triples * 3;
+    while (si < triple_end) : (si += 3) {
+        const b0 = src[si];
+        const b1 = src[si + 1];
+        const b2 = src[si + 2];
+        out[di] = table[b0 >> 2];
+        out[di + 1] = table[((b0 & 0x03) << 4) | (b1 >> 4)];
+        out[di + 2] = table[((b1 & 0x0F) << 2) | (b2 >> 6)];
+        out[di + 3] = table[b2 & 0x3F];
+        di += 4;
+    }
+    if (rem == 1) {
+        const b0 = src[si];
+        out[di] = table[b0 >> 2];
+        out[di + 1] = table[(b0 & 0x03) << 4];
+        if (!omit_padding) {
+            out[di + 2] = '=';
+            out[di + 3] = '=';
+        }
+    } else if (rem == 2) {
+        const b0 = src[si];
+        const b1 = src[si + 1];
+        out[di] = table[b0 >> 2];
+        out[di + 1] = table[((b0 & 0x03) << 4) | (b1 >> 4)];
+        out[di + 2] = table[(b1 & 0x0F) << 2];
+        if (!omit_padding) {
+            out[di + 3] = '=';
+        }
+    }
+
+    return Value.fromString(try rt.heap.ascii(out));
+}
+
+fn u8FromBase64(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const str_val = common.arg(args, 0);
+    if (!str_val.isString()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Uint8Array.fromBase64 requires a string argument" }});
+    }
+    const options = common.arg(args, 1);
+    var root_buf = [_]Value{ str_val, options };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var alphabet: Base64Alphabet = .base64;
+    var last_chunk_handling: LastChunkHandling = .loose;
+    if (!options.isUndefined()) {
+        if (!options.isObjectLike()) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Options must be an object" }});
+        }
+        alphabet = try readAlphabetOption(rt, options);
+        last_chunk_handling = try readLastChunkHandlingOption(rt, options);
+    }
+
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(rt.gpa);
+
+    const res = try fromBase64Core(rt, str_val.asString().units, alphabet, last_chunk_handling, null, &bytes);
+    if (res.syntax_error) {
+        return rt.throw(.SyntaxError, &.{.{ .ascii = "Invalid base64 string" }});
+    }
+
+    const ta = try allocateTypedArray(rt, .uint8, bytes.items.len);
+    if (bytes.items.len > 0) {
+        @memcpy(ta.kind.typed_array.buffer.kind.array_buffer.data[0..bytes.items.len], bytes.items);
+    }
+    return Value.fromObject(ta);
+}
+
+fn u8SetFromBase64(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireUint8Array(rt, this);
+    const str_val = common.arg(args, 0);
+    if (!str_val.isString()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Uint8Array.prototype.setFromBase64 requires a string argument" }});
+    }
+    const options = common.arg(args, 1);
+    var root_buf = [_]Value{ this, str_val, options };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    var alphabet: Base64Alphabet = .base64;
+    var last_chunk_handling: LastChunkHandling = .loose;
+    if (!options.isUndefined()) {
+        if (!options.isObjectLike()) {
+            return rt.throw(.TypeError, &.{.{ .ascii = "Options must be an object" }});
+        }
+        alphabet = try readAlphabetOption(rt, options);
+        last_chunk_handling = try readLastChunkHandlingOption(rt, options);
+    }
+
+    const ta = o.kind.typed_array;
+    if (ta.buffer.kind.array_buffer.detached) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
+    }
+    const dst = ta.buffer.kind.array_buffer.data[ta.byte_offset .. ta.byte_offset + ta.length];
+    const res = try fromBase64Core(rt, str_val.asString().units, alphabet, last_chunk_handling, dst, null);
+    if (res.syntax_error) {
+        return rt.throw(.SyntaxError, &.{.{ .ascii = "Invalid base64 string" }});
+    }
+    return makeReadWrittenObject(rt, res.read, res.written);
+}
+
+fn u8ToHex(rt: *Runtime, this: Value, _: []const Value) Error!Value {
+    const o = try requireUint8Array(rt, this);
+    const ta = o.kind.typed_array;
+    if (ta.buffer.kind.array_buffer.detached) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
+    }
+    const src = ta.buffer.kind.array_buffer.data[ta.byte_offset .. ta.byte_offset + ta.length];
+    if (src.len == 0) return Value.fromString(try rt.heap.ascii(""));
+
+    const out_len = std.math.mul(usize, src.len, 2) catch return rt.limit(.string_length);
+    if (out_len > rt.heap.max_string_length) return rt.limit(.string_length);
+    if (out_len > rt.heap.max_bytes) return rt.heap.exceeded(.heap_bytes);
+
+    const out = try rt.gpa.alloc(u8, out_len);
+    defer rt.gpa.free(out);
+
+    const hex_chars = "0123456789abcdef";
+    for (src, 0..) |b, i| {
+        out[i * 2] = hex_chars[b >> 4];
+        out[i * 2 + 1] = hex_chars[b & 0x0F];
+    }
+    return Value.fromString(try rt.heap.ascii(out));
+}
+
+fn u8FromHex(rt: *Runtime, _: Value, args: []const Value) Error!Value {
+    const str_val = common.arg(args, 0);
+    if (!str_val.isString()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Uint8Array.fromHex requires a string argument" }});
+    }
+    const units = str_val.asString().units;
+    if (units.len % 2 != 0) {
+        return rt.throw(.SyntaxError, &.{.{ .ascii = "Hex string must have an even length" }});
+    }
+    for (units) |u| {
+        if (hexDigit(u) == null) {
+            return rt.throw(.SyntaxError, &.{.{ .ascii = "Invalid hex character" }});
+        }
+    }
+
+    var root_buf = [_]Value{str_val};
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const byte_len = units.len / 2;
+    const ta = try allocateTypedArray(rt, .uint8, byte_len);
+    const dst = ta.kind.typed_array.buffer.kind.array_buffer.data;
+    const rooted_units = str_val.asString().units;
+    for (0..byte_len) |i| {
+        const hi = hexDigit(rooted_units[i * 2]).?;
+        const lo = hexDigit(rooted_units[i * 2 + 1]).?;
+        dst[i] = (hi << 4) | lo;
+    }
+    return Value.fromObject(ta);
+}
+
+fn u8SetFromHex(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const o = try requireUint8Array(rt, this);
+    const str_val = common.arg(args, 0);
+    if (!str_val.isString()) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "Uint8Array.prototype.setFromHex requires a string argument" }});
+    }
+    const ta = o.kind.typed_array;
+    if (ta.buffer.kind.array_buffer.detached) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
+    }
+    const units = str_val.asString().units;
+    if (units.len % 2 != 0) {
+        return rt.throw(.SyntaxError, &.{.{ .ascii = "Hex string must have an even length" }});
+    }
+
+    const dst = ta.buffer.kind.array_buffer.data[ta.byte_offset .. ta.byte_offset + ta.length];
+    const pair_count = @min(units.len / 2, dst.len);
+    for (0..pair_count) |i| {
+        const hi = hexDigit(units[i * 2]) orelse {
+            return rt.throw(.SyntaxError, &.{.{ .ascii = "Invalid hex character" }});
+        };
+        const lo = hexDigit(units[i * 2 + 1]) orelse {
+            return rt.throw(.SyntaxError, &.{.{ .ascii = "Invalid hex character" }});
+        };
+        dst[i] = (hi << 4) | lo;
+    }
+    return makeReadWrittenObject(rt, pair_count * 2, pair_count);
 }
 
 // ---------------------------------------------------------------- Proxy & Reflect (M46, D76)

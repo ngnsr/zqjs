@@ -44,6 +44,7 @@ const iterator = @import("builtins/iterator.zig");
 const regexp = @import("builtins/regexp.zig");
 const typed_array = @import("builtins/typed_array.zig");
 const proxy_reflect = @import("builtins/proxy_reflect.zig");
+const encoding = @import("builtins/encoding.zig");
 
 // Re-export public built-in APIs so callers outside `src/runtime/builtins*` keep the exact facade.
 pub const viewsRealm = typed_array.viewsRealm;
@@ -196,11 +197,17 @@ pub const Realm = struct {
     math: *Object,
     json: *Object,
     console: *Object,
+    text_encoder_prototype: *Object,
+    text_encoder_namespace: *Object,
+    text_decoder_prototype: *Object,
+    text_decoder_namespace: *Object,
+    text_encoders: *Object,
+    text_decoders: *Object,
     global_object: *Object,
     views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [68]*Object {
+    pub fn objects(r: *const Realm) [74]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -269,6 +276,12 @@ pub const Realm = struct {
             r.math,
             r.json,
             r.console,
+            r.text_encoder_prototype,
+            r.text_encoder_namespace,
+            r.text_decoder_prototype,
+            r.text_decoder_namespace,
+            r.text_encoders,
+            r.text_decoders,
             r.global_object,
         };
     }
@@ -406,6 +419,12 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .math = try common.builtin(h, object_prototype, .math),
         .json = try common.builtin(h, object_prototype, .json),
         .console = try h.newObject(object_prototype),
+        .text_encoder_prototype = try h.newObject(object_prototype),
+        .text_encoder_namespace = try h.newObject(null),
+        .text_decoder_prototype = try h.newObject(object_prototype),
+        .text_decoder_namespace = try h.newObject(null),
+        .text_encoders = try h.newWeakSet(null),
+        .text_decoders = try h.newWeakMap(null),
         .global_object = try common.builtin(h, object_prototype, .global),
     };
     try object_builtins.register(rt, &r);
@@ -434,13 +453,15 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try common.defineToStringTag(rt, r.console, r.sym_to_string_tag, "console");
     try function_error.register(rt, &r);
     try regexp.register(rt, &r);
+    try encoding.register(rt, &r);
     for (builtin_globals.keys(), 0..) |name, i| {
         const target = builtin_globals.values()[i];
         const is_const = target == .undefined or target == .nan or target == .inf;
+        const is_enumerable = std.mem.eql(u8, name, "atob") or std.mem.eql(u8, name, "btoa");
         const k = try h.internAscii(name);
         try h.defineProperty(r.global_object, k, .{
             .value = resolveGlobalTargetByIndex(&r, @intCast(i)),
-            .enumerable = false,
+            .enumerable = is_enumerable,
             .writable = !is_const,
             .configurable = !is_const,
         });
@@ -541,6 +562,8 @@ pub fn namespaceObject(rt: *Runtime, n: *const Native) Error!?*Object {
         .float64_array => (try typed_array.viewsRealm(rt)).typed_array_namespaces[8],
         .bigint64_array => (try typed_array.viewsRealm(rt)).typed_array_namespaces[9],
         .biguint64_array => (try typed_array.viewsRealm(rt)).typed_array_namespaces[10],
+        .text_encoder => r.text_encoder_namespace,
+        .text_decoder => r.text_decoder_namespace,
     };
 }
 
@@ -606,6 +629,8 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
         .float64_array => (try typed_array.viewsRealm(rt)).typed_array_prototypes[8],
         .bigint64_array => (try typed_array.viewsRealm(rt)).typed_array_prototypes[9],
         .biguint64_array => (try typed_array.viewsRealm(rt)).typed_array_prototypes[10],
+        .text_encoder => r.text_encoder_prototype,
+        .text_decoder => r.text_decoder_prototype,
     };
 }
 
@@ -651,6 +676,10 @@ pub const date_global: Native = .{ .name = "Date", .length = 7, .call = number_m
 pub const symbol_global: Native = .{ .name = "Symbol", .call = number_math.symbolCall, .namespace = .symbol };
 pub const bigint_global: Native = .{ .name = "BigInt", .length = 1, .call = number_math.bigintCall, .namespace = .bigint };
 pub const structured_clone_global: Native = .{ .name = "structuredClone", .length = 1, .call = structuredCloneCall };
+pub const atob_global: Native = .{ .name = "atob", .length = 1, .call = encoding.atobImpl };
+pub const btoa_global: Native = .{ .name = "btoa", .length = 1, .call = encoding.btoaImpl };
+pub const text_encoder_global: Native = .{ .name = "TextEncoder", .length = 0, .call = encoding.textEncoderWithoutNew, .construct = encoding.textEncoderConstruct, .namespace = .text_encoder };
+pub const text_decoder_global: Native = .{ .name = "TextDecoder", .length = 0, .call = encoding.textDecoderWithoutNew, .construct = encoding.textDecoderConstruct, .namespace = .text_decoder };
 
 fn structuredCloneCall(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     return clone.structuredCloneImpl(rt, args);
@@ -737,6 +766,10 @@ const builtin_globals = std.StaticStringMap(GlobalTarget).initComptime([_]struct
     .{ "JSON", .json },
     .{ "console", .console },
     .{ "structuredClone", .{ .native = &structured_clone_global } },
+    .{ "atob", .{ .native = &atob_global } },
+    .{ "btoa", .{ .native = &btoa_global } },
+    .{ "TextEncoder", .{ .native = &text_encoder_global } },
+    .{ "TextDecoder", .{ .native = &text_decoder_global } },
 });
 
 pub inline fn realmIfInit(rt: *const Runtime) ?*const Realm {
@@ -865,7 +898,7 @@ pub fn globalOwnProp(rt: *Runtime, atom: *const heap_mod.String) Error!?heap_mod
 /// Whether `name` is already a built-in or node-known global name (D53: duplicate
 /// registration is rejected, including built-in names).
 pub fn isBuiltinGlobal(name: []const u8) bool {
-    return std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "structuredClone") or names.has(.global, name);
+    return builtin_globals.has(name) or names.has(.global, name);
 }
 
 /// Evaluates `new callee(args...)` for built-in constructors (M14).

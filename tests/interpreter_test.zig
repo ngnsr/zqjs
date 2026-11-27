@@ -2130,6 +2130,11 @@ test "ES2026 Uint8Array Base64 and Hex methods (dual-engine)" {
         \\    errName(() => det2.toBase64({ get alphabet() { structuredClone(det2.buffer, { transfer: [det2.buffer] }); return "base64"; } })),
         \\    errName(() => det3.setFromBase64("Zg==", { get lastChunkHandling() { structuredClone(det3.buffer, { transfer: [det3.buffer] }); return "loose"; } }))
         \\);
+        \\let detHits1 = 0;
+        \\let detHits2 = 0;
+        \\const detErr1 = errName(() => det1.toBase64({ get alphabet() { detHits1++; return "base64"; } }));
+        \\const detErr2 = errName(() => det1.setFromBase64("Zg==", { get alphabet() { detHits2++; return "base64"; } }));
+        \\print("detached-reads-opts:", detErr1, detHits1, detErr2, detHits2);
         \\
         \\// 5. setFromBase64 exact { read, written }, truncation, 0-len, partial writes
         \\const rExact = new Uint8Array(3).setFromBase64("Zm9v");
@@ -2207,6 +2212,7 @@ test "ES2026 Uint8Array Base64 and Hex methods (dual-engine)" {
         \\opt-order: a,o,fa,fl
         \\pre-detached: TypeError TypeError TypeError TypeError
         \\getter-detached: TypeError TypeError
+        \\detached-reads-opts: TypeError 1 TypeError 1
         \\setb64: 4/3 4/3 7/3 0/0 0/0 4/1 4/3 0/0 4/3 4/3 10/4
         \\res-obj: true true true true
         \\partial-b64: SyntaxError 102,111,111,0

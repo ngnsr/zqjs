@@ -1896,16 +1896,13 @@ const u8_set_from_hex: Native = .{ .name = "setFromHex", .length = 1, .call = u8
 const Base64Alphabet = enum { base64, base64url };
 const LastChunkHandling = enum { loose, strict, stop_before_partial };
 
-fn requireLiveUint8Array(rt: *Runtime, this: Value) Error!*Object {
+fn requireUint8Array(rt: *Runtime, this: Value) Error!*Object {
     if (!this.isObject() or this.asObject().kind != .typed_array) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Method Uint8Array.prototype called on incompatible receiver" }});
     }
     const o = this.asObject();
     if (o.kind.typed_array.kind != .uint8) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Method Uint8Array.prototype requires a Uint8Array receiver" }});
-    }
-    if (o.kind.typed_array.buffer.kind.array_buffer.detached) {
-        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
     }
     return o;
 }
@@ -2133,7 +2130,7 @@ fn makeReadWrittenObject(rt: *Runtime, read_count: usize, written_count: usize) 
 }
 
 fn u8ToBase64(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const o = try requireLiveUint8Array(rt, this);
+    const o = try requireUint8Array(rt, this);
     const options = common.arg(args, 0);
     var root_buf = [_]Value{ this, options };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
@@ -2246,7 +2243,7 @@ fn u8FromBase64(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 }
 
 fn u8SetFromBase64(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const o = try requireLiveUint8Array(rt, this);
+    const o = try requireUint8Array(rt, this);
     const str_val = common.arg(args, 0);
     if (!str_val.isString()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Uint8Array.prototype.setFromBase64 requires a string argument" }});
@@ -2280,8 +2277,11 @@ fn u8SetFromBase64(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn u8ToHex(rt: *Runtime, this: Value, _: []const Value) Error!Value {
-    const o = try requireLiveUint8Array(rt, this);
+    const o = try requireUint8Array(rt, this);
     const ta = o.kind.typed_array;
+    if (ta.buffer.kind.array_buffer.detached) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
+    }
     const src = ta.buffer.kind.array_buffer.data[ta.byte_offset .. ta.byte_offset + ta.length];
     if (src.len == 0) return Value.fromString(try rt.heap.ascii(""));
 
@@ -2333,17 +2333,20 @@ fn u8FromHex(rt: *Runtime, _: Value, args: []const Value) Error!Value {
 }
 
 fn u8SetFromHex(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const o = try requireLiveUint8Array(rt, this);
+    const o = try requireUint8Array(rt, this);
     const str_val = common.arg(args, 0);
     if (!str_val.isString()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Uint8Array.prototype.setFromHex requires a string argument" }});
+    }
+    const ta = o.kind.typed_array;
+    if (ta.buffer.kind.array_buffer.detached) {
+        return rt.throw(.TypeError, &.{.{ .ascii = "TypedArray buffer is detached" }});
     }
     const units = str_val.asString().units;
     if (units.len % 2 != 0) {
         return rt.throw(.SyntaxError, &.{.{ .ascii = "Hex string must have an even length" }});
     }
 
-    const ta = o.kind.typed_array;
     const dst = ta.buffer.kind.array_buffer.data[ta.byte_offset .. ta.byte_offset + ta.length];
     const pair_count = @min(units.len / 2, dst.len);
     for (0..pair_count) |i| {

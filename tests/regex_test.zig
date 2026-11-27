@@ -778,3 +778,102 @@ test "FailingAllocator sweep for /u and /v modes" {
         );
     }
 }
+
+test "regex.exec: zero heap allocations on common patterns (email, zip, identifier)" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { pat: []const u8, inp: []const u8, expected: bool }{
+        .{ .pat = "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$", .inp = "user.name+tag@example.co.uk", .expected = true },
+        .{ .pat = "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$", .inp = "not-an-email@", .expected = false },
+        .{ .pat = "^\\d{5}(?:-\\d{4})?$", .inp = "94107-1234", .expected = true },
+        .{ .pat = "^[A-Za-z_$][A-Za-z0-9_$]*$", .inp = "validIdent_42", .expected = true },
+    };
+
+    for (cases) |c| {
+        const pat16 = try std.unicode.utf8ToUtf16LeAlloc(gpa, c.pat);
+        defer gpa.free(pat16);
+        const inp16 = try std.unicode.utf8ToUtf16LeAlloc(gpa, c.inp);
+        defer gpa.free(inp16);
+
+        var diag: regex.Diagnostic = .{};
+        var prog = try regex.compile(gpa, pat16, .{}, &diag);
+        defer prog.deinit(gpa);
+
+        var caps_buf: [16]?regex.Range = undefined;
+        const caps = caps_buf[0 .. @as(usize, prog.capture_count) + 1];
+        var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+        var steps: u64 = 100_000;
+        const matched = try regex.exec(failing.allocator(), &prog, inp16, 0, &steps, caps);
+        try testing.expectEqual(c.expected, matched);
+        try testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+    }
+}
+
+test "RegExp.prototype.test and exec: fast path, custom lastIndex, >16 captures, global/sticky, GC stress" {
+    var dbg: support.ProgramAllocator = .init;
+    defer support.endProgram(&dbg);
+    const gpa = dbg.allocator();
+
+    const src =
+        \\// 1. Custom lastIndex valueOf side effect even on non-global/non-sticky regex
+        \\let called = 0;
+        \\const r1 = /abc/;
+        \\r1.lastIndex = { valueOf() { called += 1; return 999; } };
+        \\print("side:" + r1.test("xyzabc") + ":" + called);
+        \\
+        \\// 2. Custom lastIndex that throws (Symbol -> TypeError) even on non-global regex
+        \\const r2 = /abc/;
+        \\r2.lastIndex = Symbol("li");
+        \\let threw = false;
+        \\try { r2.test("abc"); } catch (e) { threw = e instanceof TypeError; }
+        \\print("sym:" + threw);
+        \\
+        \\// 3. Non-string argument with toString that mutates lastIndex
+        \\const r3 = /a/g;
+        \\r3.lastIndex = 0;
+        \\const argObj = { toString() { r3.lastIndex = 2; return "xxa"; } };
+        \\print("arg:" + r3.test(argObj) + ":" + r3.lastIndex);
+        \\
+        \\// 4. >16 captures (20 capture groups) in both test() and exec()
+        \\const r20 = /(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)(m)(n)(o)(p)(q)(r)(s)(t)/;
+        \\print("cap20_test:" + r20.test("abcdefghijklmnopqrst"));
+        \\const m20 = r20.exec("abcdefghijklmnopqrst");
+        \\print("cap20_exec:" + m20.length + ":" + m20[1] + ":" + m20[17] + ":" + m20[20]);
+        \\
+        \\// 5. Global & sticky lastIndex tracking and mismatch reset
+        \\const rg = /a+/g;
+        \\const gres = [rg.test("aa_a"), rg.lastIndex, rg.test("aa_a"), rg.lastIndex, rg.test("aa_a"), rg.lastIndex];
+        \\print("global:" + gres.join(","));
+        \\const ry = /a+/y;
+        \\ry.lastIndex = 3;
+        \\const yres = [ry.test("xx_aa"), ry.lastIndex, ry.test("xx_aa"), ry.lastIndex];
+        \\print("sticky:" + yres.join(","));
+        \\
+        \\// 6. Fast-path loop with allocations to stress GC safety
+        \\const emailRe = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
+        \\let hits = 0;
+        \\for (let i = 0; i < 200; i++) {
+        \\  const s = (i % 2 === 0) ? ("user" + i + "@example.com") : ("bad_" + i);
+        \\  if (emailRe.test(s)) hits++;
+        \\}
+        \\print("gc:" + hits);
+    ;
+
+    const expected =
+        \\side:true:1
+        \\sym:true
+        \\arg:true:3
+        \\cap20_test:true
+        \\cap20_exec:21:a:q:t
+        \\global:true,2,true,4,false,0
+        \\sticky:true,5,false,0
+        \\gc:100
+        \\
+    ;
+
+    for (support.engines) |engine| {
+        var o = try support.run(gpa, src, .{}, engine, .normal);
+        defer o.deinit(gpa);
+        try testing.expectEqual(@as(u8, 0), o.code);
+        try testing.expectEqualStrings(expected, o.out);
+    }
+}

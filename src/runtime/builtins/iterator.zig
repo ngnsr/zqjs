@@ -12,6 +12,7 @@ const ops = @import("../ops.zig");
 const object = @import("../object.zig");
 const coroutine = @import("../coroutine.zig");
 const builtins = @import("../builtins.zig");
+const array = @import("array.zig");
 const common = @import("common.zig");
 const promise = @import("promise.zig");
 const regexp = @import("regexp.zig");
@@ -763,11 +764,64 @@ fn iteratorFind(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return .undefined;
 }
 
+fn isAsciiKey(key: heap_mod.PropKey, comptime ascii: []const u8) bool {
+    if (key.isSymbol()) return false;
+    const units = key.asAtom().units;
+    if (units.len != ascii.len) return false;
+    inline for (ascii, 0..) |c, i| {
+        if (units[i] != c) return false;
+    }
+    return true;
+}
+
+/// Returns true iff `Array.prototype[Symbol.iterator]` is the unmodified built-in
+/// `&array.array_values` and `ArrayIterator.prototype.next` is the unmodified built-in
+/// `&iterator_next` with `ArrayIterator.prototype.__proto__ === Iterator.prototype`.
+/// Performs zero allocations and zero atom interning.
+fn hasUnmodifiedArrayIterator(r: *const builtins.Realm) bool {
+    const sym_iter = r.array_prototype.props.get(heap_mod.PropKey.fromSymbol(r.sym_iterator)) orelse return false;
+    if (sym_iter.is_accessor or !sym_iter.value.isNative() or sym_iter.value.asNative() != &array.array_values) {
+        return false;
+    }
+    const aip = r.array_iterator_prototype;
+    if (aip.proto != r.iterator_prototype) return false;
+    switch (aip.props) {
+        .shaped => |sh| {
+            var cur: ?*const heap_mod.Shape = sh.shape;
+            while (cur) |s| : (cur = s.parent) {
+                if (s.count == 0) return false;
+                if (isAsciiKey(s.key, "next")) {
+                    const val = aip.props.getShapedSlot(s.slot);
+                    return val.isNative() and val.asNative() == &iterator_next;
+                }
+            }
+            return false;
+        },
+        .dict => return false,
+    }
+}
+
 pub fn getIterator(rt: *Runtime, iterable: Value) Error!*Object {
     if (iterable.isUndefined() or iterable.isNull()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "value is not iterable" }});
     }
     const r = try builtins.realm(rt);
+
+    // Dense-array fast path: skip ValueRoots, property lookups, Symbol.iterator callCallable,
+    // and "next" interning when Array.prototype[Symbol.iterator] and ArrayIterator.prototype.next
+    // are unmodified built-ins.
+    if (iterable.isObject()) {
+        const arr = iterable.asObject();
+        if (arr.kind == .array and
+            arr.proto == r.array_prototype and
+            !arr.has_index_overrides and
+            arr.props.get(heap_mod.PropKey.fromSymbol(r.sym_iterator)) == null and
+            hasUnmodifiedArrayIterator(r))
+        {
+            return rt.heap.newIterator(r.array_iterator_prototype, iterable, .array_values);
+        }
+    }
+
     var root_buf = [_]Value{ iterable, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
@@ -862,18 +916,24 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
                     };
                 }
             } else if (it.target.isObject() and it.target.asObject().kind == .array) {
-                const items = it.target.asObject().kind.array.items;
+                const arr = it.target.asObject();
+                const items = arr.kind.array.items;
                 if (it.cursor < items.len) {
                     const i = it.cursor;
                     it.cursor += 1;
+                    if (it.kind == .array_values) {
+                        if (!arr.has_index_overrides and !items[i].isHole()) {
+                            return items[i];
+                        }
+                        return try object.get(rt, it.target, .{ .index = @intCast(i) });
+                    }
                     const idx_val: Value = Value.fromNumber(@floatFromInt(i));
-                    const elem = if (items[i].isHole()) try object.get(rt, it.target, .{ .index = @intCast(i) }) else items[i];
-                    return switch (it.kind) {
-                        .array_values => elem,
-                        .array_keys => idx_val,
-                        .array_entries => try makePairArray(rt, idx_val, elem),
-                        else => unreachable,
-                    };
+                    if (it.kind == .array_keys) return idx_val;
+                    const elem = if (arr.has_index_overrides or items[i].isHole())
+                        try object.get(rt, it.target, .{ .index = @intCast(i) })
+                    else
+                        items[i];
+                    return try makePairArray(rt, idx_val, elem);
                 }
             } else {
                 // Generic array-like iteration (e.g. `arguments` or `Array.prototype.values.call(obj)`).
@@ -1416,6 +1476,153 @@ fn iteratorNext(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     try object.define(rt, out, try object.named(rt, "value"), next_v orelse .undefined);
     try object.define(rt, out, try object.named(rt, "done"), Value.fromBool(next_v == null));
     return Value.fromObject(out);
+}
+
+// ---------------------------------------------------------------- Unit Tests
+
+fn runIterTestSource(source: []const u8, expected_out: []const u8) !void {
+    const run = @import("../../run.zig");
+    const gpa = std.testing.allocator;
+    for ([_]run.Engine{ .treewalk, .vm }) |engine| {
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var err: std.Io.Writer.Allocating = .init(gpa);
+        defer err.deinit();
+        const code = try run.runSource(gpa, "iter_test.js", source, .{}, .{ .mode = .normal, .engine = engine }, &out.writer, &err.writer);
+        try std.testing.expectEqual(@as(u8, 0), code);
+        try std.testing.expectEqualStrings(expected_out, out.written());
+    }
+}
+
+test "dense-array for..of fast path: basic, shrinking, growing, holes, and index overrides" {
+    try runIterTestSource(
+        \\// Basic dense array + empty array
+        \\let sum = 0;
+        \\for (const x of [10, 20, 30]) sum += x;
+        \\for (const x of []) sum += 1000;
+        \\print("sum:" + sum);
+        \\
+        \\// Shrinking during iteration
+        \\const shrink = [1, 2, 3, 4];
+        \\const seenShrink = [];
+        \\for (const x of shrink) {
+        \\  seenShrink.push(x);
+        \\  if (x === 2) shrink.length = 2;
+        \\}
+        \\print("shrink:" + seenShrink.join(","));
+        \\
+        \\// Growing during iteration
+        \\const grow = [1, 2];
+        \\const seenGrow = [];
+        \\for (const x of grow) {
+        \\  seenGrow.push(x);
+        \\  if (x === 2) grow.push(3, 4);
+        \\}
+        \\print("grow:" + seenGrow.join(","));
+        \\
+        \\// Holes created during iteration fall back to prototype lookup
+        \\const holed = [1, 2, 3];
+        \\Array.prototype[1] = 99;
+        \\const seenHole = [];
+        \\try {
+        \\  for (const x of holed) {
+        \\    seenHole.push(x);
+        \\    if (x === 1) delete holed[1];
+        \\  }
+        \\} finally {
+        \\  delete Array.prototype[1];
+        \\}
+        \\print("hole:" + seenHole.join(","));
+        \\
+        \\// Index override (getter) defined during iteration
+        \\const ov = [10, 20, 30];
+        \\let getterCalls = 0;
+        \\const seenOv = [];
+        \\for (const x of ov) {
+        \\  seenOv.push(x);
+        \\  if (x === 10) {
+        \\    Object.defineProperty(ov, 1, { get() { getterCalls++; return 200; }, configurable: true });
+        \\  }
+        \\}
+        \\print("ov:" + seenOv.join(",") + ":" + getterCalls);
+    ,
+        \\sum:60
+        \\shrink:1,2
+        \\grow:1,2,3,4
+        \\hole:1,99,3
+        \\ov:10,200,30:1
+        \\
+    );
+}
+
+test "dense-array for..of slow path: mutated Symbol.iterator, ArrayIterator.prototype.next, and Iterator.prototype.return" {
+    try runIterTestSource(
+        \\// 1. Own [Symbol.iterator] on array instance
+        \\const own = [1, 2];
+        \\own[Symbol.iterator] = function() {
+        \\  let i = 0;
+        \\  return { next() { return i < 2 ? { value: 100 + i++, done: false } : { value: undefined, done: true }; } };
+        \\};
+        \\const ownOut = [];
+        \\for (const x of own) ownOut.push(x);
+        \\print("own:" + ownOut.join(","));
+        \\
+        \\// 2. Mutated Array.prototype[Symbol.iterator]
+        \\const origSymIter = Array.prototype[Symbol.iterator];
+        \\Array.prototype[Symbol.iterator] = function() {
+        \\  let i = this.length;
+        \\  const self = this;
+        \\  return { next() { return i > 0 ? { value: self[--i], done: false } : { value: undefined, done: true }; } };
+        \\};
+        \\const revOut = [];
+        \\try {
+        \\  for (const x of [1, 2, 3]) revOut.push(x);
+        \\} finally {
+        \\  Array.prototype[Symbol.iterator] = origSymIter;
+        \\}
+        \\print("protoIter:" + revOut.join(","));
+        \\
+        \\// 3. Mutated ArrayIterator.prototype.next
+        \\const arrayIterProto = Object.getPrototypeOf([][Symbol.iterator]());
+        \\const origNext = arrayIterProto.next;
+        \\let customNextCalls = 0;
+        \\arrayIterProto.next = function() {
+        \\  customNextCalls++;
+        \\  const r = origNext.call(this);
+        \\  return r.done ? r : { value: r.value * 10, done: false };
+        \\};
+        \\const nextOut = [];
+        \\try {
+        \\  for (const x of [1, 2, 3]) nextOut.push(x);
+        \\} finally {
+        \\  arrayIterProto.next = origNext;
+        \\}
+        \\print("protoNext:" + nextOut.join(",") + ":" + customNextCalls);
+        \\
+        \\// 4. Custom Iterator.prototype.return called on break
+        \\const iterProto = Object.getPrototypeOf(arrayIterProto);
+        \\let returnCalls = 0;
+        \\iterProto.return = function() {
+        \\  returnCalls++;
+        \\  return { value: undefined, done: true };
+        \\};
+        \\const breakOut = [];
+        \\try {
+        \\  for (const x of [1, 2, 3, 4]) {
+        \\    breakOut.push(x);
+        \\    if (x === 2) break;
+        \\  }
+        \\} finally {
+        \\  delete iterProto.return;
+        \\}
+        \\print("protoReturn:" + breakOut.join(",") + ":" + returnCalls);
+    ,
+        \\own:100,101
+        \\protoIter:3,2,1
+        \\protoNext:10,20,30:4
+        \\protoReturn:1,2:1
+        \\
+    );
 }
 
 // ---------------------------------------------------------------- Errors (M25)

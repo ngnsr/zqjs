@@ -18,6 +18,8 @@ pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
     try common.method(rt, r.map_namespace, "groupBy", &map_group_by);
     try common.method(rt, r.map_prototype, "get", &map_get);
     try common.method(rt, r.map_prototype, "set", &map_set);
+    try common.method(rt, r.map_prototype, "getOrInsert", &map_get_or_insert);
+    try common.method(rt, r.map_prototype, "getOrInsertComputed", &map_get_or_insert_computed);
     try common.method(rt, r.map_prototype, "has", &map_has);
     try common.method(rt, r.map_prototype, "delete", &map_delete);
     try common.method(rt, r.map_prototype, "clear", &map_clear);
@@ -43,6 +45,8 @@ pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
     try common.constant(rt, r.weak_map_prototype, "constructor", Value.fromNative(&builtins.weak_map_global));
     try common.method(rt, r.weak_map_prototype, "get", &weak_map_get);
     try common.method(rt, r.weak_map_prototype, "set", &weak_map_set);
+    try common.method(rt, r.weak_map_prototype, "getOrInsert", &weak_map_get_or_insert);
+    try common.method(rt, r.weak_map_prototype, "getOrInsertComputed", &weak_map_get_or_insert_computed);
     try common.method(rt, r.weak_map_prototype, "has", &weak_map_has);
     try common.method(rt, r.weak_map_prototype, "delete", &weak_map_delete);
     try common.constant(rt, r.weak_set_prototype, "constructor", Value.fromNative(&builtins.weak_set_global));
@@ -72,6 +76,10 @@ const map_size_getter: Native = .{ .name = "get size", .call = mapSizeGetter };
 const map_get: Native = .{ .name = "get", .length = 1, .call = mapGet };
 
 const map_set: Native = .{ .name = "set", .length = 2, .call = mapSet };
+
+const map_get_or_insert: Native = .{ .name = "getOrInsert", .length = 2, .call = mapGetOrInsert };
+
+const map_get_or_insert_computed: Native = .{ .name = "getOrInsertComputed", .length = 2, .call = mapGetOrInsertComputed };
 
 const map_has: Native = .{ .name = "has", .length = 1, .call = mapHas };
 
@@ -161,6 +169,39 @@ fn mapSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const m = try thisMap(rt, this, "set");
     try rt.heap.mapSet(m, common.arg(args, 0), common.arg(args, 1));
     return this;
+}
+
+fn requireMap(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
+    if (this.isObject() and this.asObject().kind == .map) return this.asObject();
+    return rt.throw(.TypeError, &.{ .{ .ascii = "Method Map.prototype." }, .{ .ascii = name }, .{ .ascii = " called on incompatible receiver" } });
+}
+
+fn mapGetOrInsert(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const m = try requireMap(rt, this, "getOrInsert");
+    const raw_key = common.arg(args, 0);
+    const key = if (raw_key.isNumber() and raw_key.asNumber() == 0.0) Value.fromNumber(0.0) else raw_key;
+    if (heap_mod.Heap.mapGet(m, key)) |existing| return existing;
+    const val = common.arg(args, 1);
+    try rt.heap.mapSet(m, key, val);
+    return val;
+}
+
+fn mapGetOrInsertComputed(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const m = try requireMap(rt, this, "getOrInsertComputed");
+    const cb = try common.requireCallable(rt, common.arg(args, 1));
+    const raw_key = common.arg(args, 0);
+    const key = if (raw_key.isNumber() and raw_key.asNumber() == 0.0) Value.fromNumber(0.0) else raw_key;
+    if (heap_mod.Heap.mapGet(m, key)) |existing| return existing;
+
+    var root_buf = [_]Value{ this, key, cb, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const val = try rt.callCallable(cb, .undefined, &.{key});
+    root_buf[3] = val;
+    try rt.heap.mapSet(m, key, val);
+    return val;
 }
 
 fn mapHas(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -655,6 +696,10 @@ const weak_map_get: Native = .{ .name = "get", .length = 1, .call = weakMapGet }
 
 const weak_map_set: Native = .{ .name = "set", .length = 2, .call = weakMapSet };
 
+const weak_map_get_or_insert: Native = .{ .name = "getOrInsert", .length = 2, .call = weakMapGetOrInsert };
+
+const weak_map_get_or_insert_computed: Native = .{ .name = "getOrInsertComputed", .length = 2, .call = weakMapGetOrInsertComputed };
+
 const weak_map_has: Native = .{ .name = "has", .length = 1, .call = weakMapHas };
 
 const weak_map_delete: Native = .{ .name = "delete", .length = 1, .call = weakMapDelete };
@@ -723,6 +768,34 @@ fn weakMapSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const key = heap_mod.WeakKey.fromValue(common.arg(args, 0)) orelse return rt.throw(.TypeError, &.{.{ .ascii = "Invalid value used as weak map key" }});
     try rt.heap.weakMapSet(wm, key, common.arg(args, 1));
     return this;
+}
+
+fn weakMapGetOrInsert(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const wm = try thisWeakMap(rt, this, "getOrInsert");
+    const key = heap_mod.WeakKey.fromValue(common.arg(args, 0)) orelse return rt.throw(.TypeError, &.{.{ .ascii = "Invalid value used as weak map key" }});
+    if (heap_mod.Heap.weakMapGet(wm, key)) |existing| return existing;
+    const val = common.arg(args, 1);
+    try rt.heap.weakMapSet(wm, key, val);
+    return val;
+}
+
+fn weakMapGetOrInsertComputed(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    const wm = try thisWeakMap(rt, this, "getOrInsertComputed");
+    const raw_key = common.arg(args, 0);
+    // TC39 proposal-upsert validates CanBeHeldWeakly(key) before IsCallable(callbackfn).
+    const key = heap_mod.WeakKey.fromValue(raw_key) orelse return rt.throw(.TypeError, &.{.{ .ascii = "Invalid value used as weak map key" }});
+    const cb = try common.requireCallable(rt, common.arg(args, 1));
+    if (heap_mod.Heap.weakMapGet(wm, key)) |existing| return existing;
+
+    var root_buf = [_]Value{ this, raw_key, cb, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const val = try rt.callCallable(cb, .undefined, &.{raw_key});
+    root_buf[3] = val;
+    try rt.heap.weakMapSet(wm, key, val);
+    return val;
 }
 
 fn weakMapHas(rt: *Runtime, this: Value, args: []const Value) Error!Value {

@@ -115,7 +115,7 @@
 ["ok", "1..x;", "(. 1 x)"]
 ["ok", "/re/;", "(regexp \"re\" \"\")"]
 ["ok", "`t`;", "(template \"t\")"]
-["unsupported:syntax", "#!x\n1;"]
+["ok", "#!x\n1;", "1"]
 ["unsupported:syntax", "<!-- c\n1;"]
 ["syntax", "--1;"]
 ["syntax", "1 **= 2;"]

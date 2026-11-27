@@ -22,7 +22,13 @@ pub const Lexer = struct {
 
     pub fn init(source: []const u8, diag: *Diagnostic) Lexer {
         std.debug.assert(source.len < std.math.maxInt(u32)); // callers enforce Limits.max_source_bytes
-        return .{ .source = source, .diag = diag };
+        // ES2023 §12.5 HashbangComment: only valid at byte offset 0 with no preceding whitespace or BOM.
+        var pos: u32 = 0;
+        if (source.len >= 2 and source[0] == '#' and source[1] == '!') {
+            pos = 2;
+            while (pos < source.len and !isLineTerminatorAt(source, pos)) pos += 1;
+        }
+        return .{ .source = source, .pos = pos, .diag = diag };
     }
 
     pub fn next(l: *Lexer) Error!Token {
@@ -37,6 +43,9 @@ pub const Lexer = struct {
         }
         if (isIdentStart(c) or (c == '\\' and l.peekAt(start + 1) == 'u') or (c >= 0x80 and l.isUnicodeIdentStartAt(start))) {
             return l.scanIdentifier(start, newline_before);
+        }
+        if (c == '#' and l.peekAt(start + 1) == '!') {
+            return l.fail(.{ .syntax_error = "Invalid or unexpected token" }, start, start + 2);
         }
         if (c == '#' and (isIdentStart(l.peekAt(start + 1)) or (l.peekAt(start + 1) == '\\' and l.peekAt(start + 2) == 'u') or (l.peekAt(start + 1) >= 0x80 and l.isUnicodeIdentStartAt(start + 1)))) {
             l.pos += 1;
@@ -526,4 +535,21 @@ test "Unicode identifiers and whitespace" {
     try expectTags("é", &.{.identifier});
     try expectTags("1\xC2\xA0", &.{.number}); // NBSP
     try expectTags("#℘", &.{.private_ident});
+}
+
+test "hashbang comments" {
+    try expectTags("#!/usr/bin/env zqjs\n1;", &.{ .number, .semicolon });
+    try expectTags("#!/usr/bin/env zqjs\r1;", &.{ .number, .semicolon });
+    try expectTags("#!/usr/bin/env zqjs\xE2\x80\xA81;", &.{ .number, .semicolon });
+    try expectTags("#!/usr/bin/env zqjs\xE2\x80\xA91;", &.{ .number, .semicolon });
+    try expectTags("#!/usr/bin/env zqjs", &.{});
+    try expectTags("#!", &.{});
+
+    // Hashbang is only valid at byte offset 0; anywhere else `#!` is a SyntaxError.
+    const bad = "Invalid or unexpected token";
+    try expectFailure(" #!\n1;", error.SyntaxError, .{ .syntax_error = bad });
+    try expectFailure("\n#!\n1;", error.SyntaxError, .{ .syntax_error = bad });
+    try expectFailure("/**/#!\n1;", error.SyntaxError, .{ .syntax_error = bad });
+    try expectFailure("\xEF\xBB\xBF#!\n1;", error.SyntaxError, .{ .syntax_error = bad });
+    try expectFailure("1;\n#!x", error.SyntaxError, .{ .syntax_error = bad });
 }

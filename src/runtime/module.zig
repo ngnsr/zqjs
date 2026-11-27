@@ -259,7 +259,7 @@ pub fn runPreloadScript(
         const p = try rt.gpa.create(Proto);
         var owned_by_pool = false;
         errdefer if (!owned_by_pool) rt.gpa.destroy(p);
-        p.* = compiler.compile(rt.gpa, &rt.heap, script, res_ptr.*, rt.limits, diag) catch |e| switch (e) {
+        p.* = compiler.compileWithOptions(rt.gpa, &rt.heap, script, res_ptr.*, rt.limits, .{ .source_name = "<preload>", .source = source }, diag) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.LimitExceeded => return error.LimitExceeded,
         };
@@ -470,7 +470,7 @@ fn loadModule(
     if (engine == .vm) {
         const p = try gpa.create(Proto);
         errdefer gpa.destroy(p);
-        p.* = compiler.compileWithOptions(gpa, &rt.heap, script, res, rt.limits, .{ .is_module = true, .top_level_await = script.has_top_level_await }, &diag) catch |e| switch (e) {
+        p.* = compiler.compileWithOptions(gpa, &rt.heap, script, res, rt.limits, .{ .is_module = true, .top_level_await = script.has_top_level_await, .source_name = owned_id, .source = owned_src }, &diag) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.LimitExceeded => {
                 mod_diag.diag = diag;

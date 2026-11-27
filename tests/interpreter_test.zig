@@ -2942,3 +2942,241 @@ test "ES2026 upsert and ES2024 ArrayBuffer transfer GC stress (collect_always + 
         try testing.expectEqualStrings(expected, out.written());
     }
 }
+
+test "Error stack traces: nested functions, engine TypeError, accessor, captureStackTrace, map callback, deep recursion (both engines)" {
+    // 1. new Error("boom") and engine-thrown TypeError (null.x) across outer -> middle -> inner
+    {
+        const src =
+            \\function innerErr() {
+            \\    return new Error("boom");
+            \\}
+            \\function middleErr() {
+            \\    return innerErr();
+            \\}
+            \\function outerErr() {
+            \\    return middleErr();
+            \\}
+            \\const e1 = outerErr();
+            \\print(e1.stack);
+            \\print("---");
+            \\function innerNull() {
+            \\    const x = null;
+            \\    return x.prop;
+            \\}
+            \\function middleNull() {
+            \\    return innerNull();
+            \\}
+            \\function outerNull() {
+            \\    return middleNull();
+            \\}
+            \\try {
+            \\    outerNull();
+            \\} catch (e2) {
+            \\    print(e2.stack);
+            \\}
+        ;
+        const expected =
+            \\Error: boom
+            \\    at innerErr (stack_test.js:2:12)
+            \\    at middleErr (stack_test.js:5:12)
+            \\    at outerErr (stack_test.js:8:12)
+            \\    at stack_test.js:10:12
+            \\---
+            \\TypeError: Cannot read properties of null (reading 'prop')
+            \\    at innerNull (stack_test.js:15:12)
+            \\    at middleNull (stack_test.js:18:12)
+            \\    at outerNull (stack_test.js:21:12)
+            \\    at stack_test.js:24:5
+            \\
+        ;
+        for (support.engines) |engine| {
+            var out: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer out.deinit();
+            var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer err_w.deinit();
+            const code = try zqjs.runSource(testing.allocator, "stack_test.js", src, .{}, .{
+                .mode = .normal,
+                .engine = engine,
+            }, &out.writer, &err_w.writer);
+            try testing.expectEqual(@as(u8, 0), code);
+            try testing.expectEqualStrings("", err_w.written());
+            try testing.expectEqualStrings(expected, out.written());
+        }
+    }
+
+    // 2. Error.prototype.stack remains a prototype accessor until assigned
+    {
+        const src =
+            \\const e = new Error("x");
+            \\print("before:", Object.getOwnPropertyNames(e).indexOf("stack") === -1, typeof e.stack, e.stack.indexOf("Error: x") === 0);
+            \\e.stack = "custom";
+            \\print("after:", Object.getOwnPropertyNames(e).indexOf("stack") !== -1, e.stack);
+        ;
+        const expected =
+            \\before: true string true
+            \\after: true custom
+            \\
+        ;
+        for (support.engines) |engine| {
+            var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+            defer r.deinit(testing.allocator);
+            try testing.expectEqualStrings("", r.err);
+            try testing.expectEqualStrings(expected, r.out);
+        }
+    }
+
+    // 3. Error.captureStackTrace(obj, wrapperFn) captures frames and omits wrapperFn and above
+    {
+        const src =
+            \\function makeErr(msg) {
+            \\    const obj = { name: "CustomError", message: msg };
+            \\    Error.captureStackTrace(obj, makeErr);
+            \\    return obj;
+            \\}
+            \\function callerFn() {
+            \\    return makeErr("oops");
+            \\}
+            \\const o = callerFn();
+            \\const d = Object.getOwnPropertyDescriptor(o, "stack");
+            \\print("desc:", d.writable, d.enumerable, d.configurable);
+            \\print(o.stack);
+        ;
+        const expected =
+            \\desc: true false true
+            \\CustomError: oops
+            \\    at callerFn (capture.js:7:12)
+            \\    at capture.js:9:11
+            \\
+        ;
+        for (support.engines) |engine| {
+            var out: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer out.deinit();
+            var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer err_w.deinit();
+            const code = try zqjs.runSource(testing.allocator, "capture.js", src, .{}, .{
+                .mode = .normal,
+                .engine = engine,
+            }, &out.writer, &err_w.writer);
+            try testing.expectEqual(@as(u8, 0), code);
+            try testing.expectEqualStrings("", err_w.written());
+            try testing.expectEqualStrings(expected, out.written());
+        }
+    }
+
+    // 4. Nested JS -> Array.prototype.map -> JS includes both callback and outer JS frames
+    {
+        const src =
+            \\function cb(x) {
+            \\    if (x === 2) throw new RangeError("bad " + x);
+            \\    return x;
+            \\}
+            \\function runMap() {
+            \\    return [1, 2, 3].map(cb);
+            \\}
+            \\try {
+            \\    runMap();
+            \\} catch (e) {
+            \\    print(e.stack);
+            \\}
+        ;
+        const expected =
+            \\RangeError: bad 2
+            \\    at cb (map_cb.js:2:24)
+            \\    at runMap (map_cb.js:6:12)
+            \\    at map_cb.js:9:5
+            \\
+        ;
+        for (support.engines) |engine| {
+            var out: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer out.deinit();
+            var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer err_w.deinit();
+            const code = try zqjs.runSource(testing.allocator, "map_cb.js", src, .{}, .{
+                .mode = .normal,
+                .engine = engine,
+            }, &out.writer, &err_w.writer);
+            try testing.expectEqual(@as(u8, 0), code);
+            try testing.expectEqualStrings("", err_w.written());
+            try testing.expectEqualStrings(expected, out.written());
+        }
+    }
+
+    // 5. Uncaught stack printing in normal mode (and NOT in harness mode)
+    {
+        const src =
+            \\function boom() {
+            \\    throw new Error("uncaught!");
+            \\}
+            \\boom();
+        ;
+        const expected_normal =
+            \\Uncaught Error: uncaught!
+            \\    at boom (uncaught.js:2:11)
+            \\    at uncaught.js:4:1
+            \\
+        ;
+        for (support.engines) |engine| {
+            var out: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer out.deinit();
+            var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer err_w.deinit();
+            const code = try zqjs.runSource(testing.allocator, "uncaught.js", src, .{}, .{
+                .mode = .normal,
+                .engine = engine,
+            }, &out.writer, &err_w.writer);
+            try testing.expectEqual(@as(u8, 1), code);
+            try testing.expectEqualStrings("", out.written());
+            try testing.expectEqualStrings(expected_normal, err_w.written());
+
+            var h_out: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer h_out.deinit();
+            var h_err: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer h_err.deinit();
+            const h_code = try zqjs.runSource(testing.allocator, "uncaught.js", src, .{}, .{
+                .mode = .harness,
+                .engine = engine,
+            }, &h_out.writer, &h_err.writer);
+            try testing.expectEqual(@as(u8, 1), h_code);
+            try testing.expectEqualStrings("Uncaught Error\n", h_out.written());
+            try testing.expectEqualStrings("", h_err.written());
+        }
+    }
+}
+
+test "Error stack traces: deep recursion cap (64 frames) and GC stress (both engines)" {
+    const src =
+        \\function recurse(n) {
+        \\    if (n === 0) return new Error("deep");
+        \\    return recurse(n - 1);
+        \\}
+        \\const e = recurse(80);
+        \\const lines = e.stack.split("\n");
+        \\print("header:", lines[0], "frames:", lines.length - 1);
+        \\const errs = [];
+        \\for (let i = 0; i < 8; i++) {
+        \\    const err = new TypeError("t" + i);
+        \\    errs.push(err);
+        \\}
+        \\print("gc:", errs[0].stack.indexOf("TypeError: t0") === 0, errs[7].stack.indexOf("TypeError: t7") === 0);
+    ;
+    const expected =
+        \\header: Error: deep frames: 64
+        \\gc: true true
+        \\
+    ;
+    for (support.engines) |engine| {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer err_w.deinit();
+        const code = try zqjs.runSource(testing.allocator, "deep_gc.js", src, .{}, .{
+            .mode = .normal,
+            .engine = engine,
+            .collect_always = true,
+            .verify_heap = true,
+        }, &out.writer, &err_w.writer);
+        try testing.expectEqual(@as(u8, 0), code);
+        try testing.expectEqualStrings("", err_w.written());
+        try testing.expectEqualStrings(expected, out.written());
+    }
+}

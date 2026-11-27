@@ -488,6 +488,13 @@ fn extractThrownError(v: zqjs.Value) ?ThrownErrorInfo {
     return null;
 }
 
+fn writeStackFrames(report: *std.Io.Writer, units: []const u16) std.Io.Writer.Error!void {
+    const nl = std.mem.indexOfScalar(u16, units, '\n') orelse return;
+    if (nl + 1 >= units.len) return;
+    try zqjs.ops.writeUtf16(report, units[nl + 1 ..]);
+    try report.writeByte('\n');
+}
+
 fn writeThrown(rt: *zqjs.Runtime, mode: zqjs.RunMode, report: *std.Io.Writer) std.Io.Writer.Error!void {
     if (rt.thrown_value) |v| {
         try report.writeAll("Uncaught ");
@@ -512,6 +519,16 @@ fn writeThrown(rt: *zqjs.Runtime, mode: zqjs.RunMode, report: *std.Io.Writer) st
             } else |_| try report.writeAll("[value]");
         }
         try report.writeByte('\n');
+        if (mode == .normal and v.isObject() and v.asObject().ordinary_tag == .@"error") {
+            const obj = v.asObject();
+            const stack_units: ?[]const u16 = if (lookupDataProp(obj, "stack")) |sv|
+                (if (sv.isString()) sv.asString().units else null)
+            else if (rt.heap.error_stacks.get(obj)) |s|
+                s.units
+            else
+                null;
+            if (stack_units) |u| try writeStackFrames(report, u);
+        }
     } else {
         const ex = rt.exception.?;
         try report.print("Uncaught {s}", .{@tagName(ex.name)});
@@ -520,6 +537,9 @@ fn writeThrown(rt: *zqjs.Runtime, mode: zqjs.RunMode, report: *std.Io.Writer) st
             try zqjs.ops.writeUtf16(report, ex.message.units);
         }
         try report.writeByte('\n');
+        if (mode == .normal) {
+            if (ex.stack) |s| try writeStackFrames(report, s.units);
+        }
     }
 }
 

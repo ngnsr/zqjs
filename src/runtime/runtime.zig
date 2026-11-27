@@ -43,6 +43,22 @@ pub const alive_magic: u32 = 0x5A514A53; // "ZQJS"
 pub const Exception = struct {
     name: ErrorName,
     message: *const heap_mod.String,
+    stack: ?*const heap_mod.String = null,
+};
+
+/// One JavaScript frame captured by an active engine's `StackWalker`.
+pub const StackFrame = struct {
+    func_name: []const u8,
+    source_name: []const u8,
+    line: u32,
+    col: u32,
+    callee: ?Value = null,
+};
+
+/// Engine-agnostic stack walker registered on `Runtime.stack_walkers`.
+pub const StackWalker = struct {
+    ctx: *anyopaque,
+    capture: *const fn (ctx: *anyopaque, gpa: Allocator, out: *std.ArrayList(StackFrame), max_frames: usize) Allocator.Error!void,
 };
 
 /// How an engine lets the collector mark the values only it holds.
@@ -247,6 +263,8 @@ pub const Runtime = struct {
     engine_roots: ?EngineRoots = null,
     /// The running engine's closure-invocation hook for JS → Builtin → JS reentrancy (M16.1).
     closure_caller: ?ClosureCaller = null,
+    /// Active engine stack walkers (outermost first, innermost last) for JS stack traces.
+    stack_walkers: std.ArrayList(StackWalker) = .empty,
     /// Frame address at the latest depth-0 entry (D60); 0 = unset, never faults.
     stack_base: usize = 0,
     /// Pending microtasks drained at the outermost turn checkpoint (M18).
@@ -352,6 +370,7 @@ pub const Runtime = struct {
         rt.exec_ctx.records.deinit(rt.gpa);
         rt.exec_ctx.vms.deinit(rt.gpa);
         rt.joining.deinit(rt.gpa);
+        rt.stack_walkers.deinit(rt.gpa);
         rt.extra_roots.deinit(rt.gpa);
         rt.template_cache.deinit(rt.gpa);
         rt.global_symbols.deinit(rt.gpa);
@@ -417,9 +436,43 @@ pub const Runtime = struct {
     /// itself fails (heap limit, OOM), that failure is returned instead.
     pub fn throw(rt: *Runtime, name: ErrorName, message: []const heap_mod.Piece) Error {
         const msg = try rt.heap.newString(message);
+        var stack_str: ?*const heap_mod.String = null;
+        if (rt.stack_walkers.items.len > 0) {
+            var root_buf = [_]Value{Value.fromString(msg)};
+            var roots: ValueRoots = .{ .values = &root_buf };
+            try roots.register(rt);
+            defer roots.unregister(rt);
+            stack_str = builtins_mod.formatStackTrace(rt, @tagName(name), msg, .undefined) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
+        }
         rt.thrown_value = null;
-        rt.exception = .{ .name = name, .message = msg };
+        rt.exception = .{ .name = name, .message = msg, .stack = stack_str };
         return error.Thrown;
+    }
+
+    pub fn pushStackWalker(rt: *Runtime, walker: StackWalker) error{OutOfMemory}!void {
+        try rt.stack_walkers.append(rt.gpa, walker);
+    }
+
+    pub fn popStackWalker(rt: *Runtime, ctx: *anyopaque) void {
+        std.debug.assert(rt.stack_walkers.items.len > 0);
+        std.debug.assert(rt.stack_walkers.items[rt.stack_walkers.items.len - 1].ctx == ctx);
+        _ = rt.stack_walkers.pop();
+    }
+
+    /// Captures active JS stack frames innermost-to-outermost across all active walkers.
+    pub fn captureStack(rt: *const Runtime, gpa: Allocator, max_frames: usize) Allocator.Error!std.ArrayList(StackFrame) {
+        var out: std.ArrayList(StackFrame) = .empty;
+        errdefer out.deinit(gpa);
+        var i = rt.stack_walkers.items.len;
+        while (i > 0 and out.items.len < max_frames) {
+            i -= 1;
+            const w = rt.stack_walkers.items[i];
+            try w.capture(w.ctx, gpa, &out, max_frames);
+        }
+        return out;
     }
 
     /// Records an arbitrary JS value thrown by `throw expr` and returns error.Thrown.
@@ -444,7 +497,7 @@ pub const Runtime = struct {
             return v;
         }
         const ex = rt.exception.?;
-        const err_val = try builtins_mod.makeEngineError(rt, ex.name, ex.message);
+        const err_val = try builtins_mod.makeEngineErrorWithStack(rt, ex.name, ex.message, ex.stack);
         rt.exception = null;
         rt.thrown_value = null;
         return err_val;
@@ -506,7 +559,10 @@ pub const Runtime = struct {
             h.markObj(@constCast(&e.key_ptr.*.obj));
             h.markObj(&e.value_ptr.*.obj);
         }
-        if (rt.exception) |e| h.markObj(@constCast(&e.message.obj));
+        if (rt.exception) |e| {
+            h.markObj(@constCast(&e.message.obj));
+            if (e.stack) |s| h.markObj(@constCast(&s.obj));
+        }
         if (rt.thrown_value) |v| h.markValue(v);
         if (rt.unsupported_name) |n| h.markObj(@constCast(&n.obj));
         h.markValue(rt.repl_result);

@@ -514,15 +514,146 @@ const error_is_error: Native = .{ .name = "isError", .length = 1, .call = errorI
 
 const error_capture_stack_trace: Native = .{ .name = "captureStackTrace", .length = 2, .call = errorCaptureStackTrace };
 
+const max_stack_trace_frames: usize = 64;
+
+pub fn formatStackTrace(rt: *Runtime, err_name: []const u8, msg_opt: ?*const heap_mod.String, constructor_opt: Value) Error!*const heap_mod.String {
+    return formatStackTraceImpl(rt, null, err_name, msg_opt, constructor_opt);
+}
+
+fn formatStackTraceImpl(
+    rt: *Runtime,
+    name_str_opt: ?*const heap_mod.String,
+    name_ascii: []const u8,
+    msg_opt: ?*const heap_mod.String,
+    constructor_opt: Value,
+) Error!*const heap_mod.String {
+    var frames = try rt.captureStack(rt.gpa, max_stack_trace_frames);
+    defer frames.deinit(rt.gpa);
+
+    var start_idx: usize = 0;
+    if (constructor_opt.isFunction()) {
+        for (frames.items, 0..) |f, i| {
+            if (f.callee) |c| {
+                if (c.bits == constructor_opt.bits) {
+                    start_idx = i + 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    var tail_buf: std.ArrayList(u8) = .empty;
+    defer tail_buf.deinit(rt.gpa);
+    var num_buf: [32]u8 = undefined;
+    for (frames.items[start_idx..]) |f| {
+        try tail_buf.appendSlice(rt.gpa, "\n    at ");
+        const src = if (f.source_name.len > 0) f.source_name else "<anonymous>";
+        if (f.func_name.len > 0) {
+            try tail_buf.appendSlice(rt.gpa, f.func_name);
+            if (f.line > 0) {
+                try tail_buf.appendSlice(rt.gpa, " (");
+                try tail_buf.appendSlice(rt.gpa, src);
+                const loc_str = std.fmt.bufPrint(&num_buf, ":{d}:{d})", .{ f.line, f.col }) catch unreachable;
+                try tail_buf.appendSlice(rt.gpa, loc_str);
+            } else {
+                try tail_buf.appendSlice(rt.gpa, " (<anonymous>)");
+            }
+        } else if (f.line > 0) {
+            try tail_buf.appendSlice(rt.gpa, src);
+            const loc_str = std.fmt.bufPrint(&num_buf, ":{d}:{d}", .{ f.line, f.col }) catch unreachable;
+            try tail_buf.appendSlice(rt.gpa, loc_str);
+        } else {
+            try tail_buf.appendSlice(rt.gpa, "<anonymous>");
+        }
+    }
+
+    var has_non_ascii = false;
+    for (tail_buf.items) |b| {
+        if (b >= 0x80) {
+            has_non_ascii = true;
+            break;
+        }
+    }
+    var tail_u16: ?[]u16 = null;
+    defer if (tail_u16) |u| rt.gpa.free(u);
+    if (has_non_ascii) {
+        tail_u16 = std.unicode.utf8ToUtf16LeAlloc(rt.gpa, tail_buf.items) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidUtf8 => null,
+        };
+    }
+
+    var pieces: [4]heap_mod.Piece = undefined;
+    var n_pieces: usize = 0;
+
+    const has_name = if (name_str_opt) |ns| ns.units.len > 0 else name_ascii.len > 0;
+    const has_msg = if (msg_opt) |ms| ms.units.len > 0 else false;
+
+    if (has_name) {
+        pieces[n_pieces] = if (name_str_opt) |ns| .{ .utf16 = ns.units } else .{ .ascii = name_ascii };
+        n_pieces += 1;
+    }
+    if (has_name and has_msg) {
+        pieces[n_pieces] = .{ .ascii = ": " };
+        n_pieces += 1;
+    }
+    if (has_msg) {
+        pieces[n_pieces] = .{ .utf16 = msg_opt.?.units };
+        n_pieces += 1;
+    }
+    if (tail_buf.items.len > 0) {
+        pieces[n_pieces] = if (tail_u16) |u| .{ .utf16 = u } else .{ .ascii = tail_buf.items };
+        n_pieces += 1;
+    }
+    return rt.heap.newString(pieces[0..n_pieces]);
+}
+
+fn errorNameForProto(r: *const builtins.Realm, proto: *Object) []const u8 {
+    if (proto == r.type_error_prototype) return "TypeError";
+    if (proto == r.range_error_prototype) return "RangeError";
+    if (proto == r.syntax_error_prototype) return "SyntaxError";
+    if (proto == r.reference_error_prototype) return "ReferenceError";
+    if (proto == r.eval_error_prototype) return "EvalError";
+    if (proto == r.uri_error_prototype) return "URIError";
+    if (proto == r.aggregate_error_prototype) return "AggregateError";
+    return "Error";
+}
+
 fn errorCaptureStackTrace(rt: *Runtime, _: Value, args: []const Value) Error!Value {
     const target = common.arg(args, 0);
     if (!target.isObjectLike()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Error.captureStackTrace target must be an object" }});
     }
-    if (target.isObject()) {
-        const stack_val = Value.fromString(try rt.heap.ascii("Error"));
-        try object.define(rt, target.asObject(), try object.named(rt, "stack"), stack_val);
-    }
+    const ctor_opt = common.arg(args, 1);
+
+    var root_buf = [_]Value{ target, ctor_opt, .undefined, .undefined, .undefined };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    const name_val = try object.get(rt, target, try object.named(rt, "name"));
+    root_buf[2] = name_val;
+    const name_str: ?*const heap_mod.String = if (name_val.isUndefined()) null else try common.toStringObj(rt, name_val);
+    root_buf[2] = if (name_str) |s| Value.fromString(s) else .undefined;
+
+    const msg_val = try object.get(rt, target, try object.named(rt, "message"));
+    root_buf[3] = msg_val;
+    const msg_str: ?*const heap_mod.String = if (msg_val.isUndefined()) null else try common.toStringObj(rt, msg_val);
+    root_buf[3] = if (msg_str) |s| Value.fromString(s) else .undefined;
+
+    const stack_str = try formatStackTraceImpl(rt, name_str, if (name_str == null) "Error" else "", msg_str, ctor_opt);
+    root_buf[4] = Value.fromString(stack_str);
+
+    _ = try obj_builtins.defineOwnPropertyParsed(rt, target, try object.named(rt, "stack"), .{
+        .has_val = true,
+        .val = root_buf[4],
+        .has_writ = true,
+        .writ_val = true,
+        .has_enum = true,
+        .enum_val = false,
+        .has_conf = true,
+        .conf_val = true,
+    }, true);
     return .undefined;
 }
 
@@ -543,6 +674,9 @@ fn errorStackGet(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     }
     if (!this.isObject() or this.asObject().ordinary_tag != .@"error") {
         return .undefined;
+    }
+    if (rt.heap.error_stacks.get(this.asObject())) |stack_str| {
+        return Value.fromString(stack_str);
     }
     return Value.fromString(try rt.heap.ascii(""));
 }
@@ -613,7 +747,8 @@ fn errorToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 }
 
 pub fn buildError(rt: *Runtime, proto: *Object, msg_arg: Value, opts_arg: Value) Error!*Object {
-    var root_buf = [_]Value{ msg_arg, opts_arg, .undefined, .undefined };
+    const r = try builtins.realm(rt);
+    var root_buf = [_]Value{ msg_arg, opts_arg, .undefined, .undefined, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -622,8 +757,10 @@ pub fn buildError(rt: *Runtime, proto: *Object, msg_arg: Value, opts_arg: Value)
     err_obj.ordinary_tag = .@"error";
     root_buf[2] = Value.fromObject(err_obj);
 
+    var msg_str_opt: ?*const heap_mod.String = null;
     if (!msg_arg.isUndefined()) {
         const msg_str = try common.toStringObj(rt, msg_arg);
+        msg_str_opt = msg_str;
         root_buf[3] = Value.fromString(msg_str);
         try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("message"), .{ .value = root_buf[3], .enumerable = false });
     }
@@ -631,14 +768,21 @@ pub fn buildError(rt: *Runtime, proto: *Object, msg_arg: Value, opts_arg: Value)
         const cause_key = try object.named(rt, "cause");
         if (try object.has(rt, cause_key, opts_arg)) {
             const cause_val = try object.get(rt, opts_arg, cause_key);
-            root_buf[3] = cause_val;
+            root_buf[4] = cause_val;
             try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("cause"), .{ .value = cause_val, .enumerable = false });
         }
     }
+    const stack_str = try formatStackTrace(rt, errorNameForProto(r, proto), msg_str_opt, .undefined);
+    root_buf[4] = Value.fromString(stack_str);
+    try rt.heap.setErrorStack(err_obj, stack_str);
     return err_obj;
 }
 
 pub fn makeEngineError(rt: *Runtime, name: rt_mod.ErrorName, msg: *const heap_mod.String) Error!Value {
+    return makeEngineErrorWithStack(rt, name, msg, null);
+}
+
+pub fn makeEngineErrorWithStack(rt: *Runtime, name: rt_mod.ErrorName, msg: *const heap_mod.String, pre_captured_stack: ?*const heap_mod.String) Error!Value {
     const r = try builtins.realm(rt);
     const proto = switch (name) {
         .ReferenceError => r.reference_error_prototype,
@@ -646,7 +790,11 @@ pub fn makeEngineError(rt: *Runtime, name: rt_mod.ErrorName, msg: *const heap_mo
         .RangeError => r.range_error_prototype,
         .SyntaxError => r.syntax_error_prototype,
     };
-    var root_buf = [_]Value{ Value.fromString(msg), .undefined };
+    var root_buf = [_]Value{
+        Value.fromString(msg),
+        .undefined,
+        if (pre_captured_stack) |s| Value.fromString(s) else .undefined,
+    };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -655,6 +803,12 @@ pub fn makeEngineError(rt: *Runtime, name: rt_mod.ErrorName, msg: *const heap_mo
     err_obj.ordinary_tag = .@"error";
     root_buf[1] = Value.fromObject(err_obj);
     try rt.heap.defineProperty(err_obj, try rt.heap.internAscii("message"), .{ .value = root_buf[0], .enumerable = false });
+    const stack_str = pre_captured_stack orelse blk: {
+        const s = try formatStackTrace(rt, @tagName(name), msg, .undefined);
+        root_buf[2] = Value.fromString(s);
+        break :blk s;
+    };
+    try rt.heap.setErrorStack(err_obj, stack_str);
     return root_buf[1];
 }
 

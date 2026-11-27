@@ -29,7 +29,7 @@ const Runtime = @import("runtime/runtime.zig").Runtime;
 const module = @import("runtime/module.zig");
 const ops = @import("runtime/ops.zig");
 const treewalk = @import("interp/machine.zig");
-const compile = @import("bytecode/compiler.zig").compile;
+const compileWithOptions = @import("bytecode/compiler.zig").compileWithOptions;
 const verify = @import("bytecode/verify.zig");
 const disasm = @import("bytecode/disasm.zig");
 const Vm = @import("vm/vm.zig").Vm;
@@ -74,9 +74,9 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
     rt.heap.collect_always = options.collect_always or rt.heap.collect_always;
     rt.heap.verify_always = options.verify_heap or rt.heap.verify_always;
     const outcome = switch (options.engine) {
-        .treewalk => treewalk.run(&rt, script, res),
+        .treewalk => treewalk.runWithSource(&rt, script, res, name, source),
         .vm => vm: {
-            var proto = compile(gpa, &rt.heap, script, res, limits, &diag) catch |e| switch (e) {
+            var proto = compileWithOptions(gpa, &rt.heap, script, res, limits, .{ .source_name = name, .source = source }, &diag) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.LimitExceeded => return frontendFailure(e, diag, source, name, report),
             };
@@ -253,6 +253,13 @@ fn extractThrownError(v: Value) ?ThrownErrorInfo {
     return null;
 }
 
+fn writeStackFrames(report: *Writer, units: []const u16) Writer.Error!void {
+    const nl = std.mem.indexOfScalar(u16, units, '\n') orelse return;
+    if (nl + 1 >= units.len) return;
+    try ops.writeUtf16(report, units[nl + 1 ..]);
+    try report.writeByte('\n');
+}
+
 fn writeThrown(rt: *Runtime, mode: Mode, report: *Writer) Writer.Error!void {
     if (rt.thrown_value) |v| {
         try report.writeAll("Uncaught ");
@@ -277,6 +284,16 @@ fn writeThrown(rt: *Runtime, mode: Mode, report: *Writer) Writer.Error!void {
             } else |_| try report.writeAll("[value]");
         }
         try report.writeByte('\n');
+        if (mode == .normal and v.isObject() and v.asObject().ordinary_tag == .@"error") {
+            const obj = v.asObject();
+            const stack_units: ?[]const u16 = if (lookupDataProp(obj, "stack")) |sv|
+                (if (sv.isString()) sv.asString().units else null)
+            else if (rt.heap.error_stacks.get(obj)) |s|
+                s.units
+            else
+                null;
+            if (stack_units) |u| try writeStackFrames(report, u);
+        }
     } else {
         const ex = rt.exception.?;
         try report.print("Uncaught {s}", .{@tagName(ex.name)});
@@ -285,6 +302,9 @@ fn writeThrown(rt: *Runtime, mode: Mode, report: *Writer) Writer.Error!void {
             try ops.writeUtf16(report, ex.message.units);
         }
         try report.writeByte('\n');
+        if (mode == .normal) {
+            if (ex.stack) |s| try writeStackFrames(report, s.units);
+        }
     }
 }
 

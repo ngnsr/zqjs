@@ -724,7 +724,29 @@ pub const Vm = struct {
         }
     };
 
+    fn captureStack(ctx: *anyopaque, gpa: Allocator, out: *std.ArrayList(rt_mod.StackFrame), max_frames: usize) Allocator.Error!void {
+        const vm: *const Vm = @ptrCast(@alignCast(ctx));
+        const frames = vm.frames.items;
+        var i = frames.len;
+        while (i > 0 and out.items.len < max_frames) {
+            i -= 1;
+            const f = frames[i];
+            const frame_pc: u32 = if (i + 1 == frames.len) vm.pc else frames[i + 1].return_pc -| 1;
+            const loc = f.proto.lookupLocation(frame_pc);
+            const fn_name = if (f.proto.name.len > 0) f.proto.name else f.proto.inferred_name;
+            try out.append(gpa, .{
+                .func_name = fn_name,
+                .source_name = f.proto.source_name,
+                .line = if (loc) |l| l.line else 0,
+                .col = if (loc) |l| l.col else 0,
+                .callee = if (f.closure) |cl| Value.fromClosure(@constCast(cl)) else null,
+            });
+        }
+    }
+
     inline fn runLoop(vm: *Vm, comptime bounded: bool, steps: u64) Error!State {
+        try vm.rt.pushStackWalker(.{ .ctx = vm, .capture = captureStack });
+        defer vm.rt.popStackWalker(vm);
         if (vm.rt.heap.collect_always) {
             @branchHint(.cold);
             return vm.runLoopInner(bounded, true, steps);
@@ -887,6 +909,8 @@ pub const Vm = struct {
         }
         vm.enterDepthScope();
         defer vm.syncChainDepth();
+        try vm.rt.pushStackWalker(.{ .ctx = vm, .capture = captureStack });
+        defer vm.rt.popStackWalker(vm);
         var cache = FrameCache.fromVm(vm, vm.pc);
         var state: State = .running;
         vm.execute(vm.rt, &cache, &state, false) catch |e| {
@@ -937,20 +961,20 @@ pub const Vm = struct {
             },
 
             .get_local => {
-                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(pc, cache.operand(1));
                 try cache.push(vm, s.asValue());
             },
             .set_local => {
-                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(pc, cache.operand(1));
                 s.* = Slot.fromValue(try cache.peek(vm, 0)); // the assignment's value stays on the stack
             },
             .set_local_pop => {
-                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(pc, cache.operand(1));
                 s.* = Slot.fromValue(try cache.peek(vm, 0));
                 try cache.drop(vm, 1);
             },
             .inc_local, .dec_local => {
-                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                const s = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(pc, cache.operand(1));
                 const v = s.asValue();
                 if (v.isNumber()) {
                     s.* = Slot.fromValue(Value.fromNumber(v.asNumber() + @as(f64, if (op == .inc_local) 1 else -1)));
@@ -969,8 +993,8 @@ pub const Vm = struct {
             },
             .clear_local => (try cache.slot(vm, cache.operand(0))).* = .uninit,
             .assign_const => {
-                if ((try cache.valueSlot(vm, cache.operand(0))) == null) return vm.tdz(cache.operand(1));
-                return vm.constAssignment();
+                if ((try cache.valueSlot(vm, cache.operand(0))) == null) return vm.tdz(pc, cache.operand(1));
+                return vm.constAssignment(pc);
             },
             .get_global => {
                 try cache.ensurePush(vm);
@@ -1016,12 +1040,12 @@ pub const Vm = struct {
                 s.* = Slot.fromCell(try rt.heap.newCell(old.value));
             },
             .get_cell => {
-                const v = (try cache.cellAt(vm, cache.operand(0))).value orelse return vm.tdz(cache.operand(1));
+                const v = (try cache.cellAt(vm, cache.operand(0))).value orelse return vm.tdz(pc, cache.operand(1));
                 try cache.push(vm, v);
             },
             .set_cell => {
                 const c = try cache.cellAt(vm, cache.operand(0));
-                if (c.value == null) return vm.tdz(cache.operand(1));
+                if (c.value == null) return vm.tdz(pc, cache.operand(1));
                 rt.heap.storeCell(c, try cache.peek(vm, 0));
             },
             .init_cell => {
@@ -1029,33 +1053,33 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
             },
             .assign_const_cell => {
-                if ((try cache.cellAt(vm, cache.operand(0))).value == null) return vm.tdz(cache.operand(1));
-                return vm.constAssignment();
+                if ((try cache.cellAt(vm, cache.operand(0))).value == null) return vm.tdz(pc, cache.operand(1));
+                return vm.constAssignment(pc);
             },
             .get_capture => {
-                const v = (try vm.capture(cache.operand(0))).value orelse return vm.tdz(cache.operand(1));
+                const v = (try vm.capture(cache.operand(0))).value orelse return vm.tdz(pc, cache.operand(1));
                 try cache.push(vm, v);
             },
             .set_capture => {
                 const c = try vm.capture(cache.operand(0));
-                if (c.value == null) return vm.tdz(cache.operand(1));
+                if (c.value == null) return vm.tdz(pc, cache.operand(1));
                 rt.heap.storeCell(c, try cache.peek(vm, 0));
             },
             .assign_const_capture => {
-                if ((try vm.capture(cache.operand(0))).value == null) return vm.tdz(cache.operand(1));
-                return vm.constAssignment();
+                if ((try vm.capture(cache.operand(0))).value == null) return vm.tdz(pc, cache.operand(1));
+                return vm.constAssignment(pc);
             },
             .get_repl => {
                 const idx = cache.operand(0);
                 if (idx >= p.repl_cells.len) return vm.bug("repl cell index out of range");
-                const v = p.repl_cells[idx].value orelse return vm.tdz(cache.operand(1));
+                const v = p.repl_cells[idx].value orelse return vm.tdz(pc, cache.operand(1));
                 try cache.push(vm, v);
             },
             .set_repl => {
                 const idx = cache.operand(0);
                 if (idx >= p.repl_cells.len) return vm.bug("repl cell index out of range");
                 const c = p.repl_cells[idx];
-                if (c.value == null) return vm.tdz(cache.operand(1));
+                if (c.value == null) return vm.tdz(pc, cache.operand(1));
                 rt.heap.storeCell(c, try cache.peek(vm, 0));
             },
             .init_repl => {
@@ -1067,8 +1091,8 @@ pub const Vm = struct {
             .assign_const_repl => {
                 const idx = cache.operand(0);
                 if (idx >= p.repl_cells.len) return vm.bug("repl cell index out of range");
-                if (p.repl_cells[idx].value == null) return vm.tdz(cache.operand(1));
-                return vm.constAssignment();
+                if (p.repl_cells[idx].value == null) return vm.tdz(pc, cache.operand(1));
+                return vm.constAssignment(pc);
             },
             .save_repl_result => {
                 rt.repl_result = try cache.peek(vm, 0);
@@ -1439,7 +1463,7 @@ pub const Vm = struct {
             },
             .add_local, .sub_local, .mul_local, .mod_local => {
                 const lhs = try cache.peek(vm, 0);
-                const rhs_slot = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(cache.operand(1));
+                const rhs_slot = (try cache.valueSlot(vm, cache.operand(0))) orelse return vm.tdz(pc, cache.operand(1));
                 const rhs = rhs_slot.asValue();
                 const r: Value = if (lhs.isNumber() and rhs.isNumber()) switch (op) {
                     .add_local => Value.fromNumber(lhs.asNumber() + rhs.asNumber()),
@@ -2116,7 +2140,10 @@ pub const Vm = struct {
                 try cache.drop(vm, 1);
                 (try cache.top(vm)).* = val;
             },
-            .throw_delete_super => return rt.throw(.ReferenceError, &.{.{ .ascii = "Unsupported reference to 'super'" }}),
+            .throw_delete_super => {
+                vm.pc = pc;
+                return rt.throw(.ReferenceError, &.{.{ .ascii = "Unsupported reference to 'super'" }});
+            },
             .delete_prop => {
                 cache.syncSp(vm);
                 const r = try object.delete(rt, try cache.peek(vm, 0), try vm.nameKey(cache.operand(0)));
@@ -2216,6 +2243,7 @@ pub const Vm = struct {
             .require_obj => {
                 const v = try cache.peek(vm, 0);
                 if (v.isNullish()) {
+                    vm.pc = pc;
                     return rt.throw(.TypeError, &.{ .{ .ascii = "Cannot destructure '" }, .{ .ascii = @tagName(v.tag()) }, .{ .ascii = "'" } });
                 }
             },
@@ -3016,11 +3044,15 @@ pub const Vm = struct {
         return object.named(vm.rt, try vm.name(i));
     }
 
-    fn tdz(vm: *Vm, name_index: u32) Error {
+    fn tdz(vm: *Vm, fault_pc: u32, name_index: u32) Error {
+        @branchHint(.cold);
+        vm.pc = fault_pc;
         return vm.rt.throw(.ReferenceError, &.{ .{ .ascii = "Cannot access '" }, .{ .ascii = try vm.name(name_index) }, .{ .ascii = "' before initialization" } });
     }
 
-    fn constAssignment(vm: *Vm) Error {
+    fn constAssignment(vm: *Vm, fault_pc: u32) Error {
+        @branchHint(.cold);
+        vm.pc = fault_pc;
         return vm.rt.throw(.TypeError, &.{.{ .ascii = "Assignment to constant variable." }});
     }
 

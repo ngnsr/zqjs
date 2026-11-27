@@ -1013,6 +1013,8 @@ pub const Heap = struct {
     /// covers entries [i·card_elements, (i+1)·card_elements), key and value alike. Entry
     /// indices are insertion order; only `removeProperty` shifts them (and dirties).
     prop_cards: std.AutoHashMapUnmanaged(*Object, []u64) = .empty,
+    /// Captured JS stack trace strings for Error objects (side-table so `Object` stays unchanged).
+    error_stacks: std.AutoHashMapUnmanaged(*const Object, *const String) = .empty,
     /// Collect at every safepoint, not only when requested (tests; always under -Dgc-stress).
     collect_always: bool = gc_stress,
     /// Run the heap verifier after every collection (always under -Dgc-stress; a
@@ -1156,14 +1158,17 @@ pub const Heap = struct {
         while (h.gray) |obj| {
             h.gray = obj.gray_next;
             obj.gray_next = null;
-            if (!h.in_minor and obj.kind == .object) {
+            if (obj.kind == .object) {
                 const o: *Object = @fieldParentPtr("obj", obj);
-                if (o.props == .shaped) {
+                if (!h.in_minor and o.props == .shaped) {
                     var cur = o.props.shaped.shape;
                     while (cur) |s| : (cur = s.parent) {
                         if (s.marked) break;
                         s.marked = true;
                     }
+                }
+                if (o.ordinary_tag == .@"error") {
+                    if (h.error_stacks.get(o)) |s| h.markObj(@constCast(&s.obj));
                 }
             }
             forEachChild(obj, h, markObj);
@@ -1357,6 +1362,9 @@ pub const Heap = struct {
                     if (pv.is_accessor) visitValue(pv.setter, &scan, RememberedScan.child);
                 }
             }
+            if (o.ordinary_tag == .@"error") {
+                if (h.error_stacks.get(o)) |s| scan.child(@constCast(&s.obj));
+            }
             switch (o.kind) {
                 .ordinary => {},
                 .array => |elements| if (h.cards.get(o)) |words| {
@@ -1520,6 +1528,9 @@ pub const Heap = struct {
                 forEachChild(obj, &c, Check.edge);
                 if (obj.kind == .object) {
                     const o: *Object = @fieldParentPtr("obj", obj);
+                    if (o.ordinary_tag == .@"error") {
+                        if (h.error_stacks.get(o)) |s| Check.edge(&c, @constCast(&s.obj));
+                    }
                     switch (o.kind) {
                         .weak_map => |wm| {
                             if (wm.weak_next != null) return error.GrayListNotEmpty;
@@ -1558,6 +1569,13 @@ pub const Heap = struct {
         while (atoms.next()) |k| {
             if (k.*.obj.kind == .dead) return error.AtomTableHoldsCollectedObject;
             if (k.*.atom == null) return error.AtomTableHoldsNonAtom;
+        }
+        var es_it = h.error_stacks.iterator();
+        while (es_it.next()) |e| {
+            const k = e.key_ptr.*;
+            const v = e.value_ptr.*;
+            if (k.obj.kind == .dead or v.obj.kind == .dead) return error.EdgeToCollectedObject;
+            if (k.obj.old and !v.obj.old and !k.obj.remembered) return error.UnrememberedOldToYoungEdge;
         }
         if (sum != h.bytes) return error.AccountingMismatch;
     }
@@ -1613,6 +1631,8 @@ pub const Heap = struct {
         std.debug.assert(h.cards.count() == 0 and h.prop_cards.count() == 0); // gone with their objects (release)
         h.cards.deinit(h.allocator());
         h.prop_cards.deinit(h.allocator());
+        std.debug.assert(h.error_stacks.count() == 0); // gone with their objects (release)
+        h.error_stacks.deinit(h.gpa);
         var t = h.tombstones;
         while (t) |obj| {
             t = obj.next;
@@ -2659,6 +2679,11 @@ pub const Heap = struct {
         if (owner.old and isYoung(v)) h.remember(owner);
     }
 
+    pub fn setErrorStack(h: *Heap, err_obj: *Object, stack_str: *const String) Error!void {
+        h.barrierObj(&err_obj.obj, @constCast(&stack_str.obj));
+        try h.error_stacks.put(h.gpa, err_obj, stack_str);
+    }
+
     pub inline fn barrierObj(h: *Heap, owner: *Obj, child: *Obj) void {
         owner.checkLive();
         child.checkLive();
@@ -3026,6 +3051,7 @@ pub const Heap = struct {
                     o.private_props = null;
                 }
                 if (h.prop_cards.fetchRemove(o)) |kv| h.allocator().free(kv.value);
+                if (o.ordinary_tag == .@"error") _ = h.error_stacks.remove(o);
                 switch (o.kind) {
                     .ordinary => {},
                     .array => |*elements| {

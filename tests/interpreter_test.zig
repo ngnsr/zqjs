@@ -2082,6 +2082,243 @@ test "ES2025 §10.4.4.7 mapped arguments: escaping closure and GC stress (collec
     }
 }
 
+test "WHATWG Encoding globals: btoa, atob, TextEncoder, TextDecoder (dual-engine)" {
+    const src =
+        \\function errInfo(fn) {
+        \\    try { fn(); return "ok"; }
+        \\    catch (e) { return `${e instanceof Error}:${e.name}:${e.code ?? ""}`; }
+        \\}
+        \\
+        \\// 1. Global descriptors, lengths, and constructability
+        \\const dAtob = Object.getOwnPropertyDescriptor(globalThis, "atob");
+        \\const dBtoa = Object.getOwnPropertyDescriptor(globalThis, "btoa");
+        \\const dTE = Object.getOwnPropertyDescriptor(globalThis, "TextEncoder");
+        \\const dTD = Object.getOwnPropertyDescriptor(globalThis, "TextDecoder");
+        \\print("desc:",
+        \\    dAtob.writable, dAtob.enumerable, dAtob.configurable, atob.length,
+        \\    dBtoa.writable, dBtoa.enumerable, dBtoa.configurable, btoa.length,
+        \\    dTE.writable, dTE.enumerable, dTE.configurable, TextEncoder.length,
+        \\    dTD.writable, dTD.enumerable, dTD.configurable, TextDecoder.length
+        \\);
+        \\print("ctor-err:",
+        \\    errInfo(() => new atob("Zg==")),
+        \\    errInfo(() => new btoa("f")),
+        \\    errInfo(() => TextEncoder()),
+        \\    errInfo(() => TextDecoder())
+        \\);
+        \\
+        \\// 2. btoa / atob roundtrips, Latin-1 binary 0..255, whitespace, missing padding, errors
+        \\let allLatin1 = "";
+        \\for (let i = 0; i < 256; i++) allLatin1 += String.fromCharCode(i);
+        \\const b64All = btoa(allLatin1);
+        \\const decAll = atob(b64All);
+        \\let latin1Ok = decAll.length === 256;
+        \\for (let i = 0; i < 256; i++) {
+        \\    if (decAll.charCodeAt(i) !== i) latin1Ok = false;
+        \\}
+        \\print("btoa-atob:",
+        \\    btoa(""), atob(""),
+        \\    btoa("f"), btoa("fo"), btoa("foo"),
+        \\    atob(" \t\n\f\r Zm 9v \r\n "),
+        \\    atob("Zg"), atob("Zm8"), atob("Zm9v"),
+        \\    btoa(123), atob("MTIz"),
+        \\    latin1Ok
+        \\);
+        \\print("btoa-err:",
+        \\    errInfo(() => btoa()),
+        \\    errInfo(() => btoa("Привіт")),
+        \\    errInfo(() => btoa("\u0100")),
+        \\    errInfo(() => atob()),
+        \\    errInfo(() => atob("a")),
+        \\    errInfo(() => atob("abcde")),
+        \\    errInfo(() => atob("Zm=v")),
+        \\    errInfo(() => atob("Zm9!")),
+        \\    errInfo(() => atob("Zg===")),
+        \\    errInfo(() => atob("Zg=\u0080"))
+        \\);
+        \\
+        \\// 3. TextEncoder: encoding, encode, encodeInto, subarray, detached, brand check
+        \\const enc = new TextEncoder();
+        \\print("te-meta:",
+        \\    enc.encoding,
+        \\    Object.prototype.toString.call(enc),
+        \\    TextEncoder.prototype.encode.length,
+        \\    TextEncoder.prototype.encodeInto.length,
+        \\    enc.encode().length,
+        \\    enc.encode(undefined).length,
+        \\    errInfo(() => Object.getOwnPropertyDescriptor(TextEncoder.prototype, "encoding").get.call({})),
+        \\    errInfo(() => enc.encodeInto("a"))
+        \\);
+        \\const eAscii = enc.encode("hi");
+        \\const eCyr = enc.encode("Привіт");
+        \\const eEmoji = enc.encode("😀");
+        \\const eLoneHi = enc.encode("\uD800");
+        \\const eLoneLo = enc.encode("\uDC00");
+        \\print("te-bytes:",
+        \\    [...eAscii].join(","),
+        \\    [...eCyr].join(","),
+        \\    [...eEmoji].join(","),
+        \\    [...eLoneHi].join(","),
+        \\    [...eLoneLo].join(",")
+        \\);
+        \\// Truncation mid-2-byte (é = C3 A9), mid-3-byte (€ = E2 82 AC), mid-4-byte (😀 = F0 9F 98 80)
+        \\const b2 = new Uint8Array(2);
+        \\const r2 = enc.encodeInto("aé", b2);
+        \\const b3 = new Uint8Array(3);
+        \\const r3 = enc.encodeInto("a€", b3);
+        \\const b4 = new Uint8Array(4);
+        \\const r4 = enc.encodeInto("a😀", b4);
+        \\const b5 = new Uint8Array(5);
+        \\const r5 = enc.encodeInto("a😀", b5);
+        \\const backing = new Uint8Array([9, 9, 9, 9, 9, 9]);
+        \\const sub = backing.subarray(2, 5);
+        \\const rSub = enc.encodeInto("hi!", sub);
+        \\const detU8 = new Uint8Array(4);
+        \\structuredClone(detU8.buffer, { transfer: [detU8.buffer] });
+        \\print("te-into:",
+        \\    `${r2.read}/${r2.written}:${b2[0]},${b2[1]}`,
+        \\    `${r3.read}/${r3.written}:${b3[0]},${b3[1]},${b3[2]}`,
+        \\    `${r4.read}/${r4.written}:${b4[0]},${b4[1]}`,
+        \\    `${r5.read}/${r5.written}:${[...b5].join(",")}`,
+        \\    `${rSub.read}/${rSub.written}:${[...backing].join(",")}`,
+        \\    errInfo(() => enc.encodeInto("a", detU8)),
+        \\    errInfo(() => enc.encodeInto("a", new Int8Array(4)))
+        \\);
+        \\
+        \\// 4. TextDecoder: labels, options, BOM, fatal vs replacement, views, streaming
+        \\const dec = new TextDecoder();
+        \\const decNorm1 = new TextDecoder("UTF-8");
+        \\const decNorm2 = new TextDecoder(" \tutf8\n ");
+        \\const decNorm3 = new TextDecoder("unicode-1-1-utf-8");
+        \\const decFatal = new TextDecoder("utf-8", { fatal: true });
+        \\const decBom = new TextDecoder("utf-8", { ignoreBOM: true });
+        \\print("td-meta:",
+        \\    dec.encoding, dec.fatal, dec.ignoreBOM,
+        \\    decNorm1.encoding, decNorm2.encoding, decNorm3.encoding,
+        \\    decFatal.fatal, decBom.ignoreBOM,
+        \\    Object.prototype.toString.call(dec),
+        \\    errInfo(() => new TextDecoder("latin1")),
+        \\    errInfo(() => new TextDecoder("utf-8", 42)),
+        \\    errInfo(() => Object.getOwnPropertyDescriptor(TextDecoder.prototype, "fatal").get.call({}))
+        \\);
+        \\// BOM stripping vs ignoreBOM
+        \\const withBom = new Uint8Array([0xEF, 0xBB, 0xBF, 0x68, 0x69]);
+        \\print("td-bom:",
+        \\    dec.decode(withBom), dec.decode(withBom).length,
+        \\    decBom.decode(withBom).charCodeAt(0) === 0xFEFF, decBom.decode(withBom).length
+        \\);
+        \\// ArrayBuffer, TypedArray subarray, DataView, undefined
+        \\const fullBuf = new Uint8Array([0x58, 0xF0, 0x9F, 0x98, 0x80, 0x59]);
+        \\const dv = new DataView(fullBuf.buffer, 1, 4);
+        \\print("td-views:",
+        \\    dec.decode(),
+        \\    dec.decode(fullBuf.buffer),
+        \\    dec.decode(fullBuf.subarray(1, 5)),
+        \\    dec.decode(dv)
+        \\);
+        \\// Maximal-subpart U+FFFD replacement vs fatal: true TypeError
+        \\const invalidSeqs = [
+        \\    new Uint8Array([0xC0, 0xAF]),             // overlong 2-byte
+        \\    new Uint8Array([0xE0, 0x80, 0xAF]),       // overlong 3-byte
+        \\    new Uint8Array([0xED, 0xA0, 0x80]),       // UTF-16 surrogate U+D800
+        \\    new Uint8Array([0xF4, 0x90, 0x80, 0x80]), // > U+10FFFF
+        \\    new Uint8Array([0xE2, 0x82, 0x41]),       // truncated 3-byte followed by 'A'
+        \\    new Uint8Array([0xF0, 0x9F]),             // truncated at EOF
+        \\];
+        \\print("td-repl:",
+        \\    invalidSeqs.map(s => [...dec.decode(s)].map(c => c.codePointAt(0).toString(16)).join("+")).join(" | ")
+        \\);
+        \\print("td-fatal:",
+        \\    invalidSeqs.map(s => errInfo(() => decFatal.decode(s))).join(" | "),
+        \\    decFatal.decode(enc.encode("ok"))
+        \\);
+        \\// Streaming split 4-byte emoji + split BOM + trailing incomplete flush
+        \\const sDec = new TextDecoder();
+        \\const p1 = sDec.decode(new Uint8Array([0xEF, 0xBB]), { stream: true });
+        \\const p2 = sDec.decode(new Uint8Array([0xBF, 0xF0, 0x9F]), { stream: true });
+        \\const p3 = sDec.decode(new Uint8Array([0x98, 0x80, 0x21]), { stream: true });
+        \\const p4 = sDec.decode();
+        \\const t1 = sDec.decode(new Uint8Array([0xF0, 0x9F]), { stream: true });
+        \\const t2 = sDec.decode();
+        \\print("td-stream:",
+        \\    `${p1}|${p2}|${p3}|${p4}`,
+        \\    t1.length,
+        \\    t2.charCodeAt(0).toString(16),
+        \\    errInfo(() => dec.decode(detU8)),
+        \\    errInfo(() => dec.decode("not-a-buffer"))
+        \\);
+    ;
+    const expected =
+        \\desc: true true true 1 true true true 1 true false true 0 true false true 0
+        \\ctor-err: true:TypeError: true:TypeError: true:TypeError: true:TypeError:
+        \\btoa-atob:   Zg== Zm8= Zm9v foo f fo foo MTIz 123 true
+        \\btoa-err: true:TypeError: true:InvalidCharacterError:5 true:InvalidCharacterError:5 true:TypeError: true:InvalidCharacterError:5 true:InvalidCharacterError:5 true:InvalidCharacterError:5 true:InvalidCharacterError:5 true:InvalidCharacterError:5 true:InvalidCharacterError:5
+        \\te-meta: utf-8 [object TextEncoder] 0 2 0 0 true:TypeError: true:TypeError:
+        \\te-bytes: 104,105 208,159,209,128,208,184,208,178,209,150,209,130 240,159,152,128 239,191,189 239,191,189
+        \\te-into: 1/1:97,0 1/1:97,0,0 1/1:97,0 3/5:97,240,159,152,128 3/3:9,9,104,105,33,9 true:TypeError: true:TypeError:
+        \\td-meta: utf-8 false false utf-8 utf-8 utf-8 true true [object TextDecoder] true:RangeError: true:TypeError: true:TypeError:
+        \\td-bom: hi 2 true 3
+        \\td-views:  X😀Y 😀 😀
+        \\td-repl: fffd+fffd | fffd+fffd+fffd | fffd+fffd+fffd | fffd+fffd+fffd+fffd | fffd+41 | fffd
+        \\td-fatal: true:TypeError: | true:TypeError: | true:TypeError: | true:TypeError: | true:TypeError: | true:TypeError: ok
+        \\td-stream: ||😀!| 0 fffd true:TypeError: true:TypeError:
+        \\
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqual(@as(u8, 0), r.code);
+        try testing.expectEqualStrings("", r.err);
+        try testing.expectEqualStrings(expected, r.out);
+    }
+}
+
+test "WHATWG Encoding globals GC stress (collect_always + verify_heap)" {
+    const src =
+        \\function churn(tag) {
+        \\    for (let i = 0; i < 16; i++) {
+        \\        const tmp = { k: tag + i, a: [i, i + 1] };
+        \\        void tmp;
+        \\    }
+        \\}
+        \\const b = btoa({ toString() { churn("btoa"); return "hello"; } });
+        \\const a = atob({ toString() { churn("atob"); return b; } });
+        \\const enc = new TextEncoder();
+        \\const u8 = enc.encode({ toString() { churn("enc"); return "Привіт 😀"; } });
+        \\const dst = new Uint8Array(32);
+        \\const into = enc.encodeInto({ toString() { churn("into"); return "😀ok"; } }, dst);
+        \\const dec = new TextDecoder(
+        \\    { toString() { churn("lbl"); return " UTF-8 "; } },
+        \\    {
+        \\        get fatal() { churn("f"); return false; },
+        \\        get ignoreBOM() { churn("b"); return false; },
+        \\    }
+        \\);
+        \\const c1 = dec.decode(u8.subarray(0, 14), { get stream() { churn("s1"); return true; } });
+        \\const c2 = dec.decode(u8.subarray(14), { get stream() { churn("s2"); return false; } });
+        \\print(b, a, into.read, into.written, c1 + c2);
+    ;
+    const expected =
+        \\aGVsbG8= hello 4 6 Привіт 😀
+        \\
+    ;
+    for (support.engines) |engine| {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer err_w.deinit();
+        const code = try zqjs.runSource(testing.allocator, "gc_encoding_globals.js", src, .{}, .{
+            .mode = .normal,
+            .engine = engine,
+            .collect_always = true,
+            .verify_heap = true,
+        }, &out.writer, &err_w.writer);
+        try testing.expectEqual(@as(u8, 0), code);
+        try testing.expectEqualStrings("", err_w.written());
+        try testing.expectEqualStrings(expected, out.written());
+    }
+}
+
 test "ES2026 Uint8Array Base64 and Hex methods (dual-engine)" {
     const src =
         \\// 1. Method presence & descriptors: ONLY on Uint8Array / Uint8Array.prototype

@@ -330,6 +330,8 @@ pub const Native = struct {
         float64_array,
         bigint64_array,
         biguint64_array,
+        text_encoder,
+        text_decoder,
     } = null,
 };
 

@@ -5,24 +5,64 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>zqjs — Browser WASM Playground</title>
   <style>
+    /* Chill Gray Dark (default) */
     :root {
-      --bg: #0d1117;
-      --bg-panel: #161b22;
-      --bg-elev: #1f2630;
-      --border: #2b3441;
-      --text: #e6edf3;
-      --text-dim: #8b949e;
-      --accent: #f7a41d;
-      --accent-hover: #ffb946;
-      --ok: #3fb950;
-      --err: #f85149;
-      --err-bg: rgba(248, 81, 73, 0.12);
-      --warn: #d29922;
+      color-scheme: dark;
+      --bg: #1b1d21;
+      --bg-panel: #22252a;
+      --bg-elev: #2a2e35;
+      --border: #343942;
+      --border-hover: #4a505b;
+      --text: #d5d8de;
+      --text-dim: #8c929e;
+      --accent: #d89b3c;
+      --accent-hover: #e3ad5a;
+      --on-accent: #1b1d21;
+      --ok: #7fb069;
+      --err: #e06c75;
+      --err-bg: rgba(224, 108, 117, 0.12);
+      --warn: #d8b35a;
+      --selection: rgba(216, 155, 60, 0.28);
+      --hl-comment: #6c7380;
+      --hl-string: #9fbf7a;
+      --hl-number: #d6a06b;
+      --hl-keyword: #c49bd6;
+      --hl-global: #7fb2d9;
+      --hl-node: #d89b3c;
+      --hl-annot: #7aa9a3;
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }
 
+    /* Warm Paper Light */
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --bg: #f6f6f3;
+      --bg-panel: #eeeee9;
+      --bg-elev: #ffffff;
+      --border: #dcdcd5;
+      --border-hover: #b9b9b0;
+      --text: #222428;
+      --text-dim: #6b6e75;
+      --accent: #b86e00;
+      --accent-hover: #9a5c00;
+      --on-accent: #ffffff;
+      --ok: #3d7a2a;
+      --err: #c0392b;
+      --err-bg: rgba(192, 57, 43, 0.09);
+      --warn: #9a7400;
+      --selection: rgba(184, 110, 0, 0.2);
+      --hl-comment: #8d9097;
+      --hl-string: #4f7a28;
+      --hl-number: #a5531b;
+      --hl-keyword: #8a3fa0;
+      --hl-global: #2a6496;
+      --hl-node: #b86e00;
+      --hl-annot: #2f7d75;
+    }
+
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
 
     html, body {
       margin: 0;
@@ -98,6 +138,36 @@
       gap: 8px;
     }
 
+    /* Native macOS popups center on the selected item (opening upward); the customizable select
+       drops below the button instead. Browsers without it keep the native popup. */
+    @supports (appearance: base-select) {
+      #preset-select, #preset-select::picker(select) { appearance: base-select; }
+      #preset-select { display: inline-flex; align-items: center; gap: 6px; }
+      #preset-select::picker-icon { color: var(--text-dim); transition: rotate 0.15s; }
+      #preset-select:open::picker-icon { rotate: 180deg; }
+      #preset-select::picker(select) {
+        position-area: block-end span-inline-start;
+        position-try-fallbacks: flip-inline;
+        margin-top: 4px;
+        padding: 4px;
+        min-width: anchor-size(width);
+        max-height: 70vh;
+        background: var(--bg-elev);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+      }
+      #preset-select option {
+        padding: 5px 10px;
+        border-radius: 5px;
+        white-space: nowrap;
+      }
+      #preset-select option:hover, #preset-select option:focus-visible { background: var(--selection); }
+      #preset-select option:checked { color: var(--accent); font-weight: 600; }
+      #preset-select option::checkmark { display: none; }
+    }
+
     .preset-wrap label {
       color: var(--text-dim);
       font-size: 12px;
@@ -127,7 +197,7 @@
     }
 
     button:hover, select:hover {
-      border-color: #48566a;
+      border-color: var(--border-hover);
     }
 
     button:disabled {
@@ -137,7 +207,7 @@
 
     .btn-run {
       background: var(--accent);
-      color: #0d1117;
+      color: var(--on-accent);
       border-color: var(--accent);
       font-weight: 600;
       padding: 5px 14px;
@@ -240,22 +310,139 @@
       letter-spacing: 0.04em;
     }
 
-    textarea#editor {
+    /* Editor: gutter + transparent textarea over a highlighted <pre>. All three share metrics. */
+    .editor-wrap {
       flex: 1;
-      width: 100%;
-      margin: 0;
-      padding: 14px 16px;
-      border: none;
-      outline: none;
-      resize: none;
+      display: flex;
+      min-height: 0;
       background: var(--bg);
-      color: var(--text);
+      overflow: hidden;
+    }
+
+    .gutter, .editor-highlight, textarea#editor {
+      margin: 0;
       font-family: var(--mono);
       font-size: 13px;
       line-height: 1.55;
       tab-size: 2;
       white-space: pre;
+      padding-top: 14px;
+      padding-bottom: 14px;
+    }
+
+    .gutter {
+      flex-shrink: 0;
+      min-width: 42px;
+      padding-left: 10px;
+      padding-right: 10px;
+      padding-bottom: 60px; /* lets it scroll as far as the textarea (horizontal scrollbar) */
+      text-align: right;
+      color: var(--text-dim);
+      opacity: 0.6;
+      background: var(--bg-panel);
+      border-right: 1px solid var(--border);
+      overflow: hidden;
+      user-select: none;
+    }
+
+    .editor-stack {
+      position: relative;
+      flex: 1;
+      min-width: 0;
+    }
+
+    .editor-highlight, textarea#editor {
+      position: absolute;
+      inset: 0;
+      padding-left: 16px;
+      padding-right: 16px;
+      overflow: hidden;
+    }
+
+    .editor-highlight {
+      color: var(--text);
+      pointer-events: none;
+      padding-bottom: 60px;
+    }
+
+    textarea#editor {
+      width: 100%;
+      height: 100%;
+      border: none;
+      outline: none;
+      resize: none;
+      background: transparent;
+      color: transparent;
+      caret-color: var(--text);
       overflow: auto;
+    }
+
+    textarea#editor::selection { background: var(--selection); color: transparent; }
+
+    .tok-comment { color: var(--hl-comment); font-style: italic; }
+    .tok-string { color: var(--hl-string); }
+    .tok-number { color: var(--hl-number); }
+    .tok-keyword { color: var(--hl-keyword); }
+    .tok-global { color: var(--hl-global); }
+    .tok-node { color: var(--hl-node); font-weight: 600; }
+    .tok-head { color: var(--text-dim); }
+    .tok-annot { color: var(--hl-annot); }
+
+    /* Autocomplete popup */
+    .ac-popup {
+      position: absolute;
+      z-index: 10;
+      min-width: 160px;
+      max-height: 200px;
+      overflow-y: auto;
+      margin: 0;
+      padding: 3px 0;
+      list-style: none;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .ac-popup[hidden] { display: none; }
+
+    .ac-popup li {
+      padding: 2px 10px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .ac-popup li.active {
+      background: var(--selection);
+      color: var(--text);
+    }
+
+    .ac-popup li .ac-kind {
+      float: right;
+      margin-left: 12px;
+      color: var(--text-dim);
+    }
+
+    .pane-tools {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .segmented.small button { padding: 2px 8px; font-size: 11px; }
+
+    #bytecode-pre {
+      white-space: pre;
+      word-break: normal;
+      overflow-x: auto;
+    }
+
+    .note {
+      margin-bottom: 10px;
+      color: var(--text-dim);
+      font-style: italic;
     }
 
     /* Tabs */
@@ -331,7 +518,7 @@
       border-radius: 6px;
       background: var(--err-bg);
       border: 1px solid rgba(248, 81, 73, 0.35);
-      color: #ff9490;
+      color: var(--err);
       white-space: pre-wrap;
       word-break: break-word;
     }
@@ -370,9 +557,9 @@
       .pane-left {
         border-right: none;
         border-bottom: 1px solid var(--border);
-        min-height: 44vh;
       }
-      .pane-right { min-height: 44vh; }
+      /* Bounded panes: long output scrolls inside .output-body instead of growing the page. */
+      .pane-left, .pane-right { height: 44vh; max-height: 52vh; }
       .shortcut-hint { display: none; }
     }
   </style>
@@ -387,6 +574,7 @@
       <div class="preset-wrap">
         <label for="preset-select">Example</label>
         <select id="preset-select"></select>
+        <button id="theme-btn" type="button" aria-label="Toggle color theme">Light</button>
       </div>
     </header>
 
@@ -394,7 +582,7 @@
       <button id="run-btn" class="btn-run" disabled>Run</button>
       <button id="reset-btn" class="btn-stop">Stop / Reset Worker</button>
 
-      <div class="segmented" role="group" aria-label="Execution engine">
+      <div class="segmented" id="engine-seg" role="group" aria-label="Execution engine">
         <button id="eng-vm" class="active" data-engine="vm">VM</button>
         <button id="eng-treewalk" data-engine="treewalk">Tree-walker</button>
       </div>
@@ -432,7 +620,14 @@
           <span class="pane-title">Source</span>
           <span id="status-text" class="pane-title">Idle</span>
         </div>
-        <textarea id="editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
+        <div class="editor-wrap">
+          <pre class="gutter" id="gutter" aria-hidden="true">1</pre>
+          <div class="editor-stack" id="editor-stack">
+            <pre class="editor-highlight" id="editor-highlight" aria-hidden="true"></pre>
+            <textarea id="editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" aria-label="JavaScript source"></textarea>
+            <ul class="ac-popup" id="ac-popup" role="listbox" hidden></ul>
+          </div>
+        </div>
       </section>
 
       <section class="pane pane-right">
@@ -442,7 +637,13 @@
             <button class="tab-btn" data-tab="bytecode">Bytecode</button>
             <button class="tab-btn" data-tab="ast">AST</button>
           </div>
-          <span id="exit-badge" class="exit-badge">exit —</span>
+          <div class="pane-tools">
+            <div class="segmented small" id="ast-mode" role="group" aria-label="AST view" hidden>
+              <button class="active" data-ast-mode="tree">Tree</button>
+              <button data-ast-mode="raw">Raw</button>
+            </div>
+            <span id="exit-badge" class="exit-badge">exit —</span>
+          </div>
         </div>
 
         <div class="output-body">
@@ -450,6 +651,7 @@
             <div class="empty-state">Click Run (or press Cmd/Ctrl+Enter) to execute JavaScript in WASM.</div>
           </div>
           <div id="panel-bytecode" class="tab-panel">
+            <div id="bytecode-note" class="note" hidden>VM bytecode disassembly (executed via tree-walker)</div>
             <pre id="bytecode-pre" class="code-out empty-state">No bytecode yet.</pre>
           </div>
           <div id="panel-ast" class="tab-panel">
@@ -603,7 +805,11 @@ while (true) {
     ];
 
     const editor = document.getElementById("editor");
+    const editorHighlight = document.getElementById("editor-highlight");
+    const gutter = document.getElementById("gutter");
+    const acPopup = document.getElementById("ac-popup");
     const presetSelect = document.getElementById("preset-select");
+    const themeBtn = document.getElementById("theme-btn");
     const runBtn = document.getElementById("run-btn");
     const resetBtn = document.getElementById("reset-btn");
     const versionBadge = document.getElementById("version-badge");
@@ -614,7 +820,9 @@ while (true) {
     const maxHeapSelect = document.getElementById("max-heap");
     const panelOutput = document.getElementById("panel-output");
     const bytecodePre = document.getElementById("bytecode-pre");
+    const bytecodeNote = document.getElementById("bytecode-note");
     const astPre = document.getElementById("ast-pre");
+    const astMode = document.getElementById("ast-mode");
     const statTime = document.getElementById("stat-time");
     const statSteps = document.getElementById("stat-steps");
     const statPeak = document.getElementById("stat-peak");
@@ -624,6 +832,40 @@ while (true) {
     let worker = null;
     let workerReady = false;
     let running = false;
+    let probing = false;
+    let runEngine = "vm"; // engine of the run whose result is being rendered
+    let lastAst = "";
+    let astView = "tree";
+
+    // ---------- Theme ----------
+    const THEME_KEY = "zqjs-playground-theme";
+
+    function applyTheme(theme) {
+      document.documentElement.dataset.theme = theme;
+      themeBtn.textContent = theme === "dark" ? "Light" : "Dark";
+      themeBtn.title = `Switch to ${theme === "dark" ? "light" : "dark"} theme`;
+    }
+
+    function storedTheme() {
+      try { return localStorage.getItem(THEME_KEY); } catch (_e) { return null; }
+    }
+
+    applyTheme(storedTheme() || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"));
+
+    themeBtn.addEventListener("click", () => {
+      const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+      applyTheme(next);
+      try { localStorage.setItem(THEME_KEY, next); } catch (_e) { /* storage disabled */ }
+    });
+
+    // ---------- Shared helpers ----------
+    function escapeHtml(s) {
+      return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function span(cls, text) {
+      return `<span class="${cls}">${escapeHtml(text)}</span>`;
+    }
 
     function formatBytes(bytes) {
       if (bytes < 1024) return `${bytes} B`;
@@ -635,6 +877,345 @@ while (true) {
       return Number(n).toLocaleString("en-US");
     }
 
+    // ---------- JS syntax highlighting ----------
+    const KEYWORDS = [
+      "async", "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default",
+      "delete", "do", "else", "export", "extends", "false", "finally", "for", "from", "function", "get",
+      "if", "import", "in", "instanceof", "let", "new", "null", "of", "return", "set", "static", "super",
+      "switch", "this", "throw", "true", "try", "typeof", "undefined", "var", "void", "while", "with", "yield",
+    ];
+    const GLOBALS = [
+      "console", "globalThis", "Math", "JSON", "Object", "Array", "Function", "Reflect", "Proxy", "Promise",
+      "Map", "Set", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry", "Symbol", "BigInt", "Number",
+      "String", "Boolean", "RegExp", "Date", "Iterator", "Error", "TypeError", "RangeError", "SyntaxError",
+      "ReferenceError", "EvalError", "URIError", "AggregateError", "ArrayBuffer", "SharedArrayBuffer",
+      "DataView", "Atomics", "Uint8Array", "Int8Array", "Uint8ClampedArray", "Uint16Array", "Int16Array",
+      "Uint32Array", "Int32Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
+      "TextEncoder", "TextDecoder", "NaN", "Infinity", "parseInt", "parseFloat", "isNaN", "isFinite",
+      "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI", "queueMicrotask", "structuredClone",
+      "atob", "btoa", "print",
+    ];
+    const KEYWORD_SET = new Set(KEYWORDS);
+    const GLOBAL_SET = new Set(GLOBALS);
+
+    // shortcut: no regex-literal or `${}`-nesting awareness; a full tokenizer if users hit mis-colored code.
+    const JS_TOKEN = new RegExp([
+      String.raw`(\/\/[^\n]*|\/\*[\s\S]*?(?:\*\/|$))`,
+      String.raw`(\x60(?:\\[\s\S]|[^\\\x60])*\x60?|"(?:\\.|[^\\"\n])*"?|'(?:\\.|[^\\'\n])*'?)`,
+      String.raw`(\b(?:0[xX][\da-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\d[\d_]*(?:\.[\d_]*)?(?:[eE][+-]?\d+)?)n?\b|\.\d[\d_]*(?:[eE][+-]?\d+)?)`,
+      String.raw`(#?[A-Za-z_$][\w$]*)`,
+    ].join("|"), "g");
+
+    function highlightJs(src) {
+      let out = "";
+      let last = 0;
+      for (const m of src.matchAll(JS_TOKEN)) {
+        out += escapeHtml(src.slice(last, m.index));
+        last = m.index + m[0].length;
+        if (m[1]) out += span("tok-comment", m[0]);
+        else if (m[2]) out += span("tok-string", m[0]);
+        else if (m[3]) out += span("tok-number", m[0]);
+        else if (KEYWORD_SET.has(m[0])) out += span("tok-keyword", m[0]);
+        else if (GLOBAL_SET.has(m[0]) && src[m.index - 1] !== ".") out += span("tok-global", m[0]);
+        else out += escapeHtml(m[0]);
+      }
+      return out + escapeHtml(src.slice(last));
+    }
+
+    let gutterLines = 0;
+    function renderEditor() {
+      const src = editor.value;
+      // Trailing newline keeps the <pre> as tall as the textarea when the last line is empty.
+      editorHighlight.innerHTML = highlightJs(src) + "\n";
+      const lines = src.split("\n").length;
+      if (lines !== gutterLines) {
+        gutterLines = lines;
+        gutter.textContent = Array.from({ length: lines }, (_, i) => i + 1).join("\n");
+      }
+      syncScroll();
+    }
+
+    function syncScroll() {
+      editorHighlight.scrollTop = editor.scrollTop;
+      editorHighlight.scrollLeft = editor.scrollLeft;
+      gutter.scrollTop = editor.scrollTop;
+    }
+
+    // Edits through execCommand keep the browser's native undo stack; setRangeText is the fallback.
+    function insertText(text, from, to) {
+      editor.focus();
+      editor.setSelectionRange(from, to);
+      if (!document.execCommand("insertText", false, text)) {
+        editor.setRangeText(text, from, to, "end");
+        editor.dispatchEvent(new Event("input"));
+      }
+    }
+
+    // ---------- Autocomplete ----------
+    // Mirrors the REPL (src/repl/complete.zig): keywords + globals + bindings at top level, and for
+    // `X.` / `X.prototype.` every own/inherited name. Names come from zqjs itself: on worker start
+    // the page runs ZQJS_NAMES_PROBE once, so the list matches exactly what this WASM build has.
+    const COMPLETION_KEYWORDS = [...KEYWORDS, "constructor"];
+    const ZQJS_NAMES_PROBE = `{
+      const names = (o) => {
+        const s = new Set();
+        for (let p = o, i = 0; p !== null && p !== undefined && i < 64; p = Object.getPrototypeOf(p), i++)
+          for (const k of Object.getOwnPropertyNames(p)) s.add(k);
+        return [...s].filter((k) => /^[A-Za-z_$][\\w$]*$/.test(k) && !k.startsWith("__"));
+      };
+      const out = { "": Object.getOwnPropertyNames(globalThis) };
+      for (const g of out[""]) {
+        const v = globalThis[g];
+        if (v === null || (typeof v !== "object" && typeof v !== "function")) continue;
+        out[g] = names(v);
+        if (typeof v === "function" && v.prototype) out[g + ".prototype"] = names(v.prototype);
+      }
+      console.log(JSON.stringify(out));
+    }`;
+    // { "": [global names], "Math": [...], "Map.prototype": [...] }; null until the probe answers.
+    let zqjsNames = null;
+
+    function setZqjsNames(stdout) {
+      try { zqjsNames = JSON.parse(stdout); } catch (_e) { zqjsNames = null; return; }
+      for (const g of zqjsNames[""] || []) GLOBAL_SET.add(g);
+      renderEditor();
+    }
+
+    function localNames(src) {
+      const names = new Set();
+      for (const m of src.matchAll(/\b(?:const|let|var|class|function\*?)\s+([A-Za-z_$][\w$]*)/g)) names.add(m[1]);
+      return [...names];
+    }
+
+    // `x = new Map(...)` / `X.from(...)` / `[...]` / `"..."` → the "X.prototype" key x. completes against.
+    function inferProto(name, src) {
+      const decl = new RegExp(String.raw`\b${name.replace(/\$/g, "\\$")}\s*=\s*(?:new\s+([A-Za-z_$][\w$]*)|([A-Za-z_$][\w$]*)\.from|(\[)|(["'\x60]))`).exec(src);
+      if (!decl) return null;
+      const ctor = decl[3] ? "Array" : decl[4] ? "String" : decl[1] || decl[2];
+      return `${ctor}.prototype`;
+    }
+
+    let acItems = [];
+    let acIndex = 0;
+    let acFrom = 0;
+    let acSuppress = false;
+
+    function acCandidates(force) {
+      const pos = editor.selectionStart;
+      if (pos !== editor.selectionEnd) return null;
+      const src = editor.value;
+      const before = src.slice(Math.max(0, pos - 200), pos);
+      const member = /((?:[A-Za-z_$][\w$]*[ \t]*\.[ \t]*)+)([A-Za-z_$][\w$]*)?$/.exec(before);
+      if (member) {
+        const [root, ...path] = member[1].split(".").map((p) => p.trim()).filter(Boolean);
+        if (!zqjsNames) return null;
+        const base = root === "globalThis" ? "" : GLOBAL_SET.has(root) ? root
+          : inferProto(root, src) || (force ? "Object.prototype" : null);
+        if (base === null) return null;
+        const key = [base, ...path].filter(Boolean).join(".");
+        const names = zqjsNames[key];
+        if (!names) return null;
+        const kind = [root, ...path].join(".");
+        return { prefix: member[2] || "", items: names.map((label) => ({ label, kind })) };
+      }
+      const word = /[A-Za-z_$][\w$]*$/.exec(before);
+      const prefix = word ? word[0] : "";
+      if (before[before.length - prefix.length - 1] === ".") return null;
+      if (/\d$/.test(before.slice(0, before.length - prefix.length))) return null;
+      if (!force && prefix.length < 2) return null;
+      const seen = new Set();
+      const items = [];
+      for (const [list, kind] of [[localNames(src), "local"], [zqjsNames ? zqjsNames[""] : GLOBALS, "global"], [COMPLETION_KEYWORDS, "keyword"]]) {
+        for (const label of list) {
+          if (!seen.has(label)) { seen.add(label); items.push({ label, kind }); }
+        }
+      }
+      return { prefix, items };
+    }
+
+    function hideAc() {
+      acPopup.hidden = true;
+      acItems = [];
+    }
+
+    function caretPixel(pos) {
+      const cs = getComputedStyle(editor);
+      const ctx = caretPixel.ctx || (caretPixel.ctx = document.createElement("canvas").getContext("2d"));
+      ctx.font = `${cs.fontSize} ${cs.fontFamily}`;
+      const charW = ctx.measureText("m").width;
+      const lineH = parseFloat(cs.lineHeight);
+      const before = editor.value.slice(0, pos);
+      const line = before.split("\n").length - 1;
+      const col = before.length - before.lastIndexOf("\n") - 1;
+      return {
+        top: parseFloat(cs.paddingTop) + (line + 1) * lineH - editor.scrollTop + 2,
+        left: parseFloat(cs.paddingLeft) + col * charW - editor.scrollLeft,
+        lineH,
+      };
+    }
+
+    function updateAc(force) {
+      const ctx = acCandidates(force);
+      if (!ctx) return hideAc();
+      const items = ctx.items
+        .filter((it) => it.label.startsWith(ctx.prefix) && it.label !== ctx.prefix)
+        .slice(0, 50);
+      if (items.length === 0) return hideAc();
+      acItems = items;
+      acIndex = 0;
+      acFrom = editor.selectionStart - ctx.prefix.length;
+      acPopup.innerHTML = items
+        .map((it, i) => `<li role="option" data-i="${i}">${escapeHtml(it.label)}<span class="ac-kind">${escapeHtml(it.kind)}</span></li>`)
+        .join("");
+      const { top, left, lineH } = caretPixel(acFrom);
+      const stack = editor.parentElement;
+      acPopup.hidden = false;
+      const above = top - lineH - acPopup.offsetHeight - 4;
+      const flip = top + acPopup.offsetHeight > stack.clientHeight && above >= 0;
+      acPopup.style.top = `${flip ? above : top}px`;
+      acPopup.style.left = `${Math.max(0, Math.min(left, stack.clientWidth - acPopup.offsetWidth - 4))}px`;
+      markAc();
+    }
+
+    function markAc() {
+      acPopup.querySelectorAll("li").forEach((li, i) => {
+        li.classList.toggle("active", i === acIndex);
+        li.setAttribute("aria-selected", String(i === acIndex));
+      });
+      const active = acPopup.children[acIndex];
+      if (active) active.scrollIntoView({ block: "nearest" });
+    }
+
+    function acceptAc(i = acIndex) {
+      const item = acItems[i];
+      if (!item) return hideAc();
+      hideAc();
+      acSuppress = true;
+      insertText(item.label, acFrom, editor.selectionStart);
+    }
+
+    acPopup.addEventListener("mousedown", (e) => {
+      e.preventDefault(); // keep editor focus
+      const li = e.target.closest("li");
+      if (li) acceptAc(Number(li.dataset.i));
+    });
+
+    // ---------- AST pretty-printer ----------
+    const AST_NODES = new Set([
+      "function", "const", "let", "var", "return", "call", "if", "for", "for-of", "for-in", "while",
+      "do-while", "class", "new", "arrow", "async", "await", "yield", "try", "throw", "switch",
+    ]);
+    const AST_WIDTH = 72;
+
+    // S-expression → nested arrays; atoms are {a} and quoted strings are {s}. Returns null when unbalanced.
+    function parseSexpr(src) {
+      const re = /\s*(?:(\()|(\))|("(?:\\[\s\S]|[^"\\])*")|([^\s()"]+))/y;
+      const stack = [[]];
+      let pos = 0;
+      let m;
+      while ((m = re.exec(src)) !== null) {
+        pos = re.lastIndex;
+        if (m[1]) stack.push([]);
+        else if (m[2]) {
+          if (stack.length < 2) return null;
+          const list = stack.pop();
+          stack[stack.length - 1].push(list);
+        } else if (m[3]) stack[stack.length - 1].push({ s: m[3] });
+        else if (m[4]) stack[stack.length - 1].push({ a: m[4] });
+        if (pos >= src.length) break;
+      }
+      if (stack.length !== 1 || src.slice(pos).trim() !== "") return null;
+      return stack[0];
+    }
+
+    function flatSexpr(n) {
+      if (Array.isArray(n)) return `(${n.map(flatSexpr).join(" ")})`;
+      return n.s !== undefined ? n.s : n.a;
+    }
+
+    function atomHtml(n, isHead) {
+      if (n.s !== undefined) return span("tok-string", n.s);
+      const a = n.a;
+      if (isHead) return span(AST_NODES.has(a) ? "tok-node" : "tok-head", a);
+      if (/^-?(?:\d|\.\d)/.test(a) || a === "NaN" || a === "Infinity") return span("tok-number", a);
+      if (a === "true" || a === "false" || a === "null" || a === "undefined" || a === "this") return span("tok-keyword", a);
+      // Resolver annotations: #slot, @frame-slot / @cN capture / @global, ^depth.
+      const ann = /^(.+?)((?:[#@^][\w$]+)+)$/.exec(a);
+      if (ann) return escapeHtml(ann[1]) + span("tok-annot", ann[2]);
+      return escapeHtml(a);
+    }
+
+    function sexprHtml(n, indent) {
+      if (!Array.isArray(n)) return atomHtml(n, false);
+      if (n.length === 0) return "()";
+      const fits = indent + flatSexpr(n).length <= AST_WIDTH;
+      // Head plus any leading atoms stay on the opening line; nested lists go one per line.
+      let i = 0;
+      const parts = [];
+      while (i < n.length && (i === 0 || !Array.isArray(n[i]) || fits)) {
+        parts.push(i === 0 && !Array.isArray(n[0]) ? atomHtml(n[0], true) : sexprHtml(n[i], indent + 2));
+        i++;
+      }
+      let out = `(${parts.join(" ")}`;
+      const pad = "\n" + " ".repeat(indent + 2);
+      for (; i < n.length; i++) out += pad + sexprHtml(n[i], indent + 2);
+      return out + ")";
+    }
+
+    function prettyAst(src) {
+      const forms = parseSexpr(src);
+      if (!forms) return null;
+      return forms.map((f) => sexprHtml(f, 0)).join("\n\n");
+    }
+
+    function renderAst() {
+      if (!lastAst) return;
+      const html = astView === "tree" ? prettyAst(lastAst) : null;
+      astPre.className = "code-out";
+      if (html !== null) astPre.innerHTML = html;
+      else astPre.textContent = lastAst;
+    }
+
+    // ---------- Bytecode highlighting ----------
+    function highlightBytecodeLine(line) {
+      let m = /^(\s*)(\d+)(\s+)([A-Za-z_][\w.]*)(.*)$/.exec(line);
+      if (m) {
+        const rest = m[5];
+        const c = rest.search(/\s;\s/);
+        const operands = c < 0 ? rest : rest.slice(0, c);
+        const comment = c < 0 ? "" : rest.slice(c);
+        return escapeHtml(m[1]) + span("tok-annot", m[2]) + m[3] + span("tok-keyword", m[4]) +
+          escapeHtml(operands) + (comment ? span("tok-comment", comment) : "");
+      }
+      if (/^function #/.test(line)) return span("tok-node", line);
+      if (/^(constants|names|code|handlers|exceptions)\b/.test(line)) return span("tok-head", line);
+      if (/^slots \d/.test(line)) return span("tok-comment", line);
+      m = /^(\s+)([a-z]\d+)(\s+)(.*)$/.exec(line);
+      if (m) {
+        const v = m[4];
+        const cls = /^"/.test(v) ? "tok-string" : /^-?\d/.test(v) ? "tok-number" : "tok-global";
+        return m[1] + span("tok-annot", m[2]) + m[3] + span(cls, v);
+      }
+      return escapeHtml(line);
+    }
+
+    // ---------- Results ----------
+    function setEmpty(el, text) {
+      el.className = "code-out empty-state";
+      el.textContent = text;
+    }
+
+    function clearResults(badgeText) {
+      panelOutput.innerHTML = '<div class="empty-state">Click Run (or press Cmd/Ctrl+Enter) to execute JavaScript in WASM.</div>';
+      setEmpty(bytecodePre, "No bytecode yet.");
+      setEmpty(astPre, "No AST yet.");
+      bytecodeNote.hidden = true;
+      lastAst = "";
+      exitBadge.textContent = badgeText;
+      exitBadge.className = "exit-badge";
+      for (const s of [statTime, statSteps, statPeak, statGc]) s.textContent = "—";
+    }
+
     function spawnWorker() {
       if (worker) {
         worker.terminate();
@@ -642,6 +1223,7 @@ while (true) {
       }
       workerReady = false;
       running = false;
+      probing = false;
       runBtn.disabled = true;
       versionBadge.textContent = "loading wasm…";
       versionBadge.className = "badge";
@@ -653,15 +1235,21 @@ while (true) {
         if (!msg || typeof msg !== "object") return;
 
         if (msg.type === "ready") {
-          workerReady = true;
-          runBtn.disabled = false;
           versionBadge.textContent = `v${msg.version}`;
           versionBadge.className = "badge ready";
+          // Run stays disabled until the one-off completion-name probe answers.
+          probing = true;
+          worker.postMessage({ type: "eval", code: ZQJS_NAMES_PROBE, engine: "vm", isModule: false, maxSteps: 5000000, maxHeapBytes: 33554432 });
+        } else if (probing) {
+          probing = false;
+          workerReady = true;
+          runBtn.disabled = false;
           statusText.textContent = "Ready";
+          if (msg.type === "result" && msg.data && msg.data.ok) setZqjsNames(msg.data.stdout);
         } else if (msg.type === "result") {
           running = false;
           runBtn.disabled = false;
-          statusText.textContent = "Done";
+          statusText.textContent = msg.data && msg.data.ok ? "Done" : "Failed";
           renderResult(msg.data, msg.elapsedMs);
         } else if (msg.type === "error") {
           running = false;
@@ -721,22 +1309,23 @@ while (true) {
 
       if (data.bytecode && data.bytecode.length > 0) {
         bytecodePre.className = "code-out";
-        bytecodePre.textContent = data.bytecode;
+        bytecodePre.innerHTML = data.bytecode.split("\n").map(highlightBytecodeLine).join("\n");
+        bytecodeNote.hidden = runEngine !== "treewalk";
       } else {
-        bytecodePre.className = "code-out empty-state";
-        bytecodePre.textContent = moduleToggle.checked
+        bytecodeNote.hidden = true;
+        setEmpty(bytecodePre, moduleToggle.checked
           ? "Bytecode disassembly is only shown for scripts."
-          : "No bytecode (compile failed or skipped).";
+          : "No bytecode (compile failed or skipped).");
       }
 
       if (data.ast && data.ast.length > 0) {
-        astPre.className = "code-out";
-        astPre.textContent = data.ast;
+        lastAst = data.ast;
+        renderAst();
       } else {
-        astPre.className = "code-out empty-state";
-        astPre.textContent = moduleToggle.checked
+        lastAst = "";
+        setEmpty(astPre, moduleToggle.checked
           ? "AST dump is only shown for scripts."
-          : "No AST (parse/resolve failed).";
+          : "No AST (parse/resolve failed).");
       }
 
       const stats = data.stats || {};
@@ -752,7 +1341,9 @@ while (true) {
 
     function runCode() {
       if (!worker || !workerReady || running) return;
+      hideAc();
       running = true;
+      runEngine = engine;
       runBtn.disabled = true;
       statusText.textContent = "Running…";
       worker.postMessage({
@@ -772,29 +1363,62 @@ while (true) {
       opt.textContent = preset.name;
       presetSelect.appendChild(opt);
     });
+    const customOpt = document.createElement("option");
+    customOpt.value = "custom";
+    customOpt.textContent = "Custom (saved in this browser)";
+    presetSelect.appendChild(customOpt);
+
+    // The Custom example is whatever you last typed; it survives reloads via localStorage.
+    const CUSTOM_KEY = "zqjs-playground-custom";
+
+    function readCustom() {
+      try { return JSON.parse(localStorage.getItem(CUSTOM_KEY)); } catch (_e) { return null; }
+    }
+
+    function saveCustom() {
+      try {
+        localStorage.setItem(CUSTOM_KEY, JSON.stringify({ code: editor.value, isModule: moduleToggle.checked }));
+      } catch (_e) { /* storage disabled or full: edits still work, they just aren't kept */ }
+    }
 
     function loadPreset(idx) {
-      const preset = PRESETS[idx] || PRESETS[0];
+      const saved = idx === "custom" ? readCustom() : null;
+      const preset = idx === "custom"
+        ? { code: saved && typeof saved.code === "string" ? saved.code : "// Your code here. It is saved in this browser as you type.\n", isModule: Boolean(saved && saved.isModule) }
+        : PRESETS[idx] || PRESETS[0];
+      presetSelect.value = idx === "custom" ? "custom" : String(PRESETS.indexOf(preset));
       editor.value = preset.code;
       moduleToggle.checked = Boolean(preset.isModule);
+      editor.scrollTop = editor.scrollLeft = 0;
+      hideAc();
+      renderEditor();
     }
 
     presetSelect.addEventListener("change", () => {
-      loadPreset(Number(presetSelect.value));
+      loadPreset(presetSelect.value === "custom" ? "custom" : Number(presetSelect.value));
+      clearResults("exit —");
+      if (workerReady && !running) statusText.textContent = "Ready";
     });
 
     runBtn.addEventListener("click", runCode);
     resetBtn.addEventListener("click", () => {
       spawnWorker();
-      exitBadge.textContent = "reset";
-      exitBadge.className = "exit-badge";
+      clearResults("reset");
     });
 
-    document.querySelectorAll(".segmented button").forEach((btn) => {
+    document.querySelectorAll("#engine-seg button").forEach((btn) => {
       btn.addEventListener("click", () => {
-        document.querySelectorAll(".segmented button").forEach((b) => b.classList.remove("active"));
+        document.querySelectorAll("#engine-seg button").forEach((b) => b.classList.remove("active"));
         btn.classList.add("active");
         engine = btn.dataset.engine;
+      });
+    });
+
+    astMode.querySelectorAll("button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        astMode.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b === btn));
+        astView = btn.dataset.astMode;
+        renderAst();
       });
     });
 
@@ -804,26 +1428,74 @@ while (true) {
         document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
         btn.classList.add("active");
         document.getElementById(`panel-${btn.dataset.tab}`).classList.add("active");
+        astMode.hidden = btn.dataset.tab !== "ast";
       });
     });
 
-    editor.addEventListener("keydown", (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-        e.preventDefault();
-        runCode();
+    editor.addEventListener("input", () => {
+      presetSelect.value = "custom";
+      saveCustom();
+      renderEditor();
+      if (acSuppress) {
+        acSuppress = false;
         return;
       }
-      if (e.key === "Tab") {
+      updateAc(false);
+    });
+
+    editor.addEventListener("scroll", () => {
+      syncScroll();
+      hideAc();
+    });
+    editor.addEventListener("blur", hideAc);
+    editor.addEventListener("click", hideAc);
+
+    editor.addEventListener("keydown", (e) => {
+      const plain = !e.metaKey && !e.ctrlKey && !e.altKey;
+      if (!acPopup.hidden && plain) {
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          const n = acItems.length;
+          acIndex = (acIndex + (e.key === "ArrowDown" ? 1 : n - 1)) % n;
+          markAc();
+          return;
+        }
+        if (e.key === "Tab" || e.key === "Enter") {
+          e.preventDefault();
+          acceptAc();
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          hideAc();
+          return;
+        }
+        if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home" || e.key === "End") hideAc();
+      }
+      if (e.ctrlKey && (e.code === "Space" || e.key === " ")) {
         e.preventDefault();
-        const start = editor.selectionStart;
-        const end = editor.selectionEnd;
-        const val = editor.value;
-        editor.value = val.slice(0, start) + "  " + val.slice(end);
-        editor.selectionStart = editor.selectionEnd = start + 2;
+        updateAc(true);
+        return;
+      }
+      if (e.key === "Tab" && plain && !e.shiftKey) {
+        e.preventDefault();
+        insertText("  ", editor.selectionStart, editor.selectionEnd);
       }
     });
 
-    loadPreset(0);
+    // Global so Run works with focus anywhere on the page.
+    document.addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        runCode();
+      }
+    });
+
+    moduleToggle.addEventListener("change", () => {
+      if (presetSelect.value === "custom") saveCustom();
+    });
+
+    loadPreset(readCustom() ? "custom" : 0);
     spawnWorker();
   </script>
 </body>

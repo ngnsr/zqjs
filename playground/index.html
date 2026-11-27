@@ -877,6 +877,28 @@ while (true) {
       return Number(n).toLocaleString("en-US");
     }
 
+    // Browsers coarsen performance.now() (Safari 1 ms; Firefox/Tor/Brave fingerprinting protection
+    // 16.67 ms), so a sub-tick run reads as 0. Measure the tick once so Time never fakes precision.
+    const TIMER_TICK_MS = (() => {
+      const deadline = performance.now() + 40;
+      let last = performance.now();
+      let tick = Infinity;
+      for (let seen = 0; seen < 2;) {
+        const now = performance.now();
+        if (now !== last) { tick = Math.min(tick, now - last); last = now; seen++; }
+        if (now > deadline) break;
+      }
+      return tick;
+    })();
+    // A clock that never ticked within the probe is unknown, not coarse.
+    const TIMER_COARSE = Number.isFinite(TIMER_TICK_MS) && TIMER_TICK_MS >= 0.5;
+
+    function formatElapsed(ms) {
+      if (!TIMER_COARSE) return `${ms.toFixed(2)} ms`;
+      const tick = +TIMER_TICK_MS.toFixed(2);
+      return ms < TIMER_TICK_MS ? `< ${tick} ms` : `~${Math.round(ms)} ms`;
+    }
+
     // ---------- JS syntax highlighting ----------
     const KEYWORDS = [
       "async", "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default",
@@ -1333,7 +1355,9 @@ while (true) {
       const minorGc = stats.minorCollections || 0;
       const majorGc = Math.max(0, totalGc - minorGc);
 
-      statTime.textContent = `${elapsedMs.toFixed(2)} ms`;
+      statTime.textContent = formatElapsed(elapsedMs);
+      statTime.title = !TIMER_COARSE ? ""
+        : `This browser rounds timers to ${+TIMER_TICK_MS.toFixed(2)} ms. Steps is the exact, deterministic cost.`;
       statSteps.textContent = formatNumber(stats.steps || 0);
       statPeak.textContent = formatBytes(stats.peakHeapBytes || 0);
       statGc.textContent = `${totalGc} (${minorGc} minor / ${majorGc} major)`;

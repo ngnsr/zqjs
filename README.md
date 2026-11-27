@@ -4,6 +4,8 @@ A fast, embeddable, zero-dependency JavaScript engine written from scratch in Zi
 
 Designed for host-controlled scripting (games, plugins, tools, sandboxed automation) where deterministic limits, small footprint, and portable interpreter performance (no JIT / no RWX memory) matter.
 
+**[Try it in your browser →](https://ngnsr.github.io/zqjs/)** The playground runs the engine as WebAssembly, with both engines (VM and tree-walker), step/heap limits, and live AST and bytecode views.
+
 ## Highlights
 
 - **Faster than QuickJS (`0.71×` geomean, 11 of 11 benchmarks faster):** Pure bytecode interpreter (no JIT / no RWX) with 8-byte NaN-boxed values, 64-byte frames, Shapes (hidden classes), inline caches, slab-pooled heap allocation, and fused superinstructions.

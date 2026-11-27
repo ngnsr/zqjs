@@ -42,6 +42,8 @@ pub const CompileOptions = struct {
     repl: bool = false,
     top_level_await: bool = false,
     is_module: bool = false,
+    source_name: []const u8 = "",
+    source: []const u8 = "",
 };
 
 /// Compiles a resolved script. String constants are allocated on `heap` (see Proto for
@@ -54,7 +56,24 @@ pub fn compile(gpa: Allocator, heap: *Heap, script: ast.Script, res: Resolution,
 pub fn compileWithOptions(gpa: Allocator, heap: *Heap, script: ast.Script, res: Resolution, limits: Limits, options: CompileOptions, diag: *Diagnostic) Error!Proto {
     const heap_mark = heap.mark();
     errdefer heap.rollback(heap_mark);
-    var shared: Shared = .{ .gpa = gpa, .heap = heap, .res = res, .limits = limits, .options = options, .diag = diag, .script_strict = script.is_strict or options.is_module };
+    var line_starts: std.ArrayList(u32) = .empty;
+    defer line_starts.deinit(gpa);
+    if (options.source.len > 0) {
+        try line_starts.append(gpa, 0);
+        for (options.source, 0..) |b, i| {
+            if (b == '\n') try line_starts.append(gpa, @intCast(i + 1));
+        }
+    }
+    var shared: Shared = .{
+        .gpa = gpa,
+        .heap = heap,
+        .res = res,
+        .limits = limits,
+        .options = options,
+        .diag = diag,
+        .script_strict = script.is_strict or options.is_module,
+        .line_starts = line_starts.items,
+    };
     return shared.proto(.script, null, script.statements);
 }
 
@@ -67,8 +86,21 @@ const Shared = struct {
     options: CompileOptions = .{},
     diag: *Diagnostic,
     script_strict: bool = false,
+    /// Precomputed byte offsets of each 1-based line start in `options.source` (compile-time only).
+    line_starts: []const u32 = &.{},
     /// Code bytes of all Protos so far (Limits.max_code_bytes bounds the whole script).
     code_bytes: usize = 0,
+
+    fn locateOffset(s: *const Shared, offset: u32) struct { line: u32, col: u32 } {
+        const starts = s.line_starts;
+        var lo: usize = 0;
+        var hi: usize = starts.len;
+        while (lo + 1 < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (starts[mid] <= offset) lo = mid else hi = mid;
+        }
+        return .{ .line = @intCast(lo + 1), .col = offset -| starts[lo] + 1 };
+    }
 
     /// Compiles one script or function into a Proto (and, recursively, its functions).
     fn proto(s: *Shared, kind: @FieldType(Proto, "kind"), f: ?*const ast.Function, body: []const ast.Stmt) Error!Proto {
@@ -267,6 +299,9 @@ const Compiler = struct {
     functions: std.ArrayList(Proto) = .empty,
     handlers: std.ArrayList(Proto.ExceptionHandler) = .empty,
     templates: std.ArrayList(Proto.TemplateSite) = .empty,
+    line_table: std.ArrayList(Proto.LineEntry) = .empty,
+    last_line: u32 = 0,
+    last_col: u32 = 0,
     // Deduplication. Numbers by bit pattern, so 0 and -0 stay distinct and every NaN
     // literal (there is only one bit pattern the lexer produces) shares one entry.
     number_index: std.AutoHashMapUnmanaged(u64, u32) = .empty,
@@ -304,6 +339,7 @@ const Compiler = struct {
             gpa.free(t.raw);
         }
         c.templates.deinit(gpa);
+        c.line_table.deinit(gpa);
         c.controls.deinit(gpa);
     }
 
@@ -339,12 +375,14 @@ const Compiler = struct {
                 error.OutOfMemory => return error.OutOfMemory,
             };
         }
-        const functions = try gpa.dupe(Proto, c.functions.items);
-        errdefer {
-            for (functions) |*fn_p| fn_p.deinit(gpa);
-            gpa.free(functions);
-        }
         const handlers = try gpa.dupe(Proto.ExceptionHandler, c.handlers.items);
+        errdefer gpa.free(handlers);
+        const source_name: []const u8 = if (c.s.options.source_name.len > 0) try gpa.dupe(u8, c.s.options.source_name) else "";
+        errdefer if (source_name.len > 0) gpa.free(source_name);
+        const line_table: []const Proto.LineEntry = if (c.line_table.items.len > 0) try gpa.dupe(Proto.LineEntry, c.line_table.items) else &.{};
+        errdefer if (line_table.len > 0) gpa.free(line_table);
+        const functions = try gpa.dupe(Proto, c.functions.items);
+        errdefer gpa.free(functions);
         const templates = try c.templates.toOwnedSlice(gpa);
         // Ownership of names and nested Protos has moved: don't free them twice.
         c.names.clearRetainingCapacity();
@@ -381,6 +419,8 @@ const Compiler = struct {
             .templates = templates,
             .repl_count = @intCast(c.s.res.repl_bindings.len),
             .is_module = if (f == null) c.s.options.is_module else false,
+            .source_name = source_name,
+            .line_table = line_table,
         };
     }
 
@@ -404,6 +444,14 @@ const Compiler = struct {
         const info = op.info();
         std.debug.assert(operands.len == info.operands.len);
         if (c.s.code_bytes + op.size() > c.s.limits.max_code_bytes) return c.limit(.code_bytes);
+        if (c.s.line_starts.len > 0) {
+            const loc = c.s.locateOffset(c.span.start);
+            if (loc.line != c.last_line or loc.col != c.last_col) {
+                try c.line_table.append(c.s.gpa, .{ .pc = c.here(), .line = loc.line, .col = loc.col });
+                c.last_line = loc.line;
+                c.last_col = loc.col;
+            }
+        }
         try c.code.ensureUnusedCapacity(c.s.gpa, op.size());
         c.code.appendAssumeCapacity(@backingInt(op));
         for (operands) |x| c.code.appendSliceAssumeCapacity(&std.mem.toBytes(std.mem.nativeToLittle(u32, x)));
@@ -1484,6 +1532,9 @@ const Compiler = struct {
     // ---- expressions: each pushes exactly one value
 
     fn expr(c: *Compiler, e: *const ast.Expr) Error!void {
+        const saved_span = c.span;
+        c.span = e.span;
+        defer c.span = saved_span;
         switch (e.data) {
             .number => |n| try c.emit(.push_const, &.{try c.number(n)}),
             .bigint => |raw| try c.emit(.push_const, &.{try c.bigintConst(raw)}),
@@ -2536,6 +2587,9 @@ const Compiler = struct {
     /// Compiles `e` in a value-discarded context (expression statements, `for` init/update),
     /// emitting superinstructions for common local updates and assignments (M52).
     fn exprDiscard(c: *Compiler, e: *const ast.Expr) Error!void {
+        const saved_span = c.span;
+        c.span = e.span;
+        defer c.span = saved_span;
         switch (e.data) {
             .update => |u| if (u.target == .ref) {
                 const ref = u.target.ref;

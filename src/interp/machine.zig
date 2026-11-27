@@ -22,6 +22,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ast = @import("../frontend/ast.zig");
+const Diagnostic = @import("../frontend/diag.zig").Diagnostic;
 const Resolution = @import("../frontend/resolver.zig").Resolution;
 const Value = @import("../runtime/value.zig").Value;
 const heap = @import("../runtime/heap.zig");
@@ -50,7 +51,12 @@ fn stepNumeric(rt: *Runtime, old_in: Value, is_inc: bool) Error!struct { old: Va
 /// Runs a resolved script. On error.Thrown, `rt.exception` or `rt.thrown_value`
 /// describes the exception.
 pub fn run(rt: *Runtime, script: ast.Script, res: Resolution) Error!void {
-    return runMeasured(rt, script, res, null);
+    return runMeasuredWithSource(rt, script, res, "", "", null);
+}
+
+/// Runs a resolved script with source metadata for stack traces.
+pub fn runWithSource(rt: *Runtime, script: ast.Script, res: Resolution, source_name: []const u8, source: []const u8) Error!void {
+    return runMeasuredWithSource(rt, script, res, source_name, source, null);
 }
 
 /// Runs a resolved ES Module body without draining microtasks (D72, D78).
@@ -90,6 +96,8 @@ fn runModuleImpl(rt: *Runtime, script: ast.Script, res: *const Resolution, modul
     const prev_caller = rt.closure_caller;
     rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
     defer rt.closure_caller = prev_caller;
+    try rt.pushStackWalker(.{ .ctx = &m, .capture = Machine.captureStack });
+    defer rt.popStackWalker(&m);
 
     try m.pushFnBody(0, script.statements);
     _ = try m.runLoop(0);
@@ -123,6 +131,8 @@ pub fn runRepl(rt: *Runtime, script: ast.Script, res: *const Resolution, repl_ce
     const prev_caller = rt.closure_caller;
     rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
     defer rt.closure_caller = prev_caller;
+    try rt.pushStackWalker(.{ .ctx = &m, .capture = Machine.captureStack });
+    defer rt.popStackWalker(&m);
 
     try m.pushFnBody(0, script.statements);
     _ = try m.runLoop(0);
@@ -192,9 +202,15 @@ fn runTopLevelAsyncImpl(rt: *Runtime, script: ast.Script, res: *const Resolution
 const StackUse = struct { depth: u32 = 0, bytes: usize = 0 };
 
 fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUse) Error!void {
+    return runMeasuredWithSource(rt, script, res, "", "", use);
+}
+
+fn runMeasuredWithSource(rt: *Runtime, script: ast.Script, res: Resolution, source_name: []const u8, source: []const u8, use: ?*StackUse) Error!void {
     var m: Machine = .{
         .rt = rt,
         .res = res,
+        .source_name = source_name,
+        .source = source,
         .script_strict = script.is_strict or script.source_kind == .module,
         .stack_top = if (builtin.is_test) @frameAddress() else 0,
         .lowest_frame = if (builtin.is_test) @frameAddress() else 0,
@@ -216,6 +232,8 @@ fn runMeasured(rt: *Runtime, script: ast.Script, res: Resolution, use: ?*StackUs
     const prev_caller = rt.closure_caller;
     rt.closure_caller = .{ .ctx = &m, .call = Machine.callFromBuiltin, .construct = Machine.constructFromBuiltin };
     defer rt.closure_caller = prev_caller;
+    try rt.pushStackWalker(.{ .ctx = &m, .capture = Machine.captureStack });
+    defer rt.popStackWalker(&m);
 
     try m.pushFnBody(0, script.statements);
     _ = try m.runLoop(0);
@@ -297,12 +315,12 @@ const Task = union(enum) {
     // ---- Expressions
     eval: *const ast.Expr,
     template_next: struct { t: ast.Expr.Template, idx: usize },
-    unary_finish: ast.UnaryOp,
-    binary_rhs: struct { op: ast.BinaryOp, rhs: *const ast.Expr },
-    binary_finish: ast.BinaryOp,
+    unary_finish: struct { op: ast.UnaryOp, span: ast.Span = .{ .start = 0, .end = 0 } },
+    binary_rhs: struct { op: ast.BinaryOp, rhs: *const ast.Expr, span: ast.Span = .{ .start = 0, .end = 0 } },
+    binary_finish: struct { op: ast.BinaryOp, span: ast.Span = .{ .start = 0, .end = 0 } },
     cond_branch: struct { then_expr: *const ast.Expr, else_expr: *const ast.Expr },
-    assign_ref_finish: ast.Ref,
-    assign_ref_compound: struct { ref: ast.Ref, op: ast.BinaryOp },
+    assign_ref_finish: struct { ref: ast.Ref, span: ast.Span = .{ .start = 0, .end = 0 } },
+    assign_ref_compound: struct { ref: ast.Ref, op: ast.BinaryOp, span: ast.Span = .{ .start = 0, .end = 0 } },
     assign_member_base: struct { op: ast.AssignOp, key: ast.PropertyKey, value: *const ast.Expr, is_private: bool = false, private_ref: u32 = 0 },
     assign_member_after_key: struct { op: ast.AssignOp, value: *const ast.Expr, named: ?[]const u8, is_private: bool = false, private_ref: u32 = 0 },
     assign_member_plain_finish: struct { named: ?[]const u8, is_private: bool = false, private_ref: u32 = 0 },
@@ -311,8 +329,8 @@ const Task = union(enum) {
     assign_pattern_keep: *const ast.Pattern,
     update_member_base: struct { op: UpdateOp, prefix: bool, key: ast.PropertyKey, is_private: bool = false, private_ref: u32 = 0 },
     update_member_finish: struct { op: UpdateOp, prefix: bool, named: ?[]const u8, is_private: bool = false, private_ref: u32 = 0 },
-    member_base: struct { key: ast.PropertyKey, is_delete: bool, is_private: bool = false, private_ref: u32 = 0 },
-    member_finish: struct { named: ?[]const u8, is_delete: bool, is_private: bool = false },
+    member_base: struct { key: ast.PropertyKey, is_delete: bool, is_private: bool = false, private_ref: u32 = 0, span: ast.Span = .{ .start = 0, .end = 0 } },
+    member_finish: struct { named: ?[]const u8, is_delete: bool, is_private: bool = false, span: ast.Span = .{ .start = 0, .end = 0 } },
     private_in_finish: struct { name: []const u8, private_ref: u32 },
     opt_after_base: struct { oc: ast.OptionalChain, is_delete: bool, keep_receiver: bool = false },
     opt_after_member_key: struct { oc: ast.OptionalChain, named: ?[]const u8, is_delete: bool, keep_receiver: bool = false },
@@ -327,14 +345,14 @@ const Task = union(enum) {
     object_prop_val: struct { key: object.Key, props: []const ast.PropertyDef, idx: usize },
     object_prop_computed_val: struct { value: *const ast.Expr, props: []const ast.PropertyDef, idx: usize },
     object_spread_finish: struct { props: []const ast.PropertyDef, idx: usize },
-    call_member_base: struct { key: ast.PropertyKey, args: []const *const ast.Expr, tagged: ?*const ast.Expr.TaggedTemplate = null, is_private: bool = false, private_ref: u32 = 0 },
-    call_member_key: struct { named: ?[]const u8, args: []const *const ast.Expr, tagged: ?*const ast.Expr.TaggedTemplate = null, is_private: bool = false, private_ref: u32 = 0 },
-    call_after_callee: struct { args: []const *const ast.Expr, has_receiver: bool, tagged: ?*const ast.Expr.TaggedTemplate = null },
-    new_call_after_callee: []const *const ast.Expr,
+    call_member_base: struct { key: ast.PropertyKey, args: []const *const ast.Expr, tagged: ?*const ast.Expr.TaggedTemplate = null, is_private: bool = false, private_ref: u32 = 0, span: ast.Span = .{ .start = 0, .end = 0 } },
+    call_member_key: struct { named: ?[]const u8, args: []const *const ast.Expr, tagged: ?*const ast.Expr.TaggedTemplate = null, is_private: bool = false, private_ref: u32 = 0, span: ast.Span = .{ .start = 0, .end = 0 } },
+    call_after_callee: struct { args: []const *const ast.Expr, has_receiver: bool, tagged: ?*const ast.Expr.TaggedTemplate = null, span: ast.Span = .{ .start = 0, .end = 0 } },
+    new_call_after_callee: struct { args: []const *const ast.Expr, span: ast.Span = .{ .start = 0, .end = 0 } },
     eval_args_next: struct { args: []const *const ast.Expr, idx: usize, args_base: usize },
     eval_args_spread: struct { args: []const *const ast.Expr, idx: usize, args_base: usize },
-    invoke_call: struct { has_receiver: bool, args_base: usize },
-    invoke_new_call: usize,
+    invoke_call: struct { has_receiver: bool, args_base: usize, span: ast.Span = .{ .start = 0, .end = 0 } },
+    invoke_new_call: struct { args_base: usize, span: ast.Span = .{ .start = 0, .end = 0 } },
 
     // ---- Calls & barriers
     call_bind_param: struct { func: *const ast.Function, idx: u32, args_base: u32, argc: u32 },
@@ -347,6 +365,7 @@ const Task = union(enum) {
         construct_instance: ?*heap.Object = null,
         saved_closure: ?*const heap.Closure = null,
         saved_func: ?*const ast.Function = null,
+        saved_span: ast.Span = .{ .start = 0, .end = 0 },
         saved_construct_instance: ?*heap.Object = null,
         callee_func: ?*const ast.Function = null,
         is_super_call: bool = false,
@@ -438,6 +457,9 @@ const Machine = struct {
     this: ?Value = null,
     current_closure: ?*const heap.Closure = null,
     current_func: ?*const ast.Function = null,
+    current_span: ast.Span = .{ .start = 0, .end = 0 },
+    source_name: []const u8 = "",
+    source: []const u8 = "",
     construct_instance: ?*heap.Object = null,
     is_coroutine: bool = false,
     /// Suspended at `generator_start`: the first resume pushes nothing.
@@ -479,6 +501,49 @@ const Machine = struct {
 
     fn roots(m: *Machine) rt_mod.EngineRoots {
         return .{ .ctx = m, .mark = markRoots };
+    }
+
+    fn captureStack(ctx: *anyopaque, gpa: std.mem.Allocator, out: *std.ArrayList(rt_mod.StackFrame), max_frames: usize) std.mem.Allocator.Error!void {
+        const m: *const Machine = @ptrCast(@alignCast(ctx));
+        if (out.items.len >= max_frames) return;
+        const appendFrame = struct {
+            fn call(
+                mm: *const Machine,
+                alloc: std.mem.Allocator,
+                list: *std.ArrayList(rt_mod.StackFrame),
+                func: ?*const ast.Function,
+                closure: ?*const heap.Closure,
+                span: ast.Span,
+            ) std.mem.Allocator.Error!void {
+                const fn_name: []const u8 = if (func) |f| (if (f.name) |n| n.name else f.inferred_name) else "";
+                var line: u32 = 0;
+                var col: u32 = 0;
+                if (mm.source.len > 0) {
+                    const loc = Diagnostic.locate(mm.source, span.start);
+                    line = loc.line;
+                    col = loc.column;
+                }
+                try list.append(alloc, .{
+                    .func_name = fn_name,
+                    .source_name = mm.source_name,
+                    .line = line,
+                    .col = col,
+                    .callee = if (closure) |cl| Value.fromClosure(@constCast(cl)) else null,
+                });
+            }
+        }.call;
+
+        try appendFrame(m, gpa, out, m.current_func, m.current_closure, m.current_span);
+        var i = m.tasks.items.len;
+        while (i > 0 and out.items.len < max_frames) {
+            i -= 1;
+            switch (m.tasks.items[i]) {
+                .call_return => |cr| {
+                    try appendFrame(m, gpa, out, cr.saved_func, cr.saved_closure, cr.saved_span);
+                },
+                else => {},
+            }
+        }
     }
 
     fn markRoots(ctx: *anyopaque, h: *heap.Heap) void {
@@ -851,6 +916,7 @@ const Machine = struct {
                     m.this = if (cr.has_this) cr.saved_this else null;
                     m.current_closure = cr.saved_closure;
                     m.current_func = cr.saved_func;
+                    m.current_span = cr.saved_span;
                     m.construct_instance = cr.saved_construct_instance;
                     m.res = cr.saved_res;
                     m.res_ptr = cr.saved_res_ptr;
@@ -1081,6 +1147,7 @@ const Machine = struct {
     }
 
     inline fn pushEval(m: *Machine, e: *const ast.Expr) Error!void {
+        m.current_span = e.span;
         switch (e.data) {
             .number => |n| {
                 try m.enter();
@@ -1256,7 +1323,10 @@ const Machine = struct {
                     m.rt.repl_result = v;
                 }
             },
-            .exec => |s| return m.execStmt(s),
+            .exec => |s| {
+                m.current_span = s.span;
+                return m.execStmt(s);
+            },
             .stmt_list => |sl| {
                 if (sl.idx + 1 < sl.stmts.len) {
                     try m.pushTask(.{ .stmt_list = .{ .stmts = sl.stmts, .idx = sl.idx + 1 } });
@@ -1357,7 +1427,10 @@ const Machine = struct {
             },
 
             // ---- Expressions
-            .eval => |e| try m.evalExpr(e),
+            .eval => |e| {
+                m.current_span = e.span;
+                try m.evalExpr(e);
+            },
             .template_next => |tn| {
                 const v = m.popVal();
                 var acc = m.popVal();
@@ -1380,9 +1453,10 @@ const Machine = struct {
                     try m.pushTask(.{ .eval = tn.t.exprs[tn.idx + 1] });
                 }
             },
-            .unary_finish => |op| {
+            .unary_finish => |uf| {
+                m.current_span = uf.span;
                 const v = m.popVal();
-                const res_v: Value = switch (op) {
+                const res_v: Value = switch (uf.op) {
                     .neg => blk: {
                         const nv = try ops.toNumeric(rt, v);
                         break :blk if (nv.isBigInt()) Value.fromBigInt(try bigint.neg(rt, nv.asBigInt())) else Value.fromNumber(-nv.asNumber());
@@ -1429,15 +1503,16 @@ const Machine = struct {
                         try m.pushEval(br.rhs);
                     },
                     else => {
-                        try m.pushTask(.{ .binary_finish = br.op });
+                        try m.pushTask(.{ .binary_finish = .{ .op = br.op, .span = br.span } });
                         try m.pushEval(br.rhs);
                     },
                 }
             },
-            .binary_finish => |op| {
+            .binary_finish => |bf| {
+                m.current_span = bf.span;
                 const rhs = m.popVal();
                 const lhs = m.popVal();
-                const res_v = try ops.binary(rt, op, lhs, rhs);
+                const res_v = try ops.binary(rt, bf.op, lhs, rhs);
                 m.depth -= 1;
                 try m.pushVal(res_v);
             },
@@ -1445,12 +1520,14 @@ const Machine = struct {
                 const v = m.popVal();
                 try m.pushEval(if (ops.toBoolean(v)) cb.then_expr else cb.else_expr);
             },
-            .assign_ref_finish => |ref| {
+            .assign_ref_finish => |af| {
+                m.current_span = af.span;
                 const v = m.values.items[m.values.items.len - 1];
-                try m.write(ref, v);
+                try m.write(af.ref, v);
                 m.depth -= 1;
             },
             .assign_ref_compound => |ac| {
+                m.current_span = ac.span;
                 const rhs = m.popVal();
                 const old = m.popVal();
                 const v = try ops.binary(rt, ac.op, old, rhs);
@@ -1837,6 +1914,7 @@ const Machine = struct {
                 }
             },
             .member_base => |mb| {
+                m.current_span = mb.span;
                 switch (mb.key) {
                     .name => |n| {
                         const base = m.popVal();
@@ -1851,13 +1929,14 @@ const Machine = struct {
                         try m.pushVal(res_v);
                     },
                     .computed => |e| {
-                        try m.pushTask(.{ .member_finish = .{ .named = null, .is_delete = mb.is_delete } });
+                        try m.pushTask(.{ .member_finish = .{ .named = null, .is_delete = mb.is_delete, .span = mb.span } });
                         try m.pushEval(e);
                     },
                     .string, .number => unreachable,
                 }
             },
             .member_finish => |mf| {
+                m.current_span = mf.span;
                 const kv: KeyValue = if (mf.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.popVal();
                 try object.requireObjectCoercible(rt, base, if (kv == .value) kv.value else null);
@@ -2169,15 +2248,16 @@ const Machine = struct {
         switch (task) {
             .call_member_base => |cm| {
                 switch (cm.key) {
-                    .name => |n| try m.pushTask(.{ .call_member_key = .{ .named = n, .args = cm.args, .tagged = cm.tagged, .is_private = cm.is_private, .private_ref = cm.private_ref } }),
+                    .name => |n| try m.pushTask(.{ .call_member_key = .{ .named = n, .args = cm.args, .tagged = cm.tagged, .is_private = cm.is_private, .private_ref = cm.private_ref, .span = cm.span } }),
                     .computed => |e| {
-                        try m.pushTask(.{ .call_member_key = .{ .named = null, .args = cm.args, .tagged = cm.tagged } });
+                        try m.pushTask(.{ .call_member_key = .{ .named = null, .args = cm.args, .tagged = cm.tagged, .span = cm.span } });
                         try m.pushTask(.{ .eval = e });
                     },
                     .string, .number => unreachable,
                 }
             },
             .call_member_key => |cm| {
+                m.current_span = cm.span;
                 const kv: KeyValue = if (cm.named) |n| .{ .named = n } else .{ .value = m.popVal() };
                 const base = m.values.items[m.values.items.len - 1];
                 const callee = if (cm.is_private) blk: {
@@ -2192,7 +2272,7 @@ const Machine = struct {
                     try freezeTemplateObject(rt, tpl);
                     try m.pushVal(tpl);
                 }
-                try m.pushTask(.{ .invoke_call = .{ .has_receiver = true, .args_base = args_base } });
+                try m.pushTask(.{ .invoke_call = .{ .has_receiver = true, .args_base = args_base, .span = cm.span } });
                 if (cm.args.len > 0) {
                     try m.pushTask(.{ .eval_args_next = .{ .args = cm.args, .idx = 0, .args_base = args_base } });
                 }
@@ -2205,16 +2285,16 @@ const Machine = struct {
                     try freezeTemplateObject(rt, tpl);
                     try m.pushVal(tpl);
                 }
-                try m.pushTask(.{ .invoke_call = .{ .has_receiver = ca.has_receiver, .args_base = args_base } });
+                try m.pushTask(.{ .invoke_call = .{ .has_receiver = ca.has_receiver, .args_base = args_base, .span = ca.span } });
                 if (ca.args.len > 0) {
                     try m.pushTask(.{ .eval_args_next = .{ .args = ca.args, .idx = 0, .args_base = args_base } });
                 }
             },
-            .new_call_after_callee => |args| {
+            .new_call_after_callee => |nc| {
                 const args_base = m.values.items.len;
-                try m.pushTask(.{ .invoke_new_call = args_base });
-                if (args.len > 0) {
-                    try m.pushTask(.{ .eval_args_next = .{ .args = args, .idx = 0, .args_base = args_base } });
+                try m.pushTask(.{ .invoke_new_call = .{ .args_base = args_base, .span = nc.span } });
+                if (nc.args.len > 0) {
+                    try m.pushTask(.{ .eval_args_next = .{ .args = nc.args, .idx = 0, .args_base = args_base } });
                 }
             },
             .eval_args_next => |ea| {
@@ -2246,13 +2326,16 @@ const Machine = struct {
                 _ = m.values.orderedRemove(m.values.items.len - 1 - count);
             },
             .invoke_call => |ic| {
+                m.current_span = ic.span;
                 const args_base = ic.args_base;
                 const callee = m.values.items[args_base - 1];
                 const receiver: ?Value = if (ic.has_receiver) m.values.items[args_base - 2] else null;
                 const pop_to = if (ic.has_receiver) args_base - 2 else args_base - 1;
                 try m.invokeCallable(callee, receiver, args_base, pop_to);
             },
-            .invoke_new_call => |args_base| {
+            .invoke_new_call => |inc| {
+                m.current_span = inc.span;
+                const args_base = inc.args_base;
                 const callee = m.values.items[args_base - 1];
                 var target = callee;
                 var new_target = callee;
@@ -2388,6 +2471,7 @@ const Machine = struct {
                 m.this = if (cr.has_this) cr.saved_this else null;
                 m.current_closure = cr.saved_closure;
                 m.current_func = cr.saved_func;
+                m.current_span = cr.saved_span;
                 m.construct_instance = cr.saved_construct_instance;
                 m.res = cr.saved_res;
                 m.res_ptr = cr.saved_res_ptr;
@@ -3070,6 +3154,7 @@ const Machine = struct {
     }
 
     fn execStmt(m: *Machine, s: *const ast.Stmt) Error!?UnwindKind {
+        m.current_span = s.span;
         try m.enter();
         m.safepoint();
         try m.rt.step();
@@ -3268,6 +3353,7 @@ const Machine = struct {
     }
 
     fn evalExpr(m: *Machine, e: *const ast.Expr) Error!void {
+        m.current_span = e.span;
         const rt = m.rt;
         try m.enter();
         m.safepoint();
@@ -3383,11 +3469,11 @@ const Machine = struct {
                         return;
                     }
                 }
-                try m.pushTask(.{ .unary_finish = u.op });
+                try m.pushTask(.{ .unary_finish = .{ .op = u.op, .span = e.span } });
                 try m.pushEval(u.operand);
             },
             .binary => |b| {
-                try m.pushTask(.{ .binary_rhs = .{ .op = b.op, .rhs = b.rhs } });
+                try m.pushTask(.{ .binary_rhs = .{ .op = b.op, .rhs = b.rhs, .span = e.span } });
                 try m.pushEval(b.lhs);
             },
             .conditional => |c| {
@@ -3398,13 +3484,13 @@ const Machine = struct {
             .assign => |a| switch (a.target) {
                 .ref => |ref| switch (a.op) {
                     .plain => {
-                        try m.pushTask(.{ .assign_ref_finish = ref });
+                        try m.pushTask(.{ .assign_ref_finish = .{ .ref = ref, .span = e.span } });
                         try m.pushEval(a.value);
                     },
                     .compound => |op| {
                         const old = try m.read(ref);
                         try m.pushVal(old);
-                        try m.pushTask(.{ .assign_ref_compound = .{ .ref = ref, .op = op } });
+                        try m.pushTask(.{ .assign_ref_compound = .{ .ref = ref, .op = op, .span = e.span } });
                         try m.pushEval(a.value);
                     },
                     .logical_and, .logical_or, .nullish => {
@@ -3413,7 +3499,7 @@ const Machine = struct {
                             m.depth -= 1;
                             try m.pushVal(old);
                         } else {
-                            try m.pushTask(.{ .assign_ref_finish = ref });
+                            try m.pushTask(.{ .assign_ref_finish = .{ .ref = ref, .span = e.span } });
                             try m.pushEval(a.value);
                         }
                     },
@@ -3482,7 +3568,7 @@ const Machine = struct {
                 },
             },
             .member => |mem| {
-                try m.pushTask(.{ .member_base = .{ .key = mem.key, .is_delete = false, .is_private = mem.is_private, .private_ref = mem.private_ref } });
+                try m.pushTask(.{ .member_base = .{ .key = mem.key, .is_delete = false, .is_private = mem.is_private, .private_ref = mem.private_ref, .span = e.span } });
                 try m.pushEval(mem.object);
             },
             .private_in => |pi| {
@@ -3507,7 +3593,7 @@ const Machine = struct {
                 try m.pushEval(spec);
             },
             .delete => |mem| {
-                try m.pushTask(.{ .member_base = .{ .key = mem.key, .is_delete = true } });
+                try m.pushTask(.{ .member_base = .{ .key = mem.key, .is_delete = true, .span = e.span } });
                 try m.pushEval(mem.object);
             },
             .optional_chain => |oc| try m.startOptionalChain(oc, false, false),
@@ -3536,7 +3622,7 @@ const Machine = struct {
                 try m.pushTask(.depth_pop);
                 if (c.callee.data == .member) {
                     const mem = c.callee.data.member;
-                    try m.pushTask(.{ .call_member_base = .{ .key = mem.key, .args = c.args, .is_private = mem.is_private, .private_ref = mem.private_ref } });
+                    try m.pushTask(.{ .call_member_base = .{ .key = mem.key, .args = c.args, .is_private = mem.is_private, .private_ref = mem.private_ref, .span = e.span } });
                     try m.pushEval(mem.object);
                 } else if (c.callee.data == .super_member) {
                     const this_val = try m.requireThis();
@@ -3550,10 +3636,10 @@ const Machine = struct {
                         .string, .number => unreachable,
                     }
                 } else if (c.callee.data == .optional_chain and optionalChainEndsWithProp(c.callee.data.optional_chain)) {
-                    try m.pushTask(.{ .call_after_callee = .{ .args = c.args, .has_receiver = true } });
+                    try m.pushTask(.{ .call_after_callee = .{ .args = c.args, .has_receiver = true, .span = e.span } });
                     try m.startOptionalChain(c.callee.data.optional_chain, false, true);
                 } else {
-                    try m.pushTask(.{ .call_after_callee = .{ .args = c.args, .has_receiver = false } });
+                    try m.pushTask(.{ .call_after_callee = .{ .args = c.args, .has_receiver = false, .span = e.span } });
                     try m.pushEval(c.callee);
                 }
             },
@@ -3561,7 +3647,7 @@ const Machine = struct {
                 try m.pushTask(.depth_pop);
                 if (tt.callee.data == .member) {
                     const mem = tt.callee.data.member;
-                    try m.pushTask(.{ .call_member_base = .{ .key = mem.key, .args = tt.exprs, .tagged = tt, .is_private = mem.is_private, .private_ref = mem.private_ref } });
+                    try m.pushTask(.{ .call_member_base = .{ .key = mem.key, .args = tt.exprs, .tagged = tt, .is_private = mem.is_private, .private_ref = mem.private_ref, .span = e.span } });
                     try m.pushEval(mem.object);
                 } else if (tt.callee.data == .super_member) {
                     const this_val = try m.requireThis();
@@ -3575,13 +3661,13 @@ const Machine = struct {
                         .string, .number => unreachable,
                     }
                 } else {
-                    try m.pushTask(.{ .call_after_callee = .{ .args = tt.exprs, .has_receiver = false, .tagged = tt } });
+                    try m.pushTask(.{ .call_after_callee = .{ .args = tt.exprs, .has_receiver = false, .tagged = tt, .span = e.span } });
                     try m.pushEval(tt.callee);
                 }
             },
             .new_call => |nc| {
                 try m.pushTask(.depth_pop);
-                try m.pushTask(.{ .new_call_after_callee = nc.args });
+                try m.pushTask(.{ .new_call_after_callee = .{ .args = nc.args, .span = e.span } });
                 try m.pushTask(.{ .eval = nc.callee });
             },
         }
@@ -3751,6 +3837,7 @@ const Machine = struct {
             .construct_instance = construct_instance,
             .saved_closure = m.current_closure,
             .saved_func = m.current_func,
+            .saved_span = m.current_span,
             .saved_construct_instance = m.construct_instance,
             .callee_func = f,
             .is_super_call = is_super_call,
@@ -3951,6 +4038,8 @@ const Machine = struct {
             m_ptr.repl_cells = t.repl_cells;
         }
         m_ptr.module_record = t.module_record;
+        m_ptr.source_name = ctx.caller.source_name;
+        m_ptr.source = ctx.caller.source;
         const f: *const ast.Function = @ptrCast(@alignCast(t.func));
         try m_ptr.values.appendSlice(rt.gpa, ctx.args);
         try m_ptr.pushClosureCallSync(ctx.closure, f, t.env, ctx.this, 0, 0, null, false, .undefined);
@@ -3967,6 +4056,8 @@ const Machine = struct {
 
         try rt.addRoots(m.roots());
         defer rt.removeRoots(m);
+        try rt.pushStackWalker(.{ .ctx = m, .capture = Machine.captureStack });
+        defer rt.popStackWalker(m);
 
         switch (action) {
             .start => {},
@@ -4392,7 +4483,6 @@ fn copyDataProperties(rt: *Runtime, dst: *heap.Object, src: Value, excluded: []c
 test "native stack use at depth 10 and max_interpreter_depth differs by less than 16 KiB" {
     const parse = @import("../frontend/parser.zig").parse;
     const resolve = @import("../frontend/resolver.zig").resolve;
-    const Diagnostic = @import("../frontend/diag.zig").Diagnostic;
     const Limits = @import("../limits.zig").Limits;
     const gpa = std.testing.allocator;
 

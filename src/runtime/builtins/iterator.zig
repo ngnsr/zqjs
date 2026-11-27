@@ -192,11 +192,22 @@ fn iteratorCloseDirect(rt: *Runtime, iter: Value, is_throw: bool) Error!void {
         const saved_exc = rt.exception;
         rt.thrown_value = null;
         rt.exception = null;
+        defer {
+            rt.thrown_value = saved_thrown;
+            rt.exception = saved_exc;
+        }
+        // The stashed exception is off `rt` while `return()` runs, so root it here.
+        var root_buf = [_]Value{
+            saved_thrown orelse .undefined,
+            if (saved_exc) |ex| Value.fromString(ex.message) else .undefined,
+            if (saved_exc) |ex| (if (ex.stack) |st| Value.fromString(st) else .undefined) else .undefined,
+        };
+        var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+        try roots.register(rt);
+        defer roots.unregister(rt);
         if (object.getMethod(rt, iter, try object.named(rt, "return")) catch null) |ret_fn| {
             _ = rt.callCallable(ret_fn, iter, &.{}) catch {};
         }
-        rt.thrown_value = saved_thrown;
-        rt.exception = saved_exc;
         return;
     }
     if (try object.getMethod(rt, iter, try object.named(rt, "return"))) |ret_fn| {
@@ -1066,6 +1077,7 @@ pub fn iteratorClose(rt: *Runtime, iter: *Object, is_throw: bool) Error!void {
         .undefined,
         if (saved_ex) |ex| Value.fromString(ex.message) else .undefined,
         saved_tv orelse .undefined,
+        if (saved_ex) |ex| (if (ex.stack) |st| Value.fromString(st) else .undefined) else .undefined,
     };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);

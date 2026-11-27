@@ -285,7 +285,7 @@ pub const Session = struct {
                 script,
                 res,
                 s.rt.limits,
-                .{ .repl = true, .top_level_await = is_tla },
+                .{ .repl = true, .top_level_await = is_tla, .source_name = "<repl>", .source = eff_source },
                 &diag,
             ) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -727,7 +727,7 @@ pub const Session = struct {
                 script,
                 res,
                 s.rt.limits,
-                .{ .repl = true, .top_level_await = script.has_top_level_await },
+                .{ .repl = true, .top_level_await = script.has_top_level_await, .source_name = "<repl>", .source = parse_res.source },
                 &diag,
             ) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,

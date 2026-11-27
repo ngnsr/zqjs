@@ -858,7 +858,6 @@ const RuntimeImpl = struct {
 
     fn compileImpl(r: *RuntimeImpl, name: []const u8, source: []const u8, diag: ?*Diagnostic) CompileError!*Program {
         if (r.rt.poisoned) return error.Internal; // E7: only destroy works now
-        _ = name;
         const gpa = r.gpa;
         const limits = r.rt.limits;
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -868,7 +867,7 @@ const RuntimeImpl = struct {
         const res = internal.resolve(arena.allocator(), script, &d) catch |e| return sourceError(e, d, source, diag);
         const p = try gpa.create(ProgramImpl);
         errdefer gpa.destroy(p);
-        p.* = .{ .owner = r, .proto = internal.compile(gpa, &r.rt.heap, script, res, limits, &d) catch |e| return sourceError(e, d, source, diag) };
+        p.* = .{ .owner = r, .proto = internal.compileWithOptions(gpa, &r.rt.heap, script, res, limits, .{ .source_name = name, .source = source }, &d) catch |e| return sourceError(e, d, source, diag) };
         errdefer p.proto.deinit(gpa);
         var failure: internal.verify.Failure = .{};
         _ = internal.verify.verify(gpa, &p.proto, limits, &failure) catch |e| return switch (e) {

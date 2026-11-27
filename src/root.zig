@@ -20,6 +20,7 @@ pub const ErrorName = @import("runtime/runtime.zig").ErrorName;
 pub const interpret = @import("interp/machine.zig").run;
 pub const bytecode = @import("bytecode/bytecode.zig");
 pub const compile = @import("bytecode/compiler.zig").compile;
+pub const compileWithOptions = @import("bytecode/compiler.zig").compileWithOptions;
 pub const verify = @import("bytecode/verify.zig");
 pub const disassemble = @import("bytecode/disasm.zig").disassemble;
 pub const Heap = @import("runtime/heap.zig").Heap;

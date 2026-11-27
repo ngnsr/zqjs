@@ -622,6 +622,30 @@ pub const Proto = struct {
     is_module: bool = false,
     /// Borrowed `*ModuleRecord` for `import.meta` and relative dynamic `import()` (M48, D78).
     module_record: ?*anyopaque = null,
+    /// Source name/path for stack traces ("" if unknown). Owned; freed in `deinit`.
+    source_name: []const u8 = "",
+    /// Compact PC -> (1-based line, 1-based col) mapping, sorted by strictly increasing `pc`.
+    /// Owned; freed in `deinit` if non-empty.
+    line_table: []const LineEntry = &.{},
+
+    pub const LineEntry = struct {
+        pc: u32,
+        line: u32,
+        col: u32,
+    };
+
+    /// Binary search for the last line entry with `entry.pc <= pc`.
+    pub fn lookupLocation(p: *const Proto, pc: u32) ?struct { line: u32, col: u32 } {
+        const table = p.line_table;
+        if (table.len == 0 or pc < table[0].pc) return null;
+        var lo: usize = 0;
+        var hi: usize = table.len;
+        while (lo + 1 < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (table[mid].pc <= pc) lo = mid else hi = mid;
+        }
+        return .{ .line = table[lo].line, .col = table[lo].col };
+    }
 
     pub const TemplateSite = struct {
         /// Indices into `consts` (`std.math.maxInt(u32)` means `undefined` for invalid escapes).
@@ -660,6 +684,8 @@ pub const Proto = struct {
             gpa.free(t.raw);
         }
         gpa.free(p.templates);
+        if (p.source_name.len > 0) gpa.free(p.source_name);
+        if (p.line_table.len > 0) gpa.free(p.line_table);
         p.* = undefined;
     }
 };

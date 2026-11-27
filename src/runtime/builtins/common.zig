@@ -9,6 +9,7 @@ const rt_mod = @import("../runtime.zig");
 const Runtime = rt_mod.Runtime;
 const Error = rt_mod.Error;
 const ops = @import("../ops.zig");
+const inspect = @import("../inspect.zig");
 const object = @import("../object.zig");
 const names = @import("../builtin_names.zig");
 const builtins = @import("../builtins.zig");
@@ -192,6 +193,20 @@ pub fn printImpl(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return .undefined;
 }
 
+pub fn consoleLogImpl(rt: *Runtime, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    for (args, 0..) |value, i| {
+        if (i > 0) try rt.out.writeByte(' ');
+        if (value.isString()) {
+            try ops.writeUtf16(rt.out, value.asString().units);
+        } else {
+            try inspect.inspect(rt, value, rt.out, .{ .color = false });
+        }
+    }
+    try rt.out.writeByte('\n');
+    return .undefined;
+}
+
 pub fn consoleAssertImpl(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     _ = this;
     if (args.len > 0 and ops.toBoolean(args[0])) return .undefined;
@@ -200,7 +215,7 @@ pub fn consoleAssertImpl(rt: *Runtime, this: Value, args: []const Value) Error!V
         return .undefined;
     }
     try rt.out.writeAll("Assertion failed: ");
-    return printImpl(rt, .undefined, args[1..]);
+    return consoleLogImpl(rt, .undefined, args[1..]);
 }
 
 pub fn arg(args: []const Value, i: usize) Value {

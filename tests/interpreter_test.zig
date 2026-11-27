@@ -1321,8 +1321,8 @@ test "console: log/info/debug/warn/error/assert, descriptors, detached calls, an
         \\log desc: true true true log 0 assert 0
         \\keys: log,info,debug,warn,error,assert undefined
         \\
-        \\i 1 true null undefined 42 Symbol(s)
-        \\d 1,2
+        \\i 1 true null undefined 42n Symbol(s)
+        \\d [ 1, 2 ]
         \\w
         \\e
         \\detached
@@ -1333,8 +1333,8 @@ test "console: log/info/debug/warn/error/assert, descriptors, detached calls, an
         \\Assertion failed: zero 123
         \\Assertion failed: Symbol(tag)
         \\retFail0: undefined
-        \\ok:x63 second
-        \\Assertion failed: ok:x63 third
+        \\{ toString: [Function: toString] } { toString: [Function: toString] }
+        \\Assertion failed: { toString: [Function: toString] } { toString: [Function: toString] }
         \\after delete: undefined
         \\restored
         \\
@@ -1344,6 +1344,71 @@ test "console: log/info/debug/warn/error/assert, descriptors, detached calls, an
         defer r.deinit(testing.allocator);
         try testing.expectEqualStrings("", r.err);
         try testing.expectEqualStrings(expected, r.out);
+    }
+}
+
+test "console: inspect formatting, cycle safety, read-only getters, print invariance, and GC stress" {
+    const src =
+        \\console.log("hi", { msg: "ok", arr: [1, 2] });
+        \\console.log(undefined, null, true, false, 0, -0, NaN, Infinity, 42n, Symbol("s"));
+        \\console.log({ a: 1, b: "two" });
+        \\console.log([1, [2, 3]]);
+        \\console.log(new Map([["k", 1], ["m", [2, 3]]]));
+        \\console.log(new Set([1, "two", 3n]));
+        \\console.log(new TypeError("boom"));
+        \\function greet() {}
+        \\console.log(greet);
+        \\const cyclic = {};
+        \\cyclic.self = cyclic;
+        \\console.log(cyclic);
+        \\let hits = 0;
+        \\const guarded = {
+        \\    get boom() { hits++; throw new Error("getter invoked"); },
+        \\    toString() { hits++; return "nope"; },
+        \\};
+        \\console.log(guarded);
+        \\console.log("hits:", hits);
+        \\console.assert(false, "bad", { x: 1 });
+        \\print({ a: 1 });
+    ;
+    const expected =
+        \\hi { msg: 'ok', arr: [ 1, 2 ] }
+        \\undefined null true false 0 -0 NaN Infinity 42n Symbol(s)
+        \\{ a: 1, b: 'two' }
+        \\[
+        \\  1,
+        \\  [ 2, 3 ]
+        \\]
+        \\Map(2) { 'k' => 1, 'm' => [ 2, 3 ] }
+        \\Set(3) { 1, 'two', 3n }
+        \\TypeError: boom
+        \\[Function: greet]
+        \\<ref *1> { self: [Circular *1] }
+        \\{ boom: [Getter], toString: [Function: toString] }
+        \\hits: 0
+        \\Assertion failed: bad { x: 1 }
+        \\[object Object]
+        \\
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("", r.err);
+        try testing.expectEqualStrings(expected, r.out);
+
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer err_w.deinit();
+        const code = try zqjs.runSource(testing.allocator, "console_gc_stress.js", src, .{}, .{
+            .mode = .normal,
+            .engine = engine,
+            .collect_always = true,
+            .verify_heap = true,
+        }, &out.writer, &err_w.writer);
+        try testing.expectEqual(@as(u8, 0), code);
+        try testing.expectEqualStrings("", err_w.written());
+        try testing.expectEqualStrings(expected, out.written());
     }
 }
 

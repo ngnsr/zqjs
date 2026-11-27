@@ -240,22 +240,21 @@ pub fn runRegExpMatcher(
     return matched;
 }
 
-/// Runs ECMAScript `RegExpBuiltinExec` into caller-allocated `captures` (`len == capture_count + 1`),
-/// updating `rx_obj.lastIndex` when `global` or `sticky` is set.
-pub fn regexpExecInto(
+const STACK_CAPTURES_LEN: usize = 16;
+
+fn regexpExecIntoRooted(
     rt: *Runtime,
     rx_obj: *Object,
     s: *const heap_mod.String,
     captures: []?regex.Range,
 ) Error!bool {
-    var root_buf = [_]Value{ Value.fromObject(rx_obj), Value.fromString(s) };
-    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
-    try roots.register(rt);
-    defer roots.unregister(rt);
-
-    var last_idx = try common.toLength(rt, rx_obj.kind.regexp.last_index);
     const re = rx_obj.kind.regexp;
     const global_or_sticky = re.global or re.program.flags.sticky;
+    if (!global_or_sticky and re.last_index.isNumber()) {
+        return runRegExpMatcher(rt, &re.program, s.units, 0, captures);
+    }
+
+    var last_idx = try common.toLength(rt, rx_obj.kind.regexp.last_index);
     if (!global_or_sticky) {
         last_idx = 0;
     }
@@ -273,6 +272,29 @@ pub fn regexpExecInto(
         try object.setStrict(rt, Value.fromObject(rx_obj), try object.named(rt, "lastIndex"), Value.fromNumber(@floatFromInt(captures[0].?.end)));
     }
     return true;
+}
+
+/// Runs ECMAScript `RegExpBuiltinExec` into caller-allocated `captures` (`len == capture_count + 1`),
+/// updating `rx_obj.lastIndex` when `global` or `sticky` is set.
+pub fn regexpExecInto(
+    rt: *Runtime,
+    rx_obj: *Object,
+    s: *const heap_mod.String,
+    captures: []?regex.Range,
+) Error!bool {
+    const re = rx_obj.kind.regexp;
+    const global_or_sticky = re.global or re.program.flags.sticky;
+    // Fast path: non-global/non-sticky with numeric lastIndex cannot invoke JS or trigger GC.
+    if (!global_or_sticky and re.last_index.isNumber()) {
+        return runRegExpMatcher(rt, &re.program, s.units, 0, captures);
+    }
+
+    var root_buf = [_]Value{ Value.fromObject(rx_obj), Value.fromString(s) };
+    var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
+    try roots.register(rt);
+    defer roots.unregister(rt);
+
+    return regexpExecIntoRooted(rt, rx_obj, s, captures);
 }
 
 pub fn advanceStringIndex(units: []const u16, idx: usize, is_unicode: bool) usize {
@@ -371,10 +393,14 @@ fn regexpExecImpl(rt: *Runtime, rx_obj: *Object, s: *const heap_mod.String) Erro
 
     const prog = &rx_obj.kind.regexp.program;
     const cap_len = @as(usize, prog.capture_count) + 1;
-    const captures = try rt.gpa.alloc(?regex.Range, cap_len);
-    defer rt.gpa.free(captures);
+    var stack_caps: [STACK_CAPTURES_LEN]?regex.Range = undefined;
+    const captures = if (cap_len <= stack_caps.len)
+        stack_caps[0..cap_len]
+    else
+        try rt.gpa.alloc(?regex.Range, cap_len);
+    defer if (cap_len > stack_caps.len) rt.gpa.free(captures);
 
-    if (!try regexpExecInto(rt, rx_obj, s, captures)) return .null;
+    if (!try regexpExecIntoRooted(rt, rx_obj, s, captures)) return .null;
 
     const r = try builtins.realm(rt);
     const arr = try rt.heap.newArray(r.array_prototype);
@@ -415,7 +441,11 @@ fn regexpExec(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype.exec called on incompatible receiver" }});
     }
     const rx_obj = this.asObject();
-    var root_buf = [_]Value{ Value.fromObject(rx_obj), common.arg(args, 0) };
+    const arg0 = common.arg(args, 0);
+    if (arg0.isString()) {
+        return regexpExecImpl(rt, rx_obj, arg0.asString());
+    }
+    var root_buf = [_]Value{ Value.fromObject(rx_obj), arg0 };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -429,7 +459,25 @@ fn regexpTest(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         return rt.throw(.TypeError, &.{.{ .ascii = "RegExp.prototype.test called on incompatible receiver" }});
     }
     const rx_obj = this.asObject();
-    var root_buf = [_]Value{ Value.fromObject(rx_obj), common.arg(args, 0), .undefined };
+    const arg0 = common.arg(args, 0);
+    const re = rx_obj.kind.regexp;
+    const global_or_sticky = re.global or re.program.flags.sticky;
+    const cap_len = @as(usize, re.program.capture_count) + 1;
+
+    var stack_caps: [STACK_CAPTURES_LEN]?regex.Range = undefined;
+
+    // Zero-root, zero-allocation fast path: non-global/non-sticky regex with numeric
+    // lastIndex and string input cannot invoke JS or trigger GC inside runRegExpMatcher.
+    if (!global_or_sticky and re.last_index.isNumber() and arg0.isString()) {
+        const captures = if (cap_len <= stack_caps.len)
+            stack_caps[0..cap_len]
+        else
+            try rt.gpa.alloc(?regex.Range, cap_len);
+        defer if (cap_len > stack_caps.len) rt.gpa.free(captures);
+        return Value.fromBool(try runRegExpMatcher(rt, &re.program, arg0.asString().units, 0, captures));
+    }
+
+    var root_buf = [_]Value{ Value.fromObject(rx_obj), arg0, .undefined };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
     try roots.register(rt);
     defer roots.unregister(rt);
@@ -437,11 +485,13 @@ fn regexpTest(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const s = try common.toStringObj(rt, root_buf[1]);
     root_buf[2] = Value.fromString(s);
 
-    const cap_len = @as(usize, rx_obj.kind.regexp.program.capture_count) + 1;
-    const captures = try rt.gpa.alloc(?regex.Range, cap_len);
-    defer rt.gpa.free(captures);
+    const captures = if (cap_len <= stack_caps.len)
+        stack_caps[0..cap_len]
+    else
+        try rt.gpa.alloc(?regex.Range, cap_len);
+    defer if (cap_len > stack_caps.len) rt.gpa.free(captures);
 
-    return Value.fromBool(try regexpExecInto(rt, rx_obj, s, captures));
+    return Value.fromBool(try regexpExecIntoRooted(rt, rx_obj, s, captures));
 }
 
 const regexp_source_getter: Native = .{ .name = "get source", .call = regexpSourceGetter };

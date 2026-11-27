@@ -2205,6 +2205,88 @@ const EvalFrame = struct {
     ignore_case: bool,
 };
 
+/// Stack-backed growable list that avoids heap allocation for small counts and spills
+/// transparently to `gpa` when capacity exceeds `inline_cap`. Stores no self-referential
+/// pointers so containing structs can move freely.
+fn SmallList(comptime T: type, comptime inline_cap: usize) type {
+    return struct {
+        const Self = @This();
+
+        len: usize = 0,
+        heap: std.ArrayList(T) = .empty,
+        inline_buf: [inline_cap]T = undefined,
+
+        inline fn items(self: *Self) []T {
+            return if (self.heap.capacity > 0) self.heap.items else self.inline_buf[0..self.len];
+        }
+
+        fn deinit(self: *Self, gpa: Allocator) void {
+            self.heap.deinit(gpa);
+        }
+
+        inline fn clearRetainingCapacity(self: *Self) void {
+            if (self.heap.capacity > 0) {
+                self.heap.clearRetainingCapacity();
+            } else {
+                self.len = 0;
+            }
+        }
+
+        inline fn shrinkRetainingCapacity(self: *Self, new_len: usize) void {
+            if (self.heap.capacity > 0) {
+                self.heap.shrinkRetainingCapacity(new_len);
+            } else {
+                self.len = new_len;
+            }
+        }
+
+        inline fn pop(self: *Self) ?T {
+            if (self.heap.capacity > 0) return self.heap.pop();
+            if (self.len == 0) return null;
+            self.len -= 1;
+            return self.inline_buf[self.len];
+        }
+
+        fn spill(self: *Self, gpa: Allocator, needed_total: usize) Allocator.Error!void {
+            try self.heap.ensureTotalCapacity(gpa, @max(needed_total, inline_cap * 2));
+            self.heap.appendSliceAssumeCapacity(self.inline_buf[0..self.len]);
+        }
+
+        fn ensureUnusedCapacity(self: *Self, gpa: Allocator, additional: usize) Allocator.Error!void {
+            if (self.heap.capacity > 0) {
+                try self.heap.ensureUnusedCapacity(gpa, additional);
+            } else if (self.len + additional > inline_cap) {
+                try self.spill(gpa, self.len + additional);
+            }
+        }
+
+        inline fn appendAssumeCapacity(self: *Self, item: T) void {
+            if (self.heap.capacity > 0) {
+                self.heap.appendAssumeCapacity(item);
+            } else {
+                self.inline_buf[self.len] = item;
+                self.len += 1;
+            }
+        }
+
+        fn append(self: *Self, gpa: Allocator, item: T) Allocator.Error!void {
+            try self.ensureUnusedCapacity(gpa, 1);
+            self.appendAssumeCapacity(item);
+        }
+
+        fn appendSlice(self: *Self, gpa: Allocator, s: []const T) Allocator.Error!void {
+            if (s.len == 0) return;
+            try self.ensureUnusedCapacity(gpa, s.len);
+            if (self.heap.capacity > 0) {
+                self.heap.appendSliceAssumeCapacity(s);
+            } else {
+                @memcpy(self.inline_buf[self.len .. self.len + s.len], s);
+                self.len += s.len;
+            }
+        }
+    };
+}
+
 const Matcher = struct {
     gpa: Allocator,
     p: *const Program,
@@ -2215,15 +2297,18 @@ const Matcher = struct {
     /// Current capture slots: 2 slots (start, end) per capture index `1..capture_count`.
     /// Index `2 * (cap - 1)` is start, `2 * (cap - 1) + 1` is end.
     caps: []u32,
+    caps_heap: bool = false,
     /// Current loop counter states: 1 per `0..loop_count`.
     loops: []LoopState,
+    loops_heap: bool = false,
 
     /// Flat pools storing snapshots of `caps` and `loops` pushed onto `actions`.
-    cap_pool: std.ArrayList(u32) = .empty,
-    loop_pool: std.ArrayList(LoopState) = .empty,
-    actions: std.ArrayList(Action) = .empty,
-    markers: std.ArrayList(LookaheadMarker) = .empty,
-    eval_stack: std.ArrayList(EvalFrame) = .empty,
+    /// Stack-backed for small backtracking depths so common patterns do zero heap allocations.
+    cap_pool: SmallList(u32, 128) = .{},
+    loop_pool: SmallList(LoopState, 128) = .{},
+    actions: SmallList(Action, 64) = .{},
+    markers: SmallList(LookaheadMarker, 8) = .{},
+    eval_stack: SmallList(EvalFrame, 8) = .{},
 
     fn deinit(self: *Matcher) void {
         self.cap_pool.deinit(self.gpa);
@@ -2231,8 +2316,8 @@ const Matcher = struct {
         self.actions.deinit(self.gpa);
         self.markers.deinit(self.gpa);
         self.eval_stack.deinit(self.gpa);
-        self.gpa.free(self.caps);
-        self.gpa.free(self.loops);
+        if (self.caps_heap) self.gpa.free(self.caps);
+        if (self.loops_heap) self.gpa.free(self.loops);
     }
 
     fn chargeStep(self: *Matcher) ExecError!void {
@@ -2243,16 +2328,18 @@ const Matcher = struct {
     fn pushSnapshot(self: *Matcher) ExecError!struct { cap_base: u32, loop_base: u32 } {
         // Saved states are bounded by the step budget (each comes from a charged
         // instruction) and memory by the allocator; this only keeps u32 indices valid.
-        if (self.actions.items.len >= max_backtrack_states or
-            self.cap_pool.items.len + self.caps.len > max_backtrack_cells or
-            self.loop_pool.items.len + self.loops.len > max_backtrack_cells)
+        const cap_items = self.cap_pool.items();
+        const loop_items = self.loop_pool.items();
+        if (self.actions.items().len >= max_backtrack_states or
+            cap_items.len + self.caps.len > max_backtrack_cells or
+            loop_items.len + self.loops.len > max_backtrack_cells)
         {
             return error.OutOfMemory;
         }
-        const cap_base: u32 = @intCast(self.cap_pool.items.len);
+        const cap_base: u32 = @intCast(cap_items.len);
         try self.cap_pool.appendSlice(self.gpa, self.caps);
         errdefer self.cap_pool.shrinkRetainingCapacity(cap_base);
-        const loop_base: u32 = @intCast(self.loop_pool.items.len);
+        const loop_base: u32 = @intCast(loop_items.len);
         try self.loop_pool.appendSlice(self.gpa, self.loops);
         return .{ .cap_base = cap_base, .loop_base = loop_base };
     }
@@ -2272,8 +2359,8 @@ const Matcher = struct {
     }
 
     fn restoreSnapshot(self: *Matcher, cap_base: u32, loop_base: u32) void {
-        @memcpy(self.caps, self.cap_pool.items[cap_base..][0..self.caps.len]);
-        @memcpy(self.loops, self.loop_pool.items[loop_base..][0..self.loops.len]);
+        @memcpy(self.caps, self.cap_pool.items()[cap_base..][0..self.caps.len]);
+        @memcpy(self.loops, self.loop_pool.items()[loop_base..][0..self.loops.len]);
         self.cap_pool.shrinkRetainingCapacity(cap_base);
         self.loop_pool.shrinkRetainingCapacity(loop_base);
     }
@@ -2389,9 +2476,10 @@ const Matcher = struct {
             else => return self.evalLeafNode(root, cps, self.p.flags.ignore_case),
         }
 
-        while (self.eval_stack.items.len > 0) {
-            const top_idx = self.eval_stack.items.len - 1;
-            const frame = &self.eval_stack.items[top_idx];
+        while (self.eval_stack.items().len > 0) {
+            const eval_items = self.eval_stack.items();
+            const top_idx = eval_items.len - 1;
+            const frame = &eval_items[top_idx];
             const comp = self.p.class_nodes[frame.node_idx].compound;
             if (frame.child_pos < comp.len) {
                 const child_idx = comp.start + frame.child_pos;
@@ -2414,8 +2502,9 @@ const Matcher = struct {
             } else {
                 const finished = self.eval_stack.pop().?;
                 const res = if (comp.inverted) !finished.acc else finished.acc;
-                if (self.eval_stack.items.len == 0) return res;
-                const parent = &self.eval_stack.items[self.eval_stack.items.len - 1];
+                const rem = self.eval_stack.items();
+                if (rem.len == 0) return res;
+                const parent = &rem[rem.len - 1];
                 const parent_comp = self.p.class_nodes[parent.node_idx].compound;
                 combine(parent, parent_comp.op, res, parent_comp.len);
             }
@@ -2751,10 +2840,11 @@ const Matcher = struct {
                         // If we backtrack into `body_pc`, captures inside the atom must be cleared
                         // on that branch; clear them in the saved snapshot on `cap_pool`.
                         if (info.cap_start <= info.cap_end) {
-                            const last_act = self.actions.items[self.actions.items.len - 1].branch;
+                            const act_items = self.actions.items();
+                            const last_act = act_items[act_items.len - 1].branch;
                             const start_slot = (@as(usize, info.cap_start) - 1) * 2;
                             const end_slot = @as(usize, info.cap_end) * 2;
-                            @memset(self.cap_pool.items[last_act.cap_base..][start_slot..end_slot], unset_pos);
+                            @memset(self.cap_pool.items()[last_act.cap_base..][start_slot..end_slot], unset_pos);
                         }
                         self.loops[ls.loop_id] = .{ .count = saved_count, .last_idx = saved_last };
                         pc = ls.exit_pc;
@@ -2762,9 +2852,9 @@ const Matcher = struct {
                     break :blk true;
                 },
                 .lookahead => |la| blk: {
-                    const action_wm: u32 = @intCast(self.actions.items.len);
-                    const cap_wm: u32 = @intCast(self.cap_pool.items.len);
-                    const loop_wm: u32 = @intCast(self.loop_pool.items.len);
+                    const action_wm: u32 = @intCast(self.actions.items().len);
+                    const cap_wm: u32 = @intCast(self.cap_pool.items().len);
+                    const loop_wm: u32 = @intCast(self.loop_pool.items().len);
                     if (la.negative) {
                         try self.actions.ensureUnusedCapacity(self.gpa, 1);
                         const snap = try self.pushSnapshot();
@@ -2812,12 +2902,13 @@ const Matcher = struct {
 
             if (!advance) {
                 // Pop from explicit backtrack stack.
-                if (self.actions.items.len == 0) return null;
+                if (self.actions.items().len == 0) return null;
                 try self.chargeStep();
                 const act = self.actions.pop().?;
                 // Drop any lookahead markers whose watermark was above the popped action.
-                while (self.markers.items.len > 0 and
-                    self.markers.items[self.markers.items.len - 1].action_watermark > self.actions.items.len)
+                const rem_actions = self.actions.items().len;
+                while (self.markers.items().len > 0 and
+                    self.markers.items()[self.markers.items().len - 1].action_watermark > rem_actions)
                 {
                     _ = self.markers.pop();
                 }
@@ -2859,11 +2950,15 @@ pub fn exec(
 
     if (start > input.len) return false;
 
-    const caps_buf = try gpa.alloc(u32, @as(usize, p.capture_count) * 2);
-    const loops_buf = gpa.alloc(LoopState, p.loop_count) catch |err| {
-        gpa.free(caps_buf);
-        return err;
-    };
+    var stack_caps: [32]u32 = undefined;
+    var stack_loops: [16]LoopState = undefined;
+    const cap_slots = @as(usize, p.capture_count) * 2;
+    const caps_heap = cap_slots > stack_caps.len;
+    const caps_buf = if (caps_heap) try gpa.alloc(u32, cap_slots) else stack_caps[0..cap_slots];
+    errdefer if (caps_heap) gpa.free(caps_buf);
+
+    const loops_heap = p.loop_count > stack_loops.len;
+    const loops_buf = if (loops_heap) try gpa.alloc(LoopState, p.loop_count) else stack_loops[0..p.loop_count];
 
     var matcher: Matcher = .{
         .gpa = gpa,
@@ -2871,7 +2966,9 @@ pub fn exec(
         .input = input,
         .steps = steps,
         .caps = caps_buf,
+        .caps_heap = caps_heap,
         .loops = loops_buf,
+        .loops_heap = loops_heap,
     };
     defer matcher.deinit();
 

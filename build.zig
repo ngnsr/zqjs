@@ -364,4 +364,63 @@ pub fn build(b: *std.Build) void {
     const regen_regex = b.addSystemCommand(&.{ "node", "tools/gen_regex_cases.js" });
     regen_regex.setCwd(b.path("."));
     update.dependOn(&regen_regex.step);
+
+    // Browser WASM Playground (lazy step; not part of default `zig build` or `zig build test`).
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const playground_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    playground_mod.addOptions("build_options", options);
+    const playground_exe = b.addExecutable(.{
+        .name = "zqjs-playground",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm_playground.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+            .strip = true,
+            .imports = &.{.{ .name = "zqjs_internal", .module = playground_mod }},
+        }),
+    });
+    playground_exe.root_module.addOptions("cli_options", cli_options);
+    playground_exe.entry = .disabled;
+    playground_exe.rdynamic = true;
+    playground_exe.stack_size = 2 * 1024 * 1024;
+
+    const playground_dir: std.Build.InstallDir = .{ .custom = "playground" };
+    const install_playground_wasm = b.addInstallArtifact(playground_exe, .{
+        .dest_dir = .{ .override = playground_dir },
+    });
+    const install_playground_html = b.addInstallFileWithDir(
+        b.path("playground/index.html"),
+        playground_dir,
+        "index.html",
+    );
+    const install_playground_worker = b.addInstallFileWithDir(
+        b.path("playground/worker.js"),
+        playground_dir,
+        "worker.js",
+    );
+    const playground_step = b.step("playground", "Build static Browser WASM Playground into zig-out/playground/");
+    playground_step.dependOn(&install_playground_wasm.step);
+    playground_step.dependOn(&install_playground_html.step);
+    playground_step.dependOn(&install_playground_worker.step);
+
+    const playground_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/wasm_playground.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zqjs_internal", .module = mod }},
+    });
+    playground_test_mod.addOptions("cli_options", cli_options);
+    const playground_tests = b.addRunArtifact(b.addTest(.{
+        .name = "wasm_playground_test",
+        .filters = filters,
+        .root_module = playground_test_mod,
+    }));
+    b.step("test-playground", "Run native unit tests for src/wasm_playground.zig").dependOn(&playground_tests.step);
 }

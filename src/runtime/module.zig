@@ -1495,6 +1495,7 @@ pub const FsLoader = struct {
     }
 
     fn load(ctx: ?*anyopaque, referrer_id: ?[]const u8, specifier: []const u8) LoadError!LoadedModule {
+        if (comptime @import("builtin").os.tag == .freestanding) return error.ModuleNotFound;
         const self: *FsLoader = @ptrCast(@alignCast(ctx.?));
         const resolved = try resolveFsPath(self.gpa, self.io, referrer_id orelse self.fallback_referrer, specifier);
         errdefer self.gpa.free(resolved);
@@ -1532,6 +1533,7 @@ pub fn resolveFsPath(gpa: Allocator, io: std.Io, referrer_id: ?[]const u8, speci
             return error.ModuleNotFound;
         }
         if (std.fs.path.isAbsolute(specifier)) return normalizePath(gpa, specifier);
+        if (comptime @import("builtin").os.tag == .freestanding) return normalizePath(gpa, specifier);
         const cwd = std.Io.Dir.cwd().realPathFileAlloc(io, ".", gpa) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return normalizePath(gpa, specifier),

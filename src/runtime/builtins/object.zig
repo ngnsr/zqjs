@@ -168,11 +168,7 @@ pub fn objectToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
         .object => |o| switch (o.kind) {
             .array => "Array",
             .proxy => if (is_proxy_arr) "Array" else if (o.kind.proxy.is_callable) "Function" else "Object",
-            .iterator => |it| switch (it.kind) {
-                .string_chars => "String Iterator",
-                .regexp_match_all => "RegExp String Iterator",
-                .map_entries, .map_keys, .map_values, .set_values, .set_entries, .array_values, .array_keys, .array_entries, .helper, .wrap, .custom, .async_from_sync, .for_in => "Object",
-            },
+            .iterator => "Object",
             .regexp => "RegExp",
             .date => "Date",
             .module_namespace => "Module",

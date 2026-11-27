@@ -441,6 +441,16 @@ const Resolver = struct {
             try f.var_bindings.append(r.arena, d.binding);
             return;
         }
+        // ES2025 §10.2.11 step 22: `var arguments` in a non-arrow function shares the
+        // implicit `arguments` binding so it starts initialized to the arguments object
+        // rather than `undefined`.
+        if (!f.is_arrow and std.mem.eql(u8, d.name, "arguments")) {
+            const arg_b = try r.ensureArgumentsBinding(r.fns.items.len - 1);
+            r.bindings.items[d.binding] = r.bindings.items[arg_b];
+            r.bindings.items[d.binding].alias_of = arg_b;
+            try r.live.append(r.arena, .{ .name = d.name, .binding = arg_b });
+            return;
+        }
         const slot: u32 = @intCast(r.live.items.len - f.live_start);
         r.bindings.items[d.binding] = .{ .kind = .@"var", .slot = slot, .scope = r.scope, .index = scope.len, .function = f.id };
         scope.len += 1;
@@ -979,6 +989,25 @@ const Resolver = struct {
         r.functions[r.current().id].this_binding = tb;
     }
 
+    fn ensureArgumentsBinding(r: *Resolver, owner_idx: usize) Error!u32 {
+        const owner = &r.fns.items[owner_idx];
+        return owner.arguments_binding orelse blk: {
+            const ps = r.functions[owner.id].param_scope.?;
+            const scope = &r.scopes.items[ps];
+            const new_id: u32 = @intCast(r.bindings.items.len);
+            try r.bindings.append(r.arena, .{
+                .kind = .@"var",
+                .slot = 0, // assigned in finishFunction after max_slots settles
+                .scope = ps,
+                .index = scope.len,
+                .function = owner.id,
+            });
+            scope.len += 1;
+            owner.arguments_binding = new_id;
+            break :blk new_id;
+        };
+    }
+
     fn ensureNewTargetBinding(r: *Resolver, owner_idx: usize) Error!u32 {
         const owner = &r.fns.items[owner_idx];
         return owner.new_target_binding orelse blk: {
@@ -1235,23 +1264,9 @@ const Resolver = struct {
         // No local binding shadowed `arguments` inside the enclosing non-arrow function:
         // lazily materialize the implicit `arguments` binding on that function.
         if (arg_fn_idx) |fi| {
-            const target_fn = &r.fns.items[fi];
-            const arg_b: u32 = target_fn.arguments_binding orelse blk: {
-                const ps = r.functions[target_fn.id].param_scope.?;
-                const scope = &r.scopes.items[ps];
-                const new_id: u32 = @intCast(r.bindings.items.len);
-                try r.bindings.append(r.arena, .{
-                    .kind = .let,
-                    .slot = 0, // assigned in finishFunction after max_slots settles
-                    .scope = ps,
-                    .index = scope.len,
-                    .function = target_fn.id,
-                });
-                scope.len += 1;
-                target_fn.arguments_binding = new_id;
-                break :blk new_id;
-            };
-            if (target_fn.id == r.current().id) return .{ .local = arg_b };
+            const target_fn_id = r.fns.items[fi].id;
+            const arg_b = try r.ensureArgumentsBinding(fi);
+            if (target_fn_id == r.current().id) return .{ .local = arg_b };
             r.bindings.items[arg_b].captured = true;
             return .{ .capture = .{ .binding = arg_b, .index = try r.captureIndex(r.fns.items.len - 1, arg_b) } };
         }

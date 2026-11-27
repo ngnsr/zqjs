@@ -3209,7 +3209,7 @@ fn fastArraySet(rt: *Runtime, base: Value, idx: Value, val: Value) bool {
     const elems = o.kind.array.items;
     if (!(n >= 0 and n < @as(f64, @floatFromInt(elems.len)) and @floor(n) == n)) return false;
     const i: usize = @intFromFloat(n);
-    if (elems[i].isHole() and !o.extensible) return false;
+    if (elems[i].isHole()) return false;
     o.obj.checkLive();
     rt.heap.storeElement(o, i, val);
     return true;

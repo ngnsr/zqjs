@@ -1588,6 +1588,114 @@ test "array index Object.defineProperty overrides: GC stress on getter/setter cl
     }
 }
 
+test "test262 spec tail: array shrink proto fallback, fastArraySet hole trap, iterator toStringTag, var arguments" {
+    const src =
+        \\// 1. Array.prototype.{forEach,every,some,filter,reduce,reduceRight} prototype fallback after length shrink
+        \\function makeShrinking(shrinkAt) {
+        \\  const arr = [1, 2, 3];
+        \\  Object.defineProperty(arr, shrinkAt, {
+        \\    get() { arr.length = 2; return shrinkAt === 0 ? 10 : 20; },
+        \\    configurable: true,
+        \\    enumerable: true,
+        \\  });
+        \\  return arr;
+        \\}
+        \\Array.prototype[2] = 99;
+        \\try {
+        \\  const fe = [];
+        \\  makeShrinking(1).forEach((v) => fe.push(v));
+        \\  const ev = [];
+        \\  const evRes = makeShrinking(1).every((v) => { ev.push(v); return v !== 99; });
+        \\  const sm = [];
+        \\  const smRes = makeShrinking(1).some((v) => { sm.push(v); return v === 99; });
+        \\  const fl = makeShrinking(1).filter((v) => v === 99);
+        \\  const rd = makeShrinking(1).reduce((a, v) => a + "," + v, "s");
+        \\  const rrArr = [1, 2, 3];
+        \\  Object.defineProperty(rrArr, 2, {
+        \\    get() { rrArr.length = 1; return 30; },
+        \\    configurable: true,
+        \\    enumerable: true,
+        \\  });
+        \\  Array.prototype[1] = 88;
+        \\  const rr = rrArr.reduceRight((a, v) => a + "," + v, "s");
+        \\  delete Array.prototype[1];
+        \\  print("arr:", fe.join(","), evRes, ev.join(","), smRes, sm.join(","), fl.join(","), rd, rr);
+        \\} finally {
+        \\  delete Array.prototype[2];
+        \\  delete Array.prototype[1];
+        \\}
+        \\
+        \\// 2. fastArraySet hole check: Proxy prototype set trap & inherited setter on Object.prototype
+        \\let proxyTrap = "";
+        \\const p = new Proxy({}, {
+        \\  set(target, prop, val, receiver) {
+        \\    proxyTrap = String(prop) + "=" + val + ":" + (receiver === a1);
+        \\    return true;
+        \\  },
+        \\});
+        \\const a1 = new Array(1);
+        \\Object.setPrototypeOf(a1, p);
+        \\a1[0] = 1;
+        \\let inheritedSet = -1;
+        \\Object.defineProperty(Object.prototype, 0, {
+        \\  set(v) { inheritedSet = v; },
+        \\  configurable: true,
+        \\});
+        \\try {
+        \\  const a2 = new Array(1);
+        \\  a2[0] = 42;
+        \\} finally {
+        \\  delete Object.prototype[0];
+        \\}
+        \\print("holeSet:", proxyTrap, inheritedSet);
+        \\
+        \\// 3. Object.prototype.toString on String Iterator with normal, non-string, and deleted Symbol.toStringTag
+        \\const strIter = ""[Symbol.iterator]();
+        \\const strIterProto = Object.getPrototypeOf(strIter);
+        \\const origDesc = Object.getOwnPropertyDescriptor(strIterProto, Symbol.toStringTag);
+        \\try {
+        \\  const tNormal = Object.prototype.toString.call(strIter);
+        \\  Object.defineProperty(strIterProto, Symbol.toStringTag, { value: new String("x"), configurable: true });
+        \\  const tNonStr = Object.prototype.toString.call(strIter);
+        \\  delete strIterProto[Symbol.toStringTag];
+        \\  const tDeleted = Object.prototype.toString.call(strIter);
+        \\  print("iterTag:", tNormal, "|", tNonStr, "|", tDeleted);
+        \\} finally {
+        \\  Object.defineProperty(strIterProto, Symbol.toStringTag, origDesc);
+        \\}
+        \\
+        \\// 4. var arguments does not clobber initial arguments object
+        \\function f() { return typeof arguments; var arguments = 123; }
+        \\function g() { const before = typeof arguments; var arguments = 123; return before + ":" + arguments; }
+        \\function h(a) { a = 7; return arguments[0]; var arguments; }
+        \\print("varArgs:", f(1, 2, 3), g(1, 2), h(1));
+    ;
+    const expected =
+        \\arr: 1,20,99 false 1,20,99 true 1,20,99 99 s,1,20,99 s,30,88,1
+        \\holeSet: 0=1:true 42
+        \\iterTag: [object String Iterator] | [object Object] | [object Iterator]
+        \\varArgs: object object:123 7
+        \\
+    ;
+    for (support.engines) |engine| {
+        for ([_]bool{ false, true }) |gc_stress| {
+            var out: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer out.deinit();
+            var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer err_w.deinit();
+            const code = try zqjs.runSource(testing.allocator, "test262_spec_tail.js", src, .{}, .{
+                .mode = .normal,
+                .engine = engine,
+                .collect_always = gc_stress,
+                .verify_heap = gc_stress,
+            }, &out.writer, &err_w.writer);
+            try testing.expectEqual(@as(u8, 0), code);
+            try testing.expectEqualStrings("", err_w.written());
+            try testing.expectEqualStrings(expected, out.written());
+        }
+    }
+}
+
 test "instanceof fast and slow paths: primitives, closures, natives, proxies, Symbol.hasInstance, bound, mutated Function.prototype" {
     const src =
         \\class Base {}

@@ -107,3 +107,83 @@ comptime {
     std.debug.assert((Limits{}).max_source_bytes < std.math.maxInt(u32));
     std.debug.assert((Limits{}).max_code_bytes < std.math.maxInt(u32));
 }
+
+/// Parses a positive byte size with an optional case-insensitive binary suffix
+/// (`B`, `K`/`KB`/`KiB`, `M`/`MB`/`MiB`, `G`/`GB`/`GiB`). Rejects 0, empty input,
+/// negative values, whitespace, unknown suffixes, and `usize` overflow.
+pub fn parseByteSize(s: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {}
+    if (i == 0) return null;
+
+    const n = std.fmt.parseInt(usize, s[0..i], 10) catch return null;
+    if (n == 0) return null;
+
+    const suffix = s[i..];
+    const mult: usize = if (suffix.len == 0 or std.ascii.eqlIgnoreCase(suffix, "b"))
+        1
+    else if (std.ascii.eqlIgnoreCase(suffix, "k") or std.ascii.eqlIgnoreCase(suffix, "kb") or std.ascii.eqlIgnoreCase(suffix, "kib"))
+        1024
+    else if (std.ascii.eqlIgnoreCase(suffix, "m") or std.ascii.eqlIgnoreCase(suffix, "mb") or std.ascii.eqlIgnoreCase(suffix, "mib"))
+        1024 * 1024
+    else if (std.ascii.eqlIgnoreCase(suffix, "g") or std.ascii.eqlIgnoreCase(suffix, "gb") or std.ascii.eqlIgnoreCase(suffix, "gib"))
+        1024 * 1024 * 1024
+    else
+        return null;
+
+    return std.math.mul(usize, n, mult) catch null;
+}
+
+test "parseByteSize: valid sizes and case-insensitive suffixes" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, 1), parseByteSize("1"));
+    try testing.expectEqual(@as(?usize, 4096), parseByteSize("4096"));
+    try testing.expectEqual(@as(?usize, 4096), parseByteSize("4096B"));
+    try testing.expectEqual(@as(?usize, 4096), parseByteSize("4096b"));
+
+    try testing.expectEqual(@as(?usize, 512 * 1024), parseByteSize("512K"));
+    try testing.expectEqual(@as(?usize, 512 * 1024), parseByteSize("512k"));
+    try testing.expectEqual(@as(?usize, 512 * 1024), parseByteSize("512KB"));
+    try testing.expectEqual(@as(?usize, 512 * 1024), parseByteSize("512kb"));
+    try testing.expectEqual(@as(?usize, 512 * 1024), parseByteSize("512KiB"));
+    try testing.expectEqual(@as(?usize, 512 * 1024), parseByteSize("512kib"));
+
+    try testing.expectEqual(@as(?usize, 64 * 1024 * 1024), parseByteSize("64M"));
+    try testing.expectEqual(@as(?usize, 64 * 1024 * 1024), parseByteSize("64m"));
+    try testing.expectEqual(@as(?usize, 64 * 1024 * 1024), parseByteSize("64MB"));
+    try testing.expectEqual(@as(?usize, 64 * 1024 * 1024), parseByteSize("64mb"));
+    try testing.expectEqual(@as(?usize, 64 * 1024 * 1024), parseByteSize("64MiB"));
+    try testing.expectEqual(@as(?usize, 64 * 1024 * 1024), parseByteSize("64mIb"));
+
+    try testing.expectEqual(@as(?usize, 2 * 1024 * 1024 * 1024), parseByteSize("2G"));
+    try testing.expectEqual(@as(?usize, 2 * 1024 * 1024 * 1024), parseByteSize("2g"));
+    try testing.expectEqual(@as(?usize, 2 * 1024 * 1024 * 1024), parseByteSize("2GB"));
+    try testing.expectEqual(@as(?usize, 2 * 1024 * 1024 * 1024), parseByteSize("2gb"));
+    try testing.expectEqual(@as(?usize, 2 * 1024 * 1024 * 1024), parseByteSize("2GiB"));
+    try testing.expectEqual(@as(?usize, 2 * 1024 * 1024 * 1024), parseByteSize("2gib"));
+}
+
+test "parseByteSize: rejects zero, empty, invalid, negative, whitespace, overflow" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, null), parseByteSize(""));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("0"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("0B"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("0K"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("0M"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("0G"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("-1"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("-1M"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("+1M"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize(" 1M"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("1M "));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("1 M"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("M"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("abc"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("1T"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("1.5M"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("1_024"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("999999999999999999999999999999"));
+    // Overflow on multiplication even when base digits fit in usize.
+    try testing.expectEqual(@as(?usize, null), parseByteSize("18446744073709551615K"));
+    try testing.expectEqual(@as(?usize, null), parseByteSize("17179869184G"));
+}

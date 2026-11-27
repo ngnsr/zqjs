@@ -40,6 +40,7 @@ pub const SessionOptions = struct {
     trace: bool = false,
     verify_heap: bool = false,
     color: bool = false,
+    sandbox: bool = false,
     io: ?std.Io = null,
     history_path: ?[]const u8 = null,
 };
@@ -62,6 +63,7 @@ pub const Session = struct {
     engine: Engine,
     trace: bool,
     color: bool,
+    sandbox: bool,
     io: ?std.Io,
     history_path: ?[]const u8,
 
@@ -91,6 +93,7 @@ pub const Session = struct {
             .engine = options.engine,
             .trace = options.trace,
             .color = options.color,
+            .sandbox = options.sandbox,
             .io = options.io,
             .history_path = options.history_path,
         };
@@ -748,6 +751,11 @@ pub const Session = struct {
             try s.out.flush();
             return .handled;
         } else if (std.mem.eql(u8, cmd, ".load")) {
+            if (s.sandbox) {
+                try s.err.writeAll(".load: disabled in --sandbox mode\n");
+                try s.err.flush();
+                return .handled;
+            }
             if (arg.len == 0) {
                 try s.err.writeAll("usage: .load <path>\n");
                 try s.err.flush();
@@ -774,6 +782,11 @@ pub const Session = struct {
             }
             return .handled;
         } else if (std.mem.eql(u8, cmd, ".save")) {
+            if (s.sandbox) {
+                try s.err.writeAll(".save: disabled in --sandbox mode\n");
+                try s.err.flush();
+                return .handled;
+            }
             if (arg.len == 0) {
                 try s.err.writeAll("usage: .save <path>\n");
                 try s.err.flush();

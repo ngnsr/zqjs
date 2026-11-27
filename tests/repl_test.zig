@@ -507,3 +507,38 @@ test "repl: .trace on flushes buffered stderr immediately after each eval" {
     try expectEval(s, "4 + 5", "9");
     try testing.expectEqual(@as(usize, 0), err_sink.flushed.items.len);
 }
+
+test "repl: --sandbox blocks .load and .save while normal eval, .limits, and .mem work" {
+    var out_aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out_aw.deinit();
+    var err_aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err_aw.deinit();
+
+    const s = try Session.create(testing.allocator, &out_aw.writer, &err_aw.writer, .{
+        .sandbox = true,
+        .io = std.testing.io,
+    });
+    defer s.destroy();
+
+    // .load is blocked in sandbox mode even with an existing file path.
+    try testing.expectEqual(Session.DotCommandOutcome.handled, try s.runDotCommand(".load src/main.zig"));
+    try testing.expect(std.mem.indexOf(u8, err_aw.written(), ".load: disabled in --sandbox mode") != null);
+
+    // .save is blocked in sandbox mode and does not create the target file.
+    err_aw.clearRetainingCapacity();
+    const forbidden_path = ".zig-cache/repl_sandbox_should_not_exist.js";
+    try testing.expectEqual(Session.DotCommandOutcome.handled, try s.runDotCommand(".save " ++ forbidden_path));
+    try testing.expect(std.mem.indexOf(u8, err_aw.written(), ".save: disabled in --sandbox mode") != null);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, forbidden_path, .{}));
+
+    // Normal JS evaluation, .limits, and .mem continue to work.
+    try expectEval(s, "1 + 2", "3");
+
+    out_aw.clearRetainingCapacity();
+    try testing.expectEqual(Session.DotCommandOutcome.handled, try s.runDotCommand(".limits"));
+    try testing.expect(std.mem.indexOf(u8, out_aw.written(), "max_heap_bytes=") != null);
+
+    out_aw.clearRetainingCapacity();
+    try testing.expectEqual(Session.DotCommandOutcome.handled, try s.runDotCommand(".mem"));
+    try testing.expect(std.mem.indexOf(u8, out_aw.written(), "heap:") != null);
+}

@@ -52,6 +52,9 @@ pub fn build(b: *std.Build) void {
     });
     const imports: []const std.Build.Module.Import = &.{ .{ .name = "zqjs_internal", .module = mod }, .{ .name = "zqjs", .module = api } };
 
+    const cli_options = b.addOptions();
+    cli_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+
     const exe = b.addExecutable(.{
         .name = "zqjs",
         .root_module = b.createModule(.{
@@ -62,6 +65,7 @@ pub fn build(b: *std.Build) void {
             .imports = imports,
         }),
     });
+    exe.root_module.addOptions("cli_options", cli_options);
     b.installArtifact(exe);
     const install_cli = b.addInstallArtifact(exe, .{});
     b.step("cli", "Build and install only the zqjs CLI binary (skips libzqjs.a)").dependOn(&install_cli.step);

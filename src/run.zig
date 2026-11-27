@@ -48,6 +48,8 @@ pub const Options = struct {
     collect_always: bool = false,
     /// Run the heap verifier after every collection, without the rest of -Dgc-stress.
     verify_heap: bool = false,
+    /// Allow filesystem module imports (`--sandbox` sets this to `false`).
+    allow_fs_imports: bool = true,
 };
 
 pub const Error = Allocator.Error || Writer.Error;
@@ -303,12 +305,17 @@ pub fn runModule(gpa: Allocator, name: []const u8, source: []const u8, io: std.I
         .io = io,
         .max_source_bytes = limits.max_source_bytes,
     };
-    rt.modules.loader = fs_loader.loader();
+    if (options.allow_fs_imports) {
+        rt.modules.loader = fs_loader.loader();
+    }
 
-    const canonical = module.resolveFsPath(gpa, io, null, name) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.ModuleNotFound => try gpa.dupe(u8, name),
-    };
+    const canonical = if (options.allow_fs_imports)
+        module.resolveFsPath(gpa, io, null, name) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ModuleNotFound => try gpa.dupe(u8, name),
+        }
+    else
+        try gpa.dupe(u8, name);
     defer gpa.free(canonical);
 
     var mod_diag: module.ModuleDiag = .{};

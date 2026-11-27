@@ -1,0 +1,59 @@
+# Builds the Browser WASM Playground and publishes it to GitHub Pages.
+# The .wasm is built here, never committed (repo Settings → Pages → Source: GitHub Actions).
+name: Pages
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "playground/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# One deploy at a time; let an in-flight deploy finish rather than cancel it half-published.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build playground
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # Exact toolchain pin (DESIGN_DECISIONS D17); build.zig refuses other versions.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+          cache-key: pages
+
+      - name: Build playground
+        run: zig build playground --summary all
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: zig-out/playground
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

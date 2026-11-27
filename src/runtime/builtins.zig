@@ -612,11 +612,11 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
 // ---------------------------------------------------------------- globals
 
 pub const print: Native = .{ .name = "print", .call = common.printImpl };
-pub const console_log: Native = .{ .name = "log", .call = common.printImpl };
-pub const console_info: Native = .{ .name = "info", .call = common.printImpl };
-pub const console_debug: Native = .{ .name = "debug", .call = common.printImpl };
-pub const console_warn: Native = .{ .name = "warn", .call = common.printImpl };
-pub const console_error: Native = .{ .name = "error", .call = common.printImpl };
+pub const console_log: Native = .{ .name = "log", .call = common.consoleLogImpl };
+pub const console_info: Native = .{ .name = "info", .call = common.consoleLogImpl };
+pub const console_debug: Native = .{ .name = "debug", .call = common.consoleLogImpl };
+pub const console_warn: Native = .{ .name = "warn", .call = common.consoleLogImpl };
+pub const console_error: Native = .{ .name = "error", .call = common.consoleLogImpl };
 pub const console_assert: Native = .{ .name = "assert", .call = common.consoleAssertImpl };
 pub const object_global: Native = .{ .name = "Object", .length = 1, .call = object_builtins.objectCall, .construct = object_builtins.objectConstruct, .namespace = .object };
 pub const array_global: Native = .{ .name = "Array", .length = 1, .call = array.arrayCall, .construct = array.arrayConstruct, .namespace = .array };

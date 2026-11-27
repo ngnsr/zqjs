@@ -309,11 +309,17 @@ fn getFrom(rt: *Runtime, start: *Object, receiver: Value, k: Key) Error!Value {
 pub fn ownProp(rt: *Runtime, o: *Object, k: Key) Error!?Property {
     switch (o.kind) {
         .array => |elements| switch (k) {
-            .index => |i| return if (i < elements.items.len and !elements.items[i].isHole()) .{
-                .value = elements.items[i],
-                .writable = o.array_elements_writable,
-                .configurable = o.array_elements_configurable,
-            } else null,
+            .index => |i| {
+                if (i < elements.items.len) {
+                    if (!elements.items[i].isHole()) return .{
+                        .value = elements.items[i],
+                        .writable = o.array_elements_writable,
+                        .configurable = o.array_elements_configurable,
+                    };
+                    if (o.has_index_overrides) return o.props.get(try propKey(rt, k));
+                }
+                return null;
+            },
             .atom => if (isNamed(k, "length")) return .{
                 .value = Value.fromNumber(@floatFromInt(elements.items.len)),
                 .enumerable = false,
@@ -675,6 +681,13 @@ fn setOwnData(rt: *Runtime, base: Value, k: Key, v: Value, strict: bool) Error!b
                     .index => |i| {
                         if (i < elements.items.len) {
                             if (elements.items[i].isHole()) {
+                                if (o.has_index_overrides) {
+                                    const pk = try propKey(rt, k);
+                                    if (o.props.contains(pk)) {
+                                        try rt.heap.storePropKey(o, pk, v);
+                                        return true;
+                                    }
+                                }
                                 if (!o.extensible) {
                                     if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot add property, object is not extensible" }});
                                     return false;
@@ -886,6 +899,66 @@ fn putOwn(rt: *Runtime, o: *Object, k: Key, v: Value) Error!void {
     try rt.heap.storePropKey(o, try propKey(rt, k), v);
 }
 
+/// Shrinks an array from its current length down to `new_len` per ES2025 ArraySetLength,
+/// deleting elements from the end and stopping above the highest non-configurable index.
+/// Returns `true` if `arr` reached `new_len`, or `false` if stopped by a non-configurable element.
+pub fn shrinkArrayElements(rt: *Runtime, arr: *Object, new_len: usize) Error!bool {
+    const cur_len = arr.kind.array.items.len;
+    if (new_len >= cur_len) return true;
+    if (!arr.has_index_overrides) {
+        if (arr.array_elements_configurable) {
+            rt.heap.shrinkElements(arr, new_len);
+            return true;
+        }
+        var keep = cur_len;
+        while (keep > new_len and arr.kind.array.items[keep - 1].isHole()) : (keep -= 1) {}
+        rt.heap.shrinkElements(arr, keep);
+        return keep == new_len;
+    }
+
+    // Find the highest non-configurable index in [new_len, cur_len) across both
+    // overridden index properties in `arr.props` and dense elements.
+    var max_non_conf: ?usize = null;
+    var pit = arr.props.iterator();
+    while (pit.next()) |entry| {
+        const pk = entry.key_ptr.*;
+        if (pk.isSymbol()) continue;
+        if (pk.asAtom().atom.?.index) |idx| {
+            if (idx >= new_len and idx < cur_len and !entry.value_ptr.configurable) {
+                max_non_conf = if (max_non_conf) |prev| @max(prev, idx) else idx;
+            }
+        }
+    }
+    if (!arr.array_elements_configurable) {
+        var keep = cur_len;
+        while (keep > new_len and arr.kind.array.items[keep - 1].isHole()) : (keep -= 1) {}
+        if (keep > new_len) {
+            const dense_idx = keep - 1;
+            max_non_conf = if (max_non_conf) |prev| @max(prev, dense_idx) else dense_idx;
+        }
+    }
+
+    const target_len = if (max_non_conf) |idx| idx + 1 else new_len;
+    // Remove all configurable overridden index properties >= target_len.
+    while (findOverriddenIndexGe(arr, target_len)) |pk| {
+        try rt.heap.removePropKey(arr, pk);
+    }
+    rt.heap.shrinkElements(arr, target_len);
+    return max_non_conf == null;
+}
+
+fn findOverriddenIndexGe(arr: *const Object, min_idx: usize) ?heap_mod.PropKey {
+    var pit = arr.props.iterator();
+    while (pit.next()) |entry| {
+        const pk = entry.key_ptr.*;
+        if (pk.isSymbol()) continue;
+        if (pk.asAtom().atom.?.index) |idx| {
+            if (idx >= min_idx) return pk;
+        }
+    }
+    return null;
+}
+
 fn setLength(rt: *Runtime, arr: *Object, v: Value, strict: bool) Error!bool {
     var root_buf = [_]Value{ Value.fromObject(arr), v };
     var roots: rt_mod.ValueRoots = .{ .values = &root_buf };
@@ -910,11 +983,10 @@ fn setLength(rt: *Runtime, arr: *Object, v: Value, strict: bool) Error!bool {
         try rt.heap.growElementsWithHoles(arr, len);
         return true;
     }
-    if (!arr.array_elements_configurable and len < cur_len) {
+    if (!try shrinkArrayElements(rt, arr, len)) {
         if (strict) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property of non-configurable array" }});
         return false;
     }
-    rt.heap.shrinkElements(arr, len);
     return true;
 }
 
@@ -981,7 +1053,16 @@ pub fn delete(rt: *Runtime, base: Value, k: Key) Error!bool {
             // Deleting an element leaves a hole; deleting past the end does nothing.
             .index => |i| {
                 if (i < elements.items.len) {
-                    if (elements.items[i].isHole()) return true;
+                    if (elements.items[i].isHole()) {
+                        if (o.has_index_overrides) {
+                            const pk = try propKey(rt, k);
+                            if (o.props.get(pk)) |p| {
+                                if (!p.configurable) return false;
+                                try rt.heap.removePropKey(o, pk);
+                            }
+                        }
+                        return true;
+                    }
                     if (!o.array_elements_configurable) return false;
                     rt.heap.storeElement(o, i, .hole);
                     return true;
@@ -1111,12 +1192,93 @@ fn hasInChain(rt: *Runtime, start: *Object, k: Key) Error!bool {
     return false;
 }
 
+fn asciiEqlUnits(ascii: []const u8, units: []const u16) bool {
+    if (ascii.len != units.len) return false;
+    for (ascii, units) |a, u| if (u != a) return false;
+    return true;
+}
+
+fn hasDefaultFunctionHasInstance(r: *const builtins.Realm) bool {
+    const p = r.function_prototype.props.get(heap_mod.PropKey.fromSymbol(r.sym_has_instance)) orelse return false;
+    return !p.is_accessor and p.value.isNative() and p.value.asNative() == &builtins.function_has_instance;
+}
+
+fn metaHasPropNamed(m: *const heap_mod.ClosureMeta, name: []const u8) bool {
+    for (m.props.keys()) |pk| {
+        if (!pk.isSymbol() and asciiEqlUnits(name, pk.asAtom().units)) return true;
+    }
+    return false;
+}
+
 /// `lhs instanceof rhs` (ES InstanceofOperator).
 pub fn instanceOf(rt: *Runtime, lhs: Value, rhs: Value) Error!bool {
     heap_mod.checkValue(lhs);
     heap_mod.checkValue(rhs);
     if (!rhs.isObjectLike()) {
         return rt.throw(.TypeError, &.{.{ .ascii = "Right-hand side of 'instanceof' is not an object" }});
+    }
+    // Zero-allocation fast path when `Function.prototype[Symbol.hasInstance]` is unmodified
+    // and `rhs` is a plain closure or native with no own `[Symbol.hasInstance]`.
+    if (builtins.realmIfInit(rt)) |r| {
+        if (hasDefaultFunctionHasInstance(r)) {
+            const has_inst_pk = heap_mod.PropKey.fromSymbol(r.sym_has_instance);
+            if (rhs.isClosure()) {
+                const c = rhs.asClosure();
+                if (c.impl != .bound) {
+                    const m = c.meta;
+                    const no_own_hi = m == null or (m.?.props.count() == 0 or !m.?.props.contains(has_inst_pk));
+                    const default_proto = if (m) |meta|
+                        (meta.proto == null or (meta.proto.?.isObject() and meta.proto.?.asObject() == r.function_prototype))
+                    else
+                        true;
+                    if (no_own_hi and default_proto and (try builtins.closureDefaultProto(rt, c)) == r.function_prototype) {
+                        if (!lhs.isObjectLike()) return false;
+                        if (lhs.isObject() and lhs.asObject().kind != .proxy) {
+                            if (m) |meta| {
+                                if (meta.prototype) |pv| {
+                                    if (pv.isObject() and (meta.props.count() == 0 or !metaHasPropNamed(meta, "prototype"))) {
+                                        const target_proto = pv.asObject();
+                                        var cur: ?*Object = lhs.asObject().proto;
+                                        while (cur) |o| : (cur = o.proto) {
+                                            o.obj.checkLive();
+                                            if (o == target_proto) return true;
+                                            if (o.kind == .proxy) return ordinaryHasInstance(rt, rhs, lhs);
+                                        }
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                        return ordinaryHasInstance(rt, rhs, lhs);
+                    }
+                }
+            } else if (rhs.isNative()) {
+                const n = rhs.asNative();
+                const is_views_ns = if (n.namespace) |ns| switch (ns) {
+                    .array_buffer, .data_view, .typed_array, .int8_array, .uint8_array, .uint8_clamped_array, .int16_array, .uint16_array, .int32_array, .uint32_array, .float32_array, .float64_array, .bigint64_array, .biguint64_array => true,
+                    else => false,
+                } else false;
+                if (!is_views_ns) {
+                    const ns_ok = if (try builtins.namespaceObject(rt, n)) |ns| !ns.props.contains(has_inst_pk) else true;
+                    const np = try builtins.nativeProto(rt, n);
+                    if (ns_ok and np.isObject() and np.asObject() == r.function_prototype) {
+                        if (!lhs.isObjectLike()) return false;
+                        if (lhs.isObject() and lhs.asObject().kind != .proxy) {
+                            if (try builtins.constructorPrototype(rt, n)) |target_proto| {
+                                var cur: ?*Object = lhs.asObject().proto;
+                                while (cur) |o| : (cur = o.proto) {
+                                    o.obj.checkLive();
+                                    if (o == target_proto) return true;
+                                    if (o.kind == .proxy) return ordinaryHasInstance(rt, rhs, lhs);
+                                }
+                                return false;
+                            }
+                        }
+                        return ordinaryHasInstance(rt, rhs, lhs);
+                    }
+                }
+            }
+        }
     }
     const r = try builtins.realm(rt);
     var roots_buf = [_]Value{ lhs, rhs };
@@ -1147,8 +1309,8 @@ pub fn ordinaryHasInstance(rt: *Runtime, c_val: Value, o_val: Value) Error!bool 
     const target_proto: *Object = switch (c_val.unpack()) {
         .native => |n| (try builtins.constructorPrototype(rt, n)) orelse
             return rt.throw(.TypeError, &.{.{ .ascii = "Function has non-object prototype 'undefined' in instanceof check" }}),
-        .closure => blk: {
-            var roots_buf = [_]Value{o_val};
+        .closure, .object => blk: {
+            var roots_buf = [_]Value{ o_val, c_val };
             var roots = rt_mod.ValueRoots{ .values = &roots_buf };
             try roots.register(rt);
             defer roots.unregister(rt);
@@ -1160,8 +1322,13 @@ pub fn ordinaryHasInstance(rt: *Runtime, c_val: Value, o_val: Value) Error!bool 
         },
         else => unreachable,
     };
+    var walk_roots_buf = [_]Value{ o_val, Value.fromObject(target_proto), .null };
+    var walk_roots = rt_mod.ValueRoots{ .values = &walk_roots_buf };
+    try walk_roots.register(rt);
+    defer walk_roots.unregister(rt);
     var cur: Value = try getPrototypeOfValue(rt, o_val);
     while (!cur.isNull()) : (cur = try getPrototypeOfValue(rt, cur)) {
+        walk_roots_buf[2] = cur;
         if (cur.isObject()) {
             cur.asObject().obj.checkLive();
             if (cur.asObject() == target_proto) return true;
@@ -1305,7 +1472,7 @@ pub fn ownKeys(rt: *Runtime, o: *Object) Error![]Key {
         },
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
-    const first_named = out.items.len;
+    const first_named = if (o.kind == .array and o.has_index_overrides) 0 else out.items.len;
     try appendPropStoreKeys(rt, &out, &o.props, first_named, false, false);
     return out.toOwnedSlice(rt.gpa);
 }
@@ -1326,7 +1493,7 @@ pub fn ownPropertyNames(rt: *Runtime, o: *Object) Error![]Key {
         },
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
-    const first_named = out.items.len;
+    const first_named = if (o.kind == .array and o.has_index_overrides) 0 else out.items.len;
     try appendPropStoreKeys(rt, &out, &o.props, first_named, false, true);
     if (o.kind == .primitive_wrapper and o.kind.primitive_wrapper.isString()) {
         const len_atom = try rt.heap.internAscii("length");
@@ -1353,7 +1520,7 @@ pub fn ownAllKeys(rt: *Runtime, o: *Object) Error![]Key {
         },
         .ordinary, .map, .set, .iterator, .promise, .regexp, .generator, .array_buffer, .data_view, .weak_map, .weak_set, .proxy, .date => {},
     }
-    const first_named = out.items.len;
+    const first_named = if (o.kind == .array and o.has_index_overrides) 0 else out.items.len;
     try appendPropStoreKeys(rt, &out, &o.props, first_named, true, false);
     return out.toOwnedSlice(rt.gpa);
 }

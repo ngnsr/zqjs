@@ -882,6 +882,7 @@ pub const Object = struct {
     array_elements_configurable: bool = true,
     array_elements_writable: bool = true,
     array_length_writable: bool = true,
+    has_index_overrides: bool = false,
     regexp_last_index_writable: bool = true,
     ordinary_tag: enum(u8) { plain, @"error", arguments } = .plain,
     /// Monotonic version bumped on every structural/descriptor mutation while in `.dict` mode;

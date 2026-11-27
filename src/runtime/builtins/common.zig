@@ -129,7 +129,7 @@ pub fn indexKey(rt: *Runtime, idx: usize) Error!object.Key {
 }
 
 pub fn arrayAppendOrDefine(rt: *Runtime, out: Value, idx: usize, val: Value) Error!void {
-    if (out.isObject() and out.asObject().kind == .array and out.asObject().array_elements_writable and out.asObject().array_elements_configurable) {
+    if (out.isObject() and out.asObject().kind == .array and !out.asObject().has_index_overrides and out.asObject().array_elements_writable and out.asObject().array_elements_configurable) {
         const arr = out.asObject();
         const cur = arr.kind.array.items.len;
         if (idx < cur and (arr.extensible or !arr.kind.array.items[idx].isHole())) {

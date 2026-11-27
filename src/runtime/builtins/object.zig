@@ -368,11 +368,17 @@ pub fn getOwnPropertyRaw(rt: *Runtime, target: Value, k: object.Key) Error!?heap
         .object => |o| {
             switch (o.kind) {
                 .array => |elements| switch (k) {
-                    .index => |i| return if (i < elements.items.len and !elements.items[i].isHole()) .{
-                        .value = elements.items[i],
-                        .writable = o.array_elements_writable,
-                        .configurable = o.array_elements_configurable,
-                    } else null,
+                    .index => |i| {
+                        if (i < elements.items.len) {
+                            if (!elements.items[i].isHole()) return .{
+                                .value = elements.items[i],
+                                .writable = o.array_elements_writable,
+                                .configurable = o.array_elements_configurable,
+                            };
+                            if (o.has_index_overrides) return o.props.get(try object.propKey(rt, k));
+                        }
+                        return null;
+                    },
                     .atom => if (object.isNamed(k, "length")) {
                         return .{
                             .value = Value.fromNumber(@floatFromInt(elements.items.len)),
@@ -834,14 +840,35 @@ pub fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Pa
             return false;
         }
         if (k.index >= heap_mod.Heap.MAX_DENSE_ARRAY_LEN) return rt.fail(.sparse_array);
-        if (next.is_accessor or !next.enumerable or next.writable != arr.array_elements_writable or next.configurable != arr.array_elements_configurable) {
-            return common.unsupportedReceiver(rt, "defineProperty");
-        }
-        if (k.index < cur_len) {
-            if (desc.has_val) rt.heap.storeElement(arr, k.index, next.value) else if (arr.kind.array.items[k.index].isHole()) rt.heap.storeElement(arr, k.index, .undefined);
+        const needs_override = next.is_accessor or !next.enumerable or
+            next.writable != arr.array_elements_writable or
+            next.configurable != arr.array_elements_configurable;
+        root_buf[1] = next.value;
+        root_buf[2] = next.setter;
+        if (!needs_override) {
+            if (k.index < cur_len) {
+                if (desc.has_val or current == null or current.?.is_accessor or arr.kind.array.items[k.index].isHole()) {
+                    rt.heap.storeElement(arr, k.index, next.value);
+                }
+            } else {
+                if (k.index > cur_len) try rt.heap.growElementsWithHoles(arr, k.index);
+                try rt.heap.appendElement(arr, next.value);
+            }
+            if (arr.has_index_overrides) {
+                const pk = try object.propKey(rt, k);
+                if (arr.props.contains(pk)) try rt.heap.removePropKey(arr, pk);
+            }
         } else {
-            if (k.index > cur_len) try rt.heap.growElementsWithHoles(arr, k.index);
-            try rt.heap.appendElement(arr, next.value);
+            if (k.index >= cur_len) {
+                try rt.heap.growElementsWithHoles(arr, k.index + 1);
+            }
+            const pk = try object.propKey(rt, k);
+            root_buf[4] = Value.fromString(pk.asAtom());
+            try rt.heap.definePropKey(arr, pk, next);
+            if (!arr.kind.array.items[k.index].isHole()) {
+                rt.heap.storeElement(arr, k.index, .hole);
+            }
+            arr.has_index_overrides = true;
         }
         return true;
     }
@@ -855,17 +882,10 @@ pub fn defineOwnPropertyParsed(rt: *Runtime, target: Value, k: object.Key, d: Pa
                 if (new_len > heap_mod.Heap.MAX_DENSE_ARRAY_LEN) return rt.fail(.sparse_array);
                 try rt.heap.growElementsWithHoles(arr, new_len);
             } else if (new_len < cur_len) {
-                if (!arr.array_elements_configurable) {
-                    var keep = cur_len;
-                    while (keep > new_len and arr.kind.array.items[keep - 1].isHole()) : (keep -= 1) {}
-                    rt.heap.shrinkElements(arr, keep);
-                    if (keep > new_len) {
-                        if (desc.has_writ and !next.writable) arr.array_length_writable = false;
-                        if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property of non-configurable array" }});
-                        return false;
-                    }
-                } else {
-                    rt.heap.shrinkElements(arr, new_len);
+                if (!try object.shrinkArrayElements(rt, arr, new_len)) {
+                    if (desc.has_writ and !next.writable) arr.array_length_writable = false;
+                    if (throw_on_reject) return rt.throw(.TypeError, &.{.{ .ascii = "Cannot delete property of non-configurable array" }});
+                    return false;
                 }
             }
         }
@@ -1009,7 +1029,9 @@ fn objectDefineProperties(rt: *Runtime, _: Value, args: []const Value) Error!Val
 }
 
 fn ownKeyValue(rt: *Runtime, o: *Object, k: object.Key) Error!Value {
-    if (o.kind == .array and k == .index) return o.kind.array.items[k.index];
+    if (o.kind == .array and k == .index and k.index < o.kind.array.items.len and !o.kind.array.items[k.index].isHole()) {
+        return o.kind.array.items[k.index];
+    }
     return object.get(rt, Value.fromObject(o), k);
 }
 
@@ -1361,9 +1383,10 @@ fn testIntegrityLevel(rt: *Runtime, target: Value, freeze: bool) Error!bool {
             }
             switch (o.kind) {
                 .array => |elements| {
-                    if (elements.items.len > 0) {
-                        if (o.array_elements_configurable) return false;
-                        if (freeze and o.array_elements_writable) return false;
+                    if (o.array_elements_configurable or (freeze and o.array_elements_writable)) {
+                        for (elements.items) |v| {
+                            if (!v.isHole()) return false;
+                        }
                     }
                     if (freeze and o.array_length_writable) return false;
                 },

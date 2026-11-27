@@ -525,3 +525,26 @@ test "manual minor/major GC and heap verification while paused mid-execution" {
     // a = 4 + (5 + 100) = 109; b = 4 + (7 + 100) = 111; a + b = 220
     try testing.expectEqualStrings("220\n", h.output());
 }
+
+test "runSource --trace installs closure_caller for builtin-to-JS callbacks" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err_w.deinit();
+    var trace_w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer trace_w.deinit();
+
+    const code = try zqjs.runSource(
+        testing.allocator,
+        "trace_cb.js",
+        "print([1, 2, 3].map(x => x * 2).join(','));",
+        .{},
+        .{ .mode = .normal, .engine = .vm, .trace = &trace_w.writer },
+        &out.writer,
+        &err_w.writer,
+    );
+    try testing.expectEqual(@as(u8, 0), code);
+    try testing.expectEqualStrings("", err_w.written());
+    try testing.expectEqualStrings("2,4,6\n", out.written());
+    try testing.expect(trace_w.written().len > 0);
+}

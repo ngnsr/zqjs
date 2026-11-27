@@ -472,8 +472,7 @@ fn arrayForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         const len = a.kind.array.items.len;
         const cb = try common.requireCallable(rt, root_buf[1]);
         for (0..len) |i| {
-            if (i >= a.kind.array.items.len) continue;
-            const raw = a.kind.array.items[i];
+            const raw = if (i < a.kind.array.items.len) a.kind.array.items[i] else Value.hole;
             if (raw.isHole()) {
                 if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) continue;
                 const elem = try object.get(rt, o_val, .{ .index = @intCast(i) });
@@ -563,8 +562,7 @@ fn arrayFilter(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         root_buf[3] = out_val;
         var to: usize = 0;
         for (0..len) |i| {
-            if (i >= a.kind.array.items.len) continue;
-            const raw = a.kind.array.items[i];
+            const raw = if (i < a.kind.array.items.len) a.kind.array.items[i] else Value.hole;
             const elem = if (raw.isHole()) blk: {
                 if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) continue;
                 break :blk try object.get(rt, o_val, .{ .index = @intCast(i) });
@@ -630,8 +628,7 @@ fn arrayReduce(rt: *Runtime, this: Value, args: []const Value) Error!Value {
             if (!found) return rt.throw(.TypeError, &.{.{ .ascii = "Reduce of empty array with no initial value" }});
         }
         for (start..len) |i| {
-            if (i >= a.kind.array.items.len) continue;
-            const raw = a.kind.array.items[i];
+            const raw = if (i < a.kind.array.items.len) a.kind.array.items[i] else Value.hole;
             const elem = if (raw.isHole()) blk: {
                 if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) continue;
                 break :blk try object.get(rt, o_val, .{ .index = @intCast(i) });
@@ -747,8 +744,7 @@ fn arraySomeEveryImpl(rt: *Runtime, this: Value, args: []const Value, _: []const
         const len = a.kind.array.items.len;
         const cb = try common.requireCallable(rt, root_buf[1]);
         for (0..len) |i| {
-            if (i >= a.kind.array.items.len) continue;
-            const raw = a.kind.array.items[i];
+            const raw = if (i < a.kind.array.items.len) a.kind.array.items[i] else Value.hole;
             const elem = if (raw.isHole()) blk: {
                 if (!try object.has(rt, .{ .index = @intCast(i) }, o_val)) continue;
                 break :blk try object.get(rt, o_val, .{ .index = @intCast(i) });
@@ -1425,8 +1421,7 @@ fn arrayReduceRight(rt: *Runtime, this: Value, args: []const Value) Error!Value 
         }
         while (idx > 0) {
             idx -= 1;
-            if (idx >= a.kind.array.items.len) continue;
-            const raw = a.kind.array.items[idx];
+            const raw = if (idx < a.kind.array.items.len) a.kind.array.items[idx] else Value.hole;
             const elem = if (raw.isHole()) blk: {
                 if (!try object.has(rt, .{ .index = @intCast(idx) }, o_val)) continue;
                 break :blk try object.get(rt, o_val, .{ .index = @intCast(idx) });

@@ -95,6 +95,13 @@ const Shared = struct {
             if (!func.is_arrow) if (fn_info.this_binding) |tb| {
                 try c.emit(.new_cell, &.{c.slotOf(tb)});
             };
+            if (!func.is_arrow) if (fn_info.new_target_binding) |ntb| {
+                if (c.binding(ntb).captured) {
+                    try c.emit(.box_local, &.{c.slotOf(ntb)});
+                } else {
+                    c.markSlotInit(c.slotOf(ntb));
+                }
+            };
             if (fn_info.is_simple_params) {
                 // Parameters arrive as plain values; box the captured ones.
                 for (func.params) |p| {
@@ -364,6 +371,7 @@ const Compiler = struct {
             .param_slot = info.param_slot,
             .this_slot = if (f != null and !f.?.is_arrow and info.this_binding != null) c.slotOf(info.this_binding.?) else null,
             .lexical_this_capture = info.lexical_this_capture,
+            .new_target_slot = if (f != null and !f.?.is_arrow and info.new_target_binding != null) c.slotOf(info.new_target_binding.?) else null,
             .captures = captures,
             .functions = functions,
             .handlers = handlers,
@@ -1532,6 +1540,18 @@ const Compiler = struct {
                 try c.expr(pi.rhs);
                 try c.emitLoadResolvedRef(c.s.res.private_refs[pi.private_ref], pi.name);
                 try c.emit(.in_private, &.{try c.name(pi.name)});
+            },
+            .new_target => {
+                const fn_info = c.s.res.functions[c.function];
+                if (fn_info.new_target_capture) |cap_idx| {
+                    try c.emit(.get_capture, &.{ cap_idx, try c.name("new.target") });
+                } else {
+                    const ntb = fn_info.new_target_binding.?;
+                    try c.emit(
+                        if (c.binding(ntb).captured) .get_cell else .get_local,
+                        &.{ c.slotOf(ntb), try c.name("new.target") },
+                    );
+                }
             },
             .import_meta => try c.emit(.get_import_meta, &.{}),
             .dynamic_import => |spec| {

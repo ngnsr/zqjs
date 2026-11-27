@@ -268,10 +268,10 @@ pub const Vm = struct {
     /// first step, and tears the VM down with `deinit` — which unwinds exactly the
     /// frames a fault left live. Transactional: on failure nothing is left allocated.
     pub fn initCall(rt: *Runtime, c: *const Closure, this: ?Value, args: []const Value) Error!Vm {
-        return initCallEx(rt, c, this, args, false, null);
+        return initCallEx(rt, c, this, args, false, null, .undefined);
     }
 
-    fn initCallEx(rt: *Runtime, c: *const Closure, this: ?Value, args: []const Value, is_construct: bool, construct_instance: ?*heap.Object) Error!Vm {
+    fn initCallEx(rt: *Runtime, c: *const Closure, this: ?Value, args: []const Value, is_construct: bool, construct_instance: ?*heap.Object, new_target: Value) Error!Vm {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
@@ -294,6 +294,7 @@ pub const Vm = struct {
         if (argc > 0) @memcpy(vm.stack[0..argc], args);
         vm.sp = argc;
         vm.initLocals(callee, args);
+        if (callee.new_target_slot) |nts| vm.locals[nts] = Slot.fromValue(new_target);
         vm.frames.appendAssumeCapacity(.{
             .proto = callee,
             .closure = c,
@@ -317,7 +318,7 @@ pub const Vm = struct {
     fn callFromBuiltin(ctx: *anyopaque, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
         const vm: *Vm = @ptrCast(@alignCast(ctx));
         vm.syncChainDepth();
-        return callNested(vm.rt, vm, c, this, args, false, null);
+        return callNested(vm.rt, vm, c, this, args, false, null, .undefined);
     }
 
     fn constructFromBuiltin(ctx: *anyopaque, c: *const Closure, args: []const Value, new_target: Value) Error!Value {
@@ -329,7 +330,7 @@ pub const Vm = struct {
     /// Invokes a VM closure from a top-level microtask checkpoint outside any outer VM (M18).
     pub fn callStandalone(ctx: *anyopaque, c: *const Closure, this: ?Value, args: []const Value) Error!Value {
         const rt: *Runtime = @ptrCast(@alignCast(ctx));
-        return callNested(rt, null, c, this, args, false, null);
+        return callNested(rt, null, c, this, args, false, null, .undefined);
     }
 
     pub fn constructStandalone(ctx: *anyopaque, c: *const Closure, args: []const Value, new_target: Value) Error!Value {
@@ -361,10 +362,10 @@ pub const Vm = struct {
         const instance = try rt.heap.newObject(instance_proto);
         root_buf[2] = Value.fromObject(instance);
         const init_this: ?Value = if (callee.has_super_ctor) null else Value.fromObject(instance);
-        return callNested(rt, caller_vm, c, init_this, args, true, instance);
+        return callNested(rt, caller_vm, c, init_this, args, true, instance, new_target);
     }
 
-    fn callNested(rt: *Runtime, caller_vm: ?*Vm, c: *const Closure, this: ?Value, args: []const Value, is_construct: bool, construct_instance: ?*heap.Object) Error!Value {
+    fn callNested(rt: *Runtime, caller_vm: ?*Vm, c: *const Closure, this: ?Value, args: []const Value, is_construct: bool, construct_instance: ?*heap.Object, new_target: Value) Error!Value {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
@@ -398,7 +399,7 @@ pub const Vm = struct {
         if (rt.exec_ctx.budget_fault != null) return rt.limit(.steps);
         if (rt.exec_ctx.call_depth >= rt.limits.max_call_depth) return rt.limit(.call_depth);
 
-        var nested = try Vm.initCallEx(rt, c, this, args, is_construct, construct_instance);
+        var nested = try Vm.initCallEx(rt, c, this, args, is_construct, construct_instance, new_target);
         defer nested.deinit();
         nested.chain = &rt.exec_ctx;
         rt.exec_ctx.call_depth += 1;
@@ -2280,7 +2281,7 @@ pub const Vm = struct {
                                 vm.stack[base] = try vm.startAsyncFromVm(c, receiver, args_slice);
                                 cache.sp = base + 1;
                             } else {
-                                try vm.enterSlice(c, base, args_slice, next, receiver, false, false, null);
+                                try vm.enterSlice(c, base, args_slice, next, receiver, false, false, null, .undefined);
                                 return true;
                             }
                         },
@@ -2504,7 +2505,7 @@ pub const Vm = struct {
                         vm.stack[base] = try vm.startAsyncFromVm(tc, b.bound_this, combined);
                         return false;
                     }
-                    try vm.enterSlice(tc, base, combined, next, b.bound_this, false, false, null);
+                    try vm.enterSlice(tc, base, combined, next, b.bound_this, false, false, null, .undefined);
                     return true;
                 },
                 .tree, .bound => return vm.bug("invalid bound target in the VM"),
@@ -2562,9 +2563,9 @@ pub const Vm = struct {
         const instance = try rt.heap.newObject(if (proto_val.isObject()) proto_val.asObject() else r.object_prototype);
         const init_this: ?Value = if (tc_proto.has_super_ctor) null else Value.fromObject(instance);
         if (!is_spread and combined.len == 0) {
-            try vm.enter(tc, base, args_start, @intCast(args_slice.len), next, init_this, true, false, instance);
+            try vm.enter(tc, base, args_start, @intCast(args_slice.len), next, init_this, true, false, instance, new_target);
         } else {
-            try vm.enterSlice(tc, base, effective_args, next, init_this, true, false, instance);
+            try vm.enterSlice(tc, base, effective_args, next, init_this, true, false, instance, new_target);
         }
         return true;
     }
@@ -2608,8 +2609,18 @@ pub const Vm = struct {
             return rt.throw(.TypeError, &.{.{ .ascii = "Super constructor is not a constructor" }});
         }
         const inst = f.construct_instance orelse return vm.bug("super() without construct_instance");
+        const caller_f = vm.frame();
+        const super_new_target: Value = if (caller_f.proto.new_target_slot) |nts| blk: {
+            const slot = vm.locals[caller_f.locals_base + nts];
+            break :blk if (slot.isCell())
+                slot.asCell().value orelse return vm.bug("uninitialized new.target cell")
+            else if (!slot.isUninit())
+                slot.asValue()
+            else
+                return vm.bug("uninitialized new.target slot");
+        } else Value.fromClosure(cur_closure);
         if (target.isObject()) {
-            const res = try builtins.callProxyConstruct(rt, target.asObject(), effective_args, Value.fromClosure(cur_closure));
+            const res = try builtins.callProxyConstruct(rt, target.asObject(), effective_args, super_new_target);
             const caller = &vm.frames.items[vm.frames.items.len - 1];
             if (!caller.this_opt.isNone()) {
                 return rt.throw(.ReferenceError, &.{.{ .ascii = "Super constructor may only be called once" }});
@@ -2652,9 +2663,9 @@ pub const Vm = struct {
         };
         const child_this: ?Value = if (tc_proto.has_super_ctor) null else Value.fromObject(inst);
         if (!is_spread and combined.len == 0) {
-            try vm.enter(tc, base, base, @intCast(args_slice.len), next, child_this, true, true, inst);
+            try vm.enter(tc, base, base, @intCast(args_slice.len), next, child_this, true, true, inst, super_new_target);
         } else {
-            try vm.enterSlice(tc, base, effective_args, next, child_this, true, true, inst);
+            try vm.enterSlice(tc, base, effective_args, next, child_this, true, true, inst, super_new_target);
         }
         return true;
     }
@@ -2759,6 +2770,7 @@ pub const Vm = struct {
         } else {
             vm.initLocalsSlow(locals_base, callee, vm.stack[args..][0..argc]);
         }
+        if (callee.new_target_slot) |nts| dst[nts] = Slot.fromValue(.undefined);
         vm.frames.appendAssumeCapacity(.{
             .proto = callee,
             .closure = c,
@@ -2781,7 +2793,7 @@ pub const Vm = struct {
     /// Enters closure `c`: its `argc` arguments start at `stack[args]`, and the result will
     /// replace everything from `stack[base]`. Transactional: everything that can fail
     /// happens before anything is committed.
-    fn enter(vm: *Vm, c: *const Closure, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value, is_construct: bool, is_super_call: bool, construct_instance: ?*heap.Object) Error!void {
+    fn enter(vm: *Vm, c: *const Closure, base: u32, args: u32, argc: u32, return_pc: u32, this: ?Value, is_construct: bool, is_super_call: bool, construct_instance: ?*heap.Object, new_target: Value) Error!void {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
@@ -2807,6 +2819,7 @@ pub const Vm = struct {
         }
         // 3. the callee's locals, above locals_len (not live yet, so nothing visible changes)
         vm.initLocals(callee, vm.stack[args..][0..argc]);
+        if (callee.new_target_slot) |nts| vm.locals[vm.locals_len + nts] = Slot.fromValue(new_target);
         // 4. commit
         vm.frames.appendAssumeCapacity(.{
             .proto = callee,
@@ -2831,7 +2844,7 @@ pub const Vm = struct {
         }
     }
 
-    fn enterSlice(vm: *Vm, c: *const Closure, base: u32, args_slice: []const Value, return_pc: u32, this: ?Value, is_construct: bool, is_super_call: bool, construct_instance: ?*heap.Object) Error!void {
+    fn enterSlice(vm: *Vm, c: *const Closure, base: u32, args_slice: []const Value, return_pc: u32, this: ?Value, is_construct: bool, is_super_call: bool, construct_instance: ?*heap.Object, new_target: Value) Error!void {
         c.obj.checkLive();
         const v = switch (c.impl) {
             .vm => |v| v,
@@ -2856,6 +2869,7 @@ pub const Vm = struct {
         if (argc > 0) @memcpy(vm.stack[args_start..][0..argc], args_slice);
         vm.sp = args_start + argc;
         vm.initLocals(callee, vm.stack[args_start..][0..argc]);
+        if (callee.new_target_slot) |nts| vm.locals[vm.locals_len + nts] = Slot.fromValue(new_target);
         vm.frames.appendAssumeCapacity(.{
             .proto = callee,
             .closure = c,

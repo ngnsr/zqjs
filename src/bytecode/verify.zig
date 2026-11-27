@@ -82,6 +82,10 @@ const Verifier = struct {
         if (@as(u64, p.param_slot) + p.param_count > p.slot_count) return v.fail(p, 0, "more parameters than slots");
         if (p.this_slot) |ts| if (ts >= p.slot_count) return v.fail(p, 0, "this_slot out of range");
         if (p.lexical_this_capture) |lc| if (lc >= p.captures.len) return v.fail(p, 0, "lexical_this_capture out of range");
+        if (p.new_target_slot) |nts| {
+            if (p.kind != .function or p.is_arrow) return v.fail(p, 0, "new_target_slot on non-function or arrow");
+            if (nts >= p.slot_count) return v.fail(p, 0, "new_target_slot out of range");
+        }
         for (p.consts) |k| switch (k.tag()) {
             .number, .bigint, .string => {},
             else => return v.fail(p, 0, "constant is not a number, bigint, or string"),

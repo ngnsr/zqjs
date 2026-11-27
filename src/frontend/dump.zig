@@ -592,6 +592,7 @@ const Dumper = struct {
                 try d.expr(pi.rhs);
                 try w.writeByte(')');
             },
+            .new_target => try w.writeAll("new.target"),
             .import_meta => try w.writeAll("import.meta"),
             .dynamic_import => |spec| {
                 try w.writeAll("(import ");

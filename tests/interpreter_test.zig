@@ -1609,3 +1609,185 @@ test "instanceof fast and slow paths: primitives, closures, natives, proxies, Sy
         try testing.expectEqualStrings(expected, r.out);
     }
 }
+
+test "new.target: calls, constructors, extends/super, Reflect.construct, bound, escaping arrows, defaults, methods, fields, and proxy (both engines)" {
+    const src =
+        \\function F() { return { nt: new /* c */ . /* c */ target }; }
+        \\print("plain:", F().nt === undefined);
+        \\print("new:", new F().nt === F);
+        \\
+        \\class Base {
+        \\    constructor() {
+        \\        this.baseNT = new.target;
+        \\    }
+        \\}
+        \\class Mid extends Base {}
+        \\class Sub extends Mid {
+        \\    constructor() {
+        \\        const before = new.target;
+        \\        const getNT = () => new.target;
+        \\        super();
+        \\        this.before = before;
+        \\        this.after = new.target;
+        \\        this.arrowNT = getNT();
+        \\    }
+        \\}
+        \\const sub = new Sub();
+        \\print("extends:", sub.baseNT === Sub, sub.before === Sub, sub.after === Sub, sub.arrowNT === Sub);
+        \\
+        \\function Custom() {}
+        \\const rBase = Reflect.construct(Base, [], Custom);
+        \\const rSub = Reflect.construct(Sub, [], Custom);
+        \\print("reflect:", rBase.baseNT === Custom, rSub.baseNT === Custom, rSub.before === Custom, rSub.after === Custom, rSub.arrowNT === Custom);
+        \\
+        \\const BF = F.bind(null);
+        \\const BBF = BF.bind(null);
+        \\print("bound:", new BF().nt === F, new BBF().nt === F);
+        \\print("bound-reflect:", Reflect.construct(BF, []).nt === F, Reflect.construct(BF, [], Custom).nt === Custom);
+        \\const BoundBase = Base.bind(null);
+        \\BoundBase.prototype = Base.prototype;
+        \\class SubBound extends BoundBase {
+        \\    constructor() { super(); }
+        \\}
+        \\const sb = new SubBound();
+        \\print("sub-bound:", sb.baseNT === SubBound, Reflect.construct(SubBound, [], Custom).baseNT === Custom);
+        \\
+        \\function EscapeCtor() {
+        \\    const inner = () => () => new.target;
+        \\    this.get = inner();
+        \\}
+        \\const esc = new EscapeCtor();
+        \\let churn = [];
+        \\for (let i = 0; i < 200; i++) churn.push({ i, s: "x" + i });
+        \\print("escape:", esc.get() === EscapeCtor, churn.length);
+        \\
+        \\function Def(a = new.target, g = () => new.target) {
+        \\    return { a, b: g() };
+        \\}
+        \\const dPlain = Def();
+        \\const dNew = new Def();
+        \\print("def:", dPlain.a === undefined, dPlain.b === undefined, dNew.a === Def, dNew.b === Def);
+        \\function ArrowDefOuter() {
+        \\    const arrow = (x = new.target) => x;
+        \\    return { v: arrow() };
+        \\}
+        \\print("arrow-def:", ArrowDefOuter().v === undefined, new ArrowDefOuter().v === ArrowDefOuter);
+        \\
+        \\function Outer() {
+        \\    function Inner() { return { nt: new.target }; }
+        \\    const arrow = () => new.target;
+        \\    return {
+        \\        outer: new.target,
+        \\        innerPlain: Inner().nt,
+        \\        innerNew: new Inner().nt === Inner,
+        \\        arrow: arrow(),
+        \\    };
+        \\}
+        \\const oRes = new Outer();
+        \\print("nested:", oRes.outer === Outer, oRes.innerPlain === undefined, oRes.innerNew, oRes.arrow === Outer);
+        \\
+        \\function Self(depth) {
+        \\    this.depth = depth;
+        \\    this.nt = new.target;
+        \\    if (depth > 0) this.child = new new.target(depth - 1);
+        \\}
+        \\class SelfSub extends Self {}
+        \\const selfInst = new SelfSub(1);
+        \\print("new-new-target:", selfInst.nt === SelfSub, selfInst.child instanceof SelfSub, selfInst.child.nt === SelfSub, selfInst.child.depth === 0);
+        \\
+        \\function Holder() {
+        \\    return new new.target.Sub();
+        \\}
+        \\Holder.Sub = class { constructor() { this.ok = new.target === Holder.Sub; } };
+        \\print("new-new-target-member:", new Holder().ok);
+        \\
+        \\function* gen() { yield new.target; }
+        \\async function afn() { return new.target; }
+        \\const obj = {
+        \\    m() { return new.target; },
+        \\    get g() { return new.target; },
+        \\};
+        \\function FieldHost() {
+        \\    class C {
+        \\        inst = new.target;
+        \\        instArrow = () => new.target;
+        \\        static stat = new.target;
+        \\        static blk;
+        \\        static { this.blk = new.target; }
+        \\        method() { return new.target; }
+        \\    }
+        \\    const c = new C();
+        \\    return { inst: c.inst, instArrow: c.instArrow(), stat: C.stat, blk: C.blk, m: c.method() };
+        \\}
+        \\const fh = new FieldHost();
+        \\print("methods-fields:", gen().next().value === undefined, obj.m() === undefined, obj.g === undefined, fh.inst === undefined, fh.instArrow === undefined, fh.stat === undefined, fh.blk === undefined, fh.m === undefined);
+        \\afn().then((v) => print("async:", v === undefined));
+        \\
+        \\let proxyNT = null;
+        \\const ProxyBase = new Proxy(class { constructor() {} }, {
+        \\    construct(target, args, newTarget) {
+        \\        proxyNT = newTarget;
+        \\        return Reflect.construct(target, args, newTarget);
+        \\    }
+        \\});
+        \\class SubProxy extends ProxyBase {
+        \\    constructor() { super(); }
+        \\}
+        \\new SubProxy();
+        \\const p1 = proxyNT === SubProxy;
+        \\Reflect.construct(SubProxy, [], Custom);
+        \\const p2 = proxyNT === Custom;
+        \\print("proxy-super:", p1, p2);
+    ;
+    const expected =
+        \\plain: true
+        \\new: true
+        \\extends: true true true true
+        \\reflect: true true true true true
+        \\bound: true true
+        \\bound-reflect: true true
+        \\sub-bound: true true
+        \\escape: true 200
+        \\def: true true true true
+        \\arrow-def: true true
+        \\nested: true true true true
+        \\new-new-target: true true true true
+        \\new-new-target-member: true
+        \\methods-fields: true true true true true true true true
+        \\proxy-super: true true
+        \\async: true
+        \\
+    ;
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("", r.err);
+        try testing.expectEqualStrings(expected, r.out);
+    }
+}
+
+test "new.target: early SyntaxErrors at top-level, top-level arrows, invalid targets, and unicode escapes" {
+    const cases = [_][]const u8{
+        "new.target;",
+        "() => new.target;",
+        "() => () => new.target;",
+        "class C extends new.target {}",
+        "class C { [new.target] = 1; }",
+        "function f() { new.target = 1; }",
+        "function f() { new.target += 1; }",
+        "function f() { ++new.target; }",
+        "function f() { new.target++; }",
+        "function f() { [new.target] = [1]; }",
+        "function f() { ({ a: new.target } = { a: 1 }); }",
+        "function f() { new.foo; }",
+        "function f() { new.\\u0074arget; }",
+        "function f() { \\u006eew.target; }",
+    };
+    for (cases) |src| {
+        for (support.engines) |engine| {
+            var r = try support.run(testing.allocator, src, .{}, engine, .normal);
+            defer r.deinit(testing.allocator);
+            try testing.expect(std.mem.indexOf(u8, r.err, "SyntaxError") != null);
+        }
+    }
+}

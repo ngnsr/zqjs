@@ -320,8 +320,13 @@ const Inst = union(enum) {
     eol, // $
     eol_multiline, // $ with multiline
     word_boundary, // \b
+    word_boundary_icase, // \b with unicode + ignore_case
     not_word_boundary, // \B
-    builtin: BuiltinClass,
+    not_word_boundary_icase, // \B with unicode + ignore_case
+    builtin: struct {
+        class: BuiltinClass,
+        unicode_icase: bool,
+    },
     class: u32, // index into Program.classes
     backref: u16, // 1..capture_count
     backref_icase: u16, // 1..capture_count with ignore_case
@@ -474,12 +479,16 @@ fn isWhiteSpaceOrLineTerminator(c: u21) bool {
     };
 }
 
-fn matchesBuiltin(b: BuiltinClass, c: u21) bool {
+fn isWordChar(c: u21, unicode_icase: bool) bool {
+    return isAsciiWord(c) or (unicode_icase and (c == 0x017F or c == 0x212A));
+}
+
+fn matchesBuiltin(b: BuiltinClass, c: u21, unicode_icase: bool) bool {
     return switch (b) {
         .digit => isAsciiDigit(c),
         .not_digit => !isAsciiDigit(c),
-        .word => isAsciiWord(c),
-        .not_word => !isAsciiWord(c),
+        .word => isWordChar(c, unicode_icase),
+        .not_word => !isWordChar(c, unicode_icase),
         .space => isWhiteSpaceOrLineTerminator(c),
         .not_space => !isWhiteSpaceOrLineTerminator(c),
     };
@@ -1577,11 +1586,19 @@ const Compiler = struct {
         self.pos += 1;
         switch (esc) {
             'b' => {
-                const pc = try self.emitAtomInst(.word_boundary);
+                const inst: Inst = if (self.flags.ignore_case and self.flags.isUnicodeMode())
+                    .word_boundary_icase
+                else
+                    .word_boundary;
+                const pc = try self.emitAtomInst(inst);
                 self.last_atom = .{ .start_pc = pc, .end_pc = pc + 1, .cap_start = 1, .cap_end = 0, .quantifiable = false, .is_lookahead = false };
             },
             'B' => {
-                const pc = try self.emitAtomInst(.not_word_boundary);
+                const inst: Inst = if (self.flags.ignore_case and self.flags.isUnicodeMode())
+                    .not_word_boundary_icase
+                else
+                    .not_word_boundary;
+                const pc = try self.emitAtomInst(inst);
                 self.last_atom = .{ .start_pc = pc, .end_pc = pc + 1, .cap_start = 1, .cap_end = 0, .quantifiable = false, .is_lookahead = false };
             },
             'd' => try self.emitBuiltinAtom(.digit),
@@ -1725,7 +1742,12 @@ const Compiler = struct {
     }
 
     fn emitBuiltinAtom(self: *Compiler, b: BuiltinClass) CompileError!void {
-        const start_pc = try self.emitAtomInst(.{ .builtin = b });
+        const start_pc = try self.emitAtomInst(.{
+            .builtin = .{
+                .class = b,
+                .unicode_icase = self.flags.ignore_case and self.flags.isUnicodeMode(),
+            },
+        });
         self.last_atom = .{
             .start_pc = start_pc,
             .end_pc = start_pc + 1,
@@ -2388,8 +2410,8 @@ const Matcher = struct {
         const canon_cp = self.canonicalize(cp);
         if (lo == hi) return canon_cp == self.canonicalize(lo);
         if (canon_cp >= lo and canon_cp <= hi) return true;
-        if (cp < 128 and ((cp >= 'a' and cp <= 'z') or (cp >= 'A' and cp <= 'Z'))) {
-            const flipped = cp ^ 32;
+        if (canon_cp < 128 and ((canon_cp >= 'a' and canon_cp <= 'z') or (canon_cp >= 'A' and canon_cp <= 'Z'))) {
+            const flipped = canon_cp ^ 32;
             if (flipped >= lo and flipped <= hi) return true;
         }
         if (hi > 0x7F and hi - lo <= 1024) {
@@ -2417,11 +2439,20 @@ const Matcher = struct {
                 if (icase) return self.matchesRangeIcase(r.lo, r.hi, cps[0]);
                 return cps[0] >= r.lo and cps[0] <= r.hi;
             },
-            .builtin => |b| return cps.len == 1 and matchesBuiltin(b, cps[0]),
+            .builtin => |b| return cps.len == 1 and matchesBuiltin(b, cps[0], icase and self.p.flags.isUnicodeMode()),
             .unicode_prop => |ranges| {
                 if (cps.len != 1) return false;
-                if (unicode.inRanges(cps[0], ranges)) return true;
-                return icase and unicode.inRanges(self.canonicalize(cps[0]), ranges);
+                const cp = cps[0];
+                if (unicode.inRanges(cp, ranges)) return true;
+                if (!icase) return false;
+                const canon = self.canonicalize(cp);
+                if (unicode.inRanges(canon, ranges)) return true;
+                if (canon >= 'a' and canon <= 'z') {
+                    if (unicode.inRanges(canon - 32, ranges)) return true;
+                    if (canon == 's' and unicode.inRanges(0x017F, ranges)) return true;
+                    if (canon == 'k' and unicode.inRanges(0x212A, ranges)) return true;
+                }
+                return false;
             },
             .string_prop => |strings| {
                 for (strings) |s| {
@@ -2512,9 +2543,9 @@ const Matcher = struct {
         unreachable;
     }
 
-    fn isWordAt(self: *const Matcher, pos: u32) bool {
+    fn isWordAt(self: *const Matcher, pos: u32, unicode_icase: bool) bool {
         if (pos >= self.input.len) return false;
-        return isAsciiWord(self.input[pos]);
+        return isWordChar(self.input[pos], unicode_icase);
     }
 
     const DecodedCp = struct {
@@ -2677,18 +2708,20 @@ const Matcher = struct {
                     if (ok) pc += 1;
                     break :blk ok;
                 },
-                .word_boundary => blk: {
-                    const left = if (idx > 0) self.isWordAt(idx - 1) else false;
-                    const right = self.isWordAt(idx);
+                .word_boundary, .word_boundary_icase => blk: {
+                    const u_icase = (inst == .word_boundary_icase);
+                    const left = if (idx > 0) self.isWordAt(idx - 1, u_icase) else false;
+                    const right = self.isWordAt(idx, u_icase);
                     if (left != right) {
                         pc += 1;
                         break :blk true;
                     }
                     break :blk false;
                 },
-                .not_word_boundary => blk: {
-                    const left = if (idx > 0) self.isWordAt(idx - 1) else false;
-                    const right = self.isWordAt(idx);
+                .not_word_boundary, .not_word_boundary_icase => blk: {
+                    const u_icase = (inst == .not_word_boundary_icase);
+                    const left = if (idx > 0) self.isWordAt(idx - 1, u_icase) else false;
+                    const right = self.isWordAt(idx, u_icase);
                     if (left == right) {
                         pc += 1;
                         break :blk true;
@@ -2697,7 +2730,7 @@ const Matcher = struct {
                 },
                 .builtin => |b| blk: {
                     if (self.readCodePoint(idx)) |d| {
-                        if (matchesBuiltin(b, d.cp)) {
+                        if (matchesBuiltin(b.class, d.cp, b.unicode_icase)) {
                             idx = d.next_idx;
                             pc += 1;
                             break :blk true;

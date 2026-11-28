@@ -610,10 +610,215 @@ test "Inline flag modifiers (?ims-ims:...)" {
     try expectSyntaxError("(?ii:a)");
     try expectSyntaxError("(?i-i:a)");
     try expectSyntaxError("(?-ii:a)");
+    try expectSyntaxError("(?--i:a)");
     try expectSyntaxError("(?i-m-s:a)");
     try expectSyntaxError("(?g:a)");
+    try expectSyntaxError("(?u:a)");
+    try expectSyntaxError("(?v:a)");
+    try expectSyntaxError("(?y:a)");
+    try expectSyntaxError("(?d:a)");
     try expectSyntaxError("(?i)");
     try expectSyntaxError("(?i");
+}
+
+test "ES2025 RegExp Modifiers: combined flags, nesting, classes, Unicode /u, line terminators, lookarounds" {
+    const gpa = testing.allocator;
+
+    // Combined enable/disable (?ims:...), (?-ims:...), (?i-ms:...)
+    {
+        const caps = (try runRegex("(?ims:^a.b$)", .{}, "x\nA\nB\ny", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 2, .end = 5 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?-ims:^a.b$)", .{ .ignore_case = true, .multiline = true, .dot_all = true }, "x\nA\nB\ny", 0)) == null);
+    {
+        const caps = (try runRegex("(?-ims:^a.b$)", .{ .ignore_case = true, .multiline = true, .dot_all = true }, "axb", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 3 }, caps[0].?);
+    }
+    {
+        const caps = (try runRegex("(?i-ms:^a.b$)", .{ .multiline = true, .dot_all = true }, "AxB", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 3 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?i-ms:^a.b$)", .{ .multiline = true, .dot_all = true }, "x\nAxB\ny", 0)) == null);
+    try testing.expect((try runRegex("(?i-ms:^a.b$)", .{ .multiline = true, .dot_all = true }, "A\nB", 0)) == null);
+
+    // Nested modifier overrides: (?-i:a(?i:b)c) and (?i:a(?-i:b)c)
+    {
+        const caps = (try runRegex("(?-i:a(?i:b)c)", .{ .ignore_case = true }, "aBc", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 3 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?-i:a(?i:b)c)", .{ .ignore_case = true }, "ABc", 0)) == null);
+    try testing.expect((try runRegex("(?-i:a(?i:b)c)", .{ .ignore_case = true }, "aBC", 0)) == null);
+    try testing.expect((try runRegex("(?i:a(?-i:b)c)", .{}, "ABC", 0)) == null);
+
+    // Negated character classes [^a-z] with lexical ignore_case
+    try testing.expect((try runRegex("(?i:[^a-z])", .{}, "A", 0)) == null);
+    {
+        const caps = (try runRegex("(?-i:[^a-z])", .{ .ignore_case = true }, "A", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 1 }, caps[0].?);
+    }
+
+    // Backreferences: /(?i:(a))(?-i:\1)/ captures "A" then requires exact "A"
+    {
+        const caps = (try runRegex("(?i:(a))(?-i:\\1)", .{}, "AA", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 2 }, caps[0].?);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 1 }, caps[1].?);
+    }
+    try testing.expect((try runRegex("(?i:(a))(?-i:\\1)", .{}, "Aa", 0)) == null);
+    {
+        const caps = (try runRegex("(?<ch>a)(?i:\\k<ch>)", .{}, "aA", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 2 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?<ch>a)(?-i:\\k<ch>)", .{ .ignore_case = true }, "aA", 0)) == null);
+
+    // Unicode /u case folding with modifiers: \u017F, \u212A, \p{Lowercase}, \p{Uppercase}, \w, \b
+    const u_flags: regex.Flags = .{ .unicode = true };
+    const iu_flags: regex.Flags = .{ .ignore_case = true, .unicode = true };
+    {
+        const caps = (try runRegex("(?i:\\u017F\\u212A)", u_flags, "SK", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 2 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?-i:\\u017F)", iu_flags, "s", 0)) == null);
+    try testing.expect((try runRegex("(?-i:\\u212A)", iu_flags, "k", 0)) == null);
+    {
+        const caps = (try runRegex("(?i:[A-Z])", u_flags, "\u{017F}", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 1 }, caps[0].?);
+    }
+    {
+        const caps = (try runRegex("(?i:[A-Z])", u_flags, "\u{212A}", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 1 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?-i:[a-z])", iu_flags, "\u{017F}", 0)) == null);
+    {
+        const caps = (try runRegex("(?i:\\p{Lowercase})", u_flags, "A", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 1 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?-i:\\p{Lowercase})", iu_flags, "A", 0)) == null);
+    {
+        const caps = (try runRegex("(?i:\\p{Uppercase})", u_flags, "a", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 1 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?-i:\\p{Uppercase})", iu_flags, "a", 0)) == null);
+    {
+        const caps = (try runRegex("(?i:\\w\\w)", u_flags, "\u{017F}\u{212A}", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 2 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?-i:\\w)", iu_flags, "\u{017F}", 0)) == null);
+    try testing.expect((try runRegex("(?i:\\W)", u_flags, "\u{017F}", 0)) == null);
+    {
+        const caps = (try runRegex("(?i:[\\w])", u_flags, "\u{212A}", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 1 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?-i:[\\w])", iu_flags, "\u{212A}", 0)) == null);
+    {
+        const caps = (try runRegex("(?i:\\b\\u017F\\b)", u_flags, "\u{017F}", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 1 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?-i:\\b)", iu_flags, "\u{017F}", 0)) == null);
+
+    // Multiline (?m:^b$) and (?-m:^b$) across all 4 ECMAScript LineTerminators (\n, \r, \u2028, \u2029)
+    const line_terms = [_][]const u8{ "\n", "\r", "\u{2028}", "\u{2029}" };
+    for (line_terms) |lt| {
+        const inp = try std.fmt.allocPrint(gpa, "a{s}b{s}c", .{ lt, lt });
+        defer gpa.free(inp);
+        {
+            const caps = (try runRegex("(?m:^b$)", .{}, inp, 0)).?;
+            defer gpa.free(caps);
+            try testing.expectEqual(regex.Range{ .start = 2, .end = 3 }, caps[0].?);
+        }
+        try testing.expect((try runRegex("(?-m:^b$)", .{ .multiline = true }, inp, 0)) == null);
+    }
+
+    // DotAll (?s:.) and (?-s:.) across all 4 ECMAScript LineTerminators (\n, \r, \u2028, \u2029)
+    for (line_terms) |lt| {
+        {
+            const caps = (try runRegex("(?s:^.$)", .{}, lt, 0)).?;
+            defer gpa.free(caps);
+            try testing.expectEqual(regex.Range{ .start = 0, .end = 1 }, caps[0].?);
+        }
+        try testing.expect((try runRegex("(?-s:^.$)", .{ .dot_all = true }, lt, 0)) == null);
+    }
+
+    // Lookbehind & lookahead with modifiers
+    {
+        const caps = (try runRegex("(?i:(?<=a)b)", .{}, "AB", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 1, .end = 2 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?-i:(?<=a)b)", .{ .ignore_case = true }, "AB", 0)) == null);
+    {
+        const caps = (try runRegex("(?<=(?i:a))b", .{}, "Ab", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 1, .end = 2 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?<=(?i:a))b", .{}, "AB", 0)) == null);
+    {
+        const caps = (try runRegex("(?i:(?=ab)a)b", .{}, "Ab", 0)).?;
+        defer gpa.free(caps);
+        try testing.expectEqual(regex.Range{ .start = 0, .end = 2 }, caps[0].?);
+    }
+    try testing.expect((try runRegex("(?i:(?=ab)a)b", .{}, "AB", 0)) == null);
+
+    // Modifier groups are non-capturing and do not mutate Program.flags
+    {
+        const pat16 = try std.unicode.utf8ToUtf16LeAlloc(gpa, "(?ims:a)(b)");
+        defer gpa.free(pat16);
+        var diag: regex.Diagnostic = .{};
+        var prog = try regex.compile(gpa, pat16, .{}, &diag);
+        defer prog.deinit(gpa);
+        try testing.expectEqual(@as(u16, 1), prog.capture_count);
+        try testing.expect(!prog.flags.ignore_case);
+        try testing.expect(!prog.flags.multiline);
+        try testing.expect(!prog.flags.dot_all);
+    }
+}
+
+test "ES2025 RegExp Modifiers JS integration: literal, constructor, flags isolation" {
+    var dbg: support.ProgramAllocator = .init;
+    defer support.endProgram(&dbg);
+    const gpa = dbg.allocator();
+
+    const src =
+        \\const r = /(?ims:^a.b$)/;
+        \\print("props:" + r.ignoreCase + ":" + r.multiline + ":" + r.dotAll + ":" + r.flags);
+        \\print("match:" + r.test("x\nA\nB\ny"));
+        \\const r2 = new RegExp("(?-i:a)b", "i");
+        \\print("ctor:" + r2.ignoreCase + ":" + r2.test("aB") + ":" + r2.test("AB"));
+        \\let bad = 0;
+        \\for (const pat of ["(?-:a)", "(?ii:a)", "(?i-i:a)", "(?g:a)", "(?u:a)", "(?i-m-s:a)", "(?i)"]) {
+        \\  try { new RegExp(pat); } catch (e) { if (e instanceof SyntaxError) bad++; }
+        \\}
+        \\print("bad:" + bad);
+    ;
+
+    const expected =
+        \\props:false:false:false:
+        \\match:true
+        \\ctor:true:true:false
+        \\bad:7
+        \\
+    ;
+
+    for (support.engines) |engine| {
+        var o = try support.run(gpa, src, .{}, engine, .normal);
+        defer o.deinit(gpa);
+        try testing.expectEqual(@as(u8, 0), o.code);
+        try testing.expectEqualStrings(expected, o.out);
+    }
 }
 
 test "FailingAllocator sweep for named groups, lookbehind, and modifiers" {

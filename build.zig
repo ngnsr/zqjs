@@ -43,6 +43,9 @@ pub fn build(b: *std.Build) void {
     // (heap.Mutation), so the `mutation:` tests can prove the verifier catches it. Only
     // `zig build gc-mutants` uses it; never set it for a real build.
     options.addOption([]const u8, "gc_mutation", b.option([]const u8, "gc-mutation", "GC: break one barrier piece on purpose (tests)") orelse "none");
+    // -Dop-profile: count opcodes, opcode->opcode edges, native calls and property-cache
+    // misses, printed when the runtime is destroyed; rank them with tools/op_graph.py.
+    options.addOption(bool, "op_profile", b.option(bool, "op-profile", "VM: count opcodes, edges, native calls, cache misses (tools/op_graph.py)") orelse false);
     mod.addOptions("build_options", options);
     const api = b.addModule("zqjs", .{
         .root_source_file = b.path("src/api.zig"),
@@ -216,6 +219,7 @@ pub fn build(b: *std.Build) void {
         mutant_options.addOption(bool, "stack_stress", false);
         mutant_options.addOption(bool, "gc_stress", true);
         mutant_options.addOption([]const u8, "gc_mutation", name);
+        mutant_options.addOption(bool, "op_profile", false);
         const mutant_mod = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
         mutant_mod.addOptions("build_options", mutant_options);
         const mutant = b.addRunArtifact(b.addTest(.{ .name = b.fmt("mutant-{s}", .{name}), .filters = &.{"mutation:"}, .root_module = b.createModule(.{

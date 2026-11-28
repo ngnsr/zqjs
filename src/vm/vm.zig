@@ -39,6 +39,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
+const op_profile = @import("../runtime/op_profile.zig");
 const Value = @import("../runtime/value.zig").Value;
 const Native = @import("../runtime/value.zig").Native;
 const heap = @import("../runtime/heap.zig");
@@ -231,6 +232,7 @@ pub const Vm = struct {
         if (@as(u64, script.slot_count) + script.max_stack > rt.limits.max_stack_slots) return rt.limit(.stack_slots);
         const created_ic = rt.prop_ic == null;
         try rt.ensurePropIc();
+        if (op_profile.enabled) op_profile.ensure(rt.gpa, &op_names);
         errdefer if (created_ic) {
             rt.gpa.destroy(rt.prop_ic.?);
             rt.prop_ic = null;
@@ -284,6 +286,7 @@ pub const Vm = struct {
         if (@as(u64, argc) + callee.slot_count + callee.max_stack > rt.limits.max_stack_slots) return rt.limit(.stack_slots);
         const created_ic = rt.prop_ic == null;
         try rt.ensurePropIc();
+        if (op_profile.enabled) op_profile.ensure(rt.gpa, &op_names);
         errdefer if (created_ic) {
             rt.gpa.destroy(rt.prop_ic.?);
             rt.prop_ic = null;
@@ -948,6 +951,7 @@ pub const Vm = struct {
         const byte = code_ptr[pc];
         if (byte >= Op.count) return vm.bug("invalid opcode");
         const op: Op = @fromBackingInt(@intCast(byte));
+        if (op_profile.enabled) if (op_profile.active) |pf| pf.op(byte);
         if (op.size() > code_len - pc) return vm.bug("instruction runs past the end of the code");
         try rt.step();
         var next: u32 = pc + op.size();
@@ -1295,6 +1299,7 @@ pub const Vm = struct {
                 const name_idx = cache.operand(0);
                 const r: Value = if (name_idx < p.name_atoms.len)
                     fastGetProp(rt, p, pc, base, p.name_atoms[name_idx]) orelse blk: {
+                        if (op_profile.enabled) profileMiss(p, pc, p.name_atoms[name_idx], false);
                         cache.syncSp(vm);
                         const atom = p.name_atoms[name_idx];
                         const val = try object.get(rt, base, object.namedAtom(atom));
@@ -1313,6 +1318,7 @@ pub const Vm = struct {
                 try cache.ensurePush(vm);
                 const r: Value = if (name_idx < p.name_atoms.len)
                     fastGetProp(rt, p, pc, base, p.name_atoms[name_idx]) orelse blk: {
+                        if (op_profile.enabled) profileMiss(p, pc, p.name_atoms[name_idx], false);
                         cache.syncSp(vm);
                         const atom = p.name_atoms[name_idx];
                         const val = try object.get(rt, base, object.namedAtom(atom));
@@ -1333,6 +1339,7 @@ pub const Vm = struct {
                 try cache.ensurePush(vm);
                 const r: Value = if (name_idx < p.name_atoms.len)
                     fastGetProp(rt, p, pc, base, p.name_atoms[name_idx]) orelse blk: {
+                        if (op_profile.enabled) profileMiss(p, pc, p.name_atoms[name_idx], false);
                         cache.syncSp(vm);
                         const atom = p.name_atoms[name_idx];
                         const val = try object.get(rt, base, object.namedAtom(atom));
@@ -1352,6 +1359,7 @@ pub const Vm = struct {
                 try cache.ensurePush(vm);
                 const r: Value = if (name_idx < p.name_atoms.len)
                     fastGetProp(rt, p, pc, base, p.name_atoms[name_idx]) orelse blk: {
+                        if (op_profile.enabled) profileMiss(p, pc, p.name_atoms[name_idx], false);
                         cache.syncSp(vm);
                         const atom = p.name_atoms[name_idx];
                         const val = try object.get(rt, base, object.namedAtom(atom));
@@ -1397,6 +1405,7 @@ pub const Vm = struct {
                 if (name_idx < p.name_atoms.len) {
                     const atom = p.name_atoms[name_idx];
                     if (!fastSetProp(rt, p, pc, base, atom, v)) {
+                        if (op_profile.enabled) profileMiss(p, pc, atom, true);
                         const old_sid: u32 = if (base.isObject()) base.asObject().props.shapeId() else heap.DICT_SHAPE_ID;
                         cache.syncSp(vm);
                         _ = try object.setWithReceiver(rt, base, object.namedAtom(atom), v, base, p.is_strict);
@@ -1761,6 +1770,7 @@ pub const Vm = struct {
                     cache.sp = base + 1;
                 } else if (callee_v.isNative()) {
                     const n = callee_v.asNative();
+                    if (op_profile.enabled) if (op_profile.active) |pf| pf.native(@intFromPtr(n), n.name);
                     if (is_method and argc == 1 and n == &array_builtins.array_push) {
                         if (try fastArrayPush1(rt, vm.stack[base], vm.stack[args])) |res| {
                             vm.stack[base] = res;
@@ -4079,4 +4089,16 @@ noinline fn fastGetNativeStatic(rt: *Runtime, p: *const Proto, pc: u32, base: Va
 inline fn isNameAtom(atom: *const heap.String) bool {
     const u = atom.units;
     return u.len == 4 and u[0] == 'n' and u[1] == 'a' and u[2] == 'm' and u[3] == 'e';
+}
+
+/// `-Dop-profile`: opcode names for the dump, and a property-cache miss at (function, pc).
+const op_names: [Op.count][]const u8 = blk: {
+    var names: [Op.count][]const u8 = undefined;
+    for (&names, 0..) |*n, i| n.* = @tagName(@as(Op, @fromBackingInt(@as(u8, @intCast(i)))));
+    break :blk names;
+};
+
+fn profileMiss(p: *const Proto, pc: u32, atom: *heap.String, set: bool) void {
+    const pf = op_profile.active orelse return;
+    pf.miss(@intFromPtr(p), if (p.name.len > 0) p.name else p.inferred_name, pc, atom.units, set);
 }

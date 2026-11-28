@@ -91,5 +91,7 @@ Medium-sized refactors, only pursued if profiling after Tier 1 justifies them:
 
 Every optimization step must follow the M10 discipline:
 1. **Profile first, measure before & after** using `zig build bench-js` and `python3 tools/bench_compare.py` (comparing against both the previous commit and QuickJS).
+   - *Where the time goes:* a sampling profiler (`sample <pid>` on macOS) for native functions; inside `Vm.runLoopInner`, which is one frame to such tools, build with `-Dop-profile` and rank opcodes, opcode→opcode edges, native calls and property-cache misses across workloads with `python3 tools/op_graph.py` (counts, not time; usage in the script). It compiles out entirely without the option.
+   - *Placement noise:* the VM's speed moves ±40% with where hot data lands in memory (the same binary ran `call_chain.js` in 50–72 ms depending on unused top-level `let`s). Before attributing a change, compare interleaved runs of both binaries and re-check suspicious results with a few variants of the input.
 2. **Revert any change that does not show a real speedup** (as in M10.4a).
 3. **Never weaken invariants:** `zig fmt --check .`, `zig build check-goldens`, `ReleaseSafe`, `-Dgc-stress -Dstack-stress`, `gc-mutants`, and Test262 (`0` internal errors) must stay green after every optimization commit.

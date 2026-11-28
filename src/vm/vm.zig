@@ -3545,7 +3545,18 @@ fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
         if (atom.atom.?.index != null) return null;
     } else if (o.kind == .regexp) {
         if (isLastIndexAtom(atom)) return null;
-    } else if (o.kind != .ordinary or o.builtin != null) {
+    } else if (o.builtin != null) {
+        // Built-in objects (Math, JSON, prototypes): only own hits are cached. A miss must
+        // reach object.get, which reports names node has but ZQJS lacks as Unsupported (D39).
+        if (o.kind != .ordinary) return null;
+        o.obj.checkLive();
+        const sid = objVersion(o);
+        for (propIcBucket(rt, p, pc)) |ic| {
+            if (ic.kind != 1 and ic.kind != 6) continue;
+            if (matchGetPropIc(o, atom_addr, sid, ic)) |v| return v;
+        }
+        return null;
+    } else if (!plainGetKind(o.kind)) {
         return null;
     }
     o.obj.checkLive();
@@ -3553,6 +3564,15 @@ fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
     const b = propIcBucket(rt, p, pc);
     if (matchGetPropIc(o, atom_addr, sid, b[0])) |v| return v;
     return fastGetPropPoly(o, atom_addr, sid, b);
+}
+
+/// Object kinds whose named properties live in plain storage (no virtual own properties),
+/// so the property cache applies to them like to ordinary objects.
+inline fn plainGetKind(k: std.meta.Tag(@FieldType(heap.Object, "kind"))) bool {
+    return switch (k) {
+        .ordinary, .map, .set, .weak_map, .weak_set, .date, .promise, .iterator, .generator, .array_buffer, .data_view => true,
+        else => false,
+    };
 }
 
 noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) void {
@@ -3595,9 +3615,12 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
         if (atom.atom.?.index != null or isLengthAtom(atom)) return;
     } else if (o.kind == .regexp) {
         if (isLastIndexAtom(atom)) return;
-    } else if (o.kind != .ordinary or o.builtin != null) {
+    } else if (o.builtin != null) {
+        if (o.kind != .ordinary) return;
+    } else if (!plainGetKind(o.kind)) {
         return;
     }
+    const own_only = o.builtin != null; // see fastGetProp: built-ins cache own hits only
     if (o.props == .shaped) {
         if (o.props.shaped.shape) |leaf| {
             if (leaf.find(key)) |s| {
@@ -3626,6 +3649,7 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
             return;
         }
     }
+    if (own_only) return;
     const sid = objVersion(o);
     if (o.props == .dict and o.dict_version == 0) return;
     if (o.proto) |proto| {

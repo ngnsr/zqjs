@@ -132,11 +132,22 @@ test "M27: 200 nested try/finally with return compiles linearly in time and code
         }
     }.run;
 
-    const r_flat = try compileOnce(flat.items);
-    const r_nested = try compileOnce(nested.items);
-    try testing.expect(r_nested.nanos < 20 * @max(r_flat.nanos, 1));
+    const reps = 5;
+    var min_flat_nanos: i96 = std.math.maxInt(i96);
+    for (0..reps) |_| {
+        const r = try compileOnce(flat.items);
+        min_flat_nanos = @min(min_flat_nanos, r.nanos);
+    }
+    var min_nested_nanos: i96 = std.math.maxInt(i96);
+    var nested_code_len: usize = 0;
+    for (0..reps) |_| {
+        const r = try compileOnce(nested.items);
+        min_nested_nanos = @min(min_nested_nanos, r.nanos);
+        nested_code_len = r.code_len;
+    }
+    try testing.expect(min_nested_nanos < 20 * @max(min_flat_nanos, 1));
     // Each finally level is a constant number of bytes (~80-120 bytes); exponential would be > 2^200.
-    try testing.expect(r_nested.code_len < depth * 256);
+    try testing.expect(nested_code_len < depth * 256);
 }
 
 fn fuzzOne(_: void, smith: *testing.Smith) anyerror!void {

@@ -27,6 +27,7 @@ const module_mod = @import("module.zig");
 const Limits = @import("../limits.zig").Limits;
 const Limit = @import("../limits.zig").Limit;
 const Feature = @import("../frontend/diag.zig").Feature;
+const op_profile = @import("op_profile.zig");
 
 pub const Error = error{ Thrown, HostError, LimitExceeded, Unsupported, OutOfMemory, WriteFailed, Internal };
 
@@ -377,6 +378,7 @@ pub const Runtime = struct {
         rt.deleted_native_props.deinit(rt.gpa);
         rt.microtasks.deinit(rt.gpa);
         if (rt.prop_ic) |ic| rt.gpa.destroy(ic);
+        if (op_profile.enabled) op_profile.finish();
         rt.modules.deinit(rt.gpa);
         rt.heap.deinit();
         rt.* = undefined;

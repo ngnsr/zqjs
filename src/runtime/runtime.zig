@@ -553,6 +553,7 @@ pub const Runtime = struct {
             h.markObj(&r.sym_split.obj);
             h.markObj(&r.sym_match_all.obj);
             h.markObj(&r.sym_is_concat_spreadable.obj);
+            for (r.regexp_names) |name| if (name) |a| h.markObj(&a.obj);
         }
         var sym_it = rt.global_symbols.iterator();
         while (sym_it.next()) |e| {

@@ -15,6 +15,20 @@ const Feature = @import("../../frontend/diag.zig").Feature;
 const builtins = @import("../builtins.zig");
 const common = @import("common.zig");
 
+/// RegExp protocol property names read on every `exec`/`replace`/`flags` call.
+pub const Name = enum { lastIndex, exec, flags, hasIndices, global, ignoreCase, multiline, dotAll, unicode, unicodeSets, sticky };
+
+/// The property key for `n`, interned once per realm instead of on every call. The realm is
+/// otherwise immutable after creation; this name cache is the one field filled in later.
+fn key(rt: *Runtime, comptime n: Name) Error!object.Key {
+    _ = try builtins.realm(rt);
+    const slot = &rt.realm.?.regexp_names[@backingInt(n)];
+    if (slot.*) |a| return object.namedAtom(a);
+    const a = try rt.heap.internAscii(@tagName(n));
+    slot.* = a;
+    return object.namedAtom(a);
+}
+
 pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
     try common.immutableConstant(rt, r.regexp_namespace, "prototype", Value.fromObject(r.regexp_prototype));
     try common.constant(rt, r.regexp_prototype, "constructor", Value.fromNative(&builtins.regexp_global));
@@ -175,7 +189,7 @@ pub fn regexpBuild(rt: *Runtime, args: []const Value, is_new: bool) Error!Value 
         const pv = try object.get(rt, p_arg, try object.named(rt, "source"));
         root_buf[2] = pv;
         const fv = if (f_arg.isUndefined())
-            try object.get(rt, p_arg, try object.named(rt, "flags"))
+            try object.get(rt, p_arg, try key(rt, .flags))
         else
             f_arg;
         root_buf[3] = fv;
@@ -259,17 +273,17 @@ fn regexpExecIntoRooted(
         last_idx = 0;
     }
     if (last_idx > @as(f64, @floatFromInt(s.units.len))) {
-        if (global_or_sticky) try object.setStrict(rt, Value.fromObject(rx_obj), try object.named(rt, "lastIndex"), Value.fromNumber(0));
+        if (global_or_sticky) try object.setStrict(rt, Value.fromObject(rx_obj), try key(rt, .lastIndex), Value.fromNumber(0));
         return false;
     }
     const start: u32 = @intFromFloat(last_idx);
     const matched = try runRegExpMatcher(rt, &re.program, s.units, start, captures);
     if (!matched) {
-        if (global_or_sticky) try object.setStrict(rt, Value.fromObject(rx_obj), try object.named(rt, "lastIndex"), Value.fromNumber(0));
+        if (global_or_sticky) try object.setStrict(rt, Value.fromObject(rx_obj), try key(rt, .lastIndex), Value.fromNumber(0));
         return false;
     }
     if (global_or_sticky) {
-        try object.setStrict(rt, Value.fromObject(rx_obj), try object.named(rt, "lastIndex"), Value.fromNumber(@floatFromInt(captures[0].?.end)));
+        try object.setStrict(rt, Value.fromObject(rx_obj), try key(rt, .lastIndex), Value.fromNumber(@floatFromInt(captures[0].?.end)));
     }
     return true;
 }
@@ -533,20 +547,20 @@ fn regexpFlagsGetter(rt: *Runtime, this: Value, _: []const Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const spec = [_]struct { name: []const u8, ch: u8 }{
-        .{ .name = "hasIndices", .ch = 'd' },
-        .{ .name = "global", .ch = 'g' },
-        .{ .name = "ignoreCase", .ch = 'i' },
-        .{ .name = "multiline", .ch = 'm' },
-        .{ .name = "dotAll", .ch = 's' },
-        .{ .name = "unicode", .ch = 'u' },
-        .{ .name = "unicodeSets", .ch = 'v' },
-        .{ .name = "sticky", .ch = 'y' },
+    const spec = [_]struct { name: Name, ch: u8 }{
+        .{ .name = .hasIndices, .ch = 'd' },
+        .{ .name = .global, .ch = 'g' },
+        .{ .name = .ignoreCase, .ch = 'i' },
+        .{ .name = .multiline, .ch = 'm' },
+        .{ .name = .dotAll, .ch = 's' },
+        .{ .name = .unicode, .ch = 'u' },
+        .{ .name = .unicodeSets, .ch = 'v' },
+        .{ .name = .sticky, .ch = 'y' },
     };
     var buf: [8]u8 = undefined;
     var len: usize = 0;
-    for (spec) |entry| {
-        const v = try object.get(rt, this, try object.named(rt, entry.name));
+    inline for (spec) |entry| {
+        const v = try object.get(rt, this, try key(rt, entry.name));
         if (ops.toBoolean(v)) {
             buf[len] = entry.ch;
             len += 1;
@@ -624,7 +638,7 @@ fn regexpToString(rt: *Runtime, this: Value, _: []const Value) Error!Value {
 
     const pattern = try common.toStringObj(rt, try object.get(rt, this, try object.named(rt, "source")));
     root_buf[1] = Value.fromString(pattern);
-    const flags = try common.toStringObj(rt, try object.get(rt, this, try object.named(rt, "flags")));
+    const flags = try common.toStringObj(rt, try object.get(rt, this, try key(rt, .flags)));
     root_buf[2] = Value.fromString(flags);
     return Value.fromString(try rt.heap.newString(&.{
         .{ .ascii = "/" },
@@ -719,7 +733,7 @@ pub fn regExpExecGeneric(rt: *Runtime, rx: Value, s_val: Value) Error!Value {
     try roots.register(rt);
     defer roots.unregister(rt);
 
-    const exec_fn = try object.get(rt, rx, try object.named(rt, "exec"));
+    const exec_fn = try object.get(rt, rx, try key(rt, .exec));
     root_buf[2] = exec_fn;
     if (exec_fn.isFunction()) {
         const res = try rt.callCallable(exec_fn, rx, &.{s_val});
@@ -747,7 +761,7 @@ fn regexpSymMatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const s_val = Value.fromString(s);
     root_buf[2] = s_val;
 
-    const flags_val = try object.get(rt, this, try object.named(rt, "flags"));
+    const flags_val = try object.get(rt, this, try key(rt, .flags));
     const flags_s = try common.toStringObj(rt, flags_val);
     root_buf[3] = Value.fromString(flags_s);
     const is_global = std.mem.indexOfScalar(u16, flags_s.units, 'g') != null;
@@ -758,7 +772,7 @@ fn regexpSymMatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 
     const full_unicode = std.mem.indexOfScalar(u16, flags_s.units, 'u') != null or
         std.mem.indexOfScalar(u16, flags_s.units, 'v') != null;
-    try object.setStrict(rt, this, try object.named(rt, "lastIndex"), Value.fromNumber(0));
+    try object.setStrict(rt, this, try key(rt, .lastIndex), Value.fromNumber(0));
 
     const r = try builtins.realm(rt);
     const out = try rt.heap.newArray(r.array_prototype);
@@ -776,10 +790,10 @@ fn regexpSymMatch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         root_buf[5] = Value.fromString(m_str);
         try rt.heap.appendElement(out, root_buf[5]);
         if (m_str.units.len == 0) {
-            const li_val = try object.get(rt, this, try object.named(rt, "lastIndex"));
+            const li_val = try object.get(rt, this, try key(rt, .lastIndex));
             const this_idx = try common.toLength(rt, li_val);
             const next_idx = advanceStringIndex(s.units, @intFromFloat(this_idx), full_unicode);
-            try object.setStrict(rt, this, try object.named(rt, "lastIndex"), Value.fromNumber(@floatFromInt(next_idx)));
+            try object.setStrict(rt, this, try key(rt, .lastIndex), Value.fromNumber(@floatFromInt(next_idx)));
         }
         root_buf[5] = .undefined;
     }
@@ -884,7 +898,7 @@ fn regexpSymReplace(rt: *Runtime, this: Value, args: []const Value) Error!Value 
         break :blk rs;
     } else null;
 
-    const flags_val = try object.get(rt, this, try object.named(rt, "flags"));
+    const flags_val = try object.get(rt, this, try key(rt, .flags));
     const flags_s = try common.toStringObj(rt, flags_val);
     root_buf[5] = Value.fromString(flags_s);
     const is_global = std.mem.indexOfScalar(u16, flags_s.units, 'g') != null;
@@ -892,7 +906,7 @@ fn regexpSymReplace(rt: *Runtime, this: Value, args: []const Value) Error!Value 
         std.mem.indexOfScalar(u16, flags_s.units, 'v') != null;
 
     if (is_global) {
-        try object.setStrict(rt, this, try object.named(rt, "lastIndex"), Value.fromNumber(0));
+        try object.setStrict(rt, this, try key(rt, .lastIndex), Value.fromNumber(0));
     }
 
     const r = try builtins.realm(rt);
@@ -907,10 +921,10 @@ fn regexpSymReplace(rt: *Runtime, this: Value, args: []const Value) Error!Value 
         const m0 = try object.get(rt, res, .{ .index = 0 });
         const m_str = try common.toStringObj(rt, m0);
         if (m_str.units.len == 0) {
-            const li_val = try object.get(rt, this, try object.named(rt, "lastIndex"));
+            const li_val = try object.get(rt, this, try key(rt, .lastIndex));
             const this_idx = try common.toLength(rt, li_val);
             const next_idx = advanceStringIndex(s.units, @intFromFloat(this_idx), full_unicode);
-            try object.setStrict(rt, this, try object.named(rt, "lastIndex"), Value.fromNumber(@floatFromInt(next_idx)));
+            try object.setStrict(rt, this, try key(rt, .lastIndex), Value.fromNumber(@floatFromInt(next_idx)));
         }
     }
 
@@ -995,7 +1009,7 @@ fn regexpSymSearch(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const s_val = Value.fromString(s);
     root_buf[2] = s_val;
 
-    const li_key = try object.named(rt, "lastIndex");
+    const li_key = try key(rt, .lastIndex);
     const prev_li = try object.get(rt, this, li_key);
     root_buf[3] = prev_li;
     if (!common.sameValue(prev_li, Value.fromNumber(0))) {
@@ -1027,7 +1041,7 @@ fn regexpSymSplit(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     const ctor = try common.speciesConstructor(rt, this, Value.fromNative(&builtins.regexp_global));
     root_buf[4] = ctor;
 
-    const flags_val = try object.get(rt, this, try object.named(rt, "flags"));
+    const flags_val = try object.get(rt, this, try key(rt, .flags));
     const flags_s = try common.toStringObj(rt, flags_val);
     root_buf[5] = Value.fromString(flags_s);
 
@@ -1057,7 +1071,7 @@ fn regexpSymSplit(rt: *Runtime, this: Value, args: []const Value) Error!Value {
         return Value.fromObject(out);
     }
 
-    const li_key = try object.named(rt, "lastIndex");
+    const li_key = try key(rt, .lastIndex);
     var p: usize = 0;
     var q: usize = 0;
     while (q < size) {
@@ -1114,14 +1128,14 @@ fn regexpSymMatchAll(rt: *Runtime, this: Value, args: []const Value) Error!Value
     const ctor = try common.speciesConstructor(rt, this, Value.fromNative(&builtins.regexp_global));
     root_buf[3] = ctor;
 
-    const flags_val = try object.get(rt, this, try object.named(rt, "flags"));
+    const flags_val = try object.get(rt, this, try key(rt, .flags));
     const flags_s = try common.toStringObj(rt, flags_val);
     root_buf[4] = Value.fromString(flags_s);
 
     const matcher = try common.constructValue(rt, ctor, &.{ this, Value.fromString(flags_s) });
     root_buf[5] = matcher;
 
-    const li_key = try object.named(rt, "lastIndex");
+    const li_key = try key(rt, .lastIndex);
     const last_idx = try common.toLength(rt, try object.get(rt, this, li_key));
     try object.setStrict(rt, matcher, li_key, Value.fromNumber(last_idx));
 

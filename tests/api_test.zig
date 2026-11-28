@@ -3442,3 +3442,60 @@ test "Failure formatting: custom thrown error objects without invoking getters (
     }
     try testing.expectEqualStrings("", out.written());
 }
+
+test "Failure.stack: a thrown Error's frames, and the text prefixed once (E10)" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+
+    const p = try rt.compile("t.js",
+        \\function a(){ b() }
+        \\function b(){ throw new Error("deep") }
+        \\a()
+    , null);
+    defer p.destroy();
+    var f: zqjs.Failure = .{};
+    try testing.expectError(error.Thrown, rt.run(p, &f));
+    try testing.expectEqual(zqjs.Failure.Kind.thrown, f.kind);
+    try testing.expectEqualStrings("Uncaught Error: deep", f.message());
+    try testing.expectEqualStrings(
+        \\    at b (t.js:2:21)
+        \\    at a (t.js:1:15)
+        \\    at t.js:3:1
+    , f.stack());
+    try testing.expect(!f.stack_truncated);
+
+    // An engine-raised exception keeps its bare text and gets its frames from the engine.
+    const p_engine = try rt.compile("e.js", "function f(){ null.x } f()", null);
+    defer p_engine.destroy();
+    try testing.expectError(error.Thrown, rt.run(p_engine, &f));
+    try testing.expectEqualStrings("TypeError: Cannot read properties of null (reading 'x')", f.message());
+    try testing.expectEqualStrings("    at f (e.js:1:15)\n    at e.js:1:24", f.stack());
+
+    // A thrown non-Error value has no frames; reusing the Failure clears the old ones.
+    const p_42 = try rt.compile("n.js", "throw 42", null);
+    defer p_42.destroy();
+    try testing.expectError(error.Thrown, rt.run(p_42, &f));
+    try testing.expectEqualStrings("Uncaught 42", f.message());
+    try testing.expectEqualStrings("", f.stack());
+    try testing.expect(!f.stack_truncated);
+}
+
+test "Failure.stack: frames longer than the buffer are cut at a code point with … (E10)" {
+    const rt = try zqjs.Runtime.create(testing.allocator, .{});
+    defer rt.destroy();
+
+    // 10 frames (Error.stackTraceLimit) naming a 400-byte file: well past the buffer.
+    var name: [400]u8 = undefined;
+    @memset(name[0 .. name.len - 3], 'n');
+    @memcpy(name[name.len - 3 ..], ".js");
+    const p = try rt.compile(&name, "function r(n){ if (n === 0) throw new Error('x'); r(n - 1) } r(20)", null);
+    defer p.destroy();
+    var f: zqjs.Failure = .{};
+    try testing.expectError(error.Thrown, rt.run(p, &f));
+    try testing.expectEqualStrings("Uncaught Error: x", f.message());
+    try testing.expect(f.stack_truncated);
+    try testing.expect(f.stack().len <= f.stack_text.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(f.stack()));
+    try testing.expect(std.mem.startsWith(u8, f.stack(), "    at r ("));
+    try testing.expect(std.mem.endsWith(u8, f.stack(), "\u{2026}"));
+}

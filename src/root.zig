@@ -35,6 +35,7 @@ pub const runModule = @import("run.zig").runModule;
 pub const RunMode = @import("run.zig").Mode;
 pub const RunOptions = @import("run.zig").Options;
 pub const Engine = @import("run.zig").Engine;
+pub const thrown = @import("thrown.zig");
 pub const Vm = @import("vm/vm.zig").Vm;
 pub const Value = @import("runtime/value.zig").Value;
 pub const Native = @import("runtime/value.zig").Native;

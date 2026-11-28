@@ -21,10 +21,6 @@ const Limits = @import("limits.zig").Limits;
 const Diagnostic = @import("frontend/diag.zig").Diagnostic;
 const parse = @import("frontend/parser.zig").parse;
 const resolve = @import("frontend/resolver.zig").resolve;
-const ast = @import("frontend/ast.zig");
-const bytecode = @import("bytecode/bytecode.zig");
-const heap = @import("runtime/heap.zig");
-const Value = @import("runtime/value.zig").Value;
 const Runtime = @import("runtime/runtime.zig").Runtime;
 const module = @import("runtime/module.zig");
 const ops = @import("runtime/ops.zig");
@@ -33,6 +29,7 @@ const compileWithOptions = @import("bytecode/compiler.zig").compileWithOptions;
 const verify = @import("bytecode/verify.zig");
 const disasm = @import("bytecode/disasm.zig");
 const Vm = @import("vm/vm.zig").Vm;
+const thrown = @import("thrown.zig");
 
 const RuntimeError = @import("runtime/runtime.zig").Error;
 
@@ -102,7 +99,7 @@ pub fn runSource(gpa: Allocator, name: []const u8, source: []const u8, limits: L
                 try report.print("{s}: internal error: {s}\n", .{ name, rt.internal_reason orelse "unknown" });
                 return 70;
             },
-            error.Thrown => try writeThrown(&rt, mode, report),
+            error.Thrown => try thrown.write(&rt, report, mode == .harness),
             error.HostError => try report.print("{s}: {s}\n", .{ name, rt.host_message_buf[0..rt.host_message_len] }),
             error.LimitExceeded => try report.print("{s}: LimitExceeded({s})\n", .{ name, @tagName(rt.limitHit().?) }),
             error.Unsupported => {
@@ -149,163 +146,6 @@ fn frontendFailure(e: anyerror, diag: Diagnostic, source: []const u8, name: []co
     if (e == error.OutOfMemory) return error.OutOfMemory;
     try diag.render(source, name, report);
     return 1;
-}
-
-const ThrownName = union(enum) {
-    utf16: []const u16,
-    utf8: []const u8,
-};
-
-const ThrownErrorInfo = struct {
-    name: ThrownName,
-    message: ?[]const u16,
-};
-
-fn asciiEqlUtf16(ascii: []const u8, units: []const u16) bool {
-    if (ascii.len != units.len) return false;
-    for (ascii, units) |a, u| {
-        if (u != a) return false;
-    }
-    return true;
-}
-
-/// Allocation-free, getter-free data-property lookup along the prototype chain.
-fn lookupDataProp(obj: *const heap.Object, key_ascii: []const u8) ?Value {
-    var cur: ?*const heap.Object = obj;
-    var depth: usize = 0;
-    while (cur) |o| : ({
-        cur = o.proto;
-        depth += 1;
-    }) {
-        if (depth >= 64 or o.kind == .proxy) return null;
-        var it = o.props.iterator();
-        while (it.next()) |entry| {
-            const k = entry.key_ptr.*;
-            if (!k.isSymbol() and asciiEqlUtf16(key_ascii, k.asAtom().units)) {
-                if (entry.value_ptr.is_accessor) return null;
-                return entry.value_ptr.value;
-            }
-        }
-    }
-    return null;
-}
-
-fn closureName(cl: *const heap.Closure) ?ThrownName {
-    if (cl.meta) |m| {
-        var it = m.props.iterator();
-        while (it.next()) |entry| {
-            const k = entry.key_ptr.*;
-            if (!k.isSymbol() and asciiEqlUtf16("name", k.asAtom().units)) {
-                if (entry.value_ptr.is_accessor) return null;
-                const val = entry.value_ptr.value;
-                if (val.isString() and val.asString().units.len > 0) return .{ .utf16 = val.asString().units };
-                return null;
-            }
-        }
-        if (m.name_deleted) return null;
-    }
-    return switch (cl.impl) {
-        .vm => |vm| blk: {
-            const proto: *const bytecode.Proto = @ptrCast(@alignCast(vm.proto));
-            const n = if (proto.name.len > 0) proto.name else proto.inferred_name;
-            break :blk if (n.len > 0) .{ .utf8 = n } else null;
-        },
-        .tree => |tr| blk: {
-            const func: *const ast.Function = @ptrCast(@alignCast(tr.func));
-            const n = if (func.name) |d| d.name else func.inferred_name;
-            break :blk if (n.len > 0) .{ .utf8 = n } else null;
-        },
-        .bound => |b| if (b.name.units.len > 0) .{ .utf16 = b.name.units } else null,
-        else => null,
-    };
-}
-
-fn isObjectName(n: ThrownName) bool {
-    return switch (n) {
-        .utf8 => |s| std.mem.eql(u8, s, "Object"),
-        .utf16 => |u| asciiEqlUtf16("Object", u),
-    };
-}
-
-/// Extracts error-like `{ name, message }` (or custom constructor name + string `message`,
-/// e.g. Test262's `Test262Error`) from a thrown object without allocating or invoking getters.
-fn extractThrownError(v: Value) ?ThrownErrorInfo {
-    if (!v.isObject()) return null;
-    const obj = v.asObject();
-    const msg_units: ?[]const u16 = if (lookupDataProp(obj, "message")) |mv|
-        (if (mv.isString()) mv.asString().units else null)
-    else
-        null;
-    if (lookupDataProp(obj, "name")) |nv| {
-        if (nv.isString() and nv.asString().units.len > 0) {
-            return .{ .name = .{ .utf16 = nv.asString().units }, .message = msg_units };
-        }
-    }
-    if (msg_units != null) {
-        if (lookupDataProp(obj, "constructor")) |cv| {
-            if (cv.isClosure()) {
-                if (closureName(cv.asClosure())) |cn| {
-                    if (!isObjectName(cn)) return .{ .name = cn, .message = msg_units };
-                }
-            }
-        }
-    }
-    return null;
-}
-
-fn writeStackFrames(report: *Writer, units: []const u16) Writer.Error!void {
-    const nl = std.mem.indexOfScalar(u16, units, '\n') orelse return;
-    if (nl + 1 >= units.len) return;
-    try ops.writeUtf16(report, units[nl + 1 ..]);
-    try report.writeByte('\n');
-}
-
-fn writeThrown(rt: *Runtime, mode: Mode, report: *Writer) Writer.Error!void {
-    if (rt.thrown_value) |v| {
-        try report.writeAll("Uncaught ");
-        if (extractThrownError(v)) |info| {
-            switch (info.name) {
-                .utf16 => |u| try ops.writeUtf16(report, u),
-                .utf8 => |s| try report.writeAll(s),
-            }
-            if (mode == .normal) {
-                if (info.message) |m| {
-                    if (m.len > 0) {
-                        try report.writeAll(": ");
-                        try ops.writeUtf16(report, m);
-                    }
-                }
-            }
-        } else if (mode == .normal) {
-            var buf: ops.NumberBuf = undefined;
-            if (ops.toPiece(rt, v, &buf)) |piece| switch (piece) {
-                .ascii => |a| try report.writeAll(a),
-                .utf16 => |u| try ops.writeUtf16(report, u),
-            } else |_| try report.writeAll("[value]");
-        }
-        try report.writeByte('\n');
-        if (mode == .normal and v.isObject() and v.asObject().ordinary_tag == .@"error") {
-            const obj = v.asObject();
-            const stack_units: ?[]const u16 = if (lookupDataProp(obj, "stack")) |sv|
-                (if (sv.isString()) sv.asString().units else null)
-            else if (rt.heap.error_stacks.get(obj)) |s|
-                s.units
-            else
-                null;
-            if (stack_units) |u| try writeStackFrames(report, u);
-        }
-    } else {
-        const ex = rt.exception.?;
-        try report.print("Uncaught {s}", .{@tagName(ex.name)});
-        if (mode == .normal) {
-            try report.writeAll(": ");
-            try ops.writeUtf16(report, ex.message.units);
-        }
-        try report.writeByte('\n');
-        if (mode == .normal) {
-            if (ex.stack) |s| try writeStackFrames(report, s.units);
-        }
-    }
 }
 
 /// Loads, links, and executes an ES Module graph from `name` (with optional `io` for
@@ -366,7 +206,7 @@ pub fn runModule(gpa: Allocator, name: []const u8, source: []const u8, io: std.I
             return 1;
         },
         error.Thrown => {
-            try writeThrown(&rt, mode, report);
+            try thrown.write(&rt, report, mode == .harness);
             return 1;
         },
         error.HostError => {

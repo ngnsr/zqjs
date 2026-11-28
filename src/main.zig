@@ -360,7 +360,7 @@ fn reportPreloadOrModuleErr(
             return 1;
         },
         error.Thrown => {
-            try writeThrown(rt, mode, report);
+            try zqjs.thrown.write(rt, report, mode == .harness);
             return 1;
         },
         error.HostError => {
@@ -383,163 +383,6 @@ fn reportPreloadOrModuleErr(
             try report.print("{s}: {s}\n", .{ name, @errorName(e) });
             return 1;
         },
-    }
-}
-
-const ThrownName = union(enum) {
-    utf16: []const u16,
-    utf8: []const u8,
-};
-
-const ThrownErrorInfo = struct {
-    name: ThrownName,
-    message: ?[]const u16,
-};
-
-fn asciiEqlUtf16(ascii: []const u8, units: []const u16) bool {
-    if (ascii.len != units.len) return false;
-    for (ascii, units) |a, u| {
-        if (u != a) return false;
-    }
-    return true;
-}
-
-/// Allocation-free, getter-free data-property lookup along the prototype chain.
-fn lookupDataProp(obj: *const zqjs.heap.Object, key_ascii: []const u8) ?zqjs.Value {
-    var cur: ?*const zqjs.heap.Object = obj;
-    var depth: usize = 0;
-    while (cur) |o| : ({
-        cur = o.proto;
-        depth += 1;
-    }) {
-        if (depth >= 64 or o.kind == .proxy) return null;
-        var it = o.props.iterator();
-        while (it.next()) |entry| {
-            const k = entry.key_ptr.*;
-            if (!k.isSymbol() and asciiEqlUtf16(key_ascii, k.asAtom().units)) {
-                if (entry.value_ptr.is_accessor) return null;
-                return entry.value_ptr.value;
-            }
-        }
-    }
-    return null;
-}
-
-fn closureName(cl: *const zqjs.heap.Closure) ?ThrownName {
-    if (cl.meta) |m| {
-        var it = m.props.iterator();
-        while (it.next()) |entry| {
-            const k = entry.key_ptr.*;
-            if (!k.isSymbol() and asciiEqlUtf16("name", k.asAtom().units)) {
-                if (entry.value_ptr.is_accessor) return null;
-                const val = entry.value_ptr.value;
-                if (val.isString() and val.asString().units.len > 0) return .{ .utf16 = val.asString().units };
-                return null;
-            }
-        }
-        if (m.name_deleted) return null;
-    }
-    return switch (cl.impl) {
-        .vm => |vm| blk: {
-            const proto: *const zqjs.bytecode.Proto = @ptrCast(@alignCast(vm.proto));
-            const n = if (proto.name.len > 0) proto.name else proto.inferred_name;
-            break :blk if (n.len > 0) .{ .utf8 = n } else null;
-        },
-        .tree => |tr| blk: {
-            const func: *const zqjs.ast.Function = @ptrCast(@alignCast(tr.func));
-            const n = if (func.name) |d| d.name else func.inferred_name;
-            break :blk if (n.len > 0) .{ .utf8 = n } else null;
-        },
-        .bound => |b| if (b.name.units.len > 0) .{ .utf16 = b.name.units } else null,
-        else => null,
-    };
-}
-
-fn isObjectName(n: ThrownName) bool {
-    return switch (n) {
-        .utf8 => |s| std.mem.eql(u8, s, "Object"),
-        .utf16 => |u| asciiEqlUtf16("Object", u),
-    };
-}
-
-/// Extracts error-like `{ name, message }` (or custom constructor name + string `message`,
-/// e.g. Test262's `Test262Error`) from a thrown object without allocating or invoking getters.
-fn extractThrownError(v: zqjs.Value) ?ThrownErrorInfo {
-    if (!v.isObject()) return null;
-    const obj = v.asObject();
-    const msg_units: ?[]const u16 = if (lookupDataProp(obj, "message")) |mv|
-        (if (mv.isString()) mv.asString().units else null)
-    else
-        null;
-    if (lookupDataProp(obj, "name")) |nv| {
-        if (nv.isString() and nv.asString().units.len > 0) {
-            return .{ .name = .{ .utf16 = nv.asString().units }, .message = msg_units };
-        }
-    }
-    if (msg_units != null) {
-        if (lookupDataProp(obj, "constructor")) |cv| {
-            if (cv.isClosure()) {
-                if (closureName(cv.asClosure())) |cn| {
-                    if (!isObjectName(cn)) return .{ .name = cn, .message = msg_units };
-                }
-            }
-        }
-    }
-    return null;
-}
-
-fn writeStackFrames(report: *std.Io.Writer, units: []const u16) std.Io.Writer.Error!void {
-    const nl = std.mem.indexOfScalar(u16, units, '\n') orelse return;
-    if (nl + 1 >= units.len) return;
-    try zqjs.ops.writeUtf16(report, units[nl + 1 ..]);
-    try report.writeByte('\n');
-}
-
-fn writeThrown(rt: *zqjs.Runtime, mode: zqjs.RunMode, report: *std.Io.Writer) std.Io.Writer.Error!void {
-    if (rt.thrown_value) |v| {
-        try report.writeAll("Uncaught ");
-        if (extractThrownError(v)) |info| {
-            switch (info.name) {
-                .utf16 => |u| try zqjs.ops.writeUtf16(report, u),
-                .utf8 => |s| try report.writeAll(s),
-            }
-            if (mode == .normal) {
-                if (info.message) |m| {
-                    if (m.len > 0) {
-                        try report.writeAll(": ");
-                        try zqjs.ops.writeUtf16(report, m);
-                    }
-                }
-            }
-        } else if (mode == .normal) {
-            var buf: zqjs.ops.NumberBuf = undefined;
-            if (zqjs.ops.toPiece(rt, v, &buf)) |piece| switch (piece) {
-                .ascii => |a| try report.writeAll(a),
-                .utf16 => |u| try zqjs.ops.writeUtf16(report, u),
-            } else |_| try report.writeAll("[value]");
-        }
-        try report.writeByte('\n');
-        if (mode == .normal and v.isObject() and v.asObject().ordinary_tag == .@"error") {
-            const obj = v.asObject();
-            const stack_units: ?[]const u16 = if (lookupDataProp(obj, "stack")) |sv|
-                (if (sv.isString()) sv.asString().units else null)
-            else if (rt.heap.error_stacks.get(obj)) |s|
-                s.units
-            else
-                null;
-            if (stack_units) |u| try writeStackFrames(report, u);
-        }
-    } else {
-        const ex = rt.exception.?;
-        try report.print("Uncaught {s}", .{@tagName(ex.name)});
-        if (mode == .normal) {
-            try report.writeAll(": ");
-            try zqjs.ops.writeUtf16(report, ex.message.units);
-        }
-        try report.writeByte('\n');
-        if (mode == .normal) {
-            if (ex.stack) |s| try writeStackFrames(report, s.units);
-        }
     }
 }
 
@@ -582,7 +425,11 @@ fn runPublic(gpa: std.mem.Allocator, io: std.Io, name: []const u8, source: []con
             return 70;
         },
         error.Thrown => {
-            try err.print("Uncaught {s}\n", .{failure.message()});
+            // A thrown value's text already reads "Uncaught …"; an engine-raised exception's
+            // is the bare "TypeError: …" (E10), so prefix it to match runSource.
+            const msg = failure.message();
+            try err.print("{s}{s}\n", .{ if (std.mem.startsWith(u8, msg, "Uncaught ")) "" else "Uncaught ", msg });
+            if (failure.stack().len > 0) try err.print("{s}\n", .{failure.stack()});
             return 1;
         },
         error.LimitExceeded, error.Unsupported, error.HostError => {

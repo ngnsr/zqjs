@@ -118,13 +118,20 @@ pub const Failure = struct {
     text: [256]u8,
     text_len: usize,
     truncated: bool,
+    stack_text: [2048]u8,
+    stack_len: usize,
+    stack_truncated: bool,
     pub fn message(f: *const Failure) []const u8;
+    pub fn stack(f: *const Failure) []const u8;
 };
 ```
 
 - `text` is guaranteed to be valid UTF-8.
 - If a message exceeds 256 bytes, it is truncated strictly at a code point boundary and terminated with `…` (U+2026), setting `truncated = true`.
 - UTF-16 surrogate pairs are decoded into valid 4-byte UTF-8 sequences and never split across boundaries; lone surrogates are converted to U+FFFD.
+- A thrown JavaScript value reads `Uncaught <Name>: <message>` (`Uncaught 42` for a non-Error value); an exception the engine raises (`null.x`) or a native raises with `throwJs` reads `TypeError: <message>`, without the prefix.
+- `stack()` holds a thrown Error's stack frames, the lines after the first of its `stack` (`    at b (game.js:2:21)`), separated by `\n` with no trailing newline. It is empty for a non-Error value, an error without frames and every non-`thrown` failure. The same UTF-8 and truncation rules apply, with 2048 bytes and `stack_truncated`. The C ABI's `zqjs_failure` does not carry it.
+- The CLI prints `Uncaught <Name>: <message>` followed by `stack()`, one frame per line.
 
 ### 9. Internal Errors Poison the Runtime (E7, D49)
 A ZQJS bug must never crash the host. A failed VM defensive check, a bytecode verifier rejection after a successful compile, or `error.Internal` from a callback returns `error.Internal` with an `internal` `Failure` instead of panicking.

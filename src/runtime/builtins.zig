@@ -45,6 +45,7 @@ const regexp = @import("builtins/regexp.zig");
 const typed_array = @import("builtins/typed_array.zig");
 const proxy_reflect = @import("builtins/proxy_reflect.zig");
 const encoding = @import("builtins/encoding.zig");
+const console = @import("builtins/console.zig");
 
 // Re-export public built-in APIs so callers outside `src/runtime/builtins*` keep the exact facade.
 pub const viewsRealm = typed_array.viewsRealm;
@@ -202,6 +203,9 @@ pub const Realm = struct {
     math: *Object,
     json: *Object,
     console: *Object,
+    console_counts: *Object,
+    console_timers: *Object,
+    console_group_depth: u32 = 0,
     text_encoder_prototype: *Object,
     text_encoder_namespace: *Object,
     text_decoder_prototype: *Object,
@@ -212,7 +216,7 @@ pub const Realm = struct {
     views: ?ViewsRealm = null,
 
     /// For GC roots (M8) and tests.
-    pub fn objects(r: *const Realm) [74]*Object {
+    pub fn objects(r: *const Realm) [76]*Object {
         return .{
             r.object_prototype,
             r.array_prototype,
@@ -281,6 +285,8 @@ pub const Realm = struct {
             r.math,
             r.json,
             r.console,
+            r.console_counts,
+            r.console_timers,
             r.text_encoder_prototype,
             r.text_encoder_namespace,
             r.text_decoder_prototype,
@@ -423,7 +429,9 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
         .sym_is_concat_spreadable = try h.newSymbol(try h.ascii("Symbol.isConcatSpreadable"), false),
         .math = try common.builtin(h, object_prototype, .math),
         .json = try common.builtin(h, object_prototype, .json),
-        .console = try h.newObject(object_prototype),
+        .console = try common.builtin(h, object_prototype, .console),
+        .console_counts = try h.newMap(null),
+        .console_timers = try h.newMap(null),
         .text_encoder_prototype = try h.newObject(object_prototype),
         .text_encoder_namespace = try h.newObject(null),
         .text_decoder_prototype = try h.newObject(object_prototype),
@@ -443,19 +451,7 @@ pub fn realm(rt: *Runtime) Error!*const Realm {
     try common.method(rt, r.json, "parse", &json.parse_native);
     try common.method(rt, r.json, "stringify", &json.stringify_native);
     try common.defineToStringTag(rt, r.json, r.sym_to_string_tag, "JSON");
-    // WHATWG Console namespace: methods are enumerable/writable/configurable own properties.
-    for ([_]struct { []const u8, *const Native }{
-        .{ "log", &console_log },
-        .{ "info", &console_info },
-        .{ "debug", &console_debug },
-        .{ "warn", &console_warn },
-        .{ "error", &console_error },
-        .{ "assert", &console_assert },
-    }) |entry| {
-        const k = try h.internAscii(entry[0]);
-        try h.defineProperty(r.console, k, .{ .value = Value.fromNative(entry[1]) });
-    }
-    try common.defineToStringTag(rt, r.console, r.sym_to_string_tag, "console");
+    try console.register(rt, &r);
     try function_error.register(rt, &r);
     try regexp.register(rt, &r);
     try encoding.register(rt, &r);
@@ -642,12 +638,6 @@ pub fn constructorPrototype(rt: *Runtime, n: *const Native) Error!?*Object {
 // ---------------------------------------------------------------- globals
 
 pub const print: Native = .{ .name = "print", .call = common.printImpl };
-pub const console_log: Native = .{ .name = "log", .call = common.consoleLogImpl };
-pub const console_info: Native = .{ .name = "info", .call = common.consoleLogImpl };
-pub const console_debug: Native = .{ .name = "debug", .call = common.consoleLogImpl };
-pub const console_warn: Native = .{ .name = "warn", .call = common.consoleLogImpl };
-pub const console_error: Native = .{ .name = "error", .call = common.consoleLogImpl };
-pub const console_assert: Native = .{ .name = "assert", .call = common.consoleAssertImpl };
 pub const object_global: Native = .{ .name = "Object", .length = 1, .call = object_builtins.objectCall, .construct = object_builtins.objectConstruct, .namespace = .object };
 pub const array_global: Native = .{ .name = "Array", .length = 1, .call = array.arrayCall, .construct = array.arrayConstruct, .namespace = .array };
 pub const string_global: Native = .{ .name = "String", .length = 1, .call = string.stringCall, .construct = string.stringConstruct, .namespace = .string };

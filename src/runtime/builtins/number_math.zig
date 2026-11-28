@@ -21,6 +21,8 @@ pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
     try common.method(rt, r.number_namespace, "isFinite", &number_is_finite);
     try common.method(rt, r.number_namespace, "isNaN", &number_is_nan);
     try common.method(rt, r.number_namespace, "isSafeInteger", &number_is_safe_integer);
+    try common.method(rt, r.number_namespace, "parseFloat", &builtins.parse_float_global);
+    try common.method(rt, r.number_namespace, "parseInt", &builtins.parse_int_global);
     try common.immutableConstant(rt, r.number_namespace, "MAX_SAFE_INTEGER", Value.fromNumber(9007199254740991.0));
     try common.immutableConstant(rt, r.number_namespace, "MIN_SAFE_INTEGER", Value.fromNumber(-9007199254740991.0));
     try common.immutableConstant(rt, r.number_namespace, "EPSILON", Value.fromNumber(std.math.floatEps(f64)));

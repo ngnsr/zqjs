@@ -157,7 +157,7 @@ pub fn mapConstruct(rt: *Runtime, args: []const Value) Error!Value {
 
 fn thisMap(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
     if (this.isObject() and this.asObject().kind == .map) return this.asObject();
-    return common.unsupportedReceiver(rt, name);
+    return rt.throw(.TypeError, &.{ .{ .ascii = "Method Map.prototype." }, .{ .ascii = name }, .{ .ascii = " called on incompatible receiver" } });
 }
 
 fn mapGet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
@@ -171,13 +171,8 @@ fn mapSet(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return this;
 }
 
-fn requireMap(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
-    if (this.isObject() and this.asObject().kind == .map) return this.asObject();
-    return rt.throw(.TypeError, &.{ .{ .ascii = "Method Map.prototype." }, .{ .ascii = name }, .{ .ascii = " called on incompatible receiver" } });
-}
-
 fn mapGetOrInsert(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const m = try requireMap(rt, this, "getOrInsert");
+    const m = try thisMap(rt, this, "getOrInsert");
     const raw_key = common.arg(args, 0);
     const key = if (raw_key.isNumber() and raw_key.asNumber() == 0.0) Value.fromNumber(0.0) else raw_key;
     if (heap_mod.Heap.mapGet(m, key)) |existing| return existing;
@@ -187,7 +182,7 @@ fn mapGetOrInsert(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 }
 
 fn mapGetOrInsertComputed(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    const m = try requireMap(rt, this, "getOrInsertComputed");
+    const m = try thisMap(rt, this, "getOrInsertComputed");
     const cb = try common.requireCallable(rt, common.arg(args, 1));
     const raw_key = common.arg(args, 0);
     const key = if (raw_key.isNumber() and raw_key.asNumber() == 0.0) Value.fromNumber(0.0) else raw_key;
@@ -371,7 +366,7 @@ pub fn setConstruct(rt: *Runtime, args: []const Value) Error!Value {
 
 fn thisSet(rt: *Runtime, this: Value, name: []const u8) Error!*Object {
     if (this.isObject() and this.asObject().kind == .set) return this.asObject();
-    return common.unsupportedReceiver(rt, name);
+    return rt.throw(.TypeError, &.{ .{ .ascii = "Method Set.prototype." }, .{ .ascii = name }, .{ .ascii = " called on incompatible receiver" } });
 }
 
 fn setAdd(rt: *Runtime, this: Value, args: []const Value) Error!Value {

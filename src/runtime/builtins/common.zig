@@ -193,31 +193,6 @@ pub fn printImpl(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     return .undefined;
 }
 
-pub fn consoleLogImpl(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    for (args, 0..) |value, i| {
-        if (i > 0) try rt.out.writeByte(' ');
-        if (value.isString()) {
-            try ops.writeUtf16(rt.out, value.asString().units);
-        } else {
-            try inspect.inspect(rt, value, rt.out, .{ .color = false });
-        }
-    }
-    try rt.out.writeByte('\n');
-    return .undefined;
-}
-
-pub fn consoleAssertImpl(rt: *Runtime, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    if (args.len > 0 and ops.toBoolean(args[0])) return .undefined;
-    if (args.len <= 1) {
-        try rt.out.writeAll("Assertion failed\n");
-        return .undefined;
-    }
-    try rt.out.writeAll("Assertion failed: ");
-    return consoleLogImpl(rt, .undefined, args[1..]);
-}
-
 pub fn arg(args: []const Value, i: usize) Value {
     return if (i < args.len) args[i] else .undefined;
 }

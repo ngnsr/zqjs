@@ -89,6 +89,7 @@ pub const Builtin = enum {
     bigint64_array_prototype,
     biguint64_array_constructor,
     biguint64_array_prototype,
+    console,
 };
 
 /// Whether node gives `b` an own property called `name`.
@@ -179,6 +180,7 @@ pub fn has(b: Builtin, name: []const u8) bool {
         .bigint64_array_prototype => bigint64_array_prototype.has(name),
         .biguint64_array_constructor => biguint64_array_constructor.has(name),
         .biguint64_array_prototype => biguint64_array_prototype.has(name),
+        .console => console.has(name),
     };
 }
 
@@ -1174,4 +1176,38 @@ const biguint64_array_constructor = std.StaticStringMap(void).initComptime(.{
 const biguint64_array_prototype = std.StaticStringMap(void).initComptime(.{
     .{"BYTES_PER_ELEMENT"},
     .{"constructor"},
+});
+
+const console = std.StaticStringMap(void).initComptime(.{
+    .{"Console"},
+    .{"_ignoreErrors"},
+    .{"_stderr"},
+    .{"_stderrErrorHandler"},
+    .{"_stdout"},
+    .{"_stdoutErrorHandler"},
+    .{"_times"},
+    .{"assert"},
+    .{"clear"},
+    .{"context"},
+    .{"count"},
+    .{"countReset"},
+    .{"createTask"},
+    .{"debug"},
+    .{"dir"},
+    .{"dirxml"},
+    .{"error"},
+    .{"group"},
+    .{"groupCollapsed"},
+    .{"groupEnd"},
+    .{"info"},
+    .{"log"},
+    .{"profile"},
+    .{"profileEnd"},
+    .{"table"},
+    .{"time"},
+    .{"timeEnd"},
+    .{"timeLog"},
+    .{"timeStamp"},
+    .{"trace"},
+    .{"warn"},
 });

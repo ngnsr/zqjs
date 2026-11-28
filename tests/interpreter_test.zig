@@ -292,6 +292,19 @@ test "native→JS recursion stops cleanly even when the host thread has a tiny s
     };
 }
 
+/// Runs `source` on both engines and expects an uncaught TypeError naming `method`, as node
+/// throws for a collection method called on another receiver.
+fn expectIncompatibleReceiver(source: []const u8, method: []const u8) !void {
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, source, .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        if (!std.mem.startsWith(u8, r.err, "Uncaught TypeError: Method ") or std.mem.indexOf(u8, r.err, method) == null) {
+            std.debug.print("source: {s}\nengine: {s}\nexpected TypeError for {s} in: {s}\n", .{ source, @tagName(engine), method, r.err });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 /// Runs `source` on both engines and expects the given Unsupported diagnostic (the
 /// feature id, and for `builtin` the member) after `output`.
 fn expectUnsupported(source: []const u8, output: []const u8, diagnostic: []const u8) !void {
@@ -393,7 +406,12 @@ test "object limits: heap, string length of a join, conversion depth" {
 
 test "M11.3b: Array/String unimplemented methods, non-matching receivers, and non-ASCII case report Unsupported" {
     try expectUnsupported("[1].toLocaleString;", "", "('toLocaleString')");
-    try expectUnsupported("let o = { length: 1, splice: [].splice }; o.splice(0, 1);", "", "Unsupported(builtin)");
+    // splice is generic, as in node (tests/diff/builtins_tail.js has more cases).
+    for (support.engines) |engine| {
+        var r = try support.run(testing.allocator, "let o = { length: 1, 0: 'a', splice: [].splice }; print(o.splice(0, 1)[0], o.length);", .{}, engine, .normal);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqualStrings("a 0\n", r.out);
+    }
     try expectUnsupported("let o = { charAt: ''.charAt }; o.charAt(0);", "", "Unsupported(builtin)");
     try expectUnsupported("let o = { slice: ''.slice }; o.slice(0);", "", "Unsupported(builtin)");
     try expectUnsupported("'\\u00e9'.toLowerCase();", "", "('toLowerCase')");
@@ -411,13 +429,13 @@ test "M11.3b: Array/String unimplemented methods, non-matching receivers, and no
 
 test "M14.2: Map unsupported methods, non-Map receivers, and non-Map new() targets" {
     try expectUnsupported("new Map().__lookupGetter__;", "", "('__lookupGetter__')");
-    try expectUnsupported("let o = { get: new Map().get }; o.get('x');", "", "Unsupported(builtin)");
+    try expectIncompatibleReceiver("let o = { get: new Map().get }; o.get('x');", "Map.prototype.get");
     try expectUnsupported("new Function();", "", "Unsupported(builtin)");
 }
 
 test "M14.3: Set unsupported methods, non-Set receivers, and non-array iterables" {
     try expectUnsupported("new Set().__lookupGetter__;", "", "('__lookupGetter__')");
-    try expectUnsupported("let o = { has: new Set().has }; o.has('x');", "", "Unsupported(builtin)");
+    try expectIncompatibleReceiver("let o = { has: new Set().has }; o.has('x');", "Set.prototype.has");
 }
 
 test "M14.4: unsupported iterables, Iterator.prototype methods, and member for-of targets" {
@@ -601,8 +619,8 @@ test "M16.2: Array/Map/Set callback receivers, map shrink with holes, limits, an
     }
 
     // Non-matching receivers
-    try expectUnsupported("let o = { forEach: new Map().forEach }; o.forEach(function () {});", "", "Unsupported(builtin)");
-    try expectUnsupported("let o = { forEach: new Set().forEach }; o.forEach(function () {});", "", "Unsupported(builtin)");
+    try expectIncompatibleReceiver("let o = { forEach: new Map().forEach }; o.forEach(function () {});", "Map.prototype.forEach");
+    try expectIncompatibleReceiver("let o = { forEach: new Set().forEach }; o.forEach(function () {});", "Set.prototype.forEach");
 
     for (support.engines) |engine| {
         var r_depth = try support.run(testing.allocator, "function f(x) { return [x].map(f); } f(1);", .{ .max_call_depth = 4 }, engine, .normal);
@@ -640,9 +658,9 @@ test "M17.1: callback thisArg boxing in sloppy mode and detached receivers" {
         try testing.expectEqualStrings("true\ntrue\nobject 42\nobject x\nobject true\n", r.out);
     }
 
-    // Detached/missing receiver on prototype methods reports Unsupported(builtin).
-    try expectUnsupported("const f = new Map().forEach; f(function () {});", "", "Unsupported(builtin)");
-    try expectUnsupported("const f = new Set().forEach; f(function () {});", "", "Unsupported(builtin)");
+    // A detached or missing receiver on a collection method throws a TypeError, as in node.
+    try expectIncompatibleReceiver("const f = new Map().forEach; f(function () {});", "Map.prototype.forEach");
+    try expectIncompatibleReceiver("const f = new Set().forEach; f(function () {});", "Set.prototype.forEach");
 }
 
 test "M18.1: Promise state, self-resolution, native adoption, queue fault preservation, and OOM" {
@@ -1319,7 +1337,7 @@ test "console: log/info/debug/warn/error/assert, descriptors, detached calls, an
         \\shape: object true [object console]
         \\global desc: true false true
         \\log desc: true true true log 0 assert 0
-        \\keys: log,info,debug,warn,error,assert undefined
+        \\keys: log,info,debug,warn,error,dir,time,timeEnd,timeLog,trace,assert,count,countReset,group,groupEnd,table,groupCollapsed undefined
         \\
         \\i 1 true null undefined 42n Symbol(s)
         \\d [ 1, 2 ]

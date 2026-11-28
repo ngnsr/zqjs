@@ -1,0 +1,13 @@
+Set.add TypeError
+Set.has TypeError
+Set.size TypeError
+Map.get TypeError
+Map.set TypeError
+Map.size TypeError
+WeakMap.get TypeError
+WeakSet.add TypeError
+parseFloat id: true 3.25
+parseInt id: true 16
+del1: b obj1: a x y c 4
+del2: 2 false false obj2: p s false false 2
+splice string TypeError

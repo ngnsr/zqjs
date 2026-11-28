@@ -67,6 +67,7 @@ test {
     _ = @import("runtime/date.zig");
     _ = @import("runtime/bigint.zig");
     _ = @import("runtime/pow.zig");
+    _ = @import("runtime/builtins/console.zig");
     _ = @import("bytecode/bytecode.zig");
     _ = @import("bytecode/verify.zig");
     _ = @import("interp/machine.zig");

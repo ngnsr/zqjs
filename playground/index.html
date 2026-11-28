@@ -1723,6 +1723,46 @@ while (true) {
       return new Uint8Array(buf);
     }
 
+    // A share payload larger than this is refused: a crafted z1: link inflates ~1000:1,
+    // so a 2 MB URL could otherwise expand to gigabytes in the tab.
+    const MAX_SHARE_BYTES = 1 << 20;
+
+    async function inflateCapped(bytes) {
+      const stream = new DecompressionStream("deflate-raw");
+      const writer = stream.writable.getWriter();
+      // Feed 1 KiB at a time, waiting on backpressure: one chunk inflates to ~1 MiB at most,
+      // so the reader stops a bomb close to the limit instead of after all of it.
+      const feed = (async () => {
+        for (let i = 0; i < bytes.length; i += 1024) {
+          await writer.ready;
+          await writer.write(bytes.subarray(i, i + 1024));
+        }
+        await writer.close();
+      })();
+      feed.catch(() => {}); // a cancelled read rejects the pending write; the reader reports why
+      const reader = stream.readable.getReader();
+      const chunks = [];
+      let total = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.length;
+        if (total > MAX_SHARE_BYTES) {
+          await reader.cancel();
+          throw new RangeError("Share payload too large");
+        }
+        chunks.push(value);
+      }
+      await feed;
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) {
+        out.set(c, off);
+        off += c.length;
+      }
+      return out;
+    }
+
     function hasSelectOption(selectEl, val) {
       return Array.from(selectEl.options).some((opt) => opt.value === String(val));
     }
@@ -1736,6 +1776,7 @@ while (true) {
         maxSteps: Number(state.maxSteps),
         maxHeap: Number(state.maxHeap),
       }));
+      if (raw.length > MAX_SHARE_BYTES) throw new RangeError("Share payload too large");
       if (typeof CompressionStream === "function") {
         try {
           const compressed = await streamTransform(raw, new CompressionStream("deflate-raw"));
@@ -1757,9 +1798,10 @@ while (true) {
           throw new Error("DecompressionStream unavailable");
         }
         const compressed = base64UrlToBytes(hash.slice(3));
-        bytes = await streamTransform(compressed, new DecompressionStream("deflate-raw"));
+        bytes = await inflateCapped(compressed);
       } else if (hash.startsWith("u1:")) {
         bytes = base64UrlToBytes(hash.slice(3));
+        if (bytes.length > MAX_SHARE_BYTES) throw new RangeError("Share payload too large");
       } else {
         throw new Error("Unsupported share hash prefix");
       }
@@ -1823,8 +1865,8 @@ while (true) {
           copied = false;
         }
         showShareStatus(copied ? "Link copied to clipboard." : "Share URL updated in address bar.", "ok");
-      } catch (_e) {
-        showShareStatus("Could not create share link.", "warn");
+      } catch (e) {
+        showShareStatus(e instanceof RangeError ? "Code is too large to share (over 1 MiB)." : "Could not create share link.", "warn");
       }
     });
 

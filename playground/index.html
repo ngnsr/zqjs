@@ -435,6 +435,21 @@
 
     textarea#editor::selection { background: var(--selection); color: transparent; }
 
+    /* Vim normal/visual mode: a textarea can't draw a block caret, so one sits under the text. */
+    textarea#editor.vim-block { caret-color: transparent; }
+    .vim-cursor {
+      position: absolute;
+      pointer-events: none;
+      background: var(--accent);
+      opacity: 0.5;
+    }
+    .vim-mode {
+      margin-left: 10px;
+      color: var(--accent);
+      font-family: var(--mono);
+      letter-spacing: 0;
+    }
+
     .tok-comment { color: var(--hl-comment); font-style: italic; }
     .tok-string { color: var(--hl-string); }
     .tok-escape { color: var(--hl-escape); font-weight: 600; }
@@ -682,6 +697,11 @@
         ES Module
       </label>
 
+      <label class="control-group" title="Vim keys in the editor: normal, insert and visual modes">
+        <input type="checkbox" id="vim-toggle" />
+        Vim
+      </label>
+
       <label class="control-group">
         Max Steps
         <select id="max-steps">
@@ -710,12 +730,13 @@
     <main>
       <section class="pane pane-left">
         <div class="pane-header">
-          <span class="pane-title">Source</span>
+          <span class="pane-title">Source<span id="vim-mode" class="vim-mode" hidden></span></span>
           <span id="status-text" class="pane-title">Idle</span>
         </div>
         <div class="editor-wrap">
           <pre class="gutter" id="gutter" aria-hidden="true">1</pre>
           <div class="editor-stack" id="editor-stack">
+            <div class="vim-cursor" id="vim-cursor" hidden></div>
             <pre class="editor-highlight" id="editor-highlight" aria-hidden="true"></pre>
             <textarea id="editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" aria-label="JavaScript source"></textarea>
             <ul class="ac-popup" id="ac-popup" role="listbox" hidden></ul>
@@ -1066,6 +1087,7 @@ while (true) {
         gutter.textContent = Array.from({ length: lines }, (_, i) => i + 1).join("\n");
       }
       syncScroll();
+      vimSync();
     }
 
     function syncScroll() {
@@ -1184,6 +1206,7 @@ while (true) {
         top: parseFloat(cs.paddingTop) + (line + 1) * lineH - editor.scrollTop + 2,
         left: parseFloat(cs.paddingLeft) + col * charW - editor.scrollLeft,
         lineH,
+        charW,
       };
     }
 
@@ -1622,6 +1645,7 @@ while (true) {
         acSuppress = false;
         return;
       }
+      if (vim && vim.state.mode !== "insert") return; // Vim's own edits never open autocomplete
       updateAc(false);
     });
 
@@ -1897,6 +1921,734 @@ while (true) {
       }
       loadPreset(readCustom() ? "custom" : 0);
     }
+
+    // vim:begin
+    // ---------- Vim mode ----------
+    // The core only talks to a textarea-shaped `host.el` plus host.edit/undo/redo, so the self-check
+    // table below runs without a page:
+    //   node -e 's=require("fs").readFileSync("playground/index.html","utf8");eval(s.slice(s.indexOf("// vim:begin"),s.lastIndexOf("// vim:end"))+";console.log(vimSelfCheck())")'
+    // In the page, vimSelfCheck(vimDomCase) runs the same table through the real editor.
+    function createVim(host) {
+      const ed = host.el;
+      // mode: normal | insert | visual | vline. session: the insert in progress, for `.` and undo.
+      const s = { mode: "normal", keys: "", want: null, anchor: 0, head: 0, reg: { text: "", linewise: false }, find: null, last: null, session: null };
+      const ls = (t, p) => (p > 0 ? t.lastIndexOf("\n", p - 1) + 1 : 0);
+      const le = (t, p) => { const i = t.indexOf("\n", p); return i < 0 ? t.length : i; };
+      const fnb = (t, p) => { let i = ls(t, p); while (t[i] === " " || t[i] === "\t") i++; return i; };
+      // Normal mode never rests on a line's newline, except on an empty line.
+      const clamp = (t, p) => {
+        p = Math.min(Math.max(p, 0), t.length);
+        return p > ls(t, p) && (p === t.length || t[p] === "\n") ? p - 1 : p;
+      };
+      const cls = (ch, big) => (!ch || /\s/.test(ch) ? 0 : big || !/\w/.test(ch) ? 1 : 2);
+      const visual = () => s.mode === "visual" || s.mode === "vline";
+      const cur = () => (visual() ? s.head : s.mode === "normal" ? clamp(ed.value, ed.selectionStart) : ed.selectionStart);
+      const put = (p) => ed.setSelectionRange(p, p);
+      const edit = (text, from, to) => { if (text || from !== to) host.edit(text, from, to); };
+      const lineAt = (t, p, d) => { // start of the line d lines away, clamped to the buffer
+        let L = ls(t, p);
+        for (; d > 0 && le(t, L) < t.length; d--) L = le(t, L) + 1;
+        for (; d < 0 && L > 0; d++) L = ls(t, L - 1);
+        return L;
+      };
+
+      // Words: keyword runs, other non-blank runs (or any non-blank run for WORDs); an empty line is a word.
+      function wordFwd(t, p, big) {
+        const c = cls(t[p], big);
+        if (c) while (p < t.length && cls(t[p], big) === c) p++;
+        while (p < t.length && !cls(t[p], big)) {
+          if (t[p] === "\n" && t[p + 1] === "\n") return p + 1;
+          p++;
+        }
+        return p;
+      }
+      function wordEnd(t, p, big) {
+        p++;
+        while (p < t.length && !cls(t[p], big)) p++;
+        const c = cls(t[p], big);
+        while (p + 1 < t.length && cls(t[p + 1], big) === c) p++;
+        return Math.min(p, t.length);
+      }
+      function wordBack(t, p, big) {
+        if (--p <= 0) return 0;
+        while (p > 0 && !cls(t[p], big)) {
+          if (t[p] === "\n" && t[p - 1] === "\n") return p;
+          p--;
+        }
+        const c = cls(t[p], big);
+        while (p > 0 && cls(t[p - 1], big) === c) p--;
+        return p;
+      }
+      function findChar(t, p, kind, ch, n, again) {
+        const fwd = kind === "f" || kind === "t", L = ls(t, p), E = le(t, p);
+        // `;` after t/T starts one further, or it would stay put next to the same target.
+        let q = p + (again && (kind === "t" || kind === "T") ? (fwd ? 1 : -1) : 0);
+        for (let i = 0; i < n; i++) {
+          q = fwd ? t.indexOf(ch, q + 1) : q > 0 ? t.lastIndexOf(ch, q - 1) : -1;
+          if (q < 0 || (fwd ? q >= E : q < L)) return null;
+        }
+        return { pos: kind === "t" ? q - 1 : kind === "T" ? q + 1 : q, inclusive: fwd };
+      }
+      // shortcut: brackets inside strings and comments still count; a tokenizer pass if that bites.
+      function matchPair(t, p) {
+        let i = p;
+        const E = le(t, p);
+        while (i < E && !"()[]{}".includes(t[i])) i++;
+        if (i >= E) return null;
+        const j = "([{)]}".indexOf(t[i]), open = "([{"[j % 3], close = ")]}"[j % 3], dir = j < 3 ? 1 : -1;
+        for (let d = 0, q = i; q >= 0 && q < t.length; q += dir) {
+          if (t[q] === open) d += dir;
+          else if (t[q] === close) d -= dir;
+          if (d === 0) return { pos: q, inclusive: true };
+        }
+        return null;
+      }
+
+      // { pos, inclusive?, linewise? } or null when the motion fails.
+      function motion(t, p, k, n, hasCount) {
+        const rep = (f) => { let q = p; for (let i = 0; i < n; i++) q = f(q); return q; };
+        switch (k) {
+          case "h": return { pos: Math.max(ls(t, p), p - n) };
+          case "l": return { pos: Math.min(le(t, p), p + n) };
+          case "0": return { pos: ls(t, p) };
+          case "^": return { pos: fnb(t, p) };
+          case "$": return { pos: le(t, lineAt(t, p, n - 1)) };
+          case "j": case "k": {
+            const L = lineAt(t, p, k === "j" ? n : -n);
+            s.want ??= p - ls(t, p);
+            return { pos: Math.min(L + s.want, Math.max(L, le(t, L) - 1)), linewise: true };
+          }
+          case "gg": case "G":
+            return { pos: fnb(t, hasCount ? lineAt(t, 0, n - 1) : k === "G" ? ls(t, t.length) : 0), linewise: true };
+          case "w": case "W": return { pos: rep((q) => wordFwd(t, q, k === "W")) };
+          case "b": case "B": return { pos: rep((q) => wordBack(t, q, k === "B")) };
+          case "e": case "E": return { pos: rep((q) => wordEnd(t, q, k === "E")), inclusive: true };
+          case "%": return matchPair(t, p);
+          case ";": case ",": {
+            if (!s.find) return null;
+            const [f, ch] = s.find;
+            return findChar(t, p, k === ";" ? f : { f: "F", F: "f", t: "T", T: "t" }[f], ch, n, true);
+          }
+        }
+        if (k.length === 2 && "fFtT".includes(k[0])) {
+          s.find = [k[0], k[1]];
+          return findChar(t, p, k[0], k[1], n, false);
+        }
+        return null;
+      }
+
+      // Text objects: { from, to, linewise? } or null.
+      function wordObject(t, p, big, around) {
+        const L = ls(t, p), E = le(t, p);
+        if (p >= E) return null;
+        const c = cls(t[p], big), blank = (ch) => ch === " " || ch === "\t";
+        let from = p, to = p + 1;
+        while (from > L && cls(t[from - 1], big) === c) from--;
+        while (to < E && cls(t[to], big) === c) to++;
+        if (around && !c) {
+          const c2 = cls(t[to], big);
+          while (c2 && to < E && cls(t[to], big) === c2) to++;
+        } else if (around) {
+          const end = to;
+          while (to < E && blank(t[to])) to++;
+          if (to === end) while (from > L && blank(t[from - 1])) from--;
+        }
+        return { from, to };
+      }
+      function quoteObject(t, p, q, around) {
+        const L = ls(t, p), E = le(t, p), qs = [];
+        for (let i = L; i < E; i++) if (t[i] === q && t[i - 1] !== "\\") qs.push(i);
+        // Quotes pair up from the line start; the cursor's pair, or else the next one after it.
+        let i = 0;
+        while (i + 1 < qs.length && qs[i + 1] < p) i += 2;
+        if (i + 1 >= qs.length) return null;
+        const a = qs[i], b = qs[i + 1];
+        if (!around) return { from: a + 1, to: b };
+        let from = a, to = b + 1;
+        while (to < E && (t[to] === " " || t[to] === "\t")) to++;
+        if (to === b + 1) while (from > L && (t[from - 1] === " " || t[from - 1] === "\t")) from--;
+        return { from, to };
+      }
+      function bracketObject(t, p, open, close, around) {
+        let o = -1;
+        for (let i = t[p] === close ? p - 1 : p, d = 0; i >= 0; i--) {
+          if (t[i] === close) d++;
+          else if (t[i] === open && d-- === 0) { o = i; break; }
+        }
+        if (o < 0) return null;
+        let c = -1;
+        for (let i = o + 1, d = 0; i < t.length; i++) {
+          if (t[i] === open) d++;
+          else if (t[i] === close && d-- === 0) { c = i; break; }
+        }
+        if (c < 0) return null;
+        if (around) return { from: o, to: c + 1 };
+        // i{ on a block whose braces end/start their lines works on the whole lines between them.
+        if (t[o + 1] === "\n" && ls(t, c) > o + 2 && !t.slice(ls(t, c), c).trim()) return { from: o + 2, to: ls(t, c) - 1, linewise: true };
+        return { from: o + 1, to: c };
+      }
+      const BRACKETS = { "(": "()", ")": "()", b: "()", "{": "{}", "}": "{}", B: "{}", "[": "[]", "]": "[]", "<": "<>", ">": "<>" };
+      function textObject(t, p, k) {
+        const around = k[0] === "a", ch = k[1];
+        if (ch === "w" || ch === "W") return wordObject(t, p, ch === "W", around);
+        if (ch === '"' || ch === "'" || ch === "`") return quoteObject(t, p, ch, around);
+        const br = BRACKETS[ch];
+        return br ? bracketObject(t, p, br[0], br[1], around) : null;
+      }
+
+      // What an operator acts on: { from, to, linewise? } or null.
+      function target(c, t, p) {
+        const { op, k, n } = c;
+        if (k === op) return { from: ls(t, p), to: le(t, lineAt(t, p, n - 1)), linewise: true };
+        if (k.length === 2 && (k[0] === "i" || k[0] === "a")) return textObject(t, p, k);
+        if (op === "c" && (k === "w" || k === "W") && cls(t[p])) {
+          // cw on a word changes to the end of it, not up to the next one
+          const big = k === "W";
+          let q = p;
+          while (cls(t[q + 1], big) === cls(t[p], big)) q++;
+          for (let i = 1; i < n; i++) q = wordEnd(t, q, big);
+          return { from: p, to: q + 1 };
+        }
+        const m = motion(t, p, k, n, c.hasCount);
+        if (!m) return null;
+        if (m.linewise) return { from: ls(t, Math.min(p, m.pos)), to: le(t, Math.max(p, m.pos)), linewise: true };
+        const from = Math.min(p, m.pos);
+        let to = Math.max(p, m.pos) + (m.inclusive ? 1 : 0);
+        if (k === "w" || k === "W") {
+          // dw on a line's last word stops at the line end instead of eating the newline
+          const nl = t.lastIndexOf("\n", to - 1);
+          if (nl >= from) to = nl;
+        }
+        return from < to || op === "c" ? { from, to } : null;
+      }
+
+      function operate(op, r, t, c) {
+        let { from, to } = r;
+        const lw = Boolean(r.linewise);
+        s.reg = { text: t.slice(from, to) + (lw ? "\n" : ""), linewise: lw };
+        if (op === "y") return put(lw && ls(t, ed.selectionStart) === from ? ed.selectionStart : from);
+        if (op === ">" || op === "<") {
+          const L = ls(t, from), E = le(t, to);
+          const block = t.slice(L, E).split("\n")
+            .map((line) => (op === ">" ? line && "  " + line : line.replace(/^(?: {1,2}|\t)/, "")))
+            .join("\n");
+          edit(block, L, E);
+          return put(fnb(ed.value, L));
+        }
+        if (op === "c") {
+          if (lw) from = fnb(t, from); // cc keeps the indent
+          edit("", from, to);
+          return enter(from, c, t);
+        }
+        if (lw) {
+          if (to < t.length) to++;
+          else if (from > 0) from--;
+        }
+        edit("", from, to);
+        const v = ed.value;
+        put(clamp(v, lw ? fnb(v, Math.min(from, v.length)) : from));
+      }
+
+      function paste(t, p, before, n) {
+        const { text, linewise } = s.reg;
+        if (!text) return;
+        const all = text.repeat(n);
+        if (linewise) {
+          const at = before ? ls(t, p) : le(t, p) + 1;
+          if (at > t.length) edit("\n" + all.slice(0, -1), t.length, t.length);
+          else edit(all, at, at);
+          return put(fnb(ed.value, at));
+        }
+        const at = before || p >= le(t, p) ? p : p + 1;
+        edit(all, at, at);
+        put(all.includes("\n") ? at : at + all.length - 1);
+      }
+
+      function join(t, p, n) {
+        const L = ls(t, p);
+        let end = le(t, p), out = t.slice(L, end), pos = -1;
+        for (let i = 0; i < Math.max(1, n - 1) && end < t.length; i++) {
+          const next = t.slice(end + 1, le(t, end + 1)).replace(/^[ \t]+/, "");
+          pos = L + out.length;
+          out += !out || !next || /[ \t]$/.test(out) || next[0] === ")" ? next : " " + next;
+          end = le(t, end + 1);
+        }
+        if (pos < 0) return;
+        edit(out, L, end);
+        put(clamp(ed.value, pos));
+      }
+
+      function enter(pos, c, before) {
+        put(pos);
+        s.mode = "insert";
+        s.session = { c, before, ins: ed.value, at: pos };
+      }
+
+      // a → b as one replacement of a[from, to); `at` pins where an ambiguous run (typing "aa" after "a") is read.
+      function diff(a, b, at) {
+        let i = 0, j = 0;
+        while (i < at && i < a.length && i < b.length && a[i] === b[i]) i++;
+        while (a.length - j > Math.max(i, at) && b.length - j > i && a[a.length - 1 - j] === b[b.length - 1 - j]) j++;
+        return { from: i, to: a.length - j };
+      }
+
+      // One insert session is one undo step: rewind the steps it took, then redo it as a single edit.
+      function coalesce(a, b, at) {
+        let k = 0;
+        while (ed.value !== a && k < 500) {
+          const v = ed.value;
+          if (!host.undo() || ed.value === v) break;
+          k++;
+        }
+        if (ed.value !== a) { // could not rewind (no native undo): keep the steps as they are
+          while (k-- > 0) host.redo();
+          return;
+        }
+        if (k === 1) return void host.redo();
+        const d = diff(a, b, at);
+        edit(b.slice(d.from, b.length - a.length + d.to), d.from, d.to);
+      }
+
+      function leaveInsert() {
+        const ss = s.session, t = ed.value, p = ed.selectionStart;
+        s.mode = "normal";
+        s.session = null;
+        if (ss && ss.c) {
+          const d = diff(ss.ins, t, ss.at);
+          s.last = { c: ss.c, ins: { back: ss.at - d.from, fwd: d.to - ss.at, text: t.slice(d.from, t.length - ss.ins.length + d.to) } };
+        }
+        if (ss && ss.before !== t) coalesce(ss.before, t, ss.at);
+        put(clamp(ed.value, Math.max(ls(ed.value, p), p - 1)));
+      }
+
+      function dot(c) {
+        const last = s.last;
+        if (!last) return;
+        exec(c.hasCount ? { ...last.c, n: c.n } : last.c);
+        if (s.mode !== "insert") return;
+        const p = ed.selectionStart, ins = last.ins || { back: 0, fwd: 0, text: "" };
+        edit(ins.text, Math.max(0, p - ins.back), p + ins.fwd);
+        leaveInsert();
+      }
+
+      const ALIAS = { x: "dl", X: "dh", s: "cl", S: "cc", D: "d$", C: "c$" };
+      function exec(c) {
+        if (visual()) return visualCmd(c);
+        const t = ed.value, p = clamp(t, ed.selectionStart), { n, k } = c;
+        if (!c.op && ALIAS[k]) c = { ...c, op: ALIAS[k][0], k: ALIAS[k].slice(1) };
+        if (c.op) {
+          const r = target(c, t, p);
+          if (!r) return;
+          if (c.op !== "y") s.last = { c };
+          return operate(c.op, r, t, c);
+        }
+        switch (k) {
+          case "i": return enter(p, c, t);
+          case "a": return enter(p < le(t, p) ? p + 1 : p, c, t);
+          case "I": return enter(fnb(t, p), c, t);
+          case "A": return enter(le(t, p), c, t);
+          case "o": case "O": { // the new line copies this line's indent
+            const ind = t.slice(ls(t, p), fnb(t, p)), at = k === "o" ? le(t, p) : ls(t, p);
+            edit(k === "o" ? "\n" + ind : ind + "\n", at, at);
+            return enter(at + (k === "o" ? 1 : 0) + ind.length, c, t);
+          }
+          case "v": case "V":
+            s.mode = k === "v" ? "visual" : "vline";
+            s.anchor = s.head = p;
+            return showVisual();
+          case "p": case "P":
+            s.last = { c };
+            return paste(t, p, k === "P", n);
+          case "J":
+            s.last = { c };
+            return join(t, p, n);
+          case "u":
+            for (let i = 0; i < n; i++) host.undo();
+            return put(clamp(ed.value, ed.selectionStart));
+          case ".": return dot(c);
+        }
+        if (k[0] === "r" && k.length === 2) {
+          if (p + n > le(t, p)) return;
+          s.last = { c };
+          edit(k[1].repeat(n), p, p + n);
+          return put(p + n - 1);
+        }
+        const m = motion(t, p, k, n, c.hasCount);
+        if (m) put(clamp(t, m.pos));
+      }
+
+      const VISUAL_OPS = { d: "d", x: "d", c: "c", s: "c", y: "y", ">": ">", "<": "<" };
+      function visualCmd(c) {
+        const t = ed.value, { k } = c;
+        if (k === "v" || k === "V") {
+          const m = k === "v" ? "visual" : "vline";
+          if (s.mode === m) {
+            s.mode = "normal";
+            return put(clamp(t, s.head));
+          }
+          s.mode = m;
+          return showVisual();
+        }
+        if (k === "o") [s.anchor, s.head] = [s.head, s.anchor];
+        else if (VISUAL_OPS[k]) {
+          const a = Math.min(s.anchor, s.head), b = Math.max(s.anchor, s.head), lw = s.mode === "vline";
+          s.mode = "normal";
+          // shortcut: `.` does not repeat visual-mode changes; record the region size if people miss it.
+          return operate(VISUAL_OPS[k], lw ? { from: ls(t, a), to: le(t, b), linewise: true } : { from: a, to: Math.min(b + 1, t.length) }, t, null);
+        } else if (k.length === 2 && (k[0] === "i" || k[0] === "a")) {
+          const r = textObject(t, s.head, k);
+          if (r) {
+            s.mode = r.linewise ? "vline" : "visual";
+            s.anchor = r.from;
+            s.head = Math.max(r.from, r.to - 1);
+          }
+        } else {
+          const m = motion(t, s.head, k, c.n, c.hasCount);
+          if (m) s.head = clamp(t, m.pos);
+        }
+        showVisual();
+      }
+
+      function showVisual() {
+        const t = ed.value, a = Math.min(s.anchor, s.head), b = Math.max(s.anchor, s.head);
+        if (s.mode === "vline") ed.setSelectionRange(ls(t, a), Math.min(le(t, b) + 1, t.length));
+        else ed.setSelectionRange(a, Math.min(b + 1, t.length));
+      }
+
+      // Keys are KeyboardEvent.key values plus "C-r"; a pending count/operator waits in s.keys.
+      function parse(keys) {
+        let [, c1, rest] = /^([1-9]\d*)?([\s\S]*)$/.exec(keys), op = "", c2;
+        if (!visual() && rest && "dcy<>".includes(rest[0])) [, op, c2, rest] = /^(.)([1-9]\d*)?([\s\S]*)$/.exec(rest);
+        if (!rest) return null;
+        const two = "gfFtT".includes(rest[0]) || (!op && !visual() && rest[0] === "r") || ((op || visual()) && "ia".includes(rest[0]));
+        return rest.length < (two ? 2 : 1) ? null : { n: (+c1 || 1) * (+c2 || 1), hasCount: Boolean(c1 || c2), op, k: rest };
+      }
+
+      const KEY_ALIAS = { ArrowLeft: "h", ArrowDown: "j", ArrowUp: "k", ArrowRight: "l", Backspace: "h", Enter: "j", Home: "0", End: "$" };
+      // true when the key was a Vim command; false only in insert mode, where the editor handles it.
+      function key(k) {
+        if (s.mode === "insert") {
+          if (k !== "Escape") return false;
+          leaveInsert();
+          return true;
+        }
+        k = KEY_ALIAS[k] || k;
+        if (k === "Escape") {
+          s.keys = "";
+          if (visual()) {
+            s.mode = "normal";
+            put(clamp(ed.value, s.head));
+          }
+          return true;
+        }
+        if (k === "C-r" && s.mode === "normal") {
+          for (let i = +s.keys || 1; i > 0; i--) host.redo();
+          s.keys = "";
+          put(clamp(ed.value, ed.selectionStart));
+          return true;
+        }
+        if (k.length !== 1) return true;
+        const c = parse(s.keys + k);
+        if (!c) {
+          s.keys += k;
+          return true;
+        }
+        s.keys = "";
+        exec(c);
+        // j/k keep the column they started from (null: the cursor's own); $ sticks to line ends.
+        if (c.op || (c.k !== "j" && c.k !== "k")) s.want = c.k === "$" && !c.op ? Infinity : null;
+        return true;
+      }
+
+      // After a mouse click or drag: a selection becomes visual mode, a click moves the cursor.
+      function syncSelection() {
+        if (s.mode === "insert") return;
+        s.keys = "";
+        const a = ed.selectionStart, b = ed.selectionEnd, back = ed.selectionDirection === "backward";
+        if (a === b) {
+          s.mode = "normal";
+          put(clamp(ed.value, a));
+        } else {
+          s.mode = "visual";
+          s.anchor = back ? b - 1 : a;
+          s.head = back ? a : b - 1;
+        }
+        s.want = null;
+      }
+
+      return { state: s, key, cursor: cur, syncSelection };
+    }
+
+    // An in-memory textarea with an undo stack shaped like Chrome's (undo selects the restored text).
+    function vimMockHost(text, pos) {
+      const el = { value: text, selectionStart: pos, selectionEnd: pos, setSelectionRange(a, b) { this.selectionStart = a; this.selectionEnd = b; } };
+      const done = [], undone = [];
+      const swap = (e, from, to, sel) => { el.value = el.value.slice(0, e.from) + to + el.value.slice(e.from + from.length); el.setSelectionRange(...sel); };
+      return {
+        el,
+        edit(text, from, to) {
+          done.push({ from, old: el.value.slice(from, to), text });
+          undone.length = 0;
+          el.value = el.value.slice(0, from) + text + el.value.slice(to);
+          el.setSelectionRange(from + text.length, from + text.length);
+        },
+        undo() {
+          const e = done.pop();
+          if (e) { undone.push(e); swap(e, e.text, e.old, [e.from, e.from + e.old.length]); }
+          return Boolean(e);
+        },
+        redo() {
+          const e = undone.pop();
+          if (e) { done.push(e); swap(e, e.old, e.text, [e.from + e.text.length, e.from + e.text.length]); }
+          return Boolean(e);
+        },
+      };
+    }
+
+    // [before, keys, after]: `|` is the cursor. Keys: <Esc>, <C-r>; keys the Vim core passes on (insert
+    // mode) are typed into the text, so "ciwfoo<Esc>" types foo.
+    const VIM_CHECKS = [
+      ["foo b|ar", "h", "foo |bar"],
+      ["|foo bar", "3l", "foo| bar"],
+      ["fo|o", "5l", "fo|o"],
+      ["ab|c\nd\nabcd", "jj", "abc\nd\nab|cd"],
+      ["abcd\nx\nab|cd", "kk", "ab|cd\nx\nabcd"],
+      ["a|b\n", "j", "ab\n|"],
+      ["|foo.bar baz", "w", "foo|.bar baz"],
+      ["|foo.bar baz", "W", "foo.bar |baz"],
+      ["|a b c d", "3w", "a b c |d"],
+      ["foo\n\n|bar", "b", "foo\n|\nbar"],
+      ["foo.bar |baz", "b", "foo.|bar baz"],
+      ["foo.bar |baz", "B", "|foo.bar baz"],
+      ["|foo.bar baz", "e", "fo|o.bar baz"],
+      ["|foo.bar baz", "E", "foo.ba|r baz"],
+      ["  foo |bar", "0", "|  foo bar"],
+      ["  foo |bar", "^", "  |foo bar"],
+      ["|foo bar\nbaz", "$", "foo ba|r\nbaz"],
+      ["|ab\ncd\nef", "2$", "ab\nc|d\nef"],
+      ["abc\nd|e", "gg", "|abc\nde"],
+      ["|abc\n  de", "G", "abc\n  |de"],
+      ["|a\nb\nc", "2G", "a\n|b\nc"],
+      ["|a,b,c,d", "fc", "a,b,|c,d"],
+      ["|a,b,c,d", "2f,", "a,b|,c,d"],
+      ["a,b,c,|d", "Fa", "|a,b,c,d"],
+      ["|a,b,c,d", "tc", "a,b|,c,d"],
+      ["a,b,c,|d", "Tb", "a,b|,c,d"],
+      ["|a,b,c,d", "f,;", "a,b|,c,d"],
+      ["|a,b,c,d", "t,;", "a,|b,c,d"],
+      ["|a,b,c,d", "f,;,", "a|,b,c,d"],
+      ["|f(a[1]) + 2", "%", "f(a[1]|) + 2"],
+      ["f(a[1]|) + 2", "%", "f|(a[1]) + 2"],
+      ["|{\n  x\n}", "%", "{\n  x\n|}"],
+      ["foo |bar baz", "dw", "foo |baz"],
+      ["foo |bar\nbaz", "dw", "foo| \nbaz"],
+      ["|a b c d", "d2w", "|c d"],
+      ["|a b c d", "2dw", "|c d"],
+      ["foo |bar baz", "cwqux<Esc>", "foo qu|x baz"],
+      ["foo |b baz", "cwqux<Esc>", "foo qu|x baz"],
+      ["foo |bar baz", "de", "foo | baz"],
+      ["foo bar |baz", "db", "foo |baz"],
+      ["foo |bar baz", "d$", "foo| "],
+      ["foo |bar baz", "d0", "|bar baz"],
+      ["|f(a, b)", "dt)", "|)"],
+      ["|f(a, b);", "df)", "|;"],
+      ["|f(a, b);", "d%", "|;"],
+      ["f|(a, b);", "d%", "f|;"],
+      ["a\n|b\nc", "dd", "a\n|c"],
+      ["a\nb\n|c", "dd", "a\n|b"],
+      ["|a\nb\nc\nd", "2dd", "|c\nd"],
+      ["|a\nb\nc\nd", "dj", "|c\nd"],
+      ["a\nb\n|c", "dk", "|a"],
+      ["|a\nb\nc", "dG", "|"],
+      ["a\nb\n|c", "dgg", "|"],
+      ["  a|b\nc", "ccx<Esc>", "  |x\nc"],
+      ["a|bc", "yyp", "abc\n|abc"],
+      ["a|bc\nd", "yyjp", "abc\nd\n|abc"],
+      ["a|bc\nd", "yyjP", "abc\n|abc\nd"],
+      ["|ab cd", "ywP", "ab| ab cd"],
+      ["ab |cd", "yb$p", "ab cdab| "],
+      ["|ab", "yl3p", "aaa|ab"],
+      ["foo |bar baz", "D", "foo| "],
+      ["foo |bar baz", "Cqux<Esc>", "foo qu|x"],
+      ["|abc", "x", "|bc"],
+      ["|abc", "2x", "|c"],
+      ["ab|c", "x", "a|b"],
+      ["ab|c", "X", "a|c"],
+      ["|abc", "xp", "b|ac"],
+      ["|abc", "sX<Esc>", "|Xbc"],
+      ["  a|bc\nd", "SX<Esc>", "  |X\nd"],
+      ["|abc", "rx", "|xbc"],
+      ["|abc", "3rx", "xx|x"],
+      ["|abc", "4rx", "|abc"],
+      ["|a\n  b\nc", "J", "a| b\nc"],
+      ["|a\nb\nc", "3J", "a b| c"],
+      ["|f(\n)", "J", "f(|)"],
+      ["|a\nb", "ddp", "b\n|a"],
+      ["a|b\nc", "ddP", "|ab\nc"],
+      ["|a\n  b", ">>", "  |a\n  b"],
+      ["|a\nb\nc", "3>>", "  |a\n  b\n  c"],
+      ["  a|b", "<<", "|ab"],
+      ["|a\nb", ">j", "  |a\n  b"],
+      ["foo b|ar baz", "diw", "foo | baz"],
+      ["foo b|ar baz", "daw", "foo |baz"],
+      ["foo b|ar", "daw", "fo|o"],
+      ["foo b|ar baz", "ciwX<Esc>", "foo |X baz"],
+      ["foo b|ar baz", "yiwP", "foo ba|rbar baz"],
+      ['x = "a|b c";', 'di"', 'x = "|";'],
+      ['x = "a|b c";', 'da"', "x =|;"],
+      ['|x = "ab";', 'ci"q<Esc>', 'x = "|q";'],
+      ["x = 'a|b';", "di'", "x = '|';"],
+      ["x = 'a|b' + 1;", "da'", "x = |+ 1;"],
+      ["f(a, (b|), c)", "di(", "f(a, (|), c)"],
+      ["f(a, (b), |c)", "di(", "f(|)"],
+      ["f(a, (b), |c)", "da(", "|f"],
+      ["f(a, (b), |c)", "dib", "f(|)"],
+      ["if (x) { a|; }", "ci{b<Esc>", "if (x) {|b}"],
+      ["if (x) { a|; }", "da{", "if (x)| "],
+      ["x = [1, |2];", "di[", "x = [|];"],
+      ["x = [1, |2];", "ya[P", "x = [1, 2|][1, 2];"],
+      ["{\n  a;\n  |b;\n}", "di{", "{\n|}"],
+      ["{\n  a;\n  |b;\n}", "ci{x<Esc>", "{\n  |x\n}"],
+      ["foo |bar baz", "vlld", "foo | baz"],
+      ["foo b|ar baz", "vhd", "foo |r baz"],
+      ["foo |bar baz", "veyP", "foo ba|rbar baz"],
+      ["|a\nb\nc", "Vjd", "|c"],
+      ["a\n|b\nc", "Vy$p", "a\nb\n|b\nc"],
+      ["|a\nb", "Vj>", "  |a\n  b"],
+      ["foo b|ar baz", "viwd", "foo | baz"],
+      ["x(a|b)", "vi(cq<Esc>", "x(|q)"],
+      ["foo |bar baz", "vlc-<Esc>", "foo |-r baz"],
+      ["|ab", "vl<Esc>x", "|a"],
+      ["|ab", "vlvx", "|a"],
+      ["|ab", "vVd", "|"],
+      ["a|b", "iX<Esc>", "a|Xb"],
+      ["a|b", "aX<Esc>", "ab|X"],
+      ["  a|b", "IX<Esc>", "  |Xab"],
+      ["a|b\nc", "AX<Esc>", "ab|X\nc"],
+      ["  a|b\nc", "oX<Esc>", "  ab\n  |X\nc"],
+      ["a\n  b|c", "OX<Esc>", "a\n  |X\n  bc"],
+      ["a|b", "ifoo<Esc>u", "a|b"],
+      ["foo b|ar baz", "ciwX<Esc>u", "foo |bar baz"],
+      ["foo b|ar baz", "ciwX<Esc>u<C-r>", "foo X| baz"],
+      ["|a\nb", "ddu", "|a\nb"],
+      ["|abc", "xxu", "|bc"],
+      ["|abc", "xx2u", "|abc"],
+      ["|a b c", "dw.", "|c"],
+      ["|a b c d", "2dw.", "|"],
+      ["|a b c d", "dw2.", "|d"],
+      ["|ab ab ab", "cwX<Esc>w.", "X |X ab"],
+      ["|ab\ncd", "Ax<Esc>j.", "abx\ncd|x"],
+      ["|ab\ncd", "ox<Esc>.", "ab\nx\n|x\ncd"],
+      ["|ab", "x.", "|"],
+      ["|ab\ncd", "rxj.", "xb\n|xd"],
+      ["|a\nb\nc", "J.", "a b| c"],
+      ["|ab", "yl.", "|ab"],
+      ["a|b", "i<Esc>", "|ab"],
+    ];
+
+    function vimSelfCheck(makeHost = vimMockHost) {
+      const bad = [];
+      for (const [before, keys, after] of VIM_CHECKS) {
+        const host = makeHost(before.replace("|", ""), before.indexOf("|"));
+        const vim = createVim(host);
+        for (const tok of keys.match(/<[^>]+>|[\s\S]/g)) {
+          const k = { "<Esc>": "Escape", "<C-r>": "C-r" }[tok] || tok;
+          if (!vim.key(k)) host.edit(k, host.el.selectionStart, host.el.selectionEnd);
+        }
+        const t = host.el.value, p = vim.cursor();
+        const got = t.slice(0, p) + "|" + t.slice(p);
+        if (got !== after || vim.state.mode !== "normal") bad.push(`${JSON.stringify(before)} ${keys} → ${JSON.stringify(got)} (${vim.state.mode}), want ${JSON.stringify(after)}`);
+      }
+      return bad.length ? bad : `vim self-check: ${VIM_CHECKS.length} ok`;
+    }
+    // vim:end
+
+    // Page side of Vim mode: toggle, mode label, block cursor, key routing.
+    const VIM_KEY = "zqjs-playground-vim";
+    const VIM_LABELS = { normal: "NORMAL", insert: "INSERT", visual: "VISUAL", vline: "VISUAL LINE" };
+    const vimToggle = document.getElementById("vim-toggle");
+    const vimModeEl = document.getElementById("vim-mode");
+    const vimCursor = document.getElementById("vim-cursor");
+    const vimDomHost = {
+      el: editor,
+      edit: insertText,
+      undo: () => (editor.focus(), document.execCommand("undo")),
+      redo: () => (editor.focus(), document.execCommand("redo")),
+    };
+    // For vimSelfCheck(vimDomCase): each table row runs in the real editor and its undo stack.
+    function vimDomCase(text, pos) {
+      editor.value = text;
+      editor.focus();
+      editor.setSelectionRange(pos, pos);
+      return vimDomHost;
+    }
+    let vim = null;
+
+    function vimSync() {
+      const block = Boolean(vim) && vim.state.mode !== "insert";
+      editor.classList.toggle("vim-block", block);
+      vimModeEl.hidden = !vim;
+      if (vim) vimModeEl.textContent = VIM_LABELS[vim.state.mode] + (vim.state.keys ? ` ${vim.state.keys}` : "");
+      if (!block) {
+        vimCursor.hidden = true;
+        return;
+      }
+      const { top, left, lineH, charW } = caretPixel(vim.cursor());
+      const y = top - lineH - 2;
+      vimCursor.hidden = y < 0 || left < 0;
+      vimCursor.style.cssText = `top:${y}px;left:${left}px;width:${charW}px;height:${lineH}px`;
+    }
+
+    // setSelectionRange does not scroll a textarea, so keep the cursor in view after each Vim key.
+    function vimReveal() {
+      const { top, left, lineH, charW } = caretPixel(vim.cursor());
+      const y = top - lineH - 2, pad = 14, padX = 16;
+      if (y < pad) editor.scrollTop += y - pad;
+      else if (y + lineH > editor.clientHeight - pad) editor.scrollTop += y + lineH - editor.clientHeight + pad;
+      if (left < padX) editor.scrollLeft += left - padX;
+      else if (left + charW > editor.clientWidth - padX) editor.scrollLeft += left + charW - editor.clientWidth + padX;
+    }
+
+    function setVim(on) {
+      vim = on ? createVim(vimDomHost) : null;
+      vimToggle.checked = on;
+      vimSync();
+    }
+
+    // Capture phase, so it runs before the editor's own keydown handler and can swallow normal-mode keys.
+    editor.addEventListener("keydown", (e) => {
+      if (!vim || e.isComposing || e.metaKey || (e.ctrlKey && e.key === "Enter")) return;
+      const k = e.ctrlKey ? { r: "C-r", "[": "Escape" }[e.key] : e.key;
+      // Insert mode is the plain editor; a plain Esc closes autocomplete before it leaves insert mode.
+      if (vim.state.mode === "insert" && (k !== "Escape" || (!acPopup.hidden && !e.ctrlKey))) return;
+      if (["Shift", "Control", "Alt", "Meta", "CapsLock"].includes(e.key)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (k) vim.key(k);
+      hideAc();
+      vimReveal();
+      vimSync();
+    }, true);
+
+    // Text that arrives without a keydown (dictation, emoji picker) must not land in normal mode.
+    // execCommand fires no beforeinput, so Vim's own edits pass.
+    editor.addEventListener("beforeinput", (e) => {
+      if (vim && vim.state.mode !== "insert" && /^insert(?:Text|ReplacementText)$/.test(e.inputType)) e.preventDefault();
+    });
+    editor.addEventListener("mouseup", () => {
+      if (!vim) return;
+      vim.syncSelection();
+      vimSync();
+    });
+    editor.addEventListener("scroll", () => { if (vim) vimSync(); });
+
+    vimToggle.addEventListener("change", () => {
+      setVim(vimToggle.checked);
+      try { localStorage.setItem(VIM_KEY, vimToggle.checked ? "1" : "0"); } catch (_e) { /* storage disabled */ }
+      editor.focus();
+    });
+
+    setVim((() => { try { return localStorage.getItem(VIM_KEY) === "1"; } catch (_e) { return false; } })());
 
     initFromHashOrStorage();
     spawnWorker();

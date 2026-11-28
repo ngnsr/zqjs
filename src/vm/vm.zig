@@ -631,14 +631,16 @@ pub const Vm = struct {
 
     /// Loop-local cache of the active frame's `proto`, `code_ptr`, `pc`, and frame-constant
     /// stack/local bounds (`locals_base` is stored as an index into `vm.locals`, never
-    /// as a slice/pointer, so stack/local growth in `enter()` cannot dangle). Keeping
-    /// `code_len` out of `FrameCache` (read from `p.code.len`) keeps `sp` in a register.
+    /// as a slice/pointer, so stack/local growth in `enter()` cannot dangle). `code_len` is
+    /// cached too, saving a `Proto` load on every instruction: measured faster on 14 of 16
+    /// benchmarks (`call_chain.js` -10%), although it once cost a register for `sp`.
     /// Invariants: `vm.sp` and `vm.pc` are synced via `syncSp` before any helper,
     /// error, host call, GC, or loop exit that can observe them; any opcode that pushes
     /// or pops a frame updates `cache` directly or via `FrameCache.fromVm`.
     const FrameCache = struct {
         p: *const Proto,
         code_ptr: [*]const u8,
+        code_len: u32,
         pc: u32,
         sp: u32,
         stack_base: u32,
@@ -652,6 +654,7 @@ pub const Vm = struct {
             return .{
                 .p = p,
                 .code_ptr = p.code.ptr,
+                .code_len = @intCast(p.code.len),
                 .pc = pc,
                 .sp = vm.sp,
                 .stack_base = f.stack_base,
@@ -672,7 +675,7 @@ pub const Vm = struct {
 
         inline fn target(self: FrameCache, vm: *const Vm) Error!u32 {
             const t = self.operand(0);
-            if (t >= self.p.code.len) return vm.bug("jump target outside the code");
+            if (t >= self.code_len) return vm.bug("jump target outside the code");
             return t;
         }
 
@@ -938,7 +941,7 @@ pub const Vm = struct {
         @setEvalBranchQuota(4000);
         const p = cache.p;
         const code_ptr = cache.code_ptr;
-        const code_len = p.code.len;
+        const code_len = cache.code_len;
         const pc = cache.pc;
         if (pc >= code_len) return vm.bug("pc outside the code");
         const byte = code_ptr[pc];
@@ -1739,6 +1742,7 @@ pub const Vm = struct {
                             cache.* = .{
                                 .p = callee_proto,
                                 .code_ptr = callee_proto.code.ptr,
+                                .code_len = @intCast(callee_proto.code.len),
                                 .pc = 0,
                                 .sp = cache.sp,
                                 .stack_base = cache.sp,

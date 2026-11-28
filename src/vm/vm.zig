@@ -52,6 +52,7 @@ const object = @import("../runtime/object.zig");
 const bigint = @import("../runtime/bigint.zig");
 const builtins = @import("../runtime/builtins.zig");
 const array_builtins = @import("../runtime/builtins/array.zig");
+const string_builtins = @import("../runtime/builtins/string.zig");
 const proxy_reflect = @import("../runtime/builtins/proxy_reflect.zig");
 const coroutine = @import("../runtime/coroutine.zig");
 const module = @import("../runtime/module.zig");
@@ -1762,6 +1763,16 @@ pub const Vm = struct {
                     const n = callee_v.asNative();
                     if (is_method and argc == 1 and n == &array_builtins.array_push) {
                         if (try fastArrayPush1(rt, vm.stack[base], vm.stack[args])) |res| {
+                            vm.stack[base] = res;
+                            cache.sp = base + 1;
+                        } else {
+                            @branchHint(.cold);
+                            cache.syncSp(vm);
+                            try vm.callNativeSlow(n, is_method, base, args);
+                            cache.sp = base + 1;
+                        }
+                    } else if (is_method and argc == 1 and n == &string_builtins.string_char_code_at) {
+                        if (fastCharCodeAt(vm.stack[base], vm.stack[args])) |res| {
                             vm.stack[base] = res;
                             cache.sp = base + 1;
                         } else {
@@ -3860,6 +3871,19 @@ noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
             .kind = 4,
         });
     }
+}
+
+/// `str.charCodeAt(i)` on a string primitive with an in-range integer index; anything else
+/// (NaN, fractions, negatives, out of range, non-strings) returns null for the spec path.
+noinline fn fastCharCodeAt(receiver: Value, pos: Value) ?Value {
+    if (!receiver.isString() or !pos.isNumber()) return null;
+    const s = receiver.asString();
+    s.obj.checkLive();
+    const p = pos.asNumber();
+    if (!(p >= 0 and p < @as(f64, @floatFromInt(s.units.len)))) return null;
+    const i: usize = @intFromFloat(p);
+    if (@as(f64, @floatFromInt(i)) != p) return null;
+    return Value.fromNumber(@floatFromInt(s.units[i]));
 }
 
 noinline fn fastArrayPush1(rt: *Runtime, receiver: Value, val: Value) Error!?Value {

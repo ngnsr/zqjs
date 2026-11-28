@@ -57,7 +57,7 @@ pub fn register(rt: *Runtime, r: *const builtins.Realm) Error!void {
 
 const string_char_at: Native = .{ .name = "charAt", .length = 1, .call = stringCharAt };
 
-const string_char_code_at: Native = .{ .name = "charCodeAt", .length = 1, .call = stringCharCodeAt };
+pub const string_char_code_at: Native = .{ .name = "charCodeAt", .length = 1, .call = stringCharCodeAt };
 
 const string_code_point_at: Native = .{ .name = "codePointAt", .length = 1, .call = stringCodePointAt };
 

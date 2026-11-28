@@ -163,9 +163,9 @@ fn formatSpecifier(rt: *Runtime, w: *std.Io.Writer, spec: u16, v: Value) Error!v
                 }
             }
         },
-        // shortcut: %o prints like %O; node's also shows hidden properties ([length]). Add a
-        // showHidden option to inspect if a script depends on it.
-        'o', 'O' => try inspect.inspect(rt, v, w, .{ .color = false }),
+        // node: `%o` is `{ showHidden: true, depth: 4 }` (inspect's depth counts one more).
+        'o' => try inspect.inspect(rt, v, w, .{ .depth = 5, .show_hidden = true, .color = false }),
+        'O' => try inspect.inspect(rt, v, w, .{ .color = false }),
         'j' => {
             const res = json.stringify(rt, v) catch |e| switch (e) {
                 error.Thrown => {

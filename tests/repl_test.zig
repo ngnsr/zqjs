@@ -211,10 +211,10 @@ test "repl: value inspector (all kinds, cycles, depth, getters, toStringTag, ANS
 
     // Cyclic object and array
     try expectEval(s, "const cyc = {}; cyc.self = cyc; cyc;", "<ref *1> { self: [Circular *1] }");
-    try expectEval(s, "const arr = []; arr.push(arr); arr;", "<ref *1> [\n  [Circular *1]\n]");
+    try expectEval(s, "const arr = []; arr.push(arr); arr;", "<ref *1> [ [Circular *1] ]");
 
-    // Depth limit (default depth 4)
-    try expectEval(s, "({ a: { b: { c: { d: { e: 1 } } } } })", "{ a: { b: { c: { d: [Object] } } } }");
+    // Depth limit (default depth 4, node's `depth: 3`): four nested levels break the outer line (`compact: 3`)
+    try expectEval(s, "({ a: { b: { c: { d: { e: 1 } } } } })", "{\n  a: { b: { c: { d: [Object] } } }\n}");
 
     // Getter safety: inspecting must NEVER invoke getter
     try expectEval(s, "let getterCalled = 0; const gObj = { get x() { getterCalled++; return 99; } }; gObj;", "{ x: [Getter] }");
@@ -224,6 +224,42 @@ test "repl: value inspector (all kinds, cycles, depth, getters, toStringTag, ANS
     const colored = try evalInspect(s, "42", true);
     defer testing.allocator.free(colored);
     try testing.expect(std.mem.indexOf(u8, colored, "\x1b[") != null);
+}
+
+test "repl: ANSI colors do not change the layout (node measures entries without them)" {
+    var out_aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out_aw.deinit();
+    var err_aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err_aw.deinit();
+
+    const s = try Session.create(testing.allocator, &out_aw.writer, &err_aw.writer, .{});
+    defer s.destroy();
+
+    const sources = [_][]const u8{
+        "Array.from({ length: 26 }, (_, i) => i * 3)",
+        "Array.from({ length: 30 }, (_, i) => 's' + i)",
+        "[1, 'two', null, undefined, 5, 'six', 7, 'eight']",
+        "({ a: [1, { b: 2 }], m: new Map([['k', [1, 2]]]), long: 'x'.repeat(50) })",
+    };
+    for (sources) |src| {
+        const plain = try evalInspect(s, src, false);
+        defer testing.allocator.free(plain);
+        const colored = try evalInspect(s, src, true);
+        defer testing.allocator.free(colored);
+        try testing.expect(std.mem.indexOf(u8, colored, "\x1b[") != null);
+
+        var stripped: std.ArrayList(u8) = .empty;
+        defer stripped.deinit(testing.allocator);
+        var i: usize = 0;
+        while (i < colored.len) : (i += 1) {
+            if (colored[i] == 0x1b) {
+                while (colored[i] != 'm') i += 1;
+            } else {
+                try stripped.append(testing.allocator, colored[i]);
+            }
+        }
+        try testing.expectEqualStrings(plain, stripped.items);
+    }
 }
 
 test "repl: completeness checker and read-only Tab completion" {

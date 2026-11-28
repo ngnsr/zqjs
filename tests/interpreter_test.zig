@@ -1393,10 +1393,7 @@ test "console: inspect formatting, cycle safety, read-only getters, print invari
         \\hi { msg: 'ok', arr: [ 1, 2 ] }
         \\undefined null true false 0 -0 NaN Infinity 42n Symbol(s)
         \\{ a: 1, b: 'two' }
-        \\[
-        \\  1,
-        \\  [ 2, 3 ]
-        \\]
+        \\[ 1, [ 2, 3 ] ]
         \\Map(2) { 'k' => 1, 'm' => [ 2, 3 ] }
         \\Set(3) { 1, 'two', 3n }
         \\TypeError: boom

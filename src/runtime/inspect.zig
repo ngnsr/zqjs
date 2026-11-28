@@ -445,9 +445,10 @@ const Context = struct {
 
         if (inline_mode) {
             try ctx.w.writeAll("[ ");
-            for (items[0..n], 0..) |item, i| {
+            var i: usize = 0;
+            while (i < n) {
                 if (i > 0) try ctx.w.writeAll(", ");
-                try ctx.writeValue(item, depth + 1, indent);
+                i = try ctx.writeArrayEntry(items[0..n], i, depth, indent);
             }
             if (items.len > n) {
                 try ctx.w.print(", {s}... {d} more items{s}", .{ ctx.style(Ansi.dim), items.len - n, ctx.reset() });
@@ -455,10 +456,11 @@ const Context = struct {
             try ctx.w.writeAll(" ]");
         } else {
             try ctx.w.writeAll("[\n");
-            for (items[0..n], 0..) |item, i| {
+            var i: usize = 0;
+            while (i < n) {
                 try ctx.w.splatByteAll(' ', indent + 2);
-                try ctx.writeValue(item, depth + 1, indent + 2);
-                if (i + 1 < n or items.len > n) try ctx.w.writeByte(',');
+                i = try ctx.writeArrayEntry(items[0..n], i, depth, indent + 2);
+                if (i < n or items.len > n) try ctx.w.writeByte(',');
                 try ctx.w.writeByte('\n');
             }
             if (items.len > n) {
@@ -468,6 +470,19 @@ const Context = struct {
             try ctx.w.splatByteAll(' ', indent);
             try ctx.w.writeByte(']');
         }
+    }
+
+    /// Writes `items[i]`, or the run of holes starting there as node's `<n empty items>`
+    /// (a hole is not a value: never hand it to writeValue). Returns the next index.
+    fn writeArrayEntry(ctx: *Context, items: []const Value, i: usize, depth: u32, indent: usize) (Allocator.Error || Writer.Error)!usize {
+        if (!items[i].isHole()) {
+            try ctx.writeValue(items[i], depth + 1, indent);
+            return i + 1;
+        }
+        var j = i;
+        while (j < items.len and items[j].isHole()) j += 1;
+        try ctx.w.print("{s}<{d} empty item{s}>{s}", .{ ctx.style(Ansi.dim), j - i, if (j - i == 1) "" else "s", ctx.reset() });
+        return j;
     }
 
     fn writeMap(ctx: *Context, m: heap.OrderedTable, depth: u32, indent: usize) (Allocator.Error || Writer.Error)!void {

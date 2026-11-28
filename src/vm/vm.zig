@@ -52,6 +52,7 @@ const object = @import("../runtime/object.zig");
 const bigint = @import("../runtime/bigint.zig");
 const builtins = @import("../runtime/builtins.zig");
 const array_builtins = @import("../runtime/builtins/array.zig");
+const string_builtins = @import("../runtime/builtins/string.zig");
 const proxy_reflect = @import("../runtime/builtins/proxy_reflect.zig");
 const coroutine = @import("../runtime/coroutine.zig");
 const module = @import("../runtime/module.zig");
@@ -1762,6 +1763,16 @@ pub const Vm = struct {
                     const n = callee_v.asNative();
                     if (is_method and argc == 1 and n == &array_builtins.array_push) {
                         if (try fastArrayPush1(rt, vm.stack[base], vm.stack[args])) |res| {
+                            vm.stack[base] = res;
+                            cache.sp = base + 1;
+                        } else {
+                            @branchHint(.cold);
+                            cache.syncSp(vm);
+                            try vm.callNativeSlow(n, is_method, base, args);
+                            cache.sp = base + 1;
+                        }
+                    } else if (is_method and argc == 1 and n == &string_builtins.string_char_code_at) {
+                        if (fastCharCodeAt(vm.stack[base], vm.stack[args])) |res| {
                             vm.stack[base] = res;
                             cache.sp = base + 1;
                         } else {
@@ -3534,7 +3545,18 @@ fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
         if (atom.atom.?.index != null) return null;
     } else if (o.kind == .regexp) {
         if (isLastIndexAtom(atom)) return null;
-    } else if (o.kind != .ordinary or o.builtin != null) {
+    } else if (o.builtin != null) {
+        // Built-in objects (Math, JSON, prototypes): only own hits are cached. A miss must
+        // reach object.get, which reports names node has but ZQJS lacks as Unsupported (D39).
+        if (o.kind != .ordinary) return null;
+        o.obj.checkLive();
+        const sid = objVersion(o);
+        for (propIcBucket(rt, p, pc)) |ic| {
+            if (ic.kind != 1 and ic.kind != 6) continue;
+            if (matchGetPropIc(o, atom_addr, sid, ic)) |v| return v;
+        }
+        return null;
+    } else if (!plainGetKind(o.kind)) {
         return null;
     }
     o.obj.checkLive();
@@ -3542,6 +3564,15 @@ fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.
     const b = propIcBucket(rt, p, pc);
     if (matchGetPropIc(o, atom_addr, sid, b[0])) |v| return v;
     return fastGetPropPoly(o, atom_addr, sid, b);
+}
+
+/// Object kinds whose named properties live in plain storage (no virtual own properties),
+/// so the property cache applies to them like to ordinary objects.
+inline fn plainGetKind(k: std.meta.Tag(@FieldType(heap.Object, "kind"))) bool {
+    return switch (k) {
+        .ordinary, .map, .set, .weak_map, .weak_set, .date, .promise, .iterator, .generator, .array_buffer, .data_view => true,
+        else => false,
+    };
 }
 
 noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) void {
@@ -3584,9 +3615,12 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
         if (atom.atom.?.index != null or isLengthAtom(atom)) return;
     } else if (o.kind == .regexp) {
         if (isLastIndexAtom(atom)) return;
-    } else if (o.kind != .ordinary or o.builtin != null) {
+    } else if (o.builtin != null) {
+        if (o.kind != .ordinary) return;
+    } else if (!plainGetKind(o.kind)) {
         return;
     }
+    const own_only = o.builtin != null; // see fastGetProp: built-ins cache own hits only
     if (o.props == .shaped) {
         if (o.props.shaped.shape) |leaf| {
             if (leaf.find(key)) |s| {
@@ -3615,6 +3649,7 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
             return;
         }
     }
+    if (own_only) return;
     const sid = objVersion(o);
     if (o.props == .dict and o.dict_version == 0) return;
     if (o.proto) |proto| {
@@ -3860,6 +3895,19 @@ noinline fn populateSetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
             .kind = 4,
         });
     }
+}
+
+/// `str.charCodeAt(i)` on a string primitive with an in-range integer index; anything else
+/// (NaN, fractions, negatives, out of range, non-strings) returns null for the spec path.
+noinline fn fastCharCodeAt(receiver: Value, pos: Value) ?Value {
+    if (!receiver.isString() or !pos.isNumber()) return null;
+    const s = receiver.asString();
+    s.obj.checkLive();
+    const p = pos.asNumber();
+    if (!(p >= 0 and p < @as(f64, @floatFromInt(s.units.len)))) return null;
+    const i: usize = @intFromFloat(p);
+    if (@as(f64, @floatFromInt(i)) != p) return null;
+    return Value.fromNumber(@floatFromInt(s.units[i]));
 }
 
 noinline fn fastArrayPush1(rt: *Runtime, receiver: Value, val: Value) Error!?Value {

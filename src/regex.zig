@@ -2972,10 +2972,19 @@ pub fn exec(
     };
     defer matcher.deinit();
 
+    // A program starting with a BMP non-surrogate literal can only match where that code unit
+    // is. Elsewhere `runAt` would fail on instruction 0 after exactly one charged step, so
+    // charge that step and skip its per-attempt setup (resetting caps, loops and pools).
+    const first: ?u16 = switch (p.insts[0]) {
+        .char => |c| if (c <= 0xFFFF and (c < 0xD800 or c > 0xDFFF)) @intCast(c) else null,
+        else => null,
+    };
     var pos: u32 = start;
     const limit: u32 = if (p.flags.sticky) start else @intCast(input.len);
     while (pos <= limit) {
-        if (try matcher.runAt(pos)) |end_idx| {
+        if (first != null and (pos >= input.len or input[pos] != first.?)) {
+            try matcher.chargeStep();
+        } else if (try matcher.runAt(pos)) |end_idx| {
             captures[0] = .{ .start = pos, .end = end_idx };
             for (0..p.capture_count) |i| {
                 const s = matcher.caps[i * 2];

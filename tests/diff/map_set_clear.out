@@ -1,0 +1,18 @@
+k1 1
+after-clear 9,8
+forEach-clear 1,5,6
+set-forof-clear 1,7,1
+set-forEach-clear 1,2,4
+refill 10 49,50,51,52,53,54,55,56,57,58
+delete-readd 2:2,3:3,1:10
+s1 1
+double-clear 3 1
+exhausted-after-clear {"done":true}
+still-done {"done":true}
+n {"value":1,"done":false} {"done":true}
+done-stays-done {"done":true}
+union 1,2,3,4 inter 2,3 diff 1,4
+nan 3 false 1
+cleared-size 0 []
+clone 1
+churn 20 39980

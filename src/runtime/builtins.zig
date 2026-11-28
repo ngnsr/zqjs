@@ -196,6 +196,9 @@ pub const Realm = struct {
     sym_split: *heap_mod.Symbol,
     sym_match_all: *heap_mod.Symbol,
     sym_is_concat_spreadable: *heap_mod.Symbol,
+    /// RegExp protocol property names, interned on first use (`regexp.key`) and rooted here,
+    /// so `replace`/`exec` don't re-hash "lastIndex", "flags", ... on every call.
+    regexp_names: [std.enums.values(regexp.Name).len]?*heap_mod.String = @splat(null),
     math: *Object,
     json: *Object,
     console: *Object,

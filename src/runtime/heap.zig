@@ -498,6 +498,8 @@ pub const OrderedTable = struct {
     entries: std.ArrayList(Entry) = .empty,
     index: std.HashMapUnmanaged(usize, void, IndexContext, std.hash_map.default_max_load_percentage) = .empty,
     live_count: usize = 0,
+    /// Bumped by `clear()`. A cursor that saw an older epoch restarts at 0 (see `nextLive`).
+    epoch: u32 = 0,
 
     pub fn deinit(t: *OrderedTable, alloc: Allocator) void {
         t.entries.deinit(alloc);
@@ -541,10 +543,27 @@ pub const OrderedTable = struct {
 
     pub fn clear(t: *OrderedTable) void {
         t.index.clearRetainingCapacity();
-        // Preserve `entries.items.len` with dead tombstones so active iterators keep their
-        // cursor and can still visit entries inserted after `clear()`.
-        for (t.entries.items) |*e| e.* = .{ .key = .undefined, .value = .undefined, .alive = false };
+        // Drop the entries rather than keep tombstones: a Map cleared and refilled every frame
+        // otherwise grows forever and makes clear()/forEach O(everything ever inserted).
+        t.entries.clearRetainingCapacity();
         t.live_count = 0;
+        t.epoch +%= 1;
+    }
+
+    /// The next live entry at or after `cursor.*`, advancing it. Entries added after a
+    /// `clear()` start at index 0, so a cursor whose `epoch` is stale restarts there: that is
+    /// how iterators and forEach loops keep the spec's "visit entries added after clear".
+    pub fn nextLive(t: *const OrderedTable, cursor: *usize, epoch: *u32) ?Entry {
+        if (epoch.* != t.epoch) {
+            epoch.* = t.epoch;
+            cursor.* = 0;
+        }
+        while (cursor.* < t.entries.items.len) {
+            const e = t.entries.items[cursor.*];
+            cursor.* += 1;
+            if (e.alive) return e;
+        }
+        return null;
     }
 };
 
@@ -628,6 +647,9 @@ pub const IteratorState = struct {
     next_method: Value = .undefined,
     kind: IteratorKind,
     cursor: usize = 0,
+    /// `OrderedTable.epoch` the cursor belongs to (Map/Set iterators); 0 is safe at creation,
+    /// the first `nextLive` resyncs it while the cursor is still 0.
+    epoch: u32 = 0,
     done: bool = false,
 };
 

@@ -87,16 +87,15 @@ pub const NativeError = error{ Thrown, HostError, LimitExceeded, Unsupported, Ou
 /// UTF-8 text in a fixed buffer, never allocated (E10): always valid UTF-8, cut at a code
 /// point boundary with "…" when it doesn't fit, `truncated` then set.
 const TextWriter = struct {
-    bytes: *[capacity]u8,
+    bytes: []u8,
     len: *usize,
     truncated: *bool,
     /// The last boundary at which "…" still fits.
     cut: usize = 0,
 
-    const capacity = 256;
     const ellipsis = "\u{2026}";
 
-    fn init(bytes: *[capacity]u8, len: *usize, truncated: *bool) TextWriter {
+    fn init(bytes: []u8, len: *usize, truncated: *bool) TextWriter {
         len.* = 0;
         truncated.* = false;
         return .{ .bytes = bytes, .len = len, .truncated = truncated };
@@ -106,10 +105,10 @@ const TextWriter = struct {
         if (t.truncated.*) return;
         var enc: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(cp, &enc) catch std.unicode.utf8Encode(0xFFFD, &enc) catch unreachable;
-        if (t.len.* + n <= capacity) {
+        if (t.len.* + n <= t.bytes.len) {
             @memcpy(t.bytes[t.len.*..][0..n], enc[0..n]);
             t.len.* += n;
-            if (t.len.* <= capacity - ellipsis.len) t.cut = t.len.*;
+            if (t.len.* <= t.bytes.len - ellipsis.len) t.cut = t.len.*;
             return;
         }
         t.len.* = t.cut;
@@ -119,7 +118,7 @@ const TextWriter = struct {
     }
 
     /// UTF-8 in (invalid sequences become U+FFFD).
-    fn utf8(t: *TextWriter, s: []const u8) void {
+    pub fn utf8(t: *TextWriter, s: []const u8) void {
         var i: usize = 0;
         while (i < s.len) {
             const n = std.unicode.utf8ByteSequenceLength(s[i]) catch {
@@ -137,7 +136,7 @@ const TextWriter = struct {
     }
 
     /// UTF-16 in, as `print` converts it: pairs combine, a lone surrogate becomes U+FFFD.
-    fn utf16(t: *TextWriter, units: []const u16) void {
+    pub fn utf16(t: *TextWriter, units: []const u16) void {
         var i: usize = 0;
         while (i < units.len) : (i += 1) {
             const u = units[i];
@@ -157,11 +156,20 @@ pub const Failure = struct {
     text: [256]u8 = undefined,
     text_len: usize = 0,
     truncated: bool = false,
+    /// A thrown Error's stack frames ("    at b (t.js:2:21)", '\n'-separated, no trailing
+    /// newline); empty for other failures. Cut like `text`, `stack_truncated` then set.
+    stack_text: [2048]u8 = undefined,
+    stack_len: usize = 0,
+    stack_truncated: bool = false,
 
     pub const Kind = enum { thrown, host, limit, unsupported, out_of_memory, output, internal };
 
     pub fn message(f: *const Failure) []const u8 {
         return f.text[0..f.text_len];
+    }
+
+    pub fn stack(f: *const Failure) []const u8 {
+        return f.stack_text[0..f.stack_len];
     }
 };
 
@@ -1610,138 +1618,17 @@ fn publicError(e: internal.runtime.Error) RunError {
     };
 }
 
-const ThrownName = union(enum) {
-    utf16: []const u16,
-    utf8: []const u8,
-};
-
-const ThrownErrorInfo = struct {
-    name: ThrownName,
-    message: ?[]const u16,
-};
-
-fn asciiEqlUtf16(ascii: []const u8, units: []const u16) bool {
-    if (ascii.len != units.len) return false;
-    for (ascii, units) |a, u| {
-        if (u != a) return false;
-    }
-    return true;
-}
-
-/// Allocation-free, getter-free data-property lookup along the prototype chain (D46/E10).
-fn lookupDataProp(obj: *const internal.heap.Object, key_ascii: []const u8) ?Value {
-    var cur: ?*const internal.heap.Object = obj;
-    var depth: usize = 0;
-    while (cur) |o| : ({
-        cur = o.proto;
-        depth += 1;
-    }) {
-        if (depth >= 64 or o.kind == .proxy) return null;
-        var it = o.props.iterator();
-        while (it.next()) |entry| {
-            const k = entry.key_ptr.*;
-            if (!k.isSymbol() and asciiEqlUtf16(key_ascii, k.asAtom().units)) {
-                if (entry.value_ptr.is_accessor) return null;
-                return entry.value_ptr.value;
-            }
-        }
-    }
-    return null;
-}
-
-fn closureName(cl: *const internal.heap.Closure) ?ThrownName {
-    if (cl.meta) |m| {
-        var it = m.props.iterator();
-        while (it.next()) |entry| {
-            const k = entry.key_ptr.*;
-            if (!k.isSymbol() and asciiEqlUtf16("name", k.asAtom().units)) {
-                if (entry.value_ptr.is_accessor) return null;
-                const val = entry.value_ptr.value;
-                if (val.isString() and val.asString().units.len > 0) return .{ .utf16 = val.asString().units };
-                return null;
-            }
-        }
-        if (m.name_deleted) return null;
-    }
-    return switch (cl.impl) {
-        .vm => |vm| blk: {
-            const proto: *const Proto = @ptrCast(@alignCast(vm.proto));
-            const n = if (proto.name.len > 0) proto.name else proto.inferred_name;
-            break :blk if (n.len > 0) .{ .utf8 = n } else null;
-        },
-        .tree => |tr| blk: {
-            const func: *const internal.ast.Function = @ptrCast(@alignCast(tr.func));
-            const n = if (func.name) |d| d.name else func.inferred_name;
-            break :blk if (n.len > 0) .{ .utf8 = n } else null;
-        },
-        .bound => |b| if (b.name.units.len > 0) .{ .utf16 = b.name.units } else null,
-        else => null,
-    };
-}
-
-fn isObjectName(n: ThrownName) bool {
-    return switch (n) {
-        .utf8 => |s| std.mem.eql(u8, s, "Object"),
-        .utf16 => |u| asciiEqlUtf16("Object", u),
-    };
-}
-
-fn extractThrownError(v: Value) ?ThrownErrorInfo {
-    if (!v.isObject()) return null;
-    const obj = v.asObject();
-    const msg_units: ?[]const u16 = if (lookupDataProp(obj, "message")) |mv|
-        (if (mv.isString()) mv.asString().units else null)
-    else
-        null;
-    if (lookupDataProp(obj, "name")) |nv| {
-        if (nv.isString() and nv.asString().units.len > 0) {
-            return .{ .name = .{ .utf16 = nv.asString().units }, .message = msg_units };
-        }
-    }
-    if (msg_units != null) {
-        if (lookupDataProp(obj, "constructor")) |cv| {
-            if (cv.isClosure()) {
-                if (closureName(cv.asClosure())) |cn| {
-                    if (!isObjectName(cn)) return .{ .name = cn, .message = msg_units };
-                }
-            }
-        }
-    }
-    return null;
-}
-
 fn describe(rt: *IRuntime, e: internal.runtime.Error) Failure {
     var f: Failure = .{};
     var w = TextWriter.init(&f.text, &f.text_len, &f.truncated);
     switch (e) {
         error.Thrown => {
             f.kind = .thrown;
-            if (rt.thrown_value) |v| {
-                w.utf8("Uncaught ");
-                if (extractThrownError(v)) |info| {
-                    switch (info.name) {
-                        .utf16 => |u| w.utf16(u),
-                        .utf8 => |s| w.utf8(s),
-                    }
-                    if (info.message) |m| {
-                        if (m.len > 0) {
-                            w.utf8(": ");
-                            w.utf16(m);
-                        }
-                    }
-                } else {
-                    var buf: internal.ops.NumberBuf = undefined;
-                    if (internal.ops.toPiece(rt, v, &buf)) |piece| switch (piece) {
-                        .ascii => |a| w.utf8(a),
-                        .utf16 => |u| w.utf16(u),
-                    } else |_| w.utf8("[value]");
-                }
-            } else {
-                const ex = rt.exception.?;
-                w.utf8(@tagName(ex.name));
-                w.utf8(": ");
-                w.utf16(ex.message.units);
-            }
+            // A thrown value reads "Uncaught …"; an engine-raised exception stays "TypeError: …".
+            if (rt.thrown_value != null) w.utf8("Uncaught ");
+            internal.thrown.describe(rt, &w, false);
+            var sw = TextWriter.init(&f.stack_text, &f.stack_len, &f.stack_truncated);
+            if (internal.thrown.frames(rt)) |units| sw.utf16(units);
         },
         error.HostError => {
             f.kind = .host;

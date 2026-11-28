@@ -881,12 +881,7 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
     switch (it.kind) {
         .for_in => unreachable,
         .map_entries, .map_keys, .map_values => {
-            const entries = it.target.asObject().kind.map.entries.items;
-            while (it.cursor < entries.len) {
-                const i = it.cursor;
-                it.cursor += 1;
-                const e = entries[i];
-                if (!e.alive) continue;
+            if (it.target.asObject().kind.map.nextLive(&it.cursor, &it.epoch)) |e| {
                 return switch (it.kind) {
                     .map_entries => try makePairArray(rt, e.key, e.value),
                     .map_keys => e.key,
@@ -896,12 +891,7 @@ pub fn iteratorNextVal(rt: *Runtime, iter: *Object) Error!?Value {
             }
         },
         .set_values, .set_entries => {
-            const entries = it.target.asObject().kind.set.entries.items;
-            while (it.cursor < entries.len) {
-                const i = it.cursor;
-                it.cursor += 1;
-                const e = entries[i];
-                if (!e.alive) continue;
+            if (it.target.asObject().kind.set.nextLive(&it.cursor, &it.epoch)) |e| {
                 return switch (it.kind) {
                     .set_values => e.key,
                     .set_entries => try makePairArray(rt, e.key, e.key),

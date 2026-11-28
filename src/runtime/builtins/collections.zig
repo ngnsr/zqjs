@@ -245,9 +245,8 @@ fn mapForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     defer roots.unregister(rt);
 
     var i: usize = 0;
-    while (i < m.kind.map.entries.items.len) : (i += 1) {
-        const e = m.kind.map.entries.items[i];
-        if (!e.alive) continue;
+    var epoch = m.kind.map.epoch;
+    while (m.kind.map.nextLive(&i, &epoch)) |e| {
         root_buf[3] = e.key;
         root_buf[4] = e.value;
         _ = try rt.callCallable(cb, this_arg, &.{ e.value, e.key, this });
@@ -417,9 +416,8 @@ fn setForEach(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     defer roots.unregister(rt);
 
     var i: usize = 0;
-    while (i < s.kind.set.entries.items.len) : (i += 1) {
-        const e = s.kind.set.entries.items[i];
-        if (!e.alive) continue;
+    var epoch = s.kind.set.epoch;
+    while (s.kind.set.nextLive(&i, &epoch)) |e| {
         root_buf[3] = e.key;
         _ = try rt.callCallable(cb, this_arg, &.{ e.key, e.key, this });
         root_buf[3] = .undefined;
@@ -529,9 +527,8 @@ fn setIntersection(rt: *Runtime, this: Value, args: []const Value) Error!Value {
 
     if (@as(f64, @floatFromInt(s.kind.set.live_count)) <= rec.size) {
         var i: usize = 0;
-        while (i < s.kind.set.entries.items.len) : (i += 1) {
-            const e = s.kind.set.entries.items[i];
-            if (!e.alive) continue;
+        var epoch = s.kind.set.epoch;
+        while (s.kind.set.nextLive(&i, &epoch)) |e| {
             root_buf[6] = e.key;
             const res = try rt.callCallable(rec.has, rec.obj, &.{e.key});
             if (ops.toBoolean(res)) {
@@ -565,9 +562,8 @@ fn setDifference(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     root_buf[4] = Value.fromObject(out);
     if (@as(f64, @floatFromInt(s.kind.set.live_count)) <= rec.size) {
         var i: usize = 0;
-        while (i < s.kind.set.entries.items.len) : (i += 1) {
-            const e = s.kind.set.entries.items[i];
-            if (!e.alive) continue;
+        var epoch = s.kind.set.epoch;
+        while (s.kind.set.nextLive(&i, &epoch)) |e| {
             root_buf[6] = e.key;
             const res = try rt.callCallable(rec.has, rec.obj, &.{e.key});
             if (ops.toBoolean(res)) {
@@ -623,9 +619,8 @@ fn setIsSubsetOf(rt: *Runtime, this: Value, args: []const Value) Error!Value {
     defer roots.unregister(rt);
 
     var i: usize = 0;
-    while (i < s.kind.set.entries.items.len) : (i += 1) {
-        const e = s.kind.set.entries.items[i];
-        if (!e.alive) continue;
+    var epoch = s.kind.set.epoch;
+    while (s.kind.set.nextLive(&i, &epoch)) |e| {
         root_buf[4] = e.key;
         const res = try rt.callCallable(rec.has, rec.obj, &.{e.key});
         if (!ops.toBoolean(res)) return Value.fromBool(false);
@@ -667,9 +662,8 @@ fn setIsDisjointFrom(rt: *Runtime, this: Value, args: []const Value) Error!Value
 
     if (@as(f64, @floatFromInt(s.kind.set.live_count)) <= rec.size) {
         var i: usize = 0;
-        while (i < s.kind.set.entries.items.len) : (i += 1) {
-            const e = s.kind.set.entries.items[i];
-            if (!e.alive) continue;
+        var epoch = s.kind.set.epoch;
+        while (s.kind.set.nextLive(&i, &epoch)) |e| {
             root_buf[5] = e.key;
             const res = try rt.callCallable(rec.has, rec.obj, &.{e.key});
             if (ops.toBoolean(res)) return Value.fromBool(false);

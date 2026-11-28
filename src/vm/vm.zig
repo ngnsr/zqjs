@@ -3511,6 +3511,7 @@ noinline fn fastGetPropPoly(o: *const heap.Object, atom_addr: usize, sid: u32, b
 fn fastGetProp(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) ?Value {
     const atom_addr = @intFromPtr(atom);
     if (!base.isObject()) {
+        if (base.isNative()) return fastGetNativeStatic(rt, p, pc, base, atom);
         if (base.isString()) {
             const s = base.asString();
             s.obj.checkLive();
@@ -3578,6 +3579,13 @@ inline fn plainGetKind(k: std.meta.Tag(@FieldType(heap.Object, "kind"))) bool {
 noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) void {
     const key = heap.PropKey.fromAtom(atom);
     if (!base.isObject()) {
+        if (base.isNative()) {
+            // A native's statics (Array.isArray) live on its namespace object: own hits only.
+            if (isLengthAtom(atom) or isNameAtom(atom) or atom.atom.?.index != null) return;
+            const ns = (builtins.namespaceObject(rt, base.asNative()) catch return) orelse return;
+            _ = populateOwnHit(rt, p, pc, ns, key, atom);
+            return;
+        }
         if (base.isString() and !isLengthAtom(atom) and atom.atom.?.index == null) {
             const r = builtins.realmIfInit(rt) orelse return;
             const sp = r.string_prototype;
@@ -3621,34 +3629,7 @@ noinline fn populateGetPropIc(rt: *Runtime, p: *const Proto, pc: u32, base: Valu
         return;
     }
     const own_only = o.builtin != null; // see fastGetProp: built-ins cache own hits only
-    if (o.props == .shaped) {
-        if (o.props.shaped.shape) |leaf| {
-            if (leaf.find(key)) |s| {
-                insertPropIc(rt, p, pc, .{
-                    .shape_id = o.props.shapeId(),
-                    .proto_shape_id = 0,
-                    .atom_addr = @intFromPtr(atom),
-                    .slot = s.slot,
-                    .kind = 1,
-                });
-                return;
-            }
-        }
-    } else {
-        if (o.props.dict.getIndex(key)) |idx| {
-            const prop = o.props.dict.values()[idx];
-            if (!prop.is_accessor and idx <= std.math.maxInt(u16) and o.dict_version != 0) {
-                insertPropIc(rt, p, pc, .{
-                    .shape_id = o.dict_version,
-                    .proto_shape_id = 0,
-                    .atom_addr = @intFromPtr(atom),
-                    .slot = @intCast(idx),
-                    .kind = 6,
-                });
-            }
-            return;
-        }
-    }
+    if (populateOwnHit(rt, p, pc, o, key, atom)) return;
     if (own_only) return;
     const sid = objVersion(o);
     if (o.props == .dict and o.dict_version == 0) return;
@@ -4048,4 +4029,54 @@ inline fn fastRemainderVal(a: f64, b: f64) Value {
         }
     }
     return slowRemainderVal(a, b);
+}
+
+/// The own data property `key` of `o` (shaped: kind 1, dict: kind 6) goes into the cache.
+/// True when `o` has `key` as an own property, cacheable or not: the caller stops there.
+fn populateOwnHit(rt: *Runtime, p: *const Proto, pc: u32, o: *const heap.Object, key: heap.PropKey, atom: *heap.String) bool {
+    if (o.props == .shaped) {
+        const leaf = o.props.shaped.shape orelse return false;
+        const s = leaf.find(key) orelse return false;
+        insertPropIc(rt, p, pc, .{
+            .shape_id = o.props.shapeId(),
+            .proto_shape_id = 0,
+            .atom_addr = @intFromPtr(atom),
+            .slot = s.slot,
+            .kind = 1,
+        });
+        return true;
+    }
+    const idx = o.props.dict.getIndex(key) orelse return false;
+    const prop = o.props.dict.values()[idx];
+    if (!prop.is_accessor and idx <= std.math.maxInt(u16) and o.dict_version != 0) {
+        insertPropIc(rt, p, pc, .{
+            .shape_id = o.dict_version,
+            .proto_shape_id = 0,
+            .atom_addr = @intFromPtr(atom),
+            .slot = @intCast(idx),
+            .kind = 6,
+        });
+    }
+    return true;
+}
+
+/// `Array.isArray`, `Object.keys`, ...: a native's statics live on its namespace object.
+/// Only own data hits are cached; `name`/`length` (virtual) and misses (Unsupported per
+/// D39, then Function.prototype) take the slow path.
+noinline fn fastGetNativeStatic(rt: *Runtime, p: *const Proto, pc: u32, base: Value, atom: *heap.String) ?Value {
+    if (isLengthAtom(atom) or isNameAtom(atom)) return null;
+    const ns = (builtins.namespaceObject(rt, base.asNative()) catch return null) orelse return null;
+    ns.obj.checkLive();
+    const atom_addr = @intFromPtr(atom);
+    const sid = objVersion(ns);
+    for (propIcBucket(rt, p, pc)) |ic| {
+        if (ic.kind != 1 and ic.kind != 6) continue;
+        if (matchGetPropIc(ns, atom_addr, sid, ic)) |v| return v;
+    }
+    return null;
+}
+
+inline fn isNameAtom(atom: *const heap.String) bool {
+    const u = atom.units;
+    return u.len == 4 and u[0] == 'n' and u[1] == 'a' and u[2] == 'm' and u[3] == 'e';
 }

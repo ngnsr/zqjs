@@ -64,6 +64,7 @@ test {
     _ = @import("runtime/heap.zig");
     _ = @import("runtime/op_profile.zig");
     _ = @import("runtime/ops.zig");
+    _ = @import("runtime/inspect.zig");
     _ = @import("runtime/date.zig");
     _ = @import("runtime/bigint.zig");
     _ = @import("runtime/pow.zig");

@@ -62,6 +62,7 @@ test {
     _ = @import("frontend/parser.zig");
     _ = @import("frontend/resolver.zig");
     _ = @import("runtime/heap.zig");
+    _ = @import("runtime/op_profile.zig");
     _ = @import("runtime/ops.zig");
     _ = @import("runtime/date.zig");
     _ = @import("runtime/bigint.zig");
